@@ -154,12 +154,12 @@ spec:
       resources:
         requests:
           cpu: 10
-          memory: 160Gi
-          nvidia.com/gpu: 4
+          memory: 60Gi
+          nvidia.com/gpu: 2
         limits:
           cpu: 10
-          memory: 160Gi
-          nvidia.com/gpu: 4
+          memory: 60Gi
+          nvidia.com/gpu: 2
 
       readinessProbe:
         httpGet:

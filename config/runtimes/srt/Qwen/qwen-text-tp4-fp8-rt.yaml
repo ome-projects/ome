@@ -150,13 +150,13 @@ spec:
           name: dshm
       resources:
         requests:
-          cpu: 128
-          memory: 512Gi
-          nvidia.com/gpu: 8
+          cpu: 20
+          memory: 160Gi
+          nvidia.com/gpu: 4
         limits:
-          cpu: 128
-          memory: 512Gi
-          nvidia.com/gpu: 8
+          cpu: 20
+          memory: 160Gi
+          nvidia.com/gpu: 4
 
       readinessProbe:
         httpGet:

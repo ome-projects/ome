@@ -117,7 +117,6 @@ spec:
       args:
         - |
           python3 -m sglang.launch_server \
-          --context-length=262144 \
           --enable-metrics \
           --enable-multimodal \
           --host 0.0.0.0 \
@@ -134,12 +133,12 @@ spec:
       resources:
         requests:
           cpu: 10
-          memory: 60Gi
-          nvidia.com/gpu: 2
+          memory: 30Gi
+          nvidia.com/gpu: 1
         limits:
           cpu: 10
-          memory: 60Gi
-          nvidia.com/gpu: 2
+          memory: 30Gi
+          nvidia.com/gpu: 1
 
       readinessProbe:
         httpGet:

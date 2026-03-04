@@ -59,7 +59,6 @@ spec:
       args:
         - |
           python3 -m sglang.launch_server \
-          --context-length=262144 \
           --enable-metrics \
           --enable-multimodal \
           --host 0.0.0.0 \

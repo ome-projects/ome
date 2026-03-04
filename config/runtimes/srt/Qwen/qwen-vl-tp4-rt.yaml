@@ -111,7 +111,6 @@ spec:
       args:
         - |
           python3 -m sglang.launch_server \
-          --context-length=128000 \
           --enable-metrics \
           --enable-multimodal \
           --host 0.0.0.0 \
@@ -127,11 +126,11 @@ spec:
           name: dshm
       resources:
         requests:
-          cpu: 10
+          cpu: 20
           memory: 160Gi
           nvidia.com/gpu: 4
         limits:
-          cpu: 10
+          cpu: 20
           memory: 160Gi
           nvidia.com/gpu: 4
 

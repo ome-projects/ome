@@ -145,11 +145,11 @@ spec:
           name: dshm
       resources:
         requests:
-          cpu: 10
+          cpu: 20
           memory: 160Gi
           nvidia.com/gpu: 4
         limits:
-          cpu: 10
+          cpu: 20
           memory: 160Gi
           nvidia.com/gpu: 4
 
