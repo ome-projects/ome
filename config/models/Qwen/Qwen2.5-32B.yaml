@@ -8,7 +8,7 @@ spec:
   vendor: qwen
   disabled: false
   version: "1.0.0"
-  displayName: qwen.qwen2.5-32b
+  displayName: qwen.qwen2-5-32b
   storage:
     storageUri: hf://Qwen/Qwen2.5-32B
     path: /raid/models/qwen/qwen2-5-32b

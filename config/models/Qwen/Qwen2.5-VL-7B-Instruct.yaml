@@ -4,12 +4,13 @@ metadata:
   name: qwen2-5-vl-7b-instruct
 spec:
   modelCapabilities:
-    - IMAGE_TO_TEXT
+    - IMAGE_TEXT_TO_TEXT
+    - VIDEO_TEXT_TO_TEXT
   vendor: Qwen
-  displayName: qwen.qwen2.5-vl-7b-instruct
+  displayName: qwen.qwen2-5-vl-7b-instruct
+  modelArchitecture: Qwen2_5_VLForConditionalGeneration
   disabled: false
   version: "1.0.0"
-  modelArchitecture: Qwen2_5_VLForConditionalGeneration
   modelFormat:
     name: safetensors
     version: "1.0.0"
@@ -20,4 +21,3 @@ spec:
   storage:
     storageUri: hf://Qwen/Qwen2.5-VL-7B-Instruct
     path: /raid/models/Qwen/Qwen2.5-VL-7B-Instruct
-    key: "hf-token"

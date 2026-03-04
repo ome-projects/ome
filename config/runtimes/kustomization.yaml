@@ -32,6 +32,20 @@ resources:
 - srt/mistral-7b-instruct-rt.yaml
 - srt/mixtral-8x7b-instruct-pd-rt.yaml
 - srt/mixtral-8x7b-instruct-rt.yaml
+- srt/Qwen/qwen-text-tp1-rt.yaml
+- srt/Qwen/qwen-text-tp2-rt.yaml
+- srt/Qwen/qwen-text-tp4-rt.yaml
+- srt/Qwen/qwen-text-tp8-rt.yaml
+- srt/Qwen/qwen-vl-tp1-rt.yaml
+- srt/Qwen/qwen-vl-tp2-rt.yaml
+- srt/Qwen/qwen-vl-tp4-rt.yaml
+- srt/Qwen/qwen-vl-tp8-rt.yaml
+- srt/Qwen/qwen-text-tp1-fp8-rt.yaml
+- srt/Qwen/qwen-text-tp2-fp8-rt.yaml
+- srt/Qwen/qwen-text-tp4-fp8-rt.yaml
+- srt/Qwen/qwen-vl-tp1-fp8-rt.yaml
+- srt/Qwen/qwen-vl-tp2-fp8-rt.yaml
+- srt/Qwen/qwen-vl-tp4-fp8-rt.yaml
 # vLLM runtimes
 - vllm/e5-mistral-7b-instruct-rt.yaml
 - vllm/llama-3-1-405b-instruct-fp8-rt.yaml

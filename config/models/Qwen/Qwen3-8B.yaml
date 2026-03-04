@@ -5,10 +5,18 @@ metadata:
 spec:
   modelCapabilities:
     - TEXT_TO_TEXT
-  vendor: qwen
+  vendor: Qwen
+  displayName: qwen.qwen3-8b
+  modelArchitecture: Qwen3ForCausalLM
   disabled: false
   version: "1.0.0"
-  displayName: qwen.qwen3-8b
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.51.0"
+  modelParameterSize: 8B
   storage:
     storageUri: hf://Qwen/Qwen3-8B
-    path: /raid/models/qwen/qwen3-8b
+    path: /raid/models/Qwen/Qwen3-8B

@@ -1,0 +1,22 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen2-0-5b-instruct
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen2-0-5b-instruct
+  modelArchitecture: Qwen2ForCausalLM
+  disabled: false
+  version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.40.1"
+  modelParameterSize: 0.5B
+  storage:
+    storageUri: hf://Qwen/Qwen2-0.5B-Instruct
+    path: /raid/models/Qwen/Qwen2-0.5B-Instruct

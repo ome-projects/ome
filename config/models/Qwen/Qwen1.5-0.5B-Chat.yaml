@@ -1,0 +1,22 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen1-5-0-5b-chat
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen1-5-0-5b-chat
+  modelArchitecture: Qwen2ForCausalLM
+  disabled: false
+  version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.37.0"
+  modelParameterSize: 0.5B
+  storage:
+    storageUri: hf://Qwen/Qwen1.5-0.5B-Chat
+    path: /raid/models/Qwen/Qwen1.5-0.5B-Chat

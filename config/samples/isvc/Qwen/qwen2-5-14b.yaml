@@ -11,6 +11,6 @@ spec:
     maxReplicas: 1
   runtime:
     name: srt-qwen2-5-14b
-  router:
-    minReplicas: 1
-    maxReplicas: 1
+  # router:
+  #   minReplicas: 1
+  #   maxReplicas: 1

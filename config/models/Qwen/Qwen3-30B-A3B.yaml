@@ -6,9 +6,17 @@ spec:
   modelCapabilities:
     - TEXT_TO_TEXT
   vendor: Qwen
-  displayName: Qwen.qwen3-30b-a3b
+  displayName: qwen.qwen3-30b-a3b
+  modelArchitecture: Qwen3MoeForCausalLM
   disabled: false
   version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.51.0"
+  modelParameterSize: 30B
   storage:
     storageUri: hf://Qwen/Qwen3-30B-A3B
     path: /raid/models/Qwen/Qwen3-30B-A3B

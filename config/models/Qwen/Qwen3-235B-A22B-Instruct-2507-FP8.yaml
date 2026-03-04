@@ -1,0 +1,23 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen3-235b-a22b-instruct-2507-fp8
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen3-235b-a22b-instruct-2507-fp8
+  modelArchitecture: Qwen3MoeForCausalLM
+  disabled: false
+  version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.51.0"
+  modelParameterSize: 235B
+  quantization: fp8
+  storage:
+    storageUri: hf://Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
+    path: /raid/models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8

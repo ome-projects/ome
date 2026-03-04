@@ -6,18 +6,17 @@ spec:
   modelCapabilities:
     - TEXT_TO_TEXT
   vendor: Qwen
-  displayName: qwen.qwen2.5-72b-instruct
+  displayName: qwen.qwen2-5-72b-instruct
+  modelArchitecture: Qwen2ForCausalLM
   disabled: false
   version: "1.0.0"
-  modelArchitecture: Qwen2ForCausalLM
   modelFormat:
     name: safetensors
     version: "1.0.0"
   modelFramework:
     name: transformers
     version: "4.43.1"
-  modelParameterSize: 72B
+  modelParameterSize: 72.7B
   storage:
     storageUri: hf://Qwen/Qwen2.5-72B-Instruct
     path: /raid/models/Qwen/Qwen2.5-72B-Instruct
-    key: "hf-token"

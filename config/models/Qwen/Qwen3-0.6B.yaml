@@ -6,9 +6,17 @@ spec:
   modelCapabilities:
     - TEXT_TO_TEXT
   vendor: Qwen
-  displayName: Qwen.qwen3-0.6b
+  displayName: qwen.qwen3-0-6b
+  modelArchitecture: Qwen3ForCausalLM
   disabled: false
   version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.51.0"
+  modelParameterSize: 0.6B
   storage:
     storageUri: hf://Qwen/Qwen3-0.6B
     path: /raid/models/Qwen/Qwen3-0.6B

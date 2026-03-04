@@ -1,0 +1,25 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen3-5-122b-a10b-fp8
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+    - IMAGE_TEXT_TO_TEXT
+    - VIDEO_TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen3-5-122b-a10b-fp8
+  modelArchitecture: Qwen3_5MoeForConditionalGeneration
+  disabled: false
+  version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.57.0.dev0"
+  modelParameterSize: 122B
+  quantization: fp8
+  storage:
+    storageUri: hf://Qwen/Qwen3.5-122B-A10B-FP8
+    path: /raid/models/Qwen/Qwen3.5-122B-A10B-FP8

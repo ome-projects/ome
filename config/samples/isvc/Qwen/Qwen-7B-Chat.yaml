@@ -9,6 +9,6 @@ spec:
   engine:
     minReplicas: 1
     maxReplicas: 1
-  router:
-    minReplicas: 1
-    maxReplicas: 1
+  # :
+  #   minReplicas: 1
+  #   maxReplicas: 1
