@@ -104,7 +104,7 @@ spec:
         httpGet:
           path: /health_generate
           port: 8080
-        failureThreshold: 150
+        failureThreshold: 300  # takes longer for larger models
         successThreshold: 1
         periodSeconds: 6
         initialDelaySeconds: 60

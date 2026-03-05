@@ -85,6 +85,26 @@ spec:
       modelArchitecture: Qwen3MoeForCausalLM
       version: "1.0.0"
       priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.39.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.40.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
   modelSizeRange:
     min: 0.45B
     max: 15.4B

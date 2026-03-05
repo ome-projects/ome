@@ -94,7 +94,7 @@ spec:
       version: "1.0.0"
       priority: 1
   modelSizeRange:
-    min: 27B
+    min: 0.45B
     max: 35.2B
   protocolVersions:
     - openAI
