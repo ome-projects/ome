@@ -42,6 +42,16 @@ spec:
         name: safetensors
         version: "1.0.0"
       autoSelect: true
+      modelArchitecture: Qwen3VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
       modelArchitecture: Qwen3VLMoeForConditionalGeneration
       version: "1.0.0"
       priority: 1
