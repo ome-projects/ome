@@ -6,7 +6,7 @@ spec:
   modelCapabilities:
     - TEXT_TO_TEXT
   vendor: Qwen
-  displayName: Qwen.qwen3-next-80b-a3b-instruct
+  displayName: qwen.qwen3-next-80b-a3b-instruct
   disabled: false
   version: "1.0.0"
   storage:

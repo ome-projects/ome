@@ -8,7 +8,7 @@ spec:
     - IMAGE_TEXT_TO_TEXT
     - VIDEO_TEXT_TO_TEXT
   vendor: Qwen
-  displayName: qwen.qwen3-5-35b-a3b
+  displayName: qwen.qwen3.5-35b-a3b
   modelArchitecture: Qwen3_5MoeForConditionalGeneration
   disabled: false
   version: "1.0.0"

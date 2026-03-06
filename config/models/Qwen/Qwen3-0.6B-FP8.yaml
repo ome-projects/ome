@@ -6,7 +6,7 @@ spec:
   modelCapabilities:
     - TEXT_TO_TEXT
   vendor: Qwen
-  displayName: qwen.qwen3-0-6b-fp8
+  displayName: qwen.qwen3-0.6b-fp8
   modelArchitecture: Qwen3ForCausalLM
   disabled: false
   version: "1.0.0"

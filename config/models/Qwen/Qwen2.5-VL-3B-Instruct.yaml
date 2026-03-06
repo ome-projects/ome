@@ -7,7 +7,7 @@ spec:
     - IMAGE_TEXT_TO_TEXT
     - VIDEO_TEXT_TO_TEXT
   vendor: Qwen
-  displayName: qwen.qwen2-5-vl-3b-instruct
+  displayName: qwen.qwen2.5-vl-3b-instruct
   modelArchitecture: Qwen2_5_VLForConditionalGeneration
   disabled: false
   version: "1.0.0"

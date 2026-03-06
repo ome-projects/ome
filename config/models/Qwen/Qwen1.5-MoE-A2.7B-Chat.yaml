@@ -6,7 +6,7 @@ spec:
   modelCapabilities:
     - TEXT_TO_TEXT
   vendor: Qwen
-  displayName: qwen.qwen1-5-moe-a2-7b-chat
+  displayName: qwen.qwen1.5-moe-a2.7b-chat
   modelArchitecture: Qwen2MoeForCausalLM
   disabled: false
   version: "1.0.0"
