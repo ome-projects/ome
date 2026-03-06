@@ -1,14 +1,11 @@
 apiVersion: ome.io/v1beta1
 kind: InferenceService
 metadata:
-  name: qwen2-72b-instruct
+  name: qwen3-5-122b-a10b-fp8
   namespace: qwen
 spec:
   model:
-    name: qwen2-72b-instruct
+    name: qwen3-5-122b-a10b-fp8
   engine:
     minReplicas: 1
     maxReplicas: 1
-  # router:
-  #   minReplicas: 1
-  #   maxReplicas: 1

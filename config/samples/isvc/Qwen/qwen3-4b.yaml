@@ -1,20 +1,13 @@
 ---
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: qwen3-4b
----
 
 apiVersion: ome.io/v1beta1
 kind: InferenceService
 metadata:
   name: qwen3-4b
-  namespace: qwen3-4b
+  namespace: qwen
 spec:
   model:
     name: qwen3-4b
-  runtime:
-    name: srt-qwen3-4b
   engine:
     minReplicas: 1
     maxReplicas: 1
