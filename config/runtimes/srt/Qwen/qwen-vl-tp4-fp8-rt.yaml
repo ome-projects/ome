@@ -113,7 +113,7 @@ spec:
                     - BM.GPU.H100.8
     runner:
       name: ome-container
-      image: ord.ocir.io/idqj093njucb/official-sgl:v0.5.9.38e8377-cu129
+      image: fra.ocir.io/idqj093njucb/smg:1.2.0-sglang-v0.5.9
       ports:
         - containerPort: 8080
           name: http1
@@ -124,17 +124,19 @@ spec:
         - --
       args:
         - |
-          python3 -m sglang.launch_server \
+          python3 -m smg.launch_server \
           --enable-metrics \
           --enable-multimodal \
           --host 0.0.0.0 \
           --log-requests \
-          --log-requests-level=1 \
+          --log-requests-level 1 \
           --mem-fraction-static 0.82 \
           --model-path "$MODEL_PATH" \
           --port 8080 \
           --tp-size 4 \
-          --trust-remote-code
+          --trust-remote-code \
+          --grpc-mode \
+          --router-request-id-headers "opc-request-id"
       volumeMounts:
         - mountPath: /dev/shm
           name: dshm
@@ -170,7 +172,7 @@ spec:
         httpGet:
           path: /health_generate
           port: 8080
-        failureThreshold: 150
+        failureThreshold: 300  # additional time for DeepGEMM computation during startup
         successThreshold: 1
         periodSeconds: 6
         initialDelaySeconds: 60
