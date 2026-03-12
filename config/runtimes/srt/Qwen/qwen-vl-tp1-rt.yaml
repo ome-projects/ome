@@ -120,7 +120,7 @@ spec:
         - --
       args:
         - |
-          python3 -m smg.launch_server \
+          smg serve \
           --enable-metrics \
           --enable-multimodal \
           --host 0.0.0.0 \
@@ -132,6 +132,8 @@ spec:
           --tp-size 1 \
           --trust-remote-code \
           --grpc-mode \
+          --served-model-name vllm-model \
+          --router-log-json \
           --router-request-id-headers "opc-request-id"
       volumeMounts:
         - mountPath: /dev/shm
