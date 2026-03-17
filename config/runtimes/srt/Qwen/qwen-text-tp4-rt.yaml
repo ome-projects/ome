@@ -139,7 +139,7 @@ spec:
                     - BM.GPU.H200.8
     runner:
       name: ome-container
-      image: fra.ocir.io/idqj093njucb/smg:1.2.0-sglang-v0.5.9
+      image: fra.ocir.io/idqj093njucb/smg:1.3.0-sglang-v0.5.9
       ports:
         - containerPort: 8080
           name: http1
@@ -188,7 +188,7 @@ spec:
 
       livenessProbe:
         httpGet:
-          path: /health
+          path: /health_generate
           port: 8080
         failureThreshold: 5
         successThreshold: 1
