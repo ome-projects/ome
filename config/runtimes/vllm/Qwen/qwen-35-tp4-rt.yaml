@@ -27,7 +27,7 @@ spec:
       priority: 1
   modelSizeRange:
     min: 64.8B
-    max: 79.2B
+    max: 125B
   protocolVersions:
     - openAI
   engineConfig:

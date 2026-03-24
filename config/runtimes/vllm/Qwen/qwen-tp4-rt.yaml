@@ -1,10 +1,110 @@
 apiVersion: ome.io/v1beta1
 kind: ClusterServingRuntime
 metadata:
-  name: vllm-qwen-vl-tp1
+  name: vllm-qwen-tp4
 spec:
   disabled: false
   supportedModelFormats:
+    - modelFramework:
+        name: transformers
+        version: "4.32.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: QWenLMHeadModel
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.37.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.37.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.40.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.43.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.51.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.51.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.39.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.40.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
     - modelFramework:
         name: transformers
         version: "4.41.2"
@@ -56,8 +156,8 @@ spec:
       version: "1.0.0"
       priority: 1
   modelSizeRange:
-    min: 1.7B
-    max: 8.5B
+    min: 51B
+    max: 111B
   protocolVersions:
     - openAI
   engineConfig:
@@ -104,13 +204,14 @@ spec:
           --host 0.0.0.0 \
           --model $(MODEL_PATH) \
           --port 8080 \
-          --tensor-parallel-size 1 \
+          --tensor-parallel-size 4 \
           --served-model-name vllm-model \
           --limit-mm-per-prompt '{"video": {"count": 1}, "image": {"count": 10}}' \
           --router-tool-call-parser qwen \
           --router-reasoning-parser qwen3 \
           --backend vllm \
           --router-log-json \
+          --worker-startup-timeout 600 \
           --router-request-id-headers "opc-request-id"
       env:
         - name: VLLM_LOGGING_LEVEL
@@ -120,13 +221,13 @@ spec:
           name: dshm
       resources:
         requests:
-          cpu: 10
-          memory: 30Gi
-          nvidia.com/gpu: 1
+          cpu: 20
+          memory: 160Gi
+          nvidia.com/gpu: 4
         limits:
-          cpu: 10
-          memory: 30Gi
-          nvidia.com/gpu: 1
+          cpu: 20
+          memory: 160Gi
+          nvidia.com/gpu: 4
 
       readinessProbe:
         httpGet:

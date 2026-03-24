@@ -26,8 +26,8 @@ spec:
       version: "1.0.0"
       priority: 1
   modelSizeRange:
-    min: 27B
-    max: 35.2B
+    min: 26B
+    max: 37B
   protocolVersions:
     - openAI
   engineConfig:

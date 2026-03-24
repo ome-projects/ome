@@ -1,7 +1,7 @@
 apiVersion: ome.io/v1beta1
 kind: ClusterServingRuntime
 metadata:
-  name: vllm-qwen-text-tp2-fp8
+  name: vllm-qwen-tp1
 spec:
   disabled: false
   supportedModelFormats:
@@ -11,7 +11,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: QWenLMHeadModel
       version: "1.0.0"
@@ -22,7 +21,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen2ForCausalLM
       version: "1.0.0"
@@ -33,7 +31,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen2ForCausalLM
       version: "1.0.0"
@@ -44,7 +41,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen2ForCausalLM
       version: "1.0.0"
@@ -55,7 +51,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen2ForCausalLM
       version: "1.0.0"
@@ -66,7 +61,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen2ForCausalLM
       version: "1.0.0"
@@ -77,7 +71,6 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen3ForCausalLM
       version: "1.0.0"
@@ -88,14 +81,83 @@ spec:
       modelFormat:
         name: safetensors
         version: "1.0.0"
-      quantization: fp8
       autoSelect: true
       modelArchitecture: Qwen3MoeForCausalLM
       version: "1.0.0"
       priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.39.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.40.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2_5_VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.49.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2_5_VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3VLMoeForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
   modelSizeRange:
-    min: 64.8B
-    max: 121B
+    min: 0.45B
+    max: 15.4B
   protocolVersions:
     - openAI
   engineConfig:
@@ -142,13 +204,13 @@ spec:
           --host 0.0.0.0 \
           --model $(MODEL_PATH) \
           --port 8080 \
-          --tensor-parallel-size 2 \
+          --tensor-parallel-size 1 \
           --served-model-name vllm-model \
+          --limit-mm-per-prompt '{"video": {"count": 1}, "image": {"count": 10}}' \
           --router-tool-call-parser qwen \
           --router-reasoning-parser qwen3 \
           --backend vllm \
           --router-log-json \
-          --worker-startup-timeout 1000 \
           --router-request-id-headers "opc-request-id"
       env:
         - name: VLLM_LOGGING_LEVEL
@@ -159,12 +221,12 @@ spec:
       resources:
         requests:
           cpu: 10
-          memory: 60Gi
-          nvidia.com/gpu: 2
+          memory: 30Gi
+          nvidia.com/gpu: 1
         limits:
           cpu: 10
-          memory: 60Gi
-          nvidia.com/gpu: 2
+          memory: 30Gi
+          nvidia.com/gpu: 1
 
       readinessProbe:
         httpGet:
@@ -188,7 +250,7 @@ spec:
         httpGet:
           path: /health
           port: 8080
-        failureThreshold: 300  # additional time for DeepGEMM computation during startup
+        failureThreshold: 150
         successThreshold: 1
         periodSeconds: 6
         initialDelaySeconds: 60

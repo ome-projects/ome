@@ -1,7 +1,7 @@
 apiVersion: ome.io/v1beta1
 kind: ClusterServingRuntime
 metadata:
-  name: vllm-qwen-text-tp8
+  name: vllm-qwen-tp8
 spec:
   disabled: false
   supportedModelFormats:
@@ -85,8 +85,58 @@ spec:
       modelArchitecture: Qwen3MoeForCausalLM
       version: "1.0.0"
       priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2_5_VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.49.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2_5_VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3VLMoeForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
   modelSizeRange:
-    min: 212.4B
+    min: 112B
     max: 259.6B
   protocolVersions:
     - openAI
@@ -136,9 +186,10 @@ spec:
           --port 8080 \
           --tensor-parallel-size 8 \
           --served-model-name vllm-model \
+          --limit-mm-per-prompt '{"video": {"count": 1}, "image": {"count": 10}}' \
+          --gpu-memory-utilization 0.93 \
           --router-tool-call-parser qwen \
           --router-reasoning-parser qwen3 \
-          --gpu-memory-utilization 0.92 \
           --backend vllm \
           --router-log-json \
           --worker-startup-timeout 600 \
@@ -181,7 +232,7 @@ spec:
         httpGet:
           path: /health
           port: 8080
-        failureThreshold: 150
+        failureThreshold: 300  # takes longer for larger models
         successThreshold: 1
         periodSeconds: 6
         initialDelaySeconds: 60
