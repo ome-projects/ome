@@ -3,7 +3,7 @@ kind: ClusterServingRuntime
 metadata:
   name: srt-qwen-vl-tp4-fp8
 spec:
-  disabled: false
+  disabled: true
   supportedModelFormats:
     - modelFramework:
         name: transformers
