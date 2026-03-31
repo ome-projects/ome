@@ -200,6 +200,8 @@ spec:
           --tensor-parallel-size 2 \
           --served-model-name vllm-model \
           --limit-mm-per-prompt '{"video": {"count": 1}, "image": {"count": 10}}' \
+          --generation-config vllm \
+          --optimization-level 3 \
           --router-tool-call-parser qwen \
           --router-reasoning-parser qwen3 \
           --backend vllm \
