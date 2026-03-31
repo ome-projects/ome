@@ -193,6 +193,7 @@ spec:
           --router-reasoning-parser qwen3 \
           --backend vllm \
           --router-log-json \
+          --router-max-concurrent-requests 512 \
           --router-request-id-headers "opc-request-id"
       env:
         - name: VLLM_LOGGING_LEVEL
