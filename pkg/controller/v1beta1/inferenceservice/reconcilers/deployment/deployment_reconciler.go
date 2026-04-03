@@ -216,5 +216,14 @@ func (r *DeploymentReconciler) Reconcile() (*appsv1.Deployment, error) {
 		return nil, opErr
 	}
 
-	return r.Deployment, nil
+	// Re-fetch the deployment so callers get real status (including conditions).
+	liveDeployment := &appsv1.Deployment{}
+	if err := r.client.Get(context.TODO(), types.NamespacedName{
+		Namespace: r.Deployment.Namespace,
+		Name:      r.Deployment.Name,
+	}, liveDeployment); err != nil {
+		log.Error(err, "Failed to re-fetch deployment after create/update", "namespace", r.Deployment.Namespace, "name", r.Deployment.Name)
+		return nil, err
+	}
+	return liveDeployment, nil
 }
