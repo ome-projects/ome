@@ -88,6 +88,7 @@ func (b *ComponentBuilder) WithSupportedModelFormat(format *v1beta1.SupportedMod
 
 // buildBaseFields creates the common base fields
 func (b *ComponentBuilder) buildBaseFields() BaseComponentFields {
+	statusManager := status.NewStatusReconciler(b.clientset).WithLogger(b.logger.WithName("InferenceServiceStatus"))
 	return BaseComponentFields{
 		Client:                 b.client,
 		Clientset:              b.clientset,
@@ -98,7 +99,7 @@ func (b *ComponentBuilder) buildBaseFields() BaseComponentFields {
 		BaseModelMeta:          b.baseModelMeta,
 		Runtime:                b.runtime,
 		RuntimeName:            b.runtimeName,
-		StatusManager:          status.NewStatusReconciler(),
+		StatusManager:          statusManager,
 		Log:                    b.logger,
 	}
 }

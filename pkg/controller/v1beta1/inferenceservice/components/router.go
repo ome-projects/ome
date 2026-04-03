@@ -47,6 +47,8 @@ func NewRouter(
 	runtime *v1beta1.ServingRuntimeSpec,
 	runtimeName string,
 ) Component {
+	logger := ctrl.Log.WithName("RouterReconciler")
+	statusManager := status.NewStatusReconciler(clientset).WithLogger(logger.WithName("InferenceServiceStatus"))
 	base := BaseComponentFields{
 		Client:                 client,
 		Clientset:              clientset,
@@ -57,8 +59,8 @@ func NewRouter(
 		BaseModelMeta:          baseModelMeta,
 		Runtime:                runtime,
 		RuntimeName:            runtimeName,
-		StatusManager:          status.NewStatusReconciler(),
-		Log:                    ctrl.Log.WithName("RouterReconciler"),
+		StatusManager:          statusManager,
+		Log:                    logger,
 	}
 
 	return &Router{

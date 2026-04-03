@@ -474,6 +474,19 @@ const (
 	StateReasonCrashLoopBackOff = "CrashLoopBackOff"
 )
 
+// Container log / termination message parsing
+var (
+	AnsiEscapeCodePattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+)
+
+const (
+	NotEnoughGPUMemoryMessage     = "not enough gpu memory"
+	CUDAOutOfMemoryMessage        = "cuda out of memory"
+	ModelLoadGPUOOMFailureMessage = "Model failed to load: not enough GPU memory"
+	InsufficientGPUMemoryReason   = "InsufficientGPUMemory"
+	InsufficientGPUMemoryMessage  = "Insufficient GPU memory to run the model container"
+)
+
 // CRD Kinds
 const (
 	IstioVirtualServiceKind = "VirtualService"
@@ -598,7 +611,7 @@ func GetModelsLabelWithUid(uid types.UID) string {
 
 // GetRawServiceLabel generate native service label
 func GetRawServiceLabel(service string) string {
-	return service
+	return TruncateNameWithMaxLength(service, 63)
 }
 
 func (e InferenceServiceComponent) String() string {

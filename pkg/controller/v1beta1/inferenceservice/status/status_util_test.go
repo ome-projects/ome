@@ -1,9 +1,11 @@
 package status
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -82,6 +84,66 @@ func TestInitializeComponentStatus(t *testing.T) {
 			result := manager.initializeComponentStatus(tt.status, tt.component)
 			assert.Equal(t, tt.expected, result)
 			assert.NotNil(t, tt.status.Components)
+		})
+	}
+}
+
+func TestInitializeComponentCondition(t *testing.T) {
+	tests := []struct {
+		name              string
+		initialCondition  *apis.Condition
+		expectedReason    string
+		expectedMessage   string
+		expectedCondition corev1.ConditionStatus
+	}{
+		{
+			name:              "initialize missing condition",
+			initialCondition:  nil,
+			expectedReason:    "Initializing",
+			expectedMessage:   "engine component initializing",
+			expectedCondition: corev1.ConditionFalse,
+		},
+		{
+			name: "preserve existing failure condition",
+			initialCondition: &apis.Condition{
+				Type:    v1beta1.EngineReady,
+				Status:  corev1.ConditionFalse,
+				Reason:  constants.InsufficientGPUMemoryReason,
+				Message: constants.InsufficientGPUMemoryMessage,
+			},
+			expectedReason:    constants.InsufficientGPUMemoryReason,
+			expectedMessage:   constants.InsufficientGPUMemoryMessage,
+			expectedCondition: corev1.ConditionFalse,
+		},
+		{
+			name: "preserve existing ready condition",
+			initialCondition: &apis.Condition{
+				Type:    v1beta1.EngineReady,
+				Status:  corev1.ConditionTrue,
+				Reason:  "MinimumReplicasAvailable",
+				Message: "Deployment has minimum availability.",
+			},
+			expectedReason:    "MinimumReplicasAvailable",
+			expectedMessage:   "Deployment has minimum availability.",
+			expectedCondition: corev1.ConditionTrue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewStatusReconciler()
+			status := &v1beta1.InferenceServiceStatus{}
+			if tt.initialCondition != nil {
+				status.SetCondition(v1beta1.EngineReady, tt.initialCondition)
+			}
+
+			manager.InitializeComponentCondition(status, v1beta1.EngineComponent)
+
+			engineReady := status.GetCondition(v1beta1.EngineReady)
+			require.NotNil(t, engineReady)
+			assert.Equal(t, tt.expectedCondition, engineReady.Status)
+			assert.Equal(t, tt.expectedReason, engineReady.Reason)
+			assert.Equal(t, tt.expectedMessage, engineReady.Message)
 		})
 	}
 }
@@ -755,6 +817,7 @@ func TestCheckContainerStatuses(t *testing.T) {
 		pod           *corev1.Pod
 		totalCopies   int
 		expectedState v1beta1.ModelState
+		expectedError string
 	}{
 		{
 			name:   "storage initializer running",
@@ -775,7 +838,7 @@ func TestCheckContainerStatuses(t *testing.T) {
 			expectedState: v1beta1.Loading,
 		},
 		{
-			name:   "storage initializer terminated with error",
+			name:   "storage initializer terminated with gpu oom error",
 			status: &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}},
 			pod: &corev1.Pod{
 				Status: corev1.PodStatus{
@@ -785,7 +848,7 @@ func TestCheckContainerStatuses(t *testing.T) {
 							State: corev1.ContainerState{
 								Terminated: &corev1.ContainerStateTerminated{
 									Reason:   constants.StateReasonError,
-									Message:  "Failed to download model",
+									Message:  "CUDA error: not enough GPU memory to load model",
 									ExitCode: 1,
 								},
 							},
@@ -795,6 +858,7 @@ func TestCheckContainerStatuses(t *testing.T) {
 			},
 			totalCopies:   1,
 			expectedState: v1beta1.FailedToLoad,
+			expectedError: "Model failed to load: not enough GPU memory",
 		},
 		{
 			name:   "storage initializer crash loop back off",
@@ -913,13 +977,293 @@ func TestCheckContainerStatuses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			manager := NewStatusReconciler()
-			manager.checkContainerStatuses(tt.status, tt.pod, tt.totalCopies)
+			manager.checkContainerStatuses(tt.status, v1beta1.EngineComponent, tt.pod, tt.totalCopies)
 
 			if tt.status.ModelStatus.ModelRevisionStates != nil {
 				assert.Equal(t, tt.expectedState, tt.status.ModelStatus.ModelRevisionStates.TargetModelState)
 			}
+			if tt.expectedError != "" {
+				require.NotNil(t, tt.status.ModelStatus.LastFailureInfo)
+				assert.Equal(t, tt.expectedError, tt.status.ModelStatus.LastFailureInfo.Message)
+				engineReady := tt.status.GetCondition(v1beta1.EngineReady)
+				require.NotNil(t, engineReady)
+				assert.Equal(t, corev1.ConditionFalse, engineReady.Status)
+				assert.Equal(t, constants.InsufficientGPUMemoryReason, engineReady.Reason)
+				assert.Equal(t, constants.InsufficientGPUMemoryMessage, engineReady.Message)
+				ready := tt.status.GetCondition(apis.ConditionReady)
+				require.NotNil(t, ready)
+				assert.Equal(t, corev1.ConditionFalse, ready.Status)
+			}
 		})
 	}
+}
+
+func TestCheckContainerStatusesUsesPodLogsForGPUOOM(t *testing.T) {
+	manager := NewStatusReconciler()
+	manager.podLogFetcher = func(namespace, podName, containerName string, previous bool) (string, error) {
+		assert.Equal(t, "default", namespace)
+		assert.Equal(t, "test-pod", podName)
+		assert.Equal(t, constants.MainContainerName, containerName)
+		assert.True(t, previous)
+		return "\u001b[0;36m(APIServer pid=1)\u001b[0;0m RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}\n" +
+			"\u001b[0;36m(Worker_TP0_EP0 pid=544)\u001b[0;0m ERROR Failed to load model - not enough GPU memory.", nil
+	}
+
+	status := &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: constants.MainContainerName,
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason: constants.StateReasonCrashLoopBackOff,
+						},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							Message:  "RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}",
+							ExitCode: 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	manager.checkContainerStatuses(status, v1beta1.EngineComponent, pod, 1)
+
+	require.NotNil(t, status.ModelStatus.ModelRevisionStates)
+	assert.Equal(t, v1beta1.FailedToLoad, status.ModelStatus.ModelRevisionStates.TargetModelState)
+	require.NotNil(t, status.ModelStatus.LastFailureInfo)
+	assert.Equal(t, constants.ModelLoadGPUOOMFailureMessage, status.ModelStatus.LastFailureInfo.Message)
+	assert.Equal(t, int32(1), status.ModelStatus.LastFailureInfo.ExitCode)
+	engineReady := status.GetCondition(v1beta1.EngineReady)
+	require.NotNil(t, engineReady)
+	assert.Equal(t, corev1.ConditionFalse, engineReady.Status)
+	assert.Equal(t, constants.InsufficientGPUMemoryReason, engineReady.Reason)
+	assert.Equal(t, constants.InsufficientGPUMemoryMessage, engineReady.Message)
+	ready := status.GetCondition(apis.ConditionReady)
+	require.NotNil(t, ready)
+	assert.Equal(t, corev1.ConditionFalse, ready.Status)
+}
+
+func TestCheckContainerStatusesDoesNotSetComponentFailureConditionForNonGPUOOM(t *testing.T) {
+	manager := NewStatusReconciler()
+	status := &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}}
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: constants.MainContainerName,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							Reason:   constants.StateReasonError,
+							Message:  "generic startup failure",
+							ExitCode: 2,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	manager.checkContainerStatuses(status, v1beta1.EngineComponent, pod, 1)
+
+	require.NotNil(t, status.ModelStatus.ModelRevisionStates)
+	assert.Equal(t, v1beta1.FailedToLoad, status.ModelStatus.ModelRevisionStates.TargetModelState)
+	require.NotNil(t, status.ModelStatus.LastFailureInfo)
+	assert.Equal(t, "generic startup failure", status.ModelStatus.LastFailureInfo.Message)
+	engineReady := status.GetCondition(v1beta1.EngineReady)
+	if engineReady != nil {
+		assert.NotEqual(t, constants.InsufficientGPUMemoryReason, engineReady.Reason)
+	}
+}
+
+func TestGetContainerFailureMessage(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name                string
+		containerStatus     corev1.ContainerStatus
+		logMessage          string
+		logErr              error
+		expectFetcherCalled bool
+		expectedPrevious    bool
+		expectedMessage     string
+		expectedExitCode    int32
+		expectedFound       bool
+	}{
+		{
+			name: "terminated container uses current pod logs to upgrade generic failure",
+			containerStatus: corev1.ContainerStatus{
+				Name: constants.MainContainerName,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}",
+						ExitCode: 7,
+					},
+				},
+			},
+			logMessage:          "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.31 GiB.",
+			expectFetcherCalled: true,
+			expectedPrevious:    false,
+			expectedMessage:     constants.ModelLoadGPUOOMFailureMessage,
+			expectedExitCode:    7,
+			expectedFound:       true,
+		},
+		{
+			name: "crash loop back off uses previous pod logs to upgrade generic failure",
+			containerStatus: corev1.ContainerStatus{
+				Name: constants.MainContainerName,
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: constants.StateReasonCrashLoopBackOff,
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "WorkerProc failed to start.",
+						ExitCode: 8,
+					},
+				},
+			},
+			logMessage:          "ERROR Failed to load model - not enough GPU memory.",
+			expectFetcherCalled: true,
+			expectedPrevious:    true,
+			expectedMessage:     constants.ModelLoadGPUOOMFailureMessage,
+			expectedExitCode:    8,
+			expectedFound:       true,
+		},
+		{
+			name: "gpu oom from termination message skips log fetch",
+			containerStatus: corev1.ContainerStatus{
+				Name: constants.MainContainerName,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "torch.OutOfMemoryError: CUDA out of memory.",
+						ExitCode: 9,
+					},
+				},
+			},
+			expectFetcherCalled: false,
+			expectedMessage:     constants.ModelLoadGPUOOMFailureMessage,
+			expectedExitCode:    9,
+			expectedFound:       true,
+		},
+		{
+			name: "non oom logs preserve original termination message",
+			containerStatus: corev1.ContainerStatus{
+				Name: constants.MainContainerName,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "generic startup failure",
+						ExitCode: 10,
+					},
+				},
+			},
+			logMessage:          "some unrelated log line",
+			expectFetcherCalled: true,
+			expectedPrevious:    false,
+			expectedMessage:     "generic startup failure",
+			expectedExitCode:    10,
+			expectedFound:       true,
+		},
+		{
+			name: "log fetch error preserves original termination message",
+			containerStatus: corev1.ContainerStatus{
+				Name: constants.MainContainerName,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "generic startup failure",
+						ExitCode: 11,
+					},
+				},
+			},
+			logErr:              fmt.Errorf("log fetch failed"),
+			expectFetcherCalled: true,
+			expectedPrevious:    false,
+			expectedMessage:     "generic startup failure",
+			expectedExitCode:    11,
+			expectedFound:       true,
+		},
+		{
+			name: "no termination info returns no message",
+			containerStatus: corev1.ContainerStatus{
+				Name: constants.MainContainerName,
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{},
+				},
+			},
+			logMessage:          "torch.OutOfMemoryError: CUDA out of memory.",
+			expectFetcherCalled: true,
+			expectedPrevious:    false,
+			expectedMessage:     constants.ModelLoadGPUOOMFailureMessage,
+			expectedExitCode:    0,
+			expectedFound:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewStatusReconciler()
+
+			fetcherCalls := 0
+			manager.podLogFetcher = func(namespace, podName, containerName string, previous bool) (string, error) {
+				fetcherCalls++
+				assert.Equal(t, "default", namespace)
+				assert.Equal(t, "test-pod", podName)
+				assert.Equal(t, constants.MainContainerName, containerName)
+				assert.Equal(t, tt.expectedPrevious, previous)
+				return tt.logMessage, tt.logErr
+			}
+
+			message, exitCode, found := manager.getContainerFailureMessage(pod, tt.containerStatus)
+
+			assert.Equal(t, tt.expectedMessage, message)
+			assert.Equal(t, tt.expectedExitCode, exitCode)
+			assert.Equal(t, tt.expectedFound, found)
+			if tt.expectFetcherCalled {
+				assert.Equal(t, 1, fetcherCalls)
+			} else {
+				assert.Equal(t, 0, fetcherCalls)
+			}
+		})
+	}
+}
+
+func TestGetContainerFailureMessageWithoutPodOrFetcher(t *testing.T) {
+	containerStatus := corev1.ContainerStatus{
+		Name: constants.MainContainerName,
+		State: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				Message:  "generic startup failure",
+				ExitCode: 12,
+			},
+		},
+	}
+
+	manager := NewStatusReconciler()
+	manager.podLogFetcher = nil
+
+	message, exitCode, found := manager.getContainerFailureMessage(nil, containerStatus)
+	assert.Equal(t, "generic startup failure", message)
+	assert.Equal(t, int32(12), exitCode)
+	assert.True(t, found)
+
+	message, exitCode, found = NewStatusReconciler().getContainerFailureMessage(nil, containerStatus)
+	assert.Equal(t, "generic startup failure", message)
+	assert.Equal(t, int32(12), exitCode)
+	assert.True(t, found)
 }
 
 func TestSafeGetTerminationMessage(t *testing.T) {
@@ -945,6 +1289,34 @@ func TestSafeGetTerminationMessage(t *testing.T) {
 			expectedHasTermination: true,
 		},
 		{
+			name: "terminated container with ansi gpu oom log",
+			containerStatus: corev1.ContainerStatus{
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "\u001b[0;36m(Worker_TP0_EP0 pid=544)\u001b[0;0m ERROR Failed to load model - not enough GPU memory. Tried to allocate 1.31 GiB.",
+						ExitCode: 1,
+					},
+				},
+			},
+			expectedMessage:        "Model failed to load: not enough GPU memory",
+			expectedExitCode:       1,
+			expectedHasTermination: true,
+		},
+		{
+			name: "terminated container with multiline torch out of memory log",
+			containerStatus: corev1.ContainerStatus{
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "\u001b[0;36m(Worker_TP1_EP1 pid=545)\u001b[0;0m ERROR 03-25 22:10:36 [multiproc_executor.py:772] torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.31 GiB. GPU 1 has a total capacity of 79.32 GiB of which 724.44 MiB is free.",
+						ExitCode: 1,
+					},
+				},
+			},
+			expectedMessage:        "Model failed to load: not enough GPU memory",
+			expectedExitCode:       1,
+			expectedHasTermination: true,
+		},
+		{
 			name: "crash loop back off with last termination",
 			containerStatus: corev1.ContainerStatus{
 				State: corev1.ContainerState{
@@ -960,6 +1332,48 @@ func TestSafeGetTerminationMessage(t *testing.T) {
 				},
 			},
 			expectedMessage:        "Last termination message",
+			expectedExitCode:       2,
+			expectedHasTermination: true,
+		},
+		{
+			name: "crash loop back off with ansi last termination message",
+			containerStatus: corev1.ContainerStatus{
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: constants.StateReasonCrashLoopBackOff,
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message:  "\u001b[0;36m(worker)\u001b[0;0m regular failure message",
+						ExitCode: 2,
+					},
+				},
+			},
+			expectedMessage:        "(worker) regular failure message",
+			expectedExitCode:       2,
+			expectedHasTermination: true,
+		},
+		{
+			name: "crash loop back off with multiline gpu oom worker startup log",
+			containerStatus: corev1.ContainerStatus{
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: constants.StateReasonCrashLoopBackOff,
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Message: "\u001b[0;36m(Worker_TP1_EP1 pid=545)\u001b[0;0m ERROR 03-25 22:10:36 [multiproc_executor.py:772] torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.31 GiB. GPU 1 has a total capacity of 79.32 GiB of which 724.44 MiB is free.\n" +
+							"\u001b[0;36m(Worker_TP1_EP1 pid=545)\u001b[0;0m INFO 03-25 22:10:36 [multiproc_executor.py:730] Parent process exited, terminating worker\n" +
+							"\u001b[0;36m(Worker_TP0_EP0 pid=544)\u001b[0;0m INFO 03-25 22:10:36 [multiproc_executor.py:730] Parent process exited, terminating worker\n" +
+							"\u001b[0;36m(Worker_TP0_EP0 pid=544)\u001b[0;0m ERROR 03-25 22:10:36 [gpu_model_runner.py:4128] Failed to load model - not enough GPU memory. Try lowering --gpu-memory-utilization to free memory for weights, increasing --tensor-parallel-size, or using --quantization.\n" +
+							"\u001b[0;36m(Worker_TP0_EP0 pid=544)\u001b[0;0m ERROR 03-25 22:10:36 [multiproc_executor.py:772] WorkerProc failed to start.",
+						ExitCode: 2,
+					},
+				},
+			},
+			expectedMessage:        "Model failed to load: not enough GPU memory",
 			expectedExitCode:       2,
 			expectedHasTermination: true,
 		},

@@ -724,7 +724,7 @@ func TestPropagateModelStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			manager := NewStatusReconciler()
 
-			manager.PropagateModelStatus(tt.status, tt.statusSpec, tt.podList, tt.rawDeployment)
+			manager.PropagateModelStatus(tt.status, v1beta1.PredictorComponent, tt.statusSpec, tt.podList, tt.rawDeployment)
 
 			if tt.status.ModelStatus.ModelRevisionStates != nil {
 				assert.Equal(t, tt.expectedState, tt.status.ModelStatus.ModelRevisionStates.TargetModelState)
