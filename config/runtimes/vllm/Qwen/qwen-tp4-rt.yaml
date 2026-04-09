@@ -1,0 +1,260 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: vllm-qwen-tp4
+spec:
+  disabled: false
+  supportedModelFormats:
+    - modelFramework:
+        name: transformers
+        version: "4.32.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: QWenLMHeadModel
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.37.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.37.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.40.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.43.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.51.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3ForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.51.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.39.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.40.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2MoeForCausalLM
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2_5_VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.49.0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen2_5_VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3VLForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+    - modelFramework:
+        name: transformers
+        version: "4.57.0.dev0"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      autoSelect: true
+      modelArchitecture: Qwen3VLMoeForConditionalGeneration
+      version: "1.0.0"
+      priority: 1
+  modelSizeRange:
+    min: 51B
+    max: 111B
+  protocolVersions:
+    - openAI
+  engineConfig:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+    labels:
+      logging-forward: enabled
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+    volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node.kubernetes.io/instance-type
+                  operator: In
+                  values:
+                    - BM.GPU.A100-v2.8
+                    - BM.GPU.H100.8
+                    - BM.GPU.H200-NC.8
+                    - BM.GPU.H200.8
+    runner:
+      name: ome-container
+      image: fra.ocir.io/idqj093njucb/smg:1.4.0-vllm-v0.18.0
+      ports:
+        - containerPort: 8080
+          name: http1
+          protocol: TCP
+      command:
+        - /bin/bash
+        - '-lc'
+        - --
+      args:
+        - |
+          smg serve \
+          --host 0.0.0.0 \
+          --model $(MODEL_PATH) \
+          --port 8080 \
+          --tensor-parallel-size 4 \
+          --served-model-name vllm-model \
+          --limit-mm-per-prompt '{"video": {"count": 1}, "image": {"count": 10}}' \
+          --generation-config vllm \
+          --max-model-len -1 \
+          --router-tool-call-parser qwen \
+          --router-reasoning-parser qwen3 \
+          --backend vllm \
+          --router-log-json \
+          --worker-startup-timeout 600 \
+          --router-request-id-headers "opc-request-id"
+      env:
+        - name: VLLM_LOGGING_LEVEL
+          value: "INFO"
+      volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      resources:
+        requests:
+          cpu: 20
+          memory: 160Gi
+          nvidia.com/gpu: 4
+        limits:
+          cpu: 20
+          memory: 160Gi
+          nvidia.com/gpu: 4
+
+      readinessProbe:
+        httpGet:
+          path: /readiness
+          port: 8080
+        failureThreshold: 3
+        successThreshold: 1
+        periodSeconds: 90
+        timeoutSeconds: 20
+
+      livenessProbe:
+        httpGet:
+          path: /readiness
+          port: 8080
+        failureThreshold: 5
+        successThreshold: 1
+        periodSeconds: 60
+        timeoutSeconds: 60
+
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        failureThreshold: 150
+        successThreshold: 1
+        periodSeconds: 6
+        initialDelaySeconds: 60
+        timeoutSeconds: 30

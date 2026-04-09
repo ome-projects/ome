@@ -1,0 +1,12 @@
+
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen3-235b-a22b-instruct-2507
+  namespace: qwen
+spec:
+  model:
+    name: qwen3-235b-a22b-instruct-2507
+  engine:
+    minReplicas: 1
+    maxReplicas: 1

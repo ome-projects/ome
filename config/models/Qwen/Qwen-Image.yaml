@@ -3,6 +3,8 @@ kind: ClusterBaseModel
 metadata:
   name: qwen-image
 spec:
+  modelCapabilities:
+    - TEXT_TO_IMAGE
   vendor: Qwen
   displayName: qwen.qwen-image
   disabled: false

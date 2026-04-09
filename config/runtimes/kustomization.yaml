@@ -50,3 +50,17 @@ resources:
 - vllm/llama-4-scout-17b-16e-instruct-rt.yaml
 - vllm/mistral-7b-instruct-rt.yaml
 - vllm/mixtral-8x7b-instruct-rt.yaml
+- vllm/Qwen/qwen-tp1-rt.yaml
+- vllm/Qwen/qwen-tp2-rt.yaml
+- vllm/Qwen/qwen-tp4-rt.yaml
+- vllm/Qwen/qwen-tp8-rt.yaml
+- vllm/Qwen/qwen-tp1-fp8-rt.yaml
+- vllm/Qwen/qwen-tp2-fp8-rt.yaml
+- vllm/Qwen/qwen-tp4-fp8-rt.yaml
+- vllm/Qwen/qwen-35-tp1-fp8-rt.yaml
+- vllm/Qwen/qwen-35-tp2-fp8-rt.yaml
+- vllm/Qwen/qwen-35-tp8-fp8-rt.yaml
+- vllm/Qwen/qwen-35-tp1-rt.yaml
+- vllm/Qwen/qwen-35-tp2-rt.yaml
+- vllm/Qwen/qwen-35-tp4-rt.yaml
+- vllm/Qwen/qwen-35-tp8-rt.yaml

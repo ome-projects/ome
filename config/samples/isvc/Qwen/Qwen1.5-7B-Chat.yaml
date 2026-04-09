@@ -2,13 +2,13 @@ apiVersion: ome.io/v1beta1
 kind: InferenceService
 metadata:
   name: qwen1-5-7b-chat
-  namespace: qwen1-5-7b-chat
+  namespace: qwen
 spec:
   model:
     name: qwen1-5-7b-chat
   engine:
     minReplicas: 1
     maxReplicas: 1
-  router:
-    minReplicas: 1
-    maxReplicas: 1
+  # router:
+  #   minReplicas: 1
+  #   maxReplicas: 1

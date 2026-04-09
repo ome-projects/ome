@@ -7,9 +7,9 @@ spec:
     - TEXT_TO_TEXT
   vendor: Qwen
   displayName: qwen.qwen2.5-32b-instruct
+  modelArchitecture: Qwen2ForCausalLM
   disabled: false
   version: "1.0.0"
-  modelArchitecture: Qwen2ForCausalLM
   modelFormat:
     name: safetensors
     version: "1.0.0"
@@ -20,4 +20,3 @@ spec:
   storage:
     storageUri: hf://Qwen/Qwen2.5-32B-Instruct
     path: /raid/models/Qwen/Qwen2.5-32B-Instruct
-    key: "hf-token"

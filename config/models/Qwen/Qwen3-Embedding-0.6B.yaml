@@ -6,7 +6,7 @@ spec:
   modelCapabilities:
     - TEXT_TO_EMBEDDING
   vendor: Qwen
-  displayName: Qwen.qwen3-embedding-0.6b
+  displayName: qwen.qwen3-embedding-0.6b
   disabled: false
   version: "1.0.0"
   modelArchitecture: Qwen3ForCausalLM

@@ -1,0 +1,23 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen2-5-vl-32b-instruct
+spec:
+  modelCapabilities:
+    - IMAGE_TEXT_TO_TEXT
+    - VIDEO_TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen2.5-vl-32b-instruct
+  modelArchitecture: Qwen2_5_VLForConditionalGeneration
+  disabled: false
+  version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.49.0"
+  modelParameterSize: 32B
+  storage:
+    storageUri: hf://Qwen/Qwen2.5-VL-32B-Instruct
+    path: /raid/models/Qwen/Qwen2.5-VL-32B-Instruct

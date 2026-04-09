@@ -7,9 +7,17 @@ spec:
     - IMAGE_TEXT_TO_TEXT
     - VIDEO_TEXT_TO_TEXT
   vendor: Qwen
-  displayName: Qwen.qwen3-vl-235b-a22b-instruct
+  displayName: qwen.qwen3-vl-235b-a22b-instruct
+  modelArchitecture: Qwen3VLMoeForConditionalGeneration
   disabled: false
   version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.57.0.dev0"
+  modelParameterSize: 236B
   storage:
     storageUri: hf://Qwen/Qwen3-VL-235B-A22B-Instruct
     path: /raid/models/Qwen/Qwen3-VL-235B-A22B-Instruct

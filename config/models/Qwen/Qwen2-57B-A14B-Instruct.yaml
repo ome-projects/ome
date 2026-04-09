@@ -1,0 +1,22 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen2-57b-a14b-instruct
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen2-57b-a14b-instruct
+  modelArchitecture: Qwen2MoeForCausalLM
+  disabled: false
+  version: "1.0.0"
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.40.1"
+  modelParameterSize: 57B
+  storage:
+    storageUri: hf://Qwen/Qwen2-57B-A14B-Instruct
+    path: /raid/models/Qwen/Qwen2-57B-A14B-Instruct

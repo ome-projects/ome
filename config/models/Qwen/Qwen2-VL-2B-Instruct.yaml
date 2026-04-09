@@ -4,11 +4,20 @@ metadata:
   name: qwen2-vl-2b-instruct
 spec:
   modelCapabilities:
-    - IMAGE_TO_TEXT
-  vendor: qwen
+    - IMAGE_TEXT_TO_TEXT
+    - VIDEO_TEXT_TO_TEXT
+  vendor: Qwen
+  displayName: qwen.qwen2-vl-2b-instruct
+  modelArchitecture: Qwen2VLForConditionalGeneration
   disabled: false
   version: "1.0.0"
-  displayName: qwen.qwen2-vl-2b-instruct
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.41.2"
+  modelParameterSize: 2B
   storage:
     storageUri: hf://Qwen/Qwen2-VL-2B-Instruct
-    path: /raid/models/qwen/qwen2-vl-2b-instruct
+    path: /raid/models/Qwen/Qwen2-VL-2B-Instruct

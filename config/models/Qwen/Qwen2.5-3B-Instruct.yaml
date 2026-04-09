@@ -5,10 +5,18 @@ metadata:
 spec:
   modelCapabilities:
     - TEXT_TO_TEXT
-  vendor: qwen
+  vendor: Qwen
+  displayName: qwen.qwen2.5-3b-instruct
+  modelArchitecture: Qwen2ForCausalLM
   disabled: false
   version: "1.0.0"
-  displayName: qwen.qwen2.5-3b-instruct
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.43.1"
+  modelParameterSize: 3B
   storage:
     storageUri: hf://Qwen/Qwen2.5-3B-Instruct
-    path: /raid/models/qwen/qwen2-5-3b-instruct
+    path: /raid/models/Qwen/Qwen2.5-3B-Instruct
