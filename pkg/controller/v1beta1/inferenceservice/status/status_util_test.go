@@ -80,7 +80,7 @@ func TestInitializeComponentStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			result := manager.initializeComponentStatus(tt.status, tt.component)
 			assert.Equal(t, tt.expected, result)
 			assert.NotNil(t, tt.status.Components)
@@ -131,7 +131,7 @@ func TestInitializeComponentCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			status := &v1beta1.InferenceServiceStatus{}
 			if tt.initialCondition != nil {
 				status.SetCondition(v1beta1.EngineReady, tt.initialCondition)
@@ -180,7 +180,7 @@ func TestGetFirstPod(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			pod, err := manager.getFirstPod(tt.podList)
 
 			if tt.expectError {
@@ -225,7 +225,7 @@ func TestGetFirstDeployment(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			deployment, err := manager.getFirstDeployment(tt.deployments)
 
 			if tt.expectError {
@@ -334,7 +334,7 @@ func TestGetDeploymentCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			result := manager.getDeploymentCondition(tt.deployment, tt.conditionType)
 
 			assert.Equal(t, tt.expected.Type, result.Type)
@@ -417,7 +417,7 @@ func TestGetLWSConditions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			result := manager.getLWSConditions(tt.lws, tt.conditionType)
 
 			assert.Equal(t, tt.expected.Type, result.Type)
@@ -544,7 +544,7 @@ func TestGetMultiDeploymentCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			result := manager.getMultiDeploymentCondition(tt.deployments, tt.conditionType)
 
 			assert.Equal(t, tt.expected.Type, result.Type)
@@ -619,7 +619,7 @@ func TestSetCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			manager.setCondition(tt.status, tt.conditionType, tt.condition)
 
 			if tt.shouldSet {
@@ -634,7 +634,7 @@ func TestSetCondition(t *testing.T) {
 }
 
 func TestGetReadyConditionsMap(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	conditionsMap := manager.getReadyConditionsMap()
 
 	assert.NotNil(t, conditionsMap)
@@ -644,7 +644,7 @@ func TestGetReadyConditionsMap(t *testing.T) {
 }
 
 func TestGetRouteConditionsMap(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	conditionsMap := manager.getRouteConditionsMap()
 
 	assert.NotNil(t, conditionsMap)
@@ -654,7 +654,7 @@ func TestGetRouteConditionsMap(t *testing.T) {
 }
 
 func TestGetConfigurationConditionsMap(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	conditionsMap := manager.getConfigurationConditionsMap()
 
 	assert.NotNil(t, conditionsMap)
@@ -664,7 +664,7 @@ func TestGetConfigurationConditionsMap(t *testing.T) {
 }
 
 func TestGetConditionsMapIndex(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	conditionsMapIndex := manager.getConditionsMapIndex()
 
 	assert.NotNil(t, conditionsMapIndex)
@@ -733,7 +733,7 @@ func TestHandleTrafficRouting(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			manager.handleTrafficRouting(tt.statusSpec, tt.serviceStatus, tt.revisionTraffic)
 
 			assert.Equal(t, tt.expectedLatest, tt.statusSpec.LatestRolledoutRevision)
@@ -795,7 +795,7 @@ func TestPropagateServiceConditions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			statusSpec := v1beta1.ComponentStatusSpec{}
 
 			manager.propagateServiceConditions(tt.status, tt.component, tt.serviceStatus, &statusSpec)
@@ -976,7 +976,7 @@ func TestCheckContainerStatuses(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			manager.checkContainerStatuses(tt.status, v1beta1.EngineComponent, tt.pod, tt.totalCopies)
 
 			if tt.status.ModelStatus.ModelRevisionStates != nil {
@@ -999,7 +999,7 @@ func TestCheckContainerStatuses(t *testing.T) {
 }
 
 func TestCheckContainerStatusesUsesPodLogsForGPUOOM(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	manager.podLogFetcher = func(namespace, podName, containerName string, previous bool) (string, error) {
 		assert.Equal(t, "default", namespace)
 		assert.Equal(t, "test-pod", podName)
@@ -1052,8 +1052,51 @@ func TestCheckContainerStatusesUsesPodLogsForGPUOOM(t *testing.T) {
 	assert.Equal(t, corev1.ConditionFalse, ready.Status)
 }
 
+func TestCheckContainerStatusesDoesNotUsePodLogsForStorageInitializer(t *testing.T) {
+	manager := NewStatusReconciler(nil)
+	fetcherCalls := 0
+	manager.podLogFetcher = func(namespace, podName, containerName string, previous bool) (string, error) {
+		fetcherCalls++
+		return constants.ModelLoadGPUOOMFailureMessage, nil
+	}
+
+	status := &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: constants.StorageInitializerContainerName,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							Reason:   constants.StateReasonError,
+							Message:  "failed to download model",
+							ExitCode: 2,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	manager.checkContainerStatuses(status, v1beta1.EngineComponent, pod, 1)
+
+	assert.Equal(t, 0, fetcherCalls)
+	require.NotNil(t, status.ModelStatus.ModelRevisionStates)
+	assert.Equal(t, v1beta1.FailedToLoad, status.ModelStatus.ModelRevisionStates.TargetModelState)
+	require.NotNil(t, status.ModelStatus.LastFailureInfo)
+	assert.Equal(t, "failed to download model", status.ModelStatus.LastFailureInfo.Message)
+	engineReady := status.GetCondition(v1beta1.EngineReady)
+	if engineReady != nil {
+		assert.NotEqual(t, constants.InsufficientGPUMemoryReason, engineReady.Reason)
+	}
+}
+
 func TestCheckContainerStatusesDoesNotSetComponentFailureConditionForNonGPUOOM(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	status := &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}}
 	pod := &corev1.Pod{
 		Status: corev1.PodStatus{
@@ -1215,7 +1258,7 @@ func TestGetContainerFailureMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			fetcherCalls := 0
 			manager.podLogFetcher = func(namespace, podName, containerName string, previous bool) (string, error) {
@@ -1252,7 +1295,7 @@ func TestGetContainerFailureMessageWithoutPodOrFetcher(t *testing.T) {
 		},
 	}
 
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 	manager.podLogFetcher = nil
 
 	message, exitCode, found := manager.getContainerFailureMessage(nil, containerStatus)
@@ -1260,7 +1303,7 @@ func TestGetContainerFailureMessageWithoutPodOrFetcher(t *testing.T) {
 	assert.Equal(t, int32(12), exitCode)
 	assert.True(t, found)
 
-	message, exitCode, found = NewStatusReconciler().getContainerFailureMessage(nil, containerStatus)
+	message, exitCode, found = NewStatusReconciler(nil).getContainerFailureMessage(nil, containerStatus)
 	assert.Equal(t, "generic startup failure", message)
 	assert.Equal(t, int32(12), exitCode)
 	assert.True(t, found)
@@ -1405,7 +1448,7 @@ func TestSafeGetTerminationMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			message, exitCode, hasTermination := manager.safeGetTerminationMessage(tt.containerStatus)
 
 			assert.Equal(t, tt.expectedMessage, message)

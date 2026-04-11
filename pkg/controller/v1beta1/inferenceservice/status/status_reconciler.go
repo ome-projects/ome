@@ -29,13 +29,12 @@ type StatusReconciler struct {
 	podLogFetcher func(namespace, podName, containerName string, previous bool) (string, error)
 }
 
-// NewStatusReconciler creates a new StatusReconciler instance
-func NewStatusReconciler(clientsets ...kubernetes.Interface) *StatusReconciler {
+// NewStatusReconciler creates a new StatusReconciler instance.
+// Pass a nil clientset when Kubernetes log fetching is not needed.
+func NewStatusReconciler(clientset kubernetes.Interface) *StatusReconciler {
 	reconciler := &StatusReconciler{
-		Log: logf.Log.WithName("InferenceServiceStatus"),
-	}
-	if len(clientsets) > 0 {
-		reconciler.Clientset = clientsets[0]
+		Clientset: clientset,
+		Log:       logf.Log.WithName("InferenceServiceStatus"),
 	}
 	reconciler.podLogFetcher = reconciler.fetchPodLogs
 	return reconciler

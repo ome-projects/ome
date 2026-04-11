@@ -18,7 +18,7 @@ import (
 )
 
 func TestNewStatusReconciler(t *testing.T) {
-	manager := NewStatusReconciler()
+	manager := NewStatusReconciler(nil)
 
 	assert.NotNil(t, manager)
 }
@@ -222,7 +222,7 @@ func TestPropagateRawStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.PropagateRawStatus(tt.status, tt.component, tt.deployment, tt.url)
 
@@ -420,7 +420,7 @@ func TestPropagateMultiNodeStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.PropagateMultiNodeStatus(tt.status, tt.component, tt.lws, tt.url)
 
@@ -606,7 +606,7 @@ func TestPropagateStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.PropagateStatus(tt.status, tt.component, tt.serviceStatus)
 
@@ -722,7 +722,7 @@ func TestPropagateModelStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.PropagateModelStatus(tt.status, v1beta1.PredictorComponent, tt.statusSpec, tt.podList, tt.rawDeployment)
 
@@ -770,7 +770,7 @@ func TestUpdateModelRevisionStates(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.UpdateModelRevisionStates(tt.status, tt.modelState, tt.totalCopies, tt.info)
 
@@ -809,7 +809,7 @@ func TestUpdateModelTransitionStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.UpdateModelTransitionStatus(tt.status, tt.transitionStatus, tt.info)
 
@@ -913,7 +913,7 @@ func TestPropagateCrossComponentStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 			tt.setupStatus(tt.status)
 
 			manager.PropagateCrossComponentStatus(tt.status, tt.componentList, tt.conditionType)
@@ -970,7 +970,7 @@ func TestSetModelFailureInfo(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			changed := manager.SetModelFailureInfo(tt.status, tt.info)
 
@@ -1254,7 +1254,7 @@ func TestPropagateMultiNodeRayVLLMStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
+			manager := NewStatusReconciler(nil)
 
 			manager.PropagateMultiNodeRayVLLMStatus(tt.status, tt.component, tt.deployments, tt.url)
 

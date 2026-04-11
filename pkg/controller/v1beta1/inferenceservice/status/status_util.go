@@ -273,7 +273,7 @@ func (sr *StatusReconciler) checkContainerStatuses(status *v1beta1.InferenceServ
 				sr.UpdateModelRevisionStates(status, v1beta1.Loading, totalCopies, nil)
 				return
 			case cs.State.Terminated != nil && cs.State.Terminated.Reason == constants.StateReasonError:
-				message, exitCode, _ := sr.getContainerFailureMessage(firstPod, cs)
+				message, exitCode, _ := sr.safeGetTerminationMessage(cs)
 				sr.UpdateModelRevisionStates(status, v1beta1.FailedToLoad, totalCopies, &v1beta1.FailureInfo{
 					Reason:   v1beta1.ModelLoadFailed,
 					Message:  message,
@@ -282,7 +282,7 @@ func (sr *StatusReconciler) checkContainerStatuses(status *v1beta1.InferenceServ
 				sr.updateComponentFailureCondition(status, component, message)
 				return
 			case cs.State.Waiting != nil && cs.State.Waiting.Reason == constants.StateReasonCrashLoopBackOff:
-				message, exitCode, hasTermination := sr.getContainerFailureMessage(firstPod, cs)
+				message, exitCode, hasTermination := sr.safeGetTerminationMessage(cs)
 				if hasTermination {
 					sr.UpdateModelRevisionStates(status, v1beta1.FailedToLoad, totalCopies, &v1beta1.FailureInfo{
 						Reason:   v1beta1.ModelLoadFailed,
