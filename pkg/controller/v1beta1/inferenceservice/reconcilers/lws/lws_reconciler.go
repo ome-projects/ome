@@ -173,18 +173,7 @@ func (r *LWSReconciler) Reconcile() (*lws.LeaderWorkerSet, error) {
 		return nil, opErr
 	}
 
-	// Re-fetch the live LWS so callers get real status (including conditions).
-	// Returning r.LWS here would hand back the desired-spec object whose
-	// .Status.Conditions is always empty.
-	liveLWS := &lws.LeaderWorkerSet{}
-	if err := r.client.Get(context.TODO(), types.NamespacedName{
-		Namespace: r.LWS.Namespace,
-		Name:      r.LWS.Name,
-	}, liveLWS); err != nil {
-		log.Error(err, "Failed to re-fetch LWS after create/update", "namespace", r.LWS.Namespace, "name", r.LWS.Name)
-		return nil, err
-	}
-	return liveLWS, nil
+	return r.LWS, nil
 }
 
 func (r *LWSReconciler) checkLeaderWorkerSetExist() (constants.CheckResultType, *lws.LeaderWorkerSet, error) {
