@@ -1,0 +1,38 @@
+title: Multi-Instance GPU Serving
+oep-number: 0007
+authors:
+  - "@vasheno"
+status: provisional
+creation-date: 2026-04-22
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+see-also:
+  - "/oeps/0003-accelerator-aware-runtime-selection"
+replaces: []
+
+# The target maturity stage. Valid values are "alpha", "beta", "stable"
+stage: alpha
+
+# The most recent milestone for which work toward delivery of this OEP has been
+# done. This can be the current (upcoming) milestone, if it is being actively
+# worked on.
+latest-milestone: "v0.4"
+
+# The milestone at which this feature was, or is targeted to be, at each stage.
+milestone:
+  alpha: "v0.4"
+  beta: TBD
+  stable: TBD
+
+feature-gates:
+  - name: MultiInstanceServing
+    disable-supported: true
+
+metrics:
+  - ome_mig_manager_reconcile_total
+  - ome_mig_manager_reconcile_failures_total
+  - ome_mig_config_apply_duration_seconds
+  - ome_mig_assignments_total
