@@ -26,6 +26,7 @@ type Qwen3VLTextConfig struct {
 	// Attention mechanism
 	AttentionBias    bool    `json:"attention_bias"`
 	AttentionDropout float64 `json:"attention_dropout"`
+	AttnOutputGate   bool    `json:"attn_output_gate"`
 
 	// Special tokens and embeddings
 	BosTokenId int `json:"bos_token_id"`
@@ -33,28 +34,46 @@ type Qwen3VLTextConfig struct {
 	VocabSize  int `json:"vocab_size"`
 
 	// Model architecture
-	HeadDim               int    `json:"head_dim"`
-	HiddenSize            int    `json:"hidden_size"`
-	IntermediateSize      int    `json:"intermediate_size"`
-	MaxPositionEmbeddings int    `json:"max_position_embeddings"`
-	ModelType             string `json:"model_type"`
-	NumAttentionHeads     int    `json:"num_attention_heads"`
-	NumKeyValueHeads      int    `json:"num_key_value_heads"`
-	NumHiddenLayers       int    `json:"num_hidden_layers"`
+	HeadDim               int     `json:"head_dim"`
+	HiddenSize            int     `json:"hidden_size"`
+	IntermediateSize      int     `json:"intermediate_size"`
+	MaxPositionEmbeddings int     `json:"max_position_embeddings"`
+	ModelType             string  `json:"model_type"`
+	NumAttentionHeads     int     `json:"num_attention_heads"`
+	NumKeyValueHeads      int     `json:"num_key_value_heads"`
+	NumHiddenLayers       int     `json:"num_hidden_layers"`
+	RmsNormEps            float64 `json:"rms_norm_eps"`
+
+	// Hybrid linear/full attention (Qwen3.5)
+	FullAttentionInterval int      `json:"full_attention_interval"`
+	LayerTypes            []string `json:"layer_types,omitempty"`
+	LinearConvKernelDim   int      `json:"linear_conv_kernel_dim"`
+	LinearKeyHeadDim      int      `json:"linear_key_head_dim"`
+	LinearNumKeyHeads     int      `json:"linear_num_key_heads"`
+	LinearNumValueHeads   int      `json:"linear_num_value_heads"`
+	LinearValueHeadDim    int      `json:"linear_value_head_dim"`
+
+	// Multi-token prediction (Qwen3.5)
+	MtpNumHiddenLayers        int    `json:"mtp_num_hidden_layers"`
+	MtpUseDedicatedEmbeddings bool   `json:"mtp_use_dedicated_embeddings"`
+	MambaSsmDtype             string `json:"mamba_ssm_dtype"`
 
 	// Mixture-of-Experts (MoE)
-	NumExperts          int  `json:"num_experts"`
-	NumExpertsPerTok    int  `json:"num_experts_per_tok"`
-	MoeIntermediateSize int  `json:"moe_intermediate_size"`
-	NormTopkProb        bool `json:"norm_topk_prob"`
+	NumExperts                   int     `json:"num_experts"`
+	NumExpertsPerTok             int     `json:"num_experts_per_tok"`
+	MoeIntermediateSize          int     `json:"moe_intermediate_size"`
+	NormTopkProb                 bool    `json:"norm_topk_prob"`
+	SharedExpertIntermediateSize int     `json:"shared_expert_intermediate_size"`
+	RouterAuxLossCoef            float64 `json:"router_aux_loss_coef"`
 
 	// Activation and initialization
 	HiddenAct        string  `json:"hidden_act"`
 	InitializerRange float64 `json:"initializer_range"`
 
 	// Rotary Position Embeddings (RoPE)
-	RopeScaling Qwen3VLRopeScalingConfig `json:"rope_scaling"`
-	RopeTheta   float64                  `json:"rope_theta"`
+	RopeScaling    Qwen3VLRopeScalingConfig     `json:"rope_scaling"`
+	RopeTheta      float64                      `json:"rope_theta"`
+	RopeParameters *Qwen3VLRopeParametersConfig `json:"rope_parameters,omitempty"`
 
 	// Miscellaneous
 	DecoderSparseStep int      `json:"decoder_sparse_step"`
@@ -81,11 +100,21 @@ type Qwen3VLVisionConfig struct {
 	TemporalPatchSize      int     `json:"temporal_patch_size"`
 }
 
-// Qwen3VLRopeScalingConfig represents ROPE scaling configuration.
+// Qwen3VLRopeScalingConfig represents ROPE scaling configuration for Qwen3-VL models.
 type Qwen3VLRopeScalingConfig struct {
 	MropeInterleaved bool   `json:"mrope_interleaved"`
 	MropeSection     []int  `json:"mrope_section"`
 	RopeType         string `json:"rope_type"`
+}
+
+// Qwen3VLRopeParametersConfig represents RoPE parameters for Qwen3.5 models,
+// which use rope_parameters instead of rope_scaling.
+type Qwen3VLRopeParametersConfig struct {
+	MropeInterleaved    bool    `json:"mrope_interleaved"`
+	MropeSection        []int   `json:"mrope_section"`
+	RopeType            string  `json:"rope_type"`
+	RopeTheta           float64 `json:"rope_theta"`
+	PartialRotaryFactor float64 `json:"partial_rotary_factor"`
 }
 
 // LoadQwen3VLConfig loads a Qwen3VL model configuration from a JSON file.

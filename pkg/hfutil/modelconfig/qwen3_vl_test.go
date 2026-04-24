@@ -319,8 +319,8 @@ func TestQwen35ConfigDense(t *testing.T) {
 		t.Error("Expected HasVision to return true for Qwen3.5 dense model")
 	}
 
-	if qwenConfig.TextConfig.HiddenSize != 3584 {
-		t.Errorf("Expected hidden size 3584, got %d", qwenConfig.TextConfig.HiddenSize)
+	if qwenConfig.TextConfig.HiddenSize != 5120 {
+		t.Errorf("Expected hidden size 5120, got %d", qwenConfig.TextConfig.HiddenSize)
 	}
 
 	if context := config.GetContextLength(); context != 262144 {
@@ -363,8 +363,8 @@ func TestQwen35ConfigMoE(t *testing.T) {
 		t.Error("Expected HasVision to return true for Qwen3.5 MoE model")
 	}
 
-	if qwenConfig.TextConfig.NumExperts != 128 {
-		t.Errorf("Expected num experts 128, got %d", qwenConfig.TextConfig.NumExperts)
+	if qwenConfig.TextConfig.NumExperts != 256 {
+		t.Errorf("Expected num experts 256, got %d", qwenConfig.TextConfig.NumExperts)
 	}
 
 	if qwenConfig.TextConfig.MoeIntermediateSize != 512 {
