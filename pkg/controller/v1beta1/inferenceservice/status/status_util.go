@@ -43,40 +43,53 @@ func (sr *StatusReconciler) getFirstDeployment(deployments []*appsv1.Deployment)
 	return deployments[0], nil
 }
 
-// getDeploymentCondition extracts condition from deployment
+// getDeploymentCondition extracts condition from deployment.
 func (sr *StatusReconciler) getDeploymentCondition(deployment *appsv1.Deployment, conditionType appsv1.DeploymentConditionType) *apis.Condition {
-	condition := apis.Condition{}
 	for _, con := range deployment.Status.Conditions {
 		if con.Type == conditionType {
-			condition.Type = apis.ConditionType(conditionType)
-			condition.Status = con.Status
-			condition.Message = con.Message
-			condition.LastTransitionTime = apis.VolatileTime{
-				Inner: con.LastTransitionTime,
+			return &apis.Condition{
+				Type:    apis.ConditionType(conditionType),
+				Status:  con.Status,
+				Message: con.Message,
+				LastTransitionTime: apis.VolatileTime{
+					Inner: con.LastTransitionTime,
+				},
+				Reason: con.Reason,
 			}
-			condition.Reason = con.Reason
-			break
 		}
 	}
-	return &condition
+	return &apis.Condition{
+		Type:    apis.ConditionType(conditionType),
+		Status:  v1.ConditionUnknown,
+		Reason:  "DeploymentConditionMissing",
+		Message: fmt.Sprintf("%s condition is not yet available on the deployment", conditionType),
+	}
 }
 
-// getLWSConditions extracts condition from LeaderWorkerSet
+// getLWSConditions extracts condition from LeaderWorkerSet.
+// When the requested condition type is not yet present, the function returns
+// an explicit Unknown condition so that callers never receive a zero-value
+// struct that silently falls through SetCondition.
 func (sr *StatusReconciler) getLWSConditions(lws *lwsspec.LeaderWorkerSet, conditionType lwsspec.LeaderWorkerSetConditionType) *apis.Condition {
-	condition := apis.Condition{}
 	for _, con := range lws.Status.Conditions {
 		if lwsspec.LeaderWorkerSetConditionType(con.Type) == conditionType {
-			condition.Type = apis.ConditionType(conditionType)
-			condition.Status = v1.ConditionStatus(con.Status)
-			condition.Message = con.Message
-			condition.LastTransitionTime = apis.VolatileTime{
-				Inner: con.LastTransitionTime,
+			return &apis.Condition{
+				Type:    apis.ConditionType(conditionType),
+				Status:  v1.ConditionStatus(con.Status),
+				Message: con.Message,
+				LastTransitionTime: apis.VolatileTime{
+					Inner: con.LastTransitionTime,
+				},
+				Reason: con.Reason,
 			}
-			condition.Reason = con.Reason
-			break
 		}
 	}
-	return &condition
+	return &apis.Condition{
+		Type:    apis.ConditionType(conditionType),
+		Status:  v1.ConditionUnknown,
+		Reason:  "LWSConditionMissing",
+		Message: fmt.Sprintf("%s condition is not yet available on the LeaderWorkerSet", conditionType),
+	}
 }
 
 // getMultiDeploymentCondition checks conditions across multiple deployments
@@ -141,11 +154,12 @@ func (sr *StatusReconciler) setCondition(status *v1beta1.InferenceServiceStatus,
 func (sr *StatusReconciler) InitializeComponentCondition(status *v1beta1.InferenceServiceStatus, component v1beta1.ComponentType) {
 	readyCondition := sr.getReadyConditionsMap()[component]
 
-	// Only initialize if the condition doesn't exist yet
-	if !status.IsConditionReady(readyCondition) && !status.IsConditionUnknown(readyCondition) {
+	// Only initialize if the condition doesn't exist yet.
+	// A nil condition means the status has never been set for this component;
+	if status.GetCondition(readyCondition) == nil {
 		condition := &apis.Condition{
 			Type:    readyCondition,
-			Status:  v1.ConditionFalse,
+			Status:  v1.ConditionUnknown,
 			Reason:  "Initializing",
 			Message: fmt.Sprintf("%s component initializing", component),
 		}

@@ -252,7 +252,7 @@ func TestGetDeploymentCondition(t *testing.T) {
 			},
 		},
 		{
-			name: "deployment without requested condition",
+			name: "deployment without requested condition returns Unknown",
 			deployment: &appsv1.Deployment{
 				Status: appsv1.DeploymentStatus{
 					Conditions: []appsv1.DeploymentCondition{
@@ -265,7 +265,10 @@ func TestGetDeploymentCondition(t *testing.T) {
 			},
 			conditionType: appsv1.DeploymentAvailable,
 			expected: &apis.Condition{
-				Type: "",
+				Type:    apis.ConditionType(appsv1.DeploymentAvailable),
+				Status:  corev1.ConditionUnknown,
+				Reason:  "DeploymentConditionMissing",
+				Message: "Available condition is not yet available on the deployment",
 			},
 		},
 	}
@@ -335,7 +338,7 @@ func TestGetLWSConditions(t *testing.T) {
 			},
 		},
 		{
-			name: "LWS without requested condition",
+			name: "LWS without requested condition returns Unknown",
 			lws: &lwsspec.LeaderWorkerSet{
 				Status: lwsspec.LeaderWorkerSetStatus{
 					Conditions: []metav1.Condition{
@@ -348,7 +351,10 @@ func TestGetLWSConditions(t *testing.T) {
 			},
 			conditionType: lwsspec.LeaderWorkerSetAvailable,
 			expected: &apis.Condition{
-				Type: "",
+				Type:    apis.ConditionType(lwsspec.LeaderWorkerSetAvailable),
+				Status:  corev1.ConditionUnknown,
+				Reason:  "LWSConditionMissing",
+				Message: "Available condition is not yet available on the LeaderWorkerSet",
 			},
 		},
 	}

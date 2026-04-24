@@ -184,6 +184,11 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		isvc.Status.Components = make(map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec)
 	}
 
+	// Seed top-level conditions as Unknown on first observation
+	if isvc.Status.GetCondition(v1beta1.EngineReady) == nil {
+		isvc.Status.InitializeConditions()
+	}
+
 	// Setup reconcilers
 	r.Log.Info("Reconciling inference service", "apiVersion", isvc.APIVersion, "namespace", isvc.Namespace, "isvc", isvc.Name)
 	isvcConfig, err := controllerconfig.NewInferenceServicesConfig(r.Clientset)
