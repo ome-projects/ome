@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -340,9 +341,10 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		return
 	}
 
-	if w.isToDownloadOverrideDueToDownloadPolicyBasedOnBM(oldBaseModel, newBaseModel) {
-		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
-	}
+	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnBM(oldBaseModel, newBaseModel)
+
+	// Exclude DownloadPolicy from Spec diff — policy changes are detected separately above.
+	ignoreDownloadPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy")
 
 	hasChanges := false
 	for _, diff := range []struct {
@@ -353,7 +355,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
 		{"Spec", oldBaseModel.Spec, newBaseModel.Spec},
 	} {
-		result, err := kmp.SafeDiff(diff.old, diff.new)
+		result, err := kmp.SafeDiff(diff.old, diff.new, ignoreDownloadPolicy)
 		if err != nil {
 			w.logger.Errorf("Failed to diff %s for BaseModel: %s in namespace %s",
 				diff.name, newBaseModel.Name, newBaseModel.Namespace)
@@ -362,7 +364,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		hasChanges = hasChanges || (result != "")
 	}
 
-	if hasChanges && w.shouldDownloadModelInUpdateEvent(newBaseModel.Spec.Storage) {
+	if (policyChanged || hasChanges) && w.shouldDownloadModel(newBaseModel.Spec.Storage) {
 		w.logger.Infof("BaseModel %s needs refresh in namespace %s", newBaseModel.GetName(), newBaseModel.GetNamespace())
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
 	}
@@ -395,9 +397,10 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		return
 	}
 
-	if w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel) {
-		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
-	}
+	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel)
+
+	// Exclude DownloadPolicy from Spec diff — policy changes are detected separately above.
+	ignoreDownloadPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy")
 
 	hasChanges := false
 	for _, diff := range []struct {
@@ -408,7 +411,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
 		{"Spec", oldClusterBaseModel.Spec, newClusterBaseModel.Spec},
 	} {
-		result, err := kmp.SafeDiff(diff.old, diff.new)
+		result, err := kmp.SafeDiff(diff.old, diff.new, ignoreDownloadPolicy)
 		if err != nil {
 			w.logger.Errorf("Failed to diff %s for BaseModel: %s in namespace %s",
 				diff.name, newClusterBaseModel.Name, newClusterBaseModel.Namespace)
@@ -417,7 +420,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		hasChanges = hasChanges || (result != "")
 	}
 
-	if hasChanges && w.shouldDownloadModelInUpdateEvent(newClusterBaseModel.Spec.Storage) {
+	if (policyChanged || hasChanges) && w.shouldDownloadModel(newClusterBaseModel.Spec.Storage) {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
 	}
@@ -545,12 +548,6 @@ func (w *Scout) shouldDownloadModelCommon(storageSpec *v1beta1.StorageSpec, defa
 // shouldDownloadModel checks if a model should be downloaded to this node based on node selector and node affinity
 func (w *Scout) shouldDownloadModel(storageSpec *v1beta1.StorageSpec) bool {
 	return w.shouldDownloadModelCommon(storageSpec, true)
-}
-
-// shouldDownloadModelInUpdateEvent mirrors shouldDownloadModel logic but uses a default false decision,
-// allowing callers to opt-in specific cases for updates if needed.
-func (w *Scout) shouldDownloadModelInUpdateEvent(storageSpec *v1beta1.StorageSpec) bool {
-	return w.shouldDownloadModelCommon(storageSpec, false)
 }
 
 func (w *Scout) nodeMatchesSelectorTerm(term v1.NodeSelectorTerm) bool {

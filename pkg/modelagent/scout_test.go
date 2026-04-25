@@ -1431,3 +1431,184 @@ func TestGenerateDownloadOverrideTaskBasedOnBaseModel_TensorRTLLMAndMetadataType
 	assert.Equal(t, "a10", filter.ShapeAlias)
 	assert.Equal(t, "CustomType", filter.ModelType)
 }
+
+func TestUpdateBaseModel_NoDuplicateTaskOnPolicyOnlyChange(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	sugaredLogger := logger.Sugar()
+	defer func(s *zap.SugaredLogger) { _ = s.Sync() }(sugaredLogger)
+
+	ch := make(chan *GopherTask, 10)
+	scout := &Scout{
+		nodeShapeAlias: "a10",
+		gopherChan:     ch,
+		logger:         sugaredLogger,
+		nodeInfo: &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "test-node",
+				Labels: map[string]string{"gpu-model": "a10"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		oldModel      *v1beta1.BaseModel
+		newModel      *v1beta1.BaseModel
+		expectedTasks int
+		description   string
+	}{
+		{
+			name:          "policy-only change on HuggingFace - exactly 1 task from dedicated handler",
+			oldModel:      newBaseModel("model-1", v1beta1.ReuseIfExists, "hf://meta-llama/llama-3"),
+			newModel:      newBaseModel("model-1", v1beta1.AlwaysDownload, "hf://meta-llama/llama-3"),
+			expectedTasks: 1,
+			description:   "Only the dedicated policy-change handler should fire",
+		},
+		{
+			name:          "policy-only change on non-HuggingFace - 0 tasks",
+			oldModel:      newBaseModel("model-2", v1beta1.ReuseIfExists, "oci://bucket/model"),
+			newModel:      newBaseModel("model-2", v1beta1.AlwaysDownload, "oci://bucket/model"),
+			expectedTasks: 0,
+			description:   "Dedicated handler skips non-HF, spec diff excludes DownloadPolicy",
+		},
+		{
+			name: "non-policy spec change - exactly 1 task from hasChanges block",
+			oldModel: &v1beta1.BaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "model-3"},
+				Spec: v1beta1.BaseModelSpec{
+					ModelExtensionSpec: v1beta1.ModelExtensionSpec{DisplayName: ptr("Old Name")},
+					Storage: &v1beta1.StorageSpec{
+						DownloadPolicy: ptr(v1beta1.AlwaysDownload),
+						StorageUri:     ptr("hf://meta-llama/llama-3"),
+					},
+				},
+			},
+			newModel: &v1beta1.BaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "model-3"},
+				Spec: v1beta1.BaseModelSpec{
+					ModelExtensionSpec: v1beta1.ModelExtensionSpec{DisplayName: ptr("New Name")},
+					Storage: &v1beta1.StorageSpec{
+						DownloadPolicy: ptr(v1beta1.AlwaysDownload),
+						StorageUri:     ptr("hf://meta-llama/llama-3"),
+					},
+				},
+			},
+			expectedTasks: 1,
+			description:   "Only the hasChanges block should fire",
+		},
+		{
+			name: "policy change + other spec change on HuggingFace - exactly 1 task",
+			oldModel: &v1beta1.BaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "model-4"},
+				Spec: v1beta1.BaseModelSpec{
+					ModelExtensionSpec: v1beta1.ModelExtensionSpec{DisplayName: ptr("Old Name")},
+					Storage: &v1beta1.StorageSpec{
+						DownloadPolicy: ptr(v1beta1.ReuseIfExists),
+						StorageUri:     ptr("hf://meta-llama/llama-3"),
+					},
+				},
+			},
+			newModel: &v1beta1.BaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "model-4"},
+				Spec: v1beta1.BaseModelSpec{
+					ModelExtensionSpec: v1beta1.ModelExtensionSpec{DisplayName: ptr("New Name")},
+					Storage: &v1beta1.StorageSpec{
+						DownloadPolicy: ptr(v1beta1.AlwaysDownload),
+						StorageUri:     ptr("hf://meta-llama/llama-3"),
+					},
+				},
+			},
+			expectedTasks: 1,
+			description:   "Single task even when both policy and spec change",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scout.updateBaseModel(tc.oldModel, tc.newModel)
+			assert.Equal(t, tc.expectedTasks, len(ch), tc.description)
+			for range tc.expectedTasks {
+				task := <-ch
+				assert.Equal(t, DownloadOverride, task.TaskType)
+			}
+		})
+	}
+}
+
+func TestUpdateClusterBaseModel_NoDuplicateTaskOnPolicyOnlyChange(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	sugaredLogger := logger.Sugar()
+	defer func(s *zap.SugaredLogger) { _ = s.Sync() }(sugaredLogger)
+
+	ch := make(chan *GopherTask, 10)
+	scout := &Scout{
+		nodeShapeAlias: "a10",
+		gopherChan:     ch,
+		logger:         sugaredLogger,
+		nodeInfo: &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "test-node",
+				Labels: map[string]string{"gpu-model": "a10"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		oldModel      *v1beta1.ClusterBaseModel
+		newModel      *v1beta1.ClusterBaseModel
+		expectedTasks int
+		description   string
+	}{
+		{
+			name:          "policy-only change on HuggingFace - exactly 1 task",
+			oldModel:      newClusterBaseModel("cbm-1", v1beta1.ReuseIfExists, "hf://meta-llama/llama-3"),
+			newModel:      newClusterBaseModel("cbm-1", v1beta1.AlwaysDownload, "hf://meta-llama/llama-3"),
+			expectedTasks: 1,
+			description:   "Only the dedicated policy-change handler should fire",
+		},
+		{
+			name:          "policy-only change on non-HuggingFace - 0 tasks",
+			oldModel:      newClusterBaseModel("cbm-2", v1beta1.ReuseIfExists, "oci://bucket/model"),
+			newModel:      newClusterBaseModel("cbm-2", v1beta1.AlwaysDownload, "oci://bucket/model"),
+			expectedTasks: 0,
+			description:   "Dedicated handler skips non-HF, spec diff excludes DownloadPolicy",
+		},
+		{
+			name: "non-policy spec change - exactly 1 task",
+			oldModel: &v1beta1.ClusterBaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "cbm-3"},
+				Spec: v1beta1.BaseModelSpec{
+					ModelExtensionSpec: v1beta1.ModelExtensionSpec{DisplayName: ptr("Old Name")},
+					Storage: &v1beta1.StorageSpec{
+						DownloadPolicy: ptr(v1beta1.AlwaysDownload),
+						StorageUri:     ptr("hf://meta-llama/llama-3"),
+					},
+				},
+			},
+			newModel: &v1beta1.ClusterBaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "cbm-3"},
+				Spec: v1beta1.BaseModelSpec{
+					ModelExtensionSpec: v1beta1.ModelExtensionSpec{DisplayName: ptr("New Name")},
+					Storage: &v1beta1.StorageSpec{
+						DownloadPolicy: ptr(v1beta1.AlwaysDownload),
+						StorageUri:     ptr("hf://meta-llama/llama-3"),
+					},
+				},
+			},
+			expectedTasks: 1,
+			description:   "Only the hasChanges block should fire",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scout.updateClusterBaseModel(tc.oldModel, tc.newModel)
+			assert.Equal(t, tc.expectedTasks, len(ch), tc.description)
+			for range tc.expectedTasks {
+				task := <-ch
+				assert.Equal(t, DownloadOverride, task.TaskType)
+			}
+		})
+	}
+}
