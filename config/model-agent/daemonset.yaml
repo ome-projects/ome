@@ -38,7 +38,7 @@ spec:
           type: DirectoryOrCreate
       containers:
       - name: model-agent
-        image: ghcr.io/moirai-internal/model-agent:v0.1.4
+        image: ghcr.io/moirai-internal/model-agent:v0.1.5
         imagePullPolicy: Always
         ports:
         - name: metrics

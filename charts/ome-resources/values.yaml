@@ -8,7 +8,7 @@ global:
   imagePullSecrets: []
 
 ome:
-  version: &defaultVersion v0.1.4
+  version: &defaultVersion v0.1.5
   metricsaggregator:
     enableMetricAggregation: "false"
     enablePrometheusScraping: "false"
