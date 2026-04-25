@@ -1,0 +1,10 @@
+# Artifact Hub repository metadata file
+# See https://artifacthub.io/docs/topics/repositories/helm-charts/
+#
+# After registering the repository on Artifact Hub, replace the
+# repositoryID below with the value assigned by Artifact Hub and
+# update the owners list to match Artifact Hub account emails.
+repositoryID: null
+owners:
+  - name: sgl-project
+    email: linsimo.mark@gmail.com
