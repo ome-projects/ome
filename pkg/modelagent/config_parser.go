@@ -545,7 +545,7 @@ func (p *ModelConfigParser) determineModelCapabilitiesFromHF(hfModel modelconfig
 	}
 
 	// For NemotronH_Nano capability
-	if strings.Contains(normalizedModelType, "NemotronH_Nano") {
+	if strings.Contains(normalizedModelType, "nemotronh_nano") {
 		return append(capabilities, string(v1beta1.ModelCapabilityImageTextToText), string(v1beta1.ModelCapabilityTextToText),
 			string(v1beta1.ModelCapabilityAudioToText))
 	}

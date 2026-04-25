@@ -363,6 +363,19 @@ func TestDetermineModelCapabilitiesFromHF(t *testing.T) {
 			},
 		},
 		{
+			name: "NemotronH_Nano Omni Model - falls through to vision due to case mismatch",
+			mockModel: &mockHuggingFaceModel{
+				modelType:    "NemotronH_Nano_Omni_Reasoning_V3",
+				architecture: "NemotronH_Nano_Omni_Reasoning_V3",
+				hasVision:    true,
+			},
+			expectedCapabilities: []string{
+				string(v1beta1.ModelCapabilityImageTextToText),
+				string(v1beta1.ModelCapabilityTextToText),
+				string(v1beta1.ModelCapabilityAudioToText),
+			},
+		},
+		{
 			name: "Whisper ASR Model",
 			mockModel: &mockHuggingFaceModel{
 				modelType:    "whisper",
