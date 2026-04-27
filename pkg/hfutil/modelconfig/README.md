@@ -27,7 +27,7 @@ This package provides Go utilities for loading, parsing, and analyzing Hugging F
 - **DeepSeek**: DeepSeek V3
 - **Phi Family**: Phi-3, Phi-3 Vision
 - **Qwen Family**: Qwen2, Qwen2.5
-- **Gemma Family**: Gemma, Gemma2
+- **Gemma Family**: Gemma, Gemma2, Gemma4
 - **ChatGLM Family**: ChatGLM3, GLM-4
 - **Other Models**:
   - StableLM (StabilityAI)

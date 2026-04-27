@@ -1,0 +1,57 @@
+{
+  "architectures": [
+    "Gemma4ForConditionalGeneration"
+  ],
+  "audio_config": {
+    "dtype": "bfloat16",
+    "hidden_size": 1024,
+    "model_type": "gemma4_audio",
+    "num_attention_heads": 8,
+    "num_hidden_layers": 12
+  },
+  "audio_token_id": 258881,
+  "boa_token_id": 256000,
+  "boi_token_id": 255999,
+  "dtype": "bfloat16",
+  "eoa_token_id": 258883,
+  "eoa_token_index": 258883,
+  "eoi_token_id": 258882,
+  "eos_token_id": [
+    1,
+    106
+  ],
+  "image_token_id": 258880,
+  "initializer_range": 0.02,
+  "model_type": "gemma4",
+  "text_config": {
+    "dtype": "bfloat16",
+    "enable_moe_block": false,
+    "head_dim": 256,
+    "hidden_size": 1536,
+    "hidden_size_per_layer_input": 256,
+    "intermediate_size": 6144,
+    "max_position_embeddings": 131072,
+    "model_type": "gemma4_text",
+    "num_attention_heads": 8,
+    "num_experts": null,
+    "num_hidden_layers": 35,
+    "num_key_value_heads": 1,
+    "num_kv_shared_layers": 20,
+    "sliding_window": 512,
+    "top_k_experts": null,
+    "vocab_size": 262144
+  },
+  "tie_word_embeddings": true,
+  "transformers_version": "5.5.0.dev0",
+  "video_token_id": 258884,
+  "vision_config": {
+    "dtype": "bfloat16",
+    "hidden_size": 768,
+    "intermediate_size": 3072,
+    "model_type": "gemma4_vision",
+    "num_attention_heads": 12,
+    "num_hidden_layers": 16,
+    "patch_size": 16
+  },
+  "vision_soft_tokens_per_image": 280
+}

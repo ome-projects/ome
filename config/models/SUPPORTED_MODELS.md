@@ -98,6 +98,10 @@ This document provides a comprehensive reference of all models supported by SGLa
 | Gemma 3 4B IT  | `google/gemma-3-4b-it`  | 4B         | Gemma3ForConditionalGeneration | 8 GB  | 128K    | Yes            | Configured |
 | Gemma 3 12B IT | `google/gemma-3-12b-it` | 12B        | Gemma3ForConditionalGeneration | 24 GB | 128K    | Yes            | Missing    |
 | Gemma 3 27B IT | `google/gemma-3-27b-it` | 27B        | Gemma3ForConditionalGeneration | 54 GB | 128K    | Yes            | Missing    |
+| Gemma 4 E2B IT | `google/gemma-4-E2B-it` | 5.4B       | Gemma4ForConditionalGeneration | 11 GB | 128K    | Yes            | Missing    |
+| Gemma 4 E4B IT | `google/gemma-4-E4B-it` | 8B         | Gemma4ForConditionalGeneration | 16 GB | 128K    | Yes            | Missing    |
+| Gemma 4 26B-A4B IT | `google/gemma-4-26B-A4B-it` | 26B (MoE) | Gemma4ForConditionalGeneration | 52 GB | 256K    | Yes            | Missing    |
+| Gemma 4 31B IT | `google/gemma-4-31B-it` | 31B        | Gemma4ForConditionalGeneration | 62 GB | 256K    | Yes            | Missing    |
 
 ### Microsoft Phi Family
 
