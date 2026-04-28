@@ -49,6 +49,8 @@ func NewDecoder(
 	acceleratorClass *v1beta1.AcceleratorClassSpec,
 	acceleratorClassName string,
 ) Component {
+	logger := ctrl.Log.WithName("DecoderReconciler")
+	statusManager := status.NewStatusReconciler(clientset).WithLogger(logger.WithName("InferenceServiceStatus"))
 	base := BaseComponentFields{
 		Client:                 client,
 		Clientset:              clientset,
@@ -59,8 +61,8 @@ func NewDecoder(
 		BaseModelMeta:          baseModelMeta,
 		Runtime:                runtime,
 		RuntimeName:            runtimeName,
-		StatusManager:          status.NewStatusReconciler(),
-		Log:                    ctrl.Log.WithName("DecoderReconciler"),
+		StatusManager:          statusManager,
+		Log:                    logger,
 		AcceleratorClass:       acceleratorClass,
 		AcceleratorClassName:   acceleratorClassName,
 		SupportedModelFormat:   supportedModelFormat,

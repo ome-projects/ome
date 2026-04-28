@@ -494,7 +494,7 @@ func UpdateComponentStatus(b *BaseComponentFields, isvc *v1beta1.InferenceServic
 	if err != nil {
 		return errors.Wrapf(err, "failed to list %s pods by label", componentType)
 	}
-	b.StatusManager.PropagateModelStatus(&isvc.Status, statusSpec, pods, rawDeployment)
+	b.StatusManager.PropagateModelStatus(&isvc.Status, componentType, statusSpec, pods, rawDeployment)
 
 	return nil
 }

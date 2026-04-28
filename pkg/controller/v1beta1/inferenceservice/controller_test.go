@@ -724,7 +724,7 @@ func TestInferenceServiceReconcile(t *testing.T) {
 				Log:                      ctrl.Log.WithName("test"),
 				Scheme:                   scheme,
 				Recorder:                 recorder,
-				StatusManager:            status.NewStatusReconciler(),
+				StatusManager:            status.NewStatusReconciler(nil),
 				RuntimeSelector:          runtimeselector.New(c),
 				AcceleratorClassSelector: acceleratorclassselector.New(c),
 			}
