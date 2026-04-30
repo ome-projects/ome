@@ -27,6 +27,7 @@ import (
 	"github.com/sgl-project/ome/pkg/apis/ome/v1beta1"
 	"github.com/sgl-project/ome/pkg/constants"
 	"github.com/sgl-project/ome/pkg/controller/v1beta1/inferenceservice/status"
+	"github.com/sgl-project/ome/pkg/controller/v1beta1/inferenceservice/workload"
 	"github.com/sgl-project/ome/pkg/runtimeselector"
 	omeTesting "github.com/sgl-project/ome/pkg/testing"
 )
@@ -728,6 +729,12 @@ func TestInferenceServiceReconcile(t *testing.T) {
 				RuntimeSelector:          runtimeselector.New(c),
 				AcceleratorClassSelector: acceleratorclassselector.New(c),
 			}
+
+			// Initialize StrategyManager and register strategies
+			reconciler.StrategyManager = workload.NewWorkloadStrategyManager(reconciler.Log)
+			singleStrategy := workload.NewSingleComponentStrategy(reconciler.Log)
+			err = reconciler.StrategyManager.RegisterStrategy(singleStrategy)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Ensure the InferenceService exists in the client
 			existingIsvc := &v1beta1.InferenceService{}
