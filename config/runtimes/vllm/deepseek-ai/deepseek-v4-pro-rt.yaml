@@ -1,0 +1,187 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: vllm-deepseek-v4-pro
+spec:
+  disabled: false
+  routerConfig:
+    annotations:
+      prometheus.io/path: /metrics
+      prometheus.io/port: '29000'
+      prometheus.io/scrape: 'true'
+    labels:
+      logging-forward: enabled
+    runner:
+      name: router
+      image: docker.io/lightseekorg/smg:1.4.1
+      ports:
+        - containerPort: 8080
+          name: http
+      resources:
+        limits:
+          cpu: "8"
+          memory: 16Gi
+      args:
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8080"
+        - --service-discovery
+        - --service-discovery-namespace
+        - $(NAMESPACE)
+        - --service-discovery-port
+        - "8080"
+        - --selector
+        - component=engine ome.io/inferenceservice=$(INFERENCESERVICE_NAME)
+        - --enable-igw
+        - --request-id-headers
+        - opc-request-id
+        - --log-json
+        - --disable-retries
+        - --disable-circuit-breaker
+      env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: INFERENCESERVICE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['ome.io/inferenceservice']
+      readinessProbe:
+        httpGet:
+          path: /readiness
+          port: 8080
+        failureThreshold: 5
+        periodSeconds: 30
+        timeoutSeconds: 10
+      livenessProbe:
+        httpGet:
+          path: /liveness
+          port: 8080
+        failureThreshold: 5
+        periodSeconds: 30
+        timeoutSeconds: 10
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        failureThreshold: 5
+        periodSeconds: 20
+        timeoutSeconds: 10
+        initialDelaySeconds: 30
+  supportedModelFormats:
+    - modelFramework:
+        name: transformers
+        version: "4.57.1"
+      modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      modelArchitecture: DeepseekV4ForCausalLM
+      quantization: fp8
+      autoSelect: true
+      priority: 1
+  modelSizeRange:
+    min: 800B
+    max: 900B
+  protocolVersions:
+    - openAI
+  engineConfig:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+    labels:
+      logging-forward: enabled
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node.kubernetes.io/instance-type
+                  operator: In
+                  values:
+                    - BM.GPU.H200.8
+                    - BM.GPU.H200-NC.8
+    volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+    runner:
+      name: ome-container
+      image: docker.io/vllm/vllm-openai:v0.20.0-cu129
+      ports:
+        - containerPort: 8080
+          name: http1
+          protocol: TCP
+      command:
+        - vllm
+        - serve
+      args:
+        - $(MODEL_PATH)
+        - --trust-remote-code
+        - --tensor-parallel-size=1
+        - --data-parallel-size=8
+        - --enable-expert-parallel
+        - --kv-cache-dtype=fp8
+        - --block-size=256
+        - '--compilation-config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}'
+        - --tokenizer-mode=deepseek_v4
+        - --tool-call-parser=deepseek_v4
+        - --enable-auto-tool-choice
+        - --reasoning-parser=deepseek_v4
+        - --served-model-name=vllm-model
+        - --max-model-len=-1
+        - --enable-chunked-prefill
+        - --no-scheduler-reserve-full-isl
+        - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
+        - --enable-log-requests
+        - --port=8080
+      env:
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: '3600'
+        - name: VLLM_LOGGING_LEVEL
+          value: 'INFO'
+        - name: VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+          value: '0'
+      volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      resources:
+        requests:
+          cpu: 128
+          memory: 512Gi
+          nvidia.com/gpu: 8
+        limits:
+          cpu: 128
+          memory: 512Gi
+          nvidia.com/gpu: 8
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        failureThreshold: 3
+        successThreshold: 1
+        periodSeconds: 90
+        timeoutSeconds: 60
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        failureThreshold: 5
+        successThreshold: 1
+        periodSeconds: 60
+        timeoutSeconds: 60
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        failureThreshold: 190
+        successThreshold: 1
+        periodSeconds: 6
+        initialDelaySeconds: 60
+        timeoutSeconds: 30

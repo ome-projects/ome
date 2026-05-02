@@ -1,0 +1,14 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: deepseek-v4-flash
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  vendor: deepseek-ai
+  displayName: deepseek-ai.deepseek-v4-flash
+  disabled: false
+  version: "1.0.0"
+  storage:
+    storageUri: hf://deepseek-ai/DeepSeek-V4-Flash
+    path: /raid/models/deepseek-ai/DeepSeek-V4-Flash

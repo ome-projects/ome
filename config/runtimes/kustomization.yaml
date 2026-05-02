@@ -50,3 +50,5 @@ resources:
 - vllm/llama-4-scout-17b-16e-instruct-rt.yaml
 - vllm/mistral-7b-instruct-rt.yaml
 - vllm/mixtral-8x7b-instruct-rt.yaml
+- vllm/deepseek-ai/deepseek-v4-flash-rt.yaml
+- vllm/deepseek-ai/deepseek-v4-pro-rt.yaml
