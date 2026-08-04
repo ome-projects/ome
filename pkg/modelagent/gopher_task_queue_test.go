@@ -252,6 +252,56 @@ func TestGopherTaskQueueDeleteSupersedesPendingRevalidationReplayForSameModel(t 
 	assert.Equal(t, 0, queue.len())
 }
 
+func TestGopherTaskQueueServingDemandSupersedesBackgroundForSameModel(t *testing.T) {
+	queue := newGopherTaskQueue()
+	model := &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "service-ns", UID: "model-uid"},
+	}
+
+	require.True(t, queue.enqueue(&GopherTask{TaskType: Download, BaseModel: model}))
+	require.True(t, queue.enqueue(&GopherTask{
+		TaskType:      Download,
+		BaseModel:     model,
+		ServingDemand: true,
+	}))
+
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.True(t, task.ServingDemand)
+	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherTaskQueueRejectsBackgroundWhenCapacityIsFull(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	first := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "service-ns", UID: "first-uid"},
+	}}
+	second := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "service-ns", UID: "second-uid"},
+	}}
+
+	assert.True(t, queue.enqueue(first))
+	assert.False(t, queue.enqueue(second))
+	assert.Equal(t, 1, queue.len())
+}
+
+func TestGopherTaskQueueServingDemandEvictsBackgroundAtCapacity(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	background := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "background", Namespace: "service-ns", UID: "background-uid"},
+	}}
+	demand := &GopherTask{TaskType: Download, ServingDemand: true, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "demand", Namespace: "service-ns", UID: "demand-uid"},
+	}}
+
+	assert.True(t, queue.enqueue(background))
+	assert.True(t, queue.enqueue(demand))
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Equal(t, "demand", task.BaseModel.Name)
+	assert.Equal(t, 0, queue.len())
+}
+
 func TestGopherTaskQueueEnqueueWakesMatchingBlockedWorker(t *testing.T) {
 	queue := newGopherTaskQueue()
 	normalDone := make(chan struct{})

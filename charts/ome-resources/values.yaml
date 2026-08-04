@@ -522,6 +522,27 @@ ome:
       affinity: {}
       priorityClassName: ""
 modelAgent:
+  # Deploy the model-agent DaemonSet (node-local model download/cache).
+  # Required for BaseModel/ClusterBaseModel-backed model resolution.
+  # Installs whose runtimes fetch models themselves can leave this off.
+  enabled: false
+  hostPath: /mnt/data/models
+  priorityClassName: system-node-critical
+  serviceAccountName: ome-model-agent
+  numDownloadWorkers: 2
+  numHighPriorityWorkers: 1
+  taskSchedulerCapacity: 4096
+  samePathWaitTimeout: 30m
+  demandPriorityEnabled: true
+  image:
+    # Docker registry hub. If set, overrides global.hub for model-agent.
+    # If repository contains '/', hub is ignored.
+    # Leave empty to use global.hub
+    hub: ""
+    repository: model-agent
+    pullPolicy: Always
+    tag: *defaultVersion
+
   # Instance-type -> short-name mappings, by cloud provider. Single source of
   # truth: rendered into the model-agent ConfigMap (instance-type-map) and the
   # enigma init container's INSTANCE_TYPE_MAP env var via the

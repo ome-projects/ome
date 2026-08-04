@@ -64,11 +64,15 @@ spec:
         - --models-root-dir
         - {{ .Values.modelAgent.hostPath }}
         - --num-download-worker
-        - '2'
+        - {{ .Values.modelAgent.numDownloadWorkers | quote }}
         - --num-high-priority-worker
-        - '1'
+        - {{ .Values.modelAgent.numHighPriorityWorkers | quote }}
+        - --task-scheduler-capacity
+        - {{ .Values.modelAgent.taskSchedulerCapacity | quote }}
         - --same-path-wait-timeout
-        - 30m
+        - {{ .Values.modelAgent.samePathWaitTimeout | quote }}
+        - --demand-priority-enabled
+        - {{ .Values.modelAgent.demandPriorityEnabled | quote }}
         env:
         - name: NODE_NAME
           valueFrom:

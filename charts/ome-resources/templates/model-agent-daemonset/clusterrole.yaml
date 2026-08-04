@@ -21,4 +21,7 @@ rules:
   - apiGroups: [ "ome.io" ]
     resources: [ "clusterbasemodels" ]
     verbs: [ "get", "list", "watch", "patch", "update" ]
+  - apiGroups: [ "ome.io" ]
+    resources: [ "inferenceservices" ]
+    verbs: [ "get", "list", "watch" ]
 {{- end }}

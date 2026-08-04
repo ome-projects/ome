@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -33,6 +35,8 @@ type Scout struct {
 	baseModelSynced        cache.InformerSynced
 	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister
 	clusterBaseModelSynced cache.InformerSynced
+	inferenceServiceLister omev1beta1lister.InferenceServiceLister
+	inferenceServiceSynced cache.InformerSynced
 	informerFactory        omev1beta1informers.SharedInformerFactory
 	gopherChan             chan<- *GopherTask
 	nodeName               string
@@ -40,6 +44,10 @@ type Scout struct {
 	nodeShapeAlias         string
 	kubeClient             *kubernetes.Clientset
 	logger                 *zap.SugaredLogger
+	demandPriorityEnabled  bool
+	demandMu               sync.RWMutex
+	endpointDemands        map[string]string
+	demandCounts           map[string]int
 }
 
 type TensorRTLLMShapeFilter struct {
@@ -62,6 +70,19 @@ type downloadOverrideInputs struct {
 func NewScout(ctx context.Context, nodeName string,
 	baseModelInformer omev1beta1.BaseModelInformer,
 	clusterBaseModelInformer omev1beta1.ClusterBaseModelInformer,
+	informerFactory omev1beta1informers.SharedInformerFactory,
+	gopherChan chan<- *GopherTask,
+	kubeClient *kubernetes.Clientset,
+	logger *zap.SugaredLogger) (*Scout, error) {
+	return NewScoutWithDemand(ctx, nodeName, baseModelInformer, clusterBaseModelInformer,
+		nil, false, informerFactory, gopherChan, kubeClient, logger)
+}
+
+func NewScoutWithDemand(ctx context.Context, nodeName string,
+	baseModelInformer omev1beta1.BaseModelInformer,
+	clusterBaseModelInformer omev1beta1.ClusterBaseModelInformer,
+	inferenceServiceInformer omev1beta1.InferenceServiceInformer,
+	demandPriorityEnabled bool,
 	informerFactory omev1beta1informers.SharedInformerFactory,
 	gopherChan chan<- *GopherTask,
 	kubeClient *kubernetes.Clientset,
@@ -101,12 +122,22 @@ func NewScout(ctx context.Context, nodeName string,
 		nodeName:               nodeName,
 		kubeClient:             kubeClient,
 		logger:                 logger,
+		demandPriorityEnabled:  demandPriorityEnabled && inferenceServiceInformer != nil,
+		endpointDemands:        make(map[string]string),
+		demandCounts:           make(map[string]int),
+	}
+	if scout.demandPriorityEnabled {
+		scout.inferenceServiceLister = inferenceServiceInformer.Lister()
+		scout.inferenceServiceSynced = inferenceServiceInformer.Informer().HasSynced
 	}
 
 	logger.Info("Setting up informer error handlers")
 	informers := map[string]cache.SharedInformer{
 		"baseModelInformer":        baseModelInformer.Informer(),
 		"clusterBaseModelInformer": clusterBaseModelInformer.Informer(),
+	}
+	if scout.demandPriorityEnabled {
+		informers["inferenceServiceInformer"] = inferenceServiceInformer.Informer()
 	}
 
 	for name, informer := range informers {
@@ -146,6 +177,16 @@ func NewScout(ctx context.Context, nodeName string,
 		return nil, err
 	}
 
+	if scout.demandPriorityEnabled {
+		if _, err := inferenceServiceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    scout.addOrUpdateInferenceService,
+			UpdateFunc: func(_, newObj interface{}) { scout.addOrUpdateInferenceService(newObj) },
+			DeleteFunc: scout.deleteInferenceService,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	return scout, nil
 }
 
@@ -160,6 +201,9 @@ func (w *Scout) Run(stopCh <-chan struct{}) error {
 	synced := []cache.InformerSynced{
 		w.clusterBaseModelSynced,
 		w.baseModelSynced,
+	}
+	if w.demandPriorityEnabled {
+		synced = append(synced, w.inferenceServiceSynced)
 	}
 
 	// Add retry logic with exponential backoff for cache sync
@@ -237,6 +281,9 @@ syncComplete:
 	// After caches are synced, check for any pending deletions (resources with DeletionTimestamp)
 	// This ensures we catch any deletion requests that occurred while the agent was down
 	w.reconcilePendingDeletions()
+	if w.demandPriorityEnabled {
+		w.refreshAllEndpointDemands()
+	}
 
 	<-stopCh
 	close(w.gopherChan)
@@ -279,6 +326,8 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		gopherTask := &GopherTask{
 			TaskType:  Download,
 			BaseModel: baseModel,
+			ServingDemand: w.isModelDemanded(
+				modelDemandKey(constants.BaseModel, baseModel.Namespace, baseModel.Name)),
 			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 				IsTensorrtLLMModel: IsTensorrtLLMModel,
 				ShapeAlias:         w.nodeShapeAlias,
@@ -324,6 +373,8 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		gopherTask := &GopherTask{
 			TaskType:         Download,
 			ClusterBaseModel: clusterBaseModel,
+			ServingDemand: w.isModelDemanded(
+				modelDemandKey(constants.ClusterBaseModel, "", clusterBaseModel.Name)),
 			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 				IsTensorrtLLMModel: IsTensorrtLLMModel,
 				ShapeAlias:         w.nodeShapeAlias,
@@ -487,6 +538,142 @@ func (w *Scout) deleteClusterBaseModel(obj interface{}) {
 		ClusterBaseModel: clusterBaseModel,
 	}
 	w.gopherChan <- gopherTask
+}
+
+func (w *Scout) addOrUpdateInferenceService(obj interface{}) {
+	isvc, ok := obj.(*v1beta1.InferenceService)
+	if !ok {
+		w.logger.Errorf("Failed to convert %v to InferenceService", obj)
+		return
+	}
+	endpointKey := isvc.Namespace + "/" + isvc.Name
+	if !isvc.DeletionTimestamp.IsZero() || isvc.Spec.Model == nil ||
+		strings.TrimSpace(isvc.Spec.Model.Name) == "" {
+		w.setEndpointDemand(endpointKey, "")
+		return
+	}
+
+	kind, name, supported := inferenceServiceModelReference(isvc.Spec.Model)
+	if !supported {
+		w.logger.Debugf("InferenceService %s does not reference a supported OME model", endpointKey)
+		w.setEndpointDemand(endpointKey, "")
+		return
+	}
+	modelKey := modelDemandKey(kind, isvc.Namespace, name)
+	if w.setEndpointDemand(endpointKey, modelKey) {
+		w.enqueueDemandedModel(kind, isvc.Namespace, name)
+	}
+}
+
+func (w *Scout) deleteInferenceService(obj interface{}) {
+	isvc, ok := obj.(*v1beta1.InferenceService)
+	if !ok {
+		if tombstone, tombstoneOK := obj.(cache.DeletedFinalStateUnknown); tombstoneOK {
+			isvc, ok = tombstone.Obj.(*v1beta1.InferenceService)
+		}
+	}
+	if !ok {
+		w.logger.Errorf("Failed to convert deleted %v to InferenceService", obj)
+		return
+	}
+	w.setEndpointDemand(isvc.Namespace+"/"+isvc.Name, "")
+}
+
+func (w *Scout) refreshAllEndpointDemands() {
+	isvcs, err := w.inferenceServiceLister.List(labels.Everything())
+	if err != nil {
+		w.logger.Errorf("Unable to rebuild endpoint model demand: %v", err)
+		return
+	}
+	w.demandMu.Lock()
+	w.endpointDemands = make(map[string]string)
+	w.demandCounts = make(map[string]int)
+	w.demandMu.Unlock()
+	for _, isvc := range isvcs {
+		w.addOrUpdateInferenceService(isvc)
+	}
+}
+
+func (w *Scout) setEndpointDemand(endpointKey, modelKey string) bool {
+	w.demandMu.Lock()
+	defer w.demandMu.Unlock()
+	previous := w.endpointDemands[endpointKey]
+	if previous == modelKey {
+		return false
+	}
+	if previous != "" {
+		w.demandCounts[previous]--
+		if w.demandCounts[previous] <= 0 {
+			delete(w.demandCounts, previous)
+		}
+	}
+	if modelKey == "" {
+		delete(w.endpointDemands, endpointKey)
+		return false
+	}
+	w.endpointDemands[endpointKey] = modelKey
+	w.demandCounts[modelKey]++
+	return true
+}
+
+func (w *Scout) isModelDemanded(modelKey string) bool {
+	w.demandMu.RLock()
+	defer w.demandMu.RUnlock()
+	return w.demandCounts[modelKey] > 0
+}
+
+func (w *Scout) enqueueDemandedModel(kind, namespace, name string) {
+	if strings.EqualFold(kind, constants.BaseModel) {
+		model, err := w.baseModelLister.BaseModels(namespace).Get(name)
+		if err != nil {
+			w.logger.Debugf("Demanded BaseModel %s/%s is not available yet: %v", namespace, name, err)
+			return
+		}
+		if w.shouldDownloadModel(model.Spec.Storage) {
+			w.downloadBaseModel(model)
+		}
+		return
+	}
+	model, err := w.clusterBaseModelLister.Get(name)
+	if err != nil {
+		w.logger.Debugf("Demanded ClusterBaseModel %s is not available yet: %v", name, err)
+		return
+	}
+	if w.shouldDownloadModel(model.Spec.Storage) {
+		w.downloadClusterBaseModel(model)
+	}
+}
+
+func modelDemandKey(kind, namespace, name string) string {
+	if strings.EqualFold(strings.TrimSpace(kind), constants.BaseModel) {
+		return "base/" + strings.TrimSpace(namespace) + "/" + strings.TrimSpace(name)
+	}
+	return "cluster/" + strings.TrimSpace(name)
+}
+
+func inferenceServiceModelReference(model *v1beta1.ModelRef) (string, string, bool) {
+	if model == nil || strings.TrimSpace(model.Name) == "" {
+		return "", "", false
+	}
+	if model.APIGroup != nil {
+		apiGroup := strings.TrimSpace(*model.APIGroup)
+		if apiGroup != "" && !strings.EqualFold(apiGroup, constants.OMEAPIGroupName) {
+			return "", "", false
+		}
+	}
+
+	kind := constants.ClusterBaseModel
+	if model.Kind != nil && strings.TrimSpace(*model.Kind) != "" {
+		kind = strings.TrimSpace(*model.Kind)
+	}
+	switch {
+	case strings.EqualFold(kind, constants.BaseModel):
+		return constants.BaseModel, strings.TrimSpace(model.Name), true
+	case strings.EqualFold(kind, constants.ClusterBaseModel):
+		return constants.ClusterBaseModel, strings.TrimSpace(model.Name), true
+	default:
+		return "", "", false
+	}
 }
 
 // reconcilePendingDeletions checks for any resources with deletion timestamps
@@ -741,6 +928,8 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseM
 	gopherTask := &GopherTask{
 		TaskType:         DownloadOverride,
 		ClusterBaseModel: clusterBaseModel,
+		ServingDemand: w.isModelDemanded(
+			modelDemandKey(constants.ClusterBaseModel, "", clusterBaseModel.Name)),
 		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 			IsTensorrtLLMModel: IsTensorrtLLMModel,
 			ShapeAlias:         w.nodeShapeAlias,
@@ -762,6 +951,8 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.
 	gopherTask := &GopherTask{
 		TaskType:  DownloadOverride,
 		BaseModel: baseModel,
+		ServingDemand: w.isModelDemanded(
+			modelDemandKey(constants.BaseModel, baseModel.Namespace, baseModel.Name)),
 		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 			IsTensorrtLLMModel: IsTensorrtLLMModel,
 			ShapeAlias:         w.nodeShapeAlias,

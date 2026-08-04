@@ -51,8 +51,12 @@ spec:
         - '2'
         - --num-high-priority-worker
         - '1'
+        - --task-scheduler-capacity
+        - '4096'
         - --same-path-wait-timeout
         - 30m
+        - --demand-priority-enabled
+        - 'true'
         - --concurrency
         - '2'
         env:

@@ -43,7 +43,9 @@ type config struct {
 	downloadAuthType      string
 	numDownloadWorker     int
 	numHighPriorityWorker int
+	taskSchedulerCapacity int
 	samePathWaitTimeout   time.Duration
+	demandPriorityEnabled bool
 	namespace             string
 	logLevel              string
 }
@@ -75,7 +77,9 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.multipartConcurrency, "multipart-concurrency", 4, "Number of concurrent multipart download workers per gopher")
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
+	rootCmd.PersistentFlags().IntVar(&cfg.taskSchedulerCapacity, "task-scheduler-capacity", 4096, "Maximum number of distinct queued model tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
+	rootCmd.PersistentFlags().BoolVar(&cfg.demandPriorityEnabled, "demand-priority-enabled", true, "Prioritize compatible models referenced by InferenceServices")
 	rootCmd.PersistentFlags().StringVar(&cfg.namespace, "namespace", "ome", "Kubernetes namespace to use")
 	rootCmd.PersistentFlags().StringVar(&cfg.logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
@@ -215,12 +219,15 @@ func initializeComponents(
 	// Create a Scout instance
 	baseModelInformer := omeInformerFactory.Ome().V1beta1().BaseModels()
 	clusterBaseModelInformer := omeInformerFactory.Ome().V1beta1().ClusterBaseModels()
+	inferenceServiceInformer := omeInformerFactory.Ome().V1beta1().InferenceServices()
 
-	scout, err := modelagent.NewScout(
+	scout, err := modelagent.NewScoutWithDemand(
 		ctx,
 		cfg.nodeName,
 		baseModelInformer,
 		clusterBaseModelInformer,
+		inferenceServiceInformer,
+		cfg.demandPriorityEnabled,
 		omeInformerFactory,
 		gopherTaskChan,
 		kubeClient,
@@ -278,6 +285,7 @@ func initializeComponents(
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)
 	}
+	gopher.SetTaskSchedulerCapacity(cfg.taskSchedulerCapacity)
 
 	return scout, gopher, nil
 }
