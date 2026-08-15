@@ -11,8 +11,10 @@ import (
 	"go.uber.org/zap/zaptest"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func newTestHfArtifactRepository(t *testing.T, data map[string]string) (*HfArtifactRepository, *fake.Clientset) {
@@ -33,7 +35,7 @@ func testHfArtifactEntry(t *testing.T) HfArtifactEntry {
 	return HfArtifactEntry{
 		Key:       hfArtifactConfigMapKey(identity),
 		Identity:  identity,
-		LocalPath: "/mnt/data/models/customer-model-store/_artifacts/Qwen/Qwen3-8B/" + testHFCommitSHA,
+		LocalPath: "/models/store/_artifacts/Qwen/Qwen3-8B/" + testHFCommitSHA,
 	}
 }
 
@@ -77,6 +79,84 @@ func TestHfArtifactRepositoryLockLifecycle(t *testing.T) {
 	assert.False(t, acquired)
 	assert.Equal(t, HfArtifactStatusReady, ready.Status)
 	assert.Equal(t, map[string]string{modelKey: "/models/model-1"}, ready.Children)
+}
+
+func TestHfArtifactRepositoryGetsParentForChild(t *testing.T) {
+	childModelKey := "default.basemodel.model-1"
+	repository, client := newTestHfArtifactRepository(t, map[string]string{
+		childModelKey: testModelEntryJSON(t, "model-1"),
+	})
+	parent := testHfArtifactEntry(t)
+	lockedParent, acquired, err := repository.TryAcquireLock(context.Background(), parent)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, repository.MarkReady(context.Background(), lockedParent))
+	require.NoError(t, repository.AddModelReference(
+		context.Background(),
+		parent,
+		childModelKey,
+		types.UID("model-1-uid"),
+		"/models/model-1",
+	))
+	reads := 0
+	client.PrependReactor("get", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+		reads++
+		if reads > 1 {
+			return true, &corev1.ConfigMap{}, nil
+		}
+		return false, nil, nil
+	})
+
+	foundParent, found, err := repository.GetParentForChild(context.Background(), childModelKey)
+
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, parent.Key, foundParent.Key)
+	assert.Equal(t, "/models/model-1", foundParent.Children[childModelKey])
+	assert.Equal(t, 1, reads, "both reference directions must come from one snapshot")
+}
+
+func TestHfArtifactRepositoryGetParentForChildRejectsInvalidRecords(t *testing.T) {
+	for _, name := range []string{
+		"missing parent", "corrupt parent", "corrupt child", "invalid parent key",
+		"missing reverse reference", "empty child path", "invalid parent status",
+	} {
+		t.Run(name, func(t *testing.T) {
+			childKey := "default.basemodel.model-1"
+			parent := testHfArtifactWithStatus(testHfArtifactEntry(t), HfArtifactStatusReady)
+			parent.Children[childKey] = "/models/model-1"
+			child := ModelEntry{Name: "model-1", Status: ModelStatusReady, HfArtifactKey: parent.Key}
+			switch name {
+			case "invalid parent key":
+				child.HfArtifactKey = "default.basemodel.other"
+			case "missing reverse reference":
+				delete(parent.Children, childKey)
+			case "empty child path":
+				parent.Children[childKey] = " "
+			case "invalid parent status":
+				parent.Status = "Unknown"
+			}
+			data := make(map[string]string)
+			_, err := writeHfArtifactEntry(data, parent)
+			require.NoError(t, err)
+			_, err = writeModelEntry(data, childKey, child)
+			require.NoError(t, err)
+			switch name {
+			case "missing parent":
+				delete(data, parent.Key)
+			case "corrupt parent":
+				data[parent.Key] = "{"
+			case "corrupt child":
+				data[childKey] = "{"
+			}
+			repository, _ := newTestHfArtifactRepository(t, data)
+
+			_, found, err := repository.GetParentForChild(context.Background(), childKey)
+
+			require.Error(t, err)
+			assert.False(t, found)
+		})
+	}
 }
 
 func TestHfArtifactRepositoryAcquiresFailedArtifactForRepair(t *testing.T) {
@@ -294,7 +374,7 @@ func TestValidateHfArtifactIdentityAndPathAcceptsUppercaseCommitSHA(t *testing.T
 	artifact := HfArtifactEntry{
 		Key:       hfArtifactConfigMapKey(identity),
 		Identity:  identity,
-		LocalPath: canonicalHfArtifactPath("/mnt/data/models/customer-model-store/model-ocid", identity),
+		LocalPath: canonicalHfArtifactPath("/models/store/model-1", identity),
 	}
 
 	assert.NoError(t, validateHfArtifactIdentityAndPath(artifact))
@@ -310,7 +390,7 @@ func TestHfArtifactRepositoryRemovesModelReferenceAndDeletesUnreferencedArtifact
 	require.NoError(t, repository.MarkReady(context.Background(), locked))
 	require.NoError(t, repository.AddModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1"))
 
-	removal, err := repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"))
+	removal, err := repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1")
 	require.NoError(t, err)
 	assert.True(t, removal.ReferenceRemoved)
 	assert.True(t, removal.LastReferenceRemoved)
@@ -352,7 +432,7 @@ func TestHfArtifactRepositoryKeepsArtifactWithRemainingReference(t *testing.T) {
 	require.NoError(t, repository.AddModelReference(context.Background(), artifact, firstKey, types.UID("model-1-uid"), "/models/model-1"))
 	require.NoError(t, repository.AddModelReference(context.Background(), artifact, secondKey, types.UID("model-2-uid"), "/models/model-2"))
 
-	removal, err := repository.RemoveModelReference(context.Background(), artifact, firstKey, types.UID("model-1-uid"))
+	removal, err := repository.RemoveModelReference(context.Background(), artifact, firstKey, types.UID("model-1-uid"), "/models/model-1")
 	require.NoError(t, err)
 	assert.False(t, removal.LastReferenceRemoved)
 	assert.Equal(t, HfArtifactStatusReady, removal.Artifact.Status)
@@ -371,7 +451,7 @@ func TestHfArtifactRepositoryMissingArtifactMutationsDoNotCreateEntry(t *testing
 	assert.Error(t, repository.MarkReady(context.Background(), artifact))
 	assert.Error(t, repository.MarkFailed(context.Background(), artifact))
 	assert.Error(t, repository.AddModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1"))
-	removal, err := repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"))
+	removal, err := repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1")
 	require.NoError(t, err)
 	assert.False(t, removal.ReferenceRemoved)
 
@@ -392,7 +472,7 @@ func TestHfArtifactRepositoryRejectsMissingArtifactReferencedByModel(t *testing.
 	require.NoError(t, err)
 	repository, _ := newTestHfArtifactRepository(t, map[string]string{modelKey: string(modelJSON)})
 
-	_, err = repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"))
+	_, err = repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1")
 	assert.ErrorContains(t, err, "references missing Hugging Face artifact")
 }
 
@@ -404,7 +484,7 @@ func TestHfArtifactRepositoryDoesNotStealUpdatingArtifactForDeletion(t *testing.
 	require.NoError(t, err)
 	require.True(t, acquired)
 
-	_, err = repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"))
+	_, err = repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1")
 	assert.ErrorContains(t, err, "is Updating")
 
 	stored, found, err := repository.Get(context.Background(), artifact.Identity)
@@ -422,9 +502,9 @@ func TestHfArtifactEntryJSONSchema(t *testing.T) {
 		Key:       hfArtifactConfigMapKey(identity),
 		Status:    HfArtifactStatusReady,
 		Identity:  identity,
-		LocalPath: "/mnt/data/models/customer-model-store/_artifacts/Qwen/Qwen3-8B/" + testHFCommitSHA,
+		LocalPath: "/models/store/_artifacts/Qwen/Qwen3-8B/" + testHFCommitSHA,
 		Children: map[string]string{
-			"default.basemodel.model-1": "/mnt/data/models/customer-model-store/model-1",
+			"default.basemodel.model-1": "/models/store/model-1",
 		},
 	}
 
@@ -437,9 +517,9 @@ func TestHfArtifactEntryJSONSchema(t *testing.T) {
 			"modelId": "Qwen/Qwen3-8B",
 			"commitSha": "`+testHFCommitSHA+`"
 		},
-		"localPath": "/mnt/data/models/customer-model-store/_artifacts/Qwen/Qwen3-8B/`+testHFCommitSHA+`",
+		"localPath": "/models/store/_artifacts/Qwen/Qwen3-8B/`+testHFCommitSHA+`",
 		"children": {
-			"default.basemodel.model-1": "/mnt/data/models/customer-model-store/model-1"
+			"default.basemodel.model-1": "/models/store/model-1"
 		}
 	}`, string(encoded))
 	assert.NotContains(t, string(encoded), `"config"`)
@@ -448,7 +528,7 @@ func TestHfArtifactEntryJSONSchema(t *testing.T) {
 
 func TestHfArtifactRepositoryAddModelReferenceWritesBothDirections(t *testing.T) {
 	modelKey := "default.basemodel.model-1"
-	modelPath := "/mnt/data/models/customer-model-store/model-1"
+	modelPath := "/models/store/model-1"
 	repository, client := newTestHfArtifactRepository(t, map[string]string{modelKey: testModelEntryJSON(t, "model-1")})
 	artifact := testHfArtifactEntry(t)
 
@@ -470,6 +550,35 @@ func TestHfArtifactRepositoryAddModelReferenceWritesBothDirections(t *testing.T)
 	assert.Equal(t, artifact.Key, storedModel.HfArtifactKey)
 }
 
+func TestHfArtifactRepositoryRejectsReferencePathReplacement(t *testing.T) {
+	modelKey := "default.basemodel.model-1"
+	repository, _ := newTestHfArtifactRepository(t, map[string]string{
+		modelKey: testModelEntryJSON(t, "model-1"),
+	})
+	artifact := testHfArtifactEntry(t)
+	locked, acquired, err := repository.TryAcquireLock(context.Background(), artifact)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, repository.MarkReady(context.Background(), locked))
+	require.NoError(t, repository.AddModelReference(
+		context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1",
+	))
+
+	err = repository.AddModelReference(
+		context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1-new-path",
+	)
+	assert.ErrorContains(t, err, "does not match recorded")
+	_, err = repository.RemoveModelReference(
+		context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1-new-path",
+	)
+	assert.ErrorContains(t, err, "does not match recorded")
+
+	parent, found, getErr := repository.Get(context.Background(), artifact.Identity)
+	require.NoError(t, getErr)
+	require.True(t, found)
+	assert.Equal(t, map[string]string{modelKey: "/models/model-1"}, parent.Children)
+}
+
 func TestHfArtifactRepositoryRejectsOneSidedRelationshipOnReferenceRemoval(t *testing.T) {
 	modelKey := "default.basemodel.model-1"
 	artifact := testHfArtifactWithStatus(testHfArtifactEntry(t), HfArtifactStatusReady)
@@ -481,11 +590,11 @@ func TestHfArtifactRepositoryRejectsOneSidedRelationshipOnReferenceRemoval(t *te
 		modelKey:     testModelEntryJSON(t, "model-1"),
 	})
 
-	_, err = repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"))
+	_, err = repository.RemoveModelReference(context.Background(), artifact, modelKey, types.UID("model-1-uid"), "/models/model-1")
 	assert.ErrorContains(t, err, "do not contain matching references")
 }
 
-func TestHfArtifactRepositoryFencesStaleModelReferenceMutation(t *testing.T) {
+func TestHfArtifactRepositoryRejectsStaleModelReferenceMutation(t *testing.T) {
 	modelKey := "default.basemodel.model-1"
 	currentUID := types.UID("current-model-uid")
 	staleUID := types.UID("stale-model-uid")
@@ -509,7 +618,7 @@ func TestHfArtifactRepositoryFencesStaleModelReferenceMutation(t *testing.T) {
 	assert.Empty(t, stored.Children)
 
 	require.NoError(t, repository.AddModelReference(context.Background(), artifact, modelKey, currentUID, "/models/model-1"))
-	removal, err := repository.RemoveModelReference(context.Background(), artifact, modelKey, staleUID)
+	removal, err := repository.RemoveModelReference(context.Background(), artifact, modelKey, staleUID, "/models/model-1")
 	require.NoError(t, err)
 	assert.False(t, removal.ReferenceRemoved)
 

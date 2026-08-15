@@ -56,6 +56,72 @@ func (r *HfArtifactRepository) Get(ctx context.Context, identity HfArtifactIdent
 	return stored, true, nil
 }
 
+// GetParentForChild follows a child's persisted parent reference and verifies
+// both relationship directions from one ConfigMap snapshot. With a nil error,
+// found=false means the child entry or its HfArtifactKey is absent; it says
+// nothing about local symlinks or a parent entry that still lists the child.
+func (r *HfArtifactRepository) GetParentForChild(ctx context.Context, childModelKey string) (HfArtifactEntry, bool, error) {
+	if strings.TrimSpace(childModelKey) == "" || isHfArtifactConfigMapKey(childModelKey) {
+		return HfArtifactEntry{}, false, fmt.Errorf("invalid child model ConfigMap key %q", childModelKey)
+	}
+	configMap, err := r.configMaps.getConfigMap(ctx)
+	if err != nil {
+		return HfArtifactEntry{}, false, err
+	}
+	if configMap.Data == nil {
+		return HfArtifactEntry{}, false, nil
+	}
+	if _, exists := configMap.Data[childModelKey]; !exists {
+		return HfArtifactEntry{}, false, nil
+	}
+	child, err := existingModelEntry(configMap.Data, childModelKey)
+	if err != nil {
+		return HfArtifactEntry{}, false, err
+	}
+	return parentForChildEntry(configMap.Data, childModelKey, child)
+}
+
+// parentForChildEntry resolves both relationship directions from the same
+// snapshot as the decoded child. An existing child may have no parent yet.
+func parentForChildEntry(data map[string]string, childModelKey string, child ModelEntry) (HfArtifactEntry, bool, error) {
+	if child.HfArtifactKey == "" {
+		return HfArtifactEntry{}, false, nil
+	}
+	if !isHfArtifactConfigMapKey(child.HfArtifactKey) {
+		return HfArtifactEntry{}, false, fmt.Errorf("child model %s has invalid Hugging Face parent key %s", childModelKey, child.HfArtifactKey)
+	}
+	raw, exists := data[child.HfArtifactKey]
+	if !exists {
+		return HfArtifactEntry{}, false, fmt.Errorf("child model %s references missing Hugging Face parent %s", childModelKey, child.HfArtifactKey)
+	}
+	parent, err := decodeHfArtifactEntry(child.HfArtifactKey, raw)
+	if err != nil {
+		return HfArtifactEntry{}, false, err
+	}
+	if parent.Key != child.HfArtifactKey {
+		return HfArtifactEntry{}, false, fmt.Errorf("Hugging Face parent entry %s records key %s", child.HfArtifactKey, parent.Key)
+	}
+	if err := validateHfArtifactIdentityAndPath(parent); err != nil {
+		return HfArtifactEntry{}, false, err
+	}
+	if !isValidHfArtifactStatus(parent.Status) {
+		return HfArtifactEntry{}, false, fmt.Errorf("Hugging Face parent %s has invalid status %q", parent.Key, parent.Status)
+	}
+	if childPath, found := parent.Children[childModelKey]; !found || strings.TrimSpace(childPath) == "" {
+		return HfArtifactEntry{}, false, fmt.Errorf("child model %s and Hugging Face parent %s do not contain matching references", childModelKey, parent.Key)
+	}
+	return parent, true, nil
+}
+
+// isChildMutationBlocked reports whether in-memory model UID checks reject
+// changes from this child CR instance: deletion invalidated its UID, or the
+// cached model has a different UID. A missing UID is also blocked when the key
+// has invalidated UIDs. It does not inspect parent status or lock ownership,
+// and false does not prove that the CR still exists.
+func (r *HfArtifactRepository) isChildMutationBlocked(childModelKey string, childModelUID types.UID) bool {
+	return r.configMaps.isModelMutationBlocked(childModelKey, childModelUID)
+}
+
 // TryAcquireLock atomically creates or locks an artifact that needs work.
 // When acquired is true, the returned artifact is Updating and its LockID is
 // owned by the caller. When acquired is false, the artifact is either Ready or
@@ -220,6 +286,17 @@ func (r *HfArtifactRepository) AddModelReference(ctx context.Context, expected H
 		if stored.Children == nil {
 			stored.Children = make(map[string]string)
 		}
+		// A retry may confirm the same path, but must not silently replace the
+		// recorded path and leave the old child symlink untracked.
+		if storedChildPath, exists := stored.Children[modelKey]; exists &&
+			filepath.Clean(storedChildPath) != filepath.Clean(modelPath) {
+			return false, fmt.Errorf(
+				"child model %s path %s does not match recorded child path %s",
+				modelKey,
+				modelPath,
+				storedChildPath,
+			)
+		}
 		stored.Children[modelKey] = modelPath
 		model.HfArtifactKey = stored.Key
 
@@ -237,9 +314,19 @@ func (r *HfArtifactRepository) AddModelReference(ctx context.Context, expected H
 // replacement model's reference. It refuses partial records so cleanup cannot
 // delete an artifact that may still be referenced. Removing the final
 // reference also moves the artifact to Updating under a new deletion LockID.
-func (r *HfArtifactRepository) RemoveModelReference(ctx context.Context, expected HfArtifactEntry, modelKey string, modelUID types.UID) (RemoveModelReferenceResult, error) {
+// expectedModelPath must match the stored child path; it is not a replacement path.
+func (r *HfArtifactRepository) RemoveModelReference(
+	ctx context.Context,
+	expected HfArtifactEntry,
+	modelKey string,
+	modelUID types.UID,
+	expectedModelPath string,
+) (RemoveModelReferenceResult, error) {
 	if err := validateHfArtifactIdentityAndPath(expected); err != nil {
 		return RemoveModelReferenceResult{}, err
+	}
+	if strings.TrimSpace(expectedModelPath) == "" {
+		return RemoveModelReferenceResult{}, fmt.Errorf("model path is empty")
 	}
 	var result RemoveModelReferenceResult
 	err := r.configMaps.mutateConfigMapWithRetry(ctx, func(configMap *corev1.ConfigMap) (bool, error) {
@@ -273,7 +360,7 @@ func (r *HfArtifactRepository) RemoveModelReference(ctx context.Context, expecte
 			return false, fmt.Errorf("Hugging Face artifact %s is Updating", stored.Key)
 		}
 
-		modelPath, artifactReferencesModel := stored.Children[modelKey]
+		storedModelPath, artifactReferencesModel := stored.Children[modelKey]
 		model, modelErr := existingModelEntry(configMap.Data, modelKey)
 		if modelErr != nil {
 			if artifactReferencesModel {
@@ -294,8 +381,16 @@ func (r *HfArtifactRepository) RemoveModelReference(ctx context.Context, expecte
 		if !artifactReferencesModel {
 			return false, nil
 		}
-		if strings.TrimSpace(modelPath) == "" {
+		if strings.TrimSpace(storedModelPath) == "" {
 			return false, fmt.Errorf("Hugging Face artifact %s has an empty path for model %s", stored.Key, modelKey)
+		}
+		if filepath.Clean(storedModelPath) != filepath.Clean(expectedModelPath) {
+			return false, fmt.Errorf(
+				"model %s path %s does not match recorded child path %s",
+				modelKey,
+				expectedModelPath,
+				storedModelPath,
+			)
 		}
 
 		delete(stored.Children, modelKey)
