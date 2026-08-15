@@ -1051,6 +1051,9 @@ const (
 	ArtifactUploadLockFileName     = ".ome-artifact-upload.lock"
 	ArtifactUploadLockBody         = "uploading\n"
 	HfArtifactConfigMapKeyPrefix   = "artifact.huggingface."
+	// HfArtifactReadyMarkerFileName is node-local; its body records the parent
+	// download LockID. It is distinct from the Object Storage completion marker.
+	HfArtifactReadyMarkerFileName = ".ome-hf-artifact-ready"
 	// ModelArtifactsDirectory contains node-local artifacts shared by model paths.
 	ModelArtifactsDirectory = "_artifacts"
 )
