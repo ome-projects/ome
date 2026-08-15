@@ -87,9 +87,9 @@ func TestHfArtifactConfigMapKeyAndCanonicalPath(t *testing.T) {
 	assert.True(t, strings.HasPrefix(key, "artifact.huggingface.Qwen.Qwen3-8B."))
 	assert.True(t, strings.HasSuffix(key, "."+testHFCommitSHA))
 
-	path := canonicalHfArtifactPath("/mnt/data/models/customer-model-store/model-ocid", identity)
+	path := canonicalHfArtifactPath("/models/store/model-1", identity)
 	assert.Equal(t, filepath.Join(
-		"/mnt/data/models/customer-model-store",
+		"/models/store",
 		"_artifacts",
 		"Qwen",
 		"Qwen3-8B",
