@@ -672,6 +672,7 @@ modelAgent:
   # Same shape and intent as ome.controller.podAnnotations above.
   podAnnotations: {}
   hostPath: /mnt/data/models
+  modelVerificationConcurrency: 1
   priorityClassName: system-node-critical
   serviceAccountName: ome-model-agent
   image:
