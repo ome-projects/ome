@@ -32,20 +32,21 @@ import (
 
 // config holds all configuration parameters for the model agent
 type config struct {
-	port                  int
-	modelsRootDir         string
-	modelsRootDirOnHost   string
-	nodeName              string
-	nodeLabelRetry        int
-	concurrency           int
-	multipartConcurrency  int
-	downloadRetry         int
-	downloadAuthType      string
-	numDownloadWorker     int
-	numHighPriorityWorker int
-	samePathWaitTimeout   time.Duration
-	namespace             string
-	logLevel              string
+	port                         int
+	modelsRootDir                string
+	modelsRootDirOnHost          string
+	nodeName                     string
+	nodeLabelRetry               int
+	concurrency                  int
+	multipartConcurrency         int
+	modelVerificationConcurrency int
+	downloadRetry                int
+	downloadAuthType             string
+	numDownloadWorker            int
+	numHighPriorityWorker        int
+	samePathWaitTimeout          time.Duration
+	namespace                    string
+	logLevel                     string
 }
 
 // Logger type alias for zap.SugaredLogger
@@ -73,6 +74,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.downloadRetry, "download-retry", 3, "Number of retries for downloading")
 	rootCmd.PersistentFlags().IntVar(&cfg.concurrency, "concurrency", 4, "Number of concurrent download workers per gopher")
 	rootCmd.PersistentFlags().IntVar(&cfg.multipartConcurrency, "multipart-concurrency", 4, "Number of concurrent multipart download workers per gopher")
+	rootCmd.PersistentFlags().IntVar(&cfg.modelVerificationConcurrency, "model-verification-concurrency", 1, "Maximum concurrent OCI model file integrity checks across the model-agent pod")
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
@@ -274,6 +276,7 @@ func initializeComponents(
 		logger,
 		baseModelInformer.Lister(),
 		clusterBaseModelInformer.Lister(),
+		modelagent.WithModelVerificationConcurrency(cfg.modelVerificationConcurrency),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)

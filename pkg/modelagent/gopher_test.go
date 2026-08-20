@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/ociobjectstore"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -1129,6 +1132,87 @@ func TestEnqueueTaskClassifiesStartupReadyLocalPathAsRevalidation(t *testing.T) 
 	assert.True(t, task.NormalPriorityOnly)
 	assert.True(t, task.RevalidationReplay)
 	assert.Equal(t, 0, g.taskQueue.len())
+}
+
+func TestWithModelVerificationConcurrencyCreatesSharedLimiter(t *testing.T) {
+	g := &Gopher{}
+
+	WithModelVerificationConcurrency(8)(g)
+
+	assert.Equal(t, 8, g.modelVerificationConcurrency)
+	require.NotNil(t, g.modelVerificationLimiter)
+	assert.Equal(t, 8, g.modelVerificationLimiter.limit())
+
+	WithModelVerificationConcurrency(0)(g)
+	assert.Equal(t, 1, g.modelVerificationConcurrency)
+	require.NotNil(t, g.modelVerificationLimiter)
+	assert.Equal(t, 1, g.modelVerificationLimiter.limit())
+}
+
+func TestVerificationConcurrencyIsSharedAcrossModels(t *testing.T) {
+	g := &Gopher{}
+	WithModelVerificationConcurrency(3)(g)
+
+	uris := make([]ociobjectstore.ObjectURI, 12)
+	for i := range uris {
+		uris[i] = ociobjectstore.ObjectURI{ObjectName: fmt.Sprintf("model/file-%02d", i), Prefix: "model"}
+	}
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	validate := func(_ ociobjectstore.ObjectURI, _ string) (bool, error) {
+		current := active.Add(1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed || maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		active.Add(-1)
+		return true, nil
+	}
+
+	start := make(chan struct{})
+	var runs sync.WaitGroup
+	runs.Add(2)
+	for range 2 {
+		go func() {
+			defer runs.Done()
+			<-start
+			errs := g.verifyDownloadedFilesWithValidator(uris, "/models", validate)
+			assert.Empty(t, errs)
+		}()
+	}
+	close(start)
+	runs.Wait()
+
+	assert.Equal(t, int32(3), maxActive.Load())
+}
+
+func TestVerifyDownloadedFilesWithValidatorReportsFailures(t *testing.T) {
+	g := &Gopher{}
+	WithModelVerificationConcurrency(2)(g)
+	uris := []ociobjectstore.ObjectURI{
+		{ObjectName: "model/valid", Prefix: "model"},
+		{ObjectName: "model/mismatch", Prefix: "model"},
+		{ObjectName: "model/error", Prefix: "model"},
+	}
+
+	errs := g.verifyDownloadedFilesWithValidator(uris, "/models", func(obj ociobjectstore.ObjectURI, _ string) (bool, error) {
+		switch obj.ObjectName {
+		case "model/mismatch":
+			return false, nil
+		case "model/error":
+			return false, errors.New("read failed")
+		default:
+			return true, nil
+		}
+	})
+
+	require.Len(t, errs, 2)
+	assert.ErrorContains(t, errs["model/mismatch"], "MD5 or size mismatch")
+	assert.EqualError(t, errs["model/error"], "read failed")
 }
 
 func TestCaptureStartupReadyModelsCapturesOnlyReadyEntries(t *testing.T) {
