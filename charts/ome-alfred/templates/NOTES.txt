@@ -1,0 +1,19 @@
+{{- if .Values.enabled }}
+Alfred is deployed in {{ .Release.Namespace }} (mode: {{ .Values.alfredConfig.mode }}).
+
+Watch what it observes and recommends:
+
+  # Snapshot-derived gauges (any replica):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/ome-alfred-metrics {{ .Values.metrics.port }}:{{ .Values.metrics.port }}
+  curl -s localhost:{{ .Values.metrics.port }}/metrics | grep '^alfred_'
+
+  # Recommendations:
+  kubectl get events -A --field-selector reason=RecommendationWithheld
+  kubectl -n {{ .Release.Namespace }} get cm {{ include "ome-alfred.recommendationsName" . }} -o jsonpath='{.data.last-cycle\.json}'
+
+Policy configuration hot-reloads from the {{ .Values.configMapName }} ConfigMap;
+an edit that fails validation is rejected and the last-known-good stays in
+force (see the PolicyReloadFailed events on the ConfigMap if edits do not land).
+{{- else }}
+ome-alfred is disabled (enabled: false); nothing was installed.
+{{- end }}

@@ -1,0 +1,121 @@
+{{- if .Values.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ome-alfred
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+---
+# Alfred's cluster-scoped permissions are read-only plus two narrow writes
+# (OEP-0008 §RBAC): no node writes, no pod writes, no pods/eviction. Every
+# pod-level action is executed by the controller that owns the workload.
+# Anything confined to Alfred's own namespace — its ConfigMaps, its
+# leader-election Lease — lives in the namespaced Role instead.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-alfred
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+rules:
+  # Nodes (read-only) — no cordon, no drain, no patch.
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "list", "watch" ]
+
+  # Pods (read-only) — candidate selection reads placement; eviction is the
+  # owning controller's job.
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "get", "list", "watch" ]
+
+  # PVCs / PVs (read-only) — PVC-backed model topology in the snapshot.
+  - apiGroups: [ "" ]
+    resources: [ "persistentvolumeclaims", "persistentvolumes" ]
+    verbs: [ "get", "list", "watch" ]
+
+  # Events — recommendations, migrations, evacuation and repair signals, on
+  # workloads and nodes in any namespace.
+  - apiGroups: [ "" ]
+    resources: [ "events" ]
+    verbs: [ "create", "patch" ]
+
+  # OME CRDs (read).
+  - apiGroups: [ "ome.io" ]
+    resources:
+      - inferenceservices
+      - inferenceservices/status
+      - servingruntimes
+      - clusterservingruntimes
+      - basemodels
+      - clusterbasemodels
+    verbs: [ "get", "list", "watch" ]
+
+  # The single executable contract: migration-request annotations on
+  # InferenceServices, written only in execute mode.
+  - apiGroups: [ "ome.io" ]
+    resources: [ "inferenceservices" ]
+    verbs: [ "patch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-alfred
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-alfred
+subjects:
+- kind: ServiceAccount
+  name: ome-alfred
+  namespace: {{ .Release.Namespace }}
+---
+# Everything Alfred touches only inside its own namespace. These rules are
+# deliberately not in the ClusterRole: a resourceNames restriction cannot
+# narrow a cluster-wide list/watch, so granting ConfigMap reads there would
+# expose every ConfigMap in the cluster.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ome-alfred
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+rules:
+  # ConfigMaps: read for policy loading — Alfred's informer cache is scoped
+  # to this namespace — and write only to the two pre-created Alfred-owned
+  # ConfigMaps, which it never creates at runtime.
+  - apiGroups: [ "" ]
+    resources: [ "configmaps" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "" ]
+    resources: [ "configmaps" ]
+    verbs: [ "update", "patch", "delete" ]
+    resourceNames:
+      - {{ .Values.configMapName }}
+      - {{ include "ome-alfred.recommendationsName" . }}
+
+  # Leader election — the alfred.ome.io Lease lives in Alfred's namespace.
+  - apiGroups: [ "coordination.k8s.io" ]
+    resources: [ "leases" ]
+    verbs: [ "create", "get", "update" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ome-alfred
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ome-alfred
+subjects:
+- kind: ServiceAccount
+  name: ome-alfred
+  namespace: {{ .Release.Namespace }}
+{{- end }}

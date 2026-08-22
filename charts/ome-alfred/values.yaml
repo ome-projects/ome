@@ -1,0 +1,137 @@
+# Whether this chart renders anything: lets ome-alfred ship disabled as a
+# dependency of an umbrella chart (the modelAgent.enabled pattern).
+enabled: true
+
+global:
+  # Image hub prefixed to the repository unless the repository already
+  # contains a '/' (the same helper contract as ome-resources).
+  hub: "ghcr.io/moirai-internal"
+  imagePullSecrets: []
+
+# Production runs three replicas: every replica runs the read-only
+# observation loop (scrape any pod), only the leader decides.
+replicaCount: 3
+
+image:
+  repository: alfred
+  # CI publishes no released alfred tag yet; pin this to a digest once
+  # alfred joins the image matrix (build one with `make push-alfred-image`).
+  tag: latest
+  pullPolicy: Always
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  # The cluster-wide pod cache dominates Alfred's memory; raise the memory
+  # limit on clusters with many thousands of pods.
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+metrics:
+  port: 8080
+  serviceMonitor:
+    # Requires the Prometheus Operator CRDs.
+    enabled: false
+    additionalLabels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+
+healthPort: 8081
+
+# Name of the policy ConfigMap: the --config-name flag, the rendered
+# ConfigMap, and the namespaced RBAC write grant all follow this value.
+configMapName: alfred-config
+
+# Alfred's policy configuration (OEP-0008 §Configuration), rendered verbatim
+# into <configMapName>'s config.yaml and hot-reloaded by every replica. A
+# config that fails schema validation is rejected at reload and the
+# last-known-good stays in force.
+alfredConfig:
+  schemaVersion: 1
+
+  # recommend-only | execute. recommend-only never dispatches a migration:
+  # policies, arbitration and reporting all run, only the dispatcher is off.
+  mode: recommend-only
+
+  # Loop cadence. earlyTickOn advances the next decision tick on the named
+  # events; it never interrupts a pass ([] disables).
+  decisionLoopInterval: 5m
+  observationLoopInterval: 30s
+  earlyTickOn: [NodeConditionChange]
+
+  policies:
+    defragmentation:
+      enabled: true
+      fragmentationThreshold: 0.25
+      # conservative | balanced | aggressive — a scoring knob, never a
+      # safety bypass.
+      aggressiveness: balanced
+      scoring:
+        # Within-node demand sizes, ascending.
+        sizeLadder: [1, 2, 4, 8]
+        # 0: pure observed demand; 1: pure prior.
+        demandBlendLambda: 0.3
+        # Static prior over demand sizes; keys must be ladder sizes and
+        # weights must sum to 1.
+        sizePrior:
+          "1": 0.1
+          "2": 0.1
+          "4": 0.2
+          "8": 0.6
+        pendingUrgencyTauMinutes: 30
+    nodeHealth:
+      enabled: true
+      aggressiveness: balanced
+      # Consumed from existing node conditions; Alfred never detects health.
+      triggerConditions: [GpuUnhealthy]
+      signalOnly: false
+      healthCooldownFloorMinutes: 5
+      nodeSuspicionWindowMinutes: 30
+
+  # Per-workload defaults; alfred.ome.io/* annotations on an
+  # InferenceService win over these.
+  defaultMovable: true
+  recentPlacementCooldownMinutes: 10
+  perWorkloadCooldownMinutes: 30
+  perNodeCooldownMinutes: 10
+
+  # Execution surfaces — all annotation-mediated; owning controllers execute.
+  rawDeploymentMigrationEnabled: true
+  omenativeMigrationEnabled: true
+  lwsRecommendationsEnabled: true
+
+  # Output. The recommendations ConfigMap is pre-created by this chart;
+  # Alfred updates it but never creates it.
+  recommendationsConfigMapEnabled: true
+  recommendationsConfigMapName: alfred-recommendations
+
+  # Global safety bounds, applied once by the arbiter across every policy.
+  maxInFlightMigrations: 3
+  maxMigrationsPerHour: 10
+  emergencyPendingAgeMinutes: 10
+
+  # Weekly UTC windows gating defrag dispatch; empty means no window
+  # applies. Node-health evacuation deliberately overrides them.
+  # maintenanceWindows:
+  #   - days: [Sat, Sun]
+  #     start: "02:00"
+  #     end: "06:00"
+  maintenanceWindows: []
+
+  spotPolicy:
+    avoidAsTarget: true
+    preferAsSource: true
+    preemptibleLabels:
+      - node.kubernetes.io/preemptible
+      - cloud.google.com/gke-preemptible
+
+  allowCrossTenantOptimization: true
+
+  logLevel: info
+  structuredLogging: true

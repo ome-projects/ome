@@ -1,0 +1,26 @@
+{{- if .Values.enabled }}
+# Alfred's policy configuration (OEP-0008 §Configuration). Alfred watches
+# this ConfigMap and hot-reloads it; a config that fails schema validation is
+# rejected and the last-known-good stays in force.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMapName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- .Values.alfredConfig | toYaml | nindent 4 }}
+---
+# Pre-created because Alfred's RBAC lets it update but never create a
+# ConfigMap; the reporter writes its recommendations here. Data written by
+# Alfred is not managed by this chart and survives upgrades.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ome-alfred.recommendationsName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+{{- end }}
