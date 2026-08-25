@@ -71,6 +71,8 @@ type Gopher struct {
 	baseModelLister        omev1beta1lister.BaseModelLister
 	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister
 
+	modelFileWriteLimiter *ociobjectstore.WriteLimiter
+
 	// Track active downloads for cancellation
 	activeDownloads      map[string]activeDownload // key: model UID
 	activeDownloadsMutex sync.RWMutex
@@ -90,6 +92,21 @@ const (
 	defaultStartupReadySnapshotTimeout = 5 * time.Second
 )
 
+// GopherOption configures a Gopher.
+type GopherOption func(*Gopher) error
+
+// WithModelFileWriteConcurrency sets the process-wide model-file write limit.
+func WithModelFileWriteConcurrency(concurrency int) GopherOption {
+	return func(gopher *Gopher) error {
+		limiter, err := ociobjectstore.NewWriteLimiter(concurrency)
+		if err != nil {
+			return err
+		}
+		gopher.modelFileWriteLimiter = limiter
+		return nil
+	}
+}
+
 func NewGopher(
 	modelConfigParser *modelparser.ModelConfigParser,
 	configMapReconciler *ConfigMapReconciler,
@@ -105,7 +122,9 @@ func NewGopher(
 	metrics *Metrics,
 	logger *zap.SugaredLogger,
 	baseModelLister omev1beta1lister.BaseModelLister,
-	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister) (*Gopher, error) {
+	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister,
+	opts ...GopherOption,
+) (*Gopher, error) {
 
 	if xetConfig == nil {
 		return nil, fmt.Errorf("xet hugging face config cannot be nil")
@@ -114,7 +133,7 @@ func NewGopher(
 		samePathWaitTimeout = defaultSamePathWaitTimeout
 	}
 
-	return &Gopher{
+	gopher := &Gopher{
 		modelConfigParser:      modelConfigParser,
 		configMapReconciler:    configMapReconciler,
 		downloadRetry:          downloadRetry,
@@ -133,7 +152,13 @@ func NewGopher(
 		taskQueue:              newGopherTaskQueue(),
 		samePathWaitDelay:      defaultSamePathWaitDelay,
 		samePathWaitTimeout:    samePathWaitTimeout,
-	}, nil
+	}
+	for _, opt := range opts {
+		if err := opt(gopher); err != nil {
+			return nil, fmt.Errorf("invalid gopher option: %w", err)
+		}
+	}
+	return gopher, nil
 }
 
 func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int, numHighPriorityWorker int) {
@@ -1015,6 +1040,7 @@ func (s *Gopher) createOCIOSDataStore(baseModelSpec v1beta1.BaseModelSpec) (*oci
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ociobjectstore data store: %w", err)
 	}
+	ociOSDS.SetModelFileWriteLimiter(s.modelFileWriteLimiter)
 
 	return ociOSDS, nil
 }

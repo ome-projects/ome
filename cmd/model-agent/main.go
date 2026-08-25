@@ -46,10 +46,14 @@ type config struct {
 	samePathWaitTimeout   time.Duration
 	namespace             string
 	logLevel              string
+
+	modelFileWriteConcurrency int
 }
 
 // Logger type alias for zap.SugaredLogger
 type Logger = zap.SugaredLogger
+
+const defaultModelFileWriteConcurrency = 8
 
 // Global variables
 var (
@@ -73,6 +77,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.downloadRetry, "download-retry", 3, "Number of retries for downloading")
 	rootCmd.PersistentFlags().IntVar(&cfg.concurrency, "concurrency", 4, "Number of concurrent download workers per gopher")
 	rootCmd.PersistentFlags().IntVar(&cfg.multipartConcurrency, "multipart-concurrency", 4, "Number of concurrent multipart download workers per gopher")
+	rootCmd.PersistentFlags().IntVar(&cfg.modelFileWriteConcurrency, "model-file-write-concurrency", defaultModelFileWriteConcurrency, "Maximum concurrent model-file WriteAt calls across the model-agent pod; must be greater than zero")
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
@@ -274,6 +279,7 @@ func initializeComponents(
 		logger,
 		baseModelInformer.Lister(),
 		clusterBaseModelInformer.Lister(),
+		modelagent.WithModelFileWriteConcurrency(cfg.modelFileWriteConcurrency),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)

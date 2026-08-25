@@ -30,9 +30,14 @@ import (
 // OCIOSDataStore performs data store operations against Oracle Object Storage.
 // It provides file upload, download, listing, and validation methods.
 type OCIOSDataStore struct {
-	logger logging.Interface
-	Config *Config
-	Client *objectstorage.ObjectStorageClient `validate:"required"`
+	logger                logging.Interface
+	modelFileWriteLimiter *WriteLimiter
+	Config                *Config
+	Client                *objectstorage.ObjectStorageClient `validate:"required"`
+}
+
+func (cds *OCIOSDataStore) SetModelFileWriteLimiter(limiter *WriteLimiter) {
+	cds.modelFileWriteLimiter = limiter
 }
 
 // DownloadOptions defines parameters to control DownloadWithStrategy behavior.

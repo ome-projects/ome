@@ -1,4 +1,9 @@
 {{- if .Values.modelAgent.enabled }}
+{{- $modelFileWriteConcurrency := toString .Values.modelAgent.modelFileWriteConcurrency }}
+{{- $parsedModelFileWriteConcurrency := atoi $modelFileWriteConcurrency }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" $modelFileWriteConcurrency)) (ne (toString $parsedModelFileWriteConcurrency) $modelFileWriteConcurrency) }}
+{{- fail "modelAgent.modelFileWriteConcurrency must be a positive integer within the supported range" }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -61,6 +66,8 @@ spec:
         - '2'
         - --num-high-priority-worker
         - '1'
+        - --model-file-write-concurrency
+        - {{ $parsedModelFileWriteConcurrency | quote }}
         - --same-path-wait-timeout
         - 30m
         env:

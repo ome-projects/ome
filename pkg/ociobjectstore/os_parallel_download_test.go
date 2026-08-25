@@ -1,9 +1,17 @@
 package ociobjectstore
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -92,49 +100,293 @@ func TestSplitToParts(t *testing.T) {
 
 func TestDownloadedPart(t *testing.T) {
 	t.Run("Create DownloadedPart", func(t *testing.T) {
-		// Create a temporary file for testing
-		tempFile, err := os.CreateTemp("", "test_download_part_*.tmp")
-		require.NoError(t, err)
-		defer os.Remove(tempFile.Name())
-
-		testContent := []byte("test content")
-		_, err = tempFile.Write(testContent)
-		require.NoError(t, err)
-		tempFile.Close()
-
 		part := &DownloadedPart{
-			size:         1024,
-			tempFilePath: tempFile.Name(),
-			offset:       0,
-			partNum:      1,
-			err:          nil,
+			size:    1024,
+			partNum: 1,
+			err:     nil,
 		}
 
 		assert.Equal(t, int64(1024), part.size)
-		assert.Equal(t, tempFile.Name(), part.tempFilePath)
-		assert.Equal(t, int64(0), part.offset)
 		assert.Equal(t, 1, part.partNum)
 		assert.NoError(t, part.err)
-
-		// Verify temp file contains expected content
-		data, err := os.ReadFile(part.tempFilePath)
-		require.NoError(t, err)
-		assert.Equal(t, testContent, data)
 	})
 
 	t.Run("DownloadedPart with error", func(t *testing.T) {
 		part := &DownloadedPart{
-			size:         0,
-			tempFilePath: "",
-			offset:       0,
-			partNum:      1,
-			err:          assert.AnError,
+			size:    0,
+			partNum: 1,
+			err:     assert.AnError,
 		}
 
 		assert.Equal(t, int64(0), part.size)
-		assert.Equal(t, "", part.tempFilePath)
 		assert.Error(t, part.err)
 	})
+}
+
+func TestValidateRangeResponse(t *testing.T) {
+	part := &PrepareDownloadPart{
+		byteRange:  "bytes=250-499",
+		offset:     250,
+		size:       250,
+		objectSize: 1000,
+	}
+	validContentLength := int64(250)
+	validContentRange := "bytes 250-499/1000"
+
+	newResponse := func(statusCode int, contentLength *int64, contentRange *string) objectstorage.GetObjectResponse {
+		return objectstorage.GetObjectResponse{
+			RawResponse:   &http.Response{StatusCode: statusCode},
+			Content:       io.NopCloser(bytes.NewReader(make([]byte, validContentLength))),
+			ContentLength: contentLength,
+			ContentRange:  contentRange,
+		}
+	}
+
+	t.Run("accepts exact partial response", func(t *testing.T) {
+		response := newResponse(http.StatusPartialContent, &validContentLength, &validContentRange)
+		assert.NoError(t, validateRangeResponse(response, part))
+	})
+
+	t.Run("rejects full object response", func(t *testing.T) {
+		fullObjectLength := int64(1000)
+		response := newResponse(http.StatusOK, &fullObjectLength, nil)
+		err := validateRangeResponse(response, part)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected HTTP 206")
+	})
+
+	t.Run("rejects wrong content range", func(t *testing.T) {
+		wrongContentRange := "bytes 0-249/1000"
+		response := newResponse(http.StatusPartialContent, &validContentLength, &wrongContentRange)
+		err := validateRangeResponse(response, part)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected Content-Range")
+	})
+
+	t.Run("rejects wrong content length", func(t *testing.T) {
+		wrongContentLength := int64(1000)
+		response := newResponse(http.StatusPartialContent, &wrongContentLength, &validContentRange)
+		err := validateRangeResponse(response, part)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected Content-Length 250")
+	})
+
+	t.Run("rejects missing response body", func(t *testing.T) {
+		response := newResponse(http.StatusPartialContent, &validContentLength, &validContentRange)
+		response.Content = nil
+		err := validateRangeResponse(response, part)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing response body")
+	})
+}
+
+func TestWritePartAtConcurrentOffsets(t *testing.T) {
+	contents := [][]byte{
+		bytes.Repeat([]byte("a"), 64*1024),
+		bytes.Repeat([]byte("b"), 64*1024),
+		bytes.Repeat([]byte("c"), 64*1024),
+		bytes.Repeat([]byte("d"), 31*1024),
+	}
+
+	var totalSize int64
+	parts := make([]*PrepareDownloadPart, 0, len(contents))
+	for i, content := range contents {
+		parts = append(parts, &PrepareDownloadPart{
+			offset:  totalSize,
+			partNum: i,
+			size:    int64(len(content)),
+		})
+		totalSize += int64(len(content))
+	}
+
+	target, err := os.CreateTemp(t.TempDir(), "direct-write-*.temp")
+	require.NoError(t, err)
+	defer target.Close()
+	_, err = preallocateFile(target, totalSize)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errorsByPart := make(chan error, len(parts))
+	// Start in reverse order to prove correctness does not depend on a shared
+	// file cursor or in-order part completion.
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+		content := contents[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			written, writeErr := writePartAt(target, part, bytes.NewReader(content))
+			if writeErr == nil && written != int64(len(content)) {
+				writeErr = errors.New("unexpected written byte count")
+			}
+			errorsByPart <- writeErr
+		}()
+	}
+	wg.Wait()
+	close(errorsByPart)
+	for writeErr := range errorsByPart {
+		require.NoError(t, writeErr)
+	}
+
+	require.NoError(t, target.Sync())
+	actual, err := os.ReadFile(target.Name())
+	require.NoError(t, err)
+	assert.Equal(t, bytes.Join(contents, nil), actual)
+}
+
+func TestWritePartAtRejectsShortResponse(t *testing.T) {
+	target, err := os.CreateTemp(t.TempDir(), "short-response-*.temp")
+	require.NoError(t, err)
+	defer target.Close()
+	_, err = preallocateFile(target, 8)
+	require.NoError(t, err)
+
+	part := &PrepareDownloadPart{offset: 0, partNum: 0, size: 8}
+	written, err := writePartAt(target, part, bytes.NewReader([]byte("short")))
+
+	assert.Equal(t, int64(5), written)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+func TestWritePartAtDoesNotCrossPartBoundary(t *testing.T) {
+	target, err := os.CreateTemp(t.TempDir(), "long-response-*.temp")
+	require.NoError(t, err)
+	defer target.Close()
+	_, err = preallocateFile(target, 8)
+	require.NoError(t, err)
+
+	part := &PrepareDownloadPart{offset: 2, partNum: 0, size: 3}
+	written, err := writePartAt(target, part, bytes.NewReader([]byte("toolong")))
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), written)
+
+	actual, err := os.ReadFile(target.Name())
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0, 0, 't', 'o', 'o', 0, 0, 0}, actual)
+}
+
+func TestWritePartAtRetryOverwritesPartialRange(t *testing.T) {
+	target, err := os.CreateTemp(t.TempDir(), "retry-*.temp")
+	require.NoError(t, err)
+	defer target.Close()
+	_, err = preallocateFile(target, 8)
+	require.NoError(t, err)
+
+	part := &PrepareDownloadPart{offset: 0, partNum: 0, size: 8}
+	written, err := writePartAt(target, part, bytes.NewReader([]byte("bad")))
+	assert.Equal(t, int64(3), written)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+	written, err = writePartAt(target, part, bytes.NewReader([]byte("complete")))
+	require.NoError(t, err)
+	assert.Equal(t, int64(8), written)
+
+	actual, err := os.ReadFile(target.Name())
+	require.NoError(t, err)
+	assert.Equal(t, []byte("complete"), actual)
+}
+
+func TestCopyCoalescedCombinesShortReadsIntoOneMiBWrites(t *testing.T) {
+	content := bytes.Repeat([]byte("x"), 2*1024*1024+512*1024)
+	destination := &countingWriter{}
+	written, err := copyCoalesced(destination, &fixedChunkReader{
+		reader:    bytes.NewReader(content),
+		chunkSize: 16 * 1024,
+	}, make([]byte, 1024*1024))
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(content)), written)
+	assert.Equal(t, 3, destination.calls)
+	assert.Equal(t, content, destination.Bytes())
+}
+
+func TestWriteLimiterCapsConcurrentWrites(t *testing.T) {
+	const (
+		limit      = 4
+		writeCount = 32
+	)
+	limiter, err := NewWriteLimiter(limit)
+	require.NoError(t, err)
+	destination := &concurrencyTrackingWriter{}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for i := 0; i < writeCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			writer := &modelFileWriter{writer: destination, limiter: limiter}
+			_, _ = writer.Write([]byte("test"))
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, limit, limiter.Limit())
+	assert.LessOrEqual(t, destination.maximum(), limit)
+	assert.Greater(t, destination.maximum(), 1)
+}
+
+func TestNewWriteLimiterRejectsNonPositiveConcurrency(t *testing.T) {
+	for _, concurrency := range []int{0, -1} {
+		t.Run(fmt.Sprintf("concurrency_%d", concurrency), func(t *testing.T) {
+			limiter, err := NewWriteLimiter(concurrency)
+
+			require.Error(t, err)
+			assert.Nil(t, limiter)
+		})
+	}
+}
+
+type countingWriter struct {
+	bytes.Buffer
+	calls int
+}
+
+func (w *countingWriter) Write(buffer []byte) (int, error) {
+	w.calls++
+	return w.Buffer.Write(buffer)
+}
+
+type fixedChunkReader struct {
+	reader    io.Reader
+	chunkSize int
+}
+
+func (r *fixedChunkReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > r.chunkSize {
+		buffer = buffer[:r.chunkSize]
+	}
+	return r.reader.Read(buffer)
+}
+
+type concurrencyTrackingWriter struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+}
+
+func (writer *concurrencyTrackingWriter) Write(buffer []byte) (int, error) {
+	writer.mu.Lock()
+	writer.active++
+	if writer.active > writer.maxActive {
+		writer.maxActive = writer.active
+	}
+	writer.mu.Unlock()
+
+	time.Sleep(10 * time.Millisecond)
+
+	writer.mu.Lock()
+	writer.active--
+	writer.mu.Unlock()
+	return len(buffer), nil
+}
+
+func (writer *concurrencyTrackingWriter) maximum() int {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.maxActive
 }
 
 func TestPrepareDownloadPart(t *testing.T) {
