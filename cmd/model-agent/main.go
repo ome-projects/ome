@@ -79,7 +79,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().IntVar(&cfg.taskSchedulerCapacity, "task-scheduler-capacity", 4096, "Maximum number of distinct queued model tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
-	rootCmd.PersistentFlags().BoolVar(&cfg.demandPriorityEnabled, "demand-priority-enabled", true, "Prioritize compatible models referenced by InferenceServices")
+	rootCmd.PersistentFlags().BoolVar(&cfg.demandPriorityEnabled, "demand-priority-enabled", false, "Prioritize compatible models referenced by InferenceServices")
 	rootCmd.PersistentFlags().StringVar(&cfg.namespace, "namespace", "ome", "Kubernetes namespace to use")
 	rootCmd.PersistentFlags().StringVar(&cfg.logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 

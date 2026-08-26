@@ -134,6 +134,26 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "ome", cfg.namespace)
 }
 
+func TestSchedulingContractFlagsAreRegistered(t *testing.T) {
+	tests := []struct {
+		name         string
+		defaultValue string
+	}{
+		{name: "num-high-priority-worker", defaultValue: "1"},
+		{name: "task-scheduler-capacity", defaultValue: "4096"},
+		{name: "same-path-wait-timeout", defaultValue: "30m0s"},
+		{name: "demand-priority-enabled", defaultValue: "false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flag := rootCmd.PersistentFlags().Lookup(tt.name)
+			require.NotNil(t, flag, "model-agent must expose --%s", tt.name)
+			assert.Equal(t, tt.defaultValue, flag.DefValue)
+		})
+	}
+}
+
 func TestInitializeLogger(t *testing.T) {
 	// Use Viper directly for logger configuration
 	testViper := viper.New()
