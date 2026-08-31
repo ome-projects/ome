@@ -138,6 +138,9 @@ func TestBuildOMENativeRejectsInvalidIRAndPodEvidence(t *testing.T) {
 		{name: "wrong IR owner name", mutate: func(f *omeNativeFixture) { f.ir.OwnerReferences[0].Name = "other" }},
 		{name: "wrong IR owner UID", mutate: func(f *omeNativeFixture) { f.ir.OwnerReferences[0].UID = "other-uid" }},
 		{name: "wrong IR owner API group", mutate: func(f *omeNativeFixture) { f.ir.OwnerReferences[0].APIVersion = "apps/v1" }},
+		{name: "wrong IR owner API version in same group", mutate: func(f *omeNativeFixture) {
+			f.ir.OwnerReferences[0].APIVersion = v1beta1.SchemeGroupVersion.Group + "/v1alpha1"
+		}},
 		{name: "invalid encoding", mutate: func(f *omeNativeFixture) {
 			encoding := v1beta1.InstanceStatusEncoding("FutureV3")
 			f.ir.Status.InstanceStatusEncoding = &encoding
@@ -220,6 +223,21 @@ func TestBuildOMENativePreservesCoherentNonSteadyObservation(t *testing.T) {
 	}
 }
 
+func TestBuildOMENativeKeepsStatusAndLivePodCountsSeparate(t *testing.T) {
+	fixture := newOMENativeFixture()
+	row := &fixture.ir.Status.InstanceStatuses[0]
+	row.Phase = v1beta1.OMENativeInstanceMigrating
+	row.Operation = &v1beta1.InstanceOperation{ID: "migration-3"}
+	row.PodCount = 7
+	fixture.pods = append(fixture.pods, omeNativePod(fixture, 3, 1, "default", 1, "node-b"))
+
+	component := buildOMENativeFixture(t, fixture)
+	instance := component.Instances[0]
+	if !component.ObservationValid || instance.StatusPods != 7 || instance.ObservedPods != 2 {
+		t.Fatalf("status/live pod counts alias: component=%+v instance=%+v", component, instance)
+	}
+}
+
 func TestBuildOMENativeAllowsTrustworthyTransitionalMembership(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -249,6 +267,18 @@ func TestBuildOMENativeAllowsTrustworthyTransitionalMembership(t *testing.T) {
 				f.pods[0].Finalizers = []string{"test/finalizer"}
 			},
 			want: 1,
+		},
+		{
+			name: "current and terminating stale incarnation share member identity",
+			mutate: func(f *omeNativeFixture) {
+				stale := omeNativePod(f, 3, 2, "default", 0, "node-b")
+				stale.Name += "-stale"
+				now := metav1.Now()
+				stale.DeletionTimestamp = &now
+				stale.Finalizers = []string{"test/finalizer"}
+				f.pods = append(f.pods, stale)
+			},
+			want: 2,
 		},
 	}
 	for _, test := range tests {

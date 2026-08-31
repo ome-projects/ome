@@ -166,6 +166,7 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 		Phase:            v1beta1.OMENativeInstanceReady,
 		Admitted:         true,
 		DesiredPods:      int32(len(nodes)),
+		StatusPods:       int32(len(nodes)),
 		ObservedPods:     int32(len(nodes)),
 		ServingPods:      int32(len(nodes)),
 		AvailablePods:    int32(len(nodes)),

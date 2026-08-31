@@ -50,7 +50,8 @@ func TestSnapshotBuilder(t *testing.T) {
 	}
 	if !svcB.Components[v1beta1.EngineComponent].ObservationValid || !inst.ObservationValid ||
 		inst.Phase != v1beta1.OMENativeInstanceReady || inst.Incarnation != 1 ||
-		inst.DesiredPods != 2 || inst.ObservedPods != 2 || inst.ServingPods != 2 || inst.AvailablePods != 2 {
+		inst.DesiredPods != 2 || inst.StatusPods != 2 || inst.ObservedPods != 2 ||
+		inst.ServingPods != 2 || inst.AvailablePods != 2 {
 		t.Fatalf("synthetic instance must default to structurally valid state: component=%+v instance=%+v",
 			svcB.Components[v1beta1.EngineComponent], inst)
 	}

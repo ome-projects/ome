@@ -5,7 +5,6 @@ import (
 	"sort"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -115,7 +114,7 @@ func buildOMENativeComponent(
 			ServingPods:      row.ServingPodCount,
 			AvailablePods:    row.AvailablePodCount,
 			DesiredPods:      layout.desired,
-			ObservedPods:     row.PodCount,
+			StatusPods:       row.PodCount,
 			ObservationValid: true,
 			NodesSet:         map[string]int{},
 		}
@@ -154,15 +153,15 @@ func buildOMENativeComponent(
 				invalidateInstance(component, instance, observationReasonPodJoin)
 			}
 		}
-		member := podMemberKey{runner: pod.Runner, ordinal: pod.PodOrdinal}
+		member := podMemberKey{incarnation: pod.Incarnation, runner: pod.Runner, ordinal: pod.PodOrdinal}
 		if seen[instance.Index] == nil {
 			seen[instance.Index] = make(map[podMemberKey]struct{})
 		}
 		if _, duplicate := seen[instance.Index][member]; duplicate {
 			invalidateInstance(component, instance, observationReasonPodJoin)
-			continue
+		} else {
+			seen[instance.Index][member] = struct{}{}
 		}
-		seen[instance.Index][member] = struct{}{}
 		addPodToInstance(instance, pod)
 	}
 
@@ -173,7 +172,7 @@ func buildOMENativeComponent(
 		if steady && !steadyMembershipMatches(instance, layout, seen[instance.Index]) {
 			invalidateInstance(component, instance, observationReasonPodJoin)
 		}
-		if steady && (row.PodCount != layout.desired || int32(len(instance.Pods)) != layout.desired ||
+		if steady && (instance.StatusPods != layout.desired || instance.ObservedPods != layout.desired ||
 			instance.ReadyPods != layout.desired || row.ServingPodCount != layout.desired ||
 			row.AvailablePodCount != layout.desired) {
 			invalidateInstance(component, instance, observationReasonPodCounts)
@@ -209,8 +208,7 @@ func validInferenceReplicaOwner(owners []metav1.OwnerReference, isvc *v1beta1.In
 	if controller == nil || controller.Kind != "InferenceService" || controller.Name != isvc.Name || controller.UID != isvc.UID {
 		return false
 	}
-	groupVersion, err := schema.ParseGroupVersion(controller.APIVersion)
-	return err == nil && groupVersion.Group == v1beta1.SchemeGroupVersion.Group
+	return controller.APIVersion == v1beta1.SchemeGroupVersion.String()
 }
 
 func validateRunnerLayout(runners []v1beta1.Runner) (runnerLayout, bool) {
@@ -255,8 +253,9 @@ func validPodIdentity(pod PodInfo, ownerUID types.UID) bool {
 }
 
 type podMemberKey struct {
-	runner  v1beta1.RunnerName
-	ordinal int32
+	incarnation int64
+	runner      v1beta1.RunnerName
+	ordinal     int32
 }
 
 func podIdentityAllowedForLayout(pod PodInfo, layout runnerLayout, activeOrdinal int32, steady bool) bool {
@@ -284,28 +283,39 @@ func steadyMembershipMatches(instance *Instance, layout runnerLayout, seen map[p
 		return false
 	}
 	if layout.singlePod {
-		if len(seen) != 1 {
+		if currentIncarnationMemberCount(seen, instance.Incarnation) != 1 {
 			return false
 		}
-		_, ok := seen[podMemberKey{runner: v1beta1.RunnerNameDefault, ordinal: instance.ActiveOrdinal}]
+		_, ok := seen[podMemberKey{incarnation: instance.Incarnation, runner: v1beta1.RunnerNameDefault, ordinal: instance.ActiveOrdinal}]
 		return ok
 	}
-	if instance.ActiveOrdinal != 0 || len(seen) != int(layout.desired) {
+	if instance.ActiveOrdinal != 0 || currentIncarnationMemberCount(seen, instance.Incarnation) != int(layout.desired) {
 		return false
 	}
-	if _, ok := seen[podMemberKey{runner: v1beta1.RunnerNameLeader, ordinal: 0}]; !ok {
+	if _, ok := seen[podMemberKey{incarnation: instance.Incarnation, runner: v1beta1.RunnerNameLeader, ordinal: 0}]; !ok {
 		return false
 	}
 	for ordinal := int32(0); ordinal < layout.workers; ordinal++ {
-		if _, ok := seen[podMemberKey{runner: v1beta1.RunnerNameWorker, ordinal: ordinal}]; !ok {
+		if _, ok := seen[podMemberKey{incarnation: instance.Incarnation, runner: v1beta1.RunnerNameWorker, ordinal: ordinal}]; !ok {
 			return false
 		}
 	}
 	return true
 }
 
+func currentIncarnationMemberCount(seen map[podMemberKey]struct{}, incarnation int64) int {
+	count := 0
+	for member := range seen {
+		if member.incarnation == incarnation {
+			count++
+		}
+	}
+	return count
+}
+
 func addPodToInstance(instance *Instance, pod PodInfo) {
 	instance.Pods = append(instance.Pods, pod)
+	instance.ObservedPods++
 	instance.TotalGPUs += pod.GPUs
 	if pod.Node != "" {
 		instance.NodesSet[pod.Node]++

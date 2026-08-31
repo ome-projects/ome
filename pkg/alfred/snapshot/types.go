@@ -237,16 +237,19 @@ type Instance struct {
 	// Index is a stable ordinal within the component (pod-name order).
 	Index int32
 	// Incarnation and lifecycle fields are copied from checked IR status.
-	Incarnation       int64
-	Phase             v1beta1.OMENativeInstancePhase
-	RunningRevision   string
-	TargetRevision    string
-	Admitted          bool
-	ActiveOrdinal     int32
-	ServingPods       int32
-	AvailablePods     int32
-	Operation         *v1beta1.InstanceOperation
-	DesiredPods       int32
+	Incarnation     int64
+	Phase           v1beta1.OMENativeInstancePhase
+	RunningRevision string
+	TargetRevision  string
+	Admitted        bool
+	ActiveOrdinal   int32
+	ServingPods     int32
+	AvailablePods   int32
+	Operation       *v1beta1.InstanceOperation
+	DesiredPods     int32
+	// StatusPods is the IR status row's reported PodCount.
+	StatusPods int32
+	// ObservedPods is the number of live Pods joined to this Instance.
 	ObservedPods      int32
 	ObservationValid  bool
 	ObservationReason string
