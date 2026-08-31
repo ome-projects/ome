@@ -246,7 +246,7 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 	minPod := prints[len(prints)-1].gpus
 	ranked := rankTargets(ctx.snap, ctx.cfg, ctx.bins, w, minPod, exclude)
 
-	after, placementTargets, ok := placeThenFree(ctx.bins, prints, ranked)
+	after, _, ok := placeThenFree(ctx.bins, prints, ranked)
 	if !ok {
 		// Not dispatchable: without surge headroom the migration would
 		// stall in SurgePending until timeout.
@@ -278,26 +278,32 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		}
 	}
 
-	// Preserve the successful simulation as the exhaustive capacity proof
-	// the Arbiter replays. A multi-pod Instance may require more target nodes
-	// than the historical top-N advisory hint limit.
-	hints := deduplicateTargets(placementTargets)
+	// Reporting retains the historical bounded ranked hints, while arbitration
+	// replays the complete ranked target set used by the successful simulation.
+	// The latter includes every proof node plus feasible alternates if an earlier
+	// same-cycle admission consumes one of the preferred targets.
+	placementTargets := deduplicateTargets(ranked)
+	hints := placementTargets
+	if len(hints) > maxHintTargets {
+		hints = hints[:maxHintTargets]
+	}
 	return policy.Candidate{
-		Policy:          PolicyName,
-		Workload:        w.NamespacedName,
-		Component:       comp.Type,
-		Instance:        inst.Index,
-		Mode:            comp.DeploymentMode,
-		Reason:          policy.ReasonFragmentation,
-		FromNode:        from,
-		HintTargetNodes: append([]string(nil), hints...),
-		Executable:      true,
-		SurgeShaped:     true,
-		FootprintGPUs:   inst.TotalGPUs,
-		Benefit:         benefit,
-		Cost:            cost,
-		Score:           score,
-		Emergency:       emergency,
+		Policy:               PolicyName,
+		Workload:             w.NamespacedName,
+		Component:            comp.Type,
+		Instance:             inst.Index,
+		Mode:                 comp.DeploymentMode,
+		Reason:               policy.ReasonFragmentation,
+		FromNode:             from,
+		HintTargetNodes:      append([]string(nil), hints...),
+		PlacementTargetNodes: append([]string(nil), placementTargets...),
+		Executable:           true,
+		SurgeShaped:          true,
+		FootprintGPUs:        inst.TotalGPUs,
+		Benefit:              benefit,
+		Cost:                 cost,
+		Score:                score,
+		Emergency:            emergency,
 	}, true
 }
 

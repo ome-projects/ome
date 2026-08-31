@@ -88,11 +88,15 @@ type Candidate struct {
 	// FromNode is the node the move vacates (for a multi-node instance,
 	// the node holding the largest share of its GPUs).
 	FromNode string
-	// HintTargetNodes is the policy-supplied target set. For an executable
-	// defragmentation surge it is the exhaustive, deduplicated node list from
-	// a successful atomic placement proof, in deterministic placement order;
-	// the scheduler still makes the final pod-level placement decision.
+	// HintTargetNodes is the bounded, ranked policy-supplied target set for
+	// operator-facing reporting. The scheduler still makes the final pod-level
+	// placement decision.
 	HintTargetNodes []string
+	// PlacementTargetNodes is an internal exhaustive, ranked target set for
+	// replaying a policy's successful atomic placement during arbitration. It
+	// is not part of operator-facing reports. Empty means the Arbiter falls
+	// back to HintTargetNodes for compatibility with pluggable policies.
+	PlacementTargetNodes []string
 
 	// Executable=false marks an advisory finding; AdvisoryReason says why.
 	Executable     bool
