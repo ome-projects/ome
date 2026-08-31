@@ -106,7 +106,7 @@ func movableFootprints(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool 
 	for _, workload := range snap.Workloads {
 		for _, component := range workload.Components {
 			for _, instance := range component.Instances {
-				if !movableForRepack(snap, cfg, workload, component, instance) {
+				if !movableForRepack(snap, cfg, workload, component, instance, pool) {
 					continue
 				}
 				for _, pod := range instance.Pods {
@@ -129,17 +129,18 @@ func movableFootprints(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool 
 // baseline. RawDeployment and LWS are observed demand only; they never enter
 // the FFD hypothetical.
 func movableForRepack(snap *snapshot.ClusterSnapshot, cfg *config.Config, workload *snapshot.Workload,
-	component *snapshot.Component, instance *snapshot.Instance) bool {
+	component *snapshot.Component, instance *snapshot.Instance, pool string) bool {
 	if !*cfg.OMENativeMigrationEnabled {
 		return false
 	}
 	if component.DeploymentMode != constants.OMENative {
 		return false
 	}
-	if !workload.ModelKey.Zero() {
-		if avail, ok := snap.Models[workload.ModelKey]; ok && avail.VolumePinned {
-			return false
-		}
+	if !instanceInPool(snap, instance, pool) {
+		return false
+	}
+	if modelMovabilityReason(snap, workload) != "" {
+		return false
 	}
 	return omenativeExecutionEligibility(snap, cfg, workload, component, instance, snap.Timestamp) == ""
 }

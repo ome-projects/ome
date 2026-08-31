@@ -10,6 +10,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
+	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/alfred/testutil"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -97,6 +98,64 @@ func TestAdmitHappyPathAndAdvisoryBypass(t *testing.T) {
 	d := decisions[0]
 	if !d.Admitted || d.Reason != "" || d.Target != "node2" || d.CooldownOverridden {
 		t.Fatalf("Raw advisory must not enter arbitration or claim node2: %+v", d)
+	}
+}
+
+func TestFourTargetOMENativeSurgePreservesPlacementProof(t *testing.T) {
+	b := testutil.NewSnapshot()
+	for i := 1; i <= 4; i++ {
+		b.WithNode(fmt.Sprintf("source%d", i), "h100", 8)
+		b.WithNode(fmt.Sprintf("target%d", i), "h100", 8)
+		b.WithNode(fmt.Sprintf("blocker-source%d", i), "h100", 8)
+		b.WithOtherOccupant(fmt.Sprintf("target%d", i), 7)
+		b.WithInstance(fmt.Sprintf("prod/blocker-%d", i), v1beta1.EngineComponent,
+			constants.RawDeployment, fmt.Sprintf("blocker-source%d", i), 1)
+	}
+	b.WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1,
+		"source1", "source2", "source3", "source4")
+	snap := b.Build()
+	cfg := config.Default()
+	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.01
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
+
+	var p defrag.Policy
+	var wide policy.Candidate
+	for _, c := range p.Evaluate(snap, cfg) {
+		if c.Executable && c.Workload.String() == "prod/wide" {
+			wide = c
+			break
+		}
+	}
+	if wide.Workload.Name == "" {
+		t.Fatal("defrag policy did not emit the wide OMENative candidate")
+	}
+	wantTargets := []string{"target1", "target2", "target3", "target4"}
+	if len(wide.HintTargetNodes) != len(wantTargets) {
+		t.Fatalf("placement proof targets = %v, want %v", wide.HintTargetNodes, wantTargets)
+	}
+	for i := range wantTargets {
+		if wide.HintTargetNodes[i] != wantTargets[i] {
+			t.Fatalf("placement proof targets = %v, want %v", wide.HintTargetNodes, wantTargets)
+		}
+	}
+
+	wide.Score = 10 // keep the proof-producing candidate first in arbitration
+	candidates := []policy.Candidate{wide}
+	for i := 1; i <= 4; i++ {
+		blocker := cand(fmt.Sprintf("prod/blocker-%d", i), fmt.Sprintf("blocker-source%d", i), fmt.Sprintf("target%d", i))
+		blocker.Score = 0.01
+		candidates = append(candidates, blocker)
+	}
+	decisions := admit(t, &Arbiter{}, snap, cfg, candidates...)
+	wideDecision := decisionFor(t, decisions, "prod/wide")
+	if !wideDecision.Admitted || wideDecision.Target != "target1" {
+		t.Fatalf("four-target placement proof must be admitted: %+v", wideDecision)
+	}
+	for i := 1; i <= 4; i++ {
+		d := decisionFor(t, decisions, fmt.Sprintf("prod/blocker-%d", i))
+		if d.Admitted || d.Reason != RejectTargetNodeBusy {
+			t.Fatalf("target%d must be claimed by the wide surge: %+v", i, d)
+		}
 	}
 }
 

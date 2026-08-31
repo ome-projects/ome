@@ -206,6 +206,42 @@ func TestVolumePinnedWorkloadIsNotRepackable(t *testing.T) {
 	almost(t, "pinned FReclaimable", cs.FReclaimable, 0)
 }
 
+func TestUnresolvedModelIsNotRepackable(t *testing.T) {
+	key := types.NamespacedName{Namespace: "prod", Name: "svc-a"}
+	tests := []struct {
+		name   string
+		mutate func(*snapshot.ClusterSnapshot)
+	}{
+		{
+			name: "missing availability",
+			mutate: func(s *snapshot.ClusterSnapshot) {
+				s.Workloads[key].ModelKey = snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "missing"}
+			},
+		},
+		{
+			name: "resolve error",
+			mutate: func(s *snapshot.ClusterSnapshot) {
+				model := snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "broken"}
+				s.Workloads[key].ModelKey = model
+				s.Models[model] = &snapshot.ModelAvailability{Key: model, ResolveError: "bounded test failure"}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := pinScenario(constants.OMENative, false, true)
+			tt.mutate(snap)
+			cs := ComputeScores(snap, config.Default()).PerPool["h100"]
+			if cs.FObserved <= 0 {
+				t.Fatal("unresolved model occupancy must remain observed")
+			}
+			almost(t, "FReclaimable", cs.FReclaimable, 0)
+			almost(t, "PendingPressure", cs.PendingPressure, 0)
+			almost(t, "Score", cs.Score, 0)
+		})
+	}
+}
+
 func TestOMENativeUnavailableExcludesFromRepack(t *testing.T) {
 	unavailable := ComputeScores(pinScenario(constants.OMENative, false, false), config.Default()).PerPool["h100"]
 	almost(t, "degraded FReclaimable", unavailable.FReclaimable, 0)
@@ -436,4 +472,28 @@ func TestObservedOnlyRepackCannotCreatePendingPressure(t *testing.T) {
 	almost(t, "FReclaimable", cs.FReclaimable, 0)
 	almost(t, "PendingPressure", cs.PendingPressure, 0)
 	almost(t, "Score", cs.Score, 0)
+}
+
+func TestCrossPoolAtomicInstanceIsNotRepackable(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("a-source", "a100", 8).
+		WithNode("a-target", "a100", 8).
+		WithNode("h-source", "h100", 8).
+		WithNode("h-target", "h100", 8).
+		WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1, "a-source", "h-source")
+	b.WithOtherOccupant("a-target", 7)
+	b.WithOtherOccupant("h-target", 7)
+	b.WithPendingPod(8, 30*time.Minute, "a100")
+	b.WithPendingPod(8, 30*time.Minute, "h100")
+	scores := ComputeScores(b.Build(), config.Default())
+
+	for _, pool := range []string{"a100", "h100"} {
+		cs := scores.PerPool[pool]
+		if cs.FObserved <= 0 {
+			t.Fatalf("%s cross-pool occupancy must remain observed", pool)
+		}
+		almost(t, pool+" FReclaimable", cs.FReclaimable, 0)
+		almost(t, pool+" PendingPressure", cs.PendingPressure, 0)
+		almost(t, pool+" Score", cs.Score, 0)
+	}
 }

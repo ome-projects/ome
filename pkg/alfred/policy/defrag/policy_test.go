@@ -242,6 +242,26 @@ func TestMultiPodOMENativeCandidateIsSurgeShaped(t *testing.T) {
 	}
 }
 
+func TestMultiPodPlacementProofDeduplicatesTargets(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("source1", "h100", 8).
+		WithNode("source2", "h100", 8).
+		WithNode("target", "h100", 8).
+		WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1, "source1", "source2")
+	b.WithOtherOccupant("target", 6)
+	cfg := lowGate()
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
+	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.01
+
+	execs := executables(evaluate(t, b.Build(), cfg))
+	if len(execs) != 1 {
+		t.Fatalf("want one executable multi-pod Instance, got %+v", execs)
+	}
+	if got := execs[0].HintTargetNodes; len(got) != 1 || got[0] != "target" {
+		t.Fatalf("deduplicated placement proof targets = %v, want [target]", got)
+	}
+}
+
 // TestEnumerationFilters: cooldown (with override), in-flight migrations,
 // and Movable=false all keep a workload out of the candidate set.
 func TestEnumerationFilters(t *testing.T) {
@@ -341,6 +361,101 @@ func TestVolumePinnedAdvisory(t *testing.T) {
 	execs := executables(cands)
 	if len(execs) != 1 || execs[0].Workload.String() != "prod/mover" {
 		t.Fatalf("mover must stay executable: %+v", execs)
+	}
+}
+
+func TestUnresolvedModelIsAdvisory(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func() *testutil.SnapshotBuilder
+	}{
+		{
+			name: "missing availability",
+			build: func() *testutil.SnapshotBuilder {
+				return consolidationBuilder().ConfigureWorkload("prod/mover", func(w *snapshot.Workload) {
+					w.ModelKey = snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "missing"}
+				})
+			},
+		},
+		{
+			name: "resolve error",
+			build: func() *testutil.SnapshotBuilder {
+				return consolidationBuilder().WithModel("prod/mover", &snapshot.ModelAvailability{
+					Key:          snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "broken"},
+					ResolveError: "bounded test failure",
+				})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := evaluate(t, tt.build().Build(), lowGate())
+			if len(executables(got)) != 0 {
+				t.Fatalf("unresolved model must never be executable: %+v", got)
+			}
+			unresolved := advisories(got, policy.AdvisoryModelUnresolved)
+			if len(unresolved) != 1 || unresolved[0].Instance != policy.ComponentWideInstance {
+				t.Fatalf("want one component-wide ModelUnresolved advisory, got %+v", got)
+			}
+		})
+	}
+}
+
+func TestRawInstancesEnumerateInTheirOwnPools(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("a-source", "a100", 8).
+		WithNode("a-target", "a100", 8).
+		WithNode("h-source", "h100", 8).
+		WithNode("h-target", "h100", 8).
+		WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "a-source", 1).
+		WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "h-source", 1)
+	b.WithOtherOccupant("a-target", 7)
+	b.WithOtherOccupant("h-target", 7)
+
+	got := advisories(evaluate(t, b.Build(), lowGate()), rawMigrationUnsupportedReason)
+	if len(got) != 2 {
+		t.Fatalf("want one Raw advisory from each pool, got %+v", got)
+	}
+	wantSource := map[string]bool{"a-source": true, "h-source": true}
+	for _, c := range got {
+		if !wantSource[c.FromNode] || len(c.HintTargetNodes) != 0 || c.FootprintGPUs != 0 {
+			t.Fatalf("Raw advisory must remain source-only in its own pool: %+v", c)
+		}
+		delete(wantSource, c.FromNode)
+	}
+	if len(wantSource) != 0 {
+		t.Fatalf("missing Raw sources: %v", wantSource)
+	}
+}
+
+func TestOMENativeInstancesEnumerateInTheirOwnPools(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("a-source", "a100", 8).
+		WithNode("a-target", "a100", 8).
+		WithNode("h-source", "h100", 8).
+		WithNode("h-target", "h100", 8).
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "a-source", 1).
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "h-source", 1)
+	b.WithOtherOccupant("a-target", 7)
+	b.WithOtherOccupant("h-target", 7)
+	cfg := lowGate()
+	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.05
+
+	snap := b.Build()
+	scores := ComputeScores(snap, cfg)
+	if scores.PerPool["a100"].FReclaimable <= 0 || scores.PerPool["h100"].FReclaimable <= 0 {
+		t.Fatalf("each wholly-owned Instance must be repackable in its own pool: %+v", scores.PerPool)
+	}
+	got := executables(evaluate(t, snap, cfg))
+	if len(got) != 2 {
+		t.Fatalf("want one executable OMENative Instance from each pool, got %+v", got)
+	}
+	wantSource := map[string]bool{"a-source": true, "h-source": true}
+	for _, c := range got {
+		if !wantSource[c.FromNode] || !c.SurgeShaped || c.Score <= 0 {
+			t.Fatalf("per-pool OMENative candidate mismatch: %+v", c)
+		}
+		delete(wantSource, c.FromNode)
 	}
 }
 

@@ -88,8 +88,10 @@ type Candidate struct {
 	// FromNode is the node the move vacates (for a multi-node instance,
 	// the node holding the largest share of its GPUs).
 	FromNode string
-	// HintTargetNodes is the ranked, advisory placement preference (top N;
-	// the scheduler makes the final call).
+	// HintTargetNodes is the policy-supplied target set. For an executable
+	// defragmentation surge it is the exhaustive, deduplicated node list from
+	// a successful atomic placement proof, in deterministic placement order;
+	// the scheduler still makes the final pod-level placement decision.
 	HintTargetNodes []string
 
 	// Executable=false marks an advisory finding; AdvisoryReason says why.

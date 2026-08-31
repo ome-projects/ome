@@ -162,9 +162,6 @@ func evaluateComponent(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compon
 	default:
 		return nil
 	}
-	if componentPrimaryPool(ctx.snap, comp) != ctx.pool {
-		return nil
-	}
 	if comp.DeploymentMode == constants.RawDeployment {
 		if !w.Movable || len(w.ActiveMigrations) > 0 || inCooldown(w, ctx.cfg, ctx.snap.Timestamp) {
 			return nil
@@ -175,19 +172,12 @@ func evaluateComponent(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compon
 	// Component-wide downgrades, most fundamental first; one advisory, not
 	// a stack.
 	from := componentPrimaryNode(comp)
-	if avail := modelOf(ctx.snap, w); avail != nil {
-		if avail.ResolveError != "" {
-			return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-				policy.AdvisoryModelUnresolved, from, 0)}
+	if reason := modelMovabilityReason(ctx.snap, w); reason != "" {
+		if componentPrimaryPool(ctx.snap, comp) != ctx.pool {
+			return nil
 		}
-		if avail.VolumePinned {
-			// An RWO/RWOP volume attaches to one node at a time and
-			// the source still holds it while any replacement
-			// starts; eviction would only recreate the pod on the
-			// same node.
-			return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-				policy.AdvisoryVolumePinned, from, 0)}
-		}
+		return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
+			reason, from, 0)}
 	}
 	instances := append([]*snapshot.Instance(nil), comp.Instances...)
 	sort.Slice(instances, func(i, j int) bool { return instances[i].Index < instances[j].Index })
@@ -256,7 +246,7 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 	minPod := prints[len(prints)-1].gpus
 	ranked := rankTargets(ctx.snap, ctx.cfg, ctx.bins, w, minPod, exclude)
 
-	after, _, ok := placeThenFree(ctx.bins, prints, ranked)
+	after, placementTargets, ok := placeThenFree(ctx.bins, prints, ranked)
 	if !ok {
 		// Not dispatchable: without surge headroom the migration would
 		// stall in SurgePending until timeout.
@@ -288,10 +278,10 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		}
 	}
 
-	hints := ranked
-	if len(hints) > maxHintTargets {
-		hints = hints[:maxHintTargets]
-	}
+	// Preserve the successful simulation as the exhaustive capacity proof
+	// the Arbiter replays. A multi-pod Instance may require more target nodes
+	// than the historical top-N advisory hint limit.
+	hints := deduplicateTargets(placementTargets)
 	return policy.Candidate{
 		Policy:          PolicyName,
 		Workload:        w.NamespacedName,
@@ -309,6 +299,19 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		Score:           score,
 		Emergency:       emergency,
 	}, true
+}
+
+func deduplicateTargets(targets []string) []string {
+	seen := make(map[string]struct{}, len(targets))
+	out := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+	}
+	return out
 }
 
 // omenativeExecutionEligibility is the single fail-closed Alpha execution
@@ -537,11 +540,21 @@ func sortedComponents(w *snapshot.Workload) []*snapshot.Component {
 	return out
 }
 
-func modelOf(snap *snapshot.ClusterSnapshot, w *snapshot.Workload) *snapshot.ModelAvailability {
+// modelMovabilityReason is the shared fail-closed model truth for candidate
+// classification and executable repacking. An empty reason is the only model
+// state that may move.
+func modelMovabilityReason(snap *snapshot.ClusterSnapshot, w *snapshot.Workload) string {
 	if w.ModelKey.Zero() {
-		return nil
+		return ""
 	}
-	return snap.Models[w.ModelKey]
+	avail, ok := snap.Models[w.ModelKey]
+	if !ok || avail.ResolveError != "" {
+		return policy.AdvisoryModelUnresolved
+	}
+	if avail.VolumePinned {
+		return policy.AdvisoryVolumePinned
+	}
+	return ""
 }
 
 func hasTerminating(inst *snapshot.Instance) bool {
