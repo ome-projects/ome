@@ -184,6 +184,40 @@ func TestApplyMigrationStatePreservesRequesterFromPendingAnnotation(t *testing.T
 	}
 }
 
+func TestApplyMigrationStateStoresPayloadFreeMalformedRequestReason(t *testing.T) {
+	schemaPayload := strings.Repeat("private-schema-", 32)
+	componentPayload := strings.Repeat("private-component-", 32)
+	requestedAtPayload := strings.Repeat("private-requested-at-", 32)
+	raw, err := json.Marshal(map[string]interface{}{
+		"schemaVersion": schemaPayload,
+		"component":     componentPayload,
+		"instance":      0,
+		"from_node":     "gpu-a",
+		"requested_at":  requestedAtPayload,
+	})
+	if err != nil {
+		t.Fatalf("marshal malformed request: %v", err)
+	}
+
+	workload := migrationTestWorkload()
+	applyMigrationState(workload, &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{migrationAnnotationKey("malformed"): string(raw)},
+	}})
+
+	got := workload.MalformedRequests["malformed"]
+	if got != migrationStateReasonRequestInvalid {
+		t.Fatalf("malformed reason = %q, want fixed %q", got, migrationStateReasonRequestInvalid)
+	}
+	if len(got) > 128 {
+		t.Fatalf("malformed reason is not bounded: %d bytes", len(got))
+	}
+	for _, payload := range []string{schemaPayload, componentPayload, requestedAtPayload} {
+		if strings.Contains(got, payload) {
+			t.Fatalf("malformed reason exposes request payload: %q", got)
+		}
+	}
+}
+
 func TestApplyMigrationStateOverlaysAuthoritativeIRStatus(t *testing.T) {
 	now := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
 	annotation, err := json.Marshal(audit.MigrationRequest{

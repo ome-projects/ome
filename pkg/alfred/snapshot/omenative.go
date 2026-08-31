@@ -32,10 +32,21 @@ type inferenceReplicaKey struct {
 	component v1beta1.ComponentType
 }
 
-type inferenceReplicaIndex map[inferenceReplicaKey][]*v1beta1.InferenceReplica
+type inferenceReplicaOwnerKey struct {
+	namespace string
+	uid       types.UID
+}
+
+type inferenceReplicaIndex struct {
+	byComponent map[inferenceReplicaKey][]*v1beta1.InferenceReplica
+	byOwnerUID  map[inferenceReplicaOwnerKey][]*v1beta1.InferenceReplica
+}
 
 func indexInferenceReplicas(items []v1beta1.InferenceReplica) inferenceReplicaIndex {
-	index := make(inferenceReplicaIndex)
+	index := inferenceReplicaIndex{
+		byComponent: make(map[inferenceReplicaKey][]*v1beta1.InferenceReplica),
+		byOwnerUID:  make(map[inferenceReplicaOwnerKey][]*v1beta1.InferenceReplica),
+	}
 	for i := range items {
 		ir := &items[i]
 		key := inferenceReplicaKey{
@@ -43,9 +54,71 @@ func indexInferenceReplicas(items []v1beta1.InferenceReplica) inferenceReplicaIn
 			parent:    ir.Spec.ParentRef.Name,
 			component: ir.Spec.Component,
 		}
-		index[key] = append(index[key], ir)
+		index.byComponent[key] = append(index.byComponent[key], ir)
+		if ir.UID != "" {
+			ownerKey := inferenceReplicaOwnerKey{namespace: ir.Namespace, uid: ir.UID}
+			index.byOwnerUID[ownerKey] = append(index.byOwnerUID[ownerKey], ir)
+		}
 	}
 	return index
+}
+
+func routeWorkloadPods(
+	isvc *v1beta1.InferenceService,
+	pods map[v1beta1.ComponentType][]PodInfo,
+	modes map[v1beta1.ComponentType]constants.DeploymentModeType,
+	irIndex inferenceReplicaIndex,
+) map[v1beta1.ComponentType][]PodInfo {
+	routed := make(map[v1beta1.ComponentType][]PodInfo, len(pods))
+	omeComponents := make([]v1beta1.ComponentType, 0, len(modes))
+	for component, mode := range modes {
+		if mode == constants.OMENative {
+			omeComponents = append(omeComponents, component)
+		}
+	}
+	sort.Slice(omeComponents, func(i, j int) bool { return omeComponents[i] < omeComponents[j] })
+
+	declaredComponents := make([]v1beta1.ComponentType, 0, len(pods))
+	for component := range pods {
+		declaredComponents = append(declaredComponents, component)
+	}
+	sort.Slice(declaredComponents, func(i, j int) bool { return declaredComponents[i] < declaredComponents[j] })
+
+	for _, declared := range declaredComponents {
+		for _, pod := range pods[declared] {
+			ownerMatches := irIndex.byOwnerUID[inferenceReplicaOwnerKey{
+				namespace: pod.Namespace,
+				uid:       pod.ControllerOwnerUID,
+			}]
+			if pod.ControllerOwnerPresent && pod.ControllerOwnerValid && len(ownerMatches) == 1 {
+				owner := ownerMatches[0]
+				expected := owner.Spec.Component
+				if owner.Spec.ParentRef.Name == isvc.Name && modes[expected] == constants.OMENative {
+					routed[expected] = append(routed[expected], pod)
+					continue
+				}
+			}
+
+			if len(ownerMatches) > 0 {
+				for _, component := range omeComponents {
+					routed[component] = append(routed[component], pod)
+				}
+				continue
+			}
+
+			if pod.ManagedBy == query.ManagedByOMENative {
+				for _, component := range omeComponents {
+					routed[component] = append(routed[component], pod)
+				}
+				continue
+			}
+
+			if declared != "" {
+				routed[declared] = append(routed[declared], pod)
+			}
+		}
+	}
+	return routed
 }
 
 type runnerLayout struct {
@@ -68,7 +141,7 @@ func buildOMENativeComponent(
 	}
 
 	key := inferenceReplicaKey{namespace: isvc.Namespace, parent: isvc.Name, component: componentType}
-	matches := irIndex[key]
+	matches := irIndex.byComponent[key]
 	if len(matches) == 0 {
 		invalidateComponent(component, observationReasonIRMissing)
 		return component
@@ -128,7 +201,7 @@ func buildOMENativeComponent(
 	seen := make(map[int32]map[podMemberKey]struct{}, len(rows))
 	for _, pod := range pods {
 		instance, ok := rows[pod.InstanceIndex]
-		if !validPodIdentity(pod, ir.UID) {
+		if !validPodIdentity(pod, ir.UID, componentType) {
 			if ok {
 				invalidateInstance(component, instance, observationReasonPodIdentity)
 			} else {
@@ -242,8 +315,9 @@ func validateRunnerLayout(runners []v1beta1.Runner) (runnerLayout, bool) {
 	return runnerLayout{desired: worker.Size + 1, workers: worker.Size}, true
 }
 
-func validPodIdentity(pod PodInfo, ownerUID types.UID) bool {
+func validPodIdentity(pod PodInfo, ownerUID types.UID, component v1beta1.ComponentType) bool {
 	return pod.ManagedBy == query.ManagedByOMENative &&
+		pod.Component == component &&
 		pod.InstanceIndexPresent && pod.InstanceIndexValid &&
 		pod.IncarnationPresent && pod.IncarnationValid &&
 		pod.RunnerPresent && pod.RunnerValid &&

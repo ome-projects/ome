@@ -224,11 +224,11 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.Namespace
 		}
 	}
 
-	// Workload grouping retains every nonterminal OME pod, including
-	// unscheduled pods. Checked OMENative joins must see malformed or pending
-	// members rather than silently dropping them; Raw and LWS construction
-	// filters back to scheduled pods below.
-	if isvcName != "" && component != "" && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+	// Workload grouping retains every nonterminal OME pod, including pods
+	// with missing component evidence and unscheduled pods. Checked OMENative
+	// joins route by controller ownership below; Raw and LWS construction
+	// filters back to scheduled pods.
+	if isvcName != "" && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
 		byComponent, ok := isvcPods[info.ISVC]
 		if !ok {
 			byComponent = map[v1beta1.ComponentType][]PodInfo{}
@@ -306,6 +306,11 @@ func buildWorkload(
 		{v1beta1.DecoderComponent, isvc.Spec.Decoder != nil, decoderMode},
 		{v1beta1.RouterComponent, isvc.Spec.Router != nil, routerMode},
 	}
+	componentModes := make(map[v1beta1.ComponentType]constants.DeploymentModeType, len(specComponents))
+	for _, sc := range specComponents {
+		componentModes[sc.ctype] = sc.mode
+	}
+	pods = routeWorkloadPods(isvc, pods, componentModes, irIndex)
 	for _, sc := range specComponents {
 		if !sc.present && len(pods[sc.ctype]) == 0 {
 			continue
@@ -466,7 +471,7 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 			if w.MalformedRequests == nil {
 				w.MalformedRequests = map[string]string{}
 			}
-			w.MalformedRequests[uuid] = err.Error()
+			w.MalformedRequests[uuid] = migrationStateReasonRequestInvalid
 			continue
 		}
 		inFlight[uuid] = pending

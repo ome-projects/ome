@@ -194,6 +194,98 @@ func TestBuildOMENativeRejectsInvalidIRAndPodEvidence(t *testing.T) {
 	}
 }
 
+func TestBuildOMENativeRejectsOwnedPodsWithInvalidComponentEvidence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{
+			name: "missing component label",
+			mutate: func(pod *corev1.Pod) {
+				delete(pod.Labels, constants.OMEComponentLabel)
+			},
+		},
+		{
+			name: "wrong component label",
+			mutate: func(pod *corev1.Pod) {
+				pod.Labels[constants.OMEComponentLabel] = string(v1beta1.DecoderComponent)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			baseline := buildOMENativeFixture(t, newOMENativeFixture())
+			if !baseline.ObservationValid || len(baseline.Instances) != 1 ||
+				baseline.Instances[0].Phase != v1beta1.OMENativeInstanceReady {
+				t.Fatalf("baseline is not a steady OMENative observation: %+v", baseline)
+			}
+
+			fixture := newOMENativeFixture()
+			adversarial := fixture.pods[0].DeepCopy()
+			adversarial.Name += "-adversarial"
+			test.mutate(adversarial)
+			fixture.pods = append(fixture.pods, adversarial)
+
+			component := buildOMENativeFixture(t, fixture)
+			assertInvalidOMENativeObservation(t, component)
+		})
+	}
+}
+
+func TestBuildOMENativeRejectsAmbiguousOwnerUIDAcrossComponents(t *testing.T) {
+	baselineFixture := newOMENativeFixture()
+	addOMENativeDecoder(baselineFixture)
+	baseline := buildOMENativeFixtureWorkload(t, baselineFixture)
+	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+		if !baseline.Components[component].ObservationValid {
+			t.Fatalf("baseline %s observation is invalid: %+v", component, baseline.Components[component])
+		}
+	}
+
+	fixture := newOMENativeFixture()
+	decoderIR, decoderPod := addOMENativeDecoder(fixture)
+	decoderIR.UID = fixture.ir.UID
+	decoderPod.OwnerReferences[0].UID = fixture.ir.UID
+
+	workload := buildOMENativeFixtureWorkload(t, fixture)
+	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+		t.Run(string(component), func(t *testing.T) {
+			assertInvalidOMENativeObservation(t, workload.Components[component])
+		})
+	}
+}
+
+func TestBuildOMENativeRejectsUnresolvableOwnerAcrossComponents(t *testing.T) {
+	fixture := newOMENativeFixture()
+	addOMENativeDecoder(fixture)
+	adversarial := fixture.pods[0].DeepCopy()
+	adversarial.Name += "-unresolvable"
+	adversarial.OwnerReferences[0].UID = "unknown-ir-uid"
+	fixture.pods = append(fixture.pods, adversarial)
+
+	workload := buildOMENativeFixtureWorkload(t, fixture)
+	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+		t.Run(string(component), func(t *testing.T) {
+			assertInvalidOMENativeObservation(t, workload.Components[component])
+		})
+	}
+}
+
+func TestBuildOMENativeIgnoresUnrelatedRawComponentPod(t *testing.T) {
+	fixture := newOMENativeFixture()
+	addOMENativeDecoder(fixture)
+	fixture.pods = append(fixture.pods,
+		omePod("prod", "svc-router", "node-a", "svc", "router", 0, true))
+
+	workload := buildOMENativeFixtureWorkload(t, fixture)
+	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+		if !workload.Components[component].ObservationValid {
+			t.Fatalf("Raw router Pod poisoned %s observation: %+v", component, workload.Components[component])
+		}
+	}
+}
+
 func TestBuildOMENativeIgnoresCompatibilityObservationFields(t *testing.T) {
 	fixture := newOMENativeFixture()
 	row := &fixture.ir.Status.InstanceStatuses[0]
@@ -382,6 +474,24 @@ func omeNativePod(f *omeNativeFixture, index int32, incarnation int64, runner st
 	return pod
 }
 
+func addOMENativeDecoder(f *omeNativeFixture) (*v1beta1.InferenceReplica, *corev1.Pod) {
+	f.isvc.Spec.Decoder = &v1beta1.DecoderSpec{}
+	decoderIR := f.ir.DeepCopy()
+	decoderIR.Name = "svc-decoder"
+	decoderIR.UID = "decoder-ir-uid"
+	decoderIR.Spec.Component = v1beta1.DecoderComponent
+	decoderIR.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{readyOMERow(4, 1, 1)}
+	f.extra = append(f.extra, decoderIR)
+
+	decoderPod := omeNativePod(f, 4, 1, "default", 0, "node-b")
+	decoderPod.Name = "svc-decoder-pod"
+	decoderPod.Labels[constants.OMEComponentLabel] = string(v1beta1.DecoderComponent)
+	decoderPod.OwnerReferences[0].Name = decoderIR.Name
+	decoderPod.OwnerReferences[0].UID = decoderIR.UID
+	f.pods = append(f.pods, decoderPod)
+	return decoderIR, decoderPod
+}
+
 func (f *omeNativeFixture) runtimeObjects() []runtime.Object {
 	objects := []runtime.Object{f.isvc}
 	if f.ir != nil {
@@ -395,6 +505,12 @@ func (f *omeNativeFixture) runtimeObjects() []runtime.Object {
 
 func buildOMENativeFixture(t *testing.T, fixture *omeNativeFixture) *Component {
 	t.Helper()
+	workload := buildOMENativeFixtureWorkload(t, fixture)
+	return workload.Components[v1beta1.EngineComponent]
+}
+
+func buildOMENativeFixtureWorkload(t *testing.T, fixture *omeNativeFixture) *Workload {
+	t.Helper()
 	reader := fake.NewClientBuilder().WithScheme(testScheme(t)).WithRuntimeObjects(fixture.runtimeObjects()...).Build()
 	snap, err := Build(context.Background(), reader, Options{Now: func() time.Time { return buildNow }})
 	if err != nil {
@@ -404,7 +520,7 @@ func buildOMENativeFixture(t *testing.T, fixture *omeNativeFixture) *Component {
 	if workload == nil || workload.Components[v1beta1.EngineComponent] == nil {
 		t.Fatalf("engine component missing from snapshot: %+v", workload)
 	}
-	return workload.Components[v1beta1.EngineComponent]
+	return workload
 }
 
 func assertInvalidOMENativeObservation(t *testing.T, component *Component) {
