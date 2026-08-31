@@ -35,6 +35,7 @@ func NewSnapshot() *SnapshotBuilder {
 			Nodes:              map[string]*snapshot.Node{},
 			Workloads:          map[types.NamespacedName]*snapshot.Workload{},
 			Models:             map[snapshot.ModelKey]*snapshot.ModelAvailability{},
+			OMENativeExecutor:  snapshot.OMENativeExecutorState{Available: true},
 			OMENativeAvailable: true,
 		},
 	}
@@ -105,6 +106,13 @@ func (b *SnapshotBuilder) WithNode(name, pool string, totalGPUs int64, opts ...N
 // WithOMENative sets the snapshot's OMENative availability.
 func (b *SnapshotBuilder) WithOMENative(available bool) *SnapshotBuilder {
 	b.s.OMENativeAvailable = available
+	b.s.OMENativeExecutor.Available = available
+	return b
+}
+
+// WithOMENativeExecutor replaces the structured OMENative executor state.
+func (b *SnapshotBuilder) WithOMENativeExecutor(state snapshot.OMENativeExecutorState) *SnapshotBuilder {
+	b.s.OMENativeExecutor = state
 	return b
 }
 
@@ -137,7 +145,12 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 	w := b.ensureWorkload(workload)
 	component, ok := w.Components[ctype]
 	if !ok {
-		component = &snapshot.Component{Type: ctype, DeploymentMode: mode}
+		component = &snapshot.Component{
+			Type:             ctype,
+			DeploymentMode:   mode,
+			StatusFresh:      mode == constants.OMENative,
+			ObservationValid: true,
+		}
 		w.Components[ctype] = component
 	} else if component.DeploymentMode != mode {
 		// A silent rewrite would re-label instances added under the
@@ -148,19 +161,50 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 	}
 
 	inst := &snapshot.Instance{
-		Index:    int32(len(component.Instances)),
-		NodesSet: map[string]int{},
+		Index:            int32(len(component.Instances)),
+		Incarnation:      1,
+		Phase:            v1beta1.OMENativeInstanceReady,
+		Admitted:         true,
+		DesiredPods:      int32(len(nodes)),
+		ObservedPods:     int32(len(nodes)),
+		ServingPods:      int32(len(nodes)),
+		AvailablePods:    int32(len(nodes)),
+		ObservationValid: true,
+		NodesSet:         map[string]int{},
 	}
-	for _, nodeName := range nodes {
+	for i, nodeName := range nodes {
 		n := b.mustNode(nodeName)
+		runner := v1beta1.RunnerNameDefault
+		ordinal := int32(0)
+		if len(nodes) > 1 {
+			if i == 0 {
+				runner = v1beta1.RunnerNameLeader
+			} else {
+				runner = v1beta1.RunnerNameWorker
+				ordinal = int32(i - 1)
+			}
+		}
 		pod := snapshot.PodInfo{
-			Namespace: w.NamespacedName.Namespace,
-			Name:      b.nextPodName(w.NamespacedName.Name + "-" + string(ctype)),
-			Node:      nodeName,
-			GPUs:      gpusPerPod,
-			Ready:     true,
-			ISVC:      w.NamespacedName,
-			Component: ctype,
+			Namespace:            w.NamespacedName.Namespace,
+			Name:                 b.nextPodName(w.NamespacedName.Name + "-" + string(ctype)),
+			Node:                 nodeName,
+			GPUs:                 gpusPerPod,
+			Ready:                true,
+			ISVC:                 w.NamespacedName,
+			Component:            ctype,
+			ManagedBy:            "OMENative",
+			InstanceIndex:        inst.Index,
+			InstanceIndexPresent: true,
+			InstanceIndexValid:   true,
+			Incarnation:          inst.Incarnation,
+			IncarnationPresent:   true,
+			IncarnationValid:     true,
+			Runner:               runner,
+			RunnerPresent:        true,
+			RunnerValid:          true,
+			PodOrdinal:           ordinal,
+			PodOrdinalPresent:    true,
+			PodOrdinalValid:      true,
 		}
 		start := ReferenceTime.Add(-24 * time.Hour)
 		pod.StartTime = &start
@@ -174,6 +218,23 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 		}
 	}
 	component.Instances = append(component.Instances, inst)
+	return b
+}
+
+// WithInvalidOMENativeObservation marks one synthetic OMENative component and
+// all of its Instances structurally invalid with a deliberate advisory reason.
+func (b *SnapshotBuilder) WithInvalidOMENativeObservation(workload string, ctype v1beta1.ComponentType, reason string) *SnapshotBuilder {
+	w := b.ensureWorkload(workload)
+	component, ok := w.Components[ctype]
+	if !ok || component.DeploymentMode != constants.OMENative {
+		panic(fmt.Sprintf("testutil: OMENative component %s of %q must exist before marking its observation invalid", ctype, workload))
+	}
+	component.ObservationValid = false
+	component.ObservationReason = reason
+	for _, instance := range component.Instances {
+		instance.ObservationValid = false
+		instance.ObservationReason = reason
+	}
 	return b
 }
 

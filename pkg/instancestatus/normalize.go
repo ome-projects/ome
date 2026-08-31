@@ -1,5 +1,5 @@
 // Package instancestatus normalizes InferenceReplica per-instance status
-// encodings into checked, bounded rows for CLI collectors and renderers.
+// encodings into checked, bounded rows for shared read consumers.
 package instancestatus
 
 import "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"

@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -51,6 +52,8 @@ type Options struct {
 	// OMENativeAvailable is the caller's discovery result; recorded
 	// verbatim on the snapshot.
 	OMENativeAvailable bool
+	// OMENativeExecutor is the structured executor capability observation.
+	OMENativeExecutor OMENativeExecutorState
 	// Now overrides the clock (tests); nil means time.Now.
 	Now func() time.Time
 }
@@ -87,6 +90,7 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 		Nodes:              map[string]*Node{},
 		Workloads:          map[types.NamespacedName]*Workload{},
 		Models:             map[ModelKey]*ModelAvailability{},
+		OMENativeExecutor:  opts.OMENativeExecutor,
 		OMENativeAvailable: opts.OMENativeAvailable,
 	}
 
@@ -129,10 +133,13 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 	if err := r.List(ctx, &isvcList); err != nil {
 		return nil, fmt.Errorf("list inferenceservices: %w", err)
 	}
+	var irList v1beta1.InferenceReplicaList
+	irListErr := r.List(ctx, &irList)
+	irIndex := indexInferenceReplicas(irList.Items)
 	for i := range isvcList.Items {
 		isvc := &isvcList.Items[i]
 		key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}
-		s.Workloads[key] = buildWorkload(isvc, isvcPods[key], &opts)
+		s.Workloads[key] = buildWorkload(isvc, isvcPods[key], irIndex, irListErr, &opts)
 	}
 
 	resolveModels(ctx, r, s)
@@ -194,7 +201,9 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.Namespace
 		GPUs:        gpus,
 		Ready:       podIsReady(pod),
 		Terminating: pod.DeletionTimestamp != nil,
+		ManagedBy:   pod.Labels[query.LabelManagedBy],
 	}
+	parseOMENativePodIdentity(&info, pod)
 	if pod.Status.StartTime != nil {
 		t := pod.Status.StartTime.Time
 		info.StartTime = &t
@@ -219,10 +228,11 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.Namespace
 		}
 	}
 
-	// Workload grouping: every scheduled OME pod, GPU-bearing or not (a
-	// router holds no GPUs but is still a component instance). Unscheduled
-	// pods are demand, not instances — they surface through PendingPods.
-	if isvcName != "" && pod.Spec.NodeName != "" && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+	// Workload grouping retains every nonterminal OME pod, including
+	// unscheduled pods. Checked OMENative joins must see malformed or pending
+	// members rather than silently dropping them; Raw and LWS construction
+	// filters back to scheduled pods below.
+	if isvcName != "" && component != "" && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
 		byComponent, ok := isvcPods[info.ISVC]
 		if !ok {
 			byComponent = map[v1beta1.ComponentType][]PodInfo{}
@@ -256,7 +266,13 @@ func pendingSince(pod *corev1.Pod) time.Time {
 	return pod.CreationTimestamp.Time
 }
 
-func buildWorkload(isvc *v1beta1.InferenceService, pods map[v1beta1.ComponentType][]PodInfo, opts *Options) *Workload {
+func buildWorkload(
+	isvc *v1beta1.InferenceService,
+	pods map[v1beta1.ComponentType][]PodInfo,
+	irIndex inferenceReplicaIndex,
+	irListErr error,
+	opts *Options,
+) *Workload {
 	w := &Workload{
 		NamespacedName: types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name},
 		ISVC:           isvc,
@@ -297,15 +313,82 @@ func buildWorkload(isvc *v1beta1.InferenceService, pods map[v1beta1.ComponentTyp
 		if !sc.present && len(pods[sc.ctype]) == 0 {
 			continue
 		}
-		w.Components[sc.ctype] = &Component{
-			Type:           sc.ctype,
-			DeploymentMode: sc.mode,
-			Instances:      buildInstances(sc.mode, pods[sc.ctype]),
+		component := &Component{
+			Type:             sc.ctype,
+			DeploymentMode:   sc.mode,
+			ObservationValid: true,
 		}
+		if sc.mode == constants.OMENative {
+			component = buildOMENativeComponent(isvc, sc.ctype, pods[sc.ctype], irIndex, irListErr)
+		} else {
+			component.Instances = buildInstances(sc.mode, scheduledPods(pods[sc.ctype]))
+		}
+		w.Components[sc.ctype] = component
 	}
 
 	applyMigrationState(w, isvc)
 	return w
+}
+
+func scheduledPods(pods []PodInfo) []PodInfo {
+	result := make([]PodInfo, 0, len(pods))
+	for _, pod := range pods {
+		if pod.Node != "" {
+			result = append(result, pod)
+		}
+	}
+	return result
+}
+
+func parseOMENativePodIdentity(info *PodInfo, pod *corev1.Pod) {
+	info.InstanceIndex, info.InstanceIndexPresent, info.InstanceIndexValid = parseInt32Identity(pod.Labels, query.LabelInstanceIdx, false)
+	info.Incarnation, info.IncarnationPresent, info.IncarnationValid = parseInt64Identity(pod.Labels, query.LabelInstanceIncarnation, true)
+	rawRunner, runnerPresent := pod.Labels[query.LabelRunner]
+	info.Runner = v1beta1.RunnerName(rawRunner)
+	info.RunnerPresent = runnerPresent
+	switch info.Runner {
+	case v1beta1.RunnerNameDefault, v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker:
+		info.RunnerValid = runnerPresent
+	}
+	info.PodOrdinal, info.PodOrdinalPresent, info.PodOrdinalValid = parseInt32Identity(pod.Labels, query.LabelPodOrdinal, false)
+
+	for i := range pod.OwnerReferences {
+		owner := &pod.OwnerReferences[i]
+		if owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+		if info.ControllerOwnerPresent {
+			info.ControllerOwnerValid = false
+			return
+		}
+		info.ControllerOwnerPresent = true
+		info.ControllerOwnerUID = owner.UID
+		info.ControllerOwnerValid = owner.UID != ""
+	}
+}
+
+func parseInt32Identity(labels map[string]string, key string, positive bool) (int32, bool, bool) {
+	raw, present := labels[key]
+	if !present {
+		return 0, false, false
+	}
+	value, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || value < 0 || (positive && value == 0) {
+		return 0, true, false
+	}
+	return int32(value), true, true
+}
+
+func parseInt64Identity(labels map[string]string, key string, positive bool) (int64, bool, bool) {
+	raw, present := labels[key]
+	if !present {
+		return 0, false, false
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 || (positive && value == 0) {
+		return 0, true, false
+	}
+	return value, true, true
 }
 
 // buildInstances maps a component's pods onto Instances: one Instance per pod
@@ -330,7 +413,7 @@ func buildInstances(mode constants.DeploymentModeType, pods []PodInfo) []*Instan
 }
 
 func newInstance(index int32, pods []PodInfo) *Instance {
-	inst := &Instance{Index: index, Pods: pods, NodesSet: map[string]int{}}
+	inst := &Instance{Index: index, Pods: pods, ObservationValid: true, NodesSet: map[string]int{}}
 	for _, pod := range pods {
 		inst.TotalGPUs += pod.GPUs
 		if pod.Node != "" {

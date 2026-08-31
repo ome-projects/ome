@@ -287,7 +287,10 @@ func buildTestSnapshot(t *testing.T) *ClusterSnapshot {
 
 	snap, err := Build(context.Background(), client.Reader(fakeClient), Options{
 		PreemptibleLabels: []string{"node.kubernetes.io/preemptible"},
-		Now:               func() time.Time { return buildNow },
+		OMENativeExecutor: OMENativeExecutorState{
+			Available: true, WireVersion: "v2", RenewTime: buildNow.Add(-time.Minute), Reason: "healthy",
+		},
+		Now: func() time.Time { return buildNow },
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -352,6 +355,13 @@ func TestBuildWorkloadsAndMigrationState(t *testing.T) {
 	}
 	if len(engine.Instances) != 2 {
 		t.Fatalf("engine instances: %d, want 2 (one per RawDeployment pod)", len(engine.Instances))
+	}
+	if !engine.ObservationValid || !engine.Instances[0].ObservationValid || !engine.Instances[1].ObservationValid {
+		t.Fatalf("Raw live-Pod observations must be structurally valid: %+v", engine)
+	}
+	if !snap.OMENativeExecutor.Available || snap.OMENativeExecutor.WireVersion != "v2" ||
+		!snap.OMENativeExecutor.RenewTime.Equal(buildNow.Add(-time.Minute)) {
+		t.Fatalf("structured executor state = %+v", snap.OMENativeExecutor)
 	}
 	if engine.Instances[0].Pods[0].Name != "svc-a-engine-1" || engine.Instances[0].TotalGPUs != 2 || engine.Instances[0].ReadyPods != 1 {
 		t.Fatalf("instance 0: %+v", engine.Instances[0])

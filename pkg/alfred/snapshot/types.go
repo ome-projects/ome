@@ -37,10 +37,23 @@ type ClusterSnapshot struct {
 	// (a virtual entry is a blocked evacuation fed back by the engine).
 	PendingPods []PendingPod
 
-	// OMENativeAvailable records whether an OMENative executor is
-	// available on this cluster; when false, multi-pod OMENative
-	// candidates degrade to advisory.
+	// OMENativeExecutor is the checked capability observation for the
+	// cluster's OMENative executor. Its zero value is unavailable.
+	OMENativeExecutor OMENativeExecutorState
+
+	// OMENativeAvailable is retained temporarily for compile compatibility
+	// with legacy policy and wiring code. New snapshot consumers must use
+	// OMENativeExecutor; Task 4 removes this field.
 	OMENativeAvailable bool
+}
+
+// OMENativeExecutorState is the structured executor capability observed for
+// this snapshot.
+type OMENativeExecutorState struct {
+	Available   bool
+	WireVersion string
+	RenewTime   time.Time
+	Reason      string
 }
 
 // Node is one node's physical GPU state plus the placement-relevant flags
@@ -124,6 +137,30 @@ type PodInfo struct {
 	// Component is the OME component label value (engine/decoder/router);
 	// empty for non-OME pods.
 	Component v1beta1.ComponentType
+	// ManagedBy is the ome.io/managed-by label value.
+	ManagedBy string
+
+	// OMENative identity labels retain both parsed values and whether each
+	// label was present and valid. This lets checked joins distinguish a
+	// missing label from a valid zero without retaining arbitrary payloads.
+	InstanceIndex        int32
+	InstanceIndexPresent bool
+	InstanceIndexValid   bool
+	Incarnation          int64
+	IncarnationPresent   bool
+	IncarnationValid     bool
+	Runner               v1beta1.RunnerName
+	RunnerPresent        bool
+	RunnerValid          bool
+	PodOrdinal           int32
+	PodOrdinalPresent    bool
+	PodOrdinalValid      bool
+
+	// ControllerOwnerUID is the sole controller OwnerReference UID when one
+	// structurally valid reference is present.
+	ControllerOwnerUID     types.UID
+	ControllerOwnerPresent bool
+	ControllerOwnerValid   bool
 }
 
 // Workload is one InferenceService with everything policies need to reason
@@ -178,6 +215,17 @@ type Component struct {
 	// DeploymentMode is the resolved per-component mode (RawDeployment,
 	// MultiNode, OMENative, ...), which determines the execution surface.
 	DeploymentMode constants.DeploymentModeType
+	// IR is the accepted read-only InferenceReplica source for an OMENative
+	// component. It must never be mutated by snapshot consumers.
+	IR *v1beta1.InferenceReplica
+	// StatusFresh reports whether exactly one tuple-matching IR has the exact
+	// parent controller identity and current observed generation.
+	StatusFresh bool
+	// ObservationValid reports structural agreement between the accepted IR
+	// status and live Pods.
+	ObservationValid bool
+	// ObservationReason is a bounded, payload-free invalidity reason.
+	ObservationReason string
 	// Instances are the atomic units Alfred reasons about: one per pod
 	// for RawDeployment; one per atomic group for multi-pod modes.
 	Instances []*Instance
@@ -188,6 +236,20 @@ type Component struct {
 type Instance struct {
 	// Index is a stable ordinal within the component (pod-name order).
 	Index int32
+	// Incarnation and lifecycle fields are copied from checked IR status.
+	Incarnation       int64
+	Phase             v1beta1.OMENativeInstancePhase
+	RunningRevision   string
+	TargetRevision    string
+	Admitted          bool
+	ActiveOrdinal     int32
+	ServingPods       int32
+	AvailablePods     int32
+	Operation         *v1beta1.InstanceOperation
+	DesiredPods       int32
+	ObservedPods      int32
+	ObservationValid  bool
+	ObservationReason string
 	// Pods are the member pods.
 	Pods []PodInfo
 	// NodesSet counts member pods per node.
