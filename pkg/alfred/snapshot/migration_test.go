@@ -362,6 +362,22 @@ func TestApplyMigrationStateRejectsInvalidIRStatus(t *testing.T) {
 		})
 	}
 
+	t.Run("empty UUID clears matching malformed annotation before rejection", func(t *testing.T) {
+		workload := migrationTestWorkload()
+		withMigrationIR(workload, v1beta1.EngineComponent, migrationStatus(
+			"", v1beta1.MigrationTriggerManual, 0, v1beta1.MigrationPhaseAccepted, now,
+		))
+		applyMigrationState(workload, &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			migrationAnnotationKey(""): "{not-json",
+		}}})
+		if len(workload.MalformedRequests) != 0 || len(workload.ActiveMigrations) != 0 {
+			t.Fatalf("empty UUID IR retained annotation evidence: malformed=%+v active=%+v", workload.MalformedRequests, workload.ActiveMigrations)
+		}
+		if workload.MigrationStateValid || workload.MigrationStateReason != migrationStateReasonStatusInvalid {
+			t.Fatalf("empty UUID status invalidity = valid:%t reason:%q", workload.MigrationStateValid, workload.MigrationStateReason)
+		}
+	})
+
 	t.Run("duplicate UUID across components", func(t *testing.T) {
 		workload := migrationTestWorkload()
 		workload.Components[v1beta1.DecoderComponent] = &Component{Type: v1beta1.DecoderComponent, Instances: []*Instance{{Index: 0, ObservationValid: true}}}

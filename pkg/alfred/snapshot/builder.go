@@ -505,10 +505,8 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 	}
 	for _, row := range rows {
 		status := row.status
-		if status.RequestUUID != "" {
-			delete(inFlight, status.RequestUUID)
-			delete(w.MalformedRequests, status.RequestUUID)
-		}
+		delete(inFlight, status.RequestUUID)
+		delete(w.MalformedRequests, status.RequestUUID)
 		if status.RequestUUID == "" || counts[status.RequestUUID] != 1 || !validMigrationStatus(status) {
 			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
 			continue
