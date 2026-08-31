@@ -16,12 +16,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -164,44 +162,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// OMENative availability: surface enabled AND the InferenceReplica CRD
-	// registered. No real executor ships yet, so this is the heuristic the
-	// OEP's degraded mode keys on. The probe runs on its own rest.Config
-	// copy with a finite timeout (a global timeout on the manager's config
-	// would kill long-lived informer watches) and is TTL-cached so an
-	// executor installed later is noticed without a restart.
-	discoveryConfig := rest.CopyConfig(mgr.GetConfig())
-	discoveryConfig.Timeout = 15 * time.Second
-	probeInferenceReplica := func(context.Context) (bool, error) {
-		dc, err := discovery.NewDiscoveryClientForConfig(discoveryConfig)
-		if err != nil {
-			return false, err
-		}
-		resources, err := dc.ServerResourcesForGroupVersion(constants.OMEAPIGroupName + "/" + v1beta1.APIVersion)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		for _, resource := range resources.APIResources {
-			if resource.Kind == "InferenceReplica" {
-				return true, nil
-			}
-		}
-		return false, nil
-	}
-	discoverOMENative := engine.OMENativeDiscovery(store,
-		engine.CachedProbe(5*time.Minute, nil, probeInferenceReplica),
-		ctrl.Log.WithName("alfred-omenative"))
-
 	observationLoop := &observer.Loop{
-		Reader:             mgr.GetClient(),
-		Store:              store,
-		Metrics:            alfredMetrics,
-		Log:                ctrl.Log.WithName("alfred-observer"),
-		Scorer:             defrag.PublishScores,
-		OMENativeAvailable: discoverOMENative,
+		Reader:  mgr.GetClient(),
+		Store:   store,
+		Metrics: alfredMetrics,
+		Log:     ctrl.Log.WithName("alfred-observer"),
+		Scorer:  defrag.PublishScores,
 	}
 	if err := mgr.Add(observationLoop); err != nil {
 		setupLog.Error(err, "unable to add observation loop")
@@ -298,9 +264,14 @@ func podCacheTransform(obj interface{}) (interface{}, error) {
 	if !ok {
 		return obj, nil
 	}
+	controllerOwner := metav1.GetControllerOf(pod)
 	pod.ManagedFields = nil
 	pod.Annotations = nil
-	pod.OwnerReferences = nil
+	if controllerOwner == nil {
+		pod.OwnerReferences = nil
+	} else {
+		pod.OwnerReferences = []metav1.OwnerReference{*controllerOwner}
+	}
 
 	trimContainers := func(containers []corev1.Container) {
 		for i := range containers {

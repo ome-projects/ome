@@ -356,8 +356,7 @@ func omenativeExecutionEligibility(snap *snapshot.ClusterSnapshot, cfg *config.C
 		status.CurrentRevision != status.UpdateRevision {
 		return policy.AdvisoryOMENativeStateIneligible
 	}
-	// Structured capability is the sole authorization source. The temporary
-	// OMENativeAvailable compatibility boolean is deliberately ignored.
+	// Structured capability is the sole authorization source.
 	if !snap.OMENativeExecutor.Available {
 		return policy.AdvisoryOMENativeUnavailable
 	}

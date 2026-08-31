@@ -159,27 +159,55 @@ func TestRunOnceInvokesScorerHook(t *testing.T) {
 	}
 }
 
-func TestRunOnceRecordsOMENativeDiscovery(t *testing.T) {
-	loop, m := newTestLoop(t)
-	loop.OMENativeAvailable = func(context.Context) bool { return true }
-	if err := loop.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !loop.Latest().OMENativeAvailable {
-		t.Fatal("discovery result must be recorded on the snapshot")
-	}
-	if got := promtestutil.ToFloat64(m.OMENativeUnavailable); got != 0 {
-		t.Fatalf("omenative_unavailable = %v after available discovery, want 0", got)
+func TestRunOnceRecordsOMENativeExecutorState(t *testing.T) {
+	tests := []struct {
+		name     string
+		supplier func(context.Context) snapshot.OMENativeExecutorState
+		want     snapshot.OMENativeExecutorState
+		gauge    float64
+	}{
+		{name: "nil supplier", want: snapshot.OMENativeExecutorState{}, gauge: 1},
+		{
+			name: "explicit unavailable",
+			supplier: func(context.Context) snapshot.OMENativeExecutorState {
+				return snapshot.OMENativeExecutorState{Reason: "lease-stale"}
+			},
+			want:  snapshot.OMENativeExecutorState{Reason: "lease-stale"},
+			gauge: 1,
+		},
+		{
+			name: "explicit available",
+			supplier: func(context.Context) snapshot.OMENativeExecutorState {
+				return snapshot.OMENativeExecutorState{
+					Available:   true,
+					WireVersion: "v2",
+					RenewTime:   loopNow.Add(-time.Minute),
+					Reason:      "ready",
+				}
+			},
+			want: snapshot.OMENativeExecutorState{
+				Available:   true,
+				WireVersion: "v2",
+				RenewTime:   loopNow.Add(-time.Minute),
+				Reason:      "ready",
+			},
+			gauge: 0,
+		},
 	}
 
-	loop.OMENativeAvailable = nil
-	if err := loop.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if loop.Latest().OMENativeAvailable {
-		t.Fatal("nil discovery must record unavailable")
-	}
-	if got := promtestutil.ToFloat64(m.OMENativeUnavailable); got != 1 {
-		t.Fatalf("omenative_unavailable = %v with no executor, want 1", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			loop, m := newTestLoop(t)
+			loop.OMENativeExecutor = tc.supplier
+			if err := loop.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := loop.Latest().OMENativeExecutor; got != tc.want {
+				t.Fatalf("executor state = %+v, want %+v", got, tc.want)
+			}
+			if got := promtestutil.ToFloat64(m.OMENativeUnavailable); got != tc.gauge {
+				t.Fatalf("omenative_unavailable = %v, want %v", got, tc.gauge)
+			}
+		})
 	}
 }

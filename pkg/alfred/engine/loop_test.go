@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,6 +85,18 @@ func TestRunOncePipeline(t *testing.T) {
 	}
 }
 
+func TestRunOnceReportsStructuredOMENativeExecutorState(t *testing.T) {
+	snap := scenario().Build()
+	snap.OMENativeExecutor.Available = true
+	loop, reporter, _ := newTestLoop(t, snap, &stubPolicy{})
+
+	loop.RunOnce(context.Background())
+
+	if reporter.omenativeDegraded {
+		t.Fatal("available structured state must not report OMENative degraded")
+	}
+}
+
 func TestRunOnceWithoutSnapshotSkips(t *testing.T) {
 	p := &stubPolicy{}
 	loop, _, _ := newTestLoop(t, nil, p)
@@ -135,71 +146,6 @@ func TestStartEarlyTickAdvances(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Start returned error on shutdown: %v", err)
-	}
-}
-
-func TestOMENativeDiscoveryGating(t *testing.T) {
-	store := config.NewStore()
-	calls := 0
-	check := func(context.Context) (bool, error) { calls++; return true, nil }
-	discover := OMENativeDiscovery(store, check, logr.Discard())
-	if !discover(context.Background()) {
-		t.Fatal("enabled config with a registered CRD must read available")
-	}
-
-	if _, err := store.Update([]byte("schemaVersion: 1\nomenativeMigrationEnabled: false")); err != nil {
-		t.Fatal(err)
-	}
-	before := calls
-	if discover(context.Background()) {
-		t.Fatal("disabled surface must read unavailable")
-	}
-	if calls != before {
-		t.Fatal("disabled surface must not probe discovery")
-	}
-
-	if _, err := store.Update([]byte("schemaVersion: 1")); err != nil {
-		t.Fatal(err)
-	}
-	failing := OMENativeDiscovery(store, func(context.Context) (bool, error) {
-		return true, errors.New("discovery down")
-	}, logr.Discard())
-	if failing(context.Background()) {
-		t.Fatal("a discovery error must degrade, not enable")
-	}
-}
-
-// TestCachedProbe: successes are held for the TTL, a flip is noticed after
-// it expires, and errors are never cached.
-func TestCachedProbe(t *testing.T) {
-	calls := 0
-	result := false
-	var probeErr error
-	clock := testNow
-	probe := CachedProbe(5*time.Minute, func() time.Time { return clock },
-		func(context.Context) (bool, error) { calls++; return result, probeErr })
-
-	if ok, _ := probe(context.Background()); ok || calls != 1 {
-		t.Fatalf("first probe: ok=%v calls=%d", ok, calls)
-	}
-	if _, _ = probe(context.Background()); calls != 1 {
-		t.Fatalf("inside the TTL the probe must not re-run: %d", calls)
-	}
-
-	result = true
-	clock = clock.Add(6 * time.Minute)
-	if ok, _ := probe(context.Background()); !ok || calls != 2 {
-		t.Fatalf("after the TTL a flip must be noticed: ok=%v calls=%d", ok, calls)
-	}
-
-	probeErr = errors.New("discovery down")
-	clock = clock.Add(6 * time.Minute)
-	if _, err := probe(context.Background()); err == nil {
-		t.Fatal("errors must propagate")
-	}
-	probeErr = nil
-	if _, err := probe(context.Background()); err != nil || calls != 4 {
-		t.Fatalf("errors must not be cached: err=%v calls=%d", err, calls)
 	}
 }
 

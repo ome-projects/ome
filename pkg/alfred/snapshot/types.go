@@ -40,11 +40,6 @@ type ClusterSnapshot struct {
 	// OMENativeExecutor is the checked capability observation for the
 	// cluster's OMENative executor. Its zero value is unavailable.
 	OMENativeExecutor OMENativeExecutorState
-
-	// OMENativeAvailable is retained temporarily for compile compatibility
-	// with legacy policy and wiring code. New snapshot consumers must use
-	// OMENativeExecutor; Task 4 removes this field.
-	OMENativeAvailable bool
 }
 
 // OMENativeExecutorState is the structured executor capability observed for

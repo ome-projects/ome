@@ -72,6 +72,7 @@ func TestGetOptionsCustom(t *testing.T) {
 
 func TestPodCacheTransform(t *testing.T) {
 	always := corev1.ContainerRestartPolicyAlways
+	controller := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "p",
@@ -80,7 +81,16 @@ func TestPodCacheTransform(t *testing.T) {
 			ManagedFields: []metav1.ManagedFieldsEntry{
 				{Manager: "kubelet"},
 			},
-			OwnerReferences: []metav1.OwnerReference{{Name: "rs"}},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "noncontroller", UID: "ignored"},
+				{
+					APIVersion: "ome.io/v1beta1",
+					Kind:       "InferenceReplica",
+					Name:       "ir-0",
+					UID:        "controller-uid",
+					Controller: &controller,
+				},
+			},
 		},
 		Spec: corev1.PodSpec{
 			NodeName:     "node1",
@@ -115,8 +125,17 @@ func TestPodCacheTransform(t *testing.T) {
 	got := out.(*corev1.Pod)
 
 	// Stripped: everything the snapshot never reads.
-	if got.Annotations != nil || got.ManagedFields != nil || got.OwnerReferences != nil {
+	if got.Annotations != nil || got.ManagedFields != nil {
 		t.Fatalf("metadata not stripped: %+v", got.ObjectMeta)
+	}
+	if len(got.OwnerReferences) != 1 {
+		t.Fatalf("owner references = %+v, want only controller", got.OwnerReferences)
+	}
+	owner := got.OwnerReferences[0]
+	if owner.APIVersion != "ome.io/v1beta1" || owner.Kind != "InferenceReplica" ||
+		owner.Name != "ir-0" || owner.UID != "controller-uid" ||
+		owner.Controller == nil || !*owner.Controller {
+		t.Fatalf("controller owner not preserved exactly: %+v", owner)
 	}
 	if got.Spec.Volumes != nil || got.Spec.Tolerations != nil {
 		t.Fatalf("spec not stripped: %+v", got.Spec)
@@ -149,6 +168,23 @@ func TestPodCacheTransform(t *testing.T) {
 	cm := &corev1.ConfigMap{}
 	if out, err := podCacheTransform(cm); err != nil || out != cm {
 		t.Fatalf("non-pod transform: %v %v", out, err)
+	}
+}
+
+func TestPodCacheTransformStripsNonControllerOwners(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "p",
+		OwnerReferences: []metav1.OwnerReference{
+			{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "observer", UID: "observer-uid"},
+		},
+	}}
+
+	out, err := podCacheTransform(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owners := out.(*corev1.Pod).OwnerReferences; len(owners) != 0 {
+		t.Fatalf("non-controller owners retained: %+v", owners)
 	}
 }
 

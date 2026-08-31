@@ -79,7 +79,7 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 	}
 	cfg := l.Store.Get()
 
-	l.Reporter.ReportOMENativeState(snap.OMENativeAvailable)
+	l.Reporter.ReportOMENativeState(snap.OMENativeExecutor.Available)
 
 	var candidates []policy.Candidate
 	for _, p := range l.Policies {

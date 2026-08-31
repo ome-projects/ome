@@ -40,7 +40,8 @@ data:
     recentPlacementCooldownMinutes: 1
     perWorkloadCooldownMinutes: 1
     perNodeCooldownMinutes: 1
-    rawDeploymentMigrationEnabled: true
+    # Reserved compatibility field; RawDeployment remains advisory-only.
+    rawDeploymentMigrationEnabled: false
     omenativeMigrationEnabled: true
     lwsRecommendationsEnabled: true
     recommendationsConfigMapEnabled: true

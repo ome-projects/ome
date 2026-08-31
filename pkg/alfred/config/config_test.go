@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -51,14 +52,29 @@ func TestDefaultIsSafeAndComplete(t *testing.T) {
 	if cfg.EmergencyPendingAge() != 10*time.Minute || cfg.PendingUrgencyTau() != 30*time.Minute {
 		t.Fatal("urgency accessors mismatch")
 	}
-	if !*cfg.DefaultMovable || !*cfg.RawDeploymentMigrationEnabled || !*cfg.OMENativeMigrationEnabled {
-		t.Fatal("execution-surface defaults should be enabled")
+	if !*cfg.DefaultMovable || *cfg.RawDeploymentMigrationEnabled || !*cfg.OMENativeMigrationEnabled {
+		t.Fatal("Raw migration must default off while supported execution surfaces default on")
 	}
 	if cfg.RecommendationsConfigMapName != "alfred-recommendations" {
 		t.Fatalf("recommendations configmap name: %q", cfg.RecommendationsConfigMapName)
 	}
 	if !*cfg.SpotPolicy.AvoidAsTarget || len(cfg.SpotPolicy.PreemptibleLabels) != 2 {
 		t.Fatalf("spot defaults: %+v", cfg.SpotPolicy)
+	}
+}
+
+func TestLoadPreservesReservedRawDeploymentMigrationValues(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		t.Run(fmt.Sprint(want), func(t *testing.T) {
+			cfg, err := Load([]byte(fmt.Sprintf(
+				"schemaVersion: 1\nrawDeploymentMigrationEnabled: %t\n", want)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := *cfg.RawDeploymentMigrationEnabled; got != want {
+				t.Fatalf("rawDeploymentMigrationEnabled = %t, want explicit %t", got, want)
+			}
+		})
 	}
 }
 

@@ -55,8 +55,8 @@ func TestSnapshotBuilder(t *testing.T) {
 		t.Fatalf("synthetic instance must default to structurally valid state: component=%+v instance=%+v",
 			svcB.Components[v1beta1.EngineComponent], inst)
 	}
-	if !snap.OMENativeExecutor.Available || !snap.OMENativeAvailable {
-		t.Fatalf("default executor state = %+v legacy=%t", snap.OMENativeExecutor, snap.OMENativeAvailable)
+	if !snap.OMENativeExecutor.Available {
+		t.Fatalf("default executor state = %+v", snap.OMENativeExecutor)
 	}
 
 	if len(snap.PendingPods) != 1 || snap.PendingPods[0].GPUsNeeded != 8 {

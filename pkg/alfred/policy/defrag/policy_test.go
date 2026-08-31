@@ -660,8 +660,7 @@ func TestOMENativeEligibilityFailsClosed(t *testing.T) {
 		reason string
 		mutate func(*snapshot.ClusterSnapshot)
 	}{
-		{name: "structured executor unavailable despite legacy true", reason: policy.AdvisoryOMENativeUnavailable, mutate: func(s *snapshot.ClusterSnapshot) {
-			s.OMENativeAvailable = true
+		{name: "structured executor unavailable", reason: policy.AdvisoryOMENativeUnavailable, mutate: func(s *snapshot.ClusterSnapshot) {
 			s.OMENativeExecutor.Available = false
 		}},
 		{name: "missing IR", reason: omenativeObservationInvalidReason, mutate: func(s *snapshot.ClusterSnapshot) {

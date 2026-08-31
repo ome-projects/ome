@@ -37,6 +37,8 @@ rules:
     resources:
       - inferenceservices
       - inferenceservices/status
+      - inferencereplicas
+      - inferencereplicas/status
       - servingruntimes
       - clusterservingruntimes
       - basemodels

@@ -51,8 +51,9 @@ data:
     perWorkloadCooldownMinutes: 30
     perNodeCooldownMinutes: 10
 
-    # Execution surfaces — all annotation-mediated; owning controllers execute.
-    rawDeploymentMigrationEnabled: true
+    # Reserved compatibility field; RawDeployment remains advisory-only.
+    rawDeploymentMigrationEnabled: false
+    # Future execution surfaces; owning controllers execute annotations.
     omenativeMigrationEnabled: true
     lwsRecommendationsEnabled: true
 

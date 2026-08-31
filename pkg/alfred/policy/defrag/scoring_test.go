@@ -423,9 +423,8 @@ func TestExecutionScoringUsesOnlyEligibleOMENative(t *testing.T) {
 	t.Run("LWS", func(t *testing.T) {
 		assertObservedOnly(t, base(constants.MultiNode))
 	})
-	t.Run("executor unavailable despite legacy true", func(t *testing.T) {
+	t.Run("executor unavailable", func(t *testing.T) {
 		snap := steady()
-		snap.OMENativeAvailable = true
 		snap.OMENativeExecutor.Available = false
 		assertObservedOnly(t, snap)
 	})
@@ -442,16 +441,6 @@ func TestExecutionScoringUsesOnlyEligibleOMENative(t *testing.T) {
 		almost(t, "Score", cs.Score, pinScenarioReclaimable)
 	})
 
-	t.Run("legacy compatibility boolean ignored", func(t *testing.T) {
-		available := steady()
-		available.OMENativeAvailable = true
-		legacyFalse := steady()
-		legacyFalse.OMENativeAvailable = false
-		gotAvailable := ComputeScores(available, config.Default()).PerPool["h100"]
-		gotLegacyFalse := ComputeScores(legacyFalse, config.Default()).PerPool["h100"]
-		almost(t, "legacy bool FReclaimable", gotLegacyFalse.FReclaimable, gotAvailable.FReclaimable)
-		almost(t, "legacy bool Score", gotLegacyFalse.Score, gotAvailable.Score)
-	})
 }
 
 func TestObservedOnlyRepackCannotCreatePendingPressure(t *testing.T) {

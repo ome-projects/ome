@@ -32,12 +32,11 @@ type SnapshotBuilder struct {
 func NewSnapshot() *SnapshotBuilder {
 	return &SnapshotBuilder{
 		s: &snapshot.ClusterSnapshot{
-			Timestamp:          ReferenceTime,
-			Nodes:              map[string]*snapshot.Node{},
-			Workloads:          map[types.NamespacedName]*snapshot.Workload{},
-			Models:             map[snapshot.ModelKey]*snapshot.ModelAvailability{},
-			OMENativeExecutor:  snapshot.OMENativeExecutorState{Available: true},
-			OMENativeAvailable: true,
+			Timestamp:         ReferenceTime,
+			Nodes:             map[string]*snapshot.Node{},
+			Workloads:         map[types.NamespacedName]*snapshot.Workload{},
+			Models:            map[snapshot.ModelKey]*snapshot.ModelAvailability{},
+			OMENativeExecutor: snapshot.OMENativeExecutorState{Available: true},
 		},
 	}
 }
@@ -104,10 +103,8 @@ func (b *SnapshotBuilder) WithNode(name, pool string, totalGPUs int64, opts ...N
 	return b
 }
 
-// WithOMENative sets structured executor availability and mirrors the value
-// into the temporary legacy compatibility field for synthetic snapshots.
+// WithOMENative sets structured executor availability.
 func (b *SnapshotBuilder) WithOMENative(available bool) *SnapshotBuilder {
-	b.s.OMENativeAvailable = available
 	b.s.OMENativeExecutor.Available = available
 	return b
 }

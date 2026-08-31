@@ -49,9 +49,6 @@ type Options struct {
 	// DefaultMovable is the cluster-wide movable default a workload
 	// inherits when it carries no alfred.ome.io/movable annotation.
 	DefaultMovable *bool
-	// OMENativeAvailable is the caller's discovery result; recorded
-	// verbatim on the snapshot.
-	OMENativeAvailable bool
 	// OMENativeExecutor is the structured executor capability observation.
 	OMENativeExecutor OMENativeExecutorState
 	// Now overrides the clock (tests); nil means time.Now.
@@ -86,12 +83,11 @@ func (o *Options) now() time.Time {
 // load-bearing enough to fail the build.
 func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot, error) {
 	s := &ClusterSnapshot{
-		Timestamp:          opts.now(),
-		Nodes:              map[string]*Node{},
-		Workloads:          map[types.NamespacedName]*Workload{},
-		Models:             map[ModelKey]*ModelAvailability{},
-		OMENativeExecutor:  opts.OMENativeExecutor,
-		OMENativeAvailable: opts.OMENativeAvailable,
+		Timestamp:         opts.now(),
+		Nodes:             map[string]*Node{},
+		Workloads:         map[types.NamespacedName]*Workload{},
+		Models:            map[ModelKey]*ModelAvailability{},
+		OMENativeExecutor: opts.OMENativeExecutor,
 	}
 
 	var nodeList corev1.NodeList
