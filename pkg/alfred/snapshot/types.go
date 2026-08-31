@@ -196,17 +196,25 @@ type Workload struct {
 	SpotPolicy string
 
 	// LastMigration is the completion time of the newest terminal
-	// MigrationHistory entry (CompletedAt when set, else RequestedAt);
-	// it drives the per-workload cooldown.
+	// authoritative InferenceReplica migration status (CompletedAt when set,
+	// else StartedAt); it drives the per-workload cooldown.
 	LastMigration *time.Time
-	// ActiveMigrations are in-flight requests: live request annotations
-	// plus non-terminal MigrationHistory entries, one per UUID.
+	// ActiveMigrations are in-flight requests reconstructed from live request
+	// annotations and non-terminal authoritative InferenceReplica statuses,
+	// one per UUID.
 	ActiveMigrations []InFlight
 	// MalformedRequests maps request-annotation UUIDs that failed parse
 	// or validation to the reason. The workload still carries a write the
 	// executor must ack-reject, and the reporter can surface it; hiding
 	// a corrupt request would make the workload look clean.
 	MalformedRequests map[string]string
+	// MigrationStateValid reports whether all bounded migration evidence was
+	// internally consistent. False keeps the workload advisory/busy rather
+	// than allowing incomplete status evidence to make it executable.
+	MigrationStateValid bool
+	// MigrationStateReason is a bounded, payload-free reason when migration
+	// state is invalid.
+	MigrationStateReason string
 }
 
 // Component is one component (engine/decoder/router) of a workload.
@@ -265,11 +273,13 @@ type Instance struct {
 }
 
 // InFlight is one in-flight migration touching a workload, reconstructed
-// from cluster state (request annotations and non-terminal MigrationHistory
-// entries) so it survives Alfred leader failover.
+// from cluster state (request annotations and non-terminal InferenceReplica
+// status entries) so it survives Alfred leader failover.
 type InFlight struct {
 	UUID      string
 	Component v1beta1.ComponentType
+	// Instance is the source Instance index.
+	Instance int32
 	// Mode is empty while the request is annotation-only (the executor
 	// fixes the mode at admission).
 	Mode v1beta1.MigrationMode

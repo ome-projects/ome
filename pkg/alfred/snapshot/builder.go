@@ -274,11 +274,12 @@ func buildWorkload(
 	opts *Options,
 ) *Workload {
 	w := &Workload{
-		NamespacedName: types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name},
-		ISVC:           isvc,
-		Components:     map[v1beta1.ComponentType]*Component{},
-		Movable:        opts.defaultMovable(),
-		Priority:       defaultWorkloadPriority,
+		NamespacedName:      types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name},
+		ISVC:                isvc,
+		Components:          map[v1beta1.ComponentType]*Component{},
+		Movable:             opts.defaultMovable(),
+		Priority:            defaultWorkloadPriority,
+		MigrationStateValid: true,
 	}
 	applyWorkloadOverrides(w, isvc.Annotations)
 
@@ -448,10 +449,13 @@ func applyWorkloadOverrides(w *Workload, annotations map[string]string) {
 }
 
 // applyMigrationState reconstructs cooldown and in-flight state from durable
-// cluster state (request annotations + MigrationHistory), so it survives
-// Alfred leader failover by construction.
+// cluster state (request annotations + authoritative InferenceReplica status),
+// so it survives Alfred leader failover by construction.
 func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 	inFlight := map[string]InFlight{}
+	pendingRequests := map[string]InFlight{}
+	w.MigrationStateValid = true
+	w.MigrationStateReason = ""
 
 	for key, raw := range isvc.Annotations {
 		if !strings.HasPrefix(key, audit.MigrationRequestAnnotationPrefix) {
@@ -470,20 +474,49 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 			continue
 		}
 		inFlight[uuid] = pending
+		pendingRequests[uuid] = pending
 	}
 
-	for i := range isvc.Status.MigrationHistory {
-		entry := &isvc.Status.MigrationHistory[i]
-		if entry.Phase.Terminal() {
-			// Terminal history overrides a still-present request
-			// annotation for the same UUID: the executor acks in two
-			// writes (append the terminal entry, then clear the
-			// annotation), and a snapshot taken between them must not
-			// report the finished migration as in flight.
-			delete(inFlight, entry.ID)
-			at := entry.RequestedAt.Time
-			if entry.CompletedAt != nil {
-				at = entry.CompletedAt.Time
+	type migrationRow struct {
+		component v1beta1.ComponentType
+		status    *v1beta1.MigrationStatus
+	}
+	components := make([]v1beta1.ComponentType, 0, len(w.Components))
+	for component := range w.Components {
+		components = append(components, component)
+	}
+	sort.Slice(components, func(i, j int) bool { return components[i] < components[j] })
+	var rows []migrationRow
+	for _, component := range components {
+		state := w.Components[component]
+		if state == nil || state.IR == nil {
+			continue
+		}
+		for i := range state.IR.Status.Migrations {
+			rows = append(rows, migrationRow{component: component, status: &state.IR.Status.Migrations[i]})
+		}
+	}
+
+	counts := map[string]int{}
+	for _, row := range rows {
+		if row.status.RequestUUID != "" {
+			counts[row.status.RequestUUID]++
+		}
+	}
+	for _, row := range rows {
+		status := row.status
+		if status.RequestUUID != "" {
+			delete(inFlight, status.RequestUUID)
+			delete(w.MalformedRequests, status.RequestUUID)
+		}
+		if status.RequestUUID == "" || counts[status.RequestUUID] != 1 || !validMigrationStatus(status) {
+			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
+			continue
+		}
+		if status.Phase.Terminal() {
+			at := status.StartedAt.Time
+			if status.CompletedAt != nil {
+				at = status.CompletedAt.Time
 			}
 			if w.LastMigration == nil || at.After(*w.LastMigration) {
 				last := at
@@ -491,20 +524,32 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 			}
 			continue
 		}
-		// Non-terminal history is authoritative over the bare
-		// annotation: it carries mode and phase.
-		requestedBy := entry.RequestedBy
-		if requestedBy == "" {
-			requestedBy = inFlight[entry.ID].RequestedBy
+		source := currentMigrationInstance(w, row.component, status.SourceInstance)
+		if source == nil {
+			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
+			continue
 		}
-		inFlight[entry.ID] = InFlight{
-			UUID:        entry.ID,
-			Component:   entry.Component,
-			Mode:        entry.Mode,
-			Phase:       entry.Phase,
-			RequestedAt: entry.RequestedAt.Time,
+		if !source.ObservationValid {
+			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
+		}
+		requestedBy := ""
+		if pending, ok := pendingRequests[status.RequestUUID]; ok &&
+			pending.Component == row.component && pending.Instance == status.SourceInstance {
+			requestedBy = pending.RequestedBy
+		}
+		inFlight[status.RequestUUID] = InFlight{
+			UUID:        status.RequestUUID,
+			Component:   row.component,
+			Instance:    status.SourceInstance,
+			FromNode:    status.FromNode,
+			Phase:       status.Phase,
+			RequestedAt: status.StartedAt.Time,
 			RequestedBy: requestedBy,
 		}
+	}
+
+	if len(w.MalformedRequests) != 0 {
+		invalidateMigrationState(w, migrationStateReasonRequestInvalid)
 	}
 
 	if len(inFlight) == 0 {

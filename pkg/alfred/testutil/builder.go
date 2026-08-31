@@ -306,10 +306,11 @@ func (b *SnapshotBuilder) ensureWorkload(key string) *snapshot.Workload {
 		return w
 	}
 	w := &snapshot.Workload{
-		NamespacedName: name,
-		Components:     map[v1beta1.ComponentType]*snapshot.Component{},
-		Movable:        true,
-		Priority:       0.5,
+		NamespacedName:      name,
+		Components:          map[v1beta1.ComponentType]*snapshot.Component{},
+		Movable:             true,
+		Priority:            0.5,
+		MigrationStateValid: true,
 	}
 	b.s.Workloads[name] = w
 	return w
