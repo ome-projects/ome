@@ -1,28 +1,23 @@
 package defrag
 
 import (
+	"math"
 	"sort"
 	"time"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
 // PolicyName is the metric/event label value for Policy #1.
 const PolicyName = "defragmentation"
 
-// Disruption cost per migration mode (same unit as Benefit — a share of
-// demand-weighted fragmentation). The OEP fixes the ordering (eviction,
-// rolling restart, and OMENative rolling are low; OMENative surge is
-// medium); the numeric scale is an implementation choice.
-const (
-	costTargetedEviction = 0.05
-	costRollingRestart   = 0.05
-	costOMENativeRolling = 0.05
-	costOMENativeSurge   = 0.15
-)
+// costOMENativeSurge is the disruption cost of Alpha's only executable
+// defragmentation shape: OMENative place-then-free surge.
+const costOMENativeSurge = 0.15
 
 // emergencyBoostFactor multiplies a positive Score when the move unblocks an
 // over-age pending pod — what lets a starving workload jump the queue ahead
@@ -69,6 +64,10 @@ type evalCtx struct {
 	before     float64
 	pendings   []snapshot.PendingPod
 	costWeight float64
+	// executionOpen is the exact reclaimable/pending-pressure gate. A pool
+	// reached only through observed fragmentation may emit advisories but
+	// must not rank targets, simulate, or create capacity claims.
+	executionOpen bool
 }
 
 // Evaluate turns the snapshot into a ranked []Candidate (OEP-0008
@@ -81,9 +80,6 @@ func (*Policy) Evaluate(snap *snapshot.ClusterSnapshot, cfg *config.Config) []po
 	}
 	scores := ComputeScores(snap, cfg)
 	threshold := *d.FragmentationThreshold
-	if scores.FragmentationScore <= threshold {
-		return nil
-	}
 
 	ladder := int64Ladder(d.Scoring.SizeLadder)
 	prior := parsePrior(d.Scoring.SizePrior)
@@ -95,34 +91,29 @@ func (*Policy) Evaluate(snap *snapshot.ClusterSnapshot, cfg *config.Config) []po
 	var out []policy.Candidate
 	for _, pool := range snap.GPUPools() {
 		cs := scores.PerPool[pool]
-		// Per-pool gate: you defragment the worst pool — a healthy
-		// pool's near-zero-benefit moves would be pure churn. A pool
-		// with a starving fixable pending is above threshold through
-		// the noisy-OR pressure term.
-		if cs == nil || cs.Score <= threshold {
+		if cs == nil {
+			continue
+		}
+		executionOpen := cs.Score > threshold
+		advisoryOpen := math.Max(0, cs.FObserved-cs.FReclaimable) > threshold
+		if !executionOpen && !advisoryOpen {
 			continue
 		}
 		ctx := &evalCtx{
-			snap:       snap,
-			cfg:        cfg,
-			pool:       pool,
-			bins:       schedulableBins(snap, cfg, pool),
-			ladder:     ladder,
-			weights:    demandWeights(ladder, demand[pool], prior, lambda),
-			totalFree:  cs.TotalFree,
-			pendings:   poolPendings(snap, pool),
-			costWeight: weight,
+			snap:          snap,
+			cfg:           cfg,
+			pool:          pool,
+			bins:          schedulableBins(snap, cfg, pool),
+			ladder:        ladder,
+			weights:       demandWeights(ladder, demand[pool], prior, lambda),
+			totalFree:     cs.TotalFree,
+			pendings:      poolPendings(snap, pool),
+			costWeight:    weight,
+			executionOpen: executionOpen,
 		}
 		ctx.before = weightedFrag(ctx.bins, ladder, ctx.weights, ctx.totalFree)
 
 		for _, w := range sortedWorkloads(snap) {
-			// Step-1 enumeration filters: movable, no in-flight
-			// migration, outside the per-workload cooldown. (The
-			// Arbiter re-enforces its own bounds on every policy's
-			// output; these pre-filters shape the candidate set.)
-			if !w.Movable || len(w.ActiveMigrations) > 0 || inCooldown(w, cfg, now) {
-				continue
-			}
 			for _, comp := range sortedComponents(w) {
 				out = append(out, evaluateComponent(ctx, w, comp)...)
 			}
@@ -158,31 +149,36 @@ func evaluateComponent(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compon
 		// LWS-backed groups are unsafe to migrate automatically
 		// (RecreateGroupOnPodRestart tears the group down with no surge
 		// protection) but the opportunity must still surface.
-		if !*ctx.cfg.LWSRecommendationsEnabled {
+		if !w.Movable || len(w.ActiveMigrations) > 0 || inCooldown(w, ctx.cfg, ctx.snap.Timestamp) ||
+			!*ctx.cfg.LWSRecommendationsEnabled {
 			return nil
 		}
 		if componentPrimaryPool(ctx.snap, comp) != ctx.pool {
 			return nil
 		}
 		return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-			policy.AdvisoryLWSMigrationUnsupported, componentPrimaryNode(comp), largestInstanceGPUs(comp))}
+			policy.AdvisoryLWSMigrationUnsupported, componentPrimaryNode(comp), 0)}
 	case constants.RawDeployment, constants.OMENative:
-		// Executable surfaces, handled below.
 	default:
 		return nil
 	}
 	if componentPrimaryPool(ctx.snap, comp) != ctx.pool {
 		return nil
 	}
+	if comp.DeploymentMode == constants.RawDeployment {
+		if !w.Movable || len(w.ActiveMigrations) > 0 || inCooldown(w, ctx.cfg, ctx.snap.Timestamp) {
+			return nil
+		}
+		return rawAdvisories(ctx, w, comp)
+	}
 
 	// Component-wide downgrades, most fundamental first; one advisory, not
 	// a stack.
 	from := componentPrimaryNode(comp)
-	footprint := largestInstanceGPUs(comp)
 	if avail := modelOf(ctx.snap, w); avail != nil {
 		if avail.ResolveError != "" {
 			return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-				policy.AdvisoryModelUnresolved, from, footprint)}
+				policy.AdvisoryModelUnresolved, from, 0)}
 		}
 		if avail.VolumePinned {
 			// An RWO/RWOP volume attaches to one node at a time and
@@ -190,57 +186,63 @@ func evaluateComponent(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compon
 			// starts; eviction would only recreate the pod on the
 			// same node.
 			return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-				policy.AdvisoryVolumePinned, from, footprint)}
+				policy.AdvisoryVolumePinned, from, 0)}
 		}
 	}
-	if comp.DeploymentMode == constants.OMENative {
-		if !*ctx.cfg.OMENativeMigrationEnabled {
-			return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-				policy.AdvisoryMigrationSurfaceDisabled, from, footprint)}
-		}
-		if !ctx.snap.OMENativeAvailable {
-			return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-				policy.AdvisoryOMENativeUnavailable, from, footprint)}
-		}
-	} else if !*ctx.cfg.RawDeploymentMigrationEnabled {
-		return []policy.Candidate{advisory(w, comp, policy.ComponentWideInstance,
-			policy.AdvisoryMigrationSurfaceDisabled, from, footprint)}
-	}
-
-	ready := readyInstances(comp)
 	instances := append([]*snapshot.Instance(nil), comp.Instances...)
 	sort.Slice(instances, func(i, j int) bool { return instances[i].Index < instances[j].Index })
 
 	var out []policy.Candidate
 	for _, inst := range instances {
-		// Terminating instances are the Arbiter's exclusion; skipping
-		// here is the OEP-sanctioned optimization.
-		if inst.TotalGPUs == 0 || hasTerminating(inst) || !instanceInPool(ctx.snap, inst, ctx.pool) {
+		if inst.TotalGPUs == 0 || !instanceInPool(ctx.snap, inst, ctx.pool) {
 			continue
 		}
-		if c, ok := evaluateInstance(ctx, w, comp, inst, ready); ok {
+		if !*ctx.cfg.OMENativeMigrationEnabled {
+			out = append(out, advisory(w, comp, inst.Index,
+				policy.AdvisoryMigrationSurfaceDisabled, primaryNode(inst), 0))
+			continue
+		}
+		if reason := omenativeExecutionEligibility(ctx.snap, ctx.cfg, w, comp, inst, ctx.snap.Timestamp); reason != "" {
+			out = append(out, advisory(w, comp, inst.Index, reason, primaryNode(inst), 0))
+			continue
+		}
+		if !ctx.executionOpen {
+			out = append(out, advisory(w, comp, inst.Index,
+				policy.AdvisoryNonExecutableObservedFragmentation, primaryNode(inst), 0))
+			continue
+		}
+		if c, ok := evaluateInstance(ctx, w, comp, inst); ok {
 			out = append(out, c)
 		}
 	}
 	return out
 }
 
-// evaluateInstance simulates one prospective move mode-aware (place-then-free
-// for surge shapes, free-then-place only for multi-replica eviction), scores
-// it benefit-minus-cost, and applies the emergency and spot-source boosts.
+func rawAdvisories(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Component) []policy.Candidate {
+	instances := append([]*snapshot.Instance(nil), comp.Instances...)
+	sort.Slice(instances, func(i, j int) bool { return instances[i].Index < instances[j].Index })
+	out := make([]policy.Candidate, 0, len(instances))
+	for _, inst := range instances {
+		if inst.TotalGPUs == 0 || hasTerminating(inst) || !instanceInPool(ctx.snap, inst, ctx.pool) {
+			continue
+		}
+		out = append(out, advisory(w, comp, inst.Index,
+			policy.AdvisoryRawDeploymentMigrationUnsupported, primaryNode(inst), 0))
+	}
+	return out
+}
+
+// evaluateInstance simulates Alpha's sole executable defragmentation shape
+// (OMENative place-then-free surge), scores it benefit-minus-cost, and
+// applies the emergency and spot-source boosts.
 func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Component,
-	inst *snapshot.Instance, ready int) (policy.Candidate, bool) {
+	inst *snapshot.Instance) (policy.Candidate, bool) {
 
 	prints := instanceFootprints(inst)
 	if len(prints) == 0 {
 		return policy.Candidate{}, false
 	}
 	from := primaryNode(inst)
-	// OMENative migrates an Instance by surging it regardless of replica
-	// count; RawDeployment surges only when evicting the sole ready
-	// replica would be an outage. The controller re-branches at execution
-	// time against live state; the simulation predicts from the snapshot.
-	surgeShaped := comp.DeploymentMode == constants.OMENative || ready <= 1
 
 	exclude := make(map[string]bool, len(inst.NodesSet))
 	for node := range inst.NodesSet {
@@ -254,39 +256,33 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 	minPod := prints[len(prints)-1].gpus
 	ranked := rankTargets(ctx.snap, ctx.cfg, ctx.bins, w, minPod, exclude)
 
-	var after []binState
-	if surgeShaped {
-		bins, _, ok := placeThenFree(ctx.bins, prints, ranked)
-		if !ok {
-			// Not dispatchable: without surge headroom the migration
-			// would stall in SurgePending until timeout. Surface
-			// "wants to move, no room" instead.
-			c := advisory(w, comp, inst.Index, policy.AdvisoryNoSurgeHeadroom, from, inst.TotalGPUs)
-			c.SurgeShaped = true
-			return c, true
-		}
-		after = bins
-	} else {
-		bins, target := freeThenPlace(ctx.bins, prints[0], ranked)
-		if target == "" {
-			// Nowhere to land even once the source frees its GPUs
-			// (a full pool, or a model/spot constraint that empties
-			// the ranking): evicting would strand the replacement
-			// in Pending for no gain. Surface, do not dispatch.
-			return advisory(w, comp, inst.Index, policy.AdvisoryNoFeasibleTarget, from, inst.TotalGPUs), true
-		}
-		after = bins
+	after, _, ok := placeThenFree(ctx.bins, prints, ranked)
+	if !ok {
+		// Not dispatchable: without surge headroom the migration would
+		// stall in SurgePending until timeout.
+		c := advisory(w, comp, inst.Index, policy.AdvisoryNoSurgeHeadroom, from, inst.TotalGPUs)
+		c.SurgeShaped = true
+		return c, true
 	}
 
 	benefit := ctx.before - weightedFrag(after, ctx.ladder, ctx.weights, ctx.totalFree)
-	cost := modeCost(comp.DeploymentMode, len(comp.Instances), ready)
+	cost := costOMENativeSurge
 	score := benefit - ctx.costWeight*cost
+	if score <= 0 {
+		c := advisory(w, comp, inst.Index,
+			policy.AdvisoryNonExecutableObservedFragmentation, from, 0)
+		c.SurgeShaped = true
+		c.Benefit = benefit
+		c.Cost = cost
+		c.Score = score
+		return c, true
+	}
 
 	emergency := unblocksOverAgePending(ctx, w, after)
-	if emergency && score > 0 {
+	if emergency {
 		score *= emergencyBoostFactor
 	}
-	if score > 0 && spotPrefersSource(w, ctx.cfg) {
+	if spotPrefersSource(w, ctx.cfg) {
 		if node := ctx.snap.Nodes[from]; node != nil && node.Preemptible {
 			score *= spotSourceBoostFactor
 		}
@@ -306,7 +302,7 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		FromNode:        from,
 		HintTargetNodes: append([]string(nil), hints...),
 		Executable:      true,
-		SurgeShaped:     surgeShaped,
+		SurgeShaped:     true,
 		FootprintGPUs:   inst.TotalGPUs,
 		Benefit:         benefit,
 		Cost:            cost,
@@ -315,18 +311,69 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 	}, true
 }
 
-// modeCost prices disruption per the OEP's cost table.
-func modeCost(mode constants.DeploymentModeType, instanceCount, ready int) float64 {
-	if mode == constants.OMENative {
-		if instanceCount == 1 {
-			return costOMENativeSurge
+// omenativeExecutionEligibility is the single fail-closed Alpha execution
+// baseline shared by candidate classification and executable repacking. It
+// returns the first stable advisory reason in deterministic check order; an
+// empty reason is the only executable result.
+func omenativeExecutionEligibility(snap *snapshot.ClusterSnapshot, cfg *config.Config,
+	w *snapshot.Workload, comp *snapshot.Component, inst *snapshot.Instance, now time.Time) string {
+
+	if !w.Movable || !w.MigrationStateValid || len(w.MalformedRequests) > 0 ||
+		len(w.ActiveMigrations) > 0 || inCooldown(w, cfg, now) {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	if comp.IR == nil || !comp.StatusFresh || !comp.ObservationValid {
+		return policy.AdvisoryOMENativeObservationInvalid
+	}
+	ir := comp.IR
+	if ir.Spec.Paused {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	if ir.Spec.Lifecycle != nil && ir.Spec.Lifecycle.MigrationPolicy != nil &&
+		ir.Spec.Lifecycle.MigrationPolicy.Mode == v1beta1.MigrationPolicyModeNever {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	desired := int32(1)
+	if ir.Spec.Replicas != nil {
+		desired = *ir.Spec.Replicas
+	}
+	status := &ir.Status
+	if desired <= 0 || int32(len(comp.Instances)) != desired || status.Replicas != desired || status.ReadyReplicas != desired ||
+		status.ServingReplicas != desired || status.AvailableReplicas != desired ||
+		status.UpdatedReplicas != desired || status.UpdatedReadyReplicas != desired {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	if status.CurrentRevision == "" || status.UpdateRevision == "" ||
+		status.CurrentRevision != status.UpdateRevision {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	// Structured capability is the sole authorization source. The temporary
+	// OMENativeAvailable compatibility boolean is deliberately ignored.
+	if !snap.OMENativeExecutor.Available {
+		return policy.AdvisoryOMENativeUnavailable
+	}
+	if !inst.ObservationValid {
+		return policy.AdvisoryOMENativeObservationInvalid
+	}
+	if !inst.Admitted || inst.Phase != v1beta1.OMENativeInstanceReady || inst.Operation != nil {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	if inst.DesiredPods <= 0 || inst.StatusPods != inst.DesiredPods ||
+		inst.ObservedPods != inst.DesiredPods || int32(len(inst.Pods)) != inst.DesiredPods ||
+		inst.ReadyPods != inst.DesiredPods || inst.ServingPods != inst.DesiredPods ||
+		inst.AvailablePods != inst.DesiredPods {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	if inst.RunningRevision == "" || inst.TargetRevision == "" ||
+		inst.RunningRevision != inst.TargetRevision || inst.RunningRevision != status.CurrentRevision {
+		return policy.AdvisoryOMENativeStateIneligible
+	}
+	for i := range inst.Pods {
+		if !inst.Pods[i].Ready || inst.Pods[i].Terminating {
+			return policy.AdvisoryOMENativeStateIneligible
 		}
-		return costOMENativeRolling
 	}
-	if ready <= 1 {
-		return costRollingRestart
-	}
-	return costTargetedEviction
+	return ""
 }
 
 // unblocksOverAgePending reports whether the simulated after-state seats a
@@ -497,16 +544,6 @@ func modelOf(snap *snapshot.ClusterSnapshot, w *snapshot.Workload) *snapshot.Mod
 	return snap.Models[w.ModelKey]
 }
 
-func readyInstances(comp *snapshot.Component) int {
-	count := 0
-	for _, inst := range comp.Instances {
-		if inst.ReadyPods > 0 {
-			count++
-		}
-	}
-	return count
-}
-
 func hasTerminating(inst *snapshot.Instance) bool {
 	for _, pod := range inst.Pods {
 		if pod.Terminating {
@@ -582,16 +619,6 @@ func componentPrimaryPool(snap *snapshot.ClusterSnapshot, comp *snapshot.Compone
 		}
 	}
 	return best
-}
-
-func largestInstanceGPUs(comp *snapshot.Component) int64 {
-	var largest int64
-	for _, inst := range comp.Instances {
-		if inst.TotalGPUs > largest {
-			largest = inst.TotalGPUs
-		}
-	}
-	return largest
 }
 
 func poolPendings(snap *snapshot.ClusterSnapshot, pool string) []snapshot.PendingPod {

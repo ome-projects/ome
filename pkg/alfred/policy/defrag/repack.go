@@ -3,6 +3,7 @@ package defrag
 import (
 	"sort"
 
+	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -17,11 +18,12 @@ type repackItem struct {
 // repackPool computes the step-3 hypothetical: lift every movable footprint
 // off its node, first-fit-decreasing it back onto the pool's schedulable
 // bins, and return the resulting free distribution. Everything else —
-// non-OME occupants, Movable=false workloads, LWS-backed instances,
-// volume-pinned workloads — stays fixed in place. FFD is the same heuristic
-// family candidate simulation uses; global optimality is explicitly not
-// promised (Non-Goals), so F_best is a bound, not a plan.
-func repackPool(snap *snapshot.ClusterSnapshot, pool string, observed []binState) []binState {
+// non-OME occupants and every non-executable workload (Raw, LWS, invalid or
+// busy OMENative, unavailable executor, disabled surface, pinned volume) —
+// stays fixed in place. FFD is the same heuristic family candidate simulation
+// uses; global optimality is explicitly not promised (Non-Goals), so F_best
+// is a bound, not a plan.
+func repackPool(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool string, observed []binState) []binState {
 	bins := make([]binState, len(observed))
 	copy(bins, observed)
 	binIndex := map[string]int{}
@@ -29,7 +31,7 @@ func repackPool(snap *snapshot.ClusterSnapshot, pool string, observed []binState
 		binIndex[bin.name] = i
 	}
 
-	items := movableFootprints(snap, pool)
+	items := movableFootprints(snap, cfg, pool)
 
 	// Lift: a movable pod's GPUs return to its node's free pool when the
 	// node is a schedulable bin. Pods on excluded nodes (unhealthy,
@@ -99,14 +101,14 @@ func repackPool(snap *snapshot.ClusterSnapshot, pool string, observed []binState
 // not co-locate (cross-node adjacency is out of scope, Q-039), and F_best is
 // a bound, not a plan — candidate simulation is what enforces
 // instance-atomic moves.
-func movableFootprints(snap *snapshot.ClusterSnapshot, pool string) []repackItem {
+func movableFootprints(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool string) []repackItem {
 	var items []repackItem
 	for _, workload := range snap.Workloads {
 		for _, component := range workload.Components {
-			if !movableForRepack(snap, workload, component) {
-				continue
-			}
 			for _, instance := range component.Instances {
+				if !movableForRepack(snap, cfg, workload, component, instance) {
+					continue
+				}
 				for _, pod := range instance.Pods {
 					if pod.GPUs == 0 || pod.Node == "" {
 						continue
@@ -123,23 +125,15 @@ func movableFootprints(snap *snapshot.ClusterSnapshot, pool string) []repackItem
 	return items
 }
 
-// movableForRepack mirrors candidate enumeration's executability rules:
-// OMENative (only while an executor is available) and RawDeployment
-// components of Movable workloads, excluding volume-pinned (RWO/RWOP PVC)
-// workloads — no surge-shaped mechanism can move those.
-func movableForRepack(snap *snapshot.ClusterSnapshot, workload *snapshot.Workload, component *snapshot.Component) bool {
-	if !workload.Movable {
+// movableForRepack mirrors candidate enumeration's exact executable Alpha
+// baseline. RawDeployment and LWS are observed demand only; they never enter
+// the FFD hypothetical.
+func movableForRepack(snap *snapshot.ClusterSnapshot, cfg *config.Config, workload *snapshot.Workload,
+	component *snapshot.Component, instance *snapshot.Instance) bool {
+	if !*cfg.OMENativeMigrationEnabled {
 		return false
 	}
-	switch component.DeploymentMode {
-	case constants.RawDeployment:
-	case constants.OMENative:
-		if !snap.OMENativeAvailable {
-			return false
-		}
-	default:
-		// MultiNode (LWS) is recommend-only; Knative and
-		// VirtualDeployment are not managed.
+	if component.DeploymentMode != constants.OMENative {
 		return false
 	}
 	if !workload.ModelKey.Zero() {
@@ -147,5 +141,5 @@ func movableForRepack(snap *snapshot.ClusterSnapshot, workload *snapshot.Workloa
 			return false
 		}
 	}
-	return true
+	return omenativeExecutionEligibility(snap, cfg, workload, component, instance, snap.Timestamp) == ""
 }

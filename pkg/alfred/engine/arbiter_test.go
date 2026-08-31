@@ -85,17 +85,18 @@ func decisionFor(t *testing.T, decisions []Decision, workload string) Decision {
 func TestAdmitHappyPathAndAdvisoryBypass(t *testing.T) {
 	advisory := cand("prod/b", "node3")
 	advisory.Executable = false
-	advisory.AdvisoryReason = policy.AdvisoryNoSurgeHeadroom
+	advisory.AdvisoryReason = "RawDeploymentMigrationUnsupported"
+	advisory.FootprintGPUs = 8 // advisory metadata must never reserve this
 
 	decisions := admit(t, &Arbiter{}, scenario().Build(), config.Default(),
-		cand("prod/a", "node1"), advisory)
+		advisory, cand("prod/a", "node1"))
 
 	if len(decisions) != 1 {
 		t.Fatalf("advisories must not be arbitrated: %+v", decisions)
 	}
 	d := decisions[0]
 	if !d.Admitted || d.Reason != "" || d.Target != "node2" || d.CooldownOverridden {
-		t.Fatalf("happy path decision: %+v", d)
+		t.Fatalf("Raw advisory must not enter arbitration or claim node2: %+v", d)
 	}
 }
 

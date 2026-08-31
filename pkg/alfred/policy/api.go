@@ -29,11 +29,6 @@ const (
 	// AdvisoryNoSurgeHeadroom: the surge-shaped replacement footprint fits
 	// on no feasible target while the source still holds its GPUs.
 	AdvisoryNoSurgeHeadroom = "NoSurgeHeadroom"
-	// AdvisoryNoFeasibleTarget: the free-then-place mirror of
-	// NoSurgeHeadroom — no feasible target can seat the replacement even
-	// once the source releases its GPUs, so evicting would strand it in
-	// Pending.
-	AdvisoryNoFeasibleTarget = "NoFeasibleTarget"
 	// AdvisoryVolumePinned: an RWO/RWOP PVC pins the workload to its node;
 	// no migration mechanism can move it.
 	AdvisoryVolumePinned = "VolumePinned"
@@ -41,9 +36,22 @@ const (
 	// pod restart with no surge protection; the safe fix (move the
 	// workload to OMENative) is the operator's.
 	AdvisoryLWSMigrationUnsupported = "LWSMigrationUnsupported"
+	// AdvisoryRawDeploymentMigrationUnsupported: Alpha has no truthful
+	// RawDeployment executor; every otherwise observable Raw Instance is
+	// surfaced to the operator without entering arbitration.
+	AdvisoryRawDeploymentMigrationUnsupported = "RawDeploymentMigrationUnsupported"
 	// AdvisoryOMENativeUnavailable: no OMENative executor exists on this
 	// cluster, so the migration verb has no consumer.
 	AdvisoryOMENativeUnavailable = "OMENativeUnavailable"
+	// AdvisoryOMENativeObservationInvalid: the checked IR/Pod join is
+	// missing, stale, or structurally inconsistent.
+	AdvisoryOMENativeObservationInvalid = "OMENativeObservationInvalid"
+	// AdvisoryOMENativeStateIneligible: the checked OMENative state is not
+	// fully steady or the workload is already busy with a transition.
+	AdvisoryOMENativeStateIneligible = "OMENativeStateIneligible"
+	// AdvisoryNonExecutableObservedFragmentation: fragmentation is visible
+	// to the operator but cannot authorize a positive executable move.
+	AdvisoryNonExecutableObservedFragmentation = "NonExecutableObservedFragmentation"
 	// AdvisoryMigrationSurfaceDisabled: the component's execution surface
 	// is switched off in alfred-config.
 	AdvisoryMigrationSurfaceDisabled = "MigrationSurfaceDisabled"
@@ -88,9 +96,8 @@ type Candidate struct {
 	Executable     bool
 	AdvisoryReason string
 
-	// SurgeShaped records the simulated execution shape: place-then-free
-	// (OMENative Instance surge, single-replica rolling restart) vs
-	// free-then-place (multi-replica targeted eviction).
+	// SurgeShaped records the simulated execution shape. Defragmentation
+	// has one executable Alpha shape: OMENative place-then-free surge.
 	SurgeShaped bool
 	// FootprintGPUs is the instance's GPU footprint. For a surge-shaped
 	// move this much headroom must exist while the source still holds its

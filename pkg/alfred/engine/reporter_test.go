@@ -140,6 +140,27 @@ func TestReportCycleOutcomes(t *testing.T) {
 	}
 }
 
+func TestRawAdvisoryUsesDedicatedEventReason(t *testing.T) {
+	r, _, recorder, _ := newTestReporter(t)
+	cfg := config.Default()
+	*cfg.RecommendationsConfigMapEnabled = false
+
+	raw := cand("prod/raw", "node1")
+	raw.Executable = false
+	raw.AdvisoryReason = "RawDeploymentMigrationUnsupported"
+	raw.HintTargetNodes = nil
+	raw.FootprintGPUs = 0
+	r.ReportCycle(context.Background(), []policy.Candidate{raw}, nil, cfg, testNow)
+
+	events := drainEvents(recorder)
+	if !hasEvent(events, "RawDeploymentMigrationUnsupported") {
+		t.Fatalf("Raw advisory must use its dedicated Event reason: %v", events)
+	}
+	if hasEvent(events, "FragmentationRecommendationProduced") {
+		t.Fatalf("Raw advisory must not use the generic fragmentation Event reason: %v", events)
+	}
+}
+
 // TestCrossPolicyDecisionsKeyedSeparately: node-health and defrag can both
 // target the same instance in one pass; each candidate must be reported with
 // its own decision, not the other policy's.

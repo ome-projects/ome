@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
@@ -103,7 +104,8 @@ func (b *SnapshotBuilder) WithNode(name, pool string, totalGPUs int64, opts ...N
 	return b
 }
 
-// WithOMENative sets the snapshot's OMENative availability.
+// WithOMENative sets structured executor availability and mirrors the value
+// into the temporary legacy compatibility field for synthetic snapshots.
 func (b *SnapshotBuilder) WithOMENative(available bool) *SnapshotBuilder {
 	b.s.OMENativeAvailable = available
 	b.s.OMENativeExecutor.Available = available
@@ -151,6 +153,9 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 			StatusFresh:      mode == constants.OMENative,
 			ObservationValid: true,
 		}
+		if mode == constants.OMENative {
+			component.IR = &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+		}
 		w.Components[ctype] = component
 	} else if component.DeploymentMode != mode {
 		// A silent rewrite would re-label instances added under the
@@ -172,6 +177,10 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 		AvailablePods:    int32(len(nodes)),
 		ObservationValid: true,
 		NodesSet:         map[string]int{},
+	}
+	if mode == constants.OMENative {
+		inst.RunningRevision = "revision-1"
+		inst.TargetRevision = "revision-1"
 	}
 	for i, nodeName := range nodes {
 		n := b.mustNode(nodeName)
@@ -219,6 +228,21 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 		}
 	}
 	component.Instances = append(component.Instances, inst)
+	if mode == constants.OMENative {
+		replicas := int32(len(component.Instances))
+		component.IR.Spec.Replicas = &replicas
+		component.IR.Status = v1beta1.InferenceReplicaStatus{
+			ObservedGeneration:   component.IR.Generation,
+			Replicas:             replicas,
+			ReadyReplicas:        replicas,
+			ServingReplicas:      replicas,
+			AvailableReplicas:    replicas,
+			UpdatedReplicas:      replicas,
+			UpdatedReadyReplicas: replicas,
+			CurrentRevision:      "revision-1",
+			UpdateRevision:       "revision-1",
+		}
+	}
 	return b
 }
 
