@@ -103,12 +103,12 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 	if err := r.List(ctx, &podList); err != nil {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
-	// isvcPods groups OME pods by owning ISVC and component for workload
-	// assembly below; node occupancy is filled in the same pass.
-	isvcPods := map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo{}
+	// podEvidence retains nonterminal Pod identity until ISVCs and IRs are
+	// indexed, so controller ownership can route malformed label evidence.
+	var podEvidence []PodInfo
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		ingestPod(s, pod, isvcPods, &opts)
+		ingestPod(s, pod, &podEvidence, &opts)
 	}
 	for _, n := range s.Nodes {
 		n.FreeGPUs = n.TotalGPUs - n.AllocatedGPUs
@@ -132,10 +132,11 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 	var irList v1beta1.InferenceReplicaList
 	irListErr := r.List(ctx, &irList)
 	irIndex := indexInferenceReplicas(irList.Items)
+	routedPods := routeWorkloadPods(podEvidence, isvcList.Items, irIndex)
 	for i := range isvcList.Items {
 		isvc := &isvcList.Items[i]
 		key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}
-		s.Workloads[key] = buildWorkload(isvc, isvcPods[key], irIndex, irListErr, &opts)
+		s.Workloads[key] = buildWorkload(isvc, routedPods[key], irIndex, irListErr, &opts)
 	}
 
 	resolveModels(ctx, r, s)
@@ -185,7 +186,7 @@ func buildNode(node *corev1.Node, opts *Options) *Node {
 
 // ingestPod routes one pod into node occupancy, workload grouping, and
 // pending pressure as applicable.
-func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo, opts *Options) {
+func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts *Options) {
 	gpus := PodGPURequest(pod)
 	isvcName := pod.Labels[constants.InferenceServicePodLabelKey]
 	component := v1beta1.ComponentType(pod.Labels[constants.OMEComponentLabel])
@@ -224,17 +225,11 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.Namespace
 		}
 	}
 
-	// Workload grouping retains every nonterminal OME pod, including pods
-	// with missing component evidence and unscheduled pods. Checked OMENative
-	// joins route by controller ownership below; Raw and LWS construction
-	// filters back to scheduled pods.
-	if isvcName != "" && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-		byComponent, ok := isvcPods[info.ISVC]
-		if !ok {
-			byComponent = map[v1beta1.ComponentType][]PodInfo{}
-			isvcPods[info.ISVC] = byComponent
-		}
-		byComponent[component] = append(byComponent[component], info)
+	// Retain every nonterminal Pod until owner-aware routing. This is transient
+	// build evidence, not durable snapshot payload. Raw and LWS construction
+	// filters back to scheduled Pods after routing.
+	if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+		*podEvidence = append(*podEvidence, info)
 	}
 
 	// Pending pressure: unscheduled GPU demand.
@@ -290,27 +285,7 @@ func buildWorkload(
 		}
 	}
 
-	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(
-		isvc.Spec.Engine, isvc.Spec.Decoder, isvc.Spec.Router, nil, isvc.Spec.DeploymentMode)
-	if err != nil {
-		// An ISVC without an engine spec is invalid but may transiently
-		// exist; fall back to the default mode so its pods still appear.
-		engineMode, decoderMode, routerMode = constants.RawDeployment, constants.RawDeployment, constants.RawDeployment
-	}
-	specComponents := []struct {
-		ctype   v1beta1.ComponentType
-		present bool
-		mode    constants.DeploymentModeType
-	}{
-		{v1beta1.EngineComponent, isvc.Spec.Engine != nil, engineMode},
-		{v1beta1.DecoderComponent, isvc.Spec.Decoder != nil, decoderMode},
-		{v1beta1.RouterComponent, isvc.Spec.Router != nil, routerMode},
-	}
-	componentModes := make(map[v1beta1.ComponentType]constants.DeploymentModeType, len(specComponents))
-	for _, sc := range specComponents {
-		componentModes[sc.ctype] = sc.mode
-	}
-	pods = routeWorkloadPods(isvc, pods, componentModes, irIndex)
+	specComponents := workloadComponentSpecs(isvc)
 	for _, sc := range specComponents {
 		if !sc.present && len(pods[sc.ctype]) == 0 {
 			continue
@@ -330,6 +305,27 @@ func buildWorkload(
 
 	applyMigrationState(w, isvc)
 	return w
+}
+
+type workloadComponentSpec struct {
+	ctype   v1beta1.ComponentType
+	present bool
+	mode    constants.DeploymentModeType
+}
+
+func workloadComponentSpecs(isvc *v1beta1.InferenceService) []workloadComponentSpec {
+	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(
+		isvc.Spec.Engine, isvc.Spec.Decoder, isvc.Spec.Router, nil, isvc.Spec.DeploymentMode)
+	if err != nil {
+		// An ISVC without an engine spec is invalid but may transiently
+		// exist; fall back to the default mode so its pods still appear.
+		engineMode, decoderMode, routerMode = constants.RawDeployment, constants.RawDeployment, constants.RawDeployment
+	}
+	return []workloadComponentSpec{
+		{v1beta1.EngineComponent, isvc.Spec.Engine != nil, engineMode},
+		{v1beta1.DecoderComponent, isvc.Spec.Decoder != nil, decoderMode},
+		{v1beta1.RouterComponent, isvc.Spec.Router != nil, routerMode},
+	}
 }
 
 func scheduledPods(pods []PodInfo) []PodInfo {

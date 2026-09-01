@@ -233,6 +233,45 @@ func TestBuildOMENativeRejectsOwnedPodsWithInvalidComponentEvidence(t *testing.T
 	}
 }
 
+func TestBuildOMENativeRejectsOwnedPodsWithInvalidISVCEvidence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omeNativeFixture, *corev1.Pod)
+	}{
+		{
+			name: "missing ISVC label",
+			mutate: func(_ *omeNativeFixture, pod *corev1.Pod) {
+				delete(pod.Labels, constants.InferenceServicePodLabelKey)
+			},
+		},
+		{
+			name: "wrong ISVC label",
+			mutate: func(fixture *omeNativeFixture, pod *corev1.Pod) {
+				rawMode := constants.RawDeployment
+				other := fixture.isvc.DeepCopy()
+				other.Name = "other-svc"
+				other.UID = "other-isvc-uid"
+				other.Spec.DeploymentMode = &rawMode
+				fixture.extra = append(fixture.extra, other)
+				pod.Labels[constants.InferenceServicePodLabelKey] = other.Name
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newOMENativeFixture()
+			adversarial := fixture.pods[0].DeepCopy()
+			adversarial.Name += "-adversarial-isvc"
+			test.mutate(fixture, adversarial)
+			fixture.pods = append(fixture.pods, adversarial)
+
+			component := buildOMENativeFixture(t, fixture)
+			assertInvalidOMENativeObservation(t, component)
+		})
+	}
+}
+
 func TestBuildOMENativeRejectsAmbiguousOwnerUIDAcrossComponents(t *testing.T) {
 	baselineFixture := newOMENativeFixture()
 	addOMENativeDecoder(baselineFixture)
@@ -256,7 +295,7 @@ func TestBuildOMENativeRejectsAmbiguousOwnerUIDAcrossComponents(t *testing.T) {
 	}
 }
 
-func TestBuildOMENativeRejectsUnresolvableOwnerAcrossComponents(t *testing.T) {
+func TestBuildOMENativeUsesDeclaredComponentForUnresolvableOwner(t *testing.T) {
 	fixture := newOMENativeFixture()
 	addOMENativeDecoder(fixture)
 	adversarial := fixture.pods[0].DeepCopy()
@@ -265,10 +304,10 @@ func TestBuildOMENativeRejectsUnresolvableOwnerAcrossComponents(t *testing.T) {
 	fixture.pods = append(fixture.pods, adversarial)
 
 	workload := buildOMENativeFixtureWorkload(t, fixture)
-	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
-		t.Run(string(component), func(t *testing.T) {
-			assertInvalidOMENativeObservation(t, workload.Components[component])
-		})
+	assertInvalidOMENativeObservation(t, workload.Components[v1beta1.EngineComponent])
+	decoder := workload.Components[v1beta1.DecoderComponent]
+	if !decoder.ObservationValid {
+		t.Fatalf("engine-labelled unresolved Pod poisoned decoder: %+v", decoder)
 	}
 }
 
