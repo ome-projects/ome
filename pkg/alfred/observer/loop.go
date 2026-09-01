@@ -8,6 +8,7 @@ package observer
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,7 +42,8 @@ type Loop struct {
 	// Now overrides the clock in tests.
 	Now func() time.Time
 
-	latest atomic.Pointer[snapshot.ClusterSnapshot]
+	refreshMu sync.Mutex
+	latest    atomic.Pointer[snapshot.ClusterSnapshot]
 }
 
 // ConfigStore is the read surface the observation loop needs from the
@@ -67,7 +69,7 @@ func (l *Loop) Latest() *snapshot.ClusterSnapshot {
 // observation interval, re-reading the interval every pass so a config
 // reload takes effect without a restart.
 func (l *Loop) Start(ctx context.Context) error {
-	if err := l.RunOnce(ctx); err != nil {
+	if err := l.Refresh(ctx); err != nil {
 		// The first pass may race informer sync; log and keep ticking.
 		l.Log.Error(err, "initial observation pass failed")
 	}
@@ -77,16 +79,25 @@ func (l *Loop) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(interval):
-			if err := l.RunOnce(ctx); err != nil {
+			if err := l.Refresh(ctx); err != nil {
 				l.Log.Error(err, "observation pass failed")
 			}
 		}
 	}
 }
 
-// RunOnce builds one snapshot and publishes gauges. Exported so tests (and a
-// forced pre-decision refresh) can drive passes directly.
+// RunOnce is the compatibility name for one serialized refresh.
 func (l *Loop) RunOnce(ctx context.Context) error {
+	return l.Refresh(ctx)
+}
+
+// Refresh builds and publishes one snapshot. The whole pass is serialized so
+// a periodic observation and a forced pre-decision refresh cannot interleave
+// snapshot publication, gauge resets, or scorer output.
+func (l *Loop) Refresh(ctx context.Context) error {
+	l.refreshMu.Lock()
+	defer l.refreshMu.Unlock()
+
 	started := l.now()
 	cfg := l.Store.Get()
 

@@ -13,13 +13,12 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/config"
 )
 
-// EarlyTicker turns node-condition changes into decision-loop tick
-// advancements (earlyTickOn: [NodeConditionChange]): health evacuation
-// starts within seconds while defragmentation stays lazily periodic. The
-// signal advances the timer feeding a non-reentrant loop, so it can shorten
-// waiting but never introduce concurrency. It runs on every replica — the
-// channel is only consumed by the leader's decision loop, and a non-leader's
-// signals are cheap.
+// EarlyTicker turns node-condition changes into supplemental decision passes
+// (earlyTickOn: [NodeConditionChange]): health evacuation starts within seconds
+// while defragmentation stays lazily periodic. The signal requests a fresh pass
+// from the non-reentrant loop without moving its regular cadence. It runs on
+// every replica — the channel is only consumed by the leader's decision loop,
+// and a non-leader's signals are cheap.
 type EarlyTicker struct {
 	Cache ctrlcache.Cache
 	Store *config.Store
@@ -27,7 +26,7 @@ type EarlyTicker struct {
 
 	// C carries the tick signal; buffered with capacity 1 so a signal
 	// landing mid-pass waits there instead of being lost, and a storm of
-	// changes collapses into one advancement.
+	// changes collapses into one supplemental pass.
 	C chan struct{}
 }
 
@@ -73,7 +72,7 @@ func (e *EarlyTicker) observe(oldObj, newObj interface{}) {
 	}
 	select {
 	case e.C <- struct{}{}:
-		e.Log.V(1).Info("node condition change; advancing decision tick", "node", newNode.Name)
+		e.Log.V(1).Info("node condition change; requesting supplemental decision pass", "node", newNode.Name)
 	default:
 		// A signal is already pending; the next pass covers this change.
 	}

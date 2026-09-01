@@ -13,7 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/metrics"
@@ -209,5 +211,47 @@ func TestRunOnceRecordsOMENativeExecutorState(t *testing.T) {
 				t.Fatalf("omenative_unavailable = %v, want %v", got, tc.gauge)
 			}
 		})
+	}
+}
+
+func TestRefreshHoldsSerializationLockDuringBuildAndPublication(t *testing.T) {
+	loop, _ := newTestLoop(t)
+	base, ok := loop.Reader.(client.WithWatch)
+	if !ok {
+		t.Fatalf("test reader type = %T, want client.WithWatch", loop.Reader)
+	}
+
+	assertLocked := func(phase string) {
+		t.Helper()
+		if loop.refreshMu.TryLock() {
+			loop.refreshMu.Unlock()
+			t.Errorf("refresh serialization lock is not held during %s", phase)
+		}
+	}
+	checkedBuild := false
+	checkedPublication := false
+	loop.Reader = interceptor.NewClient(base, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.NodeList); !ok {
+				return c.List(ctx, list, opts...)
+			}
+			assertLocked("snapshot build")
+			checkedBuild = true
+			return c.List(ctx, list, opts...)
+		},
+	})
+	loop.Scorer = func(*snapshot.ClusterSnapshot, *config.Config, *metrics.Metrics) {
+		assertLocked("snapshot publication")
+		checkedPublication = true
+	}
+
+	if err := loop.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if !checkedBuild {
+		t.Error("snapshot build lock assertion was not reached")
+	}
+	if !checkedPublication {
+		t.Error("snapshot publication lock assertion was not reached")
 	}
 }

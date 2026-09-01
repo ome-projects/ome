@@ -51,8 +51,9 @@ type Config struct {
 
 	DecisionLoopInterval    metav1.Duration `json:"decisionLoopInterval"`
 	ObservationLoopInterval metav1.Duration `json:"observationLoopInterval"`
-	// EarlyTickOn advances the next decision tick on the named events;
-	// empty disables advancement. A pass is never interrupted.
+	// EarlyTickOn requests a supplemental fresh decision pass on the named
+	// events without moving the regular cadence; empty disables these passes.
+	// A running pass is never interrupted.
 	EarlyTickOn []string `json:"earlyTickOn"`
 
 	Policies Policies `json:"policies"`
