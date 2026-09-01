@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,7 +25,7 @@ var capabilityNow = time.Date(2026, 8, 31, 17, 0, 0, 0, time.UTC)
 
 func TestCapabilityPublisherCreatesTrustPayload(t *testing.T) {
 	c := capabilityClient(t)
-	publisher := NewCapabilityPublisher(c, c, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-7")
+	publisher := NewCapabilityPublisher(c, c, cacheSyncerFunc(func(context.Context) bool { return true }), nil, "ome", "manager-7")
 	publisher.clock = clocktesting.NewFakeClock(capabilityNow)
 
 	if err := publisher.PublishOnce(context.Background()); err != nil {
@@ -75,7 +77,7 @@ func TestCapabilityPublisherRejectsInvalidIdentityBeforeAPI(t *testing.T) {
 					return c.Update(ctx, obj, opts...)
 				},
 			})
-			publisher := NewCapabilityPublisher(tracked, tracked, cacheSyncerFunc(func(context.Context) bool { return true }), tt.namespace, tt.holder)
+			publisher := NewCapabilityPublisher(tracked, tracked, cacheSyncerFunc(func(context.Context) bool { return true }), nil, tt.namespace, tt.holder)
 
 			if err := publisher.PublishOnce(context.Background()); err == nil {
 				t.Fatal("PublishOnce() error = nil, want invalid identity error")
@@ -120,7 +122,7 @@ func TestCapabilityPublisherStartRejectsInvalidIdentity(t *testing.T) {
 			publisher := NewCapabilityPublisher(tracked, tracked, cacheSyncerFunc(func(context.Context) bool {
 				cacheSyncs.Add(1)
 				return true
-			}), tt.namespace, tt.holder)
+			}), closedCapabilityReadiness(), tt.namespace, tt.holder)
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
@@ -135,6 +137,98 @@ func TestCapabilityPublisherStartRejectsInvalidIdentity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCapabilityPublisherStartWaitsForControllerReadiness(t *testing.T) {
+	base := capabilityClient(t)
+	readiness := make(chan struct{})
+	cacheEntered := make(chan struct{}, 1)
+	created := make(chan struct{}, 1)
+	var cacheCalls, apiCalls atomic.Int32
+	syncer := cacheSyncerFunc(func(context.Context) bool {
+		cacheCalls.Add(1)
+		cacheEntered <- struct{}{}
+		return true
+	})
+	tracked := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			apiCalls.Add(1)
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			apiCalls.Add(1)
+			if err := c.Create(ctx, obj, opts...); err != nil {
+				return err
+			}
+			created <- struct{}{}
+			return nil
+		},
+	})
+	publisher := NewCapabilityPublisher(tracked, tracked, syncer, readiness, "ome", "manager-7")
+	publisher.clock = clocktesting.NewFakeClock(capabilityNow)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- publisher.Start(ctx) }()
+
+	select {
+	case <-cacheEntered:
+		t.Fatal("cache sync began before controller readiness")
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.Equal(t, int32(0), cacheCalls.Load())
+	assert.Equal(t, int32(0), apiCalls.Load())
+
+	close(readiness)
+	waitForCapabilitySignal(t, cacheEntered, "cache sync after controller readiness")
+	waitForCapabilitySignal(t, created, "immediate publish after controller readiness")
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Start() did not stop after cancellation")
+	}
+}
+
+func TestCapabilityPublisherStartCancelsBeforeControllerReadiness(t *testing.T) {
+	base := capabilityClient(t)
+	var cacheCalls, apiCalls atomic.Int32
+	tracked := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			apiCalls.Add(1)
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			apiCalls.Add(1)
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	publisher := NewCapabilityPublisher(tracked, tracked, cacheSyncerFunc(func(context.Context) bool {
+		cacheCalls.Add(1)
+		return true
+	}), make(chan struct{}), "ome", "manager-7")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, publisher.Start(ctx))
+	assert.Equal(t, int32(0), cacheCalls.Load())
+	assert.Equal(t, int32(0), apiCalls.Load())
+}
+
+func TestCapabilityPublisherStartRejectsMissingControllerReadiness(t *testing.T) {
+	base := capabilityClient(t)
+	var cacheCalls atomic.Int32
+	publisher := NewCapabilityPublisher(base, base, cacheSyncerFunc(func(context.Context) bool {
+		cacheCalls.Add(1)
+		return true
+	}), nil, "ome", "manager-7")
+
+	if err := publisher.Start(context.Background()); err == nil {
+		t.Fatal("Start() error = nil, want missing controller readiness error")
+	}
+	assert.Equal(t, int32(0), cacheCalls.Load())
 }
 
 func TestCapabilityPublisherTakesOverAndPreservesMetadata(t *testing.T) {
@@ -158,7 +252,7 @@ func TestCapabilityPublisherTakesOverAndPreservesMetadata(t *testing.T) {
 		},
 	}
 	c := capabilityClient(t, existing)
-	publisher := NewCapabilityPublisher(c, c, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-new")
+	publisher := NewCapabilityPublisher(c, c, cacheSyncerFunc(func(context.Context) bool { return true }), nil, "ome", "manager-new")
 	publisher.clock = clocktesting.NewFakeClock(capabilityNow)
 
 	if err := publisher.PublishOnce(context.Background()); err != nil {
@@ -205,7 +299,7 @@ func TestCapabilityPublisherRetriesConflictWithFreshRead(t *testing.T) {
 			return c.Update(ctx, obj, opts...)
 		},
 	})
-	publisher := NewCapabilityPublisher(reader, writer, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-new")
+	publisher := NewCapabilityPublisher(reader, writer, cacheSyncerFunc(func(context.Context) bool { return true }), nil, "ome", "manager-new")
 	publisher.clock = clocktesting.NewFakeClock(capabilityNow)
 	publisher.retryBackoff = wait.Backoff{Steps: 3}
 
@@ -243,7 +337,7 @@ func TestCapabilityPublisherRetriesCreateRaceWithFreshRead(t *testing.T) {
 			return c.Get(ctx, key, obj, opts...)
 		},
 	})
-	publisher := NewCapabilityPublisher(reader, base, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-new")
+	publisher := NewCapabilityPublisher(reader, base, cacheSyncerFunc(func(context.Context) bool { return true }), nil, "ome", "manager-new")
 	publisher.clock = clocktesting.NewFakeClock(capabilityNow)
 	publisher.retryBackoff = wait.Backoff{Steps: 3}
 
@@ -276,7 +370,7 @@ func TestCapabilityPublisherRetriesAreBounded(t *testing.T) {
 			return apierrors.NewConflict(capabilityLeaseResource(), obj.GetName(), errors.New("persistent conflict"))
 		},
 	})
-	publisher := NewCapabilityPublisher(base, writer, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-new")
+	publisher := NewCapabilityPublisher(base, writer, cacheSyncerFunc(func(context.Context) bool { return true }), nil, "ome", "manager-new")
 	publisher.clock = clocktesting.NewFakeClock(capabilityNow)
 	publisher.retryBackoff = wait.Backoff{Steps: 3}
 
@@ -328,7 +422,7 @@ func TestCapabilityPublisherWaitsForCacheSyncRenewsAndDoesNotDelete(t *testing.T
 		},
 	})
 	fakeClock := clocktesting.NewFakeClock(capabilityNow)
-	publisher := NewCapabilityPublisher(base, writer, syncer, "ome", "manager-7")
+	publisher := NewCapabilityPublisher(base, writer, syncer, closedCapabilityReadiness(), "ome", "manager-7")
 	publisher.clock = fakeClock
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -384,7 +478,7 @@ func TestCapabilityPublisherStartContinuesAfterPublishError(t *testing.T) {
 		},
 	})
 	fakeClock := clocktesting.NewFakeClock(capabilityNow)
-	publisher := NewCapabilityPublisher(base, writer, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-7")
+	publisher := NewCapabilityPublisher(base, writer, cacheSyncerFunc(func(context.Context) bool { return true }), closedCapabilityReadiness(), "ome", "manager-7")
 	publisher.clock = fakeClock
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -408,7 +502,7 @@ func TestCapabilityPublisherStartContinuesAfterPublishError(t *testing.T) {
 
 func TestCapabilityPublisherNeedsLeaderElection(t *testing.T) {
 	c := capabilityClient(t)
-	publisher := NewCapabilityPublisher(c, c, cacheSyncerFunc(func(context.Context) bool { return true }), "ome", "manager-7")
+	publisher := NewCapabilityPublisher(c, c, cacheSyncerFunc(func(context.Context) bool { return true }), nil, "ome", "manager-7")
 	if !publisher.NeedLeaderElection() {
 		t.Fatal("capability publisher must run only after leader election")
 	}
@@ -458,4 +552,10 @@ func waitForCapabilityTicker(t *testing.T, fakeClock *clocktesting.FakeClock) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func closedCapabilityReadiness() <-chan struct{} {
+	ready := make(chan struct{})
+	close(ready)
+	return ready
 }

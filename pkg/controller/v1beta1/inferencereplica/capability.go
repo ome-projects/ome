@@ -36,6 +36,7 @@ type CapabilityPublisher struct {
 	apiReader    client.Reader
 	client       client.Client
 	cache        CacheSyncer
+	readiness    <-chan struct{}
 	namespace    string
 	holder       string
 	log          logr.Logger
@@ -49,11 +50,14 @@ var _ manager.LeaderElectionRunnable = (*CapabilityPublisher)(nil)
 
 // NewCapabilityPublisher constructs the elected InferenceReplica executor
 // heartbeat. apiReader must bypass the manager cache so every retry rebases on
-// the apiserver's latest Lease.
+// the apiserver's latest Lease. readiness must be the channel installed on the
+// matching Reconciler; Start rejects a nil channel, while PublishOnce remains a
+// directly callable write operation that does not consult startup readiness.
 func NewCapabilityPublisher(
 	apiReader client.Reader,
 	writer client.Client,
 	cache CacheSyncer,
+	readiness <-chan struct{},
 	namespace string,
 	holder string,
 ) *CapabilityPublisher {
@@ -61,6 +65,7 @@ func NewCapabilityPublisher(
 		apiReader:    apiReader,
 		client:       writer,
 		cache:        cache,
+		readiness:    readiness,
 		namespace:    namespace,
 		holder:       holder,
 		log:          ctrl.Log.WithName("InferenceReplicaCapability"),
@@ -74,15 +79,23 @@ func NewCapabilityPublisher(
 // availability or taking over the capability holder.
 func (*CapabilityPublisher) NeedLeaderElection() bool { return true }
 
-// Start waits for the shared controller cache, publishes immediately, and
-// renews periodically until the elected runnable is cancelled. Publish errors
-// are logged and retried on the next heartbeat rather than stopping the manager.
+// Start waits until the IR controller has processed its startup sentinel, then
+// waits for the shared controller cache, publishes immediately, and renews
+// periodically until the elected runnable is cancelled. Processing the
+// sentinel proves the controller has finished synchronizing every event source
+// and started its workers. Publish errors are logged and retried on the next
+// heartbeat rather than stopping the manager.
 func (p *CapabilityPublisher) Start(ctx context.Context) error {
-	if p.cache == nil || p.apiReader == nil || p.client == nil {
+	if p.cache == nil || p.apiReader == nil || p.client == nil || p.readiness == nil {
 		return fmt.Errorf("inferencereplica capability publisher is not fully wired")
 	}
 	if err := p.validateIdentity(); err != nil {
 		return err
+	}
+	select {
+	case <-p.readiness:
+	case <-ctx.Done():
+		return nil
 	}
 	if !p.cache.WaitForCacheSync(ctx) {
 		return nil

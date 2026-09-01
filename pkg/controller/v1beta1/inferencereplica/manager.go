@@ -120,7 +120,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	} else {
 		r.Log.Info("The InferenceReplica controller won't watch keda.sh/v1alpha1/ScaledObject resources because the CRD is not available; InferenceReplicas requesting KEDA autoscaling will fail on reconcile until KEDA is installed.")
 	}
-	return b.
+	b = b.
 		Watches(
 			&corev1.Pod{},
 			newPodEventHandler(r.Expectations),
@@ -135,8 +135,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&discoveryv1.EndpointSlice{},
 			handler.EnqueueRequestsFromMapFunc(EndpointSliceToIR),
-		).
-		Complete(r)
+		)
+	if r.CapabilityReadiness != nil {
+		// The buffered sentinel can enter the work queue while sources start,
+		// but no worker can process it until every syncing source's WaitForSync
+		// has completed. That worker handoff is the publisher's readiness proof.
+		b = b.WatchesRawSource(capabilityReadinessSource())
+	}
+	return b.Complete(r.reconcilerWithCapabilityReadiness())
 }
 
 // validateWiring rejects a mis-wired reconciler at setup. The

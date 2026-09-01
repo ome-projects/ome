@@ -230,7 +230,7 @@ func TestLeaderElectionConfiguration(t *testing.T) {
 	}
 }
 
-func TestInferenceReplicaCapabilityRegistration(t *testing.T) {
+func TestInferenceReplicaCapabilityReadinessGate(t *testing.T) {
 	tests := []struct {
 		name                  string
 		enableController      bool
@@ -246,8 +246,9 @@ func TestInferenceReplicaCapabilityRegistration(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := shouldRegisterInferenceReplicaCapability(test.enableController, test.isControlPlane, test.enableLeaderElection)
-			assert.Equal(t, test.wantCapabilityPublish, got)
+			readiness := newInferenceReplicaCapabilityReadiness(
+				test.enableController, test.isControlPlane, test.enableLeaderElection)
+			assert.Equal(t, test.wantCapabilityPublish, readiness != nil)
 		})
 	}
 }
