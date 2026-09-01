@@ -2,6 +2,8 @@ package observer
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,7 +15,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/metrics"
@@ -209,5 +213,75 @@ func TestRunOnceRecordsOMENativeExecutorState(t *testing.T) {
 				t.Fatalf("omenative_unavailable = %v, want %v", got, tc.gauge)
 			}
 		})
+	}
+}
+
+func TestRefreshSerializesConcurrentBuildAndPublication(t *testing.T) {
+	loop, _ := newTestLoop(t)
+	base, ok := loop.Reader.(client.WithWatch)
+	if !ok {
+		t.Fatalf("test reader type = %T, want client.WithWatch", loop.Reader)
+	}
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBuilds := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseBuilds)
+	var active, maxActive atomic.Int32
+	loop.Reader = interceptor.NewClient(base, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.NodeList); !ok {
+				return c.List(ctx, list, opts...)
+			}
+			current := active.Add(1)
+			defer active.Add(-1)
+			for {
+				old := maxActive.Load()
+				if current <= old || maxActive.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+
+	done := make(chan error, 2)
+	go func() { done <- loop.Refresh(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first refresh never entered snapshot build")
+	}
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		done <- loop.Refresh(context.Background())
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second refresh goroutine did not start")
+	}
+	select {
+	case <-entered:
+		t.Fatal("second refresh overlapped the first snapshot build")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseBuilds()
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("Refresh() error = %v", err)
+		}
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("max concurrent snapshot builds = %d, want 1", got)
 	}
 }

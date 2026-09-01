@@ -2,9 +2,11 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
@@ -17,6 +19,13 @@ import (
 // the first pass. observer.Loop implements it.
 type SnapshotSource interface {
 	Latest() *snapshot.ClusterSnapshot
+}
+
+// snapshotRefresher is kept internal so Latest-only SnapshotSource
+// implementations remain source-compatible. Early decisions fail closed when
+// the configured source cannot also coordinate a refresh.
+type snapshotRefresher interface {
+	Refresh(context.Context) error
 }
 
 // DecisionLoop is the leader-only decision Runnable: policies → arbiter →
@@ -33,11 +42,14 @@ type DecisionLoop struct {
 	Metrics   *metrics.Metrics
 	Log       logr.Logger
 
-	// EarlyTick advances the next tick when a subscribed event (a node
-	// condition change) arrives; it never interrupts a running pass. The
-	// channel must be buffered (capacity 1): a signal landing mid-pass
-	// waits there and fires the next select immediately.
+	// EarlyTick requests a supplemental pass when a subscribed event (a node
+	// condition change) arrives; it never interrupts a running pass or resets
+	// the regular timer. The channel must be buffered (capacity 1): a signal
+	// landing mid-pass waits there and fires the next select immediately.
 	EarlyTick <-chan struct{}
+
+	// timerClock drives the regular decision timer. Nil uses the real clock.
+	timerClock clock.Clock
 
 	// Now overrides the clock in tests.
 	Now func() time.Time
@@ -49,23 +61,72 @@ var _ manager.LeaderElectionRunnable = &DecisionLoop{}
 // NeedLeaderElection returns true: exactly one replica decides and acts.
 func (l *DecisionLoop) NeedLeaderElection() bool { return true }
 
-// Start runs an immediate first pass, then ticks at decisionLoopInterval,
-// re-reading the interval every pass so a config reload takes effect without
-// a restart.
+// Start runs an immediate first pass, then regular passes at
+// decisionLoopInterval. Early signals add fresh, serialized passes without
+// moving the current regular deadline. The interval is reloaded only when a
+// regular deadline is consumed, including a deadline coincident with an early
+// signal.
 func (l *DecisionLoop) Start(ctx context.Context) error {
 	l.RunOnce(ctx)
+	timer := l.decisionClock().NewTimer(l.Store.Get().DecisionLoopInterval.Duration)
+	defer timer.Stop()
 	for {
-		timer := time.NewTimer(l.Store.Get().DecisionLoopInterval.Duration)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return nil
-		case <-timer.C:
+		case <-timer.C():
+			// If an early signal is already pending at the regular deadline,
+			// fold both into one fresh pass. A failed refresh skips that pass,
+			// but the consumed regular deadline still resets normal cadence.
+			if l.takeEarlyTick() {
+				l.runFreshDecisionLogged(ctx)
+			} else {
+				l.RunOnce(ctx)
+			}
+			timer.Reset(l.Store.Get().DecisionLoopInterval.Duration)
 		case <-l.EarlyTick:
-			timer.Stop()
+			// The timer may have become ready at the same instant as the early
+			// signal. Drain it if so and count this as the regular pass; otherwise
+			// leave the still-running timer completely untouched.
+			regularDue := false
+			select {
+			case <-timer.C():
+				regularDue = true
+			default:
+			}
+			l.runFreshDecisionLogged(ctx)
+			if regularDue {
+				timer.Reset(l.Store.Get().DecisionLoopInterval.Duration)
+			}
 		}
-		l.RunOnce(ctx)
 	}
+}
+
+func (l *DecisionLoop) takeEarlyTick() bool {
+	select {
+	case <-l.EarlyTick:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *DecisionLoop) runFreshDecisionLogged(ctx context.Context) {
+	if err := l.runFreshDecision(ctx); err != nil {
+		l.Log.Error(err, "snapshot refresh failed; skipping decision pass")
+	}
+}
+
+func (l *DecisionLoop) runFreshDecision(ctx context.Context) error {
+	refresher, ok := l.Snapshots.(snapshotRefresher)
+	if !ok {
+		return fmt.Errorf("snapshot source does not support refresh")
+	}
+	if err := refresher.Refresh(ctx); err != nil {
+		return fmt.Errorf("refresh snapshot: %w", err)
+	}
+	l.RunOnce(ctx)
+	return nil
 }
 
 // RunOnce executes one decision pass against the latest snapshot. Exported
@@ -105,4 +166,11 @@ func (l *DecisionLoop) now() time.Time {
 		return time.Now()
 	}
 	return l.Now()
+}
+
+func (l *DecisionLoop) decisionClock() clock.Clock {
+	if l.timerClock == nil {
+		return clock.RealClock{}
+	}
+	return l.timerClock
 }
