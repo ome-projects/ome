@@ -234,10 +234,10 @@ At the 2026-08-31 baseline, the source tree has the following status:
 | Defragmentation Policy #1 | Partially implemented | Scoring, candidate generation, arbitration, and reporting run; placement feasibility is not yet scheduler-complete. |
 | Arbiter and Reporter | Partially implemented | Core admission gates and outputs exist; positive-benefit/regression admission and dispatch/outcome-fed ledger state are not connected. |
 | Node-Health Policy #2 | Not implemented | Node conditions only exclude unhealthy nodes as defrag targets and enqueue a coalesced early decision request. That request currently reads the latest cached snapshot without first refreshing it; no evacuation candidates or remediation signals are produced. |
-| Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Current `mode: execute` reporting says "will dispatch" despite performing no write; that mode is unsupported and must fail closed to recommend-only until the Dispatcher and its guards land. |
-| OMENative state | Requires refresh | Current code collapses every non-Raw Component into synthetic Instance 0 and reads legacy ISVC migration history. Alfred must normalize `InferenceReplica.Status` for stable Instance identity, lifecycle state, and migrations, then join live Pods by Instance index and incarnation for physical placement and readiness. |
-| OMENative executor readiness | Not implemented | CRD discovery and current status do not prove the controller is still running. Alpha execution requires a fresh OMENative capability Lease; until that signal exists and Alfred consumes it, OMENative candidates remain advisory. |
-| RawDeployment execution | Deferred | Current policy classifies Raw candidates as executable, but neither an Alfred Dispatcher nor a Raw request consumer exists. The revised design requires Raw candidates to be advisory-only until both are implemented and tested. |
+| Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Without a Dispatcher, admitted actions in both `recommend-only` and `execute` mode report `OutcomeWithheld`, with reasons `RecommendOnly` and `DispatcherUnavailable` respectively. |
+| OMENative state | Partially implemented | Checked `InferenceReplica.Status` normalization and the live Pod join by stable Instance index and incarnation are implemented. In-memory migration reconstruction reads current status; durable audit-ledger ingestion remains deferred. |
+| OMENative executor readiness | Partially implemented | The manager publishes the capability Lease and Alfred reads it directly through its uncached API reader. A just-in-time direct re-read immediately before dispatch remains deferred with the Dispatcher. |
+| RawDeployment execution | Deferred | Raw candidates are advisory (`Executable=false`). Neither an Alfred Dispatcher nor a Raw request consumer exists; execution remains deferred until both are implemented and tested. |
 
 The remaining sections describe the target architecture unless they explicitly
 say "current implementation." The compatibility baseline for new work is the
@@ -414,7 +414,7 @@ and therefore Alfred — write to the wider cluster):
 | Target | Resource | Write | Writer | Why | New RBAC for Policy #2? |
 |--------|----------|-------|--------|-----|-------------------------|
 | Alfred namespace | ConfigMap (`alfred-recommendations`) | `get`, `update`, `patch`, `delete` | Reporter | Alfred's pre-created output | No |
-| Alfred namespace | Lease | Full read/write | engine (leader election) | Leader election | No |
+| Alfred namespace | Lease (`alfred.ome.io`, pre-created without `spec`) | `get`, `update` | engine (leader election) | Leader election | No |
 | Any namespace | Events (on ISVC **and** Node) | `create`, `patch` | Reporter | Surface recommendations, migrations, evacuation + repair signals | No — `events` already granted |
 | Any namespace | InferenceService annotations | `patch` (narrow to `ome.io/migration-request-v1-*`) | Dispatcher | OEP-0007 migration verb — the single executable contract for supported workload owners, defrag **and** evacuation | No — same annotation both policies |
 
@@ -770,11 +770,12 @@ offline.
 **Risk: snapshot staleness produces a bad decision.** The snapshot is a point-in-
 time view; the cluster can change between snapshot and dispatch.
 *Mitigation:* the snapshot is rebuilt every observation-loop period (default
-30s), bounding staleness to the loop frequency, and the Dispatcher does a
-pre-flight re-check against the latest snapshot before each actuation. Mitigation,
-not full fix: a change inside the pre-flight window is still possible — caught
-downstream by OMENative's own lock and by the bounded blast radius of the narrow
-posture.
+30s), bounding staleness for recommendation. Immediately before each patch, the
+future Dispatcher must directly re-read the capability Lease and the live
+workload and InferenceReplica state; the latest cached snapshot alone is not
+actuation authorization. That just-in-time guard remains deferred with the
+Dispatcher. Even direct reads leave a small race window, which OMENative's own
+lock and the bounded blast radius of the narrow posture constrain downstream.
 
 **Risk: a third-party or future policy misbehaves.** Policy #3 (Descheduling), or
 any later addition, has a bug.
@@ -933,12 +934,16 @@ The following properties of the read surface are load-bearing for later sections
   mismatch fails closed to an advisory Candidate.
 - **Executor liveness needs a positive signal.** CRD discovery and a coherent
   InferenceReplica snapshot prove API compatibility, not that the controller is
-  still running. The OMENative controller publishes a namespaced capability
-  Lease only while the InferenceReplica executor is enabled and cache-synced.
-  Alfred requires a supported wire-version marker and a fresh `renewTime` before
-  dispatch; an absent, stale, or incompatible Lease makes every Candidate
-  advisory. This Lease is a target Alpha dependency and is not implemented in
-  the current baseline.
+  still running. The OME manager now publishes a namespaced capability Lease
+  only while the InferenceReplica executor is enabled and cache-synced. Once per
+  observation, Alfred reads the named Lease directly through its uncached API
+  reader. It requires the exact `ome.io/migration-request-schema: v1` marker, a
+  nonempty holder identity, and a `renewTime` no older than the configured
+  maximum age (30 seconds by default). A `renewTime` up to and including five
+  seconds in the future is accepted; greater future skew fails closed. An
+  absent, stale, or incompatible Lease makes every Candidate advisory. The
+  future Dispatcher must repeat this direct read just before it patches a
+  migration request; that just-in-time guard remains deferred.
 - **Placement feasibility fails closed.** GPU room, model locality, and storage
   topology are necessary but not sufficient. Before a Candidate becomes
   executable, Alfred evaluates the complete OMENative runner template: scalar
@@ -1913,9 +1918,14 @@ the process that wrote it. Alfred establishes execution readiness from **both**:
    cache-synced.
 
 A missing, stale, or incompatible input fails closed. The capability Lease is a
-target Alpha prerequisite; because the current baseline does not publish or
-consume it, current Alfred must remain recommendation-only even when the CRD and
-apparently current status are present.
+shipped Alpha prerequisite: the manager publisher renews it, and Alfred performs
+a direct uncached read during every observation. Alfred accepts only schema
+`v1`, a nonempty holder identity, and a present `renewTime` whose age does not
+exceed `omenativeCapabilityMaxStaleness` (30 seconds by default). A timestamp up
+to and including five seconds in the future is accepted; greater future skew,
+like a missing, stale, or incompatible Lease, fails closed. The future
+Dispatcher must perform another direct read immediately before its patch; that
+just-in-time recheck is not implemented yet.
 
 The target Lease is namespaced, defaults to
 `ome/ome-inferencereplica-executor`, and carries
@@ -1968,6 +1978,10 @@ dependencies:
 - Lease duration: 15s
 - Renew deadline: 10s
 - Retry period: 2s
+
+The deployment pre-creates the spec-less `alfred.ome.io` Lease. Alfred's
+namespace Role grants `get` and `update` on that resource name only; it does not
+grant `create`.
 
 Only the leader runs the decision loop — Policies, Arbiter, and Dispatchers — so
 exactly one replica is acting on the cluster at a time. All replicas run the
@@ -2033,7 +2047,8 @@ the eviction verb:
 # Leader election (Alfred namespace Role)
 - apiGroups: [coordination.k8s.io]
   resources: [leases]
-  verbs: [create, get, update]
+  resourceNames: [alfred.ome.io]
+  verbs: [get, update]
 
 # OMENative executor capability (read-only, configured namespace)
 - apiGroups: [coordination.k8s.io]
@@ -2073,7 +2088,7 @@ perform on that resource:
 | `inferenceservices` | patch | add/retry one `ome.io/migration-request-v1-*` annotation only | the consuming controller owns acknowledgement deletion; Alfred's patch must not touch spec, status, labels, finalizers, or other annotations (enforced cluster-side, below) |
 | `configmaps` (named) | update, patch, delete | mutate only `alfred-config` / `alfred-recommendations` | the caretaker does not create ConfigMaps at runtime; Helm pre-creates them |
 | `events` | create, patch | emit observability events | events are the audit trail; no other side effect |
-| `leases` | create, get, update | leader-election Lease | standard controller pattern |
+| leader-election `lease` (named) | get, update | renew the pre-created spec-less `alfred.ome.io` Lease | no create or access to other Leases |
 
 **Why the re-scope needs nothing new — and drops a verb.** Node-health
 evacuation could, in a naive design, demand `nodes` write (to cordon the failing
@@ -2660,14 +2675,16 @@ engine must not preclude them.
   `InferenceReplica.Status` is authoritative for stable Instance identity,
   lifecycle state, and migrations; live Pods joined by Instance index and
   incarnation are authoritative for physical placement and current readiness.
-  Request annotations are a mailbox and the workload audit ledger retains
-  durable history. A fresh capability Lease, not CRD/status presence alone,
-  proves executor availability. RawDeployment and LWS are advisory-only until
-  their lifecycle owner implements the request contract. Current implementation
-  gaps (Node-Health and Dispatcher) are recorded explicitly.
-- TBD: Complete Alpha implementation (checked InferenceReplica-plus-Pod
-  snapshot, capability Lease, Policy #2, Dispatcher, and outcome-fed safety
-  ledger).
+  The checked InferenceReplica-plus-Pod snapshot and the manager-published,
+  directly read capability Lease are implemented. Request annotations remain a
+  mailbox; durable workload audit-ledger ingestion is deferred. RawDeployment
+  and LWS are advisory-only until their lifecycle owner implements the request
+  contract. Current implementation gaps (Node-Health, Dispatcher, the
+  just-in-time capability recheck, and outcome-fed safety state) are recorded
+  explicitly.
+- TBD: Complete Alpha implementation (Policy #2, Dispatcher, the just-in-time
+  capability recheck, durable audit-ledger ingestion, and outcome-fed safety
+  state).
 - TBD: First Beta user.
 - TBD: Beta (Policy #3 Descheduling).
 - TBD: GA.
