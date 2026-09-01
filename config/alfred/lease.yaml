@@ -1,0 +1,11 @@
+# Alfred's leader-election Lease is deliberately pre-created. Alfred may get
+# and update only this named Lease; if it is deleted, reapplying these manifests
+# restores leadership without granting runtime permission to create arbitrary
+# Leases (including a forged executor capability heartbeat).
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: alfred.ome.io
+  namespace: ome
+  labels:
+    app.kubernetes.io/component: "ome-alfred"

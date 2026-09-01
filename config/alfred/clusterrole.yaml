@@ -32,6 +32,14 @@ rules:
     resources: [ "events" ]
     verbs: [ "create", "patch" ]
 
+  # Direct capability check — one named, uncached Get per observation pass.
+  # No list/watch and no write verb can forge the executor heartbeat.
+  - apiGroups: [ "coordination.k8s.io" ]
+    resources: [ "leases" ]
+    resourceNames:
+      - ome-inferencereplica-executor
+    verbs: [ "get" ]
+
   # OME CRDs (read).
   - apiGroups: [ "ome.io" ]
     resources:

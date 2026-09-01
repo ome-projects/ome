@@ -23,7 +23,11 @@ rules:
       - alfred-config
       - alfred-recommendations
 
-  # Leader election — the alfred.ome.io Lease lives in Alfred's namespace.
+  # Leader election — update-only on the pre-created alfred.ome.io Lease.
+  # If it is deleted, manifest reconciliation must restore it before Alfred
+  # can elect; broad Lease creation could forge executor capability state.
   - apiGroups: [ "coordination.k8s.io" ]
     resources: [ "leases" ]
-    verbs: [ "create", "get", "update" ]
+    verbs: [ "get", "update" ]
+    resourceNames:
+      - alfred.ome.io
