@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 func TestDefaultIsSafeAndComplete(t *testing.T) {
@@ -67,6 +69,16 @@ func TestDefaultIsSafeAndComplete(t *testing.T) {
 	}
 	if !*cfg.SpotPolicy.AvoidAsTarget || len(cfg.SpotPolicy.PreemptibleLabels) != 2 {
 		t.Fatalf("spot defaults: %+v", cfg.SpotPolicy)
+	}
+}
+
+func TestDefaultCapabilityNamespaceIsStable(t *testing.T) {
+	original := constants.OMENamespace
+	t.Cleanup(func() { constants.OMENamespace = original })
+	constants.OMENamespace = "runtime-control-plane"
+
+	if got := Default().OMENativeCapabilityLeaseNamespace; got != "ome" {
+		t.Fatalf("capability namespace default = %q, want fixed %q", got, "ome")
 	}
 }
 

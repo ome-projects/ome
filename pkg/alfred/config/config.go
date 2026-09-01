@@ -273,7 +273,7 @@ func (c *Config) applyDefaults() {
 		c.LWSRecommendationsEnabled = boolPtr(true)
 	}
 	defaultStr(&c.OMENativeCapabilityLeaseName, constants.OMENativeExecutorCapabilityLeaseName)
-	defaultStr(&c.OMENativeCapabilityLeaseNamespace, constants.OMENamespace)
+	defaultStr(&c.OMENativeCapabilityLeaseNamespace, "ome")
 	if c.OMENativeCapabilityMaxStaleness.Duration == 0 {
 		c.OMENativeCapabilityMaxStaleness = metav1.Duration{Duration: 30 * time.Second}
 	}
