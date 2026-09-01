@@ -16,6 +16,13 @@ func TestDefaultIsSafeAndComplete(t *testing.T) {
 	if cfg.DecisionLoopInterval.Duration != 5*time.Minute || cfg.ObservationLoopInterval.Duration != 30*time.Second {
 		t.Fatalf("default intervals: %v / %v", cfg.DecisionLoopInterval, cfg.ObservationLoopInterval)
 	}
+	if cfg.OMENativeCapabilityLeaseName != "ome-inferencereplica-executor" ||
+		cfg.OMENativeCapabilityLeaseNamespace != "ome" ||
+		cfg.OMENativeCapabilityMaxStaleness.Duration != 30*time.Second {
+		t.Fatalf("OMENative capability defaults: %q/%q/%v",
+			cfg.OMENativeCapabilityLeaseNamespace, cfg.OMENativeCapabilityLeaseName,
+			cfg.OMENativeCapabilityMaxStaleness.Duration)
+	}
 	if len(cfg.EarlyTickOn) != 1 || cfg.EarlyTickOn[0] != EarlyTickNodeConditionChange {
 		t.Fatalf("default earlyTickOn: %v", cfg.EarlyTickOn)
 	}
@@ -84,6 +91,9 @@ schemaVersion: 1
 mode: execute
 decisionLoopInterval: 2m
 observationLoopInterval: 15s
+omenativeCapabilityLeaseName: custom-executor
+omenativeCapabilityLeaseNamespace: runtime-system
+omenativeCapabilityMaxStaleness: 45s
 earlyTickOn: [NodeConditionChange]
 policies:
   defragmentation:
@@ -120,6 +130,11 @@ logLevel: debug
 	}
 	if cfg.Mode != ModeExecute || cfg.DecisionLoopInterval.Duration != 2*time.Minute {
 		t.Fatalf("top-level parse: %+v", cfg)
+	}
+	if cfg.OMENativeCapabilityLeaseName != "custom-executor" ||
+		cfg.OMENativeCapabilityLeaseNamespace != "runtime-system" ||
+		cfg.OMENativeCapabilityMaxStaleness.Duration != 45*time.Second {
+		t.Fatalf("OMENative capability parse: %+v", cfg)
 	}
 	if *cfg.Policies.Defragmentation.FragmentationThreshold != 0.4 ||
 		cfg.Policies.Defragmentation.Aggressiveness != AggressivenessConservative {
@@ -171,6 +186,13 @@ func TestLoadRejectsInvalidConfigs(t *testing.T) {
 		{"inverted window", "schemaVersion: 1\nmaintenanceWindows:\n  - days: [Mon]\n    start: \"17:00\"\n    end: \"09:00\"", "must be before end"},
 		{"unknown field", "schemaVersion: 1\nmodee: execute", "parse config.yaml"},
 		{"interval too small", "schemaVersion: 1\ndecisionLoopInterval: 100ms", "decisionLoopInterval"},
+		{"invalid capability duration", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: soon", "parse config.yaml"},
+		{"zero capability staleness", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: 0s", "omenativeCapabilityMaxStaleness"},
+		{"negative capability staleness", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: -1s", "omenativeCapabilityMaxStaleness"},
+		{"empty capability lease name", "schemaVersion: 1\nomenativeCapabilityLeaseName: \"\"", "omenativeCapabilityLeaseName"},
+		{"invalid capability lease name", "schemaVersion: 1\nomenativeCapabilityLeaseName: Bad_Name", "omenativeCapabilityLeaseName"},
+		{"empty capability namespace", "schemaVersion: 1\nomenativeCapabilityLeaseNamespace: \"\"", "omenativeCapabilityLeaseNamespace"},
+		{"invalid capability namespace", "schemaVersion: 1\nomenativeCapabilityLeaseNamespace: bad.namespace", "omenativeCapabilityLeaseNamespace"},
 		{"negative cooldown", "schemaVersion: 1\nrecentPlacementCooldownMinutes: -5", "must be positive"},
 		{"negative cap", "schemaVersion: 1\nmaxInFlightMigrations: -1", "must be positive"},
 		{"negative tau", "schemaVersion: 1\npolicies:\n  defragmentation:\n    scoring:\n      pendingUrgencyTauMinutes: -30", "must be positive"},

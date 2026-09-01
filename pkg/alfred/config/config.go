@@ -11,7 +11,10 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
+
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 // Operating modes.
@@ -62,6 +65,10 @@ type Config struct {
 	RawDeploymentMigrationEnabled *bool `json:"rawDeploymentMigrationEnabled"`
 	OMENativeMigrationEnabled     *bool `json:"omenativeMigrationEnabled"`
 	LWSRecommendationsEnabled     *bool `json:"lwsRecommendationsEnabled"`
+
+	OMENativeCapabilityLeaseName      string          `json:"omenativeCapabilityLeaseName"`
+	OMENativeCapabilityLeaseNamespace string          `json:"omenativeCapabilityLeaseNamespace"`
+	OMENativeCapabilityMaxStaleness   metav1.Duration `json:"omenativeCapabilityMaxStaleness"`
 
 	RecommendationsConfigMapEnabled *bool  `json:"recommendationsConfigMapEnabled"`
 	RecommendationsConfigMapName    string `json:"recommendationsConfigMapName"`
@@ -158,11 +165,39 @@ func Load(raw []byte) (*Config, error) {
 	if err := yaml.UnmarshalStrict(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse config.yaml: %w", err)
 	}
+	if err := validateCapabilityOverrides(raw); err != nil {
+		return nil, err
+	}
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// validateCapabilityOverrides distinguishes omitted values, which receive
+// defaults, from explicitly empty or non-positive values. Config intentionally
+// exposes fully defaulted value fields to its consumers, so that distinction is
+// available only while loading the raw document.
+func validateCapabilityOverrides(raw []byte) error {
+	var overrides struct {
+		LeaseName      *string          `json:"omenativeCapabilityLeaseName"`
+		LeaseNamespace *string          `json:"omenativeCapabilityLeaseNamespace"`
+		MaxStaleness   *metav1.Duration `json:"omenativeCapabilityMaxStaleness"`
+	}
+	if err := yaml.Unmarshal(raw, &overrides); err != nil {
+		return fmt.Errorf("parse config.yaml: %w", err)
+	}
+	if overrides.LeaseName != nil && *overrides.LeaseName == "" {
+		return fmt.Errorf("omenativeCapabilityLeaseName must not be empty")
+	}
+	if overrides.LeaseNamespace != nil && *overrides.LeaseNamespace == "" {
+		return fmt.Errorf("omenativeCapabilityLeaseNamespace must not be empty")
+	}
+	if overrides.MaxStaleness != nil && overrides.MaxStaleness.Duration <= 0 {
+		return fmt.Errorf("omenativeCapabilityMaxStaleness must be positive, got %s", overrides.MaxStaleness.Duration)
+	}
+	return nil
 }
 
 func boolPtr(b bool) *bool        { return &b }
@@ -237,6 +272,11 @@ func (c *Config) applyDefaults() {
 	if c.LWSRecommendationsEnabled == nil {
 		c.LWSRecommendationsEnabled = boolPtr(true)
 	}
+	defaultStr(&c.OMENativeCapabilityLeaseName, constants.OMENativeExecutorCapabilityLeaseName)
+	defaultStr(&c.OMENativeCapabilityLeaseNamespace, constants.OMENamespace)
+	if c.OMENativeCapabilityMaxStaleness.Duration == 0 {
+		c.OMENativeCapabilityMaxStaleness = metav1.Duration{Duration: 30 * time.Second}
+	}
 	if c.RecommendationsConfigMapEnabled == nil {
 		c.RecommendationsConfigMapEnabled = boolPtr(true)
 	}
@@ -288,6 +328,15 @@ func (c *Config) validate() error {
 	}
 	if c.ObservationLoopInterval.Duration < time.Second {
 		return fmt.Errorf("observationLoopInterval must be >= 1s, got %s", c.ObservationLoopInterval.Duration)
+	}
+	if errs := utilvalidation.IsDNS1123Subdomain(c.OMENativeCapabilityLeaseName); len(errs) != 0 {
+		return fmt.Errorf("omenativeCapabilityLeaseName %q invalid: %s", c.OMENativeCapabilityLeaseName, errs[0])
+	}
+	if errs := utilvalidation.IsDNS1123Label(c.OMENativeCapabilityLeaseNamespace); len(errs) != 0 {
+		return fmt.Errorf("omenativeCapabilityLeaseNamespace %q invalid: %s", c.OMENativeCapabilityLeaseNamespace, errs[0])
+	}
+	if c.OMENativeCapabilityMaxStaleness.Duration <= 0 {
+		return fmt.Errorf("omenativeCapabilityMaxStaleness must be positive, got %s", c.OMENativeCapabilityMaxStaleness.Duration)
 	}
 	for _, trigger := range c.EarlyTickOn {
 		if trigger != EarlyTickNodeConditionChange {

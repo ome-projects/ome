@@ -53,8 +53,13 @@ data:
 
     # Reserved compatibility field; RawDeployment remains advisory-only.
     rawDeploymentMigrationEnabled: false
-    # Future execution surfaces; owning controllers execute annotations.
+    # Execution surfaces; owning controllers execute annotations.
     omenativeMigrationEnabled: true
+    # Direct, uncached capability proof. Absent, stale, or incompatible keeps
+    # every OMENative recommendation advisory.
+    omenativeCapabilityLeaseName: ome-inferencereplica-executor
+    omenativeCapabilityLeaseNamespace: ome
+    omenativeCapabilityMaxStaleness: 30s
     lwsRecommendationsEnabled: true
 
     # Output.

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"testing"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"sigs.k8s.io/ome/pkg/alfred/config"
 )
 
 func resetFlags(t *testing.T, args []string) {
@@ -196,6 +201,25 @@ func TestPodIdentity(t *testing.T) {
 	t.Setenv("POD_NAME", "")
 	if got := podIdentity(); got == "" {
 		t.Fatal("podIdentity must fall back to hostname")
+	}
+}
+
+func TestOMENativeExecutorSupplierUsesReader(t *testing.T) {
+	holder := "ome-controller-manager-7"
+	renewed := metav1.NowMicro()
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "ome",
+			Name:        "ome-inferencereplica-executor",
+			Annotations: map[string]string{"ome.io/migration-request-schema": "v1"},
+		},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, RenewTime: &renewed},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lease).Build()
+
+	got := newOMENativeExecutor(reader)(context.Background(), config.Default())
+	if !got.Available || got.Reason != "ready" || got.WireVersion != "v1" {
+		t.Fatalf("executor state = %+v, want fresh reader-backed capability", got)
 	}
 }
 

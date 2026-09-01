@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/observer"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
+	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -163,11 +164,12 @@ func main() {
 	}
 
 	observationLoop := &observer.Loop{
-		Reader:  mgr.GetClient(),
-		Store:   store,
-		Metrics: alfredMetrics,
-		Log:     ctrl.Log.WithName("alfred-observer"),
-		Scorer:  defrag.PublishScores,
+		Reader:            mgr.GetClient(),
+		Store:             store,
+		Metrics:           alfredMetrics,
+		Log:               ctrl.Log.WithName("alfred-observer"),
+		Scorer:            defrag.PublishScores,
+		OMENativeExecutor: newOMENativeExecutor(mgr.GetAPIReader()),
 	}
 	if err := mgr.Add(observationLoop); err != nil {
 		setupLog.Error(err, "unable to add observation loop")
@@ -242,6 +244,10 @@ func main() {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func newOMENativeExecutor(reader client.Reader) func(context.Context, *config.Config) snapshot.OMENativeExecutorState {
+	return (&observer.OMENativeExecutorReader{Reader: reader}).Read
+}
 
 func podIdentity() string {
 	if pod := os.Getenv("POD_NAME"); pod != "" {

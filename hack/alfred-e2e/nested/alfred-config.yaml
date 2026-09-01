@@ -43,6 +43,9 @@ data:
     # Reserved compatibility field; RawDeployment remains advisory-only.
     rawDeploymentMigrationEnabled: false
     omenativeMigrationEnabled: true
+    omenativeCapabilityLeaseName: ome-inferencereplica-executor
+    omenativeCapabilityLeaseNamespace: ome
+    omenativeCapabilityMaxStaleness: 30s
     lwsRecommendationsEnabled: true
     recommendationsConfigMapEnabled: true
     recommendationsConfigMapName: alfred-recommendations

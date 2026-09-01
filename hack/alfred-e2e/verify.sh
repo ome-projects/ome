@@ -15,6 +15,7 @@ last_count="0"
 last_advisory="0"
 last_migration_annotations="unavailable"
 last_pending="unavailable"
+last_omenative_unavailable="unavailable"
 
 start_nested_tunnel
 
@@ -31,6 +32,7 @@ while (( SECONDS < deadline )); do
     2>/dev/null || true)"
   last_score="$(awk '$1 == "alfred_cluster_fragmentation_score" {print $2}' <<<"${metrics}")"
   last_observed="$(awk '$1 ~ /^alfred_fragmentation_observed\{/ && $1 ~ /pool="ALFRED-E2E-H100"/ && $1 ~ /size="8"/ {print $2}' <<<"${metrics}")"
+  last_omenative_unavailable="$(awk '$1 == "alfred_omenative_unavailable" {print $2}' <<<"${metrics}")"
   record="$(nested_kubectl -n ome get configmap alfred-recommendations \
     -o jsonpath='{.data.last-cycle\.json}' 2>/dev/null || true)"
   if [[ -n "${record}" ]]; then
@@ -54,6 +56,7 @@ while (( SECONDS < deadline )); do
      awk -v score="${last_score}" 'BEGIN { exit !(score == 0) }' &&
      awk -v observed="${last_observed}" 'BEGIN { exit !(observed > 0.25) }' &&
      (( last_count > 0 )) && (( last_advisory > 0 )) &&
+     [[ "${last_omenative_unavailable}" == "1" ]] &&
      [[ "${last_migration_annotations}" == "0" ]] &&
      [[ -z "${pending_node}" && "${pending_reason}" == "Unschedulable" ]]; then
     echo "Alfred fragmentation E2E passed"
@@ -61,6 +64,7 @@ while (( SECONDS < deadline )); do
     echo "  observed size-8 fragmentation: ${last_observed}"
     echo "  recommendations: ${last_count}"
     echo "  RawDeployment advisory: ${last_advisory}"
+    echo "  OMENative unavailable: ${last_omenative_unavailable}"
     echo "  migration annotations: ${last_migration_annotations}"
     echo "  pending 8-GPU demand: Unschedulable"
     exit 0
@@ -73,6 +77,7 @@ echo "  executable score: ${last_score}" >&2
 echo "  observed size-8 fragmentation: ${last_observed}" >&2
 echo "  recommendations: ${last_count}" >&2
 echo "  RawDeployment advisory: ${last_advisory}" >&2
+echo "  OMENative unavailable: ${last_omenative_unavailable}" >&2
 echo "  migration annotations: ${last_migration_annotations}" >&2
 echo "  pending 8-GPU demand: ${last_pending}" >&2
 "${host_kubectl[@]}" -n "${host_namespace}" logs deployment/alfred-under-test \

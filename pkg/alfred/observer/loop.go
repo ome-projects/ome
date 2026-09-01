@@ -23,7 +23,7 @@ import (
 // Loop is the observation-loop Runnable.
 type Loop struct {
 	Reader  client.Reader
-	Store   *config.Store
+	Store   ConfigStore
 	Metrics *metrics.Metrics
 	Log     logr.Logger
 
@@ -34,13 +34,20 @@ type Loop struct {
 	Scorer func(*snapshot.ClusterSnapshot, *config.Config, *metrics.Metrics)
 
 	// OMENativeExecutor reports the checked executor capability state for
-	// this cluster. Nil is a bounded unavailable state.
-	OMENativeExecutor func(ctx context.Context) snapshot.OMENativeExecutorState
+	// this cluster using the immutable config generation already loaded for
+	// the observation pass. Nil is a bounded unavailable state.
+	OMENativeExecutor func(ctx context.Context, cfg *config.Config) snapshot.OMENativeExecutorState
 
 	// Now overrides the clock in tests.
 	Now func() time.Time
 
 	latest atomic.Pointer[snapshot.ClusterSnapshot]
+}
+
+// ConfigStore is the read surface the observation loop needs from the
+// hot-reloaded config store.
+type ConfigStore interface {
+	Get() *config.Config
 }
 
 var _ manager.Runnable = &Loop{}
@@ -90,7 +97,7 @@ func (l *Loop) RunOnce(ctx context.Context) error {
 		Now:               l.Now,
 	}
 	if l.OMENativeExecutor != nil {
-		opts.OMENativeExecutor = l.OMENativeExecutor(ctx)
+		opts.OMENativeExecutor = l.OMENativeExecutor(ctx, cfg)
 	}
 	if opts.OMENativeExecutor.Available {
 		l.Metrics.OMENativeUnavailable.Set(0)
