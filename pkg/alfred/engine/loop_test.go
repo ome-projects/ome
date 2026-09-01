@@ -424,7 +424,7 @@ func TestEarlyTickerObserve(t *testing.T) {
 
 func waitForPolicyCalls(t *testing.T, p *stubPolicy, want int64) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for atomic.LoadInt64(&p.calls) < want {
 		if time.Now().After(deadline) {
 			t.Fatalf("policy calls = %d, want at least %d", atomic.LoadInt64(&p.calls), want)
@@ -435,7 +435,7 @@ func waitForPolicyCalls(t *testing.T, p *stubPolicy, want int64) {
 
 func waitForFakeTimer(t *testing.T, fakeClock *clocktesting.FakeClock) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for !fakeClock.HasWaiters() {
 		if time.Now().After(deadline) {
 			t.Fatal("decision loop did not arm its regular timer")

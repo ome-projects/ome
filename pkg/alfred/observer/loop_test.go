@@ -242,7 +242,10 @@ func TestRefreshSerializesConcurrentBuildAndPublication(t *testing.T) {
 					break
 				}
 			}
-			entered <- struct{}{}
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
 			select {
 			case <-release:
 			case <-ctx.Done():
