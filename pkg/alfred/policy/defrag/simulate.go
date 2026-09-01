@@ -104,37 +104,6 @@ func placeThenFree(observed []binState, sources []footprint, ranked []string) (a
 	return bins, targets, true
 }
 
-// freeThenPlace simulates the multi-replica targeted-eviction path: the
-// source frees first and the replacement may legitimately reuse the freed
-// GPUs — worst case the move under-delivers (benefit 0), it cannot deadlock.
-// The replacement lands on the first ranked target with room, else back on
-// its source when the source is a bin, else nowhere (it would pend). It
-// models a single footprint by construction: eviction applies only to
-// RawDeployment, whose Instances are one pod each.
-func freeThenPlace(observed []binState, source footprint, ranked []string) (after []binState, target string) {
-	bins := cloneBins(observed)
-	index := binIndexByName(bins)
-
-	if i, isBin := index[source.node]; isBin {
-		bins[i].free += source.gpus
-		if bins[i].free > bins[i].cap {
-			bins[i].free = bins[i].cap
-		}
-	}
-	for _, candidate := range ranked {
-		i, isBin := index[candidate]
-		if !isBin || bins[i].free < source.gpus {
-			continue
-		}
-		bins[i].free -= source.gpus
-		return bins, candidate
-	}
-	if i, isBin := index[source.node]; isBin {
-		bins[i].free -= source.gpus
-	}
-	return bins, ""
-}
-
 // canSeat reports whether any single bin could seat the pending pod's
 // footprint. Demands wider than every node are gang business — one move
 // cannot unblock them — and report false by construction.
