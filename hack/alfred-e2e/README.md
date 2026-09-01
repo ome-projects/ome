@@ -44,15 +44,18 @@ The second target succeeds only when:
 - the synthetic 8-GPU demand is rejected by the scheduler as `Unschedulable`;
 - `alfred_cluster_fragmentation_score` is exactly `0` while
   `alfred_fragmentation_observed{size="8"}` exceeds `0.25`;
+- `alfred_omenative_unavailable` is exactly `1` because the fixture publishes
+  no executor capability Lease;
 - `alfred-recommendations/last-cycle.json` contains at least one `advisory`
   recommendation with `RawDeploymentMigrationUnsupported`; and
 - the fixture InferenceService has no `ome.io/migration-request-v1-*`
   annotation.
 
-Production intentionally supplies no OMENative executor capability state in
-this phase, so CRD presence cannot make an OMENative candidate executable.
-The Dispatcher boundary is also absent: Alfred reports RawDeployment advice
-but cannot turn it into migration annotations.
+The nested fixture intentionally publishes no OMENative executor capability
+Lease. Alfred must therefore report the executor unavailable and keep any
+OMENative candidate advisory; CRD presence alone cannot enable execution. The
+Dispatcher boundary is also absent: Alfred reports RawDeployment advice but
+cannot turn it into migration annotations.
 
 Re-run assertions without recreating the fixture:
 

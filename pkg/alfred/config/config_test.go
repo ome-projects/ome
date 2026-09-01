@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 func TestDefaultIsSafeAndComplete(t *testing.T) {
@@ -15,6 +17,13 @@ func TestDefaultIsSafeAndComplete(t *testing.T) {
 	}
 	if cfg.DecisionLoopInterval.Duration != 5*time.Minute || cfg.ObservationLoopInterval.Duration != 30*time.Second {
 		t.Fatalf("default intervals: %v / %v", cfg.DecisionLoopInterval, cfg.ObservationLoopInterval)
+	}
+	if cfg.OMENativeCapabilityLeaseName != "ome-inferencereplica-executor" ||
+		cfg.OMENativeCapabilityLeaseNamespace != "ome" ||
+		cfg.OMENativeCapabilityMaxStaleness.Duration != 30*time.Second {
+		t.Fatalf("OMENative capability defaults: %q/%q/%v",
+			cfg.OMENativeCapabilityLeaseNamespace, cfg.OMENativeCapabilityLeaseName,
+			cfg.OMENativeCapabilityMaxStaleness.Duration)
 	}
 	if len(cfg.EarlyTickOn) != 1 || cfg.EarlyTickOn[0] != EarlyTickNodeConditionChange {
 		t.Fatalf("default earlyTickOn: %v", cfg.EarlyTickOn)
@@ -63,6 +72,16 @@ func TestDefaultIsSafeAndComplete(t *testing.T) {
 	}
 }
 
+func TestDefaultCapabilityNamespaceIsStable(t *testing.T) {
+	original := constants.OMENamespace
+	t.Cleanup(func() { constants.OMENamespace = original })
+	constants.OMENamespace = "runtime-control-plane"
+
+	if got := Default().OMENativeCapabilityLeaseNamespace; got != "ome" {
+		t.Fatalf("capability namespace default = %q, want fixed %q", got, "ome")
+	}
+}
+
 func TestLoadPreservesReservedRawDeploymentMigrationValues(t *testing.T) {
 	for _, want := range []bool{false, true} {
 		t.Run(fmt.Sprint(want), func(t *testing.T) {
@@ -84,6 +103,9 @@ schemaVersion: 1
 mode: execute
 decisionLoopInterval: 2m
 observationLoopInterval: 15s
+omenativeCapabilityLeaseName: custom-executor
+omenativeCapabilityLeaseNamespace: runtime-system
+omenativeCapabilityMaxStaleness: 45s
 earlyTickOn: [NodeConditionChange]
 policies:
   defragmentation:
@@ -120,6 +142,11 @@ logLevel: debug
 	}
 	if cfg.Mode != ModeExecute || cfg.DecisionLoopInterval.Duration != 2*time.Minute {
 		t.Fatalf("top-level parse: %+v", cfg)
+	}
+	if cfg.OMENativeCapabilityLeaseName != "custom-executor" ||
+		cfg.OMENativeCapabilityLeaseNamespace != "runtime-system" ||
+		cfg.OMENativeCapabilityMaxStaleness.Duration != 45*time.Second {
+		t.Fatalf("OMENative capability parse: %+v", cfg)
 	}
 	if *cfg.Policies.Defragmentation.FragmentationThreshold != 0.4 ||
 		cfg.Policies.Defragmentation.Aggressiveness != AggressivenessConservative {
@@ -171,6 +198,14 @@ func TestLoadRejectsInvalidConfigs(t *testing.T) {
 		{"inverted window", "schemaVersion: 1\nmaintenanceWindows:\n  - days: [Mon]\n    start: \"17:00\"\n    end: \"09:00\"", "must be before end"},
 		{"unknown field", "schemaVersion: 1\nmodee: execute", "parse config.yaml"},
 		{"interval too small", "schemaVersion: 1\ndecisionLoopInterval: 100ms", "decisionLoopInterval"},
+		{"invalid capability duration", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: soon", "parse config.yaml"},
+		{"zero capability staleness", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: 0s", "omenativeCapabilityMaxStaleness"},
+		{"negative capability staleness", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: -1s", "omenativeCapabilityMaxStaleness"},
+		{"capability staleness below heartbeat window", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: 29s", "omenativeCapabilityMaxStaleness"},
+		{"empty capability lease name", "schemaVersion: 1\nomenativeCapabilityLeaseName: \"\"", "omenativeCapabilityLeaseName"},
+		{"invalid capability lease name", "schemaVersion: 1\nomenativeCapabilityLeaseName: Bad_Name", "omenativeCapabilityLeaseName"},
+		{"empty capability namespace", "schemaVersion: 1\nomenativeCapabilityLeaseNamespace: \"\"", "omenativeCapabilityLeaseNamespace"},
+		{"invalid capability namespace", "schemaVersion: 1\nomenativeCapabilityLeaseNamespace: bad.namespace", "omenativeCapabilityLeaseNamespace"},
 		{"negative cooldown", "schemaVersion: 1\nrecentPlacementCooldownMinutes: -5", "must be positive"},
 		{"negative cap", "schemaVersion: 1\nmaxInFlightMigrations: -1", "must be positive"},
 		{"negative tau", "schemaVersion: 1\npolicies:\n  defragmentation:\n    scoring:\n      pendingUrgencyTauMinutes: -30", "must be positive"},
@@ -208,5 +243,42 @@ func TestStoreLastKnownGood(t *testing.T) {
 	}
 	if store.Get().Mode != ModeExecute {
 		t.Fatal("failed update must keep last-known-good")
+	}
+}
+
+func TestStoreDefaultsCapabilityNamespaceFromRuntime(t *testing.T) {
+	store, err := NewStoreForNamespace("ome-prod")
+	if err != nil {
+		t.Fatalf("NewStoreForNamespace: %v", err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+		t.Fatalf("initial capability namespace = %q, want %q", got, "ome-prod")
+	}
+
+	if outcome, err := store.Update([]byte("schemaVersion: 1\nmode: execute")); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("update without namespace: %s, %v", outcome, err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+		t.Fatalf("defaulted capability namespace = %q, want %q", got, "ome-prod")
+	}
+
+	if outcome, err := store.Update([]byte("schemaVersion: 1\nomenativeCapabilityLeaseNamespace: manager-system")); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("update with explicit namespace: %s, %v", outcome, err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "manager-system" {
+		t.Fatalf("explicit capability namespace = %q, want %q", got, "manager-system")
+	}
+
+	if outcome, err := store.Update([]byte("schemaVersion: 1")); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("update restoring runtime default: %s, %v", outcome, err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+		t.Fatalf("restored capability namespace = %q, want %q", got, "ome-prod")
+	}
+}
+
+func TestStoreRejectsInvalidRuntimeNamespace(t *testing.T) {
+	if _, err := NewStoreForNamespace("bad.namespace"); err == nil {
+		t.Fatal("NewStoreForNamespace error = nil, want invalid namespace error")
 	}
 }

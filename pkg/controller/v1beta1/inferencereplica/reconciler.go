@@ -132,6 +132,12 @@ type Reconciler struct {
 	// default. Zero (unset) preserves controller-runtime's single-worker default.
 	MaxConcurrentReconciles int
 
+	// CapabilityReadiness is shared with the elected executor-capability
+	// publisher. When non-nil, SetupWithManager queues a reserved sentinel and
+	// wraps this reconciler so the channel closes only after all controller
+	// event sources have synchronized and a worker processes that sentinel.
+	CapabilityReadiness chan struct{}
+
 	// revisionHashMu guards revisionHashCache. The same IR key is never
 	// reconciled concurrently by controller-runtime, but the cache is
 	// shared across keys, so the map itself needs a lock if concurrency is

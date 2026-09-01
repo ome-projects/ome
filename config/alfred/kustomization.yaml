@@ -12,6 +12,7 @@ resources:
   - clusterrolebinding.yaml
   - role.yaml
   - rolebinding.yaml
+  - lease.yaml
   - configmap.yaml
   - service.yaml
   - deployment.yaml

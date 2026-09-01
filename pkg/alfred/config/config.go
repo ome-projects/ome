@@ -11,7 +11,10 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
+
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 // Operating modes.
@@ -36,6 +39,8 @@ const EarlyTickNodeConditionChange = "NodeConditionChange"
 
 // SupportedSchemaVersion is the config schema this build understands.
 const SupportedSchemaVersion = 1
+
+const defaultCapabilityLeaseNamespace = "ome"
 
 // Config is the full alfred-config schema. Load returns a fully-defaulted
 // value: every pointer field is non-nil and every duration/count positive, so
@@ -62,6 +67,10 @@ type Config struct {
 	RawDeploymentMigrationEnabled *bool `json:"rawDeploymentMigrationEnabled"`
 	OMENativeMigrationEnabled     *bool `json:"omenativeMigrationEnabled"`
 	LWSRecommendationsEnabled     *bool `json:"lwsRecommendationsEnabled"`
+
+	OMENativeCapabilityLeaseName      string          `json:"omenativeCapabilityLeaseName"`
+	OMENativeCapabilityLeaseNamespace string          `json:"omenativeCapabilityLeaseNamespace"`
+	OMENativeCapabilityMaxStaleness   metav1.Duration `json:"omenativeCapabilityMaxStaleness"`
 
 	RecommendationsConfigMapEnabled *bool  `json:"recommendationsConfigMapEnabled"`
 	RecommendationsConfigMapName    string `json:"recommendationsConfigMapName"`
@@ -146,23 +155,60 @@ type MaintenanceWindow struct {
 // Default returns the fully-defaulted configuration: recommend-only, both
 // policies enabled, the OEP's conservative safety bounds.
 func Default() *Config {
+	return defaultConfig(defaultCapabilityLeaseNamespace)
+}
+
+func defaultConfig(capabilityLeaseNamespace string) *Config {
 	cfg := &Config{SchemaVersion: SupportedSchemaVersion}
-	cfg.applyDefaults()
+	cfg.applyDefaults(capabilityLeaseNamespace)
 	return cfg
 }
 
 // Load parses and validates raw config.yaml content, returning a
 // fully-defaulted Config or an error describing the first violation.
 func Load(raw []byte) (*Config, error) {
+	return loadWithCapabilityNamespace(raw, defaultCapabilityLeaseNamespace)
+}
+
+func loadWithCapabilityNamespace(raw []byte, capabilityLeaseNamespace string) (*Config, error) {
 	cfg := &Config{}
 	if err := yaml.UnmarshalStrict(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse config.yaml: %w", err)
 	}
-	cfg.applyDefaults()
+	if err := validateCapabilityOverrides(raw); err != nil {
+		return nil, err
+	}
+	cfg.applyDefaults(capabilityLeaseNamespace)
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// validateCapabilityOverrides distinguishes omitted values, which receive
+// defaults, from explicitly empty or non-positive values. Config intentionally
+// exposes fully defaulted value fields to its consumers, so that distinction is
+// available only while loading the raw document.
+func validateCapabilityOverrides(raw []byte) error {
+	var overrides struct {
+		LeaseName      *string          `json:"omenativeCapabilityLeaseName"`
+		LeaseNamespace *string          `json:"omenativeCapabilityLeaseNamespace"`
+		MaxStaleness   *metav1.Duration `json:"omenativeCapabilityMaxStaleness"`
+	}
+	if err := yaml.Unmarshal(raw, &overrides); err != nil {
+		return fmt.Errorf("parse config.yaml: %w", err)
+	}
+	if overrides.LeaseName != nil && *overrides.LeaseName == "" {
+		return fmt.Errorf("omenativeCapabilityLeaseName must not be empty")
+	}
+	if overrides.LeaseNamespace != nil && *overrides.LeaseNamespace == "" {
+		return fmt.Errorf("omenativeCapabilityLeaseNamespace must not be empty")
+	}
+	if overrides.MaxStaleness != nil && overrides.MaxStaleness.Duration <= 0 {
+		return fmt.Errorf("omenativeCapabilityMaxStaleness must be >= %s, got %s",
+			constants.OMENativeExecutorCapabilityMinStaleness, overrides.MaxStaleness.Duration)
+	}
+	return nil
 }
 
 func boolPtr(b bool) *bool        { return &b }
@@ -179,7 +225,7 @@ func defaultStr(v *string, d string) {
 	}
 }
 
-func (c *Config) applyDefaults() {
+func (c *Config) applyDefaults(capabilityLeaseNamespace string) {
 	defaultStr(&c.Mode, ModeRecommendOnly)
 	if c.DecisionLoopInterval.Duration == 0 {
 		c.DecisionLoopInterval = metav1.Duration{Duration: 5 * time.Minute}
@@ -237,6 +283,13 @@ func (c *Config) applyDefaults() {
 	if c.LWSRecommendationsEnabled == nil {
 		c.LWSRecommendationsEnabled = boolPtr(true)
 	}
+	defaultStr(&c.OMENativeCapabilityLeaseName, constants.OMENativeExecutorCapabilityLeaseName)
+	defaultStr(&c.OMENativeCapabilityLeaseNamespace, capabilityLeaseNamespace)
+	if c.OMENativeCapabilityMaxStaleness.Duration == 0 {
+		c.OMENativeCapabilityMaxStaleness = metav1.Duration{
+			Duration: constants.OMENativeExecutorCapabilityMinStaleness,
+		}
+	}
 	if c.RecommendationsConfigMapEnabled == nil {
 		c.RecommendationsConfigMapEnabled = boolPtr(true)
 	}
@@ -288,6 +341,16 @@ func (c *Config) validate() error {
 	}
 	if c.ObservationLoopInterval.Duration < time.Second {
 		return fmt.Errorf("observationLoopInterval must be >= 1s, got %s", c.ObservationLoopInterval.Duration)
+	}
+	if errs := utilvalidation.IsDNS1123Subdomain(c.OMENativeCapabilityLeaseName); len(errs) != 0 {
+		return fmt.Errorf("omenativeCapabilityLeaseName %q invalid: %s", c.OMENativeCapabilityLeaseName, errs[0])
+	}
+	if err := validateCapabilityLeaseNamespace(c.OMENativeCapabilityLeaseNamespace); err != nil {
+		return err
+	}
+	if c.OMENativeCapabilityMaxStaleness.Duration < constants.OMENativeExecutorCapabilityMinStaleness {
+		return fmt.Errorf("omenativeCapabilityMaxStaleness must be >= %s, got %s",
+			constants.OMENativeExecutorCapabilityMinStaleness, c.OMENativeCapabilityMaxStaleness.Duration)
 	}
 	for _, trigger := range c.EarlyTickOn {
 		if trigger != EarlyTickNodeConditionChange {
@@ -392,6 +455,13 @@ func (c *Config) validate() error {
 		if !start.Before(end) {
 			return fmt.Errorf("maintenanceWindows[%d] start %q must be before end %q", i, w.Start, w.End)
 		}
+	}
+	return nil
+}
+
+func validateCapabilityLeaseNamespace(namespace string) error {
+	if errs := utilvalidation.IsDNS1123Label(namespace); len(errs) != 0 {
+		return fmt.Errorf("omenativeCapabilityLeaseNamespace %q invalid: %s", namespace, errs[0])
 	}
 	return nil
 }

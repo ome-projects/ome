@@ -109,6 +109,24 @@ func managerProbeChecker(enableWebhook bool, webhookServer func() webhook.Server
 	return webhookServer().StartedChecker()
 }
 
+func shouldRegisterInferenceReplicaCapability(enableController, isControlPlane, enableLeaderElection bool) bool {
+	return enableController && !isControlPlane && enableLeaderElection
+}
+
+func newInferenceReplicaCapabilityReadiness(enableController, isControlPlane, enableLeaderElection bool) chan struct{} {
+	if !shouldRegisterInferenceReplicaCapability(enableController, isControlPlane, enableLeaderElection) {
+		return nil
+	}
+	return make(chan struct{})
+}
+
+func podIdentity() (string, error) {
+	if podName := os.Getenv("POD_NAME"); podName != "" {
+		return podName, nil
+	}
+	return os.Hostname()
+}
+
 func init() {
 	utilruntime.Must(v1beta1.AddToScheme(scheme))
 	utilruntime.Must(schedulerpluginsv1alpha1.AddToScheme(scheme))
@@ -535,6 +553,8 @@ func main() {
 		}
 	}
 
+	capabilityReadiness := newInferenceReplicaCapabilityReadiness(
+		options.enableInferenceReplicaCtrl, isControlPlane, options.enableLeaderElection)
 	if options.enableInferenceReplicaCtrl && !isControlPlane {
 		setupLog.Info("Setting up InferenceReplica controller")
 		if err = (&v1beta1inferencereplicacontroller.Reconciler{
@@ -548,9 +568,26 @@ func main() {
 			ScaleUpPodBatchSize:      podBatchSizes.ScaleUp,
 			ScaleDownPodBatchSize:    podBatchSizes.ScaleDown,
 			ScaleDownRequeueInterval: podBatchSizes.ScaleDownRequeueInterval,
+			// The same non-nil channel gates publisher registration below. The
+			// controller closes it only when a worker processes the reserved
+			// startup sentinel after all event sources have synchronized.
+			CapabilityReadiness: capabilityReadiness,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create InferenceReplica controller")
 			os.Exit(1)
+		}
+		if capabilityReadiness != nil {
+			holder, holderErr := podIdentity()
+			if holderErr != nil {
+				setupLog.Error(holderErr, "Failed to determine InferenceReplica capability holder identity")
+				os.Exit(1)
+			}
+			publisher := v1beta1inferencereplicacontroller.NewCapabilityPublisher(
+				mgr.GetAPIReader(), mgr.GetClient(), mgr.GetCache(), capabilityReadiness, constants.OMENamespace, holder)
+			if err = mgr.Add(publisher); err != nil {
+				setupLog.Error(err, "Failed to register InferenceReplica capability publisher")
+				os.Exit(1)
+			}
 		}
 	} else if isControlPlane {
 		setupLog.Info("control-plane role: InferenceReplica controller disabled")

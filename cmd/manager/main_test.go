@@ -230,6 +230,47 @@ func TestLeaderElectionConfiguration(t *testing.T) {
 	}
 }
 
+func TestInferenceReplicaCapabilityReadinessGate(t *testing.T) {
+	tests := []struct {
+		name                  string
+		enableController      bool
+		isControlPlane        bool
+		enableLeaderElection  bool
+		wantCapabilityPublish bool
+	}{
+		{name: "controller disabled", isControlPlane: false, enableLeaderElection: true},
+		{name: "control plane", enableController: true, isControlPlane: true, enableLeaderElection: true},
+		{name: "leader election disabled", enableController: true, isControlPlane: false},
+		{name: "local elected manager", enableController: true, isControlPlane: false, enableLeaderElection: true, wantCapabilityPublish: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			readiness := newInferenceReplicaCapabilityReadiness(
+				test.enableController, test.isControlPlane, test.enableLeaderElection)
+			assert.Equal(t, test.wantCapabilityPublish, readiness != nil)
+		})
+	}
+}
+
+func TestPodIdentity(t *testing.T) {
+	t.Run("downward API name", func(t *testing.T) {
+		t.Setenv("POD_NAME", "ome-controller-manager-7")
+		got, err := podIdentity()
+		require.NoError(t, err)
+		assert.Equal(t, "ome-controller-manager-7", got)
+	})
+
+	t.Run("hostname fallback", func(t *testing.T) {
+		t.Setenv("POD_NAME", "")
+		want, err := os.Hostname()
+		require.NoError(t, err)
+		got, err := podIdentity()
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	})
+}
+
 func TestHealthProbeConfiguration(t *testing.T) {
 	opts := DefaultOptions()
 	assert.Equal(t, ":8081", opts.probeAddr, "Default health probe address should be :8081")

@@ -162,14 +162,14 @@ func TestRunOnceInvokesScorerHook(t *testing.T) {
 func TestRunOnceRecordsOMENativeExecutorState(t *testing.T) {
 	tests := []struct {
 		name     string
-		supplier func(context.Context) snapshot.OMENativeExecutorState
+		supplier func(context.Context, *config.Config) snapshot.OMENativeExecutorState
 		want     snapshot.OMENativeExecutorState
 		gauge    float64
 	}{
 		{name: "nil supplier", want: snapshot.OMENativeExecutorState{}, gauge: 1},
 		{
 			name: "explicit unavailable",
-			supplier: func(context.Context) snapshot.OMENativeExecutorState {
+			supplier: func(context.Context, *config.Config) snapshot.OMENativeExecutorState {
 				return snapshot.OMENativeExecutorState{Reason: "lease-stale"}
 			},
 			want:  snapshot.OMENativeExecutorState{Reason: "lease-stale"},
@@ -177,7 +177,7 @@ func TestRunOnceRecordsOMENativeExecutorState(t *testing.T) {
 		},
 		{
 			name: "explicit available",
-			supplier: func(context.Context) snapshot.OMENativeExecutorState {
+			supplier: func(context.Context, *config.Config) snapshot.OMENativeExecutorState {
 				return snapshot.OMENativeExecutorState{
 					Available:   true,
 					WireVersion: "v2",

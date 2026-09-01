@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -197,24 +198,72 @@ func TestCrossPolicyDecisionsKeyedSeparately(t *testing.T) {
 	}
 }
 
-func TestReportCycleExecuteModeAdmits(t *testing.T) {
-	r, _, recorder, cl := newTestReporter(t, recommendationsCM(nil))
-	cfg := config.Default()
-	cfg.Mode = config.ModeExecute
-
-	c := cand("prod/a", "node1")
-	r.ReportCycle(context.Background(), []policy.Candidate{c},
-		[]Decision{{Candidate: c, Admitted: true, Target: "node2"}}, cfg, testNow)
-
-	if events := drainEvents(recorder); !hasEvent(events, "RecommendationAdmitted") {
-		t.Fatalf("execute-mode admission must not read as withheld: %v", events)
+func TestReportCycleWithholdsAdmissionUntilDispatcherExists(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		wantReason string
+		wantNote   string
+	}{
+		{
+			name:       "recommend only",
+			mode:       config.ModeRecommendOnly,
+			wantReason: "RecommendOnly",
+			wantNote:   "recommend-only: not dispatched",
+		},
+		{
+			name:       "execute without dispatcher",
+			mode:       config.ModeExecute,
+			wantReason: "DispatcherUnavailable",
+			wantNote:   "dispatcher unavailable: not dispatched",
+		},
 	}
-	var cm corev1.ConfigMap
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(cm.Data[recommendationsKey], `"outcome":"`+OutcomeAdmitted+`"`) {
-		t.Fatalf("record outcome: %s", cm.Data[recommendationsKey])
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, m, recorder, cl := newTestReporter(t, recommendationsCM(nil))
+			cfg := config.Default()
+			cfg.Mode = test.mode
+
+			c := cand("prod/a", "node1")
+			r.ReportCycle(context.Background(), []policy.Candidate{c},
+				[]Decision{{Candidate: c, Admitted: true, Target: "node2"}}, cfg, testNow)
+
+			if got := promtestutil.ToFloat64(m.RecommendationsAccepted.WithLabelValues(
+				"defragmentation", "prod/a", "engine")); got != 1 {
+				t.Fatalf("accepted admission counter = %v, want 1", got)
+			}
+			events := drainEvents(recorder)
+			if !hasEvent(events, "RecommendationWithheld") || !hasEvent(events, test.wantNote) {
+				t.Fatalf("withheld event missing fixed note %q: %v", test.wantNote, events)
+			}
+			for _, forbidden := range []string{"RecommendationAdmitted", "will dispatch"} {
+				if hasEvent(events, forbidden) {
+					t.Fatalf("event falsely claims dispatch via %q: %v", forbidden, events)
+				}
+			}
+
+			var cm corev1.ConfigMap
+			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
+				t.Fatal(err)
+			}
+			var record struct {
+				Recommendations []struct {
+					Outcome        string `json:"outcome"`
+					WithholdReason string `json:"withholdReason"`
+				} `json:"recommendations"`
+			}
+			if err := json.Unmarshal([]byte(cm.Data[recommendationsKey]), &record); err != nil {
+				t.Fatalf("decode recommendations: %v", err)
+			}
+			if len(record.Recommendations) != 1 {
+				t.Fatalf("recommendations = %+v, want one", record.Recommendations)
+			}
+			got := record.Recommendations[0]
+			if got.Outcome != "withheld" || got.WithholdReason != test.wantReason {
+				t.Fatalf("withheld record = %+v, want outcome=%q reason=%q", got, "withheld", test.wantReason)
+			}
+		})
 	}
 }
 

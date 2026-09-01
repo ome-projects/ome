@@ -1,7 +1,8 @@
 # Alfred, the GPU cluster caretaker (OEP-0008). Every replica runs the
-# read-only observation loop; only the leader decides and dispatches. Production
-# runs three replicas — one is enough for a test cluster, and leader election
-# stays on so the deployed shape matches production.
+# read-only observation loop; only the leader decides and reports. Dispatch is
+# deliberately absent in this phase, so both configured modes remain withheld.
+# Production runs three replicas — one is enough for a test cluster, and leader
+# election stays on so the deployed shape matches production.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
