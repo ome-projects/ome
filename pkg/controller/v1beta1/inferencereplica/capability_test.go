@@ -45,6 +45,98 @@ func TestCapabilityPublisherCreatesTrustPayload(t *testing.T) {
 	}
 }
 
+func TestCapabilityPublisherRejectsInvalidIdentityBeforeAPI(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		holder    string
+	}{
+		{name: "empty namespace", holder: "manager-7"},
+		{name: "whitespace namespace", namespace: " \t\n", holder: "manager-7"},
+		{name: "empty holder", namespace: "ome"},
+		{name: "whitespace holder", namespace: "ome", holder: " \t\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := capabilityClient(t)
+			var apiCalls atomic.Int32
+			tracked := interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					apiCalls.Add(1)
+					return c.Get(ctx, key, obj, opts...)
+				},
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					apiCalls.Add(1)
+					return c.Create(ctx, obj, opts...)
+				},
+				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					apiCalls.Add(1)
+					return c.Update(ctx, obj, opts...)
+				},
+			})
+			publisher := NewCapabilityPublisher(tracked, tracked, cacheSyncerFunc(func(context.Context) bool { return true }), tt.namespace, tt.holder)
+
+			if err := publisher.PublishOnce(context.Background()); err == nil {
+				t.Fatal("PublishOnce() error = nil, want invalid identity error")
+			}
+			if got := apiCalls.Load(); got != 0 {
+				t.Fatalf("API calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestCapabilityPublisherStartRejectsInvalidIdentity(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		holder    string
+	}{
+		{name: "empty namespace", holder: "manager-7"},
+		{name: "whitespace namespace", namespace: " \t\n", holder: "manager-7"},
+		{name: "empty holder", namespace: "ome"},
+		{name: "whitespace holder", namespace: "ome", holder: " \t\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := capabilityClient(t)
+			var apiCalls, cacheSyncs atomic.Int32
+			tracked := interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					apiCalls.Add(1)
+					return c.Get(ctx, key, obj, opts...)
+				},
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					apiCalls.Add(1)
+					return c.Create(ctx, obj, opts...)
+				},
+				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					apiCalls.Add(1)
+					return c.Update(ctx, obj, opts...)
+				},
+			})
+			publisher := NewCapabilityPublisher(tracked, tracked, cacheSyncerFunc(func(context.Context) bool {
+				cacheSyncs.Add(1)
+				return true
+			}), tt.namespace, tt.holder)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			if err := publisher.Start(ctx); err == nil {
+				t.Fatal("Start() error = nil, want invalid identity error")
+			}
+			if got := cacheSyncs.Load(); got != 0 {
+				t.Fatalf("cache syncs = %d, want 0", got)
+			}
+			if got := apiCalls.Load(); got != 0 {
+				t.Fatalf("API calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestCapabilityPublisherTakesOverAndPreservesMetadata(t *testing.T) {
 	oldHolder := "manager-old"
 	duration := int32(15)

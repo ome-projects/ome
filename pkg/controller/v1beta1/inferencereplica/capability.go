@@ -3,6 +3,7 @@ package inferencereplica
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -80,6 +81,9 @@ func (p *CapabilityPublisher) Start(ctx context.Context) error {
 	if p.cache == nil || p.apiReader == nil || p.client == nil {
 		return fmt.Errorf("inferencereplica capability publisher is not fully wired")
 	}
+	if err := p.validateIdentity(); err != nil {
+		return err
+	}
 	if !p.cache.WaitForCacheSync(ctx) {
 		return nil
 	}
@@ -110,6 +114,9 @@ func (p *CapabilityPublisher) PublishOnce(ctx context.Context) error {
 	if p.apiReader == nil || p.client == nil {
 		return fmt.Errorf("inferencereplica capability publisher is not fully wired")
 	}
+	if err := p.validateIdentity(); err != nil {
+		return err
+	}
 	key := client.ObjectKey{Namespace: p.namespace, Name: constants.OMENativeExecutorCapabilityLeaseName}
 	return retry.OnError(p.retryBackoff, capabilityWriteRetryable, func() error {
 		lease := &coordinationv1.Lease{}
@@ -125,6 +132,16 @@ func (p *CapabilityPublisher) PublishOnce(ctx context.Context) error {
 		p.applyCapability(lease)
 		return p.client.Update(ctx, lease)
 	})
+}
+
+func (p *CapabilityPublisher) validateIdentity() error {
+	if strings.TrimSpace(p.namespace) == "" {
+		return fmt.Errorf("inferencereplica capability publisher namespace is required")
+	}
+	if strings.TrimSpace(p.holder) == "" {
+		return fmt.Errorf("inferencereplica capability publisher holder is required")
+	}
+	return nil
 }
 
 func capabilityWriteRetryable(err error) bool {
