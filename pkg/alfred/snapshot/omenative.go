@@ -252,8 +252,13 @@ func buildOMENativeComponent(
 
 	seen := make(map[int32]map[podMemberKey]struct{}, len(rows))
 	for _, pod := range pods {
+		identityValid := validPodIdentity(pod, ir.UID, isvc, componentType)
+		if !identityValid && (!pod.InstanceIndexPresent || !pod.InstanceIndexValid) {
+			invalidateComponent(component, observationReasonPodIdentity)
+			continue
+		}
 		instance, ok := rows[pod.InstanceIndex]
-		if !validPodIdentity(pod, ir.UID, isvc, componentType) {
+		if !identityValid {
 			if ok {
 				invalidateInstance(component, instance, observationReasonPodIdentity)
 			} else {

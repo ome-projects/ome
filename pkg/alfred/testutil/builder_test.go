@@ -88,6 +88,27 @@ func TestSnapshotBuilderStructuredExecutorAndInvalidObservation(t *testing.T) {
 	}
 }
 
+func TestWithMultiPodInstanceUsesStableControllerIdentity(t *testing.T) {
+	snap := NewSnapshot().
+		WithNode("node1", "h100", 8).
+		WithNode("node2", "h100", 8).
+		WithMultiPodInstance("prod/svc", v1beta1.EngineComponent, constants.OMENative, 1, "node1", "node2").
+		WithInstance("prod/svc", v1beta1.EngineComponent, constants.OMENative, "node1", 1).
+		Build()
+
+	component := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "svc"}].Components[v1beta1.EngineComponent]
+	if component.IR == nil || component.IR.UID == "" {
+		t.Fatalf("synthetic OMENative IR has no stable UID: %+v", component.IR)
+	}
+	for _, instance := range component.Instances {
+		for _, pod := range instance.Pods {
+			if !pod.ControllerOwnerPresent || !pod.ControllerOwnerValid || pod.ControllerOwnerUID != component.IR.UID {
+				t.Fatalf("pod controller identity does not match IR %q: %+v", component.IR.UID, pod)
+			}
+		}
+	}
+}
+
 // A workload key must be exactly namespace/name with both segments non-empty;
 // anything else would mint an invalid synthetic NamespacedName.
 func TestEnsureWorkloadRejectsMalformedKeys(t *testing.T) {

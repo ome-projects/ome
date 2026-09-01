@@ -194,6 +194,56 @@ func TestBuildOMENativeRejectsInvalidIRAndPodEvidence(t *testing.T) {
 	}
 }
 
+func TestBuildOMENativeInvalidInstanceIndexDoesNotTargetZeroOrSibling(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{
+			name: "missing",
+			mutate: func(pod *corev1.Pod) {
+				delete(pod.Labels, query.LabelInstanceIdx)
+			},
+		},
+		{
+			name: "malformed",
+			mutate: func(pod *corev1.Pod) {
+				pod.Labels[query.LabelInstanceIdx] = "not-an-index"
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newOMENativeFixture()
+			fixture.ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{readyOMERow(0, 1, 1)}
+			fixture.pods[0] = omeNativePod(fixture, 0, 1, "default", 0, "node-a")
+			addOMENativeDecoder(fixture)
+
+			adversarial := fixture.pods[0].DeepCopy()
+			adversarial.Name += "-invalid-index"
+			test.mutate(adversarial)
+			fixture.pods = append(fixture.pods, adversarial)
+
+			workload := buildOMENativeFixtureWorkload(t, fixture)
+			engine := workload.Components[v1beta1.EngineComponent]
+			assertInvalidOMENativeObservation(t, engine)
+			if len(engine.Instances) != 1 {
+				t.Fatalf("engine instances = %+v, want one instance", engine.Instances)
+			}
+			instance := engine.Instances[0]
+			if !instance.ObservationValid || instance.ObservationReason != "" || len(instance.Pods) != 1 {
+				t.Fatalf("invalid index was attributed to instance 0: %+v", instance)
+			}
+
+			decoder := workload.Components[v1beta1.DecoderComponent]
+			if !decoder.ObservationValid {
+				t.Fatalf("invalid engine index poisoned decoder: %+v", decoder)
+			}
+		})
+	}
+}
+
 func TestBuildOMENativeRejectsOwnedPodsWithInvalidComponentEvidence(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -151,7 +151,10 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 			ObservationValid: true,
 		}
 		if mode == constants.OMENative {
-			component.IR = &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+			component.IR = &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
+				UID:        types.UID(fmt.Sprintf("synthetic-%s-%s-%s", w.NamespacedName.Namespace, w.NamespacedName.Name, ctype)),
+				Generation: 1,
+			}}
 		}
 		w.Components[ctype] = component
 	} else if component.DeploymentMode != mode {
@@ -212,6 +215,11 @@ func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.Co
 			PodOrdinal:           ordinal,
 			PodOrdinalPresent:    true,
 			PodOrdinalValid:      true,
+		}
+		if mode == constants.OMENative {
+			pod.ControllerOwnerUID = component.IR.UID
+			pod.ControllerOwnerPresent = true
+			pod.ControllerOwnerValid = true
 		}
 		start := ReferenceTime.Add(-24 * time.Hour)
 		pod.StartTime = &start
