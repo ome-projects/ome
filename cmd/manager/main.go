@@ -109,6 +109,17 @@ func managerProbeChecker(enableWebhook bool, webhookServer func() webhook.Server
 	return webhookServer().StartedChecker()
 }
 
+func shouldRegisterInferenceReplicaCapability(enableController, isControlPlane, enableLeaderElection bool) bool {
+	return enableController && !isControlPlane && enableLeaderElection
+}
+
+func podIdentity() (string, error) {
+	if podName := os.Getenv("POD_NAME"); podName != "" {
+		return podName, nil
+	}
+	return os.Hostname()
+}
+
 func init() {
 	utilruntime.Must(v1beta1.AddToScheme(scheme))
 	utilruntime.Must(schedulerpluginsv1alpha1.AddToScheme(scheme))
@@ -551,6 +562,19 @@ func main() {
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create InferenceReplica controller")
 			os.Exit(1)
+		}
+		if shouldRegisterInferenceReplicaCapability(options.enableInferenceReplicaCtrl, isControlPlane, options.enableLeaderElection) {
+			holder, holderErr := podIdentity()
+			if holderErr != nil {
+				setupLog.Error(holderErr, "Failed to determine InferenceReplica capability holder identity")
+				os.Exit(1)
+			}
+			publisher := v1beta1inferencereplicacontroller.NewCapabilityPublisher(
+				mgr.GetAPIReader(), mgr.GetClient(), mgr.GetCache(), constants.OMENamespace, holder)
+			if err = mgr.Add(publisher); err != nil {
+				setupLog.Error(err, "Failed to register InferenceReplica capability publisher")
+				os.Exit(1)
+			}
 		}
 	} else if isControlPlane {
 		setupLog.Info("control-plane role: InferenceReplica controller disabled")

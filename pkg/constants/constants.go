@@ -18,7 +18,15 @@ var (
 	OMEName         = "ome"
 	OMEAPIGroupName = "ome.io"
 	OMENamespace    = getEnvOrDefault("POD_NAMESPACE", "ome")
+
+	// OMENativeExecutorCapabilitySchemaAnnotationKey identifies the migration
+	// request schema consumed by the active InferenceReplica executor.
+	OMENativeExecutorCapabilitySchemaAnnotationKey = OMEAPIGroupName + "/migration-request-schema"
 )
+
+// OMENativeExecutorCapabilityLeaseName is the namespaced heartbeat published
+// by the active InferenceReplica executor manager.
+const OMENativeExecutorCapabilityLeaseName = "ome-inferencereplica-executor"
 
 // InferenceService Constants
 var (
