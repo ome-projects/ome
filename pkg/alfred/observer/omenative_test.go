@@ -185,6 +185,32 @@ func TestOMENativeExecutorCapabilityBoundaryMatrix(t *testing.T) {
 	}
 }
 
+func TestOMENativeExecutorUsesRuntimeCapabilityNamespace(t *testing.T) {
+	store, err := config.NewStoreForNamespace("ome-prod")
+	if err != nil {
+		t.Fatalf("NewStoreForNamespace: %v", err)
+	}
+	key := client.ObjectKey{
+		Namespace: "ome-prod",
+		Name:      "ome-inferencereplica-executor",
+	}
+	reader := &recordingCapabilityReader{objects: map[client.ObjectKey]*coordinationv1.Lease{
+		key: validCapabilityLease(key.Namespace, key.Name, capabilityReadNow.Add(-10*time.Second)),
+	}}
+
+	got := (&OMENativeExecutorReader{
+		Reader: reader,
+		Now:    func() time.Time { return capabilityReadNow },
+	}).Read(context.Background(), store.Get())
+
+	if !got.Available || got.Reason != omenativeReasonReady {
+		t.Fatalf("executor state = %+v, want ready", got)
+	}
+	if len(reader.keys) != 1 || reader.keys[0] != key {
+		t.Fatalf("direct Get keys = %v, want only %v", reader.keys, key)
+	}
+}
+
 func TestOMENativeExecutorUsesOneConfigGenerationPerObservationPass(t *testing.T) {
 	active := config.NewStore()
 	if _, err := active.Update([]byte(`
@@ -198,7 +224,7 @@ omenativeCapabilityMaxStaleness: 30s
 	store := &countingConfigStore{Store: active}
 	reader := &recordingCapabilityReader{objects: map[client.ObjectKey]*coordinationv1.Lease{
 		{Namespace: "capability-a", Name: "executor-a"}: validCapabilityLease("capability-a", "executor-a", capabilityReadNow.Add(-20*time.Second)),
-		{Namespace: "capability-b", Name: "executor-b"}: validCapabilityLease("capability-b", "executor-b", capabilityReadNow.Add(-20*time.Second)),
+		{Namespace: "capability-b", Name: "executor-b"}: validCapabilityLease("capability-b", "executor-b", capabilityReadNow.Add(-31*time.Second)),
 	}}
 	reader.onGet = func(key client.ObjectKey) {
 		if key.Namespace != "capability-a" {
@@ -208,7 +234,7 @@ omenativeCapabilityMaxStaleness: 30s
 schemaVersion: 1
 omenativeCapabilityLeaseNamespace: capability-b
 omenativeCapabilityLeaseName: executor-b
-omenativeCapabilityMaxStaleness: 10s
+omenativeCapabilityMaxStaleness: 30s
 `)); err != nil {
 			t.Fatalf("hot reload: %v", err)
 		}

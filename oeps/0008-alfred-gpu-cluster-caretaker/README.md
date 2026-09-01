@@ -939,7 +939,8 @@ The following properties of the read surface are load-bearing for later sections
   observation, Alfred reads the named Lease directly through its uncached API
   reader. It requires the exact `ome.io/migration-request-schema: v1` marker, a
   nonempty holder identity, and a `renewTime` no older than the configured
-  maximum age (30 seconds by default). A `renewTime` up to and including five
+  maximum age (30 seconds by default and at minimum, or three 10-second
+  renewal periods). A `renewTime` up to and including five
   seconds in the future is accepted; greater future skew fails closed. An
   absent, stale, or incompatible Lease makes every Candidate advisory. The
   future Dispatcher must repeat this direct read just before it patches a
@@ -1529,8 +1530,10 @@ config.yaml: |
   rawDeploymentMigrationEnabled: false # reserved; Raw is advisory until a consumer exists
   omenativeMigrationEnabled: true      # OMENative controller: Instance surge
   omenativeCapabilityLeaseName: ome-inferencereplica-executor
-  omenativeCapabilityLeaseNamespace: ome
-  omenativeCapabilityMaxStaleness: 30s # absent/stale/incompatible = recommend-only
+  # Omitted namespace follows Alfred's runtime namespace. Set it explicitly
+  # only when the OME manager publishes the Lease in another namespace.
+  # omenativeCapabilityLeaseNamespace: manager-system
+  omenativeCapabilityMaxStaleness: 30s # minimum; absent/stale/incompatible = recommend-only
   lwsRecommendationsEnabled: true      # produce recommendations for LWS (never execute)
 
   # Output
@@ -1918,17 +1921,21 @@ the process that wrote it. Alfred establishes execution readiness from **both**:
    cache-synced.
 
 A missing, stale, or incompatible input fails closed. The capability Lease is a
-shipped Alpha prerequisite: the manager publisher renews it, and Alfred performs
-a direct uncached read during every observation. Alfred accepts only schema
-`v1`, a nonempty holder identity, and a present `renewTime` whose age does not
-exceed `omenativeCapabilityMaxStaleness` (30 seconds by default). A timestamp up
-to and including five seconds in the future is accepted; greater future skew,
-like a missing, stale, or incompatible Lease, fails closed. The future
-Dispatcher must perform another direct read immediately before its patch; that
-just-in-time recheck is not implemented yet.
+shipped Alpha prerequisite: the manager publisher renews it every 10 seconds,
+and Alfred performs a direct uncached read during every observation. Alfred
+accepts only schema `v1`, a nonempty holder identity, and a present `renewTime`
+whose age does not exceed `omenativeCapabilityMaxStaleness`. The default and
+minimum accepted maximum age is 30 seconds, preserving three renewal periods;
+shorter settings are rejected instead of making a healthy executor flap into
+degraded mode. A timestamp up to and including five seconds in the future is
+accepted; greater future skew, like a missing, stale, or incompatible Lease,
+fails closed. The future Dispatcher must perform another direct read
+immediately before its patch; that just-in-time recheck is not implemented yet.
 
-The target Lease is namespaced, defaults to
-`ome/ome-inferencereplica-executor`, and carries
+The target Lease is namespaced and defaults to Alfred's runtime namespace
+(`ome/ome-inferencereplica-executor` in the shipped manifests). A split-namespace
+installation must set `omenativeCapabilityLeaseNamespace` to the OME manager's
+namespace explicitly. The Lease carries
 `ome.io/migration-request-schema: v1`. Its holder identity names the active OME
 manager replica. Alfred considers it fresh only when `renewTime` is present and
 no older than `omenativeCapabilityMaxStaleness`; it does not infer freshness

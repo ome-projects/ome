@@ -21,8 +21,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
 
-const capabilityPublishInterval = 10 * time.Second
-
 // CacheSyncer is the cache synchronization surface the capability publisher
 // needs before it may advertise a working executor.
 type CacheSyncer interface {
@@ -71,7 +69,7 @@ func NewCapabilityPublisher(
 		log:          ctrl.Log.WithName("InferenceReplicaCapability"),
 		clock:        clock.RealClock{},
 		retryBackoff: retry.DefaultRetry,
-		interval:     capabilityPublishInterval,
+		interval:     constants.OMENativeExecutorCapabilityRenewInterval,
 	}
 }
 

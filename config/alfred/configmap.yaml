@@ -58,10 +58,11 @@ data:
     # controllers to execute annotations; this phase emits none.
     omenativeMigrationEnabled: true
     # Direct, uncached capability proof. Absent, stale, or incompatible keeps
-    # every OMENative recommendation advisory.
+    # every OMENative recommendation advisory. The Lease namespace is omitted
+    # so it follows Alfred's runtime namespace; set it only when the manager
+    # publishes the capability in a different namespace.
     omenativeCapabilityLeaseName: ome-inferencereplica-executor
-    omenativeCapabilityLeaseNamespace: ome
-    omenativeCapabilityMaxStaleness: 30s
+    omenativeCapabilityMaxStaleness: 30s # minimum: three 10s renewals
     lwsRecommendationsEnabled: true
 
     # Output.

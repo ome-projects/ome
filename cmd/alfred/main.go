@@ -148,7 +148,11 @@ func main() {
 	}
 
 	alfredMetrics := metrics.New(nil)
-	store := config.NewStore()
+	store, err := config.NewStoreForNamespace(opts.namespace)
+	if err != nil {
+		setupLog.Error(err, "unable to configure Alfred namespace")
+		os.Exit(1)
+	}
 
 	watcher := &config.Watcher{
 		Cache:     mgr.GetCache(),

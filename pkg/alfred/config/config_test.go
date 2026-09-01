@@ -201,6 +201,7 @@ func TestLoadRejectsInvalidConfigs(t *testing.T) {
 		{"invalid capability duration", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: soon", "parse config.yaml"},
 		{"zero capability staleness", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: 0s", "omenativeCapabilityMaxStaleness"},
 		{"negative capability staleness", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: -1s", "omenativeCapabilityMaxStaleness"},
+		{"capability staleness below heartbeat window", "schemaVersion: 1\nomenativeCapabilityMaxStaleness: 29s", "omenativeCapabilityMaxStaleness"},
 		{"empty capability lease name", "schemaVersion: 1\nomenativeCapabilityLeaseName: \"\"", "omenativeCapabilityLeaseName"},
 		{"invalid capability lease name", "schemaVersion: 1\nomenativeCapabilityLeaseName: Bad_Name", "omenativeCapabilityLeaseName"},
 		{"empty capability namespace", "schemaVersion: 1\nomenativeCapabilityLeaseNamespace: \"\"", "omenativeCapabilityLeaseNamespace"},
@@ -242,5 +243,42 @@ func TestStoreLastKnownGood(t *testing.T) {
 	}
 	if store.Get().Mode != ModeExecute {
 		t.Fatal("failed update must keep last-known-good")
+	}
+}
+
+func TestStoreDefaultsCapabilityNamespaceFromRuntime(t *testing.T) {
+	store, err := NewStoreForNamespace("ome-prod")
+	if err != nil {
+		t.Fatalf("NewStoreForNamespace: %v", err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+		t.Fatalf("initial capability namespace = %q, want %q", got, "ome-prod")
+	}
+
+	if outcome, err := store.Update([]byte("schemaVersion: 1\nmode: execute")); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("update without namespace: %s, %v", outcome, err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+		t.Fatalf("defaulted capability namespace = %q, want %q", got, "ome-prod")
+	}
+
+	if outcome, err := store.Update([]byte("schemaVersion: 1\nomenativeCapabilityLeaseNamespace: manager-system")); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("update with explicit namespace: %s, %v", outcome, err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "manager-system" {
+		t.Fatalf("explicit capability namespace = %q, want %q", got, "manager-system")
+	}
+
+	if outcome, err := store.Update([]byte("schemaVersion: 1")); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("update restoring runtime default: %s, %v", outcome, err)
+	}
+	if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+		t.Fatalf("restored capability namespace = %q, want %q", got, "ome-prod")
+	}
+}
+
+func TestStoreRejectsInvalidRuntimeNamespace(t *testing.T) {
+	if _, err := NewStoreForNamespace("bad.namespace"); err == nil {
+		t.Fatal("NewStoreForNamespace error = nil, want invalid namespace error")
 	}
 }

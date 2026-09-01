@@ -10,11 +10,14 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
 
+	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -25,6 +28,44 @@ const (
 
 func TestRenderedAlfredLeaseContract(t *testing.T) {
 	objects := renderAlfredManifests(t)
+
+	t.Run("capability namespace follows the runtime namespace", func(t *testing.T) {
+		deployment := manifestAs[appsv1.Deployment](t, findManifest(t, objects, "Deployment", "ome-alfred"))
+		if len(deployment.Spec.Template.Spec.Containers) != 1 {
+			t.Fatalf("Alfred containers = %d, want 1", len(deployment.Spec.Template.Spec.Containers))
+		}
+		container := &deployment.Spec.Template.Spec.Containers[0]
+		var podNamespace *corev1.EnvVar
+		for i := range container.Env {
+			env := &container.Env[i]
+			if env.Name == "POD_NAMESPACE" {
+				podNamespace = env
+				break
+			}
+		}
+		if podNamespace == nil || podNamespace.ValueFrom == nil || podNamespace.ValueFrom.FieldRef == nil ||
+			podNamespace.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+			t.Fatalf("POD_NAMESPACE must come from metadata.namespace, got %+v", podNamespace)
+		}
+		for _, arg := range container.Args {
+			if strings.HasPrefix(arg, "--namespace") {
+				t.Fatalf("deployment argument %q overrides POD_NAMESPACE", arg)
+			}
+		}
+
+		configMap := manifestAs[corev1.ConfigMap](t, findManifest(t, objects, "ConfigMap", "alfred-config"))
+		store, err := config.NewStoreForNamespace("ome-prod")
+		if err != nil {
+			t.Fatalf("NewStoreForNamespace: %v", err)
+		}
+		outcome, err := store.Update([]byte(configMap.Data["config.yaml"]))
+		if err != nil || outcome != config.OutcomeSuccess {
+			t.Fatalf("load rendered Alfred config: %s, %v", outcome, err)
+		}
+		if got := store.Get().OMENativeCapabilityLeaseNamespace; got != "ome-prod" {
+			t.Fatalf("capability namespace = %q, want runtime namespace %q", got, "ome-prod")
+		}
+	})
 
 	t.Run("pre-created leader Lease is spec-less", func(t *testing.T) {
 		lease := findManifest(t, objects, "Lease", leaderElectionID)
