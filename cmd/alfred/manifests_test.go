@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -76,6 +77,53 @@ func TestRenderedAlfredLeaseContract(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("InferenceService writes wait for the Dispatcher", func(t *testing.T) {
+		for _, resource := range []string{"inferenceservices", "inferenceservices/status"} {
+			for _, verb := range []string{"get", "list", "watch"} {
+				if !allowsResource(effectiveRules, "ome.io", resource, verb) {
+					t.Errorf("effective permission %s %s/%s = false, want read access", verb, "ome.io", resource)
+				}
+			}
+			for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+				if allowsResource(effectiveRules, "ome.io", resource, verb) {
+					t.Errorf("effective permission %s %s/%s = true before Dispatcher and admission guard", verb, "ome.io", resource)
+				}
+			}
+		}
+	})
+}
+
+func TestAllowsResourceRecognizesWildcardGrants(t *testing.T) {
+	tests := []struct {
+		name            string
+		groups          []string
+		resources       []string
+		verbs           []string
+		checkedResource string
+		want            bool
+	}{
+		{name: "global wildcard", groups: []string{"*"}, resources: []string{"*"}, verbs: []string{"*"}, checkedResource: "inferenceservices", want: true},
+		{name: "exact resource", groups: []string{"ome.io"}, resources: []string{"inferenceservices"}, verbs: []string{"patch"}, checkedResource: "inferenceservices", want: true},
+		{name: "all subresources", groups: []string{"ome.io"}, resources: []string{"inferenceservices/*"}, verbs: []string{"patch"}, checkedResource: "inferenceservices/status", want: true},
+		{name: "named subresource wildcard", groups: []string{"ome.io"}, resources: []string{"*/status"}, verbs: []string{"patch"}, checkedResource: "inferenceservices/status", want: true},
+		{name: "two-part wildcard", groups: []string{"ome.io"}, resources: []string{"*/*"}, verbs: []string{"patch"}, checkedResource: "inferenceservices/status", want: true},
+		{name: "other resource", groups: []string{"ome.io"}, resources: []string{"pods"}, verbs: []string{"patch"}, checkedResource: "inferenceservices", want: false},
+		{name: "other subresource", groups: []string{"ome.io"}, resources: []string{"*/scale"}, verbs: []string{"patch"}, checkedResource: "inferenceservices/status", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rules := []rbacv1.PolicyRule{{
+				APIGroups: test.groups,
+				Resources: test.resources,
+				Verbs:     test.verbs,
+			}}
+			if got := allowsResource(rules, "ome.io", test.checkedResource, "patch"); got != test.want {
+				t.Fatalf("allowsResource(%v, %q) = %t, want %t", test.resources, test.checkedResource, got, test.want)
+			}
+		})
+	}
 }
 
 func renderAlfredManifests(t *testing.T) []*unstructured.Unstructured {
@@ -195,4 +243,31 @@ func containsRBAC(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func allowsResource(rules []rbacv1.PolicyRule, group, resource, verb string) bool {
+	for _, rule := range rules {
+		if !containsRBAC(rule.APIGroups, group) || !containsRBAC(rule.Verbs, verb) {
+			continue
+		}
+		for _, candidate := range rule.Resources {
+			if matchesRBACResource(candidate, resource) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func matchesRBACResource(pattern, resource string) bool {
+	patternParts, resourceParts := strings.Split(pattern, "/"), strings.Split(resource, "/")
+	if len(patternParts) != len(resourceParts) {
+		return false
+	}
+	for i := range patternParts {
+		if patternParts[i] != "*" && patternParts[i] != resourceParts[i] {
+			return false
+		}
+	}
+	return true
 }

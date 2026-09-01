@@ -12,8 +12,9 @@ data:
   config.yaml: |
     schemaVersion: 1
 
-    # recommend-only | execute. recommend-only never dispatches a migration:
-    # policies, arbitration and reporting all run, only the dispatcher is off.
+    # recommend-only | execute. Both run policy, arbitration, and reporting in
+    # this phase, but both remain withheld because no Dispatcher exists:
+    # RecommendOnly versus DispatcherUnavailable records the reason.
     mode: recommend-only
 
     # Loop cadence.
@@ -53,7 +54,8 @@ data:
 
     # Reserved compatibility field; RawDeployment remains advisory-only.
     rawDeploymentMigrationEnabled: false
-    # Execution surfaces; owning controllers execute annotations.
+    # Execution eligibility intent. A future Dispatcher will ask owning
+    # controllers to execute annotations; this phase emits none.
     omenativeMigrationEnabled: true
     # Direct, uncached capability proof. Absent, stale, or incompatible keeps
     # every OMENative recommendation advisory.

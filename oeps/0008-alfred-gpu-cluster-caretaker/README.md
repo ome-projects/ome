@@ -234,7 +234,7 @@ At the 2026-08-31 baseline, the source tree has the following status:
 | Defragmentation Policy #1 | Partially implemented | Scoring, candidate generation, arbitration, and reporting run; placement feasibility is not yet scheduler-complete. |
 | Arbiter and Reporter | Partially implemented | Core admission gates and outputs exist; positive-benefit/regression admission and dispatch/outcome-fed ledger state are not connected. |
 | Node-Health Policy #2 | Not implemented | Node conditions only exclude unhealthy nodes as defrag targets and enqueue a coalesced early decision request. That request currently reads the latest cached snapshot without first refreshing it; no evacuation candidates or remediation signals are produced. |
-| Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Without a Dispatcher, admitted actions in both `recommend-only` and `execute` mode report `OutcomeWithheld`, with reasons `RecommendOnly` and `DispatcherUnavailable` respectively. |
+| Dispatcher | Not implemented | Alfred does not patch migration-request annotations, and its current ClusterRole grants no InferenceService write. Without a Dispatcher, admitted actions in both `recommend-only` and `execute` mode report `OutcomeWithheld`, with reasons `RecommendOnly` and `DispatcherUnavailable` respectively. |
 | OMENative state | Partially implemented | Checked `InferenceReplica.Status` normalization and the live Pod join by stable Instance index and incarnation are implemented. In-memory migration reconstruction reads current status; durable audit-ledger ingestion remains deferred. |
 | OMENative executor readiness | Partially implemented | The manager publishes the capability Lease and Alfred reads it directly through its uncached API reader. A just-in-time direct re-read immediately before dispatch remains deferred with the Dispatcher. |
 | RawDeployment execution | Deferred | Raw candidates are advisory (`Executable=false`). Neither an Alfred Dispatcher nor a Raw request consumer exists; execution remains deferred until both are implemented and tested. |
@@ -2009,8 +2009,10 @@ remediation owner. In particular:
 cordons, drains, patches a Node, or evicts a pod; it reads cluster state and
 requests moves on workloads.
 
-The effective namespace Role plus ClusterRole — the defragmenter scope minus
-the eviction verb:
+The current Alpha manifest deliberately omits `inferenceservices` patch access
+while the Dispatcher and its mandatory admission guard are absent. The target
+effective namespace Role plus ClusterRole below applies when those two pieces
+land atomically; it is the defragmenter scope minus the eviction verb:
 
 ```yaml
 # Nodes (read-only) — no write, no cordon, no drain
@@ -2679,9 +2681,10 @@ engine must not preclude them.
   directly read capability Lease are implemented. Request annotations remain a
   mailbox; durable workload audit-ledger ingestion is deferred. RawDeployment
   and LWS are advisory-only until their lifecycle owner implements the request
-  contract. Current implementation gaps (Node-Health, Dispatcher, the
-  just-in-time capability recheck, and outcome-fed safety state) are recorded
-  explicitly.
+  contract. Alfred's current ClusterRole withholds InferenceService patch until
+  the Dispatcher and admission guard land together. Current implementation gaps
+  (Node-Health, Dispatcher, the just-in-time capability recheck, and outcome-fed
+  safety state) are recorded explicitly.
 - TBD: Complete Alpha implementation (Policy #2, Dispatcher, the just-in-time
   capability recheck, durable audit-ledger ingestion, and outcome-fed safety
   state).

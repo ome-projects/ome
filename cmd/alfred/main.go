@@ -1,12 +1,14 @@
 // Alfred is the OME GPU cluster caretaker (OEP-0008): a leader-elected
 // controller that observes the physical GPU layer, recommends corrective
-// migrations, and — only in execute mode — actuates them through the
-// migration-request annotation executed by the workload-owning controllers.
+// migrations, and reports arbitration results. Execute mode is configuration
+// intent only in this phase: without a Dispatcher, admitted actions in both
+// modes remain explicitly withheld.
 //
 // This binary wires two loops onto a controller-runtime manager:
 //   - the observation loop (every replica): snapshot + gauges, read-only;
-//   - the decision loop (leader only): policies → arbiter → reporter →
-//     dispatcher (added by later change sets).
+//   - the decision loop (leader only): policies → arbiter → reporter.
+//
+// A Dispatcher and its admission guard are added together by a later change.
 package main
 
 import (
