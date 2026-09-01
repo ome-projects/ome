@@ -13,20 +13,20 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
+
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 const (
 	alfredServiceAccount = "ome-alfred"
 	alfredNamespace      = "ome"
-	leaderLeaseName      = "alfred.ome.io"
-	capabilityLeaseName  = "ome-inferencereplica-executor"
 )
 
 func TestRenderedAlfredLeaseContract(t *testing.T) {
 	objects := renderAlfredManifests(t)
 
 	t.Run("pre-created leader Lease is spec-less", func(t *testing.T) {
-		lease := findManifest(t, objects, "Lease", leaderLeaseName)
+		lease := findManifest(t, objects, "Lease", leaderElectionID)
 		if lease.GetNamespace() != alfredNamespace {
 			t.Fatalf("leader Lease namespace = %q, want %q", lease.GetNamespace(), alfredNamespace)
 		}
@@ -60,8 +60,8 @@ func TestRenderedAlfredLeaseContract(t *testing.T) {
 			lease   string
 			allowed map[string]bool
 		}{
-			{name: "leader", lease: leaderLeaseName, allowed: map[string]bool{"get": true, "update": true}},
-			{name: "capability", lease: capabilityLeaseName, allowed: map[string]bool{"get": true}},
+			{name: "leader", lease: leaderElectionID, allowed: map[string]bool{"get": true, "update": true}},
+			{name: "capability", lease: constants.OMENativeExecutorCapabilityLeaseName, allowed: map[string]bool{"get": true}},
 			{name: "unrelated", lease: "unrelated-lease", allowed: map[string]bool{}},
 		}
 		for _, test := range tests {
