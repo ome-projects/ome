@@ -67,6 +67,12 @@ type downloadOverrideInputs struct {
 	TensorRTLLMModelType string
 }
 
+type modelDemandReference struct {
+	kind      string
+	namespace string
+	name      string
+}
+
 func NewScout(ctx context.Context, nodeName string,
 	baseModelInformer omev1beta1.BaseModelInformer,
 	clusterBaseModelInformer omev1beta1.ClusterBaseModelInformer,
@@ -546,23 +552,35 @@ func (w *Scout) addOrUpdateInferenceService(obj interface{}) {
 		w.logger.Errorf("Failed to convert %v to InferenceService", obj)
 		return
 	}
+	w.demandMu.Lock()
+	demand := w.setInferenceServiceDemandLocked(isvc)
+	w.demandMu.Unlock()
+	if demand != nil {
+		w.enqueueDemandedModel(demand.kind, demand.namespace, demand.name)
+	}
+}
+
+// setInferenceServiceDemandLocked updates the endpoint demand indexes from one
+// InferenceService. The caller must hold demandMu for writing.
+func (w *Scout) setInferenceServiceDemandLocked(isvc *v1beta1.InferenceService) *modelDemandReference {
 	endpointKey := isvc.Namespace + "/" + isvc.Name
 	if !isvc.DeletionTimestamp.IsZero() || isvc.Spec.Model == nil ||
 		strings.TrimSpace(isvc.Spec.Model.Name) == "" {
-		w.setEndpointDemand(endpointKey, "")
-		return
+		w.setEndpointDemandLocked(endpointKey, "")
+		return nil
 	}
 
 	kind, name, supported := inferenceServiceModelReference(isvc.Spec.Model)
 	if !supported {
 		w.logger.Debugf("InferenceService %s does not reference a supported OME model", endpointKey)
-		w.setEndpointDemand(endpointKey, "")
-		return
+		w.setEndpointDemandLocked(endpointKey, "")
+		return nil
 	}
 	modelKey := modelDemandKey(kind, isvc.Namespace, name)
-	if w.setEndpointDemand(endpointKey, modelKey) {
-		w.enqueueDemandedModel(kind, isvc.Namespace, name)
+	if !w.setEndpointDemandLocked(endpointKey, modelKey) {
+		return nil
 	}
+	return &modelDemandReference{kind: kind, namespace: isvc.Namespace, name: name}
 }
 
 func (w *Scout) deleteInferenceService(obj interface{}) {
@@ -580,23 +598,42 @@ func (w *Scout) deleteInferenceService(obj interface{}) {
 }
 
 func (w *Scout) refreshAllEndpointDemands() {
+	// Hold demandMu while taking and replaying the lister snapshot. This orders
+	// informer updates after the snapshot publication so a stale snapshot can
+	// never overwrite a newer endpoint event.
+	w.demandMu.Lock()
 	isvcs, err := w.inferenceServiceLister.List(labels.Everything())
 	if err != nil {
+		w.demandMu.Unlock()
 		w.logger.Errorf("Unable to rebuild endpoint model demand: %v", err)
 		return
 	}
-	w.demandMu.Lock()
 	w.endpointDemands = make(map[string]string)
 	w.demandCounts = make(map[string]int)
-	w.demandMu.Unlock()
+	demands := make([]modelDemandReference, 0, len(isvcs))
 	for _, isvc := range isvcs {
-		w.addOrUpdateInferenceService(isvc)
+		if demand := w.setInferenceServiceDemandLocked(isvc); demand != nil {
+			demands = append(demands, *demand)
+		}
+	}
+	w.demandMu.Unlock()
+
+	// Queue operations can perform lister and Kubernetes client work, so keep
+	// them outside demandMu.
+	for _, demand := range demands {
+		w.enqueueDemandedModel(demand.kind, demand.namespace, demand.name)
 	}
 }
 
 func (w *Scout) setEndpointDemand(endpointKey, modelKey string) bool {
 	w.demandMu.Lock()
 	defer w.demandMu.Unlock()
+	return w.setEndpointDemandLocked(endpointKey, modelKey)
+}
+
+// setEndpointDemandLocked mutates the demand indexes. The caller must hold
+// demandMu for writing.
+func (w *Scout) setEndpointDemandLocked(endpointKey, modelKey string) bool {
 	previous := w.endpointDemands[endpointKey]
 	if previous == modelKey {
 		return false
