@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ome-alfred
+description: Alfred, the OME GPU cluster caretaker (OEP-0008) — observes the physical GPU layer and recommends corrective migrations; recommend-only by default.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
