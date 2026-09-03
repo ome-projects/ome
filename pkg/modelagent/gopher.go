@@ -47,7 +47,7 @@ type GopherTask struct {
 	SamePathWaitStartedAt  time.Time
 	NormalPriorityOnly     bool
 	RevalidationReplay     bool
-	ServingDemand          bool
+	DownloadPriority       v1beta1.ModelDownloadPriority
 }
 
 type activeDownload struct {
@@ -138,7 +138,7 @@ func NewGopher(
 }
 
 // SetTaskSchedulerCapacity bounds queued model work while preserving delete
-// and serving-demand progress when the queue is under pressure.
+// and high-priority model progress when the queue is under pressure.
 func (s *Gopher) SetTaskSchedulerCapacity(capacity int) {
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue(capacity)

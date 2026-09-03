@@ -54,16 +54,30 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) bool {
 		q.normalDownload = removeSupersededTasks(q.normalDownload, task)
 		q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
 		q.high = append([]*GopherTask{task}, q.high...)
-	} else if task.ServingDemand && !task.NormalPriorityOnly && !task.RevalidationReplay {
-		// Replace queued background work for this model with one demand-priority
-		// task. Active downloads are already making progress and are unaffected.
+	} else if isFreshModelDownloadTask(task) {
+		// A model status or spec update can change its effective priority. Keep
+		// exactly one queued task for the model UID and move that task between
+		// queues without affecting an active download.
 		q.high = removeSupersededTasks(q.high, task)
 		q.normalDownload = removeSupersededTasks(q.normalDownload, task)
 		q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
-		if !q.makeRoomForPriorityTask() {
-			return false
+		switch effectiveTaskPriority(task) {
+		case v1beta1.ModelDownloadPriorityHigh:
+			if !q.makeRoomForPriorityTask() {
+				return false
+			}
+			q.high = append(q.high, task)
+		case v1beta1.ModelDownloadPriorityBackground:
+			if !q.hasCapacity() {
+				return false
+			}
+			q.normalRevalidation = append(q.normalRevalidation, task)
+		default:
+			if !q.hasCapacity() {
+				return false
+			}
+			q.normalDownload = append(q.normalDownload, task)
 		}
-		q.high = append(q.high, task)
 	} else if shouldUseHighPriorityQueue(task) {
 		if !q.hasCapacity() {
 			return false
@@ -155,9 +169,31 @@ func (q *gopherTaskQueue) lenLocked() int {
 
 func shouldUseHighPriorityQueue(task *GopherTask) bool {
 	return task.TaskType == Delete ||
-		(task.ServingDemand && !task.NormalPriorityOnly && !task.RevalidationReplay) ||
 		isObjectStorageDownloadTask(task) ||
 		(!task.NormalPriorityOnly && !task.SamePathWaitStartedAt.IsZero())
+}
+
+func isFreshModelDownloadTask(task *GopherTask) bool {
+	return task != nil &&
+		(task.TaskType == Download || task.TaskType == DownloadOverride) &&
+		!task.NormalPriorityOnly &&
+		!task.RevalidationReplay &&
+		task.SamePathWaitStartedAt.IsZero()
+}
+
+func effectiveTaskPriority(task *GopherTask) v1beta1.ModelDownloadPriority {
+	if task.DownloadPriority == v1beta1.ModelDownloadPriorityHigh {
+		return v1beta1.ModelDownloadPriorityHigh
+	}
+	if task.DownloadPriority == v1beta1.ModelDownloadPriorityBackground {
+		return v1beta1.ModelDownloadPriorityBackground
+	}
+	// Preserve the existing Object Storage fast path unless the model author
+	// explicitly selected Background.
+	if isObjectStorageDownloadTask(task) {
+		return v1beta1.ModelDownloadPriorityHigh
+	}
+	return v1beta1.ModelDownloadPriorityStandard
 }
 
 func isObjectStorageDownloadTask(task *GopherTask) bool {

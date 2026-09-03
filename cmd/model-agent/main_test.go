@@ -114,7 +114,7 @@ func TestDefaultConfig(t *testing.T) {
 	testCmd.Flags().StringVar(&cfg.downloadAuthType, "download-auth-type", "instance-principal", "authentication method for model download")
 	testCmd.Flags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 3, "number of download workers")
 	testCmd.Flags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "number of high-priority workers")
-	testCmd.Flags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "same-path wait timeout")
+	testCmd.Flags().DurationVar(&cfg.samePathReuseTimeout, "same-path-reuse-wait-timeout", 30*time.Minute, "same-path reuse wait timeout")
 	testCmd.Flags().StringVar(&cfg.namespace, "namespace", "ome", "the namespace of the ome model agents daemon set")
 
 	// Call initConfig to set cfg.nodeName
@@ -130,7 +130,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "instance-principal", cfg.downloadAuthType)
 	assert.Equal(t, 3, cfg.numDownloadWorker)
 	assert.Equal(t, 1, cfg.numHighPriorityWorker)
-	assert.Equal(t, 30*time.Minute, cfg.samePathWaitTimeout)
+	assert.Equal(t, 30*time.Minute, cfg.samePathReuseTimeout)
 	assert.Equal(t, "ome", cfg.namespace)
 }
 
@@ -141,8 +141,7 @@ func TestSchedulingContractFlagsAreRegistered(t *testing.T) {
 	}{
 		{name: "num-high-priority-worker", defaultValue: "1"},
 		{name: "task-scheduler-capacity", defaultValue: "4096"},
-		{name: "same-path-wait-timeout", defaultValue: "30m0s"},
-		{name: "demand-priority-enabled", defaultValue: "false"},
+		{name: "same-path-reuse-wait-timeout", defaultValue: "30m0s"},
 	}
 
 	for _, tt := range tests {
@@ -152,6 +151,31 @@ func TestSchedulingContractFlagsAreRegistered(t *testing.T) {
 			assert.Equal(t, tt.defaultValue, flag.DefValue)
 		})
 	}
+}
+
+func TestConfiguredSamePathReuseTimeoutAcceptsDeprecatedAlias(t *testing.T) {
+	original := cfg
+	t.Cleanup(func() { cfg = original })
+
+	cfg = &config{
+		samePathReuseTimeout:  30 * time.Minute,
+		legacySamePathTimeout: 45 * time.Minute,
+	}
+	timeout, err := configuredSamePathReuseTimeout()
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, timeout)
+}
+
+func TestConfiguredSamePathReuseTimeoutRejectsConflictingFlags(t *testing.T) {
+	original := cfg
+	t.Cleanup(func() { cfg = original })
+
+	cfg = &config{
+		samePathReuseTimeout:  time.Hour,
+		legacySamePathTimeout: 45 * time.Minute,
+	}
+	_, err := configuredSamePathReuseTimeout()
+	require.ErrorContains(t, err, "disagree")
 }
 
 func TestInitializeLogger(t *testing.T) {

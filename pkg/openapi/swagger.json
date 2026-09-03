@@ -4791,6 +4791,21 @@
         }
       }
     },
+    "v1beta1.ModelDownloadSchedulingStatus": {
+      "description": "ModelDownloadSchedulingStatus contains bounded, controller-owned serving demand. Endpoint identities are intentionally omitted to keep model status low-cardinality and bounded.",
+      "type": "object",
+      "properties": {
+        "referenceCount": {
+          "description": "ReferenceCount is the number of live InferenceServices referencing this model.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "servingDemand": {
+          "description": "ServingDemand is true while at least one live InferenceService references this model.",
+          "type": "boolean"
+        }
+      }
+    },
     "v1beta1.ModelExtensionSpec": {
       "type": "object",
       "properties": {
@@ -4989,6 +5004,10 @@
             "type"
           ],
           "x-kubernetes-list-type": "map"
+        },
+        "downloadScheduling": {
+          "description": "DownloadScheduling is controller-derived scheduling state for node-local model materialization. It is absent when no serving demand has been observed.",
+          "$ref": "#/definitions/v1beta1.ModelDownloadSchedulingStatus"
         },
         "lastReconcileTime": {
           "description": "LastReconcileTime is the wall-clock timestamp of the controller's most recent reconcile pass for this object. Liveness signal — if it falls behind by more than the reconcile period, the controller is wedged or not scheduled. Distinct from Condition.lastTransitionTime, which only advances on actual status flips.",
@@ -7425,6 +7444,10 @@
       "properties": {
         "downloadPolicy": {
           "description": "DownloadPolicy describes the policy of downloading model artifacts Supported policies: - AlwaysDownload: always download a copy of model artifact in destination path - ReuseIfExists: if the identical model artifact has been downloaded in the node, such artifact will be reused",
+          "type": "string"
+        },
+        "downloadPriority": {
+          "description": "DownloadPriority is the persistent user-selected priority for materializing this model on eligible nodes. Serving demand observed by the model controller can raise, but never lower, this priority.",
           "type": "string"
         },
         "key": {

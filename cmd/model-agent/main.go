@@ -44,8 +44,8 @@ type config struct {
 	numDownloadWorker     int
 	numHighPriorityWorker int
 	taskSchedulerCapacity int
-	samePathWaitTimeout   time.Duration
-	demandPriorityEnabled bool
+	samePathReuseTimeout  time.Duration
+	legacySamePathTimeout time.Duration
 	namespace             string
 	logLevel              string
 }
@@ -78,8 +78,9 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().IntVar(&cfg.taskSchedulerCapacity, "task-scheduler-capacity", 4096, "Maximum number of distinct queued model tasks")
-	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
-	rootCmd.PersistentFlags().BoolVar(&cfg.demandPriorityEnabled, "demand-priority-enabled", false, "Prioritize compatible models referenced by InferenceServices")
+	rootCmd.PersistentFlags().DurationVar(&cfg.samePathReuseTimeout, "same-path-reuse-wait-timeout", 30*time.Minute, "Maximum time to wait for another task populating the same local artifact path before resuming the normal download flow")
+	rootCmd.PersistentFlags().DurationVar(&cfg.legacySamePathTimeout, "same-path-wait-timeout", 0, "Deprecated alias for --same-path-reuse-wait-timeout")
+	_ = rootCmd.PersistentFlags().MarkDeprecated("same-path-wait-timeout", "use --same-path-reuse-wait-timeout")
 	rootCmd.PersistentFlags().StringVar(&cfg.namespace, "namespace", "ome", "Kubernetes namespace to use")
 	rootCmd.PersistentFlags().StringVar(&cfg.logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
@@ -219,15 +220,12 @@ func initializeComponents(
 	// Create a Scout instance
 	baseModelInformer := omeInformerFactory.Ome().V1beta1().BaseModels()
 	clusterBaseModelInformer := omeInformerFactory.Ome().V1beta1().ClusterBaseModels()
-	inferenceServiceInformer := omeInformerFactory.Ome().V1beta1().InferenceServices()
 
-	scout, err := modelagent.NewScoutWithDemand(
+	scout, err := modelagent.NewScout(
 		ctx,
 		cfg.nodeName,
 		baseModelInformer,
 		clusterBaseModelInformer,
-		inferenceServiceInformer,
-		cfg.demandPriorityEnabled,
 		omeInformerFactory,
 		gopherTaskChan,
 		kubeClient,
@@ -265,6 +263,10 @@ func initializeComponents(
 	logger.Infof("Configured Xet Hugging Face hub client with max concurrent downloads: %d", xetHubConfig.MaxConcurrentDownloads)
 
 	// Create a Gopher instance for downloading models
+	samePathReuseTimeout, err := configuredSamePathReuseTimeout()
+	if err != nil {
+		return nil, nil, err
+	}
 	gopher, err := modelagent.NewGopher(
 		modelConfigParser,
 		configMapReconciler,
@@ -275,7 +277,7 @@ func initializeComponents(
 		cfg.downloadRetry,
 		cfg.modelsRootDir,
 		gopherTaskChan,
-		cfg.samePathWaitTimeout,
+		samePathReuseTimeout,
 		nodeLabelReconciler,
 		metrics,
 		logger,
@@ -288,6 +290,16 @@ func initializeComponents(
 	gopher.SetTaskSchedulerCapacity(cfg.taskSchedulerCapacity)
 
 	return scout, gopher, nil
+}
+
+func configuredSamePathReuseTimeout() (time.Duration, error) {
+	if cfg.legacySamePathTimeout <= 0 {
+		return cfg.samePathReuseTimeout, nil
+	}
+	if cfg.samePathReuseTimeout != 30*time.Minute && cfg.samePathReuseTimeout != cfg.legacySamePathTimeout {
+		return 0, fmt.Errorf("--same-path-reuse-wait-timeout and deprecated --same-path-wait-timeout disagree")
+	}
+	return cfg.legacySamePathTimeout, nil
 }
 
 // runCommand is the main entry point executed by Cobra

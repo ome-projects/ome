@@ -128,6 +128,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.MigrationStatus":                  schema_pkg_apis_ome_v1beta1_MigrationStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus":                 schema_pkg_apis_ome_v1beta1_ModelCacheStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCopies":                      schema_pkg_apis_ome_v1beta1_ModelCopies(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelDownloadSchedulingStatus":    schema_pkg_apis_ome_v1beta1_ModelDownloadSchedulingStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelExtensionSpec":               schema_pkg_apis_ome_v1beta1_ModelExtensionSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelFormat":                      schema_pkg_apis_ome_v1beta1_ModelFormat(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelFrameworkSpec":               schema_pkg_apis_ome_v1beta1_ModelFrameworkSpec(ref),
@@ -8525,6 +8526,33 @@ func schema_pkg_apis_ome_v1beta1_ModelCopies(ref common.ReferenceCallback) commo
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_ModelDownloadSchedulingStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ModelDownloadSchedulingStatus contains bounded, controller-owned serving demand. Endpoint identities are intentionally omitted to keep model status low-cardinality and bounded.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"servingDemand": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ServingDemand is true while at least one live InferenceService references this model.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"referenceCount": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReferenceCount is the number of live InferenceServices referencing this model.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_ModelExtensionSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -8957,12 +8985,18 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus"),
 						},
 					},
+					"downloadScheduling": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DownloadScheduling is controller-derived scheduling state for node-local model materialization. It is absent when no serving demand has been observed.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelDownloadSchedulingStatus"),
+						},
+					},
 				},
 				Required: []string{"state"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelDownloadSchedulingStatus"},
 	}
 }
 
@@ -13285,6 +13319,13 @@ func schema_pkg_apis_ome_v1beta1_StorageSpec(ref common.ReferenceCallback) commo
 					"downloadPolicy": {
 						SchemaProps: spec.SchemaProps{
 							Description: "DownloadPolicy describes the policy of downloading model artifacts Supported policies: - AlwaysDownload: always download a copy of model artifact in destination path - ReuseIfExists: if the identical model artifact has been downloaded in the node, such artifact will be reused",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"downloadPriority": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DownloadPriority is the persistent user-selected priority for materializing this model on eligible nodes. Serving demand observed by the model controller can raise, but never lower, this priority.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
