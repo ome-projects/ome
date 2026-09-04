@@ -214,8 +214,19 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	} else {
 		s.classifyStartupRevalidation(task)
 	}
-	if !s.taskQueue.enqueue(task) {
-		s.logger.Warnf("Dropping model-agent task because the scheduler reached capacity: %s", getModelInfoForLogging(task))
+	result := s.taskQueue.enqueue(task)
+	if result.accepted && result.displaced == nil {
+		return
+	}
+	pending := task
+	if result.accepted {
+		pending = result.displaced
+		s.logger.Debugf("Deferring displaced model-agent task until scheduler capacity is available: %s", getModelInfoForLogging(pending))
+	} else {
+		s.logger.Debugf("Waiting for scheduler capacity for model-agent task: %s", getModelInfoForLogging(pending))
+	}
+	if !s.taskQueue.enqueueWhenAvailable(pending) {
+		s.logger.Infof("Model-agent scheduler closed before task could be queued: %s", getModelInfoForLogging(pending))
 	}
 }
 

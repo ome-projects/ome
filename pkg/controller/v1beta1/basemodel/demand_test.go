@@ -87,6 +87,72 @@ func TestModelReferenceUpdateIndexesOldAndNewModels(t *testing.T) {
 	assert.Contains(t, requests, "models/new")
 }
 
+func TestDisabledServingDemandPriorityClearsBaseModelScheduling(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	model := &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "models"},
+		Status: v1beta1.ModelStatusSpec{
+			State:      v1beta1.LifeCycleStateReady,
+			NodesReady: []string{"node-a"},
+			DownloadScheduling: &v1beta1.ModelDownloadSchedulingStatus{
+				ServingDemand:  true,
+				ReferenceCount: 1,
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.BaseModel{}).
+		WithObjects(model).
+		Build()
+
+	changed, err := reconcileModelDownloadScheduling(context.Background(), c, model, false, false)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(model), model))
+	assert.Nil(t, model.Status.DownloadScheduling)
+	assert.Equal(t, v1beta1.LifeCycleStateReady, model.Status.State)
+	assert.Equal(t, []string{"node-a"}, model.Status.NodesReady)
+
+	changed, err = reconcileModelDownloadScheduling(context.Background(), c, model, false, false)
+	require.NoError(t, err)
+	assert.False(t, changed)
+}
+
+func TestDisabledServingDemandPriorityClearsClusterBaseModelScheduling(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	model := &v1beta1.ClusterBaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model"},
+		Status: v1beta1.ModelStatusSpec{
+			State:       v1beta1.LifeCycleStateReady,
+			NodesFailed: []string{"node-b"},
+			DownloadScheduling: &v1beta1.ModelDownloadSchedulingStatus{
+				ServingDemand:  true,
+				ReferenceCount: 2,
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.ClusterBaseModel{}).
+		WithObjects(model).
+		Build()
+
+	changed, err := reconcileModelDownloadScheduling(context.Background(), c, model, true, false)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(model), model))
+	assert.Nil(t, model.Status.DownloadScheduling)
+	assert.Equal(t, v1beta1.LifeCycleStateReady, model.Status.State)
+	assert.Equal(t, []string{"node-b"}, model.Status.NodesFailed)
+
+	changed, err = reconcileModelDownloadScheduling(context.Background(), c, model, true, false)
+	require.NoError(t, err)
+	assert.False(t, changed)
+}
+
 func testModelDemandIndex(obj client.Object) []string {
 	ref, ok := modelReferenceForInferenceService(obj)
 	if !ok {

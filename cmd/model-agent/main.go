@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -204,6 +205,7 @@ func initializeComponents(
 	metrics *modelagent.Metrics,
 	gopherTaskChan chan *modelagent.GopherTask,
 	logger *Logger,
+	flags *pflag.FlagSet,
 ) (*modelagent.Scout, *modelagent.Gopher, error) {
 	// Create node label reconciler for labeling the node based on model status
 	nodeLabelReconciler := modelagent.NewNodeLabelReconciler(cfg.nodeName, kubeClient, cfg.nodeLabelRetry, logger)
@@ -263,7 +265,7 @@ func initializeComponents(
 	logger.Infof("Configured Xet Hugging Face hub client with max concurrent downloads: %d", xetHubConfig.MaxConcurrentDownloads)
 
 	// Create a Gopher instance for downloading models
-	samePathReuseTimeout, err := configuredSamePathReuseTimeout()
+	samePathReuseTimeout, err := configuredSamePathReuseTimeout(flags)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -292,14 +294,16 @@ func initializeComponents(
 	return scout, gopher, nil
 }
 
-func configuredSamePathReuseTimeout() (time.Duration, error) {
-	if cfg.legacySamePathTimeout <= 0 {
-		return cfg.samePathReuseTimeout, nil
-	}
-	if cfg.samePathReuseTimeout != 30*time.Minute && cfg.samePathReuseTimeout != cfg.legacySamePathTimeout {
+func configuredSamePathReuseTimeout(flags *pflag.FlagSet) (time.Duration, error) {
+	canonicalSet := flags.Changed("same-path-reuse-wait-timeout")
+	legacySet := flags.Changed("same-path-wait-timeout")
+	if canonicalSet && legacySet && cfg.samePathReuseTimeout != cfg.legacySamePathTimeout {
 		return 0, fmt.Errorf("--same-path-reuse-wait-timeout and deprecated --same-path-wait-timeout disagree")
 	}
-	return cfg.legacySamePathTimeout, nil
+	if legacySet {
+		return cfg.legacySamePathTimeout, nil
+	}
+	return cfg.samePathReuseTimeout, nil
 }
 
 // runCommand is the main entry point executed by Cobra
@@ -355,6 +359,7 @@ func runCommand(cmd *cobra.Command, args []string) {
 		metrics,
 		gopherTaskChan,
 		logger,
+		cmd.PersistentFlags(),
 	)
 	if err != nil {
 		logger.Fatalf("Failed to initialize components: %v", err)

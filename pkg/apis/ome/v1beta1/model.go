@@ -588,6 +588,7 @@ type ModelDownloadSchedulingStatus struct {
 
 	// ReferenceCount is the number of live InferenceServices referencing this
 	// model.
+	// +kubebuilder:validation:Minimum=0
 	ReferenceCount int32 `json:"referenceCount,omitempty"`
 }
 

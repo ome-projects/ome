@@ -17,6 +17,11 @@ type gopherTaskQueue struct {
 	closed             bool
 }
 
+type gopherTaskEnqueueResult struct {
+	accepted  bool
+	displaced *GopherTask
+}
+
 const defaultGopherTaskQueueCapacity = 4096
 
 func newGopherTaskQueue(capacity ...int) *gopherTaskQueue {
@@ -38,15 +43,20 @@ func (q *gopherTaskQueue) setCapacity(capacity int) {
 	q.capacity = capacity
 }
 
-func (q *gopherTaskQueue) enqueue(task *GopherTask) bool {
+func (q *gopherTaskQueue) enqueue(task *GopherTask) gopherTaskEnqueueResult {
 	if task == nil {
-		return false
+		return gopherTaskEnqueueResult{}
 	}
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
+	return q.enqueueLocked(task)
+}
+
+func (q *gopherTaskQueue) enqueueLocked(task *GopherTask) gopherTaskEnqueueResult {
 	if q.closed {
-		return false
+		return gopherTaskEnqueueResult{}
 	}
+	var displaced *GopherTask
 	if task.TaskType == Delete {
 		// Delete preempts pending work for the same model and should run before
 		// reuse-wait tasks, so it is the only non-FIFO insertion.
@@ -63,58 +73,83 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) bool {
 		q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
 		switch effectiveTaskPriority(task) {
 		case v1beta1.ModelDownloadPriorityHigh:
-			if !q.makeRoomForPriorityTask() {
-				return false
+			var roomAvailable bool
+			displaced, roomAvailable = q.makeRoomForPriorityTask()
+			if !roomAvailable {
+				return gopherTaskEnqueueResult{}
 			}
 			q.high = append(q.high, task)
 		case v1beta1.ModelDownloadPriorityBackground:
 			if !q.hasCapacity() {
-				return false
+				return gopherTaskEnqueueResult{}
 			}
 			q.normalRevalidation = append(q.normalRevalidation, task)
 		default:
 			if !q.hasCapacity() {
-				return false
+				return gopherTaskEnqueueResult{}
 			}
 			q.normalDownload = append(q.normalDownload, task)
 		}
 	} else if shouldUseHighPriorityQueue(task) {
 		if !q.hasCapacity() {
-			return false
+			return gopherTaskEnqueueResult{}
 		}
 		q.high = append(q.high, task)
 	} else if task.RevalidationReplay {
 		if !q.hasCapacity() {
-			return false
+			return gopherTaskEnqueueResult{}
 		}
 		q.normalRevalidation = append(q.normalRevalidation, task)
 	} else {
 		if !q.hasCapacity() {
-			return false
+			return gopherTaskEnqueueResult{}
 		}
 		q.normalDownload = append(q.normalDownload, task)
 	}
 	q.cond.Broadcast()
-	return true
+	return gopherTaskEnqueueResult{accepted: true, displaced: displaced}
+}
+
+func (q *gopherTaskQueue) enqueueWhenAvailable(task *GopherTask) bool {
+	if task == nil {
+		return true
+	}
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	pending := task
+	for !q.closed {
+		result := q.enqueueLocked(pending)
+		if result.accepted {
+			if result.displaced == nil {
+				return true
+			}
+			pending = result.displaced
+			continue
+		}
+		q.cond.Wait()
+	}
+	return false
 }
 
 func (q *gopherTaskQueue) hasCapacity() bool {
 	return q.capacity <= 0 || q.lenLocked() < q.capacity
 }
 
-func (q *gopherTaskQueue) makeRoomForPriorityTask() bool {
+func (q *gopherTaskQueue) makeRoomForPriorityTask() (*GopherTask, bool) {
 	if q.hasCapacity() {
-		return true
+		return nil, true
 	}
 	if len(q.normalRevalidation) > 0 {
+		displaced := q.normalRevalidation[len(q.normalRevalidation)-1]
 		q.normalRevalidation = q.normalRevalidation[:len(q.normalRevalidation)-1]
-		return true
+		return displaced, true
 	}
 	if len(q.normalDownload) > 0 {
+		displaced := q.normalDownload[len(q.normalDownload)-1]
 		q.normalDownload = q.normalDownload[:len(q.normalDownload)-1]
-		return true
+		return displaced, true
 	}
-	return false
+	return nil, false
 }
 
 func (q *gopherTaskQueue) popNormal() (*GopherTask, bool) {
@@ -126,11 +161,13 @@ func (q *gopherTaskQueue) popNormal() (*GopherTask, bool) {
 	if len(q.normalDownload) > 0 {
 		task := q.normalDownload[0]
 		q.normalDownload = q.normalDownload[1:]
+		q.cond.Broadcast()
 		return task, true
 	}
 	if len(q.normalRevalidation) > 0 {
 		task := q.normalRevalidation[0]
 		q.normalRevalidation = q.normalRevalidation[1:]
+		q.cond.Broadcast()
 		return task, true
 	}
 	return nil, false
@@ -145,6 +182,7 @@ func (q *gopherTaskQueue) popHighPriority() (*GopherTask, bool) {
 	if len(q.high) > 0 {
 		task := q.high[0]
 		q.high = q.high[1:]
+		q.cond.Broadcast()
 		return task, true
 	}
 	return nil, false

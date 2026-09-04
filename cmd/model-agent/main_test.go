@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,11 +158,8 @@ func TestConfiguredSamePathReuseTimeoutAcceptsDeprecatedAlias(t *testing.T) {
 	original := cfg
 	t.Cleanup(func() { cfg = original })
 
-	cfg = &config{
-		samePathReuseTimeout:  30 * time.Minute,
-		legacySamePathTimeout: 45 * time.Minute,
-	}
-	timeout, err := configuredSamePathReuseTimeout()
+	flags := parseSamePathTimeoutFlags(t, "--same-path-wait-timeout=45m")
+	timeout, err := configuredSamePathReuseTimeout(flags)
 	require.NoError(t, err)
 	assert.Equal(t, 45*time.Minute, timeout)
 }
@@ -170,12 +168,35 @@ func TestConfiguredSamePathReuseTimeoutRejectsConflictingFlags(t *testing.T) {
 	original := cfg
 	t.Cleanup(func() { cfg = original })
 
-	cfg = &config{
-		samePathReuseTimeout:  time.Hour,
-		legacySamePathTimeout: 45 * time.Minute,
-	}
-	_, err := configuredSamePathReuseTimeout()
+	flags := parseSamePathTimeoutFlags(t,
+		"--same-path-reuse-wait-timeout=30m",
+		"--same-path-wait-timeout=45m",
+	)
+	_, err := configuredSamePathReuseTimeout(flags)
 	require.ErrorContains(t, err, "disagree")
+}
+
+func TestConfiguredSamePathReuseTimeoutAcceptsMatchingFlags(t *testing.T) {
+	original := cfg
+	t.Cleanup(func() { cfg = original })
+
+	flags := parseSamePathTimeoutFlags(t,
+		"--same-path-reuse-wait-timeout=45m",
+		"--same-path-wait-timeout=45m",
+	)
+	timeout, err := configuredSamePathReuseTimeout(flags)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, timeout)
+}
+
+func parseSamePathTimeoutFlags(t *testing.T, args ...string) *pflag.FlagSet {
+	t.Helper()
+	cfg = &config{}
+	flags := pflag.NewFlagSet("same-path-timeout-test", pflag.ContinueOnError)
+	flags.DurationVar(&cfg.samePathReuseTimeout, "same-path-reuse-wait-timeout", 30*time.Minute, "")
+	flags.DurationVar(&cfg.legacySamePathTimeout, "same-path-wait-timeout", 0, "")
+	require.NoError(t, flags.Parse(args))
+	return flags
 }
 
 func TestInitializeLogger(t *testing.T) {

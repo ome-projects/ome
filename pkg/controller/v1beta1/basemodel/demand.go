@@ -178,6 +178,46 @@ func reconcileModelDownloadDemand(
 	return true, nil
 }
 
+func reconcileModelDownloadScheduling(
+	ctx context.Context,
+	kubeClient client.Client,
+	obj client.Object,
+	isClusterScoped bool,
+	enabled bool,
+) (bool, error) {
+	if enabled {
+		return reconcileModelDownloadDemand(ctx, kubeClient, obj, isClusterScoped)
+	}
+	return clearModelDownloadScheduling(ctx, kubeClient, obj)
+}
+
+func clearModelDownloadScheduling(
+	ctx context.Context,
+	kubeClient client.Client,
+	obj client.Object,
+) (bool, error) {
+	_, status, err := shared.ModelSpecAndStatus(obj)
+	if err != nil {
+		return false, err
+	}
+	if status.DownloadScheduling == nil {
+		return false, nil
+	}
+
+	updateStatus := func(ctx context.Context, c client.Client, latest client.Object) error {
+		_, latestStatus, err := shared.ModelSpecAndStatus(latest)
+		if err != nil {
+			return err
+		}
+		latestStatus.DownloadScheduling = nil
+		return c.Status().Update(ctx, latest)
+	}
+	if err := shared.RetryUpdate(ctx, kubeClient, ctrl.Log.WithName("ModelDownloadDemand"), obj, "status", updateStatus); err != nil {
+		return false, fmt.Errorf("clear model download scheduling for %s: %w", client.ObjectKeyFromObject(obj), err)
+	}
+	return true, nil
+}
+
 func modelDownloadDemandMatches(status *v1beta1.ModelDownloadSchedulingStatus, count int32) bool {
 	if count == 0 {
 		return status == nil

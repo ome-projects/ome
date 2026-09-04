@@ -84,15 +84,15 @@ func (r *BaseModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		log.Error(err, "Failed to get BaseModel")
 		return ctrl.Result{}, err
 	}
-	if r.ServingDemandPriorityEnabled {
-		changed, err := reconcileModelDownloadDemand(ctx, r.Client, baseModel, false)
-		if err != nil {
-			log.Error(err, "Failed to reconcile model download demand")
-			return ctrl.Result{}, err
-		}
-		if changed {
-			return ctrl.Result{Requeue: true}, nil
-		}
+	changed, err := reconcileModelDownloadScheduling(
+		ctx, r.Client, baseModel, false, r.ServingDemandPriorityEnabled,
+	)
+	if err != nil {
+		log.Error(err, "Failed to reconcile model download scheduling")
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	return reconcileModel(ctx, r.Client, r.Scheme, log, r.backends(), baseModel, constants.BaseModelFinalizer, false, "BaseModel")
 }
@@ -108,15 +108,15 @@ func (r *ClusterBaseModelReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		log.Error(err, "Failed to get ClusterBaseModel")
 		return ctrl.Result{}, err
 	}
-	if r.ServingDemandPriorityEnabled {
-		changed, err := reconcileModelDownloadDemand(ctx, r.Client, clusterBaseModel, true)
-		if err != nil {
-			log.Error(err, "Failed to reconcile model download demand")
-			return ctrl.Result{}, err
-		}
-		if changed {
-			return ctrl.Result{Requeue: true}, nil
-		}
+	changed, err := reconcileModelDownloadScheduling(
+		ctx, r.Client, clusterBaseModel, true, r.ServingDemandPriorityEnabled,
+	)
+	if err != nil {
+		log.Error(err, "Failed to reconcile model download scheduling")
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	return reconcileModel(ctx, r.Client, r.Scheme, log, r.backends(), clusterBaseModel, constants.ClusterBaseModelFinalizer, true, "ClusterBaseModel")
 }

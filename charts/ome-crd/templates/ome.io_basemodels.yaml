@@ -386,6 +386,7 @@ spec:
                 properties:
                   referenceCount:
                     format: int32
+                    minimum: 0
                     type: integer
                   servingDemand:
                     type: boolean
