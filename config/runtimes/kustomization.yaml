@@ -34,6 +34,7 @@ resources:
 - srt/mixtral-8x7b-instruct-rt.yaml
 - srt/thinkingmachines/inkling-small-nvfp4-rt.yaml
 # vLLM runtimes
+- vllm/aisingapore/qwen-sea-lion-v4-32b-it-rt.yaml
 - vllm/e5-mistral-7b-instruct-rt.yaml
 - vllm/llama-3-1-405b-instruct-fp8-rt.yaml
 - vllm/llama-3-1-8b-instruct-rt.yaml
