@@ -10,6 +10,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
+	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/alfred/testutil"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -85,17 +86,131 @@ func decisionFor(t *testing.T, decisions []Decision, workload string) Decision {
 func TestAdmitHappyPathAndAdvisoryBypass(t *testing.T) {
 	advisory := cand("prod/b", "node3")
 	advisory.Executable = false
-	advisory.AdvisoryReason = policy.AdvisoryNoSurgeHeadroom
+	advisory.AdvisoryReason = "RawDeploymentMigrationUnsupported"
+	advisory.FootprintGPUs = 8 // advisory metadata must never reserve this
 
 	decisions := admit(t, &Arbiter{}, scenario().Build(), config.Default(),
-		cand("prod/a", "node1"), advisory)
+		advisory, cand("prod/a", "node1"))
 
 	if len(decisions) != 1 {
 		t.Fatalf("advisories must not be arbitrated: %+v", decisions)
 	}
 	d := decisions[0]
 	if !d.Admitted || d.Reason != "" || d.Target != "node2" || d.CooldownOverridden {
-		t.Fatalf("happy path decision: %+v", d)
+		t.Fatalf("Raw advisory must not enter arbitration or claim node2: %+v", d)
+	}
+}
+
+func TestFourTargetOMENativeSurgePreservesPlacementProof(t *testing.T) {
+	b := testutil.NewSnapshot()
+	for i := 1; i <= 4; i++ {
+		b.WithNode(fmt.Sprintf("source%d", i), "h100", 8)
+		b.WithNode(fmt.Sprintf("target%d", i), "h100", 8)
+		b.WithNode(fmt.Sprintf("blocker-source%d", i), "h100", 8)
+		b.WithOtherOccupant(fmt.Sprintf("target%d", i), 7)
+		b.WithInstance(fmt.Sprintf("prod/blocker-%d", i), v1beta1.EngineComponent,
+			constants.RawDeployment, fmt.Sprintf("blocker-source%d", i), 1)
+	}
+	b.WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1,
+		"source1", "source2", "source3", "source4")
+	snap := b.Build()
+	cfg := config.Default()
+	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.01
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
+
+	var p defrag.Policy
+	var wide policy.Candidate
+	for _, c := range p.Evaluate(snap, cfg) {
+		if c.Executable && c.Workload.String() == "prod/wide" {
+			wide = c
+			break
+		}
+	}
+	if wide.Workload.Name == "" {
+		t.Fatal("defrag policy did not emit the wide OMENative candidate")
+	}
+	wantHints := []string{"target1", "target2", "target3"}
+	if len(wide.HintTargetNodes) != len(wantHints) {
+		t.Fatalf("operator hints = %v, want %v", wide.HintTargetNodes, wantHints)
+	}
+	for i := range wantHints {
+		if wide.HintTargetNodes[i] != wantHints[i] {
+			t.Fatalf("operator hints = %v, want %v", wide.HintTargetNodes, wantHints)
+		}
+	}
+	wantPlacementTargets := []string{"target1", "target2", "target3", "target4"}
+	if len(wide.PlacementTargetNodes) < len(wantPlacementTargets) {
+		t.Fatalf("placement targets = %v, want at least %v", wide.PlacementTargetNodes, wantPlacementTargets)
+	}
+	for i := range wantPlacementTargets {
+		if wide.PlacementTargetNodes[i] != wantPlacementTargets[i] {
+			t.Fatalf("placement targets = %v, want prefix %v", wide.PlacementTargetNodes, wantPlacementTargets)
+		}
+	}
+	for _, target := range append(append([]string(nil), wide.HintTargetNodes...), wide.PlacementTargetNodes...) {
+		if strings.HasPrefix(target, "source") {
+			t.Fatalf("source node leaked into target lists: %+v", wide)
+		}
+	}
+
+	wide.Score = 10 // keep the proof-producing candidate first in arbitration
+	candidates := []policy.Candidate{wide}
+	for i := 1; i <= 4; i++ {
+		blocker := cand(fmt.Sprintf("prod/blocker-%d", i), fmt.Sprintf("blocker-source%d", i), fmt.Sprintf("target%d", i))
+		blocker.Score = 0.01
+		candidates = append(candidates, blocker)
+	}
+	decisions := admit(t, &Arbiter{}, snap, cfg, candidates...)
+	wideDecision := decisionFor(t, decisions, "prod/wide")
+	if !wideDecision.Admitted || wideDecision.Target != "target1" {
+		t.Fatalf("four-target placement proof must be admitted: %+v", wideDecision)
+	}
+	for i := 1; i <= 4; i++ {
+		d := decisionFor(t, decisions, fmt.Sprintf("prod/blocker-%d", i))
+		if d.Admitted || d.Reason != RejectTargetNodeBusy {
+			t.Fatalf("target%d must be claimed by the wide surge: %+v", i, d)
+		}
+	}
+}
+
+func TestDefragReroutesUsingPlacementAlternatives(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("source", "h100", 8).
+		WithNode("target1", "h100", 8).
+		WithNode("target2", "h100", 8).
+		WithNode("blocker-source", "h100", 8).
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "source", 1).
+		WithInstance("prod/blocker", v1beta1.EngineComponent, constants.RawDeployment, "blocker-source", 1)
+	b.WithOtherOccupant("target1", 7)
+	b.WithOtherOccupant("target2", 7)
+	snap := b.Build()
+	cfg := config.Default()
+	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.01
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
+
+	var p defrag.Policy
+	var mover policy.Candidate
+	for _, c := range p.Evaluate(snap, cfg) {
+		if c.Executable && c.Workload.String() == "prod/mover" {
+			mover = c
+			break
+		}
+	}
+	if mover.Workload.Name == "" {
+		t.Fatal("defrag policy did not emit the mover candidate")
+	}
+	if len(mover.PlacementTargetNodes) < 2 || mover.PlacementTargetNodes[0] != "target1" || mover.PlacementTargetNodes[1] != "target2" {
+		t.Fatalf("placement alternatives = %v, want target1 then target2", mover.PlacementTargetNodes)
+	}
+
+	blocker := cand("prod/blocker", "blocker-source", "target1")
+	blocker.Score = mover.Score + 1
+	decisions := admit(t, &Arbiter{}, snap, cfg, mover, blocker)
+	if d := decisionFor(t, decisions, "prod/blocker"); !d.Admitted || d.Target != "target1" {
+		t.Fatalf("higher-priority move must consume target1: %+v", d)
+	}
+	if d := decisionFor(t, decisions, "prod/mover"); !d.Admitted || d.Target != "target2" {
+		t.Fatalf("defrag must reroute to its second placement alternative: %+v", d)
 	}
 }
 

@@ -7,7 +7,8 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 )
 
-// maxHintTargets is the OEP's default top-N for HintTargetNodes.
+// maxHintTargets bounds operator-facing target recommendations. Arbitration
+// receives the complete feasible target set separately.
 const maxHintTargets = 3
 
 // rankTargets returns the pool's feasible placement targets for one per-pod
@@ -16,8 +17,8 @@ const maxHintTargets = 3
 // nodes. The bins already exclude unhealthy, cordoned, CA-deleting, suspect,
 // and (by default) spot nodes; this adds the per-candidate filters — source
 // exclusion, per-workload spot avoidance, and storage-aware model
-// availability. The full ranked list is returned; callers truncate hints to
-// maxHintTargets.
+// availability. The full ranked list is returned for both atomic simulation
+// and the Arbiter's internal placement replay.
 func rankTargets(snap *snapshot.ClusterSnapshot, cfg *config.Config, bins []binState,
 	w *snapshot.Workload, podGPUs int64, exclude map[string]bool) []string {
 

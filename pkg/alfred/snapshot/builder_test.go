@@ -287,7 +287,10 @@ func buildTestSnapshot(t *testing.T) *ClusterSnapshot {
 
 	snap, err := Build(context.Background(), client.Reader(fakeClient), Options{
 		PreemptibleLabels: []string{"node.kubernetes.io/preemptible"},
-		Now:               func() time.Time { return buildNow },
+		OMENativeExecutor: OMENativeExecutorState{
+			Available: true, WireVersion: "v2", RenewTime: buildNow.Add(-time.Minute), Reason: "healthy",
+		},
+		Now: func() time.Time { return buildNow },
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -353,6 +356,13 @@ func TestBuildWorkloadsAndMigrationState(t *testing.T) {
 	if len(engine.Instances) != 2 {
 		t.Fatalf("engine instances: %d, want 2 (one per RawDeployment pod)", len(engine.Instances))
 	}
+	if !engine.ObservationValid || !engine.Instances[0].ObservationValid || !engine.Instances[1].ObservationValid {
+		t.Fatalf("Raw live-Pod observations must be structurally valid: %+v", engine)
+	}
+	if !snap.OMENativeExecutor.Available || snap.OMENativeExecutor.WireVersion != "v2" ||
+		!snap.OMENativeExecutor.RenewTime.Equal(buildNow.Add(-time.Minute)) {
+		t.Fatalf("structured executor state = %+v", snap.OMENativeExecutor)
+	}
 	if engine.Instances[0].Pods[0].Name != "svc-a-engine-1" || engine.Instances[0].TotalGPUs != 2 || engine.Instances[0].ReadyPods != 1 {
 		t.Fatalf("instance 0: %+v", engine.Instances[0])
 	}
@@ -366,28 +376,26 @@ func TestBuildWorkloadsAndMigrationState(t *testing.T) {
 		t.Fatalf("router component from pods only: %+v", router)
 	}
 
-	if svcA.LastMigration == nil || !svcA.LastMigration.Equal(completedAt.Time) {
-		t.Fatalf("LastMigration: %v, want %v", svcA.LastMigration, completedAt.Time)
+	if svcA.LastMigration != nil {
+		t.Fatalf("LastMigration = %v, want nil without authoritative IR status", svcA.LastMigration)
 	}
-	// done-1 has a terminal history entry AND a lingering request
-	// annotation (the ack-race window): it must not be in flight.
+	// ISVC migrationHistory is ignored. Both valid annotations remain active
+	// until an authoritative IR status row accepts or terminates them.
 	if len(svcA.ActiveMigrations) != 2 {
-		t.Fatalf("ActiveMigrations: %+v, want annotation req-1 + history hist-1 only", svcA.ActiveMigrations)
-	}
-	for _, f := range svcA.ActiveMigrations {
-		if f.UUID == "done-1" {
-			t.Fatalf("terminal history must override the lingering done-1 annotation: %+v", svcA.ActiveMigrations)
-		}
+		t.Fatalf("ActiveMigrations: %+v, want done-1 + req-1 annotations", svcA.ActiveMigrations)
 	}
 	// A corrupt request annotation must stay visible, not make the
 	// workload look clean.
 	if reason := svcA.MalformedRequests["bad-1"]; reason == "" {
 		t.Fatalf("malformed request bad-1 not surfaced: %+v", svcA.MalformedRequests)
 	}
-	if svcA.ActiveMigrations[0].UUID != "hist-1" || svcA.ActiveMigrations[0].Phase != v1beta1.MigrationPhaseSurgePending {
+	if svcA.MigrationStateValid || svcA.MigrationStateReason != migrationStateReasonRequestInvalid {
+		t.Fatalf("malformed request migration validity = %t/%q", svcA.MigrationStateValid, svcA.MigrationStateReason)
+	}
+	if svcA.ActiveMigrations[0].UUID != "done-1" || svcA.ActiveMigrations[0].FromNode != "node2" {
 		t.Fatalf("ActiveMigrations[0]: %+v", svcA.ActiveMigrations[0])
 	}
-	if svcA.ActiveMigrations[1].UUID != "req-1" || svcA.ActiveMigrations[1].FromNode != "node1" {
+	if svcA.ActiveMigrations[1].UUID != "req-1" || svcA.ActiveMigrations[1].FromNode != "node1" || svcA.ActiveMigrations[1].Instance != 0 {
 		t.Fatalf("ActiveMigrations[1]: %+v", svcA.ActiveMigrations[1])
 	}
 	if svcA.ActiveMigrations[1].RequestedBy != "alfred-controller" {

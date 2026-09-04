@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/metrics"
@@ -46,7 +47,7 @@ func tenSpreadNodes(movable bool) *snapshot.ClusterSnapshot {
 		node := fmt.Sprintf("node%d", i)
 		b.WithNode(node, "h100", 8)
 		if movable {
-			b.WithInstance(fmt.Sprintf("prod/svc-%d", i), v1beta1.EngineComponent, constants.RawDeployment, node, 1)
+			b.WithInstance(fmt.Sprintf("prod/svc-%d", i), v1beta1.EngineComponent, constants.OMENative, node, 1)
 		} else {
 			b.WithOtherOccupant(node, 1)
 		}
@@ -101,7 +102,7 @@ func TestPendingPressureEligible(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		node := fmt.Sprintf("node%d", i)
 		b.WithNode(node, "h100", 8)
-		b.WithInstance(fmt.Sprintf("prod/svc-%d", i), v1beta1.EngineComponent, constants.RawDeployment, node, 1)
+		b.WithInstance(fmt.Sprintf("prod/svc-%d", i), v1beta1.EngineComponent, constants.OMENative, node, 1)
 	}
 	// Pending 8-GPU pod, aged exactly tau (30m default): u = 1 - e^-1.
 	b.WithPendingPod(8, 30*time.Minute, "h100")
@@ -139,7 +140,7 @@ func TestMaxOverPools(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		node := fmt.Sprintf("h100-%d", i)
 		b.WithNode(node, "h100", 8)
-		b.WithInstance(fmt.Sprintf("prod/svc-%d", i), v1beta1.EngineComponent, constants.RawDeployment, node, 1)
+		b.WithInstance(fmt.Sprintf("prod/svc-%d", i), v1beta1.EngineComponent, constants.OMENative, node, 1)
 	}
 	b.WithNode("a100-1", "a100", 4)
 	b.WithNode("a100-2", "a100", 4)
@@ -192,7 +193,7 @@ func pinScenario(mode constants.DeploymentModeType, pinned bool, omenativeAvaila
 const pinScenarioReclaimable = 0.2175 // worked example in the test bodies
 
 func TestRepackConsolidatesIntoHoles(t *testing.T) {
-	cs := ComputeScores(pinScenario(constants.RawDeployment, false, true), config.Default()).PerPool["h100"]
+	cs := ComputeScores(pinScenario(constants.OMENative, false, true), config.Default()).PerPool["h100"]
 	// Observed [7,1]: F_obs = 0.03*0.25 + 0.06*0.5 + 0.18*1 = 0.2175.
 	// Repacked [8,0] (pod fills node2's hole): F_best = 0.
 	almost(t, "FObserved", cs.FObserved, pinScenarioReclaimable)
@@ -201,8 +202,44 @@ func TestRepackConsolidatesIntoHoles(t *testing.T) {
 }
 
 func TestVolumePinnedWorkloadIsNotRepackable(t *testing.T) {
-	cs := ComputeScores(pinScenario(constants.RawDeployment, true, true), config.Default()).PerPool["h100"]
+	cs := ComputeScores(pinScenario(constants.OMENative, true, true), config.Default()).PerPool["h100"]
 	almost(t, "pinned FReclaimable", cs.FReclaimable, 0)
+}
+
+func TestUnresolvedModelIsNotRepackable(t *testing.T) {
+	key := types.NamespacedName{Namespace: "prod", Name: "svc-a"}
+	tests := []struct {
+		name   string
+		mutate func(*snapshot.ClusterSnapshot)
+	}{
+		{
+			name: "missing availability",
+			mutate: func(s *snapshot.ClusterSnapshot) {
+				s.Workloads[key].ModelKey = snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "missing"}
+			},
+		},
+		{
+			name: "resolve error",
+			mutate: func(s *snapshot.ClusterSnapshot) {
+				model := snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "broken"}
+				s.Workloads[key].ModelKey = model
+				s.Models[model] = &snapshot.ModelAvailability{Key: model, ResolveError: "bounded test failure"}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := pinScenario(constants.OMENative, false, true)
+			tt.mutate(snap)
+			cs := ComputeScores(snap, config.Default()).PerPool["h100"]
+			if cs.FObserved <= 0 {
+				t.Fatal("unresolved model occupancy must remain observed")
+			}
+			almost(t, "FReclaimable", cs.FReclaimable, 0)
+			almost(t, "PendingPressure", cs.PendingPressure, 0)
+			almost(t, "Score", cs.Score, 0)
+		})
+	}
 }
 
 func TestOMENativeUnavailableExcludesFromRepack(t *testing.T) {
@@ -233,12 +270,12 @@ func TestRepackFallbackNeverGoesNegative(t *testing.T) {
 		WithNode("sick", "h100", 8, testutil.NodeUnhealthy())
 	// "apex" sorts before "zeta", so the sick node's pod is placed first
 	// and takes the healthy node's lifted seat.
-	b.WithInstance("prod/apex", v1beta1.EngineComponent, constants.RawDeployment, "sick", 8)
-	b.WithInstance("prod/zeta", v1beta1.EngineComponent, constants.RawDeployment, "healthy", 8)
+	b.WithInstance("prod/apex", v1beta1.EngineComponent, constants.OMENative, "sick", 8)
+	b.WithInstance("prod/zeta", v1beta1.EngineComponent, constants.OMENative, "healthy", 8)
 	snap := b.Build()
 	cfg := config.Default()
 
-	repacked := repackPool(snap, "h100", schedulableBins(snap, cfg, "h100"))
+	repacked := repackPool(snap, cfg, "h100", schedulableBins(snap, cfg, "h100"))
 	for _, bin := range repacked {
 		if bin.free < 0 {
 			t.Fatalf("repacked bin %s has negative free capacity %d", bin.name, bin.free)
@@ -266,7 +303,7 @@ func TestExcludedNodePodCannotFabricateReclaimable(t *testing.T) {
 		WithNode("healthy", "h100", 8).
 		WithNode("sick", "h100", 8, testutil.NodeUnhealthy())
 	b.WithOtherOccupant("healthy", 4) // 4 free on the only schedulable node
-	b.WithInstance("prod/evac", v1beta1.EngineComponent, constants.RawDeployment, "sick", 4)
+	b.WithInstance("prod/evac", v1beta1.EngineComponent, constants.OMENative, "sick", 4)
 
 	cs := ComputeScores(b.Build(), config.Default()).PerPool["h100"]
 	almost(t, "FReclaimable", cs.FReclaimable, 0)
@@ -279,7 +316,7 @@ func TestExcludedNodePodCannotFabricateReclaimable(t *testing.T) {
 func TestPendingPressureZeroTauIsZeroNotNaN(t *testing.T) {
 	b := testutil.NewSnapshot().WithNode("node1", "h100", 8)
 	b.WithPendingPod(8, 0, "h100") // age 0 with tau 0 is the 0/0 case
-	got := pendingPressure(b.Build(), "h100", []int64{8}, map[int64]int64{8: 1}, 0)
+	got := pendingPressure(b.Build(), "h100", []int64{8}, map[int64]int64{8: 0}, map[int64]int64{8: 1}, 0)
 	if math.IsNaN(got) || got != 0 {
 		t.Fatalf("pendingPressure with tau=0 = %v, want 0", got)
 	}
@@ -357,5 +394,95 @@ func TestPublishScoresSetsGauges(t *testing.T) {
 	}
 	if got := promtestutil.ToFloat64(m.PendingPressure.WithLabelValues("h100")); got != 0 {
 		t.Fatalf("pending_pressure{h100} = %v, want 0", got)
+	}
+}
+
+func TestExecutionScoringUsesOnlyEligibleOMENative(t *testing.T) {
+	base := func(mode constants.DeploymentModeType) *snapshot.ClusterSnapshot {
+		return pinScenario(mode, false, true)
+	}
+	steady := func() *snapshot.ClusterSnapshot {
+		return makeOMENativeSteady(t, base(constants.OMENative), "svc-a")
+	}
+	assertObservedOnly := func(t *testing.T, snap *snapshot.ClusterSnapshot) {
+		t.Helper()
+		scores := ComputeScores(snap, config.Default())
+		cs := scores.PerPool["h100"]
+		if cs.FObserved <= 0 {
+			t.Fatal("workload occupancy must remain visible in FObserved")
+		}
+		almost(t, "FReclaimable", cs.FReclaimable, 0)
+		almost(t, "PendingPressure", cs.PendingPressure, 0)
+		almost(t, "Score", cs.Score, 0)
+		almost(t, "FragmentationScore", scores.FragmentationScore, 0)
+	}
+
+	t.Run("RawDeployment", func(t *testing.T) {
+		assertObservedOnly(t, base(constants.RawDeployment))
+	})
+	t.Run("LWS", func(t *testing.T) {
+		assertObservedOnly(t, base(constants.MultiNode))
+	})
+	t.Run("executor unavailable", func(t *testing.T) {
+		snap := steady()
+		snap.OMENativeExecutor.Available = false
+		assertObservedOnly(t, snap)
+	})
+	t.Run("invalid observation", func(t *testing.T) {
+		snap := steady()
+		snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "svc-a"}].Components[v1beta1.EngineComponent].ObservationValid = false
+		assertObservedOnly(t, snap)
+	})
+
+	t.Run("eligible OMENative", func(t *testing.T) {
+		cs := ComputeScores(steady(), config.Default()).PerPool["h100"]
+		almost(t, "FObserved", cs.FObserved, pinScenarioReclaimable)
+		almost(t, "FReclaimable", cs.FReclaimable, pinScenarioReclaimable)
+		almost(t, "Score", cs.Score, pinScenarioReclaimable)
+	})
+
+}
+
+func TestObservedOnlyRepackCannotCreatePendingPressure(t *testing.T) {
+	b := testutil.NewSnapshot()
+	for i := 1; i <= 10; i++ {
+		node := fmt.Sprintf("node%d", i)
+		b.WithNode(node, "h100", 8)
+		b.WithInstance(fmt.Sprintf("prod/raw-%d", i), v1beta1.EngineComponent, constants.RawDeployment, node, 1)
+	}
+	// Even a currently open slot cannot make pending pressure executable:
+	// no eligible OMENative repack created that slot.
+	b.WithNode("open", "h100", 8)
+	b.WithPendingPod(8, 30*time.Minute, "h100")
+	cs := ComputeScores(b.Build(), config.Default()).PerPool["h100"]
+	if cs.FObserved <= 0 {
+		t.Fatal("Raw fragmentation must remain observed")
+	}
+	almost(t, "FReclaimable", cs.FReclaimable, 0)
+	almost(t, "PendingPressure", cs.PendingPressure, 0)
+	almost(t, "Score", cs.Score, 0)
+}
+
+func TestCrossPoolAtomicInstanceIsNotRepackable(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("a-source", "a100", 8).
+		WithNode("a-target", "a100", 8).
+		WithNode("h-source", "h100", 8).
+		WithNode("h-target", "h100", 8).
+		WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1, "a-source", "h-source")
+	b.WithOtherOccupant("a-target", 7)
+	b.WithOtherOccupant("h-target", 7)
+	b.WithPendingPod(8, 30*time.Minute, "a100")
+	b.WithPendingPod(8, 30*time.Minute, "h100")
+	scores := ComputeScores(b.Build(), config.Default())
+
+	for _, pool := range []string{"a100", "h100"} {
+		cs := scores.PerPool[pool]
+		if cs.FObserved <= 0 {
+			t.Fatalf("%s cross-pool occupancy must remain observed", pool)
+		}
+		almost(t, pool+" FReclaimable", cs.FReclaimable, 0)
+		almost(t, pool+" PendingPressure", cs.PendingPressure, 0)
+		almost(t, pool+" Score", cs.Score, 0)
 	}
 }

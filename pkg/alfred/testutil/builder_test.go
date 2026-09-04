@@ -48,12 +48,64 @@ func TestSnapshotBuilder(t *testing.T) {
 	if inst.TotalGPUs != 16 || len(inst.Pods) != 2 || inst.NodesSet["node1"] != 1 || inst.NodesSet["node2"] != 1 {
 		t.Fatalf("multi-pod instance: %+v", inst)
 	}
+	if !svcB.Components[v1beta1.EngineComponent].ObservationValid || !inst.ObservationValid ||
+		inst.Phase != v1beta1.OMENativeInstanceReady || inst.Incarnation != 1 ||
+		inst.DesiredPods != 2 || inst.StatusPods != 2 || inst.ObservedPods != 2 ||
+		inst.ServingPods != 2 || inst.AvailablePods != 2 {
+		t.Fatalf("synthetic instance must default to structurally valid state: component=%+v instance=%+v",
+			svcB.Components[v1beta1.EngineComponent], inst)
+	}
+	if !snap.OMENativeExecutor.Available {
+		t.Fatalf("default executor state = %+v", snap.OMENativeExecutor)
+	}
 
 	if len(snap.PendingPods) != 1 || snap.PendingPods[0].GPUsNeeded != 8 {
 		t.Fatalf("pending: %+v", snap.PendingPods)
 	}
 	if got := snap.PendingPods[0].PendingSince; !got.Equal(ReferenceTime.Add(-20 * time.Minute)) {
 		t.Fatalf("pending age: %v", got)
+	}
+}
+
+func TestSnapshotBuilderStructuredExecutorAndInvalidObservation(t *testing.T) {
+	renewed := ReferenceTime.Add(-time.Minute)
+	snap := NewSnapshot().
+		WithNode("node1", "h100", 8).
+		WithMultiPodInstance("prod/svc", v1beta1.EngineComponent, constants.OMENative, 1, "node1", "node1").
+		WithOMENativeExecutor(snapshot.OMENativeExecutorState{
+			Available: true, WireVersion: "v2", RenewTime: renewed, Reason: "healthy",
+		}).
+		WithInvalidOMENativeObservation("prod/svc", v1beta1.EngineComponent, "synthetic disagreement").
+		Build()
+
+	if snap.OMENativeExecutor.WireVersion != "v2" || !snap.OMENativeExecutor.RenewTime.Equal(renewed) {
+		t.Fatalf("structured executor state = %+v", snap.OMENativeExecutor)
+	}
+	component := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "svc"}].Components[v1beta1.EngineComponent]
+	if component.ObservationValid || component.ObservationReason != "synthetic disagreement" ||
+		component.Instances[0].ObservationValid || component.Instances[0].ObservationReason != "synthetic disagreement" {
+		t.Fatalf("invalid synthetic observation = component=%+v instance=%+v", component, component.Instances[0])
+	}
+}
+
+func TestWithMultiPodInstanceUsesStableControllerIdentity(t *testing.T) {
+	snap := NewSnapshot().
+		WithNode("node1", "h100", 8).
+		WithNode("node2", "h100", 8).
+		WithMultiPodInstance("prod/svc", v1beta1.EngineComponent, constants.OMENative, 1, "node1", "node2").
+		WithInstance("prod/svc", v1beta1.EngineComponent, constants.OMENative, "node1", 1).
+		Build()
+
+	component := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "svc"}].Components[v1beta1.EngineComponent]
+	if component.IR == nil || component.IR.UID == "" {
+		t.Fatalf("synthetic OMENative IR has no stable UID: %+v", component.IR)
+	}
+	for _, instance := range component.Instances {
+		for _, pod := range instance.Pods {
+			if !pod.ControllerOwnerPresent || !pod.ControllerOwnerValid || pod.ControllerOwnerUID != component.IR.UID {
+				t.Fatalf("pod controller identity does not match IR %q: %+v", component.IR.UID, pod)
+			}
+		}
 	}
 }
 

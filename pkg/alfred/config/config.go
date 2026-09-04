@@ -57,6 +57,8 @@ type Config struct {
 	PerWorkloadCooldownMinutes     int   `json:"perWorkloadCooldownMinutes"`
 	PerNodeCooldownMinutes         int   `json:"perNodeCooldownMinutes"`
 
+	// RawDeploymentMigrationEnabled is reserved for schema compatibility;
+	// RawDeployment recommendations remain advisory regardless of its value.
 	RawDeploymentMigrationEnabled *bool `json:"rawDeploymentMigrationEnabled"`
 	OMENativeMigrationEnabled     *bool `json:"omenativeMigrationEnabled"`
 	LWSRecommendationsEnabled     *bool `json:"lwsRecommendationsEnabled"`
@@ -227,7 +229,7 @@ func (c *Config) applyDefaults() {
 	defaultInt(&c.PerNodeCooldownMinutes, 10)
 
 	if c.RawDeploymentMigrationEnabled == nil {
-		c.RawDeploymentMigrationEnabled = boolPtr(true)
+		c.RawDeploymentMigrationEnabled = boolPtr(false)
 	}
 	if c.OMENativeMigrationEnabled == nil {
 		c.OMENativeMigrationEnabled = boolPtr(true)

@@ -1,9 +1,11 @@
 package defrag
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
@@ -14,6 +16,74 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
+const (
+	rawMigrationUnsupportedReason     = "RawDeploymentMigrationUnsupported"
+	omenativeObservationInvalidReason = "OMENativeObservationInvalid"
+	omenativeStateIneligibleReason    = "OMENativeStateIneligible"
+	nonExecutableFragmentationReason  = "NonExecutableObservedFragmentation"
+)
+
+// makeOMENativeSteady fills the exact controller-owned state an OMENative
+// component must expose before Alfred may ask its executor to migrate one
+// Instance. Tests mutate one dimension from this literal steady baseline.
+func makeOMENativeSteady(t *testing.T, snap *snapshot.ClusterSnapshot, workload string) *snapshot.ClusterSnapshot {
+	t.Helper()
+	parts := types.NamespacedName{Namespace: "prod", Name: workload}
+	w := snap.Workloads[parts]
+	if w == nil {
+		t.Fatalf("workload %s missing", parts.String())
+	}
+	comp := w.Components[v1beta1.EngineComponent]
+	if comp == nil || comp.DeploymentMode != constants.OMENative {
+		t.Fatalf("OMENative engine component missing for %s", parts.String())
+	}
+	replicas := int32(len(comp.Instances))
+	const revision = "revision-1"
+	comp.IR = &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Generation: 1},
+		Spec: v1beta1.InferenceReplicaSpec{
+			Replicas: &replicas,
+		},
+		Status: v1beta1.InferenceReplicaStatus{
+			ObservedGeneration:   1,
+			Replicas:             replicas,
+			ReadyReplicas:        replicas,
+			ServingReplicas:      replicas,
+			AvailableReplicas:    replicas,
+			UpdatedReplicas:      replicas,
+			UpdatedReadyReplicas: replicas,
+			CurrentRevision:      revision,
+			UpdateRevision:       revision,
+		},
+	}
+	comp.StatusFresh = true
+	comp.ObservationValid = true
+	for _, inst := range comp.Instances {
+		inst.Phase = v1beta1.OMENativeInstanceReady
+		inst.RunningRevision = revision
+		inst.TargetRevision = revision
+		inst.Admitted = true
+		inst.DesiredPods = int32(len(inst.Pods))
+		inst.StatusPods = int32(len(inst.Pods))
+		inst.ObservedPods = int32(len(inst.Pods))
+		inst.ReadyPods = int32(len(inst.Pods))
+		inst.ServingPods = int32(len(inst.Pods))
+		inst.AvailablePods = int32(len(inst.Pods))
+		inst.ObservationValid = true
+		inst.Operation = nil
+		for i := range inst.Pods {
+			inst.Pods[i].Ready = true
+			inst.Pods[i].Terminating = false
+		}
+	}
+	w.Movable = true
+	w.MigrationStateValid = true
+	w.MalformedRequests = nil
+	w.ActiveMigrations = nil
+	w.LastMigration = nil
+	return snap
+}
+
 // consolidationBuilder is the canonical single-move scenario: prod/mover's
 // 1-GPU pod on node1 (7 free) can fill node2's hole (1 free), freeing a full
 // 8-GPU node. Observed F = 0.2175, best F = 0 (the pinScenario numbers).
@@ -21,7 +91,7 @@ func consolidationBuilder() *testutil.SnapshotBuilder {
 	b := testutil.NewSnapshot().
 		WithNode("node1", "h100", 8).
 		WithNode("node2", "h100", 8).
-		WithInstance("prod/mover", v1beta1.EngineComponent, constants.RawDeployment, "node1", 1)
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "node1", 1)
 	b.WithOtherOccupant("node2", 7)
 	return b
 }
@@ -83,8 +153,8 @@ func TestGate(t *testing.T) {
 }
 
 // TestConsolidationCandidate pins the whole pipeline on the canonical move:
-// surge-shaped (single ready replica), benefit = the full reclaimable 0.2175,
-// cost = rolling restart, hints = the hole it should fill.
+// OMENative surge-shaped, benefit = the full reclaimable 0.2175, cost =
+// surge, hints = the hole it should fill.
 func TestConsolidationCandidate(t *testing.T) {
 	cands := evaluate(t, consolidationBuilder().Build(), lowGate())
 	execs := executables(cands)
@@ -95,8 +165,8 @@ func TestConsolidationCandidate(t *testing.T) {
 	if c.Workload.String() != "prod/mover" || c.Component != v1beta1.EngineComponent || c.Instance != 0 {
 		t.Fatalf("candidate identity: %+v", c)
 	}
-	if c.Mode != constants.RawDeployment || !c.SurgeShaped {
-		t.Fatalf("single ready replica must simulate surge-first rolling restart: %+v", c)
+	if c.Mode != constants.OMENative || !c.SurgeShaped {
+		t.Fatalf("eligible OMENative must simulate place-then-free surge: %+v", c)
 	}
 	if c.FromNode != "node1" {
 		t.Fatalf("FromNode = %q, want node1", c.FromNode)
@@ -105,8 +175,8 @@ func TestConsolidationCandidate(t *testing.T) {
 		t.Fatalf("hints = %v, want [node2] (fill the hole)", c.HintTargetNodes)
 	}
 	almost(t, "Benefit", c.Benefit, 0.2175)
-	almost(t, "Cost", c.Cost, costRollingRestart)
-	almost(t, "Score", c.Score, 0.2175-costRollingRestart)
+	almost(t, "Cost", c.Cost, costOMENativeSurge)
+	almost(t, "Score", c.Score, 0.2175-costOMENativeSurge)
 	if c.Emergency {
 		t.Fatal("no pending pod, must not be an emergency")
 	}
@@ -124,7 +194,7 @@ func TestNoSurgeHeadroomAdvisory(t *testing.T) {
 		WithNode("node2", "h100", 8).
 		WithNode("node3", "h100", 8).
 		WithInstance("prod/big", v1beta1.EngineComponent, constants.OMENative, "node1", 8).
-		WithInstance("prod/mover", v1beta1.EngineComponent, constants.RawDeployment, "node2", 1)
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "node2", 1)
 	b.WithOtherOccupant("node3", 7)
 	cfg := lowGate()
 	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.05
@@ -144,74 +214,51 @@ func TestNoSurgeHeadroomAdvisory(t *testing.T) {
 	}
 }
 
-// TestEvictionShape: with two ready replicas the controller would evict, so
-// the simulation is free-then-place and candidates need no surge headroom.
-func TestEvictionShape(t *testing.T) {
+func TestMultiPodOMENativeCandidateIsSurgeShaped(t *testing.T) {
 	b := testutil.NewSnapshot().
-		WithNode("node1", "h100", 8).
-		WithNode("node2", "h100", 8).
-		WithNode("node3", "h100", 8).
-		WithInstance("prod/wide", v1beta1.EngineComponent, constants.RawDeployment, "node1", 1).
-		WithInstance("prod/wide", v1beta1.EngineComponent, constants.RawDeployment, "node2", 1)
-	b.WithOtherOccupant("node3", 7)
+		WithNode("source1", "h100", 8).
+		WithNode("source2", "h100", 8).
+		WithNode("target1", "h100", 8).
+		WithNode("target2", "h100", 8).
+		WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1, "source1", "source2")
+	b.WithOtherOccupant("target1", 7)
+	b.WithOtherOccupant("target2", 7)
 	cfg := lowGate()
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
 	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.01
 
 	execs := executables(evaluate(t, b.Build(), cfg))
-	if len(execs) != 2 {
-		t.Fatalf("want both replicas as candidates, got %+v", execs)
+	if len(execs) != 1 {
+		t.Fatalf("want one executable multi-pod Instance, got %+v", execs)
 	}
-	for _, c := range execs {
-		if c.SurgeShaped {
-			t.Fatalf("multi-replica RawDeployment must simulate free-then-place: %+v", c)
+	c := execs[0]
+	if !c.SurgeShaped || c.FootprintGPUs != 2 || c.Score <= 0 {
+		t.Fatalf("multi-pod OMENative must be a positive place-then-free surge: %+v", c)
+	}
+	for _, target := range c.HintTargetNodes {
+		if target == "source1" || target == "source2" {
+			t.Fatalf("every current source node must be excluded from hints: %+v", c)
 		}
-		almost(t, "Cost", c.Cost, costTargetedEviction)
 	}
 }
 
-// TestEvictionNoFeasibleTargetAdvisory: a replica whose ranking is empty has
-// nowhere to be evicted to — dispatching would strand the replacement in
-// Pending. It degrades to advisory, the free-then-place mirror of
-// NoSurgeHeadroom, while its sibling with a real target stays executable.
-func TestEvictionNoFeasibleTargetAdvisory(t *testing.T) {
+func TestMultiPodPlacementProofDeduplicatesTargets(t *testing.T) {
 	b := testutil.NewSnapshot().
-		WithNode("node1", "h100", 8).
-		WithNode("node2", "h100", 8).
-		WithNode("node3", "h100", 8).
-		WithInstance("prod/wide", v1beta1.EngineComponent, constants.RawDeployment, "node1", 1).
-		WithInstance("prod/wide", v1beta1.EngineComponent, constants.RawDeployment, "node2", 1)
-	b.WithOtherOccupant("node1", 6)
-	b.WithOtherOccupant("node2", 7)
-	b.WithOtherOccupant("node3", 7)
-	b.WithModel("prod/wide", &snapshot.ModelAvailability{
-		Key:        snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "llm"},
-		Backend:    snapshot.BackendPerNode,
-		NodesReady: []string{"node1", "node2"},
-	})
+		WithNode("source1", "h100", 8).
+		WithNode("source2", "h100", 8).
+		WithNode("target", "h100", 8).
+		WithMultiPodInstance("prod/wide", v1beta1.EngineComponent, constants.OMENative, 1, "source1", "source2")
+	b.WithOtherOccupant("target", 6)
 	cfg := lowGate()
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
 	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.01
 
-	cands := evaluate(t, b.Build(), cfg)
-
-	// The node1 replica is boxed in: node2 is full and node3 lacks the model.
-	blocked := advisories(cands, policy.AdvisoryNoFeasibleTarget)
-	if len(blocked) != 1 {
-		t.Fatalf("want one NoFeasibleTarget advisory, got %+v", cands)
+	execs := executables(evaluate(t, b.Build(), cfg))
+	if len(execs) != 1 {
+		t.Fatalf("want one executable multi-pod Instance, got %+v", execs)
 	}
-	if blocked[0].FromNode != "node1" || blocked[0].SurgeShaped || blocked[0].FootprintGPUs != 1 {
-		t.Fatalf("advisory shape: %+v", blocked[0])
-	}
-	if len(blocked[0].HintTargetNodes) != 0 {
-		t.Fatalf("advisory must carry no hints, got %v", blocked[0].HintTargetNodes)
-	}
-
-	// The node2 replica can still reach node1's hole: unchanged.
-	execs := executables(cands)
-	if len(execs) != 1 || execs[0].FromNode != "node2" {
-		t.Fatalf("want the node2 replica executable, got %+v", execs)
-	}
-	if len(execs[0].HintTargetNodes) != 1 || execs[0].HintTargetNodes[0] != "node1" {
-		t.Fatalf("hints = %v, want [node1]", execs[0].HintTargetNodes)
+	if got := execs[0].HintTargetNodes; len(got) != 1 || got[0] != "target" {
+		t.Fatalf("deduplicated placement proof targets = %v, want [target]", got)
 	}
 }
 
@@ -265,6 +312,7 @@ func withBystander(workload string, mode constants.DeploymentModeType) *testutil
 func bystanderGate() *config.Config {
 	cfg := lowGate()
 	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.05
+	cfg.Policies.Defragmentation.Aggressiveness = config.AggressivenessAggressive
 	return cfg
 }
 
@@ -297,7 +345,7 @@ func TestLWSAdvisory(t *testing.T) {
 // TestVolumePinnedAdvisory: an RWO-backed workload cannot move by any
 // mechanism; it surfaces as advisory while other moves stay executable.
 func TestVolumePinnedAdvisory(t *testing.T) {
-	b := withBystander("prod/pinned", constants.RawDeployment)
+	b := withBystander("prod/pinned", constants.OMENative)
 	b.WithModel("prod/pinned", &snapshot.ModelAvailability{
 		Key:            snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "rwo"},
 		Backend:        snapshot.BackendPVC,
@@ -316,14 +364,109 @@ func TestVolumePinnedAdvisory(t *testing.T) {
 	}
 }
 
+func TestUnresolvedModelIsAdvisory(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func() *testutil.SnapshotBuilder
+	}{
+		{
+			name: "missing availability",
+			build: func() *testutil.SnapshotBuilder {
+				return consolidationBuilder().ConfigureWorkload("prod/mover", func(w *snapshot.Workload) {
+					w.ModelKey = snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "missing"}
+				})
+			},
+		},
+		{
+			name: "resolve error",
+			build: func() *testutil.SnapshotBuilder {
+				return consolidationBuilder().WithModel("prod/mover", &snapshot.ModelAvailability{
+					Key:          snapshot.ModelKey{Kind: snapshot.ModelKindBaseModel, Namespace: "prod", Name: "broken"},
+					ResolveError: "bounded test failure",
+				})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := evaluate(t, tt.build().Build(), lowGate())
+			if len(executables(got)) != 0 {
+				t.Fatalf("unresolved model must never be executable: %+v", got)
+			}
+			unresolved := advisories(got, policy.AdvisoryModelUnresolved)
+			if len(unresolved) != 1 || unresolved[0].Instance != policy.ComponentWideInstance {
+				t.Fatalf("want one component-wide ModelUnresolved advisory, got %+v", got)
+			}
+		})
+	}
+}
+
+func TestRawInstancesEnumerateInTheirOwnPools(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("a-source", "a100", 8).
+		WithNode("a-target", "a100", 8).
+		WithNode("h-source", "h100", 8).
+		WithNode("h-target", "h100", 8).
+		WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "a-source", 1).
+		WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "h-source", 1)
+	b.WithOtherOccupant("a-target", 7)
+	b.WithOtherOccupant("h-target", 7)
+
+	got := advisories(evaluate(t, b.Build(), lowGate()), rawMigrationUnsupportedReason)
+	if len(got) != 2 {
+		t.Fatalf("want one Raw advisory from each pool, got %+v", got)
+	}
+	wantSource := map[string]bool{"a-source": true, "h-source": true}
+	for _, c := range got {
+		if !wantSource[c.FromNode] || len(c.HintTargetNodes) != 0 || c.FootprintGPUs != 0 {
+			t.Fatalf("Raw advisory must remain source-only in its own pool: %+v", c)
+		}
+		delete(wantSource, c.FromNode)
+	}
+	if len(wantSource) != 0 {
+		t.Fatalf("missing Raw sources: %v", wantSource)
+	}
+}
+
+func TestOMENativeInstancesEnumerateInTheirOwnPools(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("a-source", "a100", 8).
+		WithNode("a-target", "a100", 8).
+		WithNode("h-source", "h100", 8).
+		WithNode("h-target", "h100", 8).
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "a-source", 1).
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "h-source", 1)
+	b.WithOtherOccupant("a-target", 7)
+	b.WithOtherOccupant("h-target", 7)
+	cfg := lowGate()
+	*cfg.Policies.Defragmentation.FragmentationThreshold = 0.05
+
+	snap := b.Build()
+	scores := ComputeScores(snap, cfg)
+	if scores.PerPool["a100"].FReclaimable <= 0 || scores.PerPool["h100"].FReclaimable <= 0 {
+		t.Fatalf("each wholly-owned Instance must be repackable in its own pool: %+v", scores.PerPool)
+	}
+	got := executables(evaluate(t, snap, cfg))
+	if len(got) != 2 {
+		t.Fatalf("want one executable OMENative Instance from each pool, got %+v", got)
+	}
+	wantSource := map[string]bool{"a-source": true, "h-source": true}
+	for _, c := range got {
+		if !wantSource[c.FromNode] || !c.SurgeShaped || c.Score <= 0 {
+			t.Fatalf("per-pool OMENative candidate mismatch: %+v", c)
+		}
+		delete(wantSource, c.FromNode)
+	}
+}
+
 // TestOMENativeUnavailableAdvisory: without an executor the migration verb
 // has no consumer; OMENative candidates degrade to advisory.
 func TestOMENativeUnavailableAdvisory(t *testing.T) {
 	b := withBystander("prod/omen", constants.OMENative).WithOMENative(false)
 	cands := evaluate(t, b.Build(), bystanderGate())
 	degraded := advisories(cands, policy.AdvisoryOMENativeUnavailable)
-	if len(degraded) != 1 || degraded[0].Workload.String() != "prod/omen" {
-		t.Fatalf("want one OMENativeUnavailable advisory, got %+v", cands)
+	if len(degraded) != 2 || len(executables(cands)) != 0 {
+		t.Fatalf("every OMENative workload must degrade when the executor is unavailable, got %+v", cands)
 	}
 }
 
@@ -428,7 +571,7 @@ func TestModelReadinessFiltersTargets(t *testing.T) {
 		WithNode("node1", "h100", 8).
 		WithNode("node2", "h100", 8).
 		WithNode("node3", "h100", 8).
-		WithInstance("prod/mover", v1beta1.EngineComponent, constants.RawDeployment, "node1", 1)
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "node1", 1)
 	b.WithOtherOccupant("node2", 7)
 	b.WithOtherOccupant("node3", 7)
 	b.WithModel("prod/mover", &snapshot.ModelAvailability{
@@ -459,5 +602,189 @@ func TestRankingPrefersScoreThenSmallerFootprint(t *testing.T) {
 	rankCandidates(cands)
 	if cands[0].Workload.Name != "c" || cands[1].FootprintGPUs != 2 || cands[2].FootprintGPUs != 8 {
 		t.Fatalf("ranking order wrong: %+v", cands)
+	}
+}
+
+func TestRawDeploymentIsAlwaysPerInstanceAdvisory(t *testing.T) {
+	build := func() *snapshot.ClusterSnapshot {
+		b := testutil.NewSnapshot().
+			WithNode("node1", "h100", 8).
+			WithNode("node2", "h100", 8).
+			WithNode("node3", "h100", 8).
+			WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "node1", 1).
+			WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "node3", 1)
+		b.WithOtherOccupant("node2", 7)
+		return b.Build()
+	}
+
+	for _, mode := range []string{config.ModeRecommendOnly, config.ModeExecute} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(mode+"/enabled="+fmt.Sprint(enabled), func(t *testing.T) {
+				cfg := lowGate()
+				cfg.Mode = mode
+				*cfg.RawDeploymentMigrationEnabled = enabled
+				got := evaluate(t, build(), cfg)
+				if len(executables(got)) != 0 {
+					t.Fatalf("RawDeployment must never be executable: %+v", got)
+				}
+				raw := advisories(got, rawMigrationUnsupportedReason)
+				if len(raw) != 2 {
+					t.Fatalf("want one unsupported advisory per Raw instance, got %+v", got)
+				}
+				for i, c := range raw {
+					if c.Instance != int32(i) || c.FromNode == "" || len(c.HintTargetNodes) != 0 || c.FootprintGPUs != 0 {
+						t.Fatalf("Raw advisory must identify only its source, without capacity claims: %+v", c)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestOMENativeEligibilityFailsClosed(t *testing.T) {
+	steady := func() *snapshot.ClusterSnapshot {
+		b := testutil.NewSnapshot().
+			WithNode("node1", "h100", 8).
+			WithNode("node2", "h100", 8).
+			WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "node1", 1)
+		b.WithOtherOccupant("node2", 7)
+		return makeOMENativeSteady(t, b.Build(), "mover")
+	}
+
+	if got := executables(evaluate(t, steady(), lowGate())); len(got) != 1 || !got[0].SurgeShaped || got[0].Score <= 0 {
+		t.Fatalf("fully steady OMENative state must be executable and surge-shaped: %+v", got)
+	}
+
+	tests := []struct {
+		name   string
+		reason string
+		mutate func(*snapshot.ClusterSnapshot)
+	}{
+		{name: "structured executor unavailable", reason: policy.AdvisoryOMENativeUnavailable, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.OMENativeExecutor.Available = false
+		}},
+		{name: "missing IR", reason: omenativeObservationInvalidReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].IR = nil
+		}},
+		{name: "invalid component observation", reason: omenativeObservationInvalidReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].ObservationValid = false
+		}},
+		{name: "invalid instance join", reason: omenativeObservationInvalidReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].ObservationValid = false
+		}},
+		{name: "stale status generation", reason: omenativeObservationInvalidReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].StatusFresh = false
+		}},
+		{name: "paused IR", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].IR.Spec.Paused = true
+		}},
+		{name: "migration policy Never", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			comp := s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent]
+			comp.IR.Spec.Lifecycle = &v1beta1.LifecycleSpec{MigrationPolicy: &v1beta1.MigrationPolicy{Mode: v1beta1.MigrationPolicyModeNever}}
+		}},
+		{name: "scale count mismatch", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].IR.Status.ReadyReplicas = 0
+		}},
+		{name: "rollout revision mismatch", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].IR.Status.UpdateRevision = "revision-2"
+		}},
+		{name: "instance not Ready", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].Phase = v1beta1.OMENativeInstanceUpdating
+		}},
+		{name: "instance not admitted", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].Admitted = false
+		}},
+		{name: "instance readiness mismatch", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].ReadyPods = 0
+		}},
+		{name: "instance revision mismatch", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].TargetRevision = "revision-2"
+		}},
+		{name: "active instance operation", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].Operation = &v1beta1.InstanceOperation{ID: "busy"}
+		}},
+		{name: "terminating pod", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Components[v1beta1.EngineComponent].Instances[0].Pods[0].Terminating = true
+		}},
+		{name: "active migration", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].ActiveMigrations = []snapshot.InFlight{{UUID: "active"}}
+		}},
+		{name: "malformed migration", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].MalformedRequests = map[string]string{"bad": "bounded"}
+		}},
+		{name: "invalid migration observation", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].MigrationStateValid = false
+		}},
+		{name: "workload immovable", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].Movable = false
+		}},
+		{name: "workload cooldown", reason: omenativeStateIneligibleReason, mutate: func(s *snapshot.ClusterSnapshot) {
+			recent := testutil.ReferenceTime.Add(-time.Minute)
+			s.Workloads[types.NamespacedName{Namespace: "prod", Name: "mover"}].LastMigration = &recent
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := steady()
+			tt.mutate(snap)
+			got := evaluate(t, snap, lowGate())
+			if len(executables(got)) != 0 {
+				t.Fatalf("ineligible OMENative state must fail closed: %+v", got)
+			}
+			advisory := advisories(got, tt.reason)
+			if len(advisory) != 1 || advisory[0].Instance != 0 || len(advisory[0].HintTargetNodes) != 0 || advisory[0].FootprintGPUs != 0 {
+				t.Fatalf("want one bounded source-only advisory reason %q, got %+v", tt.reason, got)
+			}
+		})
+	}
+}
+
+func TestObservedOnlyGateNeverCreatesCapacityClaim(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("node1", "h100", 8).
+		WithNode("node2", "h100", 8).
+		WithInstance("prod/raw", v1beta1.EngineComponent, constants.RawDeployment, "node1", 1)
+	b.WithOtherOccupant("node2", 7)
+	snap := b.Build()
+
+	scores := ComputeScores(snap, config.Default())
+	cs := scores.PerPool["h100"]
+	if cs.FObserved <= 0 {
+		t.Fatal("Raw occupancy must remain visible in observed fragmentation")
+	}
+	if cs.FReclaimable != 0 || cs.PendingPressure != 0 || cs.Score != 0 || scores.FragmentationScore != 0 {
+		t.Fatalf("advisory-only occupancy leaked into execution score: %+v", cs)
+	}
+
+	got := evaluate(t, snap, lowGate())
+	if len(got) != 1 || got[0].Executable || got[0].AdvisoryReason != rawMigrationUnsupportedReason || len(got[0].HintTargetNodes) != 0 || got[0].FootprintGPUs != 0 {
+		t.Fatalf("observed-only gate must emit exactly one claim-free advisory: %+v", got)
+	}
+
+	quiet := lowGate()
+	*quiet.Policies.Defragmentation.FragmentationThreshold = cs.FObserved + 0.01
+	if got := evaluate(t, snap, quiet); len(got) != 0 {
+		t.Fatalf("below-threshold advisory gap must stay silent: %+v", got)
+	}
+}
+
+func TestNonpositiveOMENativeScoreIsAdvisory(t *testing.T) {
+	b := testutil.NewSnapshot().
+		WithNode("node1", "h100", 8).
+		WithNode("node2", "h100", 8).
+		WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "node1", 1).
+		WithInstance("prod/weak", v1beta1.EngineComponent, constants.OMENative, "node2", 1)
+	b.WithOtherOccupant("node2", 6)
+	snap := makeOMENativeSteady(t, b.Build(), "mover")
+	snap = makeOMENativeSteady(t, snap, "weak")
+
+	got := evaluate(t, snap, lowGate())
+	if len(executables(got)) != 1 || executables(got)[0].Workload.String() != "prod/mover" || !executables(got)[0].SurgeShaped {
+		t.Fatalf("positive OMENative consolidation must remain the sole executable surge: %+v", got)
+	}
+	weak := advisories(got, nonExecutableFragmentationReason)
+	if len(weak) != 1 || weak[0].Workload.String() != "prod/weak" || weak[0].Score > 0 || len(weak[0].HintTargetNodes) != 0 || weak[0].FootprintGPUs != 0 {
+		t.Fatalf("nonpositive move must degrade to a claim-free observed-fragmentation advisory: %+v", got)
 	}
 }

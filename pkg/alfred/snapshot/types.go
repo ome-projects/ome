@@ -37,10 +37,18 @@ type ClusterSnapshot struct {
 	// (a virtual entry is a blocked evacuation fed back by the engine).
 	PendingPods []PendingPod
 
-	// OMENativeAvailable records whether an OMENative executor is
-	// available on this cluster; when false, multi-pod OMENative
-	// candidates degrade to advisory.
-	OMENativeAvailable bool
+	// OMENativeExecutor is the checked capability observation for the
+	// cluster's OMENative executor. Its zero value is unavailable.
+	OMENativeExecutor OMENativeExecutorState
+}
+
+// OMENativeExecutorState is the structured executor capability observed for
+// this snapshot.
+type OMENativeExecutorState struct {
+	Available   bool
+	WireVersion string
+	RenewTime   time.Time
+	Reason      string
 }
 
 // Node is one node's physical GPU state plus the placement-relevant flags
@@ -124,6 +132,30 @@ type PodInfo struct {
 	// Component is the OME component label value (engine/decoder/router);
 	// empty for non-OME pods.
 	Component v1beta1.ComponentType
+	// ManagedBy is the ome.io/managed-by label value.
+	ManagedBy string
+
+	// OMENative identity labels retain both parsed values and whether each
+	// label was present and valid. This lets checked joins distinguish a
+	// missing label from a valid zero without retaining arbitrary payloads.
+	InstanceIndex        int32
+	InstanceIndexPresent bool
+	InstanceIndexValid   bool
+	Incarnation          int64
+	IncarnationPresent   bool
+	IncarnationValid     bool
+	Runner               v1beta1.RunnerName
+	RunnerPresent        bool
+	RunnerValid          bool
+	PodOrdinal           int32
+	PodOrdinalPresent    bool
+	PodOrdinalValid      bool
+
+	// ControllerOwnerUID is the sole controller OwnerReference UID when one
+	// structurally valid reference is present.
+	ControllerOwnerUID     types.UID
+	ControllerOwnerPresent bool
+	ControllerOwnerValid   bool
 }
 
 // Workload is one InferenceService with everything policies need to reason
@@ -159,17 +191,25 @@ type Workload struct {
 	SpotPolicy string
 
 	// LastMigration is the completion time of the newest terminal
-	// MigrationHistory entry (CompletedAt when set, else RequestedAt);
-	// it drives the per-workload cooldown.
+	// authoritative InferenceReplica migration status (CompletedAt when set,
+	// else StartedAt); it drives the per-workload cooldown.
 	LastMigration *time.Time
-	// ActiveMigrations are in-flight requests: live request annotations
-	// plus non-terminal MigrationHistory entries, one per UUID.
+	// ActiveMigrations are in-flight requests reconstructed from live request
+	// annotations and non-terminal authoritative InferenceReplica statuses,
+	// one per UUID.
 	ActiveMigrations []InFlight
 	// MalformedRequests maps request-annotation UUIDs that failed parse
 	// or validation to the reason. The workload still carries a write the
 	// executor must ack-reject, and the reporter can surface it; hiding
 	// a corrupt request would make the workload look clean.
 	MalformedRequests map[string]string
+	// MigrationStateValid reports whether all bounded migration evidence was
+	// internally consistent. False keeps the workload advisory/busy rather
+	// than allowing incomplete status evidence to make it executable.
+	MigrationStateValid bool
+	// MigrationStateReason is a bounded, payload-free reason when migration
+	// state is invalid.
+	MigrationStateReason string
 }
 
 // Component is one component (engine/decoder/router) of a workload.
@@ -178,6 +218,17 @@ type Component struct {
 	// DeploymentMode is the resolved per-component mode (RawDeployment,
 	// MultiNode, OMENative, ...), which determines the execution surface.
 	DeploymentMode constants.DeploymentModeType
+	// IR is the accepted read-only InferenceReplica source for an OMENative
+	// component. It must never be mutated by snapshot consumers.
+	IR *v1beta1.InferenceReplica
+	// StatusFresh reports whether exactly one tuple-matching IR has the exact
+	// parent controller identity and current observed generation.
+	StatusFresh bool
+	// ObservationValid reports structural agreement between the accepted IR
+	// status and live Pods.
+	ObservationValid bool
+	// ObservationReason is a bounded, payload-free invalidity reason.
+	ObservationReason string
 	// Instances are the atomic units Alfred reasons about: one per pod
 	// for RawDeployment; one per atomic group for multi-pod modes.
 	Instances []*Instance
@@ -188,6 +239,23 @@ type Component struct {
 type Instance struct {
 	// Index is a stable ordinal within the component (pod-name order).
 	Index int32
+	// Incarnation and lifecycle fields are copied from checked IR status.
+	Incarnation     int64
+	Phase           v1beta1.OMENativeInstancePhase
+	RunningRevision string
+	TargetRevision  string
+	Admitted        bool
+	ActiveOrdinal   int32
+	ServingPods     int32
+	AvailablePods   int32
+	Operation       *v1beta1.InstanceOperation
+	DesiredPods     int32
+	// StatusPods is the IR status row's reported PodCount.
+	StatusPods int32
+	// ObservedPods is the number of live Pods joined to this Instance.
+	ObservedPods      int32
+	ObservationValid  bool
+	ObservationReason string
 	// Pods are the member pods.
 	Pods []PodInfo
 	// NodesSet counts member pods per node.
@@ -200,11 +268,13 @@ type Instance struct {
 }
 
 // InFlight is one in-flight migration touching a workload, reconstructed
-// from cluster state (request annotations and non-terminal MigrationHistory
-// entries) so it survives Alfred leader failover.
+// from cluster state (request annotations and non-terminal InferenceReplica
+// status entries) so it survives Alfred leader failover.
 type InFlight struct {
 	UUID      string
 	Component v1beta1.ComponentType
+	// Instance is the source Instance index.
+	Instance int32
 	// Mode is empty while the request is annotation-only (the executor
 	// fixes the mode at admission).
 	Mode v1beta1.MigrationMode

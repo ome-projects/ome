@@ -6,10 +6,10 @@ nested API; only the nested Nodes and workload Pods are simulated. No local
 container runtime is required, and no fake Node is added to the host cluster.
 
 The fragmentation fixture creates ten fake 8-GPU nodes, places one movable
-1-GPU OME pod on each node, and leaves an 8-GPU demand pending. Seven GPUs
-free on every node seats no 8-GPU job at all, while a repack would free whole
-nodes — so reclaimable fragmentation lands near `0.64`, well clear of
-Alfred's normal `0.25` policy gate, which the fixture keeps unchanged.
+1-GPU RawDeployment OME pod on each node, and leaves an 8-GPU demand pending.
+Seven GPUs free on every node seats no 8-GPU job at all, so observed size-8
+fragmentation is high. RawDeployment migration has no executable contract,
+however, and therefore contributes no reclaimable fragmentation.
 
 Two settings are E2E-only, both for determinism rather than to force the
 result. `demandBlendLambda: 1.0` takes the scoring weights entirely from the
@@ -42,9 +42,17 @@ make alfred-e2e-fragmentation \
 The second target succeeds only when:
 
 - the synthetic 8-GPU demand is rejected by the scheduler as `Unschedulable`;
-- `alfred_cluster_fragmentation_score` exceeds `0.25`;
-- `alfred-recommendations/last-cycle.json` contains recommendations; and
-- at least one recommendation is `withheld`, proving recommend-only admission.
+- `alfred_cluster_fragmentation_score` is exactly `0` while
+  `alfred_fragmentation_observed{size="8"}` exceeds `0.25`;
+- `alfred-recommendations/last-cycle.json` contains at least one `advisory`
+  recommendation with `RawDeploymentMigrationUnsupported`; and
+- the fixture InferenceService has no `ome.io/migration-request-v1-*`
+  annotation.
+
+Production intentionally supplies no OMENative executor capability state in
+this phase, so CRD presence cannot make an OMENative candidate executable.
+The Dispatcher boundary is also absent: Alfred reports RawDeployment advice
+but cannot turn it into migration annotations.
 
 Re-run assertions without recreating the fixture:
 

@@ -29,11 +29,6 @@ const (
 	// AdvisoryNoSurgeHeadroom: the surge-shaped replacement footprint fits
 	// on no feasible target while the source still holds its GPUs.
 	AdvisoryNoSurgeHeadroom = "NoSurgeHeadroom"
-	// AdvisoryNoFeasibleTarget: the free-then-place mirror of
-	// NoSurgeHeadroom — no feasible target can seat the replacement even
-	// once the source releases its GPUs, so evicting would strand it in
-	// Pending.
-	AdvisoryNoFeasibleTarget = "NoFeasibleTarget"
 	// AdvisoryVolumePinned: an RWO/RWOP PVC pins the workload to its node;
 	// no migration mechanism can move it.
 	AdvisoryVolumePinned = "VolumePinned"
@@ -41,9 +36,22 @@ const (
 	// pod restart with no surge protection; the safe fix (move the
 	// workload to OMENative) is the operator's.
 	AdvisoryLWSMigrationUnsupported = "LWSMigrationUnsupported"
+	// AdvisoryRawDeploymentMigrationUnsupported: Alpha has no truthful
+	// RawDeployment executor; every otherwise observable Raw Instance is
+	// surfaced to the operator without entering arbitration.
+	AdvisoryRawDeploymentMigrationUnsupported = "RawDeploymentMigrationUnsupported"
 	// AdvisoryOMENativeUnavailable: no OMENative executor exists on this
 	// cluster, so the migration verb has no consumer.
 	AdvisoryOMENativeUnavailable = "OMENativeUnavailable"
+	// AdvisoryOMENativeObservationInvalid: the checked IR/Pod join is
+	// missing, stale, or structurally inconsistent.
+	AdvisoryOMENativeObservationInvalid = "OMENativeObservationInvalid"
+	// AdvisoryOMENativeStateIneligible: the checked OMENative state is not
+	// fully steady or the workload is already busy with a transition.
+	AdvisoryOMENativeStateIneligible = "OMENativeStateIneligible"
+	// AdvisoryNonExecutableObservedFragmentation: fragmentation is visible
+	// to the operator but cannot authorize a positive executable move.
+	AdvisoryNonExecutableObservedFragmentation = "NonExecutableObservedFragmentation"
 	// AdvisoryMigrationSurfaceDisabled: the component's execution surface
 	// is switched off in alfred-config.
 	AdvisoryMigrationSurfaceDisabled = "MigrationSurfaceDisabled"
@@ -80,17 +88,22 @@ type Candidate struct {
 	// FromNode is the node the move vacates (for a multi-node instance,
 	// the node holding the largest share of its GPUs).
 	FromNode string
-	// HintTargetNodes is the ranked, advisory placement preference (top N;
-	// the scheduler makes the final call).
+	// HintTargetNodes is the bounded, ranked policy-supplied target set for
+	// operator-facing reporting. The scheduler still makes the final pod-level
+	// placement decision.
 	HintTargetNodes []string
+	// PlacementTargetNodes is an internal exhaustive, ranked target set for
+	// replaying a policy's successful atomic placement during arbitration. It
+	// is not part of operator-facing reports. Empty means the Arbiter falls
+	// back to HintTargetNodes for compatibility with pluggable policies.
+	PlacementTargetNodes []string
 
 	// Executable=false marks an advisory finding; AdvisoryReason says why.
 	Executable     bool
 	AdvisoryReason string
 
-	// SurgeShaped records the simulated execution shape: place-then-free
-	// (OMENative Instance surge, single-replica rolling restart) vs
-	// free-then-place (multi-replica targeted eviction).
+	// SurgeShaped records the simulated execution shape. Defragmentation
+	// has one executable Alpha shape: OMENative place-then-free surge.
 	SurgeShaped bool
 	// FootprintGPUs is the instance's GPU footprint. For a surge-shaped
 	// move this much headroom must exist while the source still holds its

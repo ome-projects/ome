@@ -33,9 +33,9 @@ type Loop struct {
 	// package wires it; while nil those gauges stay unset.
 	Scorer func(*snapshot.ClusterSnapshot, *config.Config, *metrics.Metrics)
 
-	// OMENativeAvailable reports whether an OMENative executor exists on
-	// this cluster; recorded on every snapshot. Nil means unavailable.
-	OMENativeAvailable func(ctx context.Context) bool
+	// OMENativeExecutor reports the checked executor capability state for
+	// this cluster. Nil is a bounded unavailable state.
+	OMENativeExecutor func(ctx context.Context) snapshot.OMENativeExecutorState
 
 	// Now overrides the clock in tests.
 	Now func() time.Time
@@ -89,10 +89,10 @@ func (l *Loop) RunOnce(ctx context.Context) error {
 		DefaultMovable:    cfg.DefaultMovable,
 		Now:               l.Now,
 	}
-	if l.OMENativeAvailable != nil {
-		opts.OMENativeAvailable = l.OMENativeAvailable(ctx)
+	if l.OMENativeExecutor != nil {
+		opts.OMENativeExecutor = l.OMENativeExecutor(ctx)
 	}
-	if opts.OMENativeAvailable {
+	if opts.OMENativeExecutor.Available {
 		l.Metrics.OMENativeUnavailable.Set(0)
 	} else {
 		l.Metrics.OMENativeUnavailable.Set(1)

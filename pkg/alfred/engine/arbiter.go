@@ -293,13 +293,20 @@ func (st *admitState) decide(c policy.Candidate) Decision {
 }
 
 // selectTarget re-checks capacity mode-aware and net of claims, against the
-// candidate's own hints (already schedulable- and model-filtered by the
-// policy on this same snapshot). Surge shapes must fit while the source
-// still holds its GPUs; eviction needs no headroom and may reuse its source.
+// candidate's exhaustive placement targets when supplied, or its reporting
+// hints for compatibility with other policies. Those targets are already
+// schedulable- and model-filtered by the policy on this same snapshot. Surge
+// shapes must fit while the source still holds its GPUs; eviction needs no
+// headroom and may reuse its source.
 // It returns the primary target, the per-node GPUs the admission will claim,
 // and — when nothing fits a surge — a reason distinguishing *why*: a hint
 // under evacuation, a hint already landed on this cycle, or plain capacity.
 func (st *admitState) selectTarget(c policy.Candidate, inst *snapshot.Instance) (string, map[string]int64, string) {
+	targets := c.PlacementTargetNodes
+	if len(targets) == 0 {
+		targets = c.HintTargetNodes
+	}
+
 	// The saw* flags feed the rejection reason (a metrics label and Event
 	// text), so they are reset per placement attempt: an early pod probing
 	// past a busy hint must not relabel a later pod's plain capacity
@@ -331,9 +338,9 @@ func (st *admitState) selectTarget(c policy.Candidate, inst *snapshot.Instance) 
 
 	if !c.SurgeShaped {
 		// Free-then-place cannot deadlock; a target is a preference,
-		// not a precondition. Claim the hint it will likely land on;
+		// not a precondition. Claim the first target it will likely land on;
 		// none feasible means the replacement reuses the source.
-		for _, hint := range c.HintTargetNodes {
+		for _, hint := range targets {
 			if fits(hint, c.FootprintGPUs) {
 				return hint, map[string]int64{hint: c.FootprintGPUs}, ""
 			}
@@ -362,7 +369,7 @@ func (st *admitState) selectTarget(c policy.Candidate, inst *snapshot.Instance) 
 	for _, gpus := range pods {
 		placed := false
 		resetSaw()
-		for _, hint := range c.HintTargetNodes {
+		for _, hint := range targets {
 			if !fits(hint, gpus+placement[hint]) {
 				continue
 			}

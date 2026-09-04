@@ -347,6 +347,9 @@ func (r *Reporter) namespaceRef() *corev1.ConfigMap {
 }
 
 func producedEventReason(c policy.Candidate) string {
+	if c.AdvisoryReason == policy.AdvisoryRawDeploymentMigrationUnsupported {
+		return policy.AdvisoryRawDeploymentMigrationUnsupported
+	}
 	switch c.Reason {
 	case policy.ReasonNodeUnhealthy:
 		return "EvacuationRecommendationProduced"

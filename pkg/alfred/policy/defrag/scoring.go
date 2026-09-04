@@ -43,13 +43,13 @@ type PoolScore struct {
 	// normalized by the same observed TotalFree so the difference
 	// measures slot gain, not denominator drift.
 	FBest float64
-	// FReclaimable = max(0, FObserved - FBest): the share migration
-	// could actually fix — the only part that gates the policy.
+	// FReclaimable = max(0, FObserved - FBest): the share executable
+	// OMENative migration could actually fix.
 	FReclaimable float64
 
-	// PendingPressure is P(c): age-weighted pressure from pending pods
-	// the repack could seat. Ineligible pendings are capacity shortage,
-	// not fragmentation, and never wake Alfred.
+	// PendingPressure is P(c): age-weighted pressure from pending pods for
+	// which executable repacking creates a seat that does not exist in the
+	// observed distribution. Ineligible pendings never wake Alfred.
 	PendingPressure float64
 
 	// Score = 1 - (1-FReclaimable)(1-P): noisy-OR of the two wake
@@ -60,9 +60,9 @@ type PoolScore struct {
 // Scores is the cluster-level scoring result.
 type Scores struct {
 	PerPool map[string]*PoolScore
-	// FragmentationScore is the gate value: max over pools — you
-	// defragment the worst pool, and a healthy pool must not dilute a
-	// sick one.
+	// FragmentationScore is the executable gate value: max over pools. The
+	// separate advisory enumeration gate is derived per pool from the exact
+	// observed-minus-reclaimable gap and never widens this score.
 	FragmentationScore float64
 }
 
@@ -130,10 +130,12 @@ func scorePool(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool string,
 	}
 
 	weights := demandWeights(ladder, demandGPUs, prior, lambda)
+	observedSlots := map[int64]int64{}
 
 	// Step 1 + 2 on the observed distribution.
 	for _, size := range ladder {
 		slots := slotsForSize(observed, size)
+		observedSlots[size] = slots
 		frag := fragForSize(slots, size, cs.TotalFree)
 		cs.PerSize = append(cs.PerSize, SizeFrag{Size: size, Slots: slots, Frag: frag})
 		cs.FObserved += weights[size] * frag
@@ -146,7 +148,7 @@ func scorePool(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool string,
 	// can consume capacity (a pod seated off an excluded node); letting
 	// the denominator shrink with it would fabricate reclaimable
 	// fragmentation out of a shrinking base with no slot improvement.
-	repacked := repackPool(snap, pool, observed)
+	repacked := repackPool(snap, cfg, pool, observed)
 	bestSlots := map[int64]int64{}
 	for _, size := range ladder {
 		slots := slotsForSize(repacked, size)
@@ -156,7 +158,7 @@ func scorePool(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool string,
 	cs.FReclaimable = math.Max(0, cs.FObserved-cs.FBest)
 
 	// Step 4: pending pressure over repack-seatable pendings only.
-	cs.PendingPressure = pendingPressure(snap, pool, ladder, bestSlots, tau)
+	cs.PendingPressure = pendingPressure(snap, pool, ladder, observedSlots, bestSlots, tau)
 
 	// Noisy-OR: fixable shape damage or a starving fixable pod each
 	// independently justify waking the policy.
@@ -338,10 +340,10 @@ func snapToLadder(gpus int64, ladder []int64) int64 {
 }
 
 // pendingPressure is P(c) = 1 - prod over eligible p of (1 - u(p)) with
-// u(p) = 1 - exp(-age/tau). A pending is eligible iff the repacked state
-// could seat it (Slots_best >= 1) — ineligible pendings are capacity
-// shortage (OEP-0013's problem) and must not wake Alfred.
-func pendingPressure(snap *snapshot.ClusterSnapshot, pool string, ladder []int64, bestSlots map[int64]int64, tau time.Duration) float64 {
+// u(p) = 1 - exp(-age/tau). A pending is eligible only when executable
+// repacking creates a seat (Slots_observed == 0 and Slots_best >= 1).
+func pendingPressure(snap *snapshot.ClusterSnapshot, pool string, ladder []int64,
+	observedSlots, bestSlots map[int64]int64, tau time.Duration) float64 {
 	if tau <= 0 {
 		// Config validation forbids a non-positive tau; guard anyway
 		// so a direct caller cannot push NaN (0/0) into the gauges.
@@ -357,7 +359,7 @@ func pendingPressure(snap *snapshot.ClusterSnapshot, pool string, ladder []int64
 			continue
 		}
 		size := snapToLadder(pending.GPUsNeeded, ladder)
-		if bestSlots[size] < 1 {
+		if observedSlots[size] >= 1 || bestSlots[size] < 1 {
 			continue
 		}
 		age := now.Sub(pending.PendingSince)

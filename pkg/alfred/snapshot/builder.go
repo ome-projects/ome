@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -48,9 +49,8 @@ type Options struct {
 	// DefaultMovable is the cluster-wide movable default a workload
 	// inherits when it carries no alfred.ome.io/movable annotation.
 	DefaultMovable *bool
-	// OMENativeAvailable is the caller's discovery result; recorded
-	// verbatim on the snapshot.
-	OMENativeAvailable bool
+	// OMENativeExecutor is the structured executor capability observation.
+	OMENativeExecutor OMENativeExecutorState
 	// Now overrides the clock (tests); nil means time.Now.
 	Now func() time.Time
 }
@@ -83,11 +83,11 @@ func (o *Options) now() time.Time {
 // load-bearing enough to fail the build.
 func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot, error) {
 	s := &ClusterSnapshot{
-		Timestamp:          opts.now(),
-		Nodes:              map[string]*Node{},
-		Workloads:          map[types.NamespacedName]*Workload{},
-		Models:             map[ModelKey]*ModelAvailability{},
-		OMENativeAvailable: opts.OMENativeAvailable,
+		Timestamp:         opts.now(),
+		Nodes:             map[string]*Node{},
+		Workloads:         map[types.NamespacedName]*Workload{},
+		Models:            map[ModelKey]*ModelAvailability{},
+		OMENativeExecutor: opts.OMENativeExecutor,
 	}
 
 	var nodeList corev1.NodeList
@@ -103,12 +103,12 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 	if err := r.List(ctx, &podList); err != nil {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
-	// isvcPods groups OME pods by owning ISVC and component for workload
-	// assembly below; node occupancy is filled in the same pass.
-	isvcPods := map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo{}
+	// podEvidence retains nonterminal Pod identity until ISVCs and IRs are
+	// indexed, so controller ownership can route malformed label evidence.
+	var podEvidence []PodInfo
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		ingestPod(s, pod, isvcPods, &opts)
+		ingestPod(s, pod, &podEvidence, &opts)
 	}
 	for _, n := range s.Nodes {
 		n.FreeGPUs = n.TotalGPUs - n.AllocatedGPUs
@@ -129,10 +129,14 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 	if err := r.List(ctx, &isvcList); err != nil {
 		return nil, fmt.Errorf("list inferenceservices: %w", err)
 	}
+	var irList v1beta1.InferenceReplicaList
+	irListErr := r.List(ctx, &irList)
+	irIndex := indexInferenceReplicas(irList.Items)
+	routedPods := routeWorkloadPods(podEvidence, isvcList.Items, irIndex)
 	for i := range isvcList.Items {
 		isvc := &isvcList.Items[i]
 		key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}
-		s.Workloads[key] = buildWorkload(isvc, isvcPods[key], &opts)
+		s.Workloads[key] = buildWorkload(isvc, routedPods[key], irIndex, irListErr, &opts)
 	}
 
 	resolveModels(ctx, r, s)
@@ -182,7 +186,7 @@ func buildNode(node *corev1.Node, opts *Options) *Node {
 
 // ingestPod routes one pod into node occupancy, workload grouping, and
 // pending pressure as applicable.
-func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo, opts *Options) {
+func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts *Options) {
 	gpus := PodGPURequest(pod)
 	isvcName := pod.Labels[constants.InferenceServicePodLabelKey]
 	component := v1beta1.ComponentType(pod.Labels[constants.OMEComponentLabel])
@@ -194,7 +198,9 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.Namespace
 		GPUs:        gpus,
 		Ready:       podIsReady(pod),
 		Terminating: pod.DeletionTimestamp != nil,
+		ManagedBy:   pod.Labels[query.LabelManagedBy],
 	}
+	parseOMENativePodIdentity(&info, pod)
 	if pod.Status.StartTime != nil {
 		t := pod.Status.StartTime.Time
 		info.StartTime = &t
@@ -219,16 +225,11 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, isvcPods map[types.Namespace
 		}
 	}
 
-	// Workload grouping: every scheduled OME pod, GPU-bearing or not (a
-	// router holds no GPUs but is still a component instance). Unscheduled
-	// pods are demand, not instances — they surface through PendingPods.
-	if isvcName != "" && pod.Spec.NodeName != "" && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-		byComponent, ok := isvcPods[info.ISVC]
-		if !ok {
-			byComponent = map[v1beta1.ComponentType][]PodInfo{}
-			isvcPods[info.ISVC] = byComponent
-		}
-		byComponent[component] = append(byComponent[component], info)
+	// Retain every nonterminal Pod until owner-aware routing. This is transient
+	// build evidence, not durable snapshot payload. Raw and LWS construction
+	// filters back to scheduled Pods after routing.
+	if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+		*podEvidence = append(*podEvidence, info)
 	}
 
 	// Pending pressure: unscheduled GPU demand.
@@ -256,13 +257,20 @@ func pendingSince(pod *corev1.Pod) time.Time {
 	return pod.CreationTimestamp.Time
 }
 
-func buildWorkload(isvc *v1beta1.InferenceService, pods map[v1beta1.ComponentType][]PodInfo, opts *Options) *Workload {
+func buildWorkload(
+	isvc *v1beta1.InferenceService,
+	pods map[v1beta1.ComponentType][]PodInfo,
+	irIndex inferenceReplicaIndex,
+	irListErr error,
+	opts *Options,
+) *Workload {
 	w := &Workload{
-		NamespacedName: types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name},
-		ISVC:           isvc,
-		Components:     map[v1beta1.ComponentType]*Component{},
-		Movable:        opts.defaultMovable(),
-		Priority:       defaultWorkloadPriority,
+		NamespacedName:      types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name},
+		ISVC:                isvc,
+		Components:          map[v1beta1.ComponentType]*Component{},
+		Movable:             opts.defaultMovable(),
+		Priority:            defaultWorkloadPriority,
+		MigrationStateValid: true,
 	}
 	applyWorkloadOverrides(w, isvc.Annotations)
 
@@ -277,6 +285,35 @@ func buildWorkload(isvc *v1beta1.InferenceService, pods map[v1beta1.ComponentTyp
 		}
 	}
 
+	specComponents := workloadComponentSpecs(isvc)
+	for _, sc := range specComponents {
+		if !sc.present && len(pods[sc.ctype]) == 0 {
+			continue
+		}
+		component := &Component{
+			Type:             sc.ctype,
+			DeploymentMode:   sc.mode,
+			ObservationValid: true,
+		}
+		if sc.mode == constants.OMENative {
+			component = buildOMENativeComponent(isvc, sc.ctype, pods[sc.ctype], irIndex, irListErr)
+		} else {
+			component.Instances = buildInstances(sc.mode, scheduledPods(pods[sc.ctype]))
+		}
+		w.Components[sc.ctype] = component
+	}
+
+	applyMigrationState(w, isvc)
+	return w
+}
+
+type workloadComponentSpec struct {
+	ctype   v1beta1.ComponentType
+	present bool
+	mode    constants.DeploymentModeType
+}
+
+func workloadComponentSpecs(isvc *v1beta1.InferenceService) []workloadComponentSpec {
 	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(
 		isvc.Spec.Engine, isvc.Spec.Decoder, isvc.Spec.Router, nil, isvc.Spec.DeploymentMode)
 	if err != nil {
@@ -284,28 +321,72 @@ func buildWorkload(isvc *v1beta1.InferenceService, pods map[v1beta1.ComponentTyp
 		// exist; fall back to the default mode so its pods still appear.
 		engineMode, decoderMode, routerMode = constants.RawDeployment, constants.RawDeployment, constants.RawDeployment
 	}
-	specComponents := []struct {
-		ctype   v1beta1.ComponentType
-		present bool
-		mode    constants.DeploymentModeType
-	}{
+	return []workloadComponentSpec{
 		{v1beta1.EngineComponent, isvc.Spec.Engine != nil, engineMode},
 		{v1beta1.DecoderComponent, isvc.Spec.Decoder != nil, decoderMode},
 		{v1beta1.RouterComponent, isvc.Spec.Router != nil, routerMode},
 	}
-	for _, sc := range specComponents {
-		if !sc.present && len(pods[sc.ctype]) == 0 {
-			continue
-		}
-		w.Components[sc.ctype] = &Component{
-			Type:           sc.ctype,
-			DeploymentMode: sc.mode,
-			Instances:      buildInstances(sc.mode, pods[sc.ctype]),
+}
+
+func scheduledPods(pods []PodInfo) []PodInfo {
+	result := make([]PodInfo, 0, len(pods))
+	for _, pod := range pods {
+		if pod.Node != "" {
+			result = append(result, pod)
 		}
 	}
+	return result
+}
 
-	applyMigrationState(w, isvc)
-	return w
+func parseOMENativePodIdentity(info *PodInfo, pod *corev1.Pod) {
+	info.InstanceIndex, info.InstanceIndexPresent, info.InstanceIndexValid = parseInt32Identity(pod.Labels, query.LabelInstanceIdx, false)
+	info.Incarnation, info.IncarnationPresent, info.IncarnationValid = parseInt64Identity(pod.Labels, query.LabelInstanceIncarnation, true)
+	rawRunner, runnerPresent := pod.Labels[query.LabelRunner]
+	info.Runner = v1beta1.RunnerName(rawRunner)
+	info.RunnerPresent = runnerPresent
+	switch info.Runner {
+	case v1beta1.RunnerNameDefault, v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker:
+		info.RunnerValid = runnerPresent
+	}
+	info.PodOrdinal, info.PodOrdinalPresent, info.PodOrdinalValid = parseInt32Identity(pod.Labels, query.LabelPodOrdinal, false)
+
+	for i := range pod.OwnerReferences {
+		owner := &pod.OwnerReferences[i]
+		if owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+		if info.ControllerOwnerPresent {
+			info.ControllerOwnerValid = false
+			return
+		}
+		info.ControllerOwnerPresent = true
+		info.ControllerOwnerUID = owner.UID
+		info.ControllerOwnerValid = owner.UID != ""
+	}
+}
+
+func parseInt32Identity(labels map[string]string, key string, positive bool) (int32, bool, bool) {
+	raw, present := labels[key]
+	if !present {
+		return 0, false, false
+	}
+	value, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || value < 0 || (positive && value == 0) {
+		return 0, true, false
+	}
+	return int32(value), true, true
+}
+
+func parseInt64Identity(labels map[string]string, key string, positive bool) (int64, bool, bool) {
+	raw, present := labels[key]
+	if !present {
+		return 0, false, false
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 || (positive && value == 0) {
+		return 0, true, false
+	}
+	return value, true, true
 }
 
 // buildInstances maps a component's pods onto Instances: one Instance per pod
@@ -330,7 +411,7 @@ func buildInstances(mode constants.DeploymentModeType, pods []PodInfo) []*Instan
 }
 
 func newInstance(index int32, pods []PodInfo) *Instance {
-	inst := &Instance{Index: index, Pods: pods, NodesSet: map[string]int{}}
+	inst := &Instance{Index: index, Pods: pods, ObservationValid: true, NodesSet: map[string]int{}}
 	for _, pod := range pods {
 		inst.TotalGPUs += pod.GPUs
 		if pod.Node != "" {
@@ -365,10 +446,13 @@ func applyWorkloadOverrides(w *Workload, annotations map[string]string) {
 }
 
 // applyMigrationState reconstructs cooldown and in-flight state from durable
-// cluster state (request annotations + MigrationHistory), so it survives
-// Alfred leader failover by construction.
+// cluster state (request annotations + authoritative InferenceReplica status),
+// so it survives Alfred leader failover by construction.
 func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 	inFlight := map[string]InFlight{}
+	pendingRequests := map[string]InFlight{}
+	w.MigrationStateValid = true
+	w.MigrationStateReason = ""
 
 	for key, raw := range isvc.Annotations {
 		if !strings.HasPrefix(key, audit.MigrationRequestAnnotationPrefix) {
@@ -383,24 +467,51 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 			if w.MalformedRequests == nil {
 				w.MalformedRequests = map[string]string{}
 			}
-			w.MalformedRequests[uuid] = err.Error()
+			w.MalformedRequests[uuid] = migrationStateReasonRequestInvalid
 			continue
 		}
 		inFlight[uuid] = pending
+		pendingRequests[uuid] = pending
 	}
 
-	for i := range isvc.Status.MigrationHistory {
-		entry := &isvc.Status.MigrationHistory[i]
-		if entry.Phase.Terminal() {
-			// Terminal history overrides a still-present request
-			// annotation for the same UUID: the executor acks in two
-			// writes (append the terminal entry, then clear the
-			// annotation), and a snapshot taken between them must not
-			// report the finished migration as in flight.
-			delete(inFlight, entry.ID)
-			at := entry.RequestedAt.Time
-			if entry.CompletedAt != nil {
-				at = entry.CompletedAt.Time
+	type migrationRow struct {
+		component v1beta1.ComponentType
+		status    *v1beta1.MigrationStatus
+	}
+	components := make([]v1beta1.ComponentType, 0, len(w.Components))
+	for component := range w.Components {
+		components = append(components, component)
+	}
+	sort.Slice(components, func(i, j int) bool { return components[i] < components[j] })
+	var rows []migrationRow
+	for _, component := range components {
+		state := w.Components[component]
+		if state == nil || state.IR == nil {
+			continue
+		}
+		for i := range state.IR.Status.Migrations {
+			rows = append(rows, migrationRow{component: component, status: &state.IR.Status.Migrations[i]})
+		}
+	}
+
+	counts := map[string]int{}
+	for _, row := range rows {
+		if row.status.RequestUUID != "" {
+			counts[row.status.RequestUUID]++
+		}
+	}
+	for _, row := range rows {
+		status := row.status
+		delete(inFlight, status.RequestUUID)
+		delete(w.MalformedRequests, status.RequestUUID)
+		if status.RequestUUID == "" || counts[status.RequestUUID] != 1 || !validMigrationStatus(status) {
+			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
+			continue
+		}
+		if status.Phase.Terminal() {
+			at := status.StartedAt.Time
+			if status.CompletedAt != nil {
+				at = status.CompletedAt.Time
 			}
 			if w.LastMigration == nil || at.After(*w.LastMigration) {
 				last := at
@@ -408,20 +519,32 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 			}
 			continue
 		}
-		// Non-terminal history is authoritative over the bare
-		// annotation: it carries mode and phase.
-		requestedBy := entry.RequestedBy
-		if requestedBy == "" {
-			requestedBy = inFlight[entry.ID].RequestedBy
+		source := currentMigrationInstance(w, row.component, status.SourceInstance)
+		if source == nil {
+			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
+			continue
 		}
-		inFlight[entry.ID] = InFlight{
-			UUID:        entry.ID,
-			Component:   entry.Component,
-			Mode:        entry.Mode,
-			Phase:       entry.Phase,
-			RequestedAt: entry.RequestedAt.Time,
+		if !source.ObservationValid {
+			invalidateMigrationState(w, migrationStateReasonStatusInvalid)
+		}
+		requestedBy := ""
+		if pending, ok := pendingRequests[status.RequestUUID]; ok &&
+			pending.Component == row.component && pending.Instance == status.SourceInstance {
+			requestedBy = pending.RequestedBy
+		}
+		inFlight[status.RequestUUID] = InFlight{
+			UUID:        status.RequestUUID,
+			Component:   row.component,
+			Instance:    status.SourceInstance,
+			FromNode:    status.FromNode,
+			Phase:       status.Phase,
+			RequestedAt: status.StartedAt.Time,
 			RequestedBy: requestedBy,
 		}
+	}
+
+	if len(w.MalformedRequests) != 0 {
+		invalidateMigrationState(w, migrationStateReasonRequestInvalid)
 	}
 
 	if len(inFlight) == 0 {
