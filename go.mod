@@ -183,7 +183,7 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	istio.io/api v1.19.4 // indirect
+	istio.io/api v1.31.0 // indirect
 	k8s.io/apiextensions-apiserver v0.36.2 // indirect
 	k8s.io/component-base v0.36.2 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0 // indirect
