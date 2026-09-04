@@ -222,7 +222,7 @@ jobs:
             ${{ runner.os }}-rust-
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image (amd64 only)
         run: |
@@ -273,7 +273,7 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build multi-arch images (no push)
         run: |
