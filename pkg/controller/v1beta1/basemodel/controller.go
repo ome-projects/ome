@@ -39,16 +39,18 @@ import (
 
 type BaseModelReconciler struct {
 	client.Client
-	Log            logr.Logger
-	Scheme         *runtime.Scheme
-	OmeAgentConfig *controllerconfig.OmeAgentConfig
+	Log                          logr.Logger
+	Scheme                       *runtime.Scheme
+	OmeAgentConfig               *controllerconfig.OmeAgentConfig
+	ServingDemandPriorityEnabled bool
 }
 
 type ClusterBaseModelReconciler struct {
 	client.Client
-	Log            logr.Logger
-	Scheme         *runtime.Scheme
-	OmeAgentConfig *controllerconfig.OmeAgentConfig
+	Log                          logr.Logger
+	Scheme                       *runtime.Scheme
+	OmeAgentConfig               *controllerconfig.OmeAgentConfig
+	ServingDemandPriorityEnabled bool
 }
 
 // backends builds the dispatch slice in match order: pvc → pernode.
@@ -78,6 +80,16 @@ func (r *BaseModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		log.Error(err, "Failed to get BaseModel")
 		return ctrl.Result{}, err
 	}
+	changed, err := reconcileModelDownloadScheduling(
+		ctx, r.Client, baseModel, false, r.ServingDemandPriorityEnabled,
+	)
+	if err != nil {
+		log.Error(err, "Failed to reconcile model download scheduling")
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	return reconcileModel(ctx, r.Client, r.Scheme, log, r.backends(), baseModel, constants.BaseModelFinalizer, false, "BaseModel")
 }
 
@@ -91,6 +103,16 @@ func (r *ClusterBaseModelReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 		log.Error(err, "Failed to get ClusterBaseModel")
 		return ctrl.Result{}, err
+	}
+	changed, err := reconcileModelDownloadScheduling(
+		ctx, r.Client, clusterBaseModel, true, r.ServingDemandPriorityEnabled,
+	)
+	if err != nil {
+		log.Error(err, "Failed to reconcile model download scheduling")
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	return reconcileModel(ctx, r.Client, r.Scheme, log, r.backends(), clusterBaseModel, constants.ClusterBaseModelFinalizer, true, "ClusterBaseModel")
 }
@@ -135,7 +157,7 @@ func reconcileModel(ctx context.Context, c client.Client, scheme *runtime.Scheme
 }
 
 func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.BaseModel{}).
 		Owns(&batchv1.Job{}).
 		Watches(
@@ -161,12 +183,15 @@ func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return pvc.MapToBaseModels(ctx, r.Client, r.Log, obj)
 			}),
 			builder.WithPredicates(pvc.CreatePhasePredicate()),
-		).
-		Complete(r)
+		)
+	if r.ServingDemandPriorityEnabled {
+		builder = builder.Watches(&v1beta1.InferenceService{}, modelDemandEventHandler(constants.BaseModel))
+	}
+	return builder.Complete(r)
 }
 
 func (r *ClusterBaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.ClusterBaseModel{}).
 		Owns(&batchv1.Job{}).
 		Watches(
@@ -189,8 +214,11 @@ func (r *ClusterBaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return pvc.MapToClusterBaseModels(ctx, r.Client, r.Log, obj)
 			}),
 			builder.WithPredicates(pvc.CreatePhasePredicate()),
-		).
-		Complete(r)
+		)
+	if r.ServingDemandPriorityEnabled {
+		builder = builder.Watches(&v1beta1.InferenceService{}, modelDemandEventHandler(constants.ClusterBaseModel))
+	}
+	return builder.Complete(r)
 }
 
 // createPVCStatusConfigMapPredicate fires on ConfigMaps in the OME

@@ -151,6 +151,13 @@ type StorageSpec struct {
 	// - ReuseIfExists: if the identical model artifact has been downloaded in the node, such artifact will be reused
 	// +optional
 	DownloadPolicy *DownloadPolicy `json:"downloadPolicy,omitempty"`
+
+	// DownloadPriority is the persistent user-selected priority for materializing
+	// this model on eligible nodes. Serving demand observed by the model
+	// controller can raise, but never lower, this priority.
+	// +optional
+	// +kubebuilder:default=Standard
+	DownloadPriority *ModelDownloadPriority `json:"downloadPriority,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=AlwaysDownload;ReuseIfExists
@@ -159,6 +166,18 @@ type DownloadPolicy string
 const (
 	AlwaysDownload DownloadPolicy = "AlwaysDownload"
 	ReuseIfExists  DownloadPolicy = "ReuseIfExists"
+)
+
+// ModelDownloadPriority controls the relative order of queued node-local model
+// downloads. It does not affect Kubernetes pod scheduling and does not preempt
+// an active download.
+// +kubebuilder:validation:Enum=Background;Standard;High
+type ModelDownloadPriority string
+
+const (
+	ModelDownloadPriorityBackground ModelDownloadPriority = "Background"
+	ModelDownloadPriorityStandard   ModelDownloadPriority = "Standard"
+	ModelDownloadPriorityHigh       ModelDownloadPriority = "High"
 )
 
 // Distribution selects how a BaseModel's bytes are distributed across the cluster.
@@ -551,6 +570,26 @@ type ModelStatusSpec struct {
 	// distribution backend.
 	// +optional
 	Cache *ModelCacheStatus `json:"cache,omitempty"`
+
+	// DownloadScheduling is controller-derived scheduling state for node-local
+	// model materialization. It is absent when no serving demand has been
+	// observed.
+	// +optional
+	DownloadScheduling *ModelDownloadSchedulingStatus `json:"downloadScheduling,omitempty"`
+}
+
+// ModelDownloadSchedulingStatus contains bounded, controller-owned serving
+// demand. Endpoint identities are intentionally omitted to keep model status
+// low-cardinality and bounded.
+type ModelDownloadSchedulingStatus struct {
+	// ServingDemand is true while at least one live InferenceService references
+	// this model.
+	ServingDemand bool `json:"servingDemand,omitempty"`
+
+	// ReferenceCount is the number of live InferenceServices referencing this
+	// model.
+	// +kubebuilder:validation:Minimum=0
+	ReferenceCount int32 `json:"referenceCount,omitempty"`
 }
 
 // BaseModel is the Schema for the basemodels API

@@ -200,6 +200,10 @@ ome:
     #   podAnnotations:
     #     metrics-schema: ome-controller
     podAnnotations: {}
+    modelDownloadScheduling:
+      # Project active InferenceService demand onto referenced model status.
+      # This affects model-download queue order, not Kubernetes pod priority.
+      servingDemandPriorityEnabled: false
     deploymentMode: "RawDeployment"
     # Admission-time component replica defaults stamped by the ISVC mutating
     # webhook on unset minReplicas/maxReplicas. Source of truth for these
@@ -561,8 +565,15 @@ modelAgent:
   # Same shape and intent as ome.controller.podAnnotations above.
   podAnnotations: {}
   hostPath: /mnt/data/models
-  priorityClassName: system-node-critical
+  # Optional user-supplied PriorityClass. Model-agent is not system critical.
+  priorityClassName: ""
   serviceAccountName: ome-model-agent
+  numDownloadWorkers: 2
+  numHighPriorityWorkers: 1
+  taskSchedulerCapacity: 4096
+  # Maximum time to wait for another task populating the same local artifact
+  # path before resuming the normal download flow.
+  samePathReuseWaitTimeout: 30m
   image:
     # Docker registry hub. If set, overrides global.hub for model-agent.
     # If repository contains '/', hub is ignored.

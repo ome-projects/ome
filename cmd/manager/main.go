@@ -152,6 +152,7 @@ type Options struct {
 	isvcMaxConcurrentReconciles int
 	irMaxConcurrentReconciles   int
 	enableInferenceReplicaCtrl  bool
+	servingDemandPriority       bool
 	// Client-side rate limit toward the local apiserver, shared by the manager's
 	// cache/client, the direct clientset, and the webhook handlers.
 	kubeAPIQPS   float64
@@ -188,6 +189,7 @@ func DefaultOptions() Options {
 		// via irprojector). The flag exists so operators can disable
 		// the controller if a regression lands.
 		enableInferenceReplicaCtrl: true,
+		servingDemandPriority:      false,
 		enableMultiCluster:         false,
 		multiClusterRole:           "",
 		allowExecCredentials:       false,
@@ -233,6 +235,8 @@ func GetOptions() Options {
 			"the chart supplies the value. Zero/unset falls back to controller-runtime's single-worker default.")
 	flag.BoolVar(&opts.enableInferenceReplicaCtrl, "enable-inferencereplica-controller", opts.enableInferenceReplicaCtrl,
 		"Run the InferenceReplica controller. Defaults true; flip to false to disable if the per-IR lifecycle code ships a regression.")
+	flag.BoolVar(&opts.servingDemandPriority, "serving-demand-download-priority", opts.servingDemandPriority,
+		"Project active InferenceService demand onto referenced model resources so their queued node-local downloads receive serving priority.")
 	flag.Float64Var(&opts.kubeAPIQPS, "kube-api-qps", opts.kubeAPIQPS,
 		"Steady-state client-side request rate to the local apiserver, shared by the manager cache/client, the "+
 			"direct clientset, and the webhook handlers. No in-code default; the chart supplies the value. "+
@@ -530,12 +534,19 @@ func main() {
 	if isControlPlane {
 		setupLog.Info("control-plane role: BaseModel/ClusterBaseModel/ServingRuntime/RuntimeRevisionGC controllers disabled")
 	} else {
+		if options.servingDemandPriority {
+			if err := v1beta1basemodelcontroller.SetupModelDemandIndex(context.Background(), mgr); err != nil {
+				setupLog.Error(err, "Failed to create model serving-demand index")
+				os.Exit(1)
+			}
+		}
 		setupLog.Info("Setting up BaseModel controller")
 		if err = (&v1beta1basemodelcontroller.BaseModelReconciler{
-			Client:         mgr.GetClient(),
-			Log:            ctrl.Log.WithName("BaseModel"),
-			Scheme:         mgr.GetScheme(),
-			OmeAgentConfig: omeAgentConfig,
+			Client:                       mgr.GetClient(),
+			Log:                          ctrl.Log.WithName("BaseModel"),
+			Scheme:                       mgr.GetScheme(),
+			OmeAgentConfig:               omeAgentConfig,
+			ServingDemandPriorityEnabled: options.servingDemandPriority,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create BaseModel controller")
 			os.Exit(1)
@@ -543,10 +554,11 @@ func main() {
 
 		setupLog.Info("Setting up ClusterBaseModel controller")
 		if err = (&v1beta1basemodelcontroller.ClusterBaseModelReconciler{
-			Client:         mgr.GetClient(),
-			Log:            ctrl.Log.WithName("ClusterBaseModel"),
-			Scheme:         mgr.GetScheme(),
-			OmeAgentConfig: omeAgentConfig,
+			Client:                       mgr.GetClient(),
+			Log:                          ctrl.Log.WithName("ClusterBaseModel"),
+			Scheme:                       mgr.GetScheme(),
+			OmeAgentConfig:               omeAgentConfig,
+			ServingDemandPriorityEnabled: options.servingDemandPriority,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create ClusterBaseModel controller")
 			os.Exit(1)

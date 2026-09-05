@@ -65,6 +65,9 @@ spec:
         - "--leader-elect"
         - "--webhook"
         - "--zap-encoder=console"
+        {{- if .Values.ome.controller.modelDownloadScheduling.servingDemandPriorityEnabled }}
+        - "--serving-demand-download-priority"
+        {{- end }}
         {{- if .Values.ome.controller.inferenceServiceMaxConcurrentReconciles }}
         - "--inferenceservice-max-concurrent-reconciles={{ .Values.ome.controller.inferenceServiceMaxConcurrentReconciles }}"
         {{- end }}

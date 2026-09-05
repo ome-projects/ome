@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -250,6 +251,96 @@ func TestGopherTaskQueueDeleteSupersedesPendingRevalidationReplayForSameModel(t 
 	require.True(t, ok)
 	assert.Equal(t, Delete, task.TaskType)
 	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherTaskQueueHighPrioritySupersedesBackgroundForSameModel(t *testing.T) {
+	queue := newGopherTaskQueue()
+	model := &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "service-ns", UID: "model-uid"},
+	}
+
+	require.True(t, queue.enqueue(&GopherTask{
+		TaskType:         Download,
+		BaseModel:        model,
+		DownloadPriority: v1beta1.ModelDownloadPriorityBackground,
+	}).accepted)
+	require.True(t, queue.enqueue(&GopherTask{
+		TaskType:         Download,
+		BaseModel:        model,
+		DownloadPriority: v1beta1.ModelDownloadPriorityHigh,
+	}).accepted)
+
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Equal(t, v1beta1.ModelDownloadPriorityHigh, task.DownloadPriority)
+	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherTaskQueueRejectsBackgroundWhenCapacityIsFull(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	first := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "service-ns", UID: "first-uid"},
+	}}
+	second := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "service-ns", UID: "second-uid"},
+	}}
+
+	assert.True(t, queue.enqueue(first).accepted)
+	assert.False(t, queue.enqueue(second).accepted)
+	assert.Equal(t, 1, queue.len())
+}
+
+func TestGopherTaskQueueHighPriorityPreservesDisplacedBackgroundAtCapacity(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	background := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityBackground, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "background", Namespace: "service-ns", UID: "background-uid"},
+	}}
+	demand := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityHigh, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "demand", Namespace: "service-ns", UID: "demand-uid"},
+	}}
+
+	assert.True(t, queue.enqueue(background).accepted)
+	result := queue.enqueue(demand)
+	require.True(t, result.accepted)
+	assert.Same(t, background, result.displaced)
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Equal(t, "demand", task.BaseModel.Name)
+	require.True(t, queue.enqueueWhenAvailable(result.displaced))
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Equal(t, "background", task.BaseModel.Name)
+	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherEnqueueTaskRetriesDisplacedWorkAfterCapacityIsAvailable(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	background := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityBackground, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "background", Namespace: "service-ns", UID: "background-uid"},
+	}}
+	demand := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityHigh, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "demand", Namespace: "service-ns", UID: "demand-uid"},
+	}}
+	require.True(t, queue.enqueue(background).accepted)
+	gopher := &Gopher{taskQueue: queue, logger: zap.NewNop().Sugar()}
+
+	enqueued := make(chan struct{})
+	go func() {
+		gopher.enqueueTask(demand)
+		close(enqueued)
+	}()
+
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Equal(t, "demand", task.BaseModel.Name)
+	select {
+	case <-enqueued:
+	case <-time.After(time.Second):
+		t.Fatal("displaced work was not re-enqueued after capacity became available")
+	}
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Equal(t, "background", task.BaseModel.Name)
 }
 
 func TestGopherTaskQueueEnqueueWakesMatchingBlockedWorker(t *testing.T) {

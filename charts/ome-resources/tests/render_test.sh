@@ -143,6 +143,29 @@ model_agent="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --show-only templates/model-agent-daemonset/daemonset.yaml)"
 grep -Fq 'helm.sh/chart: ome-resources-0.1.0' <<<"${model_agent}" ||
   fail "model agent chart version label was not rendered"
+grep -Fq -- '--same-path-reuse-wait-timeout' <<<"${model_agent}" ||
+  fail "model agent did not render the canonical same-path reuse timeout flag"
+if grep -Fq -- '--demand-priority-enabled' <<<"${model_agent}"; then
+  fail "model agent still rendered the removed endpoint-demand watcher flag"
+fi
+if grep -Fq 'priorityClassName:' <<<"${model_agent}"; then
+  fail "model agent rendered a PriorityClass when none was configured"
+fi
+
+prioritized_model_agent="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set modelAgent.enabled=true \
+  --set-string modelAgent.priorityClassName=workload-high \
+  --show-only templates/model-agent-daemonset/daemonset.yaml)"
+grep -Fq 'priorityClassName: "workload-high"' <<<"${prioritized_model_agent}" ||
+  fail "model agent did not render an operator-supplied PriorityClass"
+
+demand_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.modelDownloadScheduling.servingDemandPriorityEnabled=true \
+  --show-only templates/ome-controller/deployment.yaml)"
+grep -Fq -- '--serving-demand-download-priority' <<<"${demand_controller}" ||
+  fail "controller did not render serving-demand projection when enabled"
 
 prometheus_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
