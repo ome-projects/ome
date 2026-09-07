@@ -30,6 +30,16 @@ const (
 	RuntimeTreeCollectionInferenceService      RuntimeTreeCollectionKind = "InferenceService"
 )
 
+// RuntimeTreeCollectionScope identifies the exact Kubernetes list scope used
+// to collect one kind. Namespace is carried separately for Namespace scope.
+type RuntimeTreeCollectionScope string
+
+const (
+	RuntimeTreeCollectionScopeCluster       RuntimeTreeCollectionScope = "Cluster"
+	RuntimeTreeCollectionScopeAllNamespaces RuntimeTreeCollectionScope = "AllNamespaces"
+	RuntimeTreeCollectionScopeNamespace     RuntimeTreeCollectionScope = "Namespace"
+)
+
 // RuntimeTreeCollectionStatus describes the outcome of one bounded list.
 type RuntimeTreeCollectionStatus string
 
@@ -42,6 +52,8 @@ const (
 // RuntimeTreeCollection reports bounded collection evidence for one kind.
 type RuntimeTreeCollection struct {
 	Kind          RuntimeTreeCollectionKind   `json:"kind"`
+	Scope         RuntimeTreeCollectionScope  `json:"scope"`
+	Namespace     string                      `json:"namespace,omitempty"`
 	Status        RuntimeTreeCollectionStatus `json:"status"`
 	ObservedPages int                         `json:"observedPages"`
 	ObservedItems int                         `json:"observedItems"`
@@ -340,9 +352,17 @@ func formatRuntimeTreeIssuePath(
 
 func formatRuntimeTreeCollection(collection RuntimeTreeCollection) string {
 	return "Collection: " + string(collection.Kind) +
+		" scope=" + formatRuntimeTreeCollectionScope(collection) +
 		" status=" + string(collection.Status) +
 		" pages=" + strconv.Itoa(collection.ObservedPages) +
 		" items=" + strconv.Itoa(collection.ObservedItems)
+}
+
+func formatRuntimeTreeCollectionScope(collection RuntimeTreeCollection) string {
+	if collection.Namespace == "" {
+		return string(collection.Scope)
+	}
+	return string(collection.Scope) + "/" + collection.Namespace
 }
 
 func compareRuntimeTreeCollections(a, b RuntimeTreeCollection) int {
@@ -351,6 +371,8 @@ func compareRuntimeTreeCollections(a, b RuntimeTreeCollection) int {
 	}
 	for _, result := range []int{
 		cmp.Compare(a.Kind, b.Kind),
+		cmp.Compare(a.Scope, b.Scope),
+		cmp.Compare(a.Namespace, b.Namespace),
 		cmp.Compare(a.Status, b.Status),
 		cmp.Compare(a.ObservedPages, b.ObservedPages),
 		cmp.Compare(a.ObservedItems, b.ObservedItems),

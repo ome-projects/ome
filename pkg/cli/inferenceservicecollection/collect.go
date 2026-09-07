@@ -35,6 +35,26 @@ func Collect(
 	client omeclient.OmeV1beta1Interface,
 	limits paging.Limits,
 ) (Result, error) {
+	return collect(ctx, client, metav1.NamespaceAll, limits)
+}
+
+// CollectInNamespace reads InferenceServices only in namespace through
+// bounded Kubernetes pagination.
+func CollectInNamespace(
+	ctx context.Context,
+	client omeclient.OmeV1beta1Interface,
+	namespace string,
+	limits paging.Limits,
+) (Result, error) {
+	return collect(ctx, client, namespace, limits)
+}
+
+func collect(
+	ctx context.Context,
+	client omeclient.OmeV1beta1Interface,
+	namespace string,
+	limits paging.Limits,
+) (Result, error) {
 	result := Result{InferenceServices: []omev1beta1.InferenceService{}}
 	observedPages := 0
 	services, err := paging.ListBounded(
@@ -45,7 +65,7 @@ func Collect(
 			requestCtx context.Context,
 			options metav1.ListOptions,
 		) (paging.Page[omev1beta1.InferenceService], error) {
-			list, listErr := client.InferenceServices(metav1.NamespaceAll).List(requestCtx, options)
+			list, listErr := client.InferenceServices(namespace).List(requestCtx, options)
 			if requestErr := requestCtx.Err(); requestErr != nil {
 				return paging.Page[omev1beta1.InferenceService]{}, requestErr
 			}

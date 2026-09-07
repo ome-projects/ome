@@ -29,7 +29,7 @@ const (
 	ReferenceResolved ReferenceState = "Resolved"
 	// ReferenceUnresolved means the service cannot be attributed to one runtime,
 	// either because it requests automatic selection or because its declared
-	// runtime was not present in the supplied snapshot.
+	// runtime was authoritatively absent from the supplied snapshot.
 	ReferenceUnresolved ReferenceState = "Unresolved"
 	// ReferenceInvalid means the object or declared reference is malformed.
 	ReferenceInvalid ReferenceState = "Invalid"
@@ -42,9 +42,13 @@ const (
 type ReferenceReason string
 
 const (
-	ReasonAutomaticSelection        ReferenceReason = "AutomaticSelection"
-	ReasonInvalidRuntimeName        ReferenceReason = "InvalidRuntimeName"
-	ReasonInvalidKind               ReferenceReason = "InvalidKind"
+	ReasonAutomaticSelection ReferenceReason = "AutomaticSelection"
+	ReasonInvalidRuntimeName ReferenceReason = "InvalidRuntimeName"
+	// ReasonInvalidKind is retained for source compatibility; controller-accurate
+	// indexing treats unrecognized kinds as namespaced-first.
+	ReasonInvalidKind ReferenceReason = "InvalidKind"
+	// ReasonInvalidAPIGroup is retained for source compatibility; the controller
+	// does not consult APIGroup during runtime lookup.
 	ReasonInvalidAPIGroup           ReferenceReason = "InvalidAPIGroup"
 	ReasonInvalidInferenceService   ReferenceReason = "InvalidInferenceService"
 	ReasonDuplicateInferenceService ReferenceReason = "DuplicateInferenceService"
@@ -79,13 +83,13 @@ type Index struct {
 	references []ReferenceEvidence
 }
 
-// Build indexes explicit references against an already-collected runtime
-// snapshot without mutating or retaining either input. Duplicate and malformed
-// services remain visible through References but are never silently attributed
-// to a runtime. Nil and ClusterServingRuntime kinds resolve cluster-first with
-// a same-namespace ServingRuntime fallback, matching the API's defaulted
-// reference semantics. ServingRuntime kinds resolve only in the service's
-// namespace.
+// Build indexes explicit references against an already-collected complete
+// runtime snapshot without mutating or retaining either input. Duplicate and
+// malformed services remain visible through References but are never silently
+// attributed to a runtime. ServingRuntime kinds resolve namespaced-only;
+// ClusterServingRuntime kinds resolve cluster-first; and empty or unrecognized
+// kinds resolve namespaced-first. APIGroup is ignored, matching the controller
+// lookup.
 func Build(services []omev1beta1.InferenceService, snapshot runtimegraph.Snapshot) *Index {
 	runtimes := runtimeIdentitySet(snapshot)
 	counts := make(map[InferenceServiceIdentity]int, len(services))
@@ -191,46 +195,29 @@ func classifyReference(
 	}
 	evidence.RuntimeName = reference.Name
 
-	kind := runtimegraph.KindClusterServingRuntime
-	if reference.Kind != nil {
-		kind = runtimegraph.Kind(*reference.Kind)
-		if kind != runtimegraph.KindClusterServingRuntime && kind != runtimegraph.KindServingRuntime {
-			evidence.State = ReferenceInvalid
-			evidence.Reason = ReasonInvalidKind
-			return evidence
-		}
-	}
-	apiGroup := omev1beta1.SchemeGroupVersion.Group
-	if reference.APIGroup != nil {
-		apiGroup = *reference.APIGroup
-	}
-	if apiGroup != omev1beta1.SchemeGroupVersion.Group {
-		evidence.State = ReferenceInvalid
-		evidence.Reason = ReasonInvalidAPIGroup
-		return evidence
-	}
-
 	cluster := runtimegraph.Identity{Kind: runtimegraph.KindClusterServingRuntime, Name: reference.Name}
 	local := runtimegraph.Identity{
 		Kind: runtimegraph.KindServingRuntime, Namespace: identity.Namespace, Name: reference.Name,
 	}
-	var runtime runtimegraph.Identity
-	if kind == runtimegraph.KindServingRuntime {
-		if _, exists := runtimes[local]; exists {
-			runtime = local
+	candidates := []runtimegraph.Identity{local, cluster}
+	if reference.Kind != nil {
+		switch runtimegraph.Kind(*reference.Kind) {
+		case runtimegraph.KindServingRuntime:
+			candidates = []runtimegraph.Identity{local}
+		case runtimegraph.KindClusterServingRuntime:
+			candidates = []runtimegraph.Identity{cluster, local}
 		}
-	} else if _, exists := runtimes[cluster]; exists {
-		runtime = cluster
-	} else if _, exists := runtimes[local]; exists {
-		runtime = local
 	}
-	if runtime.Name == "" {
-		evidence.State = ReferenceUnresolved
-		evidence.Reason = ReasonRuntimeNotFound
-		return evidence
+	for _, candidate := range candidates {
+		if _, exists := runtimes[candidate]; exists {
+			runtime := candidate
+			evidence.State = ReferenceResolved
+			evidence.Runtime = &runtime
+			return evidence
+		}
 	}
-	evidence.State = ReferenceResolved
-	evidence.Runtime = &runtime
+	evidence.State = ReferenceUnresolved
+	evidence.Reason = ReasonRuntimeNotFound
 	return evidence
 }
 

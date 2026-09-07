@@ -61,6 +61,35 @@ func TestCollectDrainsInferenceServicesAcrossAllNamespaces(t *testing.T) {
 	assert.Equal(t, []string{metav1.NamespaceAll, metav1.NamespaceAll}, namespaces)
 }
 
+func TestCollectInNamespaceNeverUsesAClusterWideList(t *testing.T) {
+	t.Parallel()
+
+	client := omefake.NewSimpleClientset()
+	var namespaces []string
+	client.PrependReactor("list", "inferenceservices", func(action ktesting.Action) (bool, runtime.Object, error) {
+		namespaces = append(namespaces, action.GetNamespace())
+		if action.GetNamespace() != "team-a" {
+			return true, nil, apierrors.NewForbidden(
+				schema.GroupResource{Group: "ome.io", Resource: "inferenceservices"},
+				"", errors.New("cluster-wide list denied"),
+			)
+		}
+		return true, &omev1beta1.InferenceServiceList{
+			Items: []omev1beta1.InferenceService{inferenceService("team-a", "service-a")},
+		}, nil
+	})
+
+	got, err := CollectInNamespace(
+		context.Background(), client.OmeV1beta1(), "team-a", testLimits,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.InferenceServices, 1)
+	assert.Equal(t, "team-a/service-a",
+		got.InferenceServices[0].Namespace+"/"+got.InferenceServices[0].Name)
+	assert.Equal(t, []string{"team-a"}, namespaces)
+}
+
 func TestCollectReturnsDefensiveCopies(t *testing.T) {
 	t.Parallel()
 

@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/runtimegraph"
 )
 
-func TestBuildDefaultsNilAndClusterKindsToClusterFirstOnCollision(t *testing.T) {
+func TestBuildSeparatesDefaultAndExplicitClusterKindsOnCollision(t *testing.T) {
 	clusterKind := string(runtimegraph.KindClusterServingRuntime)
 	index := Build([]omev1beta1.InferenceService{
 		inferenceService("team-a", "default-kind", runtimeReference("shared", nil, nil)),
@@ -39,13 +39,57 @@ func TestBuildDefaultsNilAndClusterKindsToClusterFirstOnCollision(t *testing.T) 
 	require.NoError(t, err)
 
 	assert.Equal(t, []InferenceServiceIdentity{
-		{Namespace: "team-a", Name: "default-kind"},
 		{Namespace: "team-a", Name: "explicit-cluster-kind"},
 	}, cluster.InferenceServices)
-	assert.Empty(t, local.InferenceServices)
+	assert.Equal(t, []InferenceServiceIdentity{
+		{Namespace: "team-a", Name: "default-kind"},
+	}, local.InferenceServices)
 }
 
-func TestBuildFallsBackFromNilAndClusterKindsToNamespacedRuntime(t *testing.T) {
+// TestBuildMatchesControllerReferenceResolution catches the offline usage
+// index drifting from DefaultRuntimeFetcher.GetRuntime. A nonnil reference
+// whose kind is empty or unrecognized resolves namespaced-first, while an
+// explicit ClusterServingRuntime resolves cluster-first. APIGroup is not part
+// of the controller's lookup decision.
+func TestBuildMatchesControllerReferenceResolution(t *testing.T) {
+	emptyKind := ""
+	unknownKind := "OtherRuntime"
+	clusterKind := string(runtimegraph.KindClusterServingRuntime)
+	namespacedKind := string(runtimegraph.KindServingRuntime)
+	nonstandardGroup := "runtime.example.test"
+	index := Build([]omev1beta1.InferenceService{
+		inferenceService("team-a", "nil-kind", runtimeReference("shared", nil, nil)),
+		inferenceService("team-a", "empty-kind", runtimeReference("shared", &emptyKind, nil)),
+		inferenceService("team-a", "unknown-kind", runtimeReference("shared", &unknownKind, nil)),
+		inferenceService("team-a", "nonstandard-group", runtimeReference("shared", &namespacedKind, &nonstandardGroup)),
+		inferenceService("team-a", "cluster-kind", runtimeReference("shared", &clusterKind, &nonstandardGroup)),
+	}, runtimeSnapshot(
+		runtimegraph.Identity{Kind: runtimegraph.KindClusterServingRuntime, Name: "shared"},
+		runtimegraph.Identity{Kind: runtimegraph.KindServingRuntime, Namespace: "team-a", Name: "shared"},
+	))
+
+	cluster, err := index.ForRuntime(runtimegraph.Identity{
+		Kind: runtimegraph.KindClusterServingRuntime,
+		Name: "shared",
+	})
+	require.NoError(t, err)
+	local, err := index.ForRuntime(runtimegraph.Identity{
+		Kind:      runtimegraph.KindServingRuntime,
+		Namespace: "team-a",
+		Name:      "shared",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, []InferenceServiceIdentity{{Namespace: "team-a", Name: "cluster-kind"}}, cluster.InferenceServices)
+	assert.Equal(t, []InferenceServiceIdentity{
+		{Namespace: "team-a", Name: "empty-kind"},
+		{Namespace: "team-a", Name: "nil-kind"},
+		{Namespace: "team-a", Name: "nonstandard-group"},
+		{Namespace: "team-a", Name: "unknown-kind"},
+	}, local.InferenceServices)
+}
+
+func TestBuildResolvesDefaultAndClusterKindsToNamespacedOnlyRuntime(t *testing.T) {
 	clusterKind := string(runtimegraph.KindClusterServingRuntime)
 	index := Build([]omev1beta1.InferenceService{
 		inferenceService("team-a", "default-kind", runtimeReference("local-only", nil, nil)),
@@ -239,7 +283,7 @@ func TestBuildDistinguishesAutomaticSelectionFromEmptyRuntimeName(t *testing.T) 
 	}, index.References())
 }
 
-func TestBuildPreservesInvalidRuntimeReferenceEvidence(t *testing.T) {
+func TestBuildIgnoresAPIGroupAndDefaultsOtherKindsForMissingRuntime(t *testing.T) {
 	empty := ""
 	unsupportedKind := "OtherRuntime"
 	unexpectedGroup := "other.example"
@@ -254,30 +298,30 @@ func TestBuildPreservesInvalidRuntimeReferenceEvidence(t *testing.T) {
 	assert.Equal(t, []ReferenceEvidence{
 		{
 			InferenceService: InferenceServiceIdentity{Namespace: "team-a", Name: "empty-group"},
-			State:            ReferenceInvalid,
+			State:            ReferenceUnresolved,
 			RuntimeName:      "runtime-c",
-			Reason:           ReasonInvalidAPIGroup,
+			Reason:           ReasonRuntimeNotFound,
 			Occurrences:      1,
 		},
 		{
 			InferenceService: InferenceServiceIdentity{Namespace: "team-a", Name: "empty-kind"},
-			State:            ReferenceInvalid,
+			State:            ReferenceUnresolved,
 			RuntimeName:      "runtime-a",
-			Reason:           ReasonInvalidKind,
+			Reason:           ReasonRuntimeNotFound,
 			Occurrences:      1,
 		},
 		{
 			InferenceService: InferenceServiceIdentity{Namespace: "team-a", Name: "unexpected-group"},
-			State:            ReferenceInvalid,
+			State:            ReferenceUnresolved,
 			RuntimeName:      "runtime-d",
-			Reason:           ReasonInvalidAPIGroup,
+			Reason:           ReasonRuntimeNotFound,
 			Occurrences:      1,
 		},
 		{
 			InferenceService: InferenceServiceIdentity{Namespace: "team-a", Name: "unsupported-kind"},
-			State:            ReferenceInvalid,
+			State:            ReferenceUnresolved,
 			RuntimeName:      "runtime-b",
-			Reason:           ReasonInvalidKind,
+			Reason:           ReasonRuntimeNotFound,
 			Occurrences:      1,
 		},
 	}, index.References())

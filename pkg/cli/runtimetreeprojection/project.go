@@ -33,6 +33,8 @@ var (
 // object kind.
 type CollectionObservation struct {
 	Kind          reportv1alpha1.RuntimeTreeCollectionKind
+	Scope         reportv1alpha1.RuntimeTreeCollectionScope
+	Namespace     string
 	Status        reportv1alpha1.RuntimeTreeCollectionStatus
 	ObservedPages int
 	ObservedItems int
@@ -114,7 +116,8 @@ func projectSnapshot(
 	truncated := false
 	unavailable := false
 	for _, collection := range snapshot.Collections {
-		if !validCollectionKind(collection.Kind) || !validCollectionStatus(collection.Status) ||
+		if !validCollectionKind(collection.Kind) || !validCollectionScope(collection) ||
+			!validCollectionStatus(collection.Status) ||
 			collection.ObservedPages < 0 || collection.ObservedItems < 0 {
 			return reportv1alpha1.RuntimeTreeSnapshot{}, nil, nil, fmt.Errorf(
 				"%w: malformed %q collection", ErrInvalidSnapshot, collection.Kind,
@@ -136,7 +139,8 @@ func projectSnapshot(
 		truncated = truncated || collection.Status == reportv1alpha1.RuntimeTreeCollectionStatusTruncated
 		unavailable = unavailable || collection.Status == reportv1alpha1.RuntimeTreeCollectionStatusUnavailable
 		collections = append(collections, reportv1alpha1.RuntimeTreeCollection{
-			Kind: collection.Kind, Status: collection.Status,
+			Kind: collection.Kind, Scope: collection.Scope, Namespace: collection.Namespace,
+			Status:        collection.Status,
 			ObservedPages: collection.ObservedPages, ObservedItems: collection.ObservedItems,
 		})
 	}
@@ -163,6 +167,26 @@ func projectSnapshot(
 	return reportv1alpha1.RuntimeTreeSnapshot{
 		Completeness: completeness, Collections: collections,
 	}, statuses, warnings, nil
+}
+
+func validCollectionScope(collection CollectionObservation) bool {
+	switch collection.Kind {
+	case reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime:
+		return collection.Scope == reportv1alpha1.RuntimeTreeCollectionScopeCluster &&
+			collection.Namespace == ""
+	case reportv1alpha1.RuntimeTreeCollectionServingRuntime,
+		reportv1alpha1.RuntimeTreeCollectionInferenceService:
+		switch collection.Scope {
+		case reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces:
+			return collection.Namespace == ""
+		case reportv1alpha1.RuntimeTreeCollectionScopeNamespace:
+			return len(validation.IsDNS1123Label(collection.Namespace)) == 0
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 func requiredCollectionKinds() []reportv1alpha1.RuntimeTreeCollectionKind {

@@ -71,9 +71,9 @@ func TestProjectPreservesThreeContextsAndAttachesOnlyToExactHeads(t *testing.T) 
 		"`-- ServingRuntime/local-b\n"+
 		"    `-- InferenceService/chat-b\n"+
 		"Snapshot: Complete\n"+
-		"Collection: ClusterServingRuntime status=Complete pages=1 items=2\n"+
-		"Collection: ServingRuntime status=Complete pages=1 items=2\n"+
-		"Collection: InferenceService status=Complete pages=1 items=4\n",
+		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=2\n"+
+		"Collection: ServingRuntime scope=AllNamespaces status=Complete pages=1 items=2\n"+
+		"Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=4\n",
 		output.String())
 }
 
@@ -135,9 +135,9 @@ func TestProjectKeepsSameContextMaxDepthPathsSeparate(t *testing.T) {
 		"Issue: MaxDepthExceeded subject=ClusterServingRuntime/level-6 parent=level-1\n"+
 		"Issue path: ClusterServingRuntime/level-6 -> ClusterServingRuntime/level-5 -> ClusterServingRuntime/level-4 -> ClusterServingRuntime/target -> ClusterServingRuntime/level-2\n"+
 		"Snapshot: Complete\n"+
-		"Collection: ClusterServingRuntime status=Complete pages=1 items=6\n"+
-		"Collection: ServingRuntime status=Complete pages=1 items=0\n"+
-		"Collection: InferenceService status=Complete pages=1 items=0\n",
+		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=6\n"+
+		"Collection: ServingRuntime scope=AllNamespaces status=Complete pages=1 items=0\n"+
+		"Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=0\n",
 		output.String())
 }
 
@@ -169,9 +169,9 @@ func TestProjectDerivesSnapshotContextCompletenessAndWarnings(t *testing.T) {
 	got, err := runtimetreeprojection.Project(runtimetreeprojection.Input{
 		Projection: projection,
 		Snapshot: runtimetreeprojection.SnapshotObservation{Collections: []runtimetreeprojection.CollectionObservation{
-			{Kind: reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
-			{Kind: reportv1alpha1.RuntimeTreeCollectionServingRuntime, Status: reportv1alpha1.RuntimeTreeCollectionStatusUnavailable, ObservedPages: 1, ObservedItems: 2},
-			{Kind: reportv1alpha1.RuntimeTreeCollectionInferenceService, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 0},
+			{Kind: reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: reportv1alpha1.RuntimeTreeCollectionScopeCluster, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
+			{Kind: reportv1alpha1.RuntimeTreeCollectionServingRuntime, Scope: reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: reportv1alpha1.RuntimeTreeCollectionStatusUnavailable, ObservedPages: 1, ObservedItems: 2},
+			{Kind: reportv1alpha1.RuntimeTreeCollectionInferenceService, Scope: reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 0},
 		}},
 	}, fixedProjectionClock())
 	require.NoError(t, err)
@@ -203,9 +203,9 @@ func TestProjectDerivesSnapshotContextCompletenessAndWarnings(t *testing.T) {
 		"ClusterServingRuntime/root [selected]\n"+
 		"`-- ServingRuntime/local-b\n"+
 		"Snapshot: Partial\n"+
-		"Collection: ClusterServingRuntime status=Complete pages=1 items=2\n"+
-		"Collection: ServingRuntime status=Unavailable pages=1 items=2\n"+
-		"Collection: InferenceService status=Complete pages=1 items=0\n"+
+		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=2\n"+
+		"Collection: ServingRuntime scope=AllNamespaces status=Unavailable pages=1 items=2\n"+
+		"Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=0\n"+
 		"Warning: PartialData\n"+
 		"Warning: SourceUnavailable\n",
 		output.String())
@@ -213,9 +213,9 @@ func TestProjectDerivesSnapshotContextCompletenessAndWarnings(t *testing.T) {
 	got, err = runtimetreeprojection.Project(runtimetreeprojection.Input{
 		Projection: projection,
 		Snapshot: runtimetreeprojection.SnapshotObservation{Collections: []runtimetreeprojection.CollectionObservation{
-			{Kind: reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
-			{Kind: reportv1alpha1.RuntimeTreeCollectionServingRuntime, Status: reportv1alpha1.RuntimeTreeCollectionStatusTruncated, ObservedPages: 1, ObservedItems: 2},
-			{Kind: reportv1alpha1.RuntimeTreeCollectionInferenceService, Status: reportv1alpha1.RuntimeTreeCollectionStatusUnavailable},
+			{Kind: reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: reportv1alpha1.RuntimeTreeCollectionScopeCluster, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
+			{Kind: reportv1alpha1.RuntimeTreeCollectionServingRuntime, Scope: reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: reportv1alpha1.RuntimeTreeCollectionStatusTruncated, ObservedPages: 1, ObservedItems: 2},
+			{Kind: reportv1alpha1.RuntimeTreeCollectionInferenceService, Scope: reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: reportv1alpha1.RuntimeTreeCollectionStatusUnavailable},
 		}},
 	}, fixedProjectionClock())
 	require.NoError(t, err)
@@ -359,6 +359,25 @@ func TestProjectRejectsMalformedSnapshotAndFutureCollectionEnums(t *testing.T) {
 		})},
 		{name: "future status", collections: replaceCollection(completeCollections(1, 0, 0), reportv1alpha1.RuntimeTreeCollectionServingRuntime, func(value *runtimetreeprojection.CollectionObservation) {
 			value.Status = reportv1alpha1.RuntimeTreeCollectionStatus("Future")
+		})},
+		{name: "cluster runtime with namespace scope", collections: replaceCollection(completeCollections(1, 0, 0), reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, func(value *runtimetreeprojection.CollectionObservation) {
+			value.Scope = reportv1alpha1.RuntimeTreeCollectionScopeNamespace
+			value.Namespace = "team-a"
+		})},
+		{name: "namespaced scope without namespace", collections: replaceCollection(completeCollections(1, 0, 0), reportv1alpha1.RuntimeTreeCollectionServingRuntime, func(value *runtimetreeprojection.CollectionObservation) {
+			value.Scope = reportv1alpha1.RuntimeTreeCollectionScopeNamespace
+			value.Namespace = ""
+		})},
+		{name: "all namespaces scope with namespace", collections: replaceCollection(completeCollections(1, 0, 0), reportv1alpha1.RuntimeTreeCollectionInferenceService, func(value *runtimetreeprojection.CollectionObservation) {
+			value.Scope = reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces
+			value.Namespace = "team-a"
+		})},
+		{name: "future scope", collections: replaceCollection(completeCollections(1, 0, 0), reportv1alpha1.RuntimeTreeCollectionServingRuntime, func(value *runtimetreeprojection.CollectionObservation) {
+			value.Scope = reportv1alpha1.RuntimeTreeCollectionScope("Future")
+		})},
+		{name: "invalid namespace scope", collections: replaceCollection(completeCollections(1, 0, 0), reportv1alpha1.RuntimeTreeCollectionInferenceService, func(value *runtimetreeprojection.CollectionObservation) {
+			value.Scope = reportv1alpha1.RuntimeTreeCollectionScopeNamespace
+			value.Namespace = "Bad_NS"
 		})},
 	}
 	for _, test := range tests {
@@ -680,9 +699,9 @@ func completeSnapshotObservation(clusterRuntimes, namespacedRuntimes, inferenceS
 
 func completeCollections(clusterRuntimes, namespacedRuntimes, inferenceServices int) []runtimetreeprojection.CollectionObservation {
 	return []runtimetreeprojection.CollectionObservation{
-		{Kind: reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: clusterRuntimes},
-		{Kind: reportv1alpha1.RuntimeTreeCollectionServingRuntime, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: namespacedRuntimes},
-		{Kind: reportv1alpha1.RuntimeTreeCollectionInferenceService, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: inferenceServices},
+		{Kind: reportv1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: reportv1alpha1.RuntimeTreeCollectionScopeCluster, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: clusterRuntimes},
+		{Kind: reportv1alpha1.RuntimeTreeCollectionServingRuntime, Scope: reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: namespacedRuntimes},
+		{Kind: reportv1alpha1.RuntimeTreeCollectionInferenceService, Scope: reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: reportv1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: inferenceServices},
 	}
 }
 

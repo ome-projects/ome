@@ -96,6 +96,65 @@ func TestCollectDrainsBothRuntimeKindsAcrossAllNamespaces(t *testing.T) {
 	}
 }
 
+func TestCollectInNamespaceScopesOnlyServingRuntimes(t *testing.T) {
+	t.Parallel()
+
+	client := omefake.NewSimpleClientset()
+	seen := map[string][]string{}
+	client.PrependReactor("list", "*", func(action ktesting.Action) (bool, runtime.Object, error) {
+		resource := action.GetResource().Resource
+		seen[resource] = append(seen[resource], action.GetNamespace())
+		switch resource {
+		case "clusterservingruntimes":
+			return true, &omev1beta1.ClusterServingRuntimeList{
+				Items: []omev1beta1.ClusterServingRuntime{clusterRuntime("cluster")},
+			}, nil
+		case "servingruntimes":
+			if action.GetNamespace() != "team-a" {
+				return true, nil, apierrors.NewForbidden(
+					schema.GroupResource{Group: "ome.io", Resource: resource},
+					"", errors.New("cluster-wide list denied"),
+				)
+			}
+			return true, &omev1beta1.ServingRuntimeList{
+				Items: []omev1beta1.ServingRuntime{servingRuntime("team-a", "runtime")},
+			}, nil
+		default:
+			t.Fatalf("unexpected list resource %q", resource)
+			return true, nil, nil
+		}
+	})
+
+	got, err := CollectInNamespace(
+		context.Background(), client.OmeV1beta1(), "team-a", testLimits,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{""}, seen["clusterservingruntimes"])
+	assert.Equal(t, []string{"team-a"}, seen["servingruntimes"])
+	require.Len(t, got.Snapshot.ServingRuntimes, 1)
+	assert.Equal(t, "team-a", got.Snapshot.ServingRuntimes[0].Namespace)
+}
+
+func TestCollectServingRuntimesCanExpandAcrossNamespaces(t *testing.T) {
+	t.Parallel()
+
+	runtimeA := servingRuntime("team-a", "runtime-a")
+	runtimeB := servingRuntime("team-b", "runtime-b")
+	client := omefake.NewSimpleClientset(&runtimeA, &runtimeB)
+
+	got, err := CollectServingRuntimes(
+		context.Background(), client.OmeV1beta1(), metav1.NamespaceAll, testLimits,
+	)
+
+	require.NoError(t, err)
+	assert.Len(t, got.ServingRuntimes, 2)
+	assert.Equal(t, KindCompleteness{ObservedPages: 1, ObservedItems: 2}, got.Completeness)
+	require.Len(t, client.Actions(), 1)
+	assert.Equal(t, "servingruntimes", client.Actions()[0].GetResource().Resource)
+	assert.Empty(t, client.Actions()[0].GetNamespace())
+}
+
 func TestCollectReturnsDefensiveRuntimeCopies(t *testing.T) {
 	t.Parallel()
 
@@ -329,6 +388,13 @@ func TestCollectPreservesTypedRequiredListErrors(t *testing.T) {
 			got, err := Collect(context.Background(), client.OmeV1beta1(), testLimits)
 
 			require.Error(t, err)
+			var collectionErr *CollectionError
+			require.ErrorAs(t, err, &collectionErr)
+			wantKind := CollectionClusterServingRuntime
+			if test.resource == "servingruntimes" {
+				wantKind = CollectionServingRuntime
+			}
+			assert.Equal(t, wantKind, collectionErr.Kind)
 			assert.True(t, apierrors.IsForbidden(err))
 			assert.ErrorIs(t, err, forbidden)
 			if test.resource == "servingruntimes" {

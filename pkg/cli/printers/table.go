@@ -300,9 +300,28 @@ func wrapCell(value string, width int) []string {
 	}
 	tokens := splitWhitespaceTokens(value)
 	if len(tokens) > 1 {
-		return wrapWhitespaceTokens(tokens, width)
+		return wrapWhitespaceTokens(joinTreeBranchIdentity(tokens), width)
 	}
 	return wrapIdentifier(value, width)
+}
+
+// joinTreeBranchIdentity keeps an ASCII tree branch and its following
+// identity in the same wrap token. Identifier-aware wrapping can then split
+// the combined token after the identity's kind separator instead of emitting
+// a visually detached `-- or |-- line.
+func joinTreeBranchIdentity(tokens []whitespaceToken) []whitespaceToken {
+	if len(tokens) < 3 || tokens[0].whitespace || !tokens[1].whitespace || tokens[2].whitespace {
+		return tokens
+	}
+	if tokens[0].value != "`--" && tokens[0].value != "|--" {
+		return tokens
+	}
+	joined := make([]whitespaceToken, 0, len(tokens)-2)
+	joined = append(joined, whitespaceToken{
+		value: tokens[0].value + tokens[1].value + tokens[2].value,
+		width: tokens[0].width + tokens[1].width + tokens[2].width,
+	})
+	return append(joined, tokens[3:]...)
 }
 
 type whitespaceToken struct {
@@ -488,6 +507,13 @@ func wrapIdentifier(value string, width int) []string {
 func splitIdentifier(value string) []string {
 	var segments []string
 	var segment strings.Builder
+	for _, prefix := range []string{"`-- ", "|-- "} {
+		if strings.HasPrefix(value, prefix) {
+			segment.WriteString(prefix)
+			value = strings.TrimPrefix(value, prefix)
+			break
+		}
+	}
 	for _, cluster := range displayClusters(value) {
 		segment.WriteString(cluster.value)
 		switch cluster.value {

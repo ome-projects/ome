@@ -35,6 +35,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome runtime effective",
 		"ome runtime explain",
 		"ome runtime history",
+		"ome runtime tree",
 		"ome status",
 		"ome version",
 	}
@@ -50,6 +51,13 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if explain.Use != "explain (--model NAME | --isvc NAME)" || explain.Short != "Explain which serving runtimes match a model and why" {
 		t.Fatalf("runtime explain contract changed: Use=%q Short=%q", explain.Use, explain.Short)
+	}
+	tree, _, err := root.Find([]string{"runtime", "tree"})
+	if err != nil {
+		t.Fatalf("find runtime tree: %v", err)
+	}
+	if tree.Use != "tree RUNTIME" || tree.Short != "Show runtime inheritance and InferenceService users" {
+		t.Fatalf("runtime tree contract changed: Use=%q Short=%q", tree.Use, tree.Short)
 	}
 }
 

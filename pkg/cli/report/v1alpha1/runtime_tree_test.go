@@ -22,9 +22,9 @@ func TestRuntimeTreeTablePreservesContextAndHeadPaths(t *testing.T) {
 		Snapshot: v1alpha1.RuntimeTreeSnapshot{
 			Completeness: v1alpha1.RuntimeTreeSnapshotPartial,
 			Collections: []v1alpha1.RuntimeTreeCollection{
-				{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusTruncated, ObservedPages: 1, ObservedItems: 2},
-				{Kind: v1alpha1.RuntimeTreeCollectionInferenceService, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 3},
-				{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
+				{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: v1alpha1.RuntimeTreeCollectionStatusTruncated, ObservedPages: 1, ObservedItems: 2},
+				{Kind: v1alpha1.RuntimeTreeCollectionInferenceService, Scope: v1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 3},
+				{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeCluster, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
 			},
 		},
 		Contexts: []v1alpha1.RuntimeTreeContext{
@@ -106,12 +106,39 @@ func TestRuntimeTreeTablePreservesContextAndHeadPaths(t *testing.T) {
 		"Issue: ParentMissing subject=ServingRuntime/orphan parent=missing\n"+
 		"Issue path: ServingRuntime/orphan -> ClusterServingRuntime/root\n"+
 		"Snapshot: Partial\n"+
-		"Collection: ClusterServingRuntime status=Complete pages=1 items=2\n"+
-		"Collection: ServingRuntime status=Truncated pages=1 items=2\n"+
-		"Collection: InferenceService status=Complete pages=1 items=3\n"+
+		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=2\n"+
+		"Collection: ServingRuntime scope=AllNamespaces status=Truncated pages=1 items=2\n"+
+		"Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=3\n"+
 		"Warning: PartialData\n"+
 		"Warning: Truncated\n",
 		output.String())
+}
+
+func TestRuntimeTreeTableMakesEveryCollectionScopeExplicit(t *testing.T) {
+	content := v1alpha1.RuntimeTreeContent{Snapshot: v1alpha1.RuntimeTreeSnapshot{
+		Collections: []v1alpha1.RuntimeTreeCollection{
+			{
+				Kind:  v1alpha1.RuntimeTreeCollectionClusterServingRuntime,
+				Scope: v1alpha1.RuntimeTreeCollectionScopeCluster,
+			},
+			{
+				Kind:  v1alpha1.RuntimeTreeCollectionServingRuntime,
+				Scope: v1alpha1.RuntimeTreeCollectionScopeAllNamespaces,
+			},
+			{
+				Kind:      v1alpha1.RuntimeTreeCollectionInferenceService,
+				Scope:     v1alpha1.RuntimeTreeCollectionScopeNamespace,
+				Namespace: "team-a",
+			},
+		},
+	}}
+
+	table := content.Table()
+
+	require.Len(t, table.Rows, 5)
+	assert.Equal(t, []string{"Collection: ClusterServingRuntime scope=Cluster status= pages=0 items=0"}, table.Rows[2])
+	assert.Equal(t, []string{"Collection: ServingRuntime scope=AllNamespaces status= pages=0 items=0"}, table.Rows[3])
+	assert.Equal(t, []string{"Collection: InferenceService scope=Namespace/team-a status= pages=0 items=0"}, table.Rows[4])
 }
 
 func TestRuntimeTreeTableShowsCycleClosingEdge(t *testing.T) {
@@ -124,9 +151,9 @@ func TestRuntimeTreeTableShowsCycleClosingEdge(t *testing.T) {
 			Snapshot: v1alpha1.RuntimeTreeSnapshot{
 				Completeness: v1alpha1.RuntimeTreeSnapshotComplete,
 				Collections: []v1alpha1.RuntimeTreeCollection{
-					{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1},
-					{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
-					{Kind: v1alpha1.RuntimeTreeCollectionInferenceService, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1},
+					{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeCluster, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1},
+					{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeNamespace, Namespace: "team-a", Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 2},
+					{Kind: v1alpha1.RuntimeTreeCollectionInferenceService, Scope: v1alpha1.RuntimeTreeCollectionScopeNamespace, Namespace: "team-a", Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1},
 				},
 			},
 			Contexts: []v1alpha1.RuntimeTreeContext{{
@@ -160,9 +187,9 @@ func TestRuntimeTreeTableShowsCycleClosingEdge(t *testing.T) {
 		"Issue: CycleDetected subject=ServingRuntime/a parent=a\n"+
 		"Issue path: ServingRuntime/a -> ServingRuntime/b -> ServingRuntime/a\n"+
 		"Snapshot: Complete\n"+
-		"Collection: ClusterServingRuntime status=Complete pages=1 items=0\n"+
-		"Collection: ServingRuntime status=Complete pages=1 items=2\n"+
-		"Collection: InferenceService status=Complete pages=1 items=0\n",
+		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=0\n"+
+		"Collection: ServingRuntime scope=Namespace/team-a status=Complete pages=1 items=2\n"+
+		"Collection: InferenceService scope=Namespace/team-a status=Complete pages=1 items=0\n",
 		output.String())
 }
 
@@ -172,8 +199,8 @@ func TestRuntimeTreeCanonicalIsDeterministicImmutableAndNonNil(t *testing.T) {
 	content := v1alpha1.RuntimeTreeContent{
 		Target: target,
 		Snapshot: v1alpha1.RuntimeTreeSnapshot{Collections: []v1alpha1.RuntimeTreeCollection{
-			{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusComplete},
-			{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusComplete},
+			{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeAllNamespaces, Status: v1alpha1.RuntimeTreeCollectionStatusComplete},
+			{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeCluster, Status: v1alpha1.RuntimeTreeCollectionStatusComplete},
 		}},
 		Contexts: []v1alpha1.RuntimeTreeContext{
 			{
@@ -225,7 +252,20 @@ func TestRuntimeTreeMachineFormatsAreStableAndKeepPerPathEvidence(t *testing.T) 
 			Target: target,
 			Snapshot: v1alpha1.RuntimeTreeSnapshot{
 				Completeness: v1alpha1.RuntimeTreeSnapshotPartial,
-				Collections:  []v1alpha1.RuntimeTreeCollection{{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Status: v1alpha1.RuntimeTreeCollectionStatusUnavailable}},
+				Collections: []v1alpha1.RuntimeTreeCollection{
+					{
+						Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeCluster,
+						Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1,
+					},
+					{
+						Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeNamespace,
+						Namespace: "team-a", Status: v1alpha1.RuntimeTreeCollectionStatusUnavailable,
+					},
+					{
+						Kind: v1alpha1.RuntimeTreeCollectionInferenceService, Scope: v1alpha1.RuntimeTreeCollectionScopeNamespace,
+						Namespace: "team-a", Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1,
+					},
+				},
 			},
 			Contexts: []v1alpha1.RuntimeTreeContext{{
 				Context:                v1alpha1.RuntimeTreeResolutionContext{Mode: v1alpha1.RuntimeTreeResolutionModeNamespaced, Namespace: "team-a"},
@@ -268,9 +308,26 @@ func TestRuntimeTreeMachineFormatsAreStableAndKeepPerPathEvidence(t *testing.T) 
       "completeness": "Partial",
       "collections": [
         {
+          "kind": "ClusterServingRuntime",
+          "scope": "Cluster",
+          "status": "Complete",
+          "observedPages": 1,
+          "observedItems": 0
+        },
+        {
           "kind": "ServingRuntime",
+          "scope": "Namespace",
+          "namespace": "team-a",
           "status": "Unavailable",
           "observedPages": 0,
+          "observedItems": 0
+        },
+        {
+          "kind": "InferenceService",
+          "scope": "Namespace",
+          "namespace": "team-a",
+          "status": "Complete",
+          "observedPages": 1,
           "observedItems": 0
         }
       ]
@@ -364,10 +421,23 @@ content:
     resolutionCompleteness: Partial
   snapshot:
     collections:
+    - kind: ClusterServingRuntime
+      observedItems: 0
+      observedPages: 1
+      scope: Cluster
+      status: Complete
     - kind: ServingRuntime
+      namespace: team-a
       observedItems: 0
       observedPages: 0
+      scope: Namespace
       status: Unavailable
+    - kind: InferenceService
+      namespace: team-a
+      observedItems: 0
+      observedPages: 1
+      scope: Namespace
+      status: Complete
     completeness: Partial
   target:
     kind: ServingRuntime

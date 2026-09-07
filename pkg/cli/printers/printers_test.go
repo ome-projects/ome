@@ -474,6 +474,43 @@ func TestWrapCellPrefersIdentifierBoundaries(t *testing.T) {
 	)
 }
 
+func TestWrapCellKeepsIndentedTreeBranchesWithTheirIdentity(t *testing.T) {
+	for _, branch := range []string{"`--", "|--"} {
+		t.Run(branch, func(t *testing.T) {
+			const width = 24
+			segments := wrapCell(
+				"    "+branch+" ClusterServingRuntime/"+strings.Repeat("a", 80),
+				width,
+			)
+
+			require.Greater(t, len(segments), 1)
+			assert.True(t,
+				strings.HasPrefix(segments[0], "    "+branch+" C"),
+				"branch must share its first line with the identity: %q",
+				segments[0],
+			)
+			for _, segment := range segments {
+				assert.LessOrEqual(t, displayWidth(segment), width)
+				assert.NotEqual(t, "    "+branch, segment)
+			}
+		})
+	}
+}
+
+func TestTreeBranchWrappingLeavesUnrelatedWhitespaceTokensUnchanged(t *testing.T) {
+	for _, value := range []string{
+		"alpha  beta",
+		"prefix `-- identity",
+		"prefix |-- identity",
+		"`--identity",
+	} {
+		t.Run(value, func(t *testing.T) {
+			tokens := splitWhitespaceTokens(value)
+			assert.Equal(t, tokens, joinTreeBranchIdentity(tokens))
+		})
+	}
+}
+
 func TestSplitIdentifierDoesNotSplitDelimiterGrapheme(t *testing.T) {
 	assert.Equal(t,
 		[]string{"runtime-\u0301name/", "leaf"},
