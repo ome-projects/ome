@@ -5,6 +5,7 @@ import (
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/backends/pernode"
@@ -28,18 +29,20 @@ func pickBackend(backends []shared.Backend, spec *v1beta1.BaseModelSpec) shared.
 // PVC artifacts left over when a model's URI flips away from pvc://.
 // Lives here (not in pernode/) so that cross-backend cleanup doesn't
 // drag a pernode→pvc import.
-type perNodeBackend struct{}
+type perNodeBackend struct {
+	nodeReader client.Reader
+}
 
 func (perNodeBackend) Name() string                          { return "pernode" }
 func (perNodeBackend) Matches(_ *v1beta1.BaseModelSpec) bool { return true }
 
-func (perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {
+func (b perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {
 	if err := pvc.CleanupStaleArtifacts(ctx, a.Client, a.Log, a.Obj, a.IsClusterScoped); err != nil {
 		a.Log.Error(err, "Failed to clean up stale PVC artifacts after URI swap")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 
-	if err := pernode.ReconcileStatusFromConfigMaps(ctx, a.Client, a.Log, a.Obj, a.IsClusterScoped, a.Kind); err != nil {
+	if err := pernode.ReconcileStatusFromConfigMaps(ctx, a.Client, b.nodeReader, a.Log, a.Obj, a.IsClusterScoped, a.Kind); err != nil {
 		a.Log.Error(err, "Failed to update "+a.Kind+" status")
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
@@ -50,6 +53,6 @@ func (perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ctrl
 	return ctrl.Result{}, nil
 }
 
-func (perNodeBackend) HandleDeletion(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {
-	return pernode.HandleModelDeletion(ctx, a.Client, a.Obj, a.Finalizer)
+func (b perNodeBackend) HandleDeletion(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {
+	return pernode.HandleModelDeletion(ctx, a.Client, b.nodeReader, a.Obj, a.Finalizer)
 }

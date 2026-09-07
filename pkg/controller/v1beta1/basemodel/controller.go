@@ -39,6 +39,8 @@ import (
 
 type BaseModelReconciler struct {
 	client.Client
+	// APIReader confirms Node absence without the informer cache before cleanup.
+	APIReader      client.Reader
 	Log            logr.Logger
 	Scheme         *runtime.Scheme
 	OmeAgentConfig *controllerconfig.OmeAgentConfig
@@ -46,6 +48,8 @@ type BaseModelReconciler struct {
 
 type ClusterBaseModelReconciler struct {
 	client.Client
+	// APIReader confirms Node absence without the informer cache before cleanup.
+	APIReader      client.Reader
 	Log            logr.Logger
 	Scheme         *runtime.Scheme
 	OmeAgentConfig *controllerconfig.OmeAgentConfig
@@ -56,14 +60,14 @@ type ClusterBaseModelReconciler struct {
 func (r *BaseModelReconciler) backends() []shared.Backend {
 	return []shared.Backend{
 		pvc.New(r.OmeAgentConfig),
-		perNodeBackend{},
+		perNodeBackend{nodeReader: r.APIReader},
 	}
 }
 
 func (r *ClusterBaseModelReconciler) backends() []shared.Backend {
 	return []shared.Backend{
 		pvc.New(r.OmeAgentConfig),
-		perNodeBackend{},
+		perNodeBackend{nodeReader: r.APIReader},
 	}
 }
 
@@ -135,6 +139,9 @@ func reconcileModel(ctx context.Context, c client.Client, scheme *runtime.Scheme
 }
 
 func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.BaseModel{}).
 		Owns(&batchv1.Job{}).
@@ -166,6 +173,9 @@ func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *ClusterBaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.ClusterBaseModel{}).
 		Owns(&batchv1.Job{}).

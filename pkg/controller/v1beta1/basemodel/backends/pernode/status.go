@@ -8,8 +8,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -22,7 +20,7 @@ import (
 // caller-supplied statusUpdateFunc. Per-node spec updates from the
 // agent flow through specUpdateFunc (filtered to entries that carry a
 // non-nil Config).
-func processModelStatus(ctx context.Context, kubeClient client.Client, log logr.Logger, namespace, name string, isClusterScope bool,
+func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReader client.Reader, log logr.Logger, namespace, name string, isClusterScope bool,
 	specUpdateFunc func(context.Context, *shared.ModelConfig) error,
 	statusUpdateFunc func(context.Context, []string, []string) error) error {
 
@@ -48,25 +46,23 @@ func processModelStatus(ctx context.Context, kubeClient client.Client, log logr.
 	var nodesReady []string
 	var nodesFailed []string
 	var specUpdateErrors []string
+	modelKey := constants.GetModelConfigMapKey(namespace, name, isClusterScope)
 
 	for _, configMap := range configMaps.Items {
 		processedNodes++
-
-		node := &corev1.Node{}
-		if err := kubeClient.Get(ctx, types.NamespacedName{Name: configMap.Name}, node); err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			log.Error(err, "Failed to get node", "node", configMap.Name)
-			continue
-		}
-		validNodes++
-
-		modelKey := constants.GetModelConfigMapKey(namespace, name, isClusterScope)
 		data, exists := configMap.Data[modelKey]
 		if !exists {
 			continue
 		}
+
+		orphaned, err := cleanupOrphanedNodeConfigMap(ctx, kubeClient, nodeReader, &configMap)
+		if err != nil {
+			return err
+		}
+		if orphaned {
+			continue
+		}
+		validNodes++
 
 		var modelEntry shared.ModelEntry
 		if err := json.Unmarshal([]byte(data), &modelEntry); err != nil {

@@ -16,10 +16,9 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
 )
 
-// HandleModelDeletion is the per-node deletion handler. Waits for every
-// node's model-agent to clear or mark-deleted the model in its per-node
-// ConfigMap before dropping the finalizer.
-func HandleModelDeletion(ctx context.Context, kubeClient client.Client, obj client.Object, finalizer string) (ctrl.Result, error) {
+// HandleModelDeletion waits for model-agent deletion acknowledgements, cleaning
+// up status ConfigMaps for confirmed-absent Nodes before dropping the finalizer.
+func HandleModelDeletion(ctx context.Context, kubeClient client.Client, nodeReader client.Reader, obj client.Object, finalizer string) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	if controllerutil.ContainsFinalizer(obj, finalizer) {
@@ -70,19 +69,23 @@ func HandleModelDeletion(ctx context.Context, kubeClient client.Client, obj clie
 			if !exists {
 				continue
 			}
-			nodesWithModel++
-
-			// Check if it's already marked for deletion
+			// A completed agent acknowledgement does not require Node availability.
 			var modelEntry shared.ModelEntry
-			if err := json.Unmarshal([]byte(data), &modelEntry); err == nil {
-				// If model entry is present but not marked as deleted, add it to the list
-				if modelEntry.Status != shared.ModelStatusDeleted {
-					modelsNotDeleted = append(modelsNotDeleted, configMap.Name)
-				}
-			} else {
-				// Can't parse the entry, consider it not deleted for safety
-				modelsNotDeleted = append(modelsNotDeleted, configMap.Name)
+			if err := json.Unmarshal([]byte(data), &modelEntry); err == nil && modelEntry.Status == shared.ModelStatusDeleted {
+				nodesWithModel++
+				continue
 			}
+
+			orphaned, err := cleanupOrphanedNodeConfigMap(ctx, kubeClient, nodeReader, configMap)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if orphaned {
+				continue
+			}
+			nodesWithModel++
+			// Unacknowledged or malformed entries still block deletion on live Nodes.
+			modelsNotDeleted = append(modelsNotDeleted, configMap.Name)
 		}
 
 		modelInfo := modelName

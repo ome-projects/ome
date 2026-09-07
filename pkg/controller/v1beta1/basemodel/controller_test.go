@@ -528,6 +528,7 @@ func TestBaseModelReconcile(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "deleted-node",
 						Namespace: constants.OMENamespace,
+						UID:       types.UID("deleted-node-configmap"),
 						Labels: map[string]string{
 							constants.ModelStatusConfigMapLabel: "true",
 						},
@@ -571,8 +572,9 @@ func TestBaseModelReconcile(t *testing.T) {
 
 			// Run reconciliation
 			reconciler := &BaseModelReconciler{
-				Client: c,
-				Scheme: c.Scheme(),
+				Client:    c,
+				APIReader: c,
+				Scheme:    c.Scheme(),
 			}
 
 			result, err := reconciler.Reconcile(context.TODO(), ctrl.Request{
@@ -730,9 +732,10 @@ func TestClusterBaseModelReconcile(t *testing.T) {
 			}
 
 			reconciler := &ClusterBaseModelReconciler{
-				Client: c,
-				Log:    ctrl.Log.WithName("test"),
-				Scheme: scheme,
+				Client:    c,
+				APIReader: c,
+				Log:       ctrl.Log.WithName("test"),
+				Scheme:    scheme,
 			}
 
 			req := ctrl.Request{
