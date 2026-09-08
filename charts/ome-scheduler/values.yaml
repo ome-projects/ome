@@ -107,8 +107,10 @@ scheduler:
   # which hands Score a sample of the feasible nodes; OMEGangPack derives its
   # per-domain free-node counts from exactly that sample, so a partial view can
   # rank an empty domain above a partly-filled one. Set to 100 wherever
-  # standaloneDomainPacking is active. Gang pods never rely on this — PreFilter
-  # already narrows them to a single domain.
+  # standaloneDomainPacking is active. Gang correctness never relies on this:
+  # PreFilter either narrows to one domain or, for a hard spread constraint,
+  # exposes only domains that can each hold the complete gang. A partial sample
+  # can affect which surviving domain wins, but not whether the gang fits there.
   percentageOfNodesToScore:
 
   # The scheduler serves /metrics on a secure port (HTTPS + delegated authn/authz),

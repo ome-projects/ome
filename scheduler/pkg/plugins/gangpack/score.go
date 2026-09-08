@@ -9,14 +9,17 @@ import (
 	"sigs.k8s.io/ome/scheduler/pkg/topology"
 )
 
-// Domain-level bin-packing score for standalone (non-gang) whole-node pods.
+// Domain-level bin-packing score for standalone whole-node pods and deferred
+// hard-spread gangs.
 //
 // Standalone pods — e.g. single-host TPU replicas that take one node of a slice
 // — are steered toward domains that are already partly used, so partly-filled
 // domains fill before empty ones are opened. That keeps whole domains free for
 // multi-host gangs instead of letting single-host replicas fragment every slice.
-// Gang members are left alone: their domain is already pinned in PreFilter, so
-// PreScore skips when a pin exists.
+// Gang members normally arrive already pinned from PreFilter. The exception is
+// an initial member with a hard topology spread constraint: its pin is deferred
+// until Reserve, so this score preserves best-fit ordering among the domains
+// that survived the framework's filters.
 //
 // The built-in node-level MostAllocated cannot do this: accelerator nodes are
 // whole-node, so every empty candidate looks identical; the packing signal only
@@ -63,10 +66,36 @@ func (g *GangPack) packingTopologyKey(state framework.CycleState) string {
 	return g.topologyKey
 }
 
-// PreScore computes, once per scheduling cycle, the free whole-node count per
-// domain over the filtered candidate nodes, so Score is a cheap per-node lookup.
-// Returns Skip (which also skips Score) when domain packing does not apply.
+// PreScore computes domain packing state once per scheduling cycle, so Score is
+// a cheap per-node lookup. Standalone pods count free filtered nodes directly;
+// deferred gangs keep the full-gang capacity calculated in PreFilter but drop
+// domains with no node left after the regular filters. Returns Skip (which also
+// skips Score) when domain packing does not apply.
 func (g *GangPack) PreScore(_ context.Context, state framework.CycleState, pod *v1.Pod, nodes []framework.NodeInfo) *framework.Status {
+	if plan := readDeferredPin(state); plan != nil {
+		filteredDomains := make(map[string]bool)
+		for _, node := range nodes {
+			if node != nil && node.Node() != nil {
+				filteredDomains[domainOf(node.Node(), plan.gang.topologyKey)] = true
+			}
+		}
+		free := make(topology.FreeByDomain)
+		maxFree := 0
+		for domain, capacity := range plan.free {
+			if !filteredDomains[domain] {
+				continue
+			}
+			free[domain] = capacity
+			if capacity > maxFree {
+				maxFree = capacity
+			}
+		}
+		if len(free) == 0 {
+			return framework.NewStatus(framework.Skip)
+		}
+		state.Write(preScoreStateKey, &domainPackState{topologyKey: plan.gang.topologyKey, free: free, maxFree: maxFree})
+		return nil
+	}
 	tk := g.packingTopologyKey(state)
 	if tk == "" {
 		return framework.NewStatus(framework.Skip)
