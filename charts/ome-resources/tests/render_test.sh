@@ -466,3 +466,16 @@ grep -Eq '^  metricProviders:' <<<"${metric_providers_config}" ||
   fail "top-level metricProviders key was not rendered when bindings are set"
 grep -Fq '"cluster-prometheus":{"headers":{"X-Scope-OrgID":"tenant-a"},"serverAddress":"http://ome-prometheus.ome.svc:9090"}' <<<"${metric_providers_config}" ||
   fail "top-level metric provider binding was not rendered"
+
+# The traffic reconciler picks its translator by probing CRDs at startup
+# (reconcilers/traffic/factory) and then watches the chosen backend policy
+# kind. Every kind a translator can watch must be listable by the manager,
+# otherwise the informer never syncs and the manager exits on cache-sync
+# timeout on any cluster where that CRD happens to exist.
+manager_role="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --show-only templates/ome-controller/rbac/role.yaml)"
+for translator_resource in destinationrules backendtrafficpolicies; do
+  grep -Eq "^  - ${translator_resource}\$" <<<"${manager_role}" ||
+    fail "manager ClusterRole does not grant ${translator_resource}, which a traffic translator watches"
+done
