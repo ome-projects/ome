@@ -1,0 +1,105 @@
+{{- if .Values.enabled }}
+# Alfred, the GPU cluster caretaker (OEP-0008). Every replica runs the
+# read-only observation loop; only the leader decides and dispatches.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ome-alfred
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      control-plane: ome-alfred
+  template:
+    metadata:
+      labels:
+        {{- include "ome-alfred.labels" . | nindent 8 }}
+      annotations:
+        kubectl.kubernetes.io/default-container: alfred
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: "/metrics"
+        # A config change takes effect via hot reload, no restart needed;
+        # this checksum only restarts pods when the rendered document
+        # changes AND the pod template is being applied anyway.
+        checksum/alfred-config: {{ .Values.alfredConfig | toYaml | sha256sum }}
+    spec:
+      serviceAccountName: ome-alfred
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: alfred
+        image: {{ include "ome-alfred.image" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+          - "--metrics-bind-address=:{{ .Values.metrics.port }}"
+          - "--health-probe-bind-address=:{{ .Values.healthPort }}"
+          - "--leader-elect=true"
+          - "--config-name={{ .Values.configMapName }}"
+          - "--config-key=config.yaml"
+        env:
+          # Alfred reads its namespace from the downward API: it holds the
+          # config ConfigMap and the leader-election Lease.
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          # Labels alfred_leader_status so the leader is identifiable.
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        ports:
+        - name: metrics
+          containerPort: {{ .Values.metrics.port }}
+          protocol: TCP
+        - name: health
+          containerPort: {{ .Values.healthPort }}
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 10
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 10
+{{- end }}
