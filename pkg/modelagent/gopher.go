@@ -215,18 +215,12 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 		s.classifyStartupRevalidation(task)
 	}
 	result := s.taskQueue.enqueue(task)
-	if result.accepted && result.displaced == nil {
+	if !result.accepted {
+		s.logger.Infof("Model-agent scheduler closed before task could be queued: %s", getModelInfoForLogging(task))
 		return
 	}
-	pending := task
-	if result.accepted {
-		pending = result.displaced
-		s.logger.Debugf("Deferring displaced model-agent task until scheduler capacity is available: %s", getModelInfoForLogging(pending))
-	} else {
-		s.logger.Debugf("Waiting for scheduler capacity for model-agent task: %s", getModelInfoForLogging(pending))
-	}
-	if !s.taskQueue.enqueueWhenAvailable(pending) {
-		s.logger.Infof("Model-agent scheduler closed before task could be queued: %s", getModelInfoForLogging(pending))
+	if result.deferred {
+		s.logger.Debugf("Deferred model-agent task in scheduler-owned pending state: %s", getModelInfoForLogging(task))
 	}
 }
 

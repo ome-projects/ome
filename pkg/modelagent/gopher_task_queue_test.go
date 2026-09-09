@@ -276,7 +276,7 @@ func TestGopherTaskQueueHighPrioritySupersedesBackgroundForSameModel(t *testing.
 	assert.Equal(t, 0, queue.len())
 }
 
-func TestGopherTaskQueueRejectsBackgroundWhenCapacityIsFull(t *testing.T) {
+func TestGopherTaskQueueDefersBackgroundWhenCapacityIsFull(t *testing.T) {
 	queue := newGopherTaskQueue(1)
 	first := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "service-ns", UID: "first-uid"},
@@ -286,8 +286,17 @@ func TestGopherTaskQueueRejectsBackgroundWhenCapacityIsFull(t *testing.T) {
 	}}
 
 	assert.True(t, queue.enqueue(first).accepted)
-	assert.False(t, queue.enqueue(second).accepted)
-	assert.Equal(t, 1, queue.len())
+	result := queue.enqueue(second)
+	assert.True(t, result.accepted)
+	assert.True(t, result.deferred)
+	assert.Equal(t, 2, queue.len())
+
+	task, ok := queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, first, task)
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, second, task)
 }
 
 func TestGopherTaskQueueHighPriorityPreservesDisplacedBackgroundAtCapacity(t *testing.T) {
@@ -302,45 +311,70 @@ func TestGopherTaskQueueHighPriorityPreservesDisplacedBackgroundAtCapacity(t *te
 	assert.True(t, queue.enqueue(background).accepted)
 	result := queue.enqueue(demand)
 	require.True(t, result.accepted)
-	assert.Same(t, background, result.displaced)
+	assert.False(t, result.deferred)
 	task, ok := queue.popHighPriority()
 	require.True(t, ok)
 	assert.Equal(t, "demand", task.BaseModel.Name)
-	require.True(t, queue.enqueueWhenAvailable(result.displaced))
 	task, ok = queue.popNormal()
 	require.True(t, ok)
 	assert.Equal(t, "background", task.BaseModel.Name)
 	assert.Equal(t, 0, queue.len())
 }
 
-func TestGopherEnqueueTaskRetriesDisplacedWorkAfterCapacityIsAvailable(t *testing.T) {
+func TestGopherDispatcherObservesHighTaskWhileBackgroundWaitsForCapacity(t *testing.T) {
 	queue := newGopherTaskQueue(1)
+	first := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "service-ns", UID: "first-uid"},
+	}}
 	background := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityBackground, BaseModel: &v1beta1.BaseModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "background", Namespace: "service-ns", UID: "background-uid"},
 	}}
 	demand := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityHigh, BaseModel: &v1beta1.BaseModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "demand", Namespace: "service-ns", UID: "demand-uid"},
 	}}
-	require.True(t, queue.enqueue(background).accepted)
-	gopher := &Gopher{taskQueue: queue, logger: zap.NewNop().Sugar()}
-
-	enqueued := make(chan struct{})
+	require.True(t, queue.enqueue(first).accepted)
+	gopherChan := make(chan *GopherTask)
+	gopher := &Gopher{gopherChan: gopherChan, taskQueue: queue, logger: zap.NewNop().Sugar()}
+	stopCh := make(chan struct{})
+	dispatchDone := make(chan struct{})
 	go func() {
-		gopher.enqueueTask(demand)
-		close(enqueued)
+		gopher.dispatchTasks(stopCh)
+		close(dispatchDone)
 	}()
+
+	sendTaskAndWait(t, gopherChan, background)
+	sendTaskAndWait(t, gopherChan, demand)
 
 	task, ok := queue.popHighPriority()
 	require.True(t, ok)
-	assert.Equal(t, "demand", task.BaseModel.Name)
-	select {
-	case <-enqueued:
-	case <-time.After(time.Second):
-		t.Fatal("displaced work was not re-enqueued after capacity became available")
-	}
+	assert.Same(t, demand, task)
 	task, ok = queue.popNormal()
 	require.True(t, ok)
-	assert.Equal(t, "background", task.BaseModel.Name)
+	assert.Same(t, first, task)
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, background, task)
+
+	close(stopCh)
+	select {
+	case <-dispatchDone:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not stop")
+	}
+}
+
+func sendTaskAndWait(t *testing.T, ch chan<- *GopherTask, task *GopherTask) {
+	t.Helper()
+	sent := make(chan struct{})
+	go func() {
+		ch <- task
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(time.Second):
+		t.Fatalf("dispatcher did not accept %s", getModelInfoForLogging(task))
+	}
 }
 
 func TestGopherTaskQueueEnqueueWakesMatchingBlockedWorker(t *testing.T) {
