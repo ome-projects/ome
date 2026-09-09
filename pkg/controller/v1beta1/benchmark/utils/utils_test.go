@@ -9,9 +9,11 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -522,4 +524,127 @@ func TestUpdateVolumeMounts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// enginePod builds an engine pod of isvcName whose single container runs the given argv.
+func enginePod(name, namespace, isvcName string, command []string, env []v1.EnvVar) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				constants.InferenceServicePodLabelKey: isvcName,
+				constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+			},
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "ome-container", Command: command, Env: env}},
+		},
+	}
+}
+
+func TestResolveServedModelName(t *testing.T) {
+	const ns = "default"
+	const isvcName = "test-isvc"
+
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: ns},
+	}
+
+	tests := []struct {
+		name    string
+		objects []client.Object
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "first of several served model names wins",
+			objects: []client.Object{enginePod("p", ns, isvcName, []string{
+				"python3", "--served-model-name", "primary", "alias", "--dtype", "float16",
+			}, nil)},
+			want: "primary",
+		},
+		{
+			name: "equals form is accepted",
+			objects: []client.Object{enginePod("p", ns, isvcName, []string{
+				"python3", "--served-model-name=primary", "--dtype=float16",
+			}, nil)},
+			want: "primary",
+		},
+		{
+			name: "falls back to --model with $(VAR) expanded",
+			objects: []client.Object{enginePod("p", ns, isvcName,
+				[]string{"python3", "--model", "$(MODEL_PATH)"},
+				[]v1.EnvVar{{Name: "MODEL_PATH", Value: "/mnt/models/qwen"}},
+			)},
+			want: "/mnt/models/qwen",
+		},
+		{
+			name: "falls back to SGLang --model-path",
+			objects: []client.Object{enginePod("p", ns, isvcName, []string{
+				"python3", "-m", "sglang.launch_server", "--model-path", "/mnt/models/llama",
+			}, nil)},
+			want: "/mnt/models/llama",
+		},
+		{
+			name: "a flag directly after --served-model-name is not its value",
+			objects: []client.Object{enginePod("p", ns, isvcName, []string{
+				"python3", "--served-model-name", "--dtype", "float16", "--model", "/mnt/models/x",
+			}, nil)},
+			want: "/mnt/models/x",
+		},
+		{
+			name: "pods of other inference services are ignored",
+			objects: []client.Object{
+				enginePod("other", ns, "another-isvc", []string{"python3", "--served-model-name", "wrong"}, nil),
+				enginePod("mine", ns, isvcName, []string{"python3", "--served-model-name", "right"}, nil),
+			},
+			want: "right",
+		},
+		{
+			name:    "no engine pods is an error",
+			objects: nil,
+			wantErr: true,
+		},
+		{
+			name: "engine pod naming no model is an error",
+			objects: []client.Object{enginePod("p", ns, isvcName, []string{
+				"python3", "--host", "0.0.0.0",
+			}, nil)},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = v1beta1.AddToScheme(scheme)
+			_ = v1.AddToScheme(scheme)
+
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.objects...).Build()
+
+			got, err := resolveServedModelName(context.TODO(), c, isvc)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestExpandContainerEnv(t *testing.T) {
+	env := []v1.EnvVar{
+		{Name: "MODEL_PATH", Value: "/mnt/models/x"},
+		{Name: "EMPTY", Value: ""},
+		{Name: "FROM_REF", ValueFrom: &v1.EnvVarSource{}},
+	}
+
+	assert.Equal(t, "/mnt/models/x", expandContainerEnv("$(MODEL_PATH)", env))
+	assert.Equal(t, "/mnt/models/x/sub", expandContainerEnv("$(MODEL_PATH)/sub", env))
+	assert.Equal(t, "plain", expandContainerEnv("plain", env))
+	// Unresolvable references are left as-is rather than blanked out.
+	assert.Equal(t, "$(UNKNOWN)", expandContainerEnv("$(UNKNOWN)", env))
+	assert.Equal(t, "$(FROM_REF)", expandContainerEnv("$(FROM_REF)", env))
 }

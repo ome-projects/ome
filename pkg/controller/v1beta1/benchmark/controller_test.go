@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 )
 
@@ -28,6 +29,34 @@ var (
 	IntPtr    = ptr.To[int]
 	StringPtr = ptr.To[string]
 )
+
+// engineTestPod builds an engine pod for isvcName serving under servedName. The benchmark
+// controller reads --api-model-name off these pods, so fixtures exercising an
+// InferenceService endpoint need one.
+func engineTestPod(isvcName, namespace, servedName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      isvcName + "-engine-t3st",
+			Namespace: namespace,
+			Labels: map[string]string{
+				constants.InferenceServicePodLabelKey: isvcName,
+				constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "ome-container",
+					Image: "vllm-image",
+					Command: []string{
+						"python3", "-m", "vllm.entrypoints.openai.api_server",
+						"--served-model-name", servedName,
+					},
+				},
+			},
+		},
+	}
+}
 
 func TestBenchmarkJobReconciler_Reconcile(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -384,6 +413,7 @@ func TestBenchmarkJobReconciler_createPodSpec(t *testing.T) {
 						},
 					},
 				}).
+				WithObjects(engineTestPod("test-isvc", "default", "my-served-model")).
 				Build()
 
 			r := &BenchmarkJobReconciler{
@@ -484,6 +514,7 @@ func TestBenchmarkJobReconciler_buildBenchmarkCommand(t *testing.T) {
 				WithObjects(tt.benchmarkJob).
 				WithObjects(tt.isvc).
 				WithObjects(baseModel).
+				WithObjects(engineTestPod("test-isvc", "default", "my-served-model")).
 				Build()
 
 			r := &BenchmarkJobReconciler{
@@ -503,6 +534,7 @@ func TestBenchmarkJobReconciler_buildBenchmarkCommand(t *testing.T) {
 				if len(args) == 0 {
 					t.Error("buildBenchmarkCommand() args is empty")
 				}
+				assertFlagValue(t, args, "--api-model-name", "my-served-model")
 			}
 		},
 		)
@@ -761,7 +793,8 @@ func TestBenchmarkJobReconciler_createPodSpec_NodeAffinity(t *testing.T) {
 
 	client := cfake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(benchmarkJob, inferenceService, baseModel).
+		WithObjects(benchmarkJob, inferenceService, baseModel,
+			engineTestPod("test-isvc", "default", "my-served-model")).
 		Build()
 
 	r := &BenchmarkJobReconciler{
@@ -858,7 +891,8 @@ func TestBenchmarkJobReconciler_createPodSpec_NodeAffinity_WithPodOverride(t *te
 
 	client := cfake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(benchmarkJob, inferenceService, baseModel).
+		WithObjects(benchmarkJob, inferenceService, baseModel,
+			engineTestPod("test-isvc", "default", "my-served-model")).
 		Build()
 
 	r := &BenchmarkJobReconciler{
@@ -1029,4 +1063,19 @@ func TestBenchmarkJobReconciler_updateStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertFlagValue fails unless args contains flag immediately followed by want.
+func assertFlagValue(t *testing.T, args []string, flag, want string) {
+	t.Helper()
+	for i, arg := range args {
+		if arg == flag {
+			if i+1 >= len(args) {
+				t.Fatalf("%s has no value in %v", flag, args)
+			}
+			assert.Equal(t, want, args[i+1])
+			return
+		}
+	}
+	t.Fatalf("%s not found in %v", flag, args)
 }

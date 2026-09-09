@@ -3,12 +3,14 @@ package benchmarkutils
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
@@ -66,9 +68,14 @@ func BuildInferenceServiceArgs(ctx context.Context, c client.Client, endpointSpe
 			return nil, fmt.Errorf("BaseModel %s has missing Storage or Path information", baseModelName)
 		}
 
+		modelName, err := resolveServedModelName(ctx, c, inferenceService)
+		if err != nil {
+			return nil, err
+		}
+
 		args := map[string]string{
 			"--api-key":         "sample-key", // TODO: Use actual service account key later
-			"--api-model-name":  "vllm-model",
+			"--api-model-name":  modelName,
 			"--model-tokenizer": *baseModel.Storage.Path,
 		}
 
@@ -104,6 +111,93 @@ func BuildInferenceServiceArgs(ctx context.Context, c client.Client, endpointSpe
 	}
 
 	return nil, fmt.Errorf("invalid EndpointSpec: both Endpoint and InferenceService are nil")
+}
+
+// Flags the supported engines use to name the model they serve. When --served-model-name
+// is absent both vLLM and SGLang fall back to the model location, so this code does too.
+const (
+	servedModelNameFlag = "--served-model-name"
+	vLLMModelFlag       = "--model"
+	sgLangModelPathFlag = "--model-path"
+)
+
+// resolveServedModelName returns the name the engine actually serves the model under. That
+// name goes into the `model` field of every request genai-bench sends, and engines reject
+// requests naming a model they do not serve.
+//
+// The value is read from the running engine pods rather than from the ServingRuntime or the
+// InferenceService. --served-model-name can be set on either one: runtimes normally carry it,
+// while an InferenceService may override the runner. Only the pod reflects the two merged, so
+// reading either spec alone silently misses the other.
+func resolveServedModelName(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService) (string, error) {
+	pods := &v1.PodList{}
+	if err := c.List(ctx, pods,
+		client.InNamespace(isvc.Namespace),
+		client.MatchingLabels{
+			constants.InferenceServicePodLabelKey: isvc.Name,
+			constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+		}); err != nil {
+		return "", fmt.Errorf("failed to list engine pods of InferenceService %s/%s: %w",
+			isvc.Namespace, isvc.Name, err)
+	}
+
+	var modelLocation string
+	for _, pod := range pods.Items {
+		for _, container := range pod.Spec.Containers {
+			argv := append(append([]string{}, container.Command...), container.Args...)
+
+			if name := flagValue(argv, servedModelNameFlag); name != "" {
+				return name, nil
+			}
+
+			// Remember the model location in case no container names the model explicitly.
+			if modelLocation != "" {
+				continue
+			}
+			for _, flag := range []string{vLLMModelFlag, sgLangModelPathFlag} {
+				if value := flagValue(argv, flag); value != "" {
+					modelLocation = expandContainerEnv(value, container.Env)
+					break
+				}
+			}
+		}
+	}
+
+	if modelLocation != "" {
+		return modelLocation, nil
+	}
+
+	return "", fmt.Errorf("cannot determine the served model name of InferenceService %s/%s: "+
+		"no engine pod container specifies %s, %s or %s",
+		isvc.Namespace, isvc.Name, servedModelNameFlag, vLLMModelFlag, sgLangModelPathFlag)
+}
+
+// flagValue returns the first value given to flag in argv, accepting both "--flag value" and
+// "--flag=value". vLLM accepts several names for one model and reports the first back to
+// clients, so the first is the one that matters here.
+func flagValue(argv []string, flag string) string {
+	for i, arg := range argv {
+		if value, found := strings.CutPrefix(arg, flag+"="); found {
+			return value
+		}
+		if arg == flag && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+			return argv[i+1]
+		}
+	}
+	return ""
+}
+
+// expandContainerEnv resolves Kubernetes $(VAR) references against the container's own
+// environment. OME runtime templates point the model flag at $(MODEL_PATH), so the raw
+// argument is a placeholder rather than the value the engine sees.
+func expandContainerEnv(value string, env []v1.EnvVar) string {
+	for _, envVar := range env {
+		if envVar.Value == "" {
+			continue
+		}
+		value = strings.ReplaceAll(value, "$("+envVar.Name+")", envVar.Value)
+	}
+	return value
 }
 
 // buildArgsFromEndpoint constructs the arguments map when an Endpoint is directly provided.
