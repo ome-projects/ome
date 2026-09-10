@@ -186,6 +186,9 @@ func BindEnvsRecursive(v *viper.Viper, iface interface{}, path string) error {
 			if err := BindEnvsRecursive(v, field.Addr().Interface(), fullPath); err != nil {
 				return err
 			}
+			// Binding the parent lets Viper shadow nested environment keys
+			// during Unmarshal, so bind only the leaves of a struct.
+			continue
 		}
 
 		if err := v.BindEnv(fullPath); err != nil {

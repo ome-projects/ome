@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -41,6 +43,83 @@ const expectedConfig = `a:
 imports:
     - intermediate.yaml
 `
+
+func TestBindEnvsRecursiveNestedConfig(t *testing.T) {
+	type checksum struct {
+		Algorithm string `mapstructure:"algorithm"`
+	}
+	type location struct {
+		Bucket   string   `mapstructure:"bucket"`
+		Object   string   `mapstructure:"object"`
+		Checksum checksum `mapstructure:"checksum"`
+	}
+	type config struct {
+		Source *location `mapstructure:"source"`
+		Target location  `mapstructure:"target"`
+	}
+
+	for _, initialized := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pointer_initialized_%t", initialized), func(t *testing.T) {
+			cfg := config{}
+			if initialized {
+				cfg.Source = &location{}
+			}
+			v := viper.New()
+			v.SetEnvPrefix("BIND_TEST")
+			v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+			v.AutomaticEnv()
+			t.Setenv("BIND_TEST_SOURCE_BUCKET", "source-bucket")
+			t.Setenv("BIND_TEST_SOURCE_OBJECT", "weights/model.bin")
+			t.Setenv("BIND_TEST_SOURCE_CHECKSUM_ALGORITHM", "sha256")
+			t.Setenv("BIND_TEST_TARGET_BUCKET", "target-bucket")
+			t.Setenv("BIND_TEST_TARGET_OBJECT", "copy/model.bin")
+			v.SetDefault("target.checksum.algorithm", "md5")
+
+			require.NoError(t, BindEnvsRecursive(v, &cfg, ""))
+			// Parent environment keys shadow nested keys in Viper's AllKeys,
+			// making environment-only fields disappear during Unmarshal.
+			require.ElementsMatch(t, []string{
+				"source.bucket", "source.object", "source.checksum.algorithm",
+				"target.bucket", "target.object", "target.checksum.algorithm",
+			}, v.AllKeys())
+			require.NoError(t, v.Unmarshal(&cfg))
+			assert.Equal(t, config{
+				Source: &location{Bucket: "source-bucket", Object: "weights/model.bin", Checksum: checksum{Algorithm: "sha256"}},
+				Target: location{Bucket: "target-bucket", Object: "copy/model.bin", Checksum: checksum{Algorithm: "md5"}},
+			}, cfg)
+		})
+	}
+}
+
+func TestBindEnvsRecursiveLeafTypes(t *testing.T) {
+	type config struct {
+		Name     *string           `mapstructure:"name"`
+		Enabled  bool              `mapstructure:"enabled"`
+		Workers  int               `mapstructure:"workers"`
+		Timeout  time.Duration     `mapstructure:"timeout"`
+		Labels   []string          `mapstructure:"labels"`
+		Metadata map[string]string `mapstructure:"metadata"`
+	}
+	cfg := config{}
+	v := viper.New()
+	v.SetEnvPrefix("BIND_TEST")
+	v.AutomaticEnv()
+	t.Setenv("BIND_TEST_NAME", "adapter")
+	t.Setenv("BIND_TEST_ENABLED", "true")
+	t.Setenv("BIND_TEST_WORKERS", "2")
+	t.Setenv("BIND_TEST_TIMEOUT", "30m")
+	t.Setenv("BIND_TEST_LABELS", "first,second")
+
+	require.NoError(t, BindEnvsRecursive(v, &cfg, ""))
+	assert.ElementsMatch(t, []string{"name", "enabled", "workers", "timeout", "labels", "metadata"}, v.AllKeys())
+	v.Set("metadata", map[string]string{"owner": "test"})
+	require.NoError(t, v.Unmarshal(&cfg))
+	name := "adapter"
+	assert.Equal(t, config{
+		Name: &name, Enabled: true, Workers: 2, Timeout: 30 * time.Minute,
+		Labels: []string{"first", "second"}, Metadata: map[string]string{"owner": "test"},
+	}, cfg)
+}
 
 func TestConfigFileImports(t *testing.T) {
 	// TODO: Would be ideal to use afero or similar in the future. Creating
