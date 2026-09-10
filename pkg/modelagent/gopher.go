@@ -47,6 +47,7 @@ type GopherTask struct {
 	SamePathWaitStartedAt  time.Time
 	NormalPriorityOnly     bool
 	RevalidationReplay     bool
+	DownloadPriority       v1beta1.ModelDownloadPriority
 }
 
 type activeDownload struct {
@@ -136,6 +137,16 @@ func NewGopher(
 	}, nil
 }
 
+// SetTaskSchedulerCapacity bounds queued model work while preserving delete
+// and high-priority model progress when the queue is under pressure.
+func (s *Gopher) SetTaskSchedulerCapacity(capacity int) {
+	if s.taskQueue == nil {
+		s.taskQueue = newGopherTaskQueue(capacity)
+		return
+	}
+	s.taskQueue.setCapacity(capacity)
+}
+
 func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int, numHighPriorityWorker int) {
 	startupSnapshotCtx, cancelStartupSnapshot := context.WithTimeout(context.Background(), defaultStartupReadySnapshotTimeout)
 	defer cancelStartupSnapshot()
@@ -203,7 +214,14 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	} else {
 		s.classifyStartupRevalidation(task)
 	}
-	s.taskQueue.enqueue(task)
+	result := s.taskQueue.enqueue(task)
+	if !result.accepted {
+		s.logger.Infof("Model-agent scheduler closed before task could be queued: %s", getModelInfoForLogging(task))
+		return
+	}
+	if result.deferred {
+		s.logger.Debugf("Deferred model-agent task in scheduler-owned pending state: %s", getModelInfoForLogging(task))
+	}
 }
 
 func (s *Gopher) runWorker() {

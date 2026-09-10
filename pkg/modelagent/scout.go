@@ -108,7 +108,6 @@ func NewScout(ctx context.Context, nodeName string,
 		"baseModelInformer":        baseModelInformer.Informer(),
 		"clusterBaseModelInformer": clusterBaseModelInformer.Informer(),
 	}
-
 	for name, informer := range informers {
 		err := informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
 			// Pipe to the default handler first, which just logs the error
@@ -277,8 +276,9 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		}
 
 		gopherTask := &GopherTask{
-			TaskType:  Download,
-			BaseModel: baseModel,
+			TaskType:         Download,
+			BaseModel:        baseModel,
+			DownloadPriority: effectiveModelDownloadPriority(baseModel.Spec.Storage, &baseModel.Status),
 			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 				IsTensorrtLLMModel: IsTensorrtLLMModel,
 				ShapeAlias:         w.nodeShapeAlias,
@@ -324,6 +324,7 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		gopherTask := &GopherTask{
 			TaskType:         Download,
 			ClusterBaseModel: clusterBaseModel,
+			DownloadPriority: effectiveModelDownloadPriority(clusterBaseModel.Spec.Storage, &clusterBaseModel.Status),
 			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 				IsTensorrtLLMModel: IsTensorrtLLMModel,
 				ShapeAlias:         w.nodeShapeAlias,
@@ -741,6 +742,7 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseM
 	gopherTask := &GopherTask{
 		TaskType:         DownloadOverride,
 		ClusterBaseModel: clusterBaseModel,
+		DownloadPriority: effectiveModelDownloadPriority(clusterBaseModel.Spec.Storage, &clusterBaseModel.Status),
 		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 			IsTensorrtLLMModel: IsTensorrtLLMModel,
 			ShapeAlias:         w.nodeShapeAlias,
@@ -760,8 +762,9 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.
 		modelType = modelTypeFromMetadata
 	}
 	gopherTask := &GopherTask{
-		TaskType:  DownloadOverride,
-		BaseModel: baseModel,
+		TaskType:         DownloadOverride,
+		BaseModel:        baseModel,
+		DownloadPriority: effectiveModelDownloadPriority(baseModel.Spec.Storage, &baseModel.Status),
 		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 			IsTensorrtLLMModel: IsTensorrtLLMModel,
 			ShapeAlias:         w.nodeShapeAlias,
@@ -770,4 +773,14 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.
 	}
 	w.logger.Infof("generate DownloadOverride task %v", baseModel.Spec.DisplayName)
 	w.gopherChan <- gopherTask
+}
+
+func effectiveModelDownloadPriority(storage *v1beta1.StorageSpec, status *v1beta1.ModelStatusSpec) v1beta1.ModelDownloadPriority {
+	if status != nil && status.DownloadScheduling != nil && status.DownloadScheduling.ServingDemand {
+		return v1beta1.ModelDownloadPriorityHigh
+	}
+	if storage != nil && storage.DownloadPriority != nil {
+		return *storage.DownloadPriority
+	}
+	return v1beta1.ModelDownloadPriorityStandard
 }

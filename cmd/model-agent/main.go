@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -43,7 +44,9 @@ type config struct {
 	downloadAuthType      string
 	numDownloadWorker     int
 	numHighPriorityWorker int
-	samePathWaitTimeout   time.Duration
+	taskSchedulerCapacity int
+	samePathReuseTimeout  time.Duration
+	legacySamePathTimeout time.Duration
 	namespace             string
 	logLevel              string
 }
@@ -75,7 +78,10 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.multipartConcurrency, "multipart-concurrency", 4, "Number of concurrent multipart download workers per gopher")
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
-	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
+	rootCmd.PersistentFlags().IntVar(&cfg.taskSchedulerCapacity, "task-scheduler-capacity", 4096, "Maximum number of distinct queued model tasks")
+	rootCmd.PersistentFlags().DurationVar(&cfg.samePathReuseTimeout, "same-path-reuse-wait-timeout", 30*time.Minute, "Maximum time to wait for another task populating the same local artifact path before resuming the normal download flow")
+	rootCmd.PersistentFlags().DurationVar(&cfg.legacySamePathTimeout, "same-path-wait-timeout", 0, "Deprecated alias for --same-path-reuse-wait-timeout")
+	_ = rootCmd.PersistentFlags().MarkDeprecated("same-path-wait-timeout", "use --same-path-reuse-wait-timeout")
 	rootCmd.PersistentFlags().StringVar(&cfg.namespace, "namespace", "ome", "Kubernetes namespace to use")
 	rootCmd.PersistentFlags().StringVar(&cfg.logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
@@ -199,6 +205,7 @@ func initializeComponents(
 	metrics *modelagent.Metrics,
 	gopherTaskChan chan *modelagent.GopherTask,
 	logger *Logger,
+	flags *pflag.FlagSet,
 ) (*modelagent.Scout, *modelagent.Gopher, error) {
 	// Create node label reconciler for labeling the node based on model status
 	nodeLabelReconciler := modelagent.NewNodeLabelReconciler(cfg.nodeName, kubeClient, cfg.nodeLabelRetry, logger)
@@ -258,6 +265,10 @@ func initializeComponents(
 	logger.Infof("Configured Xet Hugging Face hub client with max concurrent downloads: %d", xetHubConfig.MaxConcurrentDownloads)
 
 	// Create a Gopher instance for downloading models
+	samePathReuseTimeout, err := configuredSamePathReuseTimeout(flags)
+	if err != nil {
+		return nil, nil, err
+	}
 	gopher, err := modelagent.NewGopher(
 		modelConfigParser,
 		configMapReconciler,
@@ -268,7 +279,7 @@ func initializeComponents(
 		cfg.downloadRetry,
 		cfg.modelsRootDir,
 		gopherTaskChan,
-		cfg.samePathWaitTimeout,
+		samePathReuseTimeout,
 		nodeLabelReconciler,
 		metrics,
 		logger,
@@ -278,8 +289,21 @@ func initializeComponents(
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)
 	}
+	gopher.SetTaskSchedulerCapacity(cfg.taskSchedulerCapacity)
 
 	return scout, gopher, nil
+}
+
+func configuredSamePathReuseTimeout(flags *pflag.FlagSet) (time.Duration, error) {
+	canonicalSet := flags.Changed("same-path-reuse-wait-timeout")
+	legacySet := flags.Changed("same-path-wait-timeout")
+	if canonicalSet && legacySet && cfg.samePathReuseTimeout != cfg.legacySamePathTimeout {
+		return 0, fmt.Errorf("--same-path-reuse-wait-timeout and deprecated --same-path-wait-timeout disagree")
+	}
+	if legacySet {
+		return cfg.legacySamePathTimeout, nil
+	}
+	return cfg.samePathReuseTimeout, nil
 }
 
 // runCommand is the main entry point executed by Cobra
@@ -335,6 +359,7 @@ func runCommand(cmd *cobra.Command, args []string) {
 		metrics,
 		gopherTaskChan,
 		logger,
+		cmd.PersistentFlags(),
 	)
 	if err != nil {
 		logger.Fatalf("Failed to initialize components: %v", err)

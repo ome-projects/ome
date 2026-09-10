@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,7 +115,7 @@ func TestDefaultConfig(t *testing.T) {
 	testCmd.Flags().StringVar(&cfg.downloadAuthType, "download-auth-type", "instance-principal", "authentication method for model download")
 	testCmd.Flags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 3, "number of download workers")
 	testCmd.Flags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "number of high-priority workers")
-	testCmd.Flags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "same-path wait timeout")
+	testCmd.Flags().DurationVar(&cfg.samePathReuseTimeout, "same-path-reuse-wait-timeout", 30*time.Minute, "same-path reuse wait timeout")
 	testCmd.Flags().StringVar(&cfg.namespace, "namespace", "ome", "the namespace of the ome model agents daemon set")
 
 	// Call initConfig to set cfg.nodeName
@@ -130,8 +131,72 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "instance-principal", cfg.downloadAuthType)
 	assert.Equal(t, 3, cfg.numDownloadWorker)
 	assert.Equal(t, 1, cfg.numHighPriorityWorker)
-	assert.Equal(t, 30*time.Minute, cfg.samePathWaitTimeout)
+	assert.Equal(t, 30*time.Minute, cfg.samePathReuseTimeout)
 	assert.Equal(t, "ome", cfg.namespace)
+}
+
+func TestSchedulingContractFlagsAreRegistered(t *testing.T) {
+	tests := []struct {
+		name         string
+		defaultValue string
+	}{
+		{name: "num-high-priority-worker", defaultValue: "1"},
+		{name: "task-scheduler-capacity", defaultValue: "4096"},
+		{name: "same-path-reuse-wait-timeout", defaultValue: "30m0s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flag := rootCmd.PersistentFlags().Lookup(tt.name)
+			require.NotNil(t, flag, "model-agent must expose --%s", tt.name)
+			assert.Equal(t, tt.defaultValue, flag.DefValue)
+		})
+	}
+}
+
+func TestConfiguredSamePathReuseTimeoutAcceptsDeprecatedAlias(t *testing.T) {
+	original := cfg
+	t.Cleanup(func() { cfg = original })
+
+	flags := parseSamePathTimeoutFlags(t, "--same-path-wait-timeout=45m")
+	timeout, err := configuredSamePathReuseTimeout(flags)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, timeout)
+}
+
+func TestConfiguredSamePathReuseTimeoutRejectsConflictingFlags(t *testing.T) {
+	original := cfg
+	t.Cleanup(func() { cfg = original })
+
+	flags := parseSamePathTimeoutFlags(t,
+		"--same-path-reuse-wait-timeout=30m",
+		"--same-path-wait-timeout=45m",
+	)
+	_, err := configuredSamePathReuseTimeout(flags)
+	require.ErrorContains(t, err, "disagree")
+}
+
+func TestConfiguredSamePathReuseTimeoutAcceptsMatchingFlags(t *testing.T) {
+	original := cfg
+	t.Cleanup(func() { cfg = original })
+
+	flags := parseSamePathTimeoutFlags(t,
+		"--same-path-reuse-wait-timeout=45m",
+		"--same-path-wait-timeout=45m",
+	)
+	timeout, err := configuredSamePathReuseTimeout(flags)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, timeout)
+}
+
+func parseSamePathTimeoutFlags(t *testing.T, args ...string) *pflag.FlagSet {
+	t.Helper()
+	cfg = &config{}
+	flags := pflag.NewFlagSet("same-path-timeout-test", pflag.ContinueOnError)
+	flags.DurationVar(&cfg.samePathReuseTimeout, "same-path-reuse-wait-timeout", 30*time.Minute, "")
+	flags.DurationVar(&cfg.legacySamePathTimeout, "same-path-wait-timeout", 0, "")
+	require.NoError(t, flags.Parse(args))
+	return flags
 }
 
 func TestInitializeLogger(t *testing.T) {

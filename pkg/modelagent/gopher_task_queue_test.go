@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -250,6 +251,130 @@ func TestGopherTaskQueueDeleteSupersedesPendingRevalidationReplayForSameModel(t 
 	require.True(t, ok)
 	assert.Equal(t, Delete, task.TaskType)
 	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherTaskQueueHighPrioritySupersedesBackgroundForSameModel(t *testing.T) {
+	queue := newGopherTaskQueue()
+	model := &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "service-ns", UID: "model-uid"},
+	}
+
+	require.True(t, queue.enqueue(&GopherTask{
+		TaskType:         Download,
+		BaseModel:        model,
+		DownloadPriority: v1beta1.ModelDownloadPriorityBackground,
+	}).accepted)
+	require.True(t, queue.enqueue(&GopherTask{
+		TaskType:         Download,
+		BaseModel:        model,
+		DownloadPriority: v1beta1.ModelDownloadPriorityHigh,
+	}).accepted)
+
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Equal(t, v1beta1.ModelDownloadPriorityHigh, task.DownloadPriority)
+	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherTaskQueueDefersBackgroundWhenCapacityIsFull(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	first := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "service-ns", UID: "first-uid"},
+	}}
+	second := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "service-ns", UID: "second-uid"},
+	}}
+
+	assert.True(t, queue.enqueue(first).accepted)
+	result := queue.enqueue(second)
+	assert.True(t, result.accepted)
+	assert.True(t, result.deferred)
+	assert.Equal(t, 2, queue.len())
+
+	task, ok := queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, first, task)
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, second, task)
+}
+
+func TestGopherTaskQueueHighPriorityPreservesDisplacedBackgroundAtCapacity(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	background := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityBackground, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "background", Namespace: "service-ns", UID: "background-uid"},
+	}}
+	demand := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityHigh, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "demand", Namespace: "service-ns", UID: "demand-uid"},
+	}}
+
+	assert.True(t, queue.enqueue(background).accepted)
+	result := queue.enqueue(demand)
+	require.True(t, result.accepted)
+	assert.False(t, result.deferred)
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Equal(t, "demand", task.BaseModel.Name)
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Equal(t, "background", task.BaseModel.Name)
+	assert.Equal(t, 0, queue.len())
+}
+
+func TestGopherDispatcherObservesHighTaskWhileBackgroundWaitsForCapacity(t *testing.T) {
+	queue := newGopherTaskQueue(1)
+	first := &GopherTask{TaskType: Download, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "service-ns", UID: "first-uid"},
+	}}
+	background := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityBackground, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "background", Namespace: "service-ns", UID: "background-uid"},
+	}}
+	demand := &GopherTask{TaskType: Download, DownloadPriority: v1beta1.ModelDownloadPriorityHigh, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "demand", Namespace: "service-ns", UID: "demand-uid"},
+	}}
+	require.True(t, queue.enqueue(first).accepted)
+	gopherChan := make(chan *GopherTask)
+	gopher := &Gopher{gopherChan: gopherChan, taskQueue: queue, logger: zap.NewNop().Sugar()}
+	stopCh := make(chan struct{})
+	dispatchDone := make(chan struct{})
+	go func() {
+		gopher.dispatchTasks(stopCh)
+		close(dispatchDone)
+	}()
+
+	sendTaskAndWait(t, gopherChan, background)
+	sendTaskAndWait(t, gopherChan, demand)
+
+	task, ok := queue.popHighPriority()
+	require.True(t, ok)
+	assert.Same(t, demand, task)
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, first, task)
+	task, ok = queue.popNormal()
+	require.True(t, ok)
+	assert.Same(t, background, task)
+
+	close(stopCh)
+	select {
+	case <-dispatchDone:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not stop")
+	}
+}
+
+func sendTaskAndWait(t *testing.T, ch chan<- *GopherTask, task *GopherTask) {
+	t.Helper()
+	sent := make(chan struct{})
+	go func() {
+		ch <- task
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(time.Second):
+		t.Fatalf("dispatcher did not accept %s", getModelInfoForLogging(task))
+	}
 }
 
 func TestGopherTaskQueueEnqueueWakesMatchingBlockedWorker(t *testing.T) {
