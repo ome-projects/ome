@@ -7447,8 +7447,13 @@
           "type": "string"
         },
         "downloadPriority": {
-          "description": "DownloadPriority is the persistent user-selected priority for materializing this model on eligible nodes. Serving demand observed by the model controller can raise, but never lower, this priority.",
-          "type": "string"
+          "description": "DownloadPriority is the persistent user-selected priority for materializing this model on eligible nodes. Serving demand observed by the model controller can raise, but never lower, this priority.\n\nPossible enum values:\n - `\"Background\"`\n - `\"High\"`\n - `\"Standard\"`",
+          "type": "string",
+          "enum": [
+            "Background",
+            "High",
+            "Standard"
+          ]
         },
         "key": {
           "description": "StorageKey is the name of the key in a Kubernetes Secret used to authenticate access to the model storage. This key will be used to fetch credentials during model download or access.",

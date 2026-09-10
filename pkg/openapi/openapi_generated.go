@@ -13325,9 +13325,10 @@ func schema_pkg_apis_ome_v1beta1_StorageSpec(ref common.ReferenceCallback) commo
 					},
 					"downloadPriority": {
 						SchemaProps: spec.SchemaProps{
-							Description: "DownloadPriority is the persistent user-selected priority for materializing this model on eligible nodes. Serving demand observed by the model controller can raise, but never lower, this priority.",
+							Description: "DownloadPriority is the persistent user-selected priority for materializing this model on eligible nodes. Serving demand observed by the model controller can raise, but never lower, this priority.\n\nPossible enum values:\n - `\"Background\"`\n - `\"High\"`\n - `\"Standard\"`",
 							Type:        []string{"string"},
 							Format:      "",
+							Enum:        []interface{}{"Background", "High", "Standard"},
 						},
 					},
 				},

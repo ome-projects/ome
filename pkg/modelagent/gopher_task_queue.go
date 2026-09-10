@@ -73,6 +73,9 @@ func (q *gopherTaskQueue) enqueueLocked(task *GopherTask) gopherTaskEnqueueResul
 	if q.closed {
 		return gopherTaskEnqueueResult{}
 	}
+	if retained := q.retainedTaskLocked(task); retained != nil {
+		return gopherTaskEnqueueResult{accepted: true, deferred: q.isPendingLocked(retained)}
+	}
 	q.removeSupersededLocked(task)
 	if task.TaskType == Delete {
 		// Deletion is a safety operation. Preserve its existing ability to exceed
@@ -89,6 +92,50 @@ func (q *gopherTaskQueue) enqueueLocked(task *GopherTask) gopherTaskEnqueueResul
 	}
 }
 
+// retainedTaskLocked coalesces retries into the strongest queued intent without
+// moving that intent to the back of its FIFO or replacing its wait deadline.
+// Fresh informer observations still supersede old downloads, including when
+// the user lowers priority or the controller removes serving demand.
+func (q *gopherTaskQueue) retainedTaskLocked(incoming *GopherTask) *GopherTask {
+	uid := getModelUID(incoming)
+	if uid == "" || incoming.TaskType == Delete || isFreshModelDownloadTask(incoming) {
+		return nil
+	}
+	selected := incoming
+	retained := false
+	for _, tasks := range [][]*GopherTask{
+		q.high, q.normalDownload, q.normalRevalidation,
+		q.pendingHigh, q.pendingDownload, q.pendingRevalidation,
+	} {
+		for _, queued := range tasks {
+			if getModelUID(queued) == uid && continuationSupersededBy(queued, selected) {
+				selected = queued
+				retained = true
+			}
+		}
+	}
+	if !retained {
+		return nil
+	}
+	return selected
+}
+
+func continuationSupersededBy(queued, incoming *GopherTask) bool {
+	if queued.TaskType == Delete || incoming.TaskType == Delete {
+		return queued.TaskType == Delete
+	}
+	if isFreshModelDownloadTask(queued) || isFreshModelDownloadTask(incoming) {
+		return isFreshModelDownloadTask(queued)
+	}
+	if queuedLane, incomingLane := taskQueueLane(queued), taskQueueLane(incoming); queuedLane != incomingLane {
+		return queuedLane < incomingLane
+	}
+	if queued.TaskType != incoming.TaskType {
+		return queued.TaskType == DownloadOverride
+	}
+	return true
+}
+
 func (q *gopherTaskQueue) removeSupersededLocked(task *GopherTask) {
 	if task.TaskType == Delete {
 		q.high = removeTasksForModelUID(q.high, task)
@@ -99,14 +146,12 @@ func (q *gopherTaskQueue) removeSupersededLocked(task *GopherTask) {
 		q.pendingRevalidation = removeTasksForModelUID(q.pendingRevalidation, task)
 		return
 	}
-	if isFreshModelDownloadTask(task) {
-		q.high = removeSupersededTasks(q.high, task)
-		q.normalDownload = removeSupersededTasks(q.normalDownload, task)
-		q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
-	}
-	// Deferred work is coalesced by object UID for every task class. This keeps
-	// scheduler-owned overflow proportional to model cardinality rather than
-	// informer event volume while retaining same-name recreations with new UIDs.
+	// Only a fresh observation or stronger continuation reaches this point.
+	// Coalesce across runnable and deferred lanes so displacement cannot leave
+	// duplicate retries. Delete tasks and different object UIDs remain distinct.
+	q.high = removeSupersededTasks(q.high, task)
+	q.normalDownload = removeSupersededTasks(q.normalDownload, task)
+	q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
 	q.pendingHigh = removeSupersededTasks(q.pendingHigh, task)
 	q.pendingDownload = removeSupersededTasks(q.pendingDownload, task)
 	q.pendingRevalidation = removeSupersededTasks(q.pendingRevalidation, task)

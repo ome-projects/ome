@@ -171,6 +171,7 @@ const (
 // ModelDownloadPriority controls the relative order of queued node-local model
 // downloads. It does not affect Kubernetes pod scheduling and does not preempt
 // an active download.
+// +enum
 // +kubebuilder:validation:Enum=Background;Standard;High
 type ModelDownloadPriority string
 
