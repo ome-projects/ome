@@ -413,7 +413,7 @@ and therefore Alfred — write to the wider cluster):
 
 | Target | Resource | Write | Writer | Why | New RBAC for Policy #2? |
 |--------|----------|-------|--------|-----|-------------------------|
-| Alfred namespace | ConfigMap (`alfred-recommendations`) | `get`, `update`, `patch`, `delete` | Reporter | Alfred's pre-created output | No |
+| Alfred namespace | ConfigMap (`alfred-recommendations`) | `get`, `update`, `patch` | Reporter | Alfred's pre-created output | No |
 | Alfred namespace | Lease | Full read/write | engine (leader election) | Leader election | No |
 | Any namespace | Events (on ISVC **and** Node) | `create`, `patch` | Reporter | Surface recommendations, migrations, evacuation + repair signals | No — `events` already granted |
 | Any namespace | InferenceService annotations | `patch` (narrow to `ome.io/migration-request-v1-*`) | Dispatcher | OEP-0007 migration verb — the single executable contract for supported workload owners, defrag **and** evacuation | No — same annotation both policies |
@@ -2020,7 +2020,7 @@ the eviction verb:
   verbs: [get, list, watch]
 - apiGroups: [""]
   resources: [configmaps]
-  verbs: [update, patch, delete]
+  verbs: [update, patch]
   resourceNames:
     - alfred-config
     - alfred-recommendations
@@ -2071,7 +2071,7 @@ perform on that resource:
 | `inferencereplicas` | get, list, watch | nothing — read-only | stable OMENative Instance identity, lifecycle state, and authoritative migration status |
 | OMENative capability `lease` | get | nothing — read-only | proves that a compatible InferenceReplica executor is currently enabled and renewing |
 | `inferenceservices` | patch | add/retry one `ome.io/migration-request-v1-*` annotation only | the consuming controller owns acknowledgement deletion; Alfred's patch must not touch spec, status, labels, finalizers, or other annotations (enforced cluster-side, below) |
-| `configmaps` (named) | update, patch, delete | mutate only `alfred-config` / `alfred-recommendations` | the caretaker does not create ConfigMaps at runtime; Helm pre-creates them |
+| `configmaps` (named) | update, patch | mutate only `alfred-config` / `alfred-recommendations` | the caretaker does not create ConfigMaps at runtime; Helm pre-creates them |
 | `events` | create, patch | emit observability events | events are the audit trail; no other side effect |
 | `leases` | create, get, update | leader-election Lease | standard controller pattern |
 
@@ -2131,7 +2131,7 @@ on ambiguous CEL behavior.
 
 **ConfigMap write boundary.** The caretaker does not create ConfigMaps at
 runtime. Helm pre-creates `alfred-config` and, if recommendation snapshots are
-enabled, `alfred-recommendations`; the caretaker only updates/patches/deletes
+enabled, `alfred-recommendations`; the caretaker only updates/patches
 those named objects.
 
 ### Observability
