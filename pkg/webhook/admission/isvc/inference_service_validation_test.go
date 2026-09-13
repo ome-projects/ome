@@ -250,6 +250,30 @@ func TestInferenceServiceValidator_ValidateUpdate_Terminating(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Nil(t, warnings)
 	})
+
+	t.Run("terminating isvc with spec.model removed admitted", func(t *testing.T) {
+		// Not a dangling reference but no reference at all. With neither
+		// spec.model nor spec.runtime set, a live ISVC is rejected by the
+		// structural "at least one of" rule — which runs well before any
+		// cluster lookup — so this pins that the guard clears structural
+		// rules too, not just the ones that resolve cluster state.
+		noModel := func(terminating bool, finalizers ...string) *v1beta1.InferenceService {
+			obj := isvc("disabled-model", terminating, finalizers...)
+			obj.Spec.Model = nil
+			return obj
+		}
+
+		_, err := validator.ValidateUpdate(context.Background(),
+			noModel(false, finalizer), noModel(false, finalizer))
+		assert.Error(t, err, "a live ISVC with no model and no runtime must still be rejected")
+		assert.Contains(t, err.Error(), "at least one of spec.model or spec.runtime must be set")
+
+		warnings, err := validator.ValidateUpdate(context.Background(),
+			noModel(true, finalizer), noModel(true))
+
+		assert.NoError(t, err)
+		assert.Nil(t, warnings)
+	})
 }
 
 func TestInferenceServiceValidator_ValidateDelete(t *testing.T) {
