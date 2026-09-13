@@ -163,6 +163,95 @@ func TestInferenceServiceValidator_ValidateUpdate(t *testing.T) {
 	}
 }
 
+// A terminating InferenceService is admitted on UPDATE whatever its spec
+// resolves to. Removing the controller's finalizer is an UPDATE, so it is
+// ValidateUpdate — not the no-op ValidateDelete — that gates teardown, and
+// this webhook is failurePolicy=fail: rejecting that write leaves the object
+// stuck in Terminating forever with its children never garbage-collected.
+// Regression test for the report that disabling a referenced BaseModel made
+// every InferenceService pointing at it undeletable.
+func TestInferenceServiceValidator_ValidateUpdate_Terminating(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+
+	disabledModel := &v1beta1.ClusterBaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "disabled-model"},
+		Spec: v1beta1.BaseModelSpec{
+			ModelArchitecture: stringPtr("llama"),
+			ModelFormat:       v1beta1.ModelFormat{Name: "llama", Version: stringPtr("1")},
+			ModelExtensionSpec: v1beta1.ModelExtensionSpec{
+				Disabled: boolPtr(true),
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(disabledModel).
+		Build()
+	validator := &InferenceServiceValidator{
+		Client:          fakeClient,
+		RuntimeSelector: runtimeselector.New(fakeClient),
+	}
+
+	// modelRef names the model the ISVC points at; terminating stamps the
+	// deletionTimestamp the apiserver sets once `kubectl delete` has run,
+	// and finalizers is the list the controller is about to empty.
+	isvc := func(modelRef string, terminating bool, finalizers ...string) *v1beta1.InferenceService {
+		obj := &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "test-isvc",
+				Namespace:  "default",
+				Finalizers: finalizers,
+			},
+			Spec: v1beta1.InferenceServiceSpec{
+				Model: &v1beta1.ModelRef{Name: modelRef},
+				// Engine present with no runner config so the validator
+				// takes the model/runtime resolution path.
+				Engine: &v1beta1.EngineSpec{},
+			},
+		}
+		if terminating {
+			now := metav1.Now()
+			obj.DeletionTimestamp = &now
+		}
+		return obj
+	}
+
+	const finalizer = "inferenceservice.finalizers"
+
+	t.Run("live isvc still rejected", func(t *testing.T) {
+		// The guard is scoped to teardown: on an object that is not being
+		// deleted the disabled-model rule keeps firing as before.
+		_, err := validator.ValidateUpdate(context.Background(),
+			isvc("disabled-model", false, finalizer),
+			isvc("disabled-model", false, finalizer))
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "model disabled-model is disabled")
+	})
+
+	t.Run("finalizer removal on terminating isvc admitted", func(t *testing.T) {
+		warnings, err := validator.ValidateUpdate(context.Background(),
+			isvc("disabled-model", true, finalizer),
+			isvc("disabled-model", true))
+
+		assert.NoError(t, err)
+		assert.Nil(t, warnings)
+	})
+
+	t.Run("terminating isvc whose model is gone admitted", func(t *testing.T) {
+		// Same wedge, other cause: the model was deleted rather than
+		// disabled, so resolution fails outright. Teardown must not care.
+		warnings, err := validator.ValidateUpdate(context.Background(),
+			isvc("deleted-model", true, finalizer),
+			isvc("deleted-model", true))
+
+		assert.NoError(t, err)
+		assert.Nil(t, warnings)
+	})
+}
+
 func TestInferenceServiceValidator_ValidateDelete(t *testing.T) {
 	tests := []struct {
 		name    string

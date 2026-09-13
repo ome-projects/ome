@@ -114,6 +114,17 @@ func (v *InferenceServiceValidator) ValidateCreate(ctx context.Context, isvc *v1
 }
 
 func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc, isvc *v1beta1.InferenceService) (admission.Warnings, error) {
+	// An ISVC already under deletion is admitted unconditionally.
+	// Removing the controller's finalizer is an UPDATE, so it lands here
+	// and never in the no-op ValidateDelete, and this webhook is
+	// fail-closed (failurePolicy=fail): a denied finalizer removal wedges
+	// the object in Terminating forever. Nothing is given up by skipping —
+	// the controller stops reconciling a terminating ISVC (it returns
+	// right after dropping the finalizer), so the spec the rules below
+	// protect is never acted on again.
+	if !oldIsvc.DeletionTimestamp.IsZero() {
+		return nil, nil
+	}
 	if err := validateLegacyAutoscalerFieldsFromCtx(ctx); err != nil {
 		return nil, err
 	}
