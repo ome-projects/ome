@@ -33,6 +33,17 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# Spread replicas across nodes so one node drain cannot take the leader and
+# every standby at once. ScheduleAnyway keeps single-node clusters
+# schedulable; set to [] to disable.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        control-plane: ome-alfred
+
 metrics:
   port: 8080
   serviceMonitor:
@@ -101,8 +112,9 @@ alfredConfig:
   perWorkloadCooldownMinutes: 30
   perNodeCooldownMinutes: 10
 
-  # Execution surfaces — all annotation-mediated; owning controllers execute.
-  rawDeploymentMigrationEnabled: true
+  # Reserved compatibility field; RawDeployment remains advisory-only.
+  rawDeploymentMigrationEnabled: false
+  # Future execution surfaces; owning controllers execute annotations.
   omenativeMigrationEnabled: true
   lwsRecommendationsEnabled: true
 

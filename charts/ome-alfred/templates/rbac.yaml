@@ -46,6 +46,8 @@ rules:
     resources:
       - inferenceservices
       - inferenceservices/status
+      - inferencereplicas
+      - inferencereplicas/status
       - servingruntimes
       - clusterservingruntimes
       - basemodels
@@ -87,13 +89,13 @@ metadata:
 rules:
   # ConfigMaps: read for policy loading — Alfred's informer cache is scoped
   # to this namespace — and write only to the two pre-created Alfred-owned
-  # ConfigMaps, which it never creates at runtime.
+  # ConfigMaps, which it never creates or deletes at runtime.
   - apiGroups: [ "" ]
     resources: [ "configmaps" ]
     verbs: [ "get", "list", "watch" ]
   - apiGroups: [ "" ]
     resources: [ "configmaps" ]
-    verbs: [ "update", "patch", "delete" ]
+    verbs: [ "update", "patch" ]
     resourceNames:
       - {{ .Values.configMapName }}
       - {{ include "ome-alfred.recommendationsName" . }}

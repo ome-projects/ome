@@ -36,19 +36,32 @@ func TestShippedDefaultConfigsAreValid(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// The manifest is multi-document; alfred-config comes first.
-			first := strings.SplitN(string(raw), "\n---", 2)[0]
-			var cm struct {
-				Data map[string]string `json:"data"`
+			// Select the document by name, not position: a reordered manifest must
+			// fail naming the real cause rather than a misleading missing key.
+			for _, part := range strings.Split(string(raw), "\n---") {
+				// Declared per document: unmarshalling into a reused struct keeps
+				// fields absent from the next document, so a nameless one would
+				// inherit the previous document's name.
+				var cm struct {
+					Metadata struct {
+						Name string `json:"name"`
+					} `json:"metadata"`
+					Data map[string]string `json:"data"`
+				}
+				if err := yaml.Unmarshal([]byte(part), &cm); err != nil {
+					t.Fatal(err)
+				}
+				if cm.Metadata.Name != "alfred-config" {
+					continue
+				}
+				doc, ok := cm.Data["config.yaml"]
+				if !ok {
+					t.Fatal("config.yaml key missing from alfred-config manifest")
+				}
+				return []byte(doc)
 			}
-			if err := yaml.Unmarshal([]byte(first), &cm); err != nil {
-				t.Fatal(err)
-			}
-			doc, ok := cm.Data["config.yaml"]
-			if !ok {
-				t.Fatal("config.yaml key missing from alfred-config manifest")
-			}
-			return []byte(doc)
+			t.Fatal("alfred-config ConfigMap not found in config/alfred/configmap.yaml")
+			return nil
 		},
 	}
 

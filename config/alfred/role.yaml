@@ -18,7 +18,7 @@ rules:
     verbs: [ "get", "list", "watch" ]
   - apiGroups: [ "" ]
     resources: [ "configmaps" ]
-    verbs: [ "update", "patch", "delete" ]
+    verbs: [ "update", "patch" ]
     resourceNames:
       - alfred-config
       - alfred-recommendations

@@ -17,7 +17,7 @@ ome-resources' ome.imageWithHub: if the repository already contains '/', the
 hub is ignored.
 */}}
 {{- define "ome-alfred.image" -}}
-{{- $hub := .Values.global.hub }}
+{{- $hub := (.Values.global).hub }}
 {{- $repo := .Values.image.repository }}
 {{- $tag := .Values.image.tag | toString }}
 {{- if and $hub (not (contains "/" $repo)) -}}
