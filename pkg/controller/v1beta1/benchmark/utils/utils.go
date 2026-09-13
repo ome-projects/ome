@@ -147,7 +147,7 @@ func resolveServedModelName(ctx context.Context, c client.Client, isvc *v1beta1.
 			argv := append(append([]string{}, container.Command...), container.Args...)
 
 			if name := flagValue(argv, servedModelNameFlag); name != "" {
-				return name, nil
+				return expandContainerEnv(name, container.Env), nil
 			}
 
 			// Remember the model location in case no container names the model explicitly.
@@ -188,8 +188,8 @@ func flagValue(argv []string, flag string) string {
 }
 
 // expandContainerEnv resolves Kubernetes $(VAR) references against the container's own
-// environment. OME runtime templates point the model flag at $(MODEL_PATH), so the raw
-// argument is a placeholder rather than the value the engine sees.
+// environment. OME runtime templates point these flags at $(SERVED_MODEL_NAME) and
+// $(MODEL_PATH), so the raw argument is a placeholder rather than the value the engine sees.
 func expandContainerEnv(value string, env []v1.EnvVar) string {
 	for _, envVar := range env {
 		if envVar.Value == "" {

@@ -572,6 +572,14 @@ func TestResolveServedModelName(t *testing.T) {
 			want: "primary",
 		},
 		{
+			name: "$(VAR) in --served-model-name is expanded",
+			objects: []client.Object{enginePod("p", ns, isvcName,
+				[]string{"python3", "--served-model-name", "$(SERVED_MODEL_NAME)"},
+				[]v1.EnvVar{{Name: "SERVED_MODEL_NAME", Value: "vllm-model"}},
+			)},
+			want: "vllm-model",
+		},
+		{
 			name: "falls back to --model with $(VAR) expanded",
 			objects: []client.Object{enginePod("p", ns, isvcName,
 				[]string{"python3", "--model", "$(MODEL_PATH)"},
