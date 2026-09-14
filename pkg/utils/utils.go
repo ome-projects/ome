@@ -127,6 +127,42 @@ func IsGPUEnabled(requirements v1.ResourceRequirements, acceleratorResources []s
 	return false
 }
 
+// PodRequestsAccelerator reports whether any container of spec requests one of
+// acceleratorResources in either Requests or Limits, counting init containers
+// alongside the runtime ones. The unit is the whole pod, which is the unit an
+// admission or accounting decision is made over.
+//
+// It is wider than IsGPUEnabled on both counts, deliberately: that one reads
+// Limits alone on a single container's requirements, and its callers rely on
+// exactly that. Here a chip held through Requests, or held only for the length
+// of an init container, is capacity held all the same.
+//
+// It applies no fallback either — an empty acceleratorResources matches
+// nothing rather than standing in for a default vendor. A caller whose
+// decision must not turn on an unconfigured list guards on the empty list
+// itself, so a fallback is never mistaken for a real answer.
+func PodRequestsAccelerator(spec *v1.PodSpec, acceleratorResources []string) bool {
+	if spec == nil || len(acceleratorResources) == 0 {
+		return false
+	}
+	holds := func(containers []v1.Container) bool {
+		for i := range containers {
+			r := &containers[i].Resources
+			for _, name := range acceleratorResources {
+				n := v1.ResourceName(name)
+				if _, ok := r.Limits[n]; ok {
+					return true
+				}
+				if _, ok := r.Requests[n]; ok {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return holds(spec.Containers) || holds(spec.InitContainers)
+}
+
 // FirstNonNilError returns the first non nil interface in the slice
 func FirstNonNilError(objects []error) error {
 	for _, object := range objects {

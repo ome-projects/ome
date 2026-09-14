@@ -163,6 +163,11 @@ type InferenceServiceReconciler struct {
 	// the controller stamps a `GangSchedulingUnavailable=True`
 	// Component condition.
 	GangSchedulingAvailable bool
+	// QuotaAcceleratorResources are the resource names whose presence in a
+	// Component's pods puts it under the quota backend (--accelerator-resources).
+	// A Component requesting none of them is projected without the Kueue
+	// queue-name label, so its pods are never gated. Empty governs everything.
+	QuotaAcceleratorResources []string
 	// KedaAvailable is the cluster-discovery boolean for the KEDA CRDs,
 	// probed once in SetupWithManager. The policy layer consults it so a
 	// rendered class=KEDA block on a KEDA-less cluster fails closed
@@ -1295,13 +1300,14 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	r.GangSchedulingAvailable = podGroupFound
 	r.componentDeps = &components.ComponentDeps{
-		Client:                  r.Client,
-		Clientset:               r.Clientset,
-		APIReader:               r.APIReader,
-		Expectations:            r.Expectations,
-		Recorder:                r.Recorder,
-		Scheme:                  r.Scheme,
-		GangSchedulingAvailable: r.GangSchedulingAvailable,
+		Client:                    r.Client,
+		Clientset:                 r.Clientset,
+		APIReader:                 r.APIReader,
+		Expectations:              r.Expectations,
+		Recorder:                  r.Recorder,
+		Scheme:                    r.Scheme,
+		GangSchedulingAvailable:   r.GangSchedulingAvailable,
+		QuotaAcceleratorResources: r.QuotaAcceleratorResources,
 	}
 	// Short-TTL cache for the inferenceservice-config ConfigMap so a reconcile
 	// pass shares one apiserver GET across the per-pass config loads. TTL is
@@ -1780,14 +1786,15 @@ func (r *InferenceServiceReconciler) buildComponentDeps(cfg *controllerconfig.In
 	// nil prototype: Reconcile invoked without SetupWithManager (tests).
 	if r.componentDeps == nil {
 		return &components.ComponentDeps{
-			Client:                  r.Client,
-			Clientset:               r.Clientset,
-			APIReader:               r.APIReader,
-			Expectations:            r.Expectations,
-			Recorder:                r.Recorder,
-			Scheme:                  r.Scheme,
-			GangSchedulingAvailable: r.GangSchedulingAvailable,
-			Config:                  cfg,
+			Client:                    r.Client,
+			Clientset:                 r.Clientset,
+			APIReader:                 r.APIReader,
+			Expectations:              r.Expectations,
+			Recorder:                  r.Recorder,
+			Scheme:                    r.Scheme,
+			GangSchedulingAvailable:   r.GangSchedulingAvailable,
+			QuotaAcceleratorResources: r.QuotaAcceleratorResources,
+			Config:                    cfg,
 		}
 	}
 	d := *r.componentDeps

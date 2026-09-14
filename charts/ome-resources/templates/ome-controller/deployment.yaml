@@ -74,6 +74,9 @@ spec:
         {{- if .Values.ome.controller.configCacheTTL }}
         - "--config-cache-ttl={{ .Values.ome.controller.configCacheTTL }}"
         {{- end }}
+        {{- with .Values.ome.controller.quotaAcceleratorResources }}
+        - "--accelerator-resources={{ join "," . }}"
+        {{- end }}
         {{- if .Values.ome.controller.kubeAPIQPS }}
         - "--kube-api-qps={{ .Values.ome.controller.kubeAPIQPS }}"
         {{- end }}

@@ -277,6 +277,14 @@ ome:
       - nvidia.com/gpu
       # - amd.com/gpu
       # - google.com/tpu
+    # quotaAcceleratorResources names the resources whose presence in a pod puts
+    # its Component under Kueue admission; a Component requesting none of them
+    # is never gated. Rendered as --accelerator-resources; an empty list omits
+    # the flag and governs every Component. Separate from acceleratorResources
+    # above so setting it never changes a pod template.
+    quotaAcceleratorResources:
+      - nvidia.com/gpu
+      - google.com/tpu
     # canaryAnalysis tunes metric-gated canary promotion (spec.rollout.canary).
     canaryAnalysis:
       # Default Prometheus the analysis queries when a canary does not set its own

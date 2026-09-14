@@ -166,6 +166,11 @@ type Options struct {
 	execCredentialAllowedCmds string
 	placementControlPlaneID   string
 	configCacheTTL            time.Duration
+	// quotaAcceleratorResources names the resources whose presence puts a
+	// workload under the quota backend. Deploy-time rather than a ConfigMap
+	// key, and distinct from the inferenceservice-config key of a similar
+	// name, which sizes PARALLELISM_SIZE.
+	quotaAcceleratorResources string
 	zapOpts                   zap.Options
 }
 
@@ -265,6 +270,12 @@ func GetOptions() Options {
 		"TTL for the in-memory cache of the inferenceservice-config ConfigMap on the InferenceService reconcile path. "+
 			"Collapses the per-reconcile config loads onto one apiserver GET per window; kept short so ConfigMap edits "+
 			"apply without a restart. Set to 0 to disable caching (read the apiserver on every load).")
+	flag.StringVar(&opts.quotaAcceleratorResources, "accelerator-resources", opts.quotaAcceleratorResources,
+		"Comma-separated resource names that put a workload under the quota backend, in full, e.g. "+
+			"\"google.com/tpu,nvidia.com/gpu\". Only a Component whose pods request one of them carries "+
+			"the Kueue queue-name label, so a cpu-only router is never gated. A vendor left off runs "+
+			"ungated; keep this in step with ome-quota-manager's flag of the same name. Empty (default) "+
+			"governs every Component.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -492,15 +503,24 @@ func main() {
 		setupLog.Info("control-plane role: local InferenceService reconciler disabled; placement controller owns ISVCs")
 	} else {
 		setupLog.Info("Setting up InferenceService controller")
+		// Logged because the consequence is invisible in the objects: a
+		// Component requesting none of these is projected with no queue-name
+		// label, so nothing downstream records that it was released.
+		quotaAcceleratorResources := splitAndTrim(options.quotaAcceleratorResources)
+		if len(quotaAcceleratorResources) > 0 {
+			setupLog.Info("Quota backend governs workloads requesting these resources",
+				"quotaAcceleratorResources", quotaAcceleratorResources)
+		}
 		if err = (&v1beta1isvccontroller.InferenceServiceReconciler{
-			Client:                  mgr.GetClient(),
-			Clientset:               clientSet,
-			Log:                     ctrl.Log.WithName("InferenceService"),
-			Scheme:                  mgr.GetScheme(),
-			Recorder:                eventBroadcaster.NewRecorder(mgr.GetScheme(), v1.EventSource{Component: "v1beta1Controllers"}),
-			TrafficReconciler:       trafficReconciler,
-			MaxConcurrentReconciles: options.isvcMaxConcurrentReconciles,
-			ConfigCacheTTL:          options.configCacheTTL,
+			Client:                    mgr.GetClient(),
+			Clientset:                 clientSet,
+			Log:                       ctrl.Log.WithName("InferenceService"),
+			Scheme:                    mgr.GetScheme(),
+			Recorder:                  eventBroadcaster.NewRecorder(mgr.GetScheme(), v1.EventSource{Component: "v1beta1Controllers"}),
+			TrafficReconciler:         trafficReconciler,
+			MaxConcurrentReconciles:   options.isvcMaxConcurrentReconciles,
+			ConfigCacheTTL:            options.configCacheTTL,
+			QuotaAcceleratorResources: quotaAcceleratorResources,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create InferenceService controller")
 			os.Exit(1)

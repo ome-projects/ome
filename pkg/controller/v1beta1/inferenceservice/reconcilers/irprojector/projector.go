@@ -160,6 +160,11 @@ type Params struct {
 	// (no scaler, never a default HPA).
 	PreserveAutoscaler bool
 
+	// QuotaAcceleratorResources are the resource names whose presence in a pod
+	// puts that Component under the quota backend (--accelerator-resources).
+	// See quotaGoverned. Empty leaves every Component governed.
+	QuotaAcceleratorResources []string
+
 	// Client is the controller-runtime client used to CreateOrUpdate
 	// the IR. The ISVC controller already holds this.
 	Client client.Client
@@ -193,6 +198,7 @@ func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceRe
 	if err := validateParams(p); err != nil {
 		return nil, err
 	}
+	p = applyQuotaGovernance(p)
 
 	name := InferenceReplicaName(p.ISVC.Name, p.Component)
 	key := types.NamespacedName{Namespace: p.ISVC.Namespace, Name: name}

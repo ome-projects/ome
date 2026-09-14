@@ -190,21 +190,22 @@ func (d *Decoder) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferen
 			return ctrl.Result{}, errors.Wrap(err, "failed to resolve autoscaler for decoder")
 		}
 		ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
-			ISVC:               isvc,
-			Component:          v1beta1.DecoderComponent,
-			ComponentExt:       &d.decoderSpec.ComponentExtensionSpec,
-			ObjectMeta:         objectMeta,
-			PodSpec:            podSpec,
-			WorkerPodSpec:      workerPodSpec,
-			WorkerSize:         workerSize,
-			MultiPod:           multiPod,
-			TopologyKey:        d.decoderSpec.TopologyKey,
-			TopologySpread:     d.decoderSpec.TopologySpread,
-			TopologySpreadKey:  d.decoderSpec.TopologySpreadKey,
-			ResolvedAutoscaler: res.Resolved,
-			PreserveAutoscaler: res.Hold,
-			Client:             d.Client,
-			Reader:             d.APIReader,
+			ISVC:                      isvc,
+			Component:                 v1beta1.DecoderComponent,
+			ComponentExt:              &d.decoderSpec.ComponentExtensionSpec,
+			ObjectMeta:                objectMeta,
+			PodSpec:                   podSpec,
+			WorkerPodSpec:             workerPodSpec,
+			WorkerSize:                workerSize,
+			MultiPod:                  multiPod,
+			TopologyKey:               d.decoderSpec.TopologyKey,
+			TopologySpread:            d.decoderSpec.TopologySpread,
+			TopologySpreadKey:         d.decoderSpec.TopologySpreadKey,
+			ResolvedAutoscaler:        res.Resolved,
+			PreserveAutoscaler:        res.Hold,
+			QuotaAcceleratorResources: d.QuotaAcceleratorResources,
+			Client:                    d.Client,
+			Reader:                    d.APIReader,
 		})
 		if err != nil {
 			if apierrors.IsConflict(err) {

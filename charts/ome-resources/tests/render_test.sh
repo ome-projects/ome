@@ -356,6 +356,39 @@ if grep -Fq 'acceleratorResources' <<<"${accelerator_resources_cleared}"; then
   fail "acceleratorResources key was rendered when the list was cleared"
 fi
 
+# quotaAcceleratorResources decides which workloads carry the Kueue queue-name
+# label. Deliberately a different value from acceleratorResources above and a
+# flag rather than a ConfigMap key: this one must be settable without touching a
+# pod template, which is exactly what widening the ConfigMap list would do.
+grep -Fq -- '--accelerator-resources=nvidia.com/gpu,google.com/tpu' <<<"${controller}" ||
+  fail "default quota accelerator resources were not rendered"
+
+quota_accel_overridden="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-json 'ome.controller.quotaAcceleratorResources=["nvidia.com/gpu","google.com/tpu","amd.com/gpu"]' \
+  --show-only templates/ome-controller/deployment.yaml)"
+grep -Fq -- '--accelerator-resources=nvidia.com/gpu,google.com/tpu,amd.com/gpu' <<<"${quota_accel_overridden}" ||
+  fail "quota accelerator resources override was not rendered"
+
+# Cleared means "govern every Component": the flag must be absent, not empty,
+# because --accelerator-resources= would read as a list naming nothing.
+quota_accel_cleared="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-json 'ome.controller.quotaAcceleratorResources=[]' \
+  --show-only templates/ome-controller/deployment.yaml)"
+if grep -Fq -- '--accelerator-resources' <<<"${quota_accel_cleared}"; then
+  fail "quota accelerator resources flag was rendered when the list was cleared"
+fi
+
+# The two lists are independent: widening the admission list must not change the
+# ConfigMap that sizes PARALLELISM_SIZE, which is the coupling this split exists
+# to avoid.
+grep -Fq '["nvidia.com/gpu"]' <<<"$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-json 'ome.controller.quotaAcceleratorResources=["nvidia.com/gpu","google.com/tpu"]' \
+  --show-only templates/ome-controller/configmap.yaml)" ||
+  fail "quota accelerator resources leaked into the acceleratorResources config key"
+
 # ome.autoscalerPolicy.enabled gates the policy validating webhook and the
 # config block. Manager RBAC stays ungated in the generated role (the
 # optional-CRD precedent: grants on absent CRDs are inert), so the gate-off

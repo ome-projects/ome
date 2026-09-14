@@ -481,6 +481,107 @@ func TestIsGpuEnabled(t *testing.T) {
 	}
 }
 
+func TestPodRequestsAccelerator(t *testing.T) {
+	multiVendor := []string{
+		constants.NvidiaGPUResourceType,
+		"amd.com/gpu",
+		constants.GoogleTPUResourceType,
+	}
+	container := func(name string, req, lim v1.ResourceList) v1.Container {
+		return v1.Container{Name: name, Resources: v1.ResourceRequirements{Requests: req, Limits: lim}}
+	}
+
+	tests := []struct {
+		name                 string
+		spec                 *v1.PodSpec
+		acceleratorResources []string
+		expected             bool
+	}{
+		{
+			name:                 "nil spec",
+			spec:                 nil,
+			acceleratorResources: multiVendor,
+			expected:             false,
+		},
+		{
+			name: "cpu and memory only",
+			spec: &v1.PodSpec{Containers: []v1.Container{
+				container("router", v1.ResourceList{"cpu": resource.MustParse("2")}, v1.ResourceList{"memory": resource.MustParse("4Gi")}),
+			}},
+			acceleratorResources: multiVendor,
+			expected:             false,
+		},
+		{
+			name: "accelerator in limits",
+			spec: &v1.PodSpec{Containers: []v1.Container{
+				container("engine", nil, v1.ResourceList{constants.GoogleTPUResourceType: resource.MustParse("4")}),
+			}},
+			acceleratorResources: multiVendor,
+			expected:             true,
+		},
+		{
+			// Unlike IsGPUEnabled, which reads Limits alone, this predicate
+			// also reads Requests: a pod holding a chip through requests is
+			// under accelerator budget just the same.
+			name: "accelerator in requests only",
+			spec: &v1.PodSpec{Containers: []v1.Container{
+				container("engine", v1.ResourceList{constants.NvidiaGPUResourceType: resource.MustParse("8")}, nil),
+			}},
+			acceleratorResources: multiVendor,
+			expected:             true,
+		},
+		{
+			name: "accelerator in a container other than the first",
+			spec: &v1.PodSpec{Containers: []v1.Container{
+				container("proxy", v1.ResourceList{"cpu": resource.MustParse("1")}, nil),
+				container("engine", nil, v1.ResourceList{"amd.com/gpu": resource.MustParse("1")}),
+			}},
+			acceleratorResources: multiVendor,
+			expected:             true,
+		},
+		{
+			name: "accelerator in an init container",
+			spec: &v1.PodSpec{
+				InitContainers: []v1.Container{
+					container("warmup", nil, v1.ResourceList{constants.NvidiaGPUResourceType: resource.MustParse("1")}),
+				},
+				Containers: []v1.Container{
+					container("router", v1.ResourceList{"cpu": resource.MustParse("2")}, nil),
+				},
+			},
+			acceleratorResources: multiVendor,
+			expected:             true,
+		},
+		{
+			name: "vendor name outside the configured list",
+			spec: &v1.PodSpec{Containers: []v1.Container{
+				container("engine", nil, v1.ResourceList{"amd.com/gpu": resource.MustParse("1")}),
+			}},
+			acceleratorResources: []string{constants.NvidiaGPUResourceType},
+			expected:             false,
+		},
+		{
+			// No fallback list: this predicate reports only what the caller
+			// asked about, so an empty list matches nothing. Callers that must
+			// not silently ungate real accelerator work guard on the empty
+			// list themselves rather than relying on a default here.
+			name: "empty resource list matches nothing",
+			spec: &v1.PodSpec{Containers: []v1.Container{
+				container("engine", nil, v1.ResourceList{constants.NvidiaGPUResourceType: resource.MustParse("8")}),
+			}},
+			acceleratorResources: nil,
+			expected:             false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			res := PodRequestsAccelerator(tt.spec, tt.acceleratorResources)
+			g.Expect(res).To(gomega.Equal(tt.expected))
+		})
+	}
+}
+
 func TestFirstNonNilError(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 	scenarios := map[string]struct {

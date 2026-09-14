@@ -84,6 +84,11 @@ type BaseComponentFields struct {
 	// tests; the shared helpers treat nil as feature-disabled and fail refs
 	// closed.
 	PolicyResolver *autoscaler.PolicyResolver
+
+	// QuotaAcceleratorResources are the resource names that put a Component
+	// under the quota backend, threaded from the InferenceServiceReconciler to
+	// the InferenceReplica projector. Empty governs everything.
+	QuotaAcceleratorResources []string
 }
 
 // newBaseComponentFields is the ONE place BaseComponentFields is
@@ -94,26 +99,27 @@ type BaseComponentFields struct {
 // ReconcileFineTunedWeights, never at construction.
 func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName string) BaseComponentFields {
 	return BaseComponentFields{
-		Client:                  deps.Client,
-		Clientset:               deps.Clientset,
-		APIReader:               deps.APIReader,
-		Expectations:            deps.Expectations,
-		Recorder:                deps.Recorder,
-		GangSchedulingAvailable: deps.GangSchedulingAvailable,
-		Scheme:                  deps.Scheme,
-		InferenceServiceConfig:  deps.Config,
-		DeploymentMode:          in.DeploymentMode,
-		BaseModel:               in.BaseModel,
-		BaseModelMeta:           in.BaseModelMeta,
-		Runtime:                 in.Runtime,
-		RuntimeName:             in.RuntimeName,
-		StatusManager:           status.NewStatusReconciler(),
-		Log:                     ctrl.Log.WithName(loggerName),
-		SupportedModelFormat:    in.ModelFormat,
-		AcceleratorClass:        in.AcceleratorClass,
-		AcceleratorClassName:    in.AcceleratorClassName,
-		Overlays:                in.Overlays,
-		PolicyResolver:          in.PolicyResolver,
+		Client:                    deps.Client,
+		Clientset:                 deps.Clientset,
+		APIReader:                 deps.APIReader,
+		Expectations:              deps.Expectations,
+		Recorder:                  deps.Recorder,
+		GangSchedulingAvailable:   deps.GangSchedulingAvailable,
+		QuotaAcceleratorResources: deps.QuotaAcceleratorResources,
+		Scheme:                    deps.Scheme,
+		InferenceServiceConfig:    deps.Config,
+		DeploymentMode:            in.DeploymentMode,
+		BaseModel:                 in.BaseModel,
+		BaseModelMeta:             in.BaseModelMeta,
+		Runtime:                   in.Runtime,
+		RuntimeName:               in.RuntimeName,
+		StatusManager:             status.NewStatusReconciler(),
+		Log:                       ctrl.Log.WithName(loggerName),
+		SupportedModelFormat:      in.ModelFormat,
+		AcceleratorClass:          in.AcceleratorClass,
+		AcceleratorClassName:      in.AcceleratorClassName,
+		Overlays:                  in.Overlays,
+		PolicyResolver:            in.PolicyResolver,
 	}
 }
 

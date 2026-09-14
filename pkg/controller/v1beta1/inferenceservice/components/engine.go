@@ -203,21 +203,22 @@ func (e *Engine) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 			return ctrl.Result{}, errors.Wrap(err, "failed to resolve autoscaler for engine")
 		}
 		ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
-			ISVC:               isvc,
-			Component:          v1beta1.EngineComponent,
-			ComponentExt:       &e.engineSpec.ComponentExtensionSpec,
-			ObjectMeta:         objectMeta,
-			PodSpec:            podSpec,
-			WorkerPodSpec:      workerPodSpec,
-			WorkerSize:         workerSize,
-			MultiPod:           multiPod,
-			TopologyKey:        e.engineSpec.TopologyKey,
-			TopologySpread:     e.engineSpec.TopologySpread,
-			TopologySpreadKey:  e.engineSpec.TopologySpreadKey,
-			ResolvedAutoscaler: res.Resolved,
-			PreserveAutoscaler: res.Hold,
-			Client:             e.Client,
-			Reader:             e.APIReader,
+			ISVC:                      isvc,
+			Component:                 v1beta1.EngineComponent,
+			ComponentExt:              &e.engineSpec.ComponentExtensionSpec,
+			ObjectMeta:                objectMeta,
+			PodSpec:                   podSpec,
+			WorkerPodSpec:             workerPodSpec,
+			WorkerSize:                workerSize,
+			MultiPod:                  multiPod,
+			TopologyKey:               e.engineSpec.TopologyKey,
+			TopologySpread:            e.engineSpec.TopologySpread,
+			TopologySpreadKey:         e.engineSpec.TopologySpreadKey,
+			ResolvedAutoscaler:        res.Resolved,
+			PreserveAutoscaler:        res.Hold,
+			QuotaAcceleratorResources: e.QuotaAcceleratorResources,
+			Client:                    e.Client,
+			Reader:                    e.APIReader,
 		})
 		if err != nil {
 			if apierrors.IsConflict(err) {

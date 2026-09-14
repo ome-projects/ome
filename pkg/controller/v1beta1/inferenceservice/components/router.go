@@ -171,16 +171,17 @@ func (r *Router) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 			return ctrl.Result{}, errors.Wrap(err, "failed to resolve autoscaler for router")
 		}
 		ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
-			ISVC:               isvc,
-			Component:          v1beta1.RouterComponent,
-			ComponentExt:       &r.routerSpec.ComponentExtensionSpec,
-			ObjectMeta:         objectMeta,
-			PodSpec:            podSpec,
-			MultiPod:           false,
-			ResolvedAutoscaler: res.Resolved,
-			PreserveAutoscaler: res.Hold,
-			Client:             r.Client,
-			Reader:             r.APIReader,
+			ISVC:                      isvc,
+			Component:                 v1beta1.RouterComponent,
+			ComponentExt:              &r.routerSpec.ComponentExtensionSpec,
+			ObjectMeta:                objectMeta,
+			PodSpec:                   podSpec,
+			MultiPod:                  false,
+			ResolvedAutoscaler:        res.Resolved,
+			PreserveAutoscaler:        res.Hold,
+			QuotaAcceleratorResources: r.QuotaAcceleratorResources,
+			Client:                    r.Client,
+			Reader:                    r.APIReader,
 		})
 		if err != nil {
 			if apierrors.IsConflict(err) {

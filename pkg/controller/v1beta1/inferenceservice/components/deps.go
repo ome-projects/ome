@@ -33,6 +33,10 @@ type ComponentDeps struct {
 	// reads it to decide whether to emit PodGroups for multi-pod
 	// Instances; other deployment modes ignore it.
 	GangSchedulingAvailable bool
+	// QuotaAcceleratorResources are the resource names that put a Component
+	// under the quota backend; see InferenceServiceReconciler for the full
+	// contract. Empty governs everything.
+	QuotaAcceleratorResources []string
 }
 
 // ComponentInputs are resolved fresh each reconcile by the controller
