@@ -249,6 +249,23 @@ ome:
     # the controller log.
     kubeAPIQPS: 100
     kubeAPIBurst: 200
+    # Timing of the leader election loop. Source of truth for these values (the
+    # OME binary has NO built-in default; omitting any one of the three falls
+    # back to controller-runtime's 15s/10s/2s). The three are rendered only as a
+    # complete set, because the elector rejects a lease that can expire while its
+    # holder is still renewing.
+    #
+    # controller-runtime caps each renewal request at renewDeadline/2, so a
+    # window holds two attempts and the leader survives exactly one hung
+    # apiserver request. At the defaults that is a ~10s budget, which a routine
+    # etcd stall exhausts — costing the leader its lease and restarting the pod.
+    # 40s buys two 20s attempts. The cost is failover latency: a standby waits up
+    # to leaseDuration before taking over, so raise these only as far as the
+    # cluster's apiserver actually needs.
+    leaderElection:
+      leaseDuration: "60s"
+      renewDeadline: "40s"
+      retryPeriod: "8s"
     # TTL for the in-memory cache of the inferenceservice-config ConfigMap on the
     # InferenceService reconcile path. Collapses the per-reconcile config loads
     # (deploy/inferenceservice/ingress/canaryAnalysis) onto one apiserver GET per

@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/acceleratorquota"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/leaderelection"
 	kueuebackend "sigs.k8s.io/ome/pkg/quota/backend/kueue"
 	quotacert "sigs.k8s.io/ome/pkg/quota/cert"
 	"sigs.k8s.io/ome/pkg/quota/tree"
@@ -78,6 +79,9 @@ type options struct {
 	probeAddr            string
 	enableLeaderElection bool
 	leaderElectionID     string
+	// leaderElectionTiming is supplied by the chart, because the margin a leader
+	// needs depends on the apiserver latency of the cluster.
+	leaderElectionTiming leaderelection.Timing
 	// maxTreeDepth bounds a node's distance from the root, in edges. Zero
 	// disables the check rather than assuming a bound.
 	maxTreeDepth int
@@ -149,6 +153,7 @@ func main() {
 			"two active instances would race each other's status writes on every node.")
 	flag.StringVar(&opts.leaderElectionID, "leader-election-id", opts.leaderElectionID,
 		"Name of the leader-election lock.")
+	opts.leaderElectionTiming.BindFlags(flag.CommandLine)
 	flag.IntVar(&opts.maxTreeDepth, "max-tree-depth", opts.maxTreeDepth,
 		"Greatest permitted distance from the root, in edges (the root is 0, a top-tier grouping "+
 			"is 1). 0 disables the depth check rather than assuming a bound.")
@@ -243,6 +248,11 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts.zapOpts)))
 
+	if err := opts.leaderElectionTiming.Validate(); err != nil {
+		setupLog.Error(err, "bad flag")
+		os.Exit(1)
+	}
+
 	mode := acceleratorquota.Mode(opts.mode)
 	switch mode {
 	case acceleratorquota.ModeWorkload, acceleratorquota.ModeManagement:
@@ -291,6 +301,7 @@ func main() {
 		LeaderElection:         opts.enableLeaderElection,
 		LeaderElectionID:       opts.leaderElectionID,
 	}
+	opts.leaderElectionTiming.Apply(&mgrOpts)
 	if opts.enableWebhook {
 		mgrOpts.WebhookServer = webhook.NewServer(webhook.Options{
 			Port:    opts.webhookPort,

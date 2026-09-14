@@ -51,6 +51,24 @@ quotaManager:
   replicaCount: 2
   leaderElect: true
 
+  # Timing of the leader election loop. Source of truth for these values (the
+  # binary has NO built-in default; omitting any one of the three falls back to
+  # controller-runtime's 15s/10s/2s). The three are rendered only as a complete
+  # set, because the elector rejects a lease that can expire while its holder is
+  # still renewing.
+  #
+  # controller-runtime caps each renewal request at renewDeadline/2, so a window
+  # holds two attempts and the leader survives exactly one hung apiserver
+  # request. At the defaults that is a ~10s budget, which a routine etcd stall
+  # exhausts — costing the leader its lease and restarting the pod. 40s buys two
+  # 20s attempts. The cost is failover latency: the standby waits up to
+  # leaseDuration before taking over, so raise these only as far as the cluster's
+  # apiserver actually needs.
+  leaderElection:
+    leaseDuration: "60s"
+    renewDeadline: "40s"
+    retryPeriod: "8s"
+
   # maxTreeDepth bounds a node's distance from the root, in edges (the root is 0,
   # a top-tier grouping is 1). 0 disables the check rather than assuming a bound;
   # it is a guardrail against accidental sprawl, not a Kueue limit.

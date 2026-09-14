@@ -80,6 +80,13 @@ spec:
         {{- if .Values.ome.controller.kubeAPIBurst }}
         - "--kube-api-burst={{ .Values.ome.controller.kubeAPIBurst }}"
         {{- end }}
+        {{- with .Values.ome.controller.leaderElection }}
+        {{- if and .leaseDuration .renewDeadline .retryPeriod }}
+        - "--leader-elect-lease-duration={{ .leaseDuration }}"
+        - "--leader-elect-renew-deadline={{ .renewDeadline }}"
+        - "--leader-elect-retry-period={{ .retryPeriod }}"
+        {{- end }}
+        {{- end }}
         {{- if .Values.ome.multicluster.enabled }}
         - "--enable-multicluster"
         {{- if .Values.ome.multicluster.role }}

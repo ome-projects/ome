@@ -57,6 +57,7 @@ import (
 	v1beta1runtimerevisioncontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/runtimerevision"
 	v1beta1servingruntimecontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/servingruntime"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/leaderelection"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils"
 	"sigs.k8s.io/ome/pkg/version"
@@ -139,14 +140,17 @@ func splitAndTrim(csv string) []string {
 
 // Options defines the program-configurable options that may be passed on the command line.
 type Options struct {
-	metricsAddr                 string
-	secureMetrics               bool
-	enableHTTP2                 bool
-	webhookPort                 int
-	enableLeaderElection        bool
-	enableWebhook               bool
-	probeAddr                   string
-	leaderElectionNamespace     string
+	metricsAddr             string
+	secureMetrics           bool
+	enableHTTP2             bool
+	webhookPort             int
+	enableLeaderElection    bool
+	enableWebhook           bool
+	probeAddr               string
+	leaderElectionNamespace string
+	// Timing of the leader election loop. Supplied by the chart, because the
+	// margin a leader needs depends on the apiserver latency of the cluster.
+	leaderElectionTiming        leaderelection.Timing
 	runtimeRevisionRetention    int
 	runtimeRevisionGracePeriod  time.Duration
 	isvcMaxConcurrentReconciles int
@@ -219,6 +223,7 @@ func GetOptions() Options {
 		"Enable leader election for ome controller manager. "+
 			"Enabling this will ensure there is only one active ome controller manager.")
 	flag.StringVar(&opts.leaderElectionNamespace, "leader-election-namespace", opts.leaderElectionNamespace, "The namespace in which the leader election configmap will be created.")
+	opts.leaderElectionTiming.BindFlags(flag.CommandLine)
 	flag.BoolVar(&opts.enableWebhook, "webhook", opts.enableWebhook, "Enable the webhook server.")
 	flag.StringVar(&opts.probeAddr, "health-probe-addr", opts.probeAddr, "The address the probe endpoint binds to.")
 	flag.IntVar(&opts.runtimeRevisionRetention, "runtime-revision-retention", opts.runtimeRevisionRetention,
@@ -292,6 +297,11 @@ func main() {
 
 	setupLog.Info("Initializing", "gitVersion", version.GitVersion, "gitCommit", version.GitCommit)
 
+	if err := options.leaderElectionTiming.Validate(); err != nil {
+		setupLog.Error(err, "Invalid leader election timing")
+		os.Exit(1)
+	}
+
 	// Get a config to talk to the apiserver
 	setupLog.Info("Configuring API client connection")
 	cfg := ctrl.GetConfigOrDie()
@@ -342,7 +352,7 @@ func main() {
 	}
 	omePodSelector := labels.NewSelector().Add(*omePodReq)
 
-	mgr, err := manager.New(cfg, manager.Options{
+	mgrOpts := manager.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
 			// Strip managedFields from every cached object (Pods, Nodes,
@@ -368,7 +378,10 @@ func main() {
 		LeaderElectionID:        LeaderLockName,
 		LeaderElectionNamespace: options.leaderElectionNamespace,
 		HealthProbeBindAddress:  options.probeAddr,
-	})
+	}
+	options.leaderElectionTiming.Apply(&mgrOpts)
+
+	mgr, err := manager.New(cfg, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "Failed to initialize controller manager")
 		os.Exit(1)

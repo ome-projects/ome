@@ -63,6 +63,13 @@ spec:
         - "--metrics-bind-address=:{{ .Values.quotaManager.metricsPort }}"
         - "--health-probe-addr=:{{ .Values.quotaManager.probePort }}"
         - "--leader-elect={{ .Values.quotaManager.leaderElect }}"
+        {{- with .Values.quotaManager.leaderElection }}
+        {{- if and .leaseDuration .renewDeadline .retryPeriod }}
+        - "--leader-elect-lease-duration={{ .leaseDuration }}"
+        - "--leader-elect-renew-deadline={{ .renewDeadline }}"
+        - "--leader-elect-retry-period={{ .retryPeriod }}"
+        {{- end }}
+        {{- end }}
         - "--zap-log-level={{ .Values.quotaManager.logLevel }}"
         {{- if eq (include "ome-quota-manager.mode" .) "management" }}
         {{- with .Values.quotaManager.projection.origin }}

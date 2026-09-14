@@ -113,6 +113,30 @@ func TestDefaultOptions(t *testing.T) {
 	// controller-runtime's own default in place.
 	assert.Zero(t, opts.kubeAPIQPS)
 	assert.Zero(t, opts.kubeAPIBurst)
+	assert.Zero(t, opts.leaderElectionTiming.LeaseDuration)
+	assert.Zero(t, opts.leaderElectionTiming.RenewDeadline)
+	assert.Zero(t, opts.leaderElectionTiming.RetryPeriod)
+}
+
+func TestGetOptionsLeaderElectionTiming(t *testing.T) {
+	oldArgs := os.Args
+	defer func() {
+		os.Args = oldArgs
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	}()
+
+	flag.CommandLine = flag.NewFlagSet("cmd", flag.ExitOnError)
+	os.Args = []string{"cmd",
+		"--leader-elect-lease-duration=60s",
+		"--leader-elect-renew-deadline=40s",
+		"--leader-elect-retry-period=8s",
+	}
+
+	o := GetOptions()
+	assert.Equal(t, 60*time.Second, o.leaderElectionTiming.LeaseDuration)
+	assert.Equal(t, 40*time.Second, o.leaderElectionTiming.RenewDeadline)
+	assert.Equal(t, 8*time.Second, o.leaderElectionTiming.RetryPeriod)
+	assert.NoError(t, o.leaderElectionTiming.Validate())
 }
 
 func TestGetOptionsKubeAPIRateLimits(t *testing.T) {
