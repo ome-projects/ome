@@ -70,6 +70,7 @@ type AutoscaleTargetState string
 const (
 	AutoscaleTargetReported    AutoscaleTargetState = "Reported"
 	AutoscaleTargetNotReported AutoscaleTargetState = "NotReported"
+	AutoscaleTargetUnavailable AutoscaleTargetState = "Unavailable"
 	AutoscaleTargetInvalid     AutoscaleTargetState = "Invalid"
 )
 
@@ -317,6 +318,11 @@ func canonicalAutoscaleComponent(component AutoscaleComponentStatus) AutoscaleCo
 		value := component.Replicas.LastScaleTime.UTC()
 		result.Replicas.LastScaleTime = &value
 	}
+	if component.Replicas.State != AutoscaleReplicasReported && component.Replicas.State != AutoscaleReplicasAmbiguous {
+		result.Replicas.CurrentReplicas = nil
+		result.Replicas.DesiredReplicas = nil
+		result.Replicas.LastScaleTime = nil
+	}
 	result.Conditions = component.Conditions
 	result.Conditions.Items = append([]AutoscaleCondition{}, component.Conditions.Items...)
 	for i := range result.Conditions.Items {
@@ -335,6 +341,9 @@ func canonicalAutoscaleComponent(component AutoscaleComponentStatus) AutoscaleCo
 		return result.Conditions.Items[i].LastTransitionTime.Before(result.Conditions.Items[j].LastTransitionTime)
 	})
 	result.Conditions.Items = dedupeAutoscaleConditions(result.Conditions.Items)
+	if component.Conditions.State != AutoscaleConditionsReported && component.Conditions.State != AutoscaleConditionsUnavailable {
+		result.Conditions.Items = []AutoscaleCondition{}
+	}
 	return result
 }
 

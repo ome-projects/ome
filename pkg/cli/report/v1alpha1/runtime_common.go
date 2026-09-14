@@ -48,16 +48,19 @@ type DeploymentModeSource string
 
 const (
 	DeploymentModeSourceComponentAnnotation DeploymentModeSource = "ComponentAnnotation"
+	DeploymentModeSourceServiceAnnotation   DeploymentModeSource = "ServiceAnnotation"
 	DeploymentModeSourceServiceSpec         DeploymentModeSource = "ServiceSpec"
 	DeploymentModeSourceLeaderWorkerShape   DeploymentModeSource = "LeaderWorkerShape"
 	DeploymentModeSourceDefault             DeploymentModeSource = "Default"
 )
 
-// InheritanceState identifies whether declared inheritance was observed.
+// InheritanceState identifies whether declared inheritance was observed,
+// inherently absent from a flattened snapshot, or unavailable.
 type InheritanceState string
 
 const (
 	InheritanceStateObserved    InheritanceState = "Observed"
+	InheritanceStateNotRecorded InheritanceState = "NotRecorded"
 	InheritanceStateUnavailable InheritanceState = "Unavailable"
 )
 

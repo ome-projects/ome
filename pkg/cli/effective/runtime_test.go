@@ -689,12 +689,24 @@ func TestResolveLiveReportsInvalidDeclaredRuntimeKind(t *testing.T) {
 func TestMergeEffectiveComponentsReportsDeploymentModeSource(t *testing.T) {
 	omeNative := constants.OMENative
 	tests := []struct {
-		name       string
-		engine     *v1beta1.EngineSpec
-		specMode   *constants.DeploymentModeType
-		wantMode   constants.DeploymentModeType
-		wantSource ComponentDeploymentModeSource
+		name               string
+		serviceAnnotations map[string]string
+		engine             *v1beta1.EngineSpec
+		specMode           *constants.DeploymentModeType
+		wantMode           constants.DeploymentModeType
+		wantSource         ComponentDeploymentModeSource
 	}{
+		{
+			name: "service virtual annotation is the controller early-exit mode",
+			serviceAnnotations: map[string]string{
+				constants.DeploymentMode: string(constants.VirtualDeployment),
+			},
+			engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
+				Annotations: map[string]string{constants.DeploymentMode: string(constants.RawDeployment)},
+			}},
+			specMode: &omeNative, wantMode: constants.VirtualDeployment,
+			wantSource: DeploymentModeServiceAnnotation,
+		},
 		{
 			name: "component annotation",
 			engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
@@ -726,7 +738,7 @@ func TestMergeEffectiveComponentsReportsDeploymentModeSource(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			isvc := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+			isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: test.serviceAnnotations}, Spec: v1beta1.InferenceServiceSpec{
 				DeploymentMode: test.specMode,
 				Engine:         test.engine,
 			}}

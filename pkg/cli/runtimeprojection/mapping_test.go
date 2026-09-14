@@ -90,6 +90,7 @@ func TestClosedRuntimeEnumMappings(t *testing.T) {
 		modeMapping("mode native", constants.OMENative, reportv1alpha1.DeploymentModeOMENative),
 		modeMapping("mode hostile", constants.DeploymentModeType("hostile"), ""),
 		modeSourceMapping("mode source annotation", effective.DeploymentModeComponentAnnotation, reportv1alpha1.DeploymentModeSourceComponentAnnotation),
+		modeSourceMapping("mode source service annotation", effective.DeploymentModeServiceAnnotation, reportv1alpha1.DeploymentModeSourceServiceAnnotation),
 		modeSourceMapping("mode source service", effective.DeploymentModeServiceSpec, reportv1alpha1.DeploymentModeSourceServiceSpec),
 		modeSourceMapping("mode source shape", effective.DeploymentModeLeaderWorkerShape, reportv1alpha1.DeploymentModeSourceLeaderWorkerShape),
 		modeSourceMapping("mode source default", effective.DeploymentModeDefault, reportv1alpha1.DeploymentModeSourceDefault),

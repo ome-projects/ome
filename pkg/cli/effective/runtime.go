@@ -68,7 +68,11 @@ type RuntimeAdvisory struct {
 type InheritanceObservationState string
 
 const (
-	InheritanceObserved    InheritanceObservationState = "Observed"
+	InheritanceObserved InheritanceObservationState = "Observed"
+	// InheritanceNotRecorded means the active flattened snapshot does not
+	// carry a source chain. This is expected for ControllerRevision payloads,
+	// not an evidence read failure.
+	InheritanceNotRecorded InheritanceObservationState = "NotRecorded"
 	InheritanceUnavailable InheritanceObservationState = "Unavailable"
 )
 
@@ -290,6 +294,7 @@ type ComponentDeploymentModeSource string
 
 const (
 	DeploymentModeComponentAnnotation ComponentDeploymentModeSource = "ComponentAnnotation"
+	DeploymentModeServiceAnnotation   ComponentDeploymentModeSource = "ServiceAnnotation"
 	DeploymentModeServiceSpec         ComponentDeploymentModeSource = "ServiceSpec"
 	DeploymentModeLeaderWorkerShape   ComponentDeploymentModeSource = "LeaderWorkerShape"
 	DeploymentModeDefault             ComponentDeploymentModeSource = "Default"
@@ -782,29 +787,49 @@ func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1bet
 	if err != nil {
 		return nil, fmt.Errorf("resolve component deployment modes: %w", err)
 	}
+	serviceVirtual := false
+	if mode, found := isvcutils.GetDeploymentModeFromAnnotations(isvc.Annotations); found && mode == constants.VirtualDeployment {
+		// The controller handles a service-level VirtualDeployment annotation
+		// before runtime selection or component reconciliation. That global
+		// early exit takes precedence over all per-component mode inputs.
+		engineMode, decoderMode, routerMode = mode, mode, mode
+		serviceVirtual = true
+	}
 
 	components := make([]EffectiveComponent, 0, 3)
 	if engine != nil {
+		source := componentDeploymentModeSource(engine.Annotations, engine.Leader != nil || engine.Worker != nil, isvc.Spec.DeploymentMode)
+		if serviceVirtual {
+			source = DeploymentModeServiceAnnotation
+		}
 		components = append(components, EffectiveComponent{
 			Type:                 v1beta1.EngineComponent,
 			DeploymentMode:       engineMode,
-			DeploymentModeSource: componentDeploymentModeSource(engine.Annotations, engine.Leader != nil || engine.Worker != nil, isvc.Spec.DeploymentMode),
+			DeploymentModeSource: source,
 			engine:               engine,
 		})
 	}
 	if decoder != nil {
+		source := componentDeploymentModeSource(decoder.Annotations, decoder.Leader != nil || decoder.Worker != nil, isvc.Spec.DeploymentMode)
+		if serviceVirtual {
+			source = DeploymentModeServiceAnnotation
+		}
 		components = append(components, EffectiveComponent{
 			Type:                 v1beta1.DecoderComponent,
 			DeploymentMode:       decoderMode,
-			DeploymentModeSource: componentDeploymentModeSource(decoder.Annotations, decoder.Leader != nil || decoder.Worker != nil, isvc.Spec.DeploymentMode),
+			DeploymentModeSource: source,
 			decoder:              decoder,
 		})
 	}
 	if router != nil {
+		source := componentDeploymentModeSource(router.Annotations, false, isvc.Spec.DeploymentMode)
+		if serviceVirtual {
+			source = DeploymentModeServiceAnnotation
+		}
 		components = append(components, EffectiveComponent{
 			Type:                 v1beta1.RouterComponent,
 			DeploymentMode:       routerMode,
-			DeploymentModeSource: componentDeploymentModeSource(router.Annotations, false, isvc.Spec.DeploymentMode),
+			DeploymentModeSource: source,
 			router:               router,
 		})
 	}

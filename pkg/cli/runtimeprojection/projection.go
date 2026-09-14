@@ -897,6 +897,8 @@ func mapDeploymentModeSource(value effective.ComponentDeploymentModeSource) (rep
 	switch value {
 	case effective.DeploymentModeComponentAnnotation:
 		return reportv1alpha1.DeploymentModeSourceComponentAnnotation, true
+	case effective.DeploymentModeServiceAnnotation:
+		return reportv1alpha1.DeploymentModeSourceServiceAnnotation, true
 	case effective.DeploymentModeServiceSpec:
 		return reportv1alpha1.DeploymentModeSourceServiceSpec, true
 	case effective.DeploymentModeLeaderWorkerShape:

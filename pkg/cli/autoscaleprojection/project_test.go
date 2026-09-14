@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -541,8 +542,8 @@ func TestProjectConditionsAreAllowlistedValidatedDedupedAndOrdered(t *testing.T)
 		CurrentReplicas: 2, DesiredReplicas: 3,
 		Conditions: []metav1.Condition{
 			duplicate,
-			{Type: "ScalingLimited", Status: metav1.ConditionUnknown, LastTransitionTime: transition},
-			{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition},
+			{Type: "ScalingLimited", Status: metav1.ConditionUnknown, LastTransitionTime: transition, Reason: "Limited"},
+			{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Able"},
 			duplicate,
 		},
 	})
@@ -564,10 +565,10 @@ func TestProjectKEDAConditionsUseTheirOwnFixedOrder(t *testing.T) {
 		Class: omev1beta1.AutoscalerKEDA, ManagedBy: omev1beta1.AutoscalerManagedByOME,
 		SpecSource: "runtime", CurrentReplicas: 2, DesiredReplicas: 3,
 		Conditions: []metav1.Condition{
-			{Type: "Paused", Status: metav1.ConditionFalse, LastTransitionTime: transition},
-			{Type: "Fallback", Status: metav1.ConditionUnknown, LastTransitionTime: transition},
-			{Type: "Active", Status: metav1.ConditionTrue, LastTransitionTime: transition},
-			{Type: "Ready", Status: metav1.ConditionTrue, LastTransitionTime: transition},
+			{Type: "Paused", Status: metav1.ConditionFalse, LastTransitionTime: transition, Reason: "NotPaused"},
+			{Type: "Fallback", Status: metav1.ConditionUnknown, LastTransitionTime: transition, Reason: "Unknown"},
+			{Type: "Active", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Active"},
+			{Type: "Ready", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Ready"},
 		},
 	})
 
@@ -581,6 +582,96 @@ func TestProjectKEDAConditionsUseTheirOwnFixedOrder(t *testing.T) {
 	}, conditionTypes(got.Content.Components[0].Conditions.Items))
 }
 
+func TestProjectIgnoresValidAutoscalerResolvedPolicyCondition(t *testing.T) {
+	transition := metav1.NewTime(time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC))
+	status := reportedHPA()
+	status.Conditions = append(status.Conditions, metav1.Condition{
+		Type: omev1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionTrue,
+		Reason: omev1beta1.AutoscalerResolvedReasonInlinePrecedence, LastTransitionTime: transition,
+	})
+	isvc := inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status)
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{
+		Autoscaler:          &omev1beta1.ComponentAutoscaler{Class: omev1beta1.AutoscalerHPA},
+		AutoscalerPolicyRef: &omev1beta1.AutoscalerPolicyRef{Name: "shadowed-policy"},
+	}}
+
+	got, err := Project(isvc, fixedClock())
+
+	require.NoError(t, err)
+	require.Len(t, got.Content.Components, 1)
+	component := got.Content.Components[0]
+	assert.Equal(t, reportv1alpha1.AutoscaleComponentReported, component.State)
+	assert.Equal(t, reportv1alpha1.AutoscaleConditionsReported, component.Conditions.State)
+	assert.Equal(t, []reportv1alpha1.AutoscaleConditionType{reportv1alpha1.AutoscaleConditionAbleToScale}, conditionTypes(component.Conditions.Items))
+	assert.NotContains(t, issueCodes(got.Content.Issues), reportv1alpha1.AutoscaleIssueConditionInvalid)
+
+	status.Conditions = status.Conditions[1:]
+	got, err = Project(inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status), fixedClock())
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.AutoscaleConditionsNotReported, got.Content.Components[0].Conditions.State)
+	assert.Empty(t, got.Content.Components[0].Conditions.Items)
+	assert.NotContains(t, issueCodes(got.Content.Issues), reportv1alpha1.AutoscaleIssueConditionInvalid)
+}
+
+func TestProjectIgnoresValidAutoscalerResolvedForExternalAndNone(t *testing.T) {
+	transition := metav1.NewTime(time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC))
+	for _, test := range []struct {
+		name    string
+		class   omev1beta1.AutoscalerClass
+		managed omev1beta1.AutoscalerManagedBy
+	}{
+		{name: "External", class: omev1beta1.AutoscalerExternal, managed: omev1beta1.AutoscalerManagedByExternal},
+		{name: "None", class: omev1beta1.AutoscalerNone, managed: omev1beta1.AutoscalerManagedByNone},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := &omev1beta1.ComponentAutoscalerStatus{
+				Class: test.class, ManagedBy: test.managed, SpecSource: "isvc",
+				Conditions: []metav1.Condition{{
+					Type: omev1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionTrue,
+					Reason: omev1beta1.AutoscalerResolvedReasonInlinePrecedence, LastTransitionTime: transition,
+				}},
+			}
+			isvc := inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status)
+			isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{
+				Autoscaler:          &omev1beta1.ComponentAutoscaler{Class: test.class},
+				AutoscalerPolicyRef: &omev1beta1.AutoscalerPolicyRef{Name: "shadowed-policy"},
+			}}
+
+			got, err := Project(isvc, fixedClock())
+
+			require.NoError(t, err)
+			require.Len(t, got.Content.Components, 1)
+			component := got.Content.Components[0]
+			assert.Equal(t, reportv1alpha1.AutoscaleComponentReported, component.State)
+			assert.Equal(t, reportv1alpha1.AutoscaleConditionsUnavailable, component.Conditions.State)
+			assert.Empty(t, component.Conditions.Items)
+			assert.Empty(t, got.Content.Issues)
+			assert.Equal(t, reportv1alpha1.AutoscaleStateReported, got.Content.Summary.State)
+		})
+	}
+}
+
+func TestProjectMalformedExternalConditionDegradesToPartialUnavailable(t *testing.T) {
+	status := &omev1beta1.ComponentAutoscalerStatus{
+		Class: omev1beta1.AutoscalerExternal, ManagedBy: omev1beta1.AutoscalerManagedByExternal,
+		SpecSource: "isvc", Conditions: []metav1.Condition{{
+			Type: omev1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionTrue,
+			Reason: "SECRET INVALID REASON", Message: "SECRET CONDITION MESSAGE",
+		}},
+	}
+
+	got, err := Project(inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status), fixedClock())
+
+	require.NoError(t, err)
+	require.Len(t, got.Content.Components, 1)
+	assert.Equal(t, reportv1alpha1.AutoscaleComponentPartial, got.Content.Components[0].State)
+	assert.Equal(t, reportv1alpha1.AutoscaleConditionsUnavailable, got.Content.Components[0].Conditions.State)
+	assert.Equal(t, []reportv1alpha1.AutoscaleIssueCode{reportv1alpha1.AutoscaleIssueConditionInvalid}, issueCodes(got.Content.Issues))
+	encoded, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "SECRET")
+}
+
 func TestProjectInvalidAndConflictingConditionsAreOmitted(t *testing.T) {
 	transition := metav1.NewTime(time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC))
 	later := metav1.NewTime(transition.Add(time.Minute))
@@ -591,14 +682,17 @@ func TestProjectInvalidAndConflictingConditionsAreOmitted(t *testing.T) {
 		wantIssue  reportv1alpha1.AutoscaleIssueCode
 		wantItems  []reportv1alpha1.AutoscaleCondition
 	}{
-		{name: "foreign HPA condition", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, LastTransitionTime: transition}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
-		{name: "foreign KEDA condition", class: omev1beta1.AutoscalerKEDA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
-		{name: "unknown status", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: "SECRET_STATUS", LastTransitionTime: transition}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
-		{name: "zero transition", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "foreign HPA condition", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Ready"}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "foreign KEDA condition", class: omev1beta1.AutoscalerKEDA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Able"}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "unknown status", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: "SECRET_STATUS", LastTransitionTime: transition, Reason: "Able"}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "zero transition", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue, Reason: "Able"}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "empty reason", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "malformed reason", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "SECRET REASON"}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
+		{name: "oversized reason", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: strings.Repeat("S", 1025)}}, wantIssue: reportv1alpha1.AutoscaleIssueConditionInvalid},
 		{name: "conflicting duplicate", class: omev1beta1.AutoscalerHPA, conditions: []metav1.Condition{
-			{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition},
-			{Type: "AbleToScale", Status: metav1.ConditionFalse, LastTransitionTime: later},
-			{Type: "ScalingActive", Status: metav1.ConditionTrue, LastTransitionTime: transition},
+			{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Able"},
+			{Type: "AbleToScale", Status: metav1.ConditionFalse, LastTransitionTime: later, Reason: "Unable"},
+			{Type: "ScalingActive", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Active"},
 		}, wantIssue: reportv1alpha1.AutoscaleIssueConditionConflict, wantItems: []reportv1alpha1.AutoscaleCondition{{Type: reportv1alpha1.AutoscaleConditionScalingActive, Status: reportv1alpha1.AutoscaleConditionTrue, LastTransitionTime: transition.Time}}},
 	}
 
@@ -610,10 +704,10 @@ func TestProjectInvalidAndConflictingConditionsAreOmitted(t *testing.T) {
 			got, err := Project(inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status), fixedClock())
 			require.NoError(t, err)
 			component := got.Content.Components[0]
-			assert.Equal(t, reportv1alpha1.AutoscaleConditionsInvalid, component.Conditions.State)
+			assert.Equal(t, reportv1alpha1.AutoscaleConditionsUnavailable, component.Conditions.State)
 			assert.Equal(t, append([]reportv1alpha1.AutoscaleCondition{}, test.wantItems...), component.Conditions.Items)
 			assert.Contains(t, issueCodes(got.Content.Issues), test.wantIssue)
-			assert.Equal(t, reportv1alpha1.AutoscaleComponentInvalid, component.State)
+			assert.Equal(t, reportv1alpha1.AutoscaleComponentPartial, component.State)
 		})
 	}
 }
@@ -623,9 +717,9 @@ func TestProjectReportsBothInvalidAndConflictingConditionAnomalies(t *testing.T)
 	later := metav1.NewTime(transition.Add(time.Minute))
 	status := reportedHPA()
 	status.Conditions = []metav1.Condition{
-		{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition},
-		{Type: "AbleToScale", Status: metav1.ConditionFalse, LastTransitionTime: later},
-		{Type: "SECRET_CONDITION", Status: metav1.ConditionTrue, LastTransitionTime: transition},
+		{Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Able"},
+		{Type: "AbleToScale", Status: metav1.ConditionFalse, LastTransitionTime: later, Reason: "Unable"},
+		{Type: "SECRET_CONDITION", Status: metav1.ConditionTrue, LastTransitionTime: transition, Reason: "Secret"},
 	}
 
 	got, err := Project(inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status), fixedClock())
@@ -781,6 +875,7 @@ func validHPACondition(conditionType string) metav1.Condition {
 	return metav1.Condition{
 		Type: conditionType, Status: metav1.ConditionTrue,
 		LastTransitionTime: metav1.NewTime(time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC)),
+		Reason:             "Observed",
 	}
 }
 

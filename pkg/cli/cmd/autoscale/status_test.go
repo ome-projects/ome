@@ -440,7 +440,7 @@ func TestStatusProductionWiringProjectsTheSingleFetchedParent(t *testing.T) {
 					Class: omev1beta1.AutoscalerHPA, ManagedBy: omev1beta1.AutoscalerManagedByOME,
 					SpecSource: "default", CurrentReplicas: 2, DesiredReplicas: 3,
 					Conditions: []metav1.Condition{{
-						Type: "AbleToScale", Status: metav1.ConditionTrue, LastTransitionTime: transition,
+						Type: "AbleToScale", Status: metav1.ConditionTrue, Reason: "Observed", LastTransitionTime: transition,
 					}},
 				},
 				ScaleTargetRef: &omev1beta1.ScaleTargetRef{

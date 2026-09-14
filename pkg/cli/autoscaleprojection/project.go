@@ -6,7 +6,9 @@ import (
 	"errors"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
@@ -178,7 +180,10 @@ func projectComponent(
 	}
 	nonOMEClass := classOK && (component.Class == reportv1alpha1.AutoscaleClassExternal || component.Class == reportv1alpha1.AutoscaleClassNone)
 	unexpectedReplicas := nonOMEClass && (autoscaler.CurrentReplicas != 0 || autoscaler.DesiredReplicas != 0 || autoscaler.LastScaleTime != nil)
-	unexpectedConditions := nonOMEClass && len(autoscaler.Conditions) != 0
+	unexpectedConditions, malformedConditions := false, false
+	if nonOMEClass {
+		unexpectedConditions, malformedConditions = classifyNonOMEConditions(autoscaler.Conditions)
+	}
 
 	if !matrixOK {
 		component.Replicas.State = reportv1alpha1.AutoscaleReplicasInvalid
@@ -204,13 +209,42 @@ func projectComponent(
 		component.Replicas.State = reportv1alpha1.AutoscaleReplicasInvalid
 		addIssue(reportv1alpha1.AutoscaleIssueUnexpectedScalerEvidence)
 	}
+	if malformedConditions {
+		if matrixOK {
+			component.Conditions = reportv1alpha1.AutoscaleConditionsStatus{
+				State: reportv1alpha1.AutoscaleConditionsUnavailable,
+				Items: []reportv1alpha1.AutoscaleCondition{},
+			}
+		}
+		addIssue(reportv1alpha1.AutoscaleIssueConditionInvalid)
+	}
 	if unexpectedConditions {
 		component.Conditions.State = reportv1alpha1.AutoscaleConditionsInvalid
 		addIssue(reportv1alpha1.AutoscaleIssueUnexpectedScalerEvidence)
 	}
 
 	component.State = summarizeComponent(component, classOK && managedByOK && specSourceOK && matrixOK)
+	if malformedConditions && component.State == reportv1alpha1.AutoscaleComponentReported {
+		component.State = reportv1alpha1.AutoscaleComponentPartial
+	}
 	return component, issues
+}
+
+func classifyNonOMEConditions(conditions []metav1.Condition) (unexpected, malformed bool) {
+	for _, condition := range conditions {
+		if len(metav1validation.ValidateCondition(condition, field.NewPath("condition"))) != 0 {
+			malformed = true
+			continue
+		}
+		// AutoscalerResolved is policy-selection provenance written for every
+		// class. It is not backend scaler evidence and its reason/message are
+		// deliberately neither interpreted nor emitted.
+		if condition.Type == omev1beta1.AutoscalerResolvedCondition {
+			continue
+		}
+		unexpected = true
+	}
+	return unexpected, malformed
 }
 
 func projectTarget(
@@ -274,8 +308,19 @@ func projectOMEConditions(
 	byType := map[reportv1alpha1.AutoscaleConditionType][]reportv1alpha1.AutoscaleCondition{}
 	invalid := false
 	for _, condition := range conditions {
+		if len(metav1validation.ValidateCondition(condition, field.NewPath("condition"))) != 0 {
+			invalid = true
+			continue
+		}
+		// AutoscalerResolved is first-party policy provenance, not backend
+		// scaler health. Its free-form reason/message stay out of this report;
+		// structurally valid instances neither contaminate nor satisfy the
+		// backend condition evidence set.
+		if condition.Type == omev1beta1.AutoscalerResolvedCondition {
+			continue
+		}
 		typeValue, ok := conditionType(class, condition.Type)
-		if !ok || condition.LastTransitionTime.IsZero() {
+		if !ok {
 			invalid = true
 			continue
 		}
@@ -307,12 +352,15 @@ func projectOMEConditions(
 	}
 	state := reportv1alpha1.AutoscaleConditionsReported
 	issues := []reportv1alpha1.AutoscaleIssueCode{}
+	if len(items) == 0 && !conflict && !invalid {
+		state = reportv1alpha1.AutoscaleConditionsNotReported
+	}
 	if conflict {
-		state = reportv1alpha1.AutoscaleConditionsInvalid
+		state = reportv1alpha1.AutoscaleConditionsUnavailable
 		issues = append(issues, reportv1alpha1.AutoscaleIssueConditionConflict)
 	}
 	if invalid {
-		state = reportv1alpha1.AutoscaleConditionsInvalid
+		state = reportv1alpha1.AutoscaleConditionsUnavailable
 		issues = append(issues, reportv1alpha1.AutoscaleIssueConditionInvalid)
 	}
 	return reportv1alpha1.AutoscaleConditionsStatus{State: state, Items: items}, issues
@@ -405,7 +453,9 @@ func summarizeComponent(component reportv1alpha1.AutoscaleComponentStatus, enums
 	if component.Target.State == reportv1alpha1.AutoscaleTargetNotReported ||
 		component.Replicas.State == reportv1alpha1.AutoscaleReplicasAmbiguous ||
 		component.Replicas.State == reportv1alpha1.AutoscaleReplicasNotReported ||
-		component.Conditions.State == reportv1alpha1.AutoscaleConditionsNotReported {
+		component.Conditions.State == reportv1alpha1.AutoscaleConditionsNotReported ||
+		(component.ManagedBy == reportv1alpha1.AutoscaleManagedByOME &&
+			component.Conditions.State == reportv1alpha1.AutoscaleConditionsUnavailable) {
 		return reportv1alpha1.AutoscaleComponentPartial
 	}
 	return reportv1alpha1.AutoscaleComponentReported
