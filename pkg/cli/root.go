@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/cmd/get"
 	"sigs.k8s.io/ome/pkg/cli/cmd/instance"
 	"sigs.k8s.io/ome/pkg/cli/cmd/logs"
+	"sigs.k8s.io/ome/pkg/cli/cmd/migration"
 	"sigs.k8s.io/ome/pkg/cli/cmd/rollout"
 	runtimecmd "sigs.k8s.io/ome/pkg/cli/cmd/runtime"
 	"sigs.k8s.io/ome/pkg/cli/cmd/status"
@@ -40,9 +41,9 @@ func newRootCmd(f factory.Factory, configFlags *genericclioptions.ConfigFlags, s
   kubectl ome <command>
 
 It provides model-centric visibility into OME resources: rich listings,
-controller-reported autoscaling and logical-instance evidence, InferenceService
-readiness and rollout diagnosis, runtime-selection explanations and
-component-aware log streaming.`,
+controller-reported autoscaling, logical-instance and migration evidence,
+InferenceService readiness and rollout diagnosis, runtime-selection
+explanations and component-aware log streaming.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -56,6 +57,7 @@ component-aware log streaming.`,
 	cmd.AddCommand(get.NewCmd(f, streams))
 	cmd.AddCommand(instance.NewCmd(f, streams))
 	cmd.AddCommand(logs.NewCmd(f, streams))
+	cmd.AddCommand(migration.NewCmd(f, streams))
 	cmd.AddCommand(rollout.NewCmd(f, streams))
 	cmd.AddCommand(runtimecmd.NewCmd(f, streams))
 	cmd.AddCommand(status.NewCmd(f, streams))

@@ -32,6 +32,8 @@ func TestRootCommandTree(t *testing.T) {
 		"ome instance",
 		"ome instance list",
 		"ome logs",
+		"ome migration",
+		"ome migration status",
 		"ome rollout",
 		"ome rollout explain",
 		"ome rollout status",
@@ -87,6 +89,23 @@ func TestRootHelpListsLogicalInstanceInspection(t *testing.T) {
 	}
 	if !bytes.Contains(output.Bytes(), []byte("  instance    Inspect controller-reported logical instances\n")) {
 		t.Fatalf("root help does not list instance command:\n%s", output.String())
+	}
+}
+
+func TestRootHelpListsMigrationStatus(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	root := NewRootCmdWithFactory(factory.Static{NS: "default"}, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: &output, ErrOut: &output,
+	})
+	root.SetArgs([]string{"--help"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(output.String(), "migration") || !strings.Contains(output.String(), "Inspect OMENative migrations") {
+		t.Fatalf("root help does not list migration status:\n%s", output.String())
 	}
 }
 
