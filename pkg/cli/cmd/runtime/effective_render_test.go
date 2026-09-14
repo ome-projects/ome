@@ -288,7 +288,23 @@ func TestEffectiveHealthyPinnedExactFormats(t *testing.T) {
 		format string
 		want   string
 	}{
-		{format: "table", want: `VIEW     STATE       REASON   RUNTIME                                 REVISION                      HASH       COMPONENT   MODE            MODE-SOURCE   PIN           PIN-STATE   SYNC           STATUS    DRIFT                           LIVE-RELATION   ISSUES
+		{format: "table", want: `SCOPE     FIELD           VALUE
+Live      STATE           Available
+Live      RUNTIME         CSR/cluster-runtime
+Live      HASH            e0e2b0d6
+Live      ENGINE          RawDeployment (Default)
+Active    STATE           Available
+Active    RUNTIME         CSR/cluster-runtime
+Active    REVISION        cr-cluster-runtime-e0e2b0d6
+Active    HASH            e0e2b0d6
+Active    ENGINE          RawDeployment (Default)
+Service   PIN             ExplicitPin/Resolved
+Service   SYNC            Acknowledged
+Service   STATUS          Current
+Service   DRIFT           ReportedTrue/RevisionMismatch
+Service   LIVE-RELATION   Equal
+`},
+		{format: "wide", want: `VIEW     STATE       REASON   RUNTIME                                 REVISION                      HASH       COMPONENT   MODE            MODE-SOURCE   PIN           PIN-STATE   SYNC           STATUS    DRIFT                           LIVE-RELATION   ISSUES
 Live     Available   -        ClusterServingRuntime/cluster-runtime   -                             e0e2b0d6   engine      RawDeployment   Default       ExplicitPin   Resolved    Acknowledged   Current   ReportedTrue/RevisionMismatch   Equal           -
 Active   Available   -        ClusterServingRuntime/cluster-runtime   cr-cluster-runtime-e0e2b0d6   e0e2b0d6   engine      RawDeployment   Default       ExplicitPin   Resolved    Acknowledged   Current   ReportedTrue/RevisionMismatch   Equal           -
 `},
@@ -531,8 +547,9 @@ func TestEffectiveTableAdaptsToTerminalWidth(t *testing.T) {
 	for _, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
 		assert.LessOrEqual(t, len([]rune(line)), 80, "line %q", line)
 	}
-	assert.Contains(t, out.String(), "VIEW:")
-	assert.Contains(t, out.String(), "ClusterServingRuntime/cluster-runtime")
+	assert.Contains(t, out.String(), "SCOPE")
+	assert.NotContains(t, out.String(), "SCOPE:")
+	assert.Contains(t, out.String(), "CSR/cluster-runtime")
 	assert.Contains(t, out.String(), "ReportedTrue/RevisionMismatch")
 }
 
@@ -543,9 +560,22 @@ func TestEffectiveStalePinnedExactFormats(t *testing.T) {
 		format string
 		want   string
 	}{
-		{format: "table", want: `VIEW     STATE       REASON   RUNTIME                                 REVISION                      HASH       COMPONENT   MODE            MODE-SOURCE   PIN           PIN-STATE   SYNC           STATUS   DRIFT                           LIVE-RELATION   ISSUES
-Live     Available   -        ClusterServingRuntime/cluster-runtime   -                             e0e2b0d6   engine      RawDeployment   Default       ExplicitPin   Resolved    Acknowledged   Stale    ReportedTrue/RevisionMismatch   Equal           StatusStale
-Active   Available   -        ClusterServingRuntime/cluster-runtime   cr-cluster-runtime-e0e2b0d6   e0e2b0d6   engine      RawDeployment   Default       ExplicitPin   Resolved    Acknowledged   Stale    ReportedTrue/RevisionMismatch   Equal           StatusStale
+		{format: "table", want: `SCOPE     FIELD           VALUE
+Live      STATE           Available
+Live      RUNTIME         CSR/cluster-runtime
+Live      HASH            e0e2b0d6
+Live      ENGINE          RawDeployment (Default)
+Active    STATE           Available
+Active    RUNTIME         CSR/cluster-runtime
+Active    REVISION        cr-cluster-runtime-e0e2b0d6
+Active    HASH            e0e2b0d6
+Active    ENGINE          RawDeployment (Default)
+Service   PIN             ExplicitPin/Resolved
+Service   SYNC            Acknowledged
+Service   STATUS          Stale
+Service   DRIFT           ReportedTrue/RevisionMismatch
+Service   LIVE-RELATION   Equal
+Service   ISSUE           StatusStale
 `},
 		{format: "json", want: `{
   "apiVersion": "cli.ome.io/v1alpha1",
@@ -793,9 +823,18 @@ func TestEffectiveNotConfiguredExactFormats(t *testing.T) {
 		format string
 		want   string
 	}{
-		{format: "table", want: `VIEW     STATE         REASON          RUNTIME   REVISION   HASH   COMPONENT   MODE   MODE-SOURCE   PIN        PIN-STATE     SYNC     STATUS       DRIFT         LIVE-RELATION   ISSUES
-Live     Unavailable   NotConfigured   -         -          -      -           -      -             AutoSync   Unavailable   Absent   Unobserved   NotReported   Unknown         InheritanceUnavailable,StatusUnobserved
-Active   Unavailable   NotConfigured   -         -          -      -           -      -             AutoSync   Unavailable   Absent   Unobserved   NotReported   Unknown         InheritanceUnavailable,StatusUnobserved
+		{format: "table", want: `SCOPE     FIELD           VALUE
+Live      STATE           Unavailable
+Live      REASON          NotConfigured
+Active    STATE           Unavailable
+Active    REASON          NotConfigured
+Service   PIN             AutoSync/Unavailable
+Service   SYNC            Absent
+Service   STATUS          Unobserved
+Service   DRIFT           NotReported
+Service   LIVE-RELATION   Unknown
+Service   ISSUE           InheritanceUnavailable
+Service   ISSUE           StatusUnobserved
 `},
 		{format: "json", want: `{
   "apiVersion": "cli.ome.io/v1alpha1",

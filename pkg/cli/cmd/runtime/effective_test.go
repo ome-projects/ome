@@ -289,7 +289,11 @@ and live-versus-controller-active evidence for an InferenceService.
 Current only means status.observedGeneration == metadata.generation in the
 fetched snapshot, never wall-clock freshness or rollout convergence. Raw
 runtime specs, ControllerRevision data, status messages, resource versions,
-and synchronization tokens are never printed.`, cmd.Long)
+and synchronization tokens are never printed.
+
+The compact table uses SR for ServingRuntime and CSR for ClusterServingRuntime,
+and renders components as MODE (SOURCE). Use -o wide for the complete legacy
+table.`, cmd.Long)
 	assert.Contains(t, cmd.Long, "status.observedGeneration == metadata.generation")
 	assert.Contains(t, cmd.Long, "never wall-clock freshness or rollout convergence")
 	assert.Contains(t, cmd.Long, "Raw\nruntime specs")
@@ -300,7 +304,7 @@ and synchronization tokens are never printed.`, cmd.Long)
 	require.NotNil(t, output)
 	assert.Equal(t, "o", output.Shorthand)
 	assert.Equal(t, "table", output.DefValue)
-	assert.Equal(t, "Output format: table, json or yaml", output.Usage)
+	assert.Equal(t, "Output format: table, wide, json or yaml", output.Usage)
 	omeNamespace := cmd.Flags().Lookup("ome-namespace")
 	require.NotNil(t, omeNamespace)
 	assert.Equal(t, "ome", omeNamespace.DefValue)
@@ -334,13 +338,17 @@ fetched snapshot, never wall-clock freshness or rollout convergence. Raw
 runtime specs, ControllerRevision data, status messages, resource versions,
 and synchronization tokens are never printed.
 
+The compact table uses SR for ServingRuntime and CSR for ClusterServingRuntime,
+and renders components as MODE (SOURCE). Use -o wide for the complete legacy
+table.
+
 Usage:
   runtime effective INFERENCESERVICE [flags]
 
 Flags:
   -h, --help                   help for effective
       --ome-namespace string   Namespace where the OME control plane is installed (default "ome")
-  -o, --output string          Output format: table, json or yaml (default "table")
+  -o, --output string          Output format: table, wide, json or yaml (default "table")
 `, out.String())
 }
 
@@ -555,7 +563,7 @@ func TestEffectiveAcquiresBoundSnapshotBeforeOptionalEvidence(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "service", primaryGET.GetName())
 	assert.Empty(t, kube.Actions(), "no revision is named and history is disabled")
-	assert.Contains(t, out.String(), "VIEW")
+	assert.Contains(t, out.String(), "SCOPE")
 	assert.Contains(t, out.String(), "NotConfigured")
 	assert.Empty(t, errOut.String())
 }

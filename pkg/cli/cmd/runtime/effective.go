@@ -39,6 +39,7 @@ type effectiveOptions struct {
 	output           string
 	name             string
 	format           report.Format
+	wide             bool
 }
 
 func newEffectiveCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -71,7 +72,11 @@ and live-versus-controller-active evidence for an InferenceService.
 Current only means status.observedGeneration == metadata.generation in the
 fetched snapshot, never wall-clock freshness or rollout convergence. Raw
 runtime specs, ControllerRevision data, status messages, resource versions,
-and synchronization tokens are never printed.`,
+and synchronization tokens are never printed.
+
+The compact table uses SR for ServingRuntime and CSR for ClusterServingRuntime,
+and renders components as MODE (SOURCE). Use -o wide for the complete legacy
+table.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.name = args[0]
@@ -81,17 +86,35 @@ and synchronization tokens are never printed.`,
 			return o.run(cmd.Context(), f)
 		},
 	}
-	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, json or yaml")
+	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	o.namespaceOptions.AddOMEFlags(cmd.Flags())
 	return cmd
 }
 
 func (o *effectiveOptions) validate() error {
-	format, err := report.ParseFormat(o.output)
+	format, wide, err := parseEffectiveOutput(o.output)
 	if err != nil {
 		return err
 	}
 	o.format = format
+	o.wide = wide
+	return o.validateName()
+}
+
+func parseEffectiveOutput(value string) (report.Format, bool, error) {
+	if value == "wide" {
+		return report.FormatTable, true, nil
+	}
+	format, err := report.ParseFormat(value)
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"unsupported output format %q (supported: table, wide, json, yaml)", value,
+		)
+	}
+	return format, false, nil
+}
+
+func (o *effectiveOptions) validateName() error {
 	if problems := validation.IsDNS1123Subdomain(o.name); len(problems) > 0 {
 		return fmt.Errorf("InferenceService name %q is invalid: %s", o.name, strings.Join(problems, "; "))
 	}
@@ -111,6 +134,12 @@ func (o *effectiveOptions) run(ctx context.Context, f factory.Factory) error {
 	)
 	if err != nil {
 		return fmt.Errorf("project effective runtime evidence: %w", err)
+	}
+	if o.wide {
+		if err := projected.Content.WideTable().Write(o.Out); err != nil {
+			return fmt.Errorf("write effective runtime report: %w", err)
+		}
+		return nil
 	}
 	if err := report.Write(o.Out, o.format, projected); err != nil {
 		return fmt.Errorf("write effective runtime report: %w", err)

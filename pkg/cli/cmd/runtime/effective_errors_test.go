@@ -281,7 +281,7 @@ func TestEffectivePreservesWriterFailures(t *testing.T) {
 		{name: "short write", writer: failingWriter{short: true}, want: io.ErrShortWrite},
 	}
 	for _, test := range tests {
-		for _, format := range []string{"table", "json", "yaml"} {
+		for _, format := range []string{"table", "wide", "json", "yaml"} {
 			t.Run(test.name+"/"+format, func(t *testing.T) {
 				var errOut bytes.Buffer
 				cmd := newEffectiveCmdWithDependencies(completeFactory(t), genericiooptions.IOStreams{

@@ -3,6 +3,7 @@ package v1alpha1_test
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,30 @@ func TestRuntimeEffectiveTableContract(t *testing.T) {
 	)
 
 	assert.Equal(t, report.Table{
+		Headers: []string{"SCOPE", "FIELD", "VALUE"},
+		Rows: [][]string{
+			{"Live", "STATE", "Available"},
+			{"Live", "RUNTIME", "SR/prod/vllm"},
+			{"Live", "HASH", "11223344"},
+			{"Live", "ENGINE", "RawDeployment (Default)"},
+			{"Live", "DECODER", "MultiNode (LeaderWorkerShape)"},
+			{"Live", "ROUTER", "VirtualDeployment (ServiceSpec)"},
+			{"Active", "STATE", "Available"},
+			{"Active", "RUNTIME", "CSR/cluster-vllm"},
+			{"Active", "REVISION", "revision-a"},
+			{"Active", "HASH", "aabbccdd"},
+			{"Active", "ENGINE", "OMENative (ComponentAnnotation)"},
+			{"Service", "PIN", "ManagedPin/Resolved"},
+			{"Service", "SYNC", "Pending"},
+			{"Service", "STATUS", "Stale"},
+			{"Service", "DRIFT", "ReportedTrue/PinAdvanced"},
+			{"Service", "LIVE-RELATION", "Different"},
+			{"Service", "ISSUE", "RevisionHashMismatch(revision-a)"},
+			{"Service", "ISSUE", "StatusStale"},
+		},
+	}, reportValue.Table())
+
+	assert.Equal(t, report.Table{
 		Headers: []string{
 			"VIEW", "STATE", "REASON", "RUNTIME", "REVISION", "HASH", "COMPONENT", "MODE", "MODE-SOURCE",
 			"PIN", "PIN-STATE", "SYNC", "STATUS", "DRIFT", "LIVE-RELATION", "ISSUES",
@@ -92,17 +117,12 @@ func TestRuntimeEffectiveTableContract(t *testing.T) {
 			{"Live", "Available", "-", "ServingRuntime/prod/vllm", "-", "11223344", "router", "VirtualDeployment", "ServiceSpec", "ManagedPin", "Resolved", "Pending", "Stale", "ReportedTrue/PinAdvanced", "Different", "RevisionHashMismatch(revision-a),StatusStale"},
 			{"Active", "Available", "-", "ClusterServingRuntime/cluster-vllm", "revision-a", "aabbccdd", "engine", "OMENative", "ComponentAnnotation", "ManagedPin", "Resolved", "Pending", "Stale", "ReportedTrue/PinAdvanced", "Different", "RevisionHashMismatch(revision-a),StatusStale"},
 		},
-	}, reportValue.Table())
+	}, reportValue.Content.WideTable())
 
 	var output bytes.Buffer
 	require.NoError(t, report.Write(&output, report.FormatTable, reportValue))
-	assert.Equal(t,
-		"VIEW     STATE       REASON   RUNTIME                              REVISION     HASH       COMPONENT   MODE                MODE-SOURCE           PIN          PIN-STATE   SYNC      STATUS   DRIFT                      LIVE-RELATION   ISSUES\n"+
-			"Live     Available   -        ServingRuntime/prod/vllm             -            11223344   engine      RawDeployment       Default               ManagedPin   Resolved    Pending   Stale    ReportedTrue/PinAdvanced   Different       RevisionHashMismatch(revision-a),StatusStale\n"+
-			"Live     Available   -        ServingRuntime/prod/vllm             -            11223344   decoder     MultiNode           LeaderWorkerShape     ManagedPin   Resolved    Pending   Stale    ReportedTrue/PinAdvanced   Different       RevisionHashMismatch(revision-a),StatusStale\n"+
-			"Live     Available   -        ServingRuntime/prod/vllm             -            11223344   router      VirtualDeployment   ServiceSpec           ManagedPin   Resolved    Pending   Stale    ReportedTrue/PinAdvanced   Different       RevisionHashMismatch(revision-a),StatusStale\n"+
-			"Active   Available   -        ClusterServingRuntime/cluster-vllm   revision-a   aabbccdd   engine      OMENative           ComponentAnnotation   ManagedPin   Resolved    Pending   Stale    ReportedTrue/PinAdvanced   Different       RevisionHashMismatch(revision-a),StatusStale\n",
-		output.String())
+	assert.Contains(t, output.String(), "SCOPE")
+	assert.Contains(t, output.String(), "RevisionHashMismatch(revision-a)")
 }
 
 func TestRuntimeEffectiveTableUsesDashRowForConfigurationWithoutComponents(t *testing.T) {
@@ -121,9 +141,133 @@ func TestRuntimeEffectiveTableUsesDashRowForConfigurationWithoutComponents(t *te
 	}
 
 	assert.Equal(t, [][]string{
-		{"Live", "Unavailable", "-", "-", "-", "-", "-", "-", "-", "AutoSync", "NotApplicable", "Absent", "Unobserved", "-", "-", "-"},
-		{"Active", "Unavailable", "NotFound", "-", "-", "-", "-", "-", "-", "AutoSync", "NotApplicable", "Absent", "Unobserved", "-", "-", "-"},
+		{"Live", "STATE", "Unavailable"},
+		{"Active", "STATE", "Unavailable"},
+		{"Active", "REASON", "NotFound"},
+		{"Service", "PIN", "AutoSync/NotApplicable"},
+		{"Service", "SYNC", "Absent"},
+		{"Service", "STATUS", "Unobserved"},
 	}, content.Table().Rows)
+}
+
+func TestRuntimeEffectiveCompactTableBoundsAndDisambiguatesIdentities(t *testing.T) {
+	liveName := "aa-" + strings.Repeat("x", 120) + "-shared-tail"
+	activeName := "aa-" + strings.Repeat("y", 120) + "-shared-tail"
+	namespace := "team-" + strings.Repeat("n", 60) + "-shared-tail"
+	live := runtimeObject(v1alpha1.RuntimeKindServingRuntime, namespace, liveName)
+	active := runtimeObject(v1alpha1.RuntimeKindServingRuntime, namespace, activeName)
+	reportValue := v1alpha1.NewRuntimeEffectiveReport(
+		v1alpha1.Metadata{Namespace: "prod", Name: "chat"},
+		v1alpha1.RuntimeEffectiveContent{
+			Live: v1alpha1.RuntimeConfiguration{
+				State: v1alpha1.ConfigurationStateAvailable, Source: &live,
+				Components: []v1alpha1.RuntimeComponent{{
+					Type:                 v1alpha1.RuntimeComponentEngine,
+					DeploymentMode:       v1alpha1.DeploymentMode(strings.Repeat("界", 40)),
+					DeploymentModeSource: v1alpha1.DeploymentModeSourceDefault,
+				}},
+			},
+			Active: v1alpha1.RuntimeConfiguration{
+				State: v1alpha1.ConfigurationStateAvailable, Source: &active,
+			},
+			LiveToActive: v1alpha1.RuntimeHashRelationDifferent,
+		},
+		fixedClock{},
+	)
+
+	table := reportValue.Table()
+	var identities []string
+	for _, row := range table.Rows {
+		if row[1] == "RUNTIME" {
+			identities = append(identities, row[2])
+			assert.Equal(t, 2, strings.Count(row[2], "/"), row[2])
+			assert.Equal(t, 2, strings.Count(row[2], "#"), row[2])
+		}
+	}
+	require.Len(t, identities, 2)
+	assert.NotEqual(t, identities[0], identities[1])
+
+	var compact bytes.Buffer
+	require.NoError(t, report.Write(&compact, report.FormatTable, reportValue))
+	for _, line := range strings.Split(strings.TrimSuffix(compact.String(), "\n"), "\n") {
+		assert.LessOrEqual(t, runtimeEffectiveFixtureWidth(line), 80, "line %q", line)
+	}
+	assert.NotContains(t, compact.String(), liveName)
+	assert.NotContains(t, compact.String(), activeName)
+
+	var wide bytes.Buffer
+	require.NoError(t, reportValue.Content.WideTable().Write(&wide))
+	assert.Contains(t, wide.String(), liveName)
+	assert.Contains(t, wide.String(), activeName)
+
+	var structured bytes.Buffer
+	require.NoError(t, report.Write(&structured, report.FormatJSON, reportValue))
+	assert.Contains(t, structured.String(), liveName)
+	assert.Contains(t, structured.String(), activeName)
+	assert.Contains(t, structured.String(), namespace)
+}
+
+func TestRuntimeEffectiveCompactTableHandlesPartialAndUnknownValues(t *testing.T) {
+	unknown := runtimeObject(v1alpha1.RuntimeKindUnknown, "team-a", "runtime")
+	longRevision := "revision-" + strings.Repeat("x", 120)
+	content := v1alpha1.RuntimeEffectiveContent{
+		Live: v1alpha1.RuntimeConfiguration{
+			Source: &unknown,
+			Components: []v1alpha1.RuntimeComponent{
+				{Type: v1alpha1.RuntimeComponentEngine, DeploymentMode: v1alpha1.DeploymentModeRawDeployment},
+				{Type: v1alpha1.RuntimeComponentDecoder, DeploymentModeSource: v1alpha1.DeploymentModeSourceDefault},
+				{Type: v1alpha1.RuntimeComponentRouter},
+				{Type: v1alpha1.RuntimeComponentType("SECRET_COMPONENT")},
+			},
+		},
+		Active: v1alpha1.RuntimeConfiguration{Revision: &v1alpha1.RuntimeRevisionReference{
+			Namespace: "ome", Name: longRevision,
+		}},
+		Issues: []v1alpha1.RuntimeIssue{
+			{Code: v1alpha1.RuntimeIssueStatusStale, Revision: longRevision},
+			{Code: v1alpha1.RuntimeIssueCode("ExtremelyLongFutureIssueCode" + strings.Repeat("x", 60))},
+		},
+	}
+
+	table := content.Table()
+	rows := make(map[string][]string)
+	var issues []string
+	for _, row := range table.Rows {
+		key := row[0] + "/" + row[1]
+		rows[key] = row
+		if key == "Service/ISSUE" {
+			issues = append(issues, row[2])
+		}
+	}
+	assert.Equal(t, "Unknown/team-a/runtime", rows["Live/RUNTIME"][2])
+	assert.Equal(t, "RawDeployment", rows["Live/ENGINE"][2])
+	assert.Equal(t, "Default", rows["Live/DECODER"][2])
+	assert.Equal(t, "-", rows["Live/ROUTER"][2])
+	assert.Equal(t, "Unsupported component omitted", rows["Live/OTHER"][2])
+	assert.NotContains(t, strings.Join(rows["Live/OTHER"], " "), "SECRET_COMPONENT")
+	assert.Contains(t, rows["Active/REVISION"][2], "#")
+	require.Len(t, issues, 2)
+	assert.Contains(t, strings.Join(issues, " "), "#")
+	for _, issue := range issues {
+		assert.LessOrEqual(t, runtimeEffectiveFixtureWidth(issue), 54)
+	}
+
+	var structured bytes.Buffer
+	require.NoError(t, report.Write(&structured, report.FormatJSON, content))
+	assert.Contains(t, structured.String(), "SECRET_COMPONENT")
+	assert.Contains(t, structured.String(), longRevision)
+}
+
+func runtimeEffectiveFixtureWidth(value string) int {
+	width := 0
+	for _, char := range value {
+		if char == '界' {
+			width += 2
+			continue
+		}
+		width++
+	}
+	return width
 }
 
 func TestRuntimeEffectiveSelectionAllowsMissingOrUnknownRuntimeIdentity(t *testing.T) {

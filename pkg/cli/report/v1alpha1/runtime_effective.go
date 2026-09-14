@@ -1,10 +1,13 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strings"
 	"time"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 )
 
@@ -95,8 +98,22 @@ func (c RuntimeEffectiveContent) Canonical() RuntimeEffectiveContent {
 	return result
 }
 
-// Table returns the deterministic human-readable effective configuration view.
+// Table returns a compact deterministic effective-configuration view. Each
+// fact occupies one row so the default output remains readable without
+// terminal metadata.
 func (c RuntimeEffectiveContent) Table() report.Table {
+	canonical := c.Canonical()
+	rows := appendCompactConfigurationRows(nil, "Live", canonical.Live)
+	rows = appendCompactConfigurationRows(rows, "Active", canonical.Active)
+	rows = appendCompactRuntimeServiceRows(rows, canonical)
+	return report.Table{
+		Headers: []string{"SCOPE", "FIELD", "VALUE"},
+		Rows:    rows,
+	}
+}
+
+// WideTable returns the complete legacy effective-configuration table.
+func (c RuntimeEffectiveContent) WideTable() report.Table {
 	canonical := c.Canonical()
 	table := report.Table{
 		Headers: []string{
@@ -113,6 +130,198 @@ func (c RuntimeEffectiveContent) Table() report.Table {
 		table.Rows, "Active", canonical.Active, canonical.Pin, canonical.LiveToActive, canonical.Issues,
 	)
 	return table
+}
+
+const compactRuntimeEffectiveValueWidth = 54
+
+func appendCompactConfigurationRows(
+	rows [][]string,
+	scope string,
+	configuration RuntimeConfiguration,
+) [][]string {
+	rows = appendCompactRuntimeEffectiveRow(rows, scope, "STATE", string(configuration.State))
+	if configuration.UnavailableReason != "" {
+		rows = appendCompactRuntimeEffectiveRow(
+			rows, scope, "REASON", string(configuration.UnavailableReason),
+		)
+	}
+	if configuration.Source != nil {
+		rows = append(rows, []string{
+			scope, "RUNTIME", compactRuntimeReferenceDisplay(configuration.Source),
+		})
+	}
+	if configuration.Revision != nil {
+		rows = append(rows, []string{
+			scope, "REVISION", compactRuntimeEffectiveIdentity(revisionReferenceDisplay(configuration.Revision)),
+		})
+	}
+	if configuration.Hash != "" {
+		rows = appendCompactRuntimeEffectiveRow(rows, scope, "HASH", configuration.Hash)
+	}
+	for _, component := range configuration.Components {
+		field := compactRuntimeComponentField(component.Type)
+		if field == "" {
+			rows = append(rows, []string{scope, "OTHER", "Unsupported component omitted"})
+			continue
+		}
+		rows = appendCompactRuntimeEffectiveRow(
+			rows, scope, field, compactRuntimeComponentValue(component),
+		)
+	}
+	return rows
+}
+
+func appendCompactRuntimeServiceRows(
+	rows [][]string,
+	content RuntimeEffectiveContent,
+) [][]string {
+	if value := compactRuntimePin(content.Pin); value != "" {
+		rows = appendCompactRuntimeEffectiveRow(rows, "Service", "PIN", value)
+	}
+	if content.Pin.SyncState != "" {
+		rows = appendCompactRuntimeEffectiveRow(
+			rows, "Service", "SYNC", string(content.Pin.SyncState),
+		)
+	}
+	if content.Pin.Status.Freshness != "" {
+		rows = appendCompactRuntimeEffectiveRow(
+			rows, "Service", "STATUS", string(content.Pin.Status.Freshness),
+		)
+	}
+	if content.Pin.ReportedDrift.State != "" {
+		rows = appendCompactRuntimeEffectiveRow(
+			rows, "Service", "DRIFT", runtimeDriftDisplay(content.Pin.ReportedDrift),
+		)
+	}
+	if content.LiveToActive != "" {
+		rows = appendCompactRuntimeEffectiveRow(
+			rows, "Service", "LIVE-RELATION", string(content.LiveToActive),
+		)
+	}
+	for _, issue := range content.Issues {
+		rows = append(rows, []string{
+			"Service", "ISSUE", compactRuntimeIssueDisplay(issue),
+		})
+	}
+	return rows
+}
+
+func appendCompactRuntimeEffectiveRow(
+	rows [][]string,
+	scope string,
+	field string,
+	value string,
+) [][]string {
+	return append(rows, []string{
+		scope, field, printers.BoundedCell(orDash(value), compactRuntimeEffectiveValueWidth),
+	})
+}
+
+func compactRuntimeComponentField(component RuntimeComponentType) string {
+	switch component {
+	case RuntimeComponentEngine:
+		return "ENGINE"
+	case RuntimeComponentDecoder:
+		return "DECODER"
+	case RuntimeComponentRouter:
+		return "ROUTER"
+	default:
+		return ""
+	}
+}
+
+func compactRuntimeComponentValue(component RuntimeComponent) string {
+	mode := orDash(string(component.DeploymentMode))
+	source := orDash(string(component.DeploymentModeSource))
+	switch {
+	case mode == "-" && source == "-":
+		return "-"
+	case source == "-":
+		return mode
+	case mode == "-":
+		return source
+	default:
+		return mode + " (" + source + ")"
+	}
+}
+
+func compactRuntimePin(pin RuntimePin) string {
+	parts := make([]string, 0, 2)
+	if pin.Mode != "" {
+		parts = append(parts, string(pin.Mode))
+	}
+	if pin.State != "" {
+		parts = append(parts, string(pin.State))
+	}
+	return strings.Join(parts, "/")
+}
+
+func compactRuntimeEffectiveIdentity(value string) string {
+	const normalizedIdentityLimit = 1024
+	clean := printers.BoundedMiddleCell(value, normalizedIdentityLimit)
+	if printers.BoundedMiddleCell(clean, compactRuntimeEffectiveValueWidth) == clean {
+		return clean
+	}
+	digest := sha256.Sum256([]byte(clean))
+	prefix := printers.BoundedMiddleCell(
+		clean, compactRuntimeEffectiveValueWidth-1-8,
+	)
+	return prefix + "#" + hex.EncodeToString(digest[:4])
+}
+
+func compactRuntimeIssueDisplay(issue RuntimeIssue) string {
+	code := string(issue.Code)
+	if issue.Revision == "" {
+		return compactRuntimeEffectiveIdentity(code)
+	}
+	full := code + "(" + issue.Revision + ")"
+	clean := printers.BoundedCell(full, 1024)
+	if printers.BoundedCell(clean, compactRuntimeEffectiveValueWidth) == clean {
+		return clean
+	}
+	const codeWidth = 28
+	const revisionWidth = compactRuntimeEffectiveValueWidth - codeWidth - 2
+	return compactRuntimeIdentityComponent(code, codeWidth) + "(" +
+		compactRuntimeIdentityComponent(issue.Revision, revisionWidth) + ")"
+}
+
+func compactRuntimeReferenceDisplay(reference *RuntimeObjectReference) string {
+	if reference == nil {
+		return "-"
+	}
+	kind := compactRuntimeKind(reference.Kind)
+	if reference.Namespace == "" {
+		nameWidth := compactRuntimeEffectiveValueWidth - len(kind) - 1
+		return kind + "/" + compactRuntimeIdentityComponent(reference.Name, nameWidth)
+	}
+
+	namespaceWidth := 20
+	nameWidth := compactRuntimeEffectiveValueWidth - len(kind) - 2 - namespaceWidth
+	return kind + "/" +
+		compactRuntimeIdentityComponent(reference.Namespace, namespaceWidth) + "/" +
+		compactRuntimeIdentityComponent(reference.Name, nameWidth)
+}
+
+func compactRuntimeKind(kind RuntimeKind) string {
+	switch kind {
+	case RuntimeKindServingRuntime:
+		return "SR"
+	case RuntimeKindClusterServingRuntime:
+		return "CSR"
+	default:
+		return "Unknown"
+	}
+}
+
+func compactRuntimeIdentityComponent(value string, width int) string {
+	const normalizedIdentityLimit = 1024
+	clean := printers.BoundedMiddleCell(orDash(value), normalizedIdentityLimit)
+	if printers.BoundedMiddleCell(clean, width) == clean {
+		return clean
+	}
+	digest := sha256.Sum256([]byte(clean))
+	prefix := printers.BoundedMiddleCell(clean, width-1-8)
+	return prefix + "#" + hex.EncodeToString(digest[:4])
 }
 
 func (c RuntimeConfiguration) canonical() RuntimeConfiguration {
