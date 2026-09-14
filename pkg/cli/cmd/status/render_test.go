@@ -2,7 +2,9 @@ package status
 
 import (
 	"bytes"
+	"errors"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -143,4 +145,32 @@ func TestRenderShowsOptionalStatusSections(t *testing.T) {
 	assert.Contains(t, out, "  Canary: present (inspect with kubectl get inferenceservice -o yaml)\n")
 	assert.Contains(t, out, "  Placement: present (inspect with kubectl get inferenceservice -o yaml)\n")
 	assert.Contains(t, out, "  RolloutCoordination: present (inspect with kubectl get inferenceservice -o yaml)\n")
+}
+
+func TestRenderPropagatesObservationWarningWriterError(t *testing.T) {
+	want := errors.New("warning write failed")
+	w := &failOnWrite{call: 5, err: want}
+	r := &report{
+		ISVC: &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "team-a"},
+		},
+		Pods:     map[v1beta1.ComponentType][]corev1.Pod{},
+		Warnings: []string{"bounded warning"},
+	}
+
+	require.ErrorIs(t, render(r, w), want)
+}
+
+type failOnWrite struct {
+	writes int
+	call   int
+	err    error
+}
+
+func (w *failOnWrite) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.call {
+		return 0, w.err
+	}
+	return io.Discard.Write(p)
 }

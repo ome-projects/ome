@@ -4,28 +4,74 @@ package status
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/observation"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
+const (
+	maxStatusPods                    = 1000
+	maxStatusEventsPerTarget         = 25
+	maxStatusEventTargets            = 16
+	maxStatusEvents                  = 100
+	maxConcurrentStatusEventRequests = 8
+)
+
+type gatherLimits struct {
+	pods      paging.Limits
+	events    observation.EventLimits
+	maxEvents int
+}
+
+func defaultGatherLimits() gatherLimits {
+	return gatherLimits{
+		pods: paging.Limits{
+			PageSize:       paging.ChunkSize,
+			MaxItems:       maxStatusPods,
+			MaxPages:       2,
+			RequestTimeout: 10 * time.Second,
+		},
+		events: observation.EventLimits{
+			Paging: paging.Limits{
+				PageSize:       maxStatusEventsPerTarget,
+				MaxItems:       maxStatusEventsPerTarget,
+				MaxPages:       1,
+				RequestTimeout: 5 * time.Second,
+			},
+			MaxTargets:    maxStatusEventTargets,
+			MaxConcurrent: maxConcurrentStatusEventRequests,
+		},
+		maxEvents: maxStatusEvents,
+	}
+}
+
 type report struct {
-	ISVC   *v1beta1.InferenceService
-	Pods   map[v1beta1.ComponentType][]corev1.Pod
-	Events []corev1.Event
+	ISVC     *v1beta1.InferenceService
+	Pods     map[v1beta1.ComponentType][]corev1.Pod
+	Events   []corev1.Event
+	Warnings []string
 }
 
 func gather(ctx context.Context, f factory.Factory, ns, name string) (*report, error) {
+	return gatherWithLimits(ctx, f, ns, name, defaultGatherLimits())
+}
+
+func gatherWithLimits(ctx context.Context, f factory.Factory, ns, name string, limits gatherLimits) (*report, error) {
+	if limits.maxEvents <= 0 {
+		return nil, fmt.Errorf("event output limit must be positive")
+	}
 	ome, err := f.OMEClient()
 	if err != nil {
 		return nil, err
@@ -39,82 +85,132 @@ func gather(ctx context.Context, f factory.Factory, ns, name string) (*report, e
 		return nil, err
 	}
 	podSelector := fmt.Sprintf("%s=%s", constants.InferenceServiceLabel, name)
-	podObjs, err := paging.ListAllPaged(ctx, func(pageOpts metav1.ListOptions) ([]runtime.Object, string, error) {
-		pageOpts.LabelSelector = podSelector
-		l, err := kube.CoreV1().Pods(ns).List(ctx, pageOpts)
-		if err != nil {
-			return nil, "", err
-		}
-		items := make([]runtime.Object, 0, len(l.Items))
-		for i := range l.Items {
-			items = append(items, &l.Items[i])
-		}
-		return items, l.Continue, nil
-	})
+	podCollection, err := observation.CollectPods(ctx, kube.CoreV1(), ns, podSelector, limits.pods)
 	if err != nil {
 		return nil, err
 	}
-	pods := make([]corev1.Pod, 0, len(podObjs))
-	for _, obj := range podObjs {
-		pods = append(pods, *obj.(*corev1.Pod))
-	}
+	pods := podCollection.Items
 
 	r := &report{ISVC: isvc, Pods: map[v1beta1.ComponentType][]corev1.Pod{}}
+	if podCollection.Truncated {
+		r.Warnings = append(r.Warnings, fmt.Sprintf(
+			"Pod observation truncated; collected pods: %d; component details may be incomplete",
+			len(pods),
+		))
+	}
 	for _, p := range pods {
 		component := v1beta1.ComponentType(p.Labels[constants.OMEComponentLabel])
 		r.Pods[component] = append(r.Pods[component], p)
 	}
 
-	// Warning events, scoped per involved object (the kubectl-describe
-	// pattern) instead of one namespace-wide "type=Warning" list filtered
-	// client-side: one tiny field-selector query for the InferenceService,
-	// plus one for each of its pods. seen dedupes by event UID across those
-	// queries.
-	seen := map[types.UID]bool{}
-	isvcEvents, err := eventsForObject(ctx, kube, ns, name, "InferenceService")
+	targets, skippedPodTargets := statusEventTargets(ns, name, isvc, pods, limits.events.MaxTargets)
+	eventCollection, err := observation.CollectWarningEvents(ctx, kube.CoreV1(), targets, limits.events)
 	if err != nil {
 		return nil, err
 	}
-	r.Events = mergeWarningEvents(r.Events, seen, isvcEvents, name, "InferenceService")
-	for _, p := range pods {
-		podEvents, err := eventsForObject(ctx, kube, ns, p.Name, "Pod")
-		if err != nil {
-			return nil, err
+	for _, failure := range eventCollection.Failures {
+		r.Warnings = append(r.Warnings, fmt.Sprintf(
+			"Warning Events unavailable for %s %s/%s (%s)",
+			failure.Target.Kind,
+			failure.Target.Namespace,
+			failure.Target.Name,
+			warningEventFailureReason(failure.Err),
+		))
+	}
+	if eventCollection.Truncated || skippedPodTargets > 0 {
+		warning := "Warning Event observation truncated"
+		skippedTargets := eventCollection.SkippedTargets + skippedPodTargets
+		if skippedTargets > 0 {
+			warning += fmt.Sprintf("; object targets not queried: %d", skippedTargets)
 		}
-		r.Events = mergeWarningEvents(r.Events, seen, podEvents, p.Name, "Pod")
+		if omitted := len(eventCollection.Items) - limits.maxEvents; omitted > 0 {
+			warning += fmt.Sprintf("; events not shown: %d", omitted)
+		}
+		r.Warnings = append(r.Warnings, warning+"; recent events may be incomplete")
+	}
+	r.Events = eventCollection.Items
+	if len(r.Events) > limits.maxEvents {
+		r.Events = r.Events[:limits.maxEvents]
+		if !eventCollection.Truncated && skippedPodTargets == 0 {
+			r.Warnings = append(r.Warnings, fmt.Sprintf(
+				"Warning Event observation truncated; events not shown: %d; recent events may be incomplete",
+				len(eventCollection.Items)-limits.maxEvents,
+			))
+		}
 	}
 	return r, nil
 }
 
-// eventsForObject fetches the Warning events for a single involved object
-// (kubectl-describe's pattern): a field-selector query keeps each response
-// tiny instead of listing every Warning event in the namespace.
-func eventsForObject(ctx context.Context, kube kubernetes.Interface, ns, name, kind string) ([]corev1.Event, error) {
-	sel := fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=%s,type=%s", name, kind, corev1.EventTypeWarning)
-	l, err := kube.CoreV1().Events(ns).List(ctx, metav1.ListOptions{FieldSelector: sel})
-	if err != nil {
-		return nil, err
+func statusEventTargets(
+	namespace string,
+	name string,
+	isvc *v1beta1.InferenceService,
+	pods []corev1.Pod,
+	maxTargets int,
+) ([]observation.ObjectRef, int) {
+	targets := []observation.ObjectRef{{
+		Namespace: namespace,
+		Kind:      "InferenceService",
+		Name:      name,
+		UID:       isvc.UID,
+	}}
+	orderedPods := append([]corev1.Pod{}, pods...)
+	sort.SliceStable(orderedPods, func(i, j int) bool {
+		leftNeedsEvents := statusPodNeedsEventObservation(orderedPods[i])
+		rightNeedsEvents := statusPodNeedsEventObservation(orderedPods[j])
+		if leftNeedsEvents != rightNeedsEvents {
+			return leftNeedsEvents
+		}
+		if orderedPods[i].Namespace != orderedPods[j].Namespace {
+			return orderedPods[i].Namespace < orderedPods[j].Namespace
+		}
+		if orderedPods[i].Name != orderedPods[j].Name {
+			return orderedPods[i].Name < orderedPods[j].Name
+		}
+		return orderedPods[i].UID < orderedPods[j].UID
+	})
+	podLimit := max(maxTargets-1, 0)
+	if len(orderedPods) > podLimit {
+		orderedPods = orderedPods[:podLimit]
 	}
-	return l.Items, nil
+	for _, pod := range orderedPods {
+		targets = append(targets, observation.ObjectRef{
+			Namespace: namespace,
+			Kind:      "Pod",
+			Name:      pod.Name,
+			UID:       pod.UID,
+		})
+	}
+	return targets, len(pods) - len(orderedPods)
 }
 
-// mergeWarningEvents appends the events from one eventsForObject query onto
-// acc, keeping only Warning events whose InvolvedObject actually matches
-// (name, kind) -- defense in depth, since a field-selector-blind source
-// (the fake clientset in tests, or a misbehaving API server) would
-// otherwise leak unrelated events through -- and deduping by UID against
-// seen, which callers thread across every per-object query so the same
-// event is never counted twice.
-func mergeWarningEvents(acc []corev1.Event, seen map[types.UID]bool, events []corev1.Event, wantName, wantKind string) []corev1.Event {
-	for _, e := range events {
-		if e.Type != corev1.EventTypeWarning || e.InvolvedObject.Name != wantName || e.InvolvedObject.Kind != wantKind {
-			continue
-		}
-		if seen[e.UID] {
-			continue
-		}
-		seen[e.UID] = true
-		acc = append(acc, e)
+func statusPodNeedsEventObservation(pod corev1.Pod) bool {
+	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return true
 	}
-	return acc
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status != corev1.ConditionTrue
+		}
+	}
+	return true
+}
+
+func warningEventFailureReason(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded),
+		kerrors.IsTimeout(err),
+		kerrors.IsServerTimeout(err):
+		return "Timeout"
+	case kerrors.IsForbidden(err):
+		return "Forbidden"
+	case kerrors.IsUnauthorized(err):
+		return "Unauthorized"
+	case kerrors.IsNotFound(err):
+		return "NotFound"
+	case kerrors.IsTooManyRequests(err), kerrors.IsServiceUnavailable(err):
+		return "Unavailable"
+	default:
+		return "Unreadable"
+	}
 }
