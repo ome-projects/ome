@@ -367,8 +367,9 @@ func (b *projector) applyCanaryStatus(
 		b.markMalformed(reportv1alpha1.RolloutIssueCanaryStepInvalid, ptrInt(projected.Index), "")
 		return
 	}
-	repinBoundary := canaryevidence.ValidPausedNonRaisingRepinBoundary(
-		b.isvc, primary, projected.Phase, group.Canary.Steps, status,
+	componentStatus := b.isvc.Status.Components[primary]
+	repinBoundary := canaryevidence.ValidRepinBoundary(
+		b.isvc, primary, projected.Phase, group.Canary.Steps, status, componentStatus.Traffic,
 	)
 	if !validCanaryPhaseStepResidue(projected.Phase, group.Canary.Steps, status) && !repinBoundary {
 		b.markMalformed(reportv1alpha1.RolloutIssueStatusMalformed, ptrInt(projected.Index), "")

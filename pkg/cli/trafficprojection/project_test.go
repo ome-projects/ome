@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -645,15 +646,15 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			isvc := currentTrafficISVC(t)
-			// clampCanary repinned a [20, 100] rollout while 20% was
-			// programmed to the shorter, final-only [100] ladder.
-			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+			newSteps := []omev1beta1.RolloutGroupStep{{
 				Capacity: intstr.FromString("100%"), Traffic: 100,
 			}}
-			isvc.Status.Canary.PreStepHold = true
-			component := isvc.Status.Components[omev1beta1.EngineComponent]
-			component.RolloutPhase = tt.phase
-			isvc.Status.Components[omev1beta1.EngineComponent] = component
+			// clampCanary repinned a [20, 100] rollout while 20% was
+			// programmed to the shorter, final-only [100] ladder. The
+			// active run proves that this is a repin, rather than forged
+			// stand-alone CanaryStatus residue.
+			configureTrafficRepin(t, isvc, isvc.Spec.Rollout.Groups[0].Canary.Steps,
+				newSteps, 0, 20, tt.phase, true)
 			if tt.globalPause != "" {
 				// A run-boundary repin is flushed before canary reconciliation.
 				// Global pause then returns without replacing the pre-repin phase,
@@ -669,6 +670,69 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 			assert.Equal(t, int32(1), got.Content.Canary.TotalSteps)
 			assert.Equal(t, int32(20), got.Content.Canary.ObservedTraffic)
 			assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+				Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+			})
+		})
+	}
+}
+
+func TestProjectRejectsUnprovenRepinPreStepHold(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService)
+	}{
+		{name: "active run missing", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun = nil
+		}},
+		{name: "initial pin is not a repin", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.PinnedAt = isvc.Status.Rollout.ActiveRun.OpenedAt
+		}},
+		{name: "pin does not postdate step", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.PinnedAt = *isvc.Status.Canary.StepEnteredTime
+		}},
+		{name: "primary target differs", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = "cccccccc"
+		}},
+		{name: "source is invalid", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Source = "SECRET_SOURCE"
+		}},
+		{name: "policy progression differs", mutate: func(isvc *omev1beta1.InferenceService) {
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Source = omev1beta1.RolloutPlanSourcePolicy
+			pinned.PolicyGeneration = 1
+			pinned.PolicyRef = &omev1beta1.RolloutPolicyRef{
+				Name: "guarded-canary", Progression: omev1beta1.RolloutProgressionBlueGreen,
+			}
+		}},
+		{name: "portable digest differs", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PortableDigest = "rp1:000000000000"
+		}},
+		{name: "closed rollback residue has no pinned plan", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun = nil
+			isvc.Status.Canary.ObservedTrafficWeight = 0
+			isvc.Status.Canary.RolledBackRevisionHash = isvc.Status.Canary.CanaryRevisionHash
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = omev1beta1.RolloutPhaseRolledBack
+			component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+				RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 100,
+			}}
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			configureTrafficRepin(t, isvc, isvc.Spec.Rollout.Groups[0].Canary.Steps,
+				[]omev1beta1.RolloutGroupStep{{Capacity: intstr.FromString("100%"), Traffic: 100}},
+				0, 20, omev1beta1.RolloutPhaseCanarying, true)
+			tt.mutate(isvc)
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Nil(t, got.Content.Canary)
+			assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
 				Code: reportv1alpha1.TrafficIssueCanaryInvalid,
 			})
 		})
@@ -757,6 +821,9 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			isvc := currentTrafficISVC(t)
+			mode := constants.OMENative
+			isvc.Spec.DeploymentMode = &mode
+			isvc.Spec.Engine = &omev1beta1.EngineSpec{}
 			// Repin replaces a controller-valid old ladder before the
 			// executor runs: [10, 30, 100] leaves 50% above the new target,
 			// while [100] clamps a completed 100% step to zero at equal
@@ -832,6 +899,141 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 	}
 }
 
+func TestProjectRejectsImpossiblePolicyRepinProvenance(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService)
+	}{
+		{name: "policy progression mismatch", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = omev1beta1.RolloutProgressionBlueGreen
+		}},
+		{name: "policy kind invalid", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Kind = "ClusterRolloutPolicy"
+		}},
+		{name: "policy name invalid", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Name = "bad/name"
+		}},
+		{name: "policy progression invalid", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = "SECRET_PROGRESSION"
+		}},
+		{name: "policy capacity is absolute", mutate: func(isvc *omev1beta1.InferenceService) {
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Group.Canary.Steps[1].Capacity = intstr.FromInt(2)
+			refreshTrafficPinnedDigest(t, pinned)
+		}},
+		{name: "policy server address is not portable", mutate: func(isvc *omev1beta1.InferenceService) {
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Group.Canary.Prometheus = &omev1beta1.AnalysisPrometheus{
+				ServerAddress: "https://prometheus.internal.example",
+			}
+			refreshTrafficPinnedDigest(t, pinned)
+		}},
+		{name: "policy auth reference is not portable", mutate: func(isvc *omev1beta1.InferenceService) {
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Group.Canary.Prometheus = &omev1beta1.AnalysisPrometheus{
+				AuthRef: &corev1.SecretKeySelector{Key: "token"},
+			}
+			refreshTrafficPinnedDigest(t, pinned)
+		}},
+		{name: "resolved group order is unsupported", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Order = []omev1beta1.ComponentType{
+				omev1beta1.EngineComponent,
+			}
+		}},
+		{name: "canary cannot coexist with another group", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Spec.Decoder = &omev1beta1.DecoderSpec{}
+			group := omev1beta1.RolloutGroup{
+				Components: []omev1beta1.ComponentType{omev1beta1.DecoderComponent},
+				BlueGreen:  &omev1beta1.GroupBlueGreen{},
+			}
+			digest, err := rolloutpolicy.ProgressionDigest(&group)
+			require.NoError(t, err)
+			isvc.Status.Rollout.ActiveRun.Plan.Groups = append(
+				isvc.Status.Rollout.ActiveRun.Plan.Groups,
+				omev1beta1.RolloutRunGroup{
+					Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: digest, Group: group,
+				},
+			)
+			isvc.Status.Rollout.ActiveRun.TargetRevisions = append(
+				isvc.Status.Rollout.ActiveRun.TargetRevisions,
+				omev1beta1.RolloutRunTarget{Component: omev1beta1.DecoderComponent, Revision: "cccccccc"},
+			)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			configureTrafficRepin(t, isvc,
+				[]omev1beta1.RolloutGroupStep{
+					{Capacity: intstr.FromString("25%"), Traffic: 20},
+					{Capacity: intstr.FromString("50%"), Traffic: 50},
+					{Capacity: intstr.FromString("100%"), Traffic: 100},
+				},
+				[]omev1beta1.RolloutGroupStep{
+					{Capacity: intstr.FromString("25%"), Traffic: 10},
+					{Capacity: intstr.FromString("50%"), Traffic: 30},
+					{Capacity: intstr.FromString("100%"), Traffic: 100},
+				},
+				1, 50, omev1beta1.RolloutPhasePaused, false)
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Source = omev1beta1.RolloutPlanSourcePolicy
+			pinned.PolicyGeneration = 7
+			pinned.PolicyRef = &omev1beta1.RolloutPolicyRef{
+				Name: "guarded-canary", Progression: omev1beta1.RolloutProgressionCanary,
+			}
+			tt.mutate(isvc)
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Nil(t, got.Content.Canary)
+			assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+				Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+			})
+		})
+	}
+}
+
+func TestProjectAcceptsPolicyRepinWithReorderedTargets(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	configureTrafficRepin(t, isvc,
+		[]omev1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("25%"), Traffic: 20},
+			{Capacity: intstr.FromString("50%"), Traffic: 50},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		},
+		[]omev1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("25%"), Traffic: 10},
+			{Capacity: intstr.FromString("50%"), Traffic: 30},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		},
+		1, 50, omev1beta1.RolloutPhasePaused, false)
+	isvc.Spec.Decoder = &omev1beta1.DecoderSpec{}
+	pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+	pinned.Source = omev1beta1.RolloutPlanSourcePolicy
+	pinned.PolicyGeneration = 7
+	pinned.PolicyRef = &omev1beta1.RolloutPolicyRef{
+		Name: "guarded-canary", Progression: omev1beta1.RolloutProgressionCanary,
+	}
+	pinned.Group.Components = []omev1beta1.ComponentType{
+		omev1beta1.DecoderComponent, omev1beta1.EngineComponent,
+	}
+	isvc.Status.Rollout.ActiveRun.TargetRevisions = []omev1beta1.RolloutRunTarget{
+		{Component: omev1beta1.EngineComponent, Revision: "e5f6a7b8"},
+		{Component: omev1beta1.DecoderComponent, Revision: "cccccccc"},
+	}
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, int32(1), got.Content.Canary.CurrentStep)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+	})
+}
+
 func TestProjectAcceptsRollbackRepinPreStepHold(t *testing.T) {
 	for _, phase := range []omev1beta1.RolloutPhase{
 		omev1beta1.RolloutPhaseRollingBack,
@@ -842,12 +1044,11 @@ func TestProjectAcceptsRollbackRepinPreStepHold(t *testing.T) {
 			// The run layer handles repin before closed-outcome detection. A
 			// one-step replacement therefore clamps the rolled-back status and
 			// persists its hold before the canary reconciler runs again.
-			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+			newSteps := []omev1beta1.RolloutGroupStep{{
 				Capacity: intstr.FromString("100%"), Traffic: 100,
 			}}
-			isvc.Status.Canary.CurrentStep = 0
-			isvc.Status.Canary.ObservedTrafficWeight = 0
-			isvc.Status.Canary.PreStepHold = true
+			configureTrafficRepin(t, isvc, isvc.Spec.Rollout.Groups[0].Canary.Steps,
+				newSteps, 0, 0, phase, true)
 			isvc.Status.Canary.RolledBackRevisionHash = isvc.Status.Canary.CanaryRevisionHash
 			component := isvc.Status.Components[omev1beta1.EngineComponent]
 			component.RolloutPhase = phase
@@ -871,10 +1072,11 @@ func TestProjectAcceptsRollbackRepinPreStepHold(t *testing.T) {
 
 func TestProjectAcceptsPromotedThroughAfterBackwardRepinClamp(t *testing.T) {
 	isvc := currentTrafficISVC(t)
-	isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+	newSteps := []omev1beta1.RolloutGroupStep{{
 		Capacity: intstr.FromString("100%"), Traffic: 100,
 	}}
-	isvc.Status.Canary.PreStepHold = true
+	configureTrafficRepin(t, isvc, isvc.Spec.Rollout.Groups[0].Canary.Steps,
+		newSteps, 0, 20, omev1beta1.RolloutPhaseCanarying, true)
 	isvc.Status.Canary.PromotedThrough = "SECRET_OLD_PROMOTE"
 	// A global pause lets the phase and durable promotion record from the
 	// repin boundary remain visible until the executor resumes.
@@ -1294,6 +1496,78 @@ func currentTrafficISVC(t *testing.T) *omev1beta1.InferenceService {
 			},
 		},
 	}
+}
+
+func configureTrafficRepin(
+	t *testing.T,
+	isvc *omev1beta1.InferenceService,
+	oldSteps, newSteps []omev1beta1.RolloutGroupStep,
+	currentStep, observedTraffic int32,
+	phase omev1beta1.RolloutPhase,
+	preStepHold bool,
+) {
+	t.Helper()
+	mode := constants.OMENative
+	isvc.Spec.DeploymentMode = &mode
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+	group := omev1beta1.RolloutGroup{
+		Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+		Canary: &omev1beta1.GroupCanary{
+			Steps: append([]omev1beta1.RolloutGroupStep{}, newSteps...),
+		},
+	}
+	isvc.Spec.Rollout = &omev1beta1.RolloutSpec{Groups: []omev1beta1.RolloutGroup{group}}
+	opened := metav1.NewTime(time.Date(2026, time.September, 14, 16, 40, 0, 0, time.UTC))
+	entered := metav1.NewTime(time.Date(2026, time.September, 14, 16, 45, 0, 0, time.UTC))
+	pinnedAt := metav1.NewTime(time.Date(2026, time.September, 14, 16, 50, 0, 0, time.UTC))
+	isvc.Status.Canary.CurrentStep = currentStep
+	isvc.Status.Canary.ObservedTrafficWeight = observedTraffic
+	isvc.Status.Canary.PreStepHold = preStepHold
+	isvc.Status.Canary.StepEnteredTime = &entered
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.RolloutPhase = phase
+	component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+		RevisionName: "chat-engine-rev-e5f6a7b8", Percent: observedTraffic, LatestRevision: true,
+	}}
+	if observedTraffic == 0 {
+		component.Traffic = nil
+	}
+	if observedTraffic < 100 {
+		component.Traffic = append(component.Traffic, omev1beta1.ComponentTrafficTarget{
+			RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 100 - observedTraffic,
+		})
+	}
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+	oldGroup := group
+	oldGroup.Canary = &omev1beta1.GroupCanary{
+		Steps: append([]omev1beta1.RolloutGroupStep{}, oldSteps...),
+	}
+	oldDigest, err := rolloutpolicy.ProgressionDigest(&oldGroup)
+	require.NoError(t, err)
+	pinnedDigest, err := rolloutpolicy.ProgressionDigest(&group)
+	require.NoError(t, err)
+	runIdentity := fmt.Sprintf("%s=%s;%s%s", omev1beta1.EngineComponent,
+		"e5f6a7b8", oldDigest, opened.Time.UTC().Format(time.RFC3339))
+	isvc.Status.Rollout = &omev1beta1.RolloutStatus{ActiveRun: &omev1beta1.RolloutRun{
+		RunID: "chat-" + rolloutpolicy.ShortHash([]byte(runIdentity)), OpenedAt: opened, PinnedAt: pinnedAt,
+		TargetRevisions: []omev1beta1.RolloutRunTarget{{
+			Component: omev1beta1.EngineComponent, Revision: "e5f6a7b8",
+		}},
+		Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{
+			Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: pinnedDigest, Group: group,
+		}}},
+	}}
+	if isvc.Annotations == nil {
+		isvc.Annotations = map[string]string{}
+	}
+	isvc.Annotations[constants.PausedRolloutAnnotation] = "true"
+}
+
+func refreshTrafficPinnedDigest(t *testing.T, pinned *omev1beta1.RolloutRunGroup) {
+	t.Helper()
+	digest, err := rolloutpolicy.ProgressionDigest(&pinned.Group)
+	require.NoError(t, err)
+	pinned.PortableDigest = digest
 }
 
 func primaryCanaryComponent(component omev1beta1.ComponentType) omev1beta1.ComponentStatusSpec {

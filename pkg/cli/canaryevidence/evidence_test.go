@@ -114,10 +114,10 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 		{name: "manual promotion identity", phase: reportv1alpha1.RolloutPhaseCanarying, status: promotedStatus(1, 20, "bbbbbbbb"), traffic: true, residue: true},
 		{name: "wrong manual promotion identity", phase: reportv1alpha1.RolloutPhaseCanarying, status: promotedStatus(1, 20, "cccccccc"), traffic: true, residue: false},
 		{name: "rollback residue outside rollback", phase: reportv1alpha1.RolloutPhasePending, status: rolledBackStatus(0), traffic: true, residue: false},
-		{name: "repin hold pending", phase: reportv1alpha1.RolloutPhasePending, status: heldStatus(2, 30), traffic: true, residue: true},
-		{name: "repin hold paused on clamped final step", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(2, 30), traffic: true, residue: true},
-		{name: "repin hold failed capacity gate", phase: reportv1alpha1.RolloutPhaseFailed, status: heldStatus(2, 30), traffic: true, residue: true},
-		{name: "persisted repin boundary can remain canarying", phase: reportv1alpha1.RolloutPhaseCanarying, status: heldStatus(2, 30), traffic: true, residue: true},
+		{name: "repin hold pending needs run proof", phase: reportv1alpha1.RolloutPhasePending, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold paused needs run proof", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold failed needs run proof", phase: reportv1alpha1.RolloutPhaseFailed, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold canarying needs run proof", phase: reportv1alpha1.RolloutPhaseCanarying, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot remain promoting", phase: reportv1alpha1.RolloutPhasePromoting, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot remain stable", phase: reportv1alpha1.RolloutPhaseStable, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot use blue green phase", phase: reportv1alpha1.RolloutPhaseBlueGreenStandby, status: heldStatus(2, 30), traffic: false, residue: false},
@@ -137,7 +137,7 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 	}
 }
 
-func TestRollbackRepinHoldRemainsValidUntilCanaryReconcile(t *testing.T) {
+func TestPreStepHoldCannotBeQualifiedWithoutRunEvidence(t *testing.T) {
 	steps := []omev1beta1.RolloutGroupStep{{
 		Capacity: intstr.FromString("100%"), Traffic: 100,
 	}}
@@ -149,13 +149,13 @@ func TestRollbackRepinHoldRemainsValidUntilCanaryReconcile(t *testing.T) {
 		reportv1alpha1.RolloutPhaseRolledBack,
 	} {
 		t.Run(string(phase), func(t *testing.T) {
-			assert.True(t, canaryevidence.ObservedTrafficMatchesStep(phase, steps, status))
-			assert.True(t, canaryevidence.ValidPhaseStepResidue(phase, steps, status))
+			assert.False(t, canaryevidence.ObservedTrafficMatchesStep(phase, steps, status))
+			assert.False(t, canaryevidence.ValidPhaseStepResidue(phase, steps, status))
 		})
 	}
 }
 
-func TestRepinHoldAcceptsPromotedThroughAfterBackwardClamp(t *testing.T) {
+func TestPreStepHoldPromotionResidueNeedsRunEvidence(t *testing.T) {
 	steps := []omev1beta1.RolloutGroupStep{{
 		Capacity: intstr.FromString("100%"), Traffic: 100,
 	}}
@@ -165,7 +165,7 @@ func TestRepinHoldAcceptsPromotedThroughAfterBackwardClamp(t *testing.T) {
 	// that advanced index back to zero without clearing the durable record.
 	status.PromotedThrough = "old-opaque-command"
 
-	assert.True(t, canaryevidence.ValidPhaseStepResidue(
+	assert.False(t, canaryevidence.ValidPhaseStepResidue(
 		reportv1alpha1.RolloutPhaseCanarying, steps, status,
 	))
 
@@ -282,12 +282,26 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 				StableRevisionHash: "aaaaaaaa", CanaryRevisionHash: "bbbbbbbb",
 				CurrentStep: 1, ObservedTrafficWeight: 50, StepEnteredTime: &entered,
 			}
+			mode := constants.OMENative
 			isvc := &omev1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "chat", Annotations: map[string]string{constants.PausedRolloutAnnotation: "true"},
 				},
+				Spec: omev1beta1.InferenceServiceSpec{
+					DeploymentMode: &mode,
+					Engine:         &omev1beta1.EngineSpec{},
+					Decoder:        &omev1beta1.DecoderSpec{},
+				},
 				Status: omev1beta1.InferenceServiceStatus{
 					Canary: status,
+					Components: map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
+						omev1beta1.EngineComponent: {
+							Traffic: []omev1beta1.ComponentTrafficTarget{
+								{RevisionName: "chat-engine-rev-aaaaaaaa", Percent: 50},
+								{RevisionName: "chat-engine-rev-bbbbbbbb", Percent: 50},
+							},
+						},
+					},
 					Rollout: &omev1beta1.RolloutStatus{ActiveRun: &omev1beta1.RolloutRun{
 						RunID: "chat-" + rolloutpolicy.ShortHash([]byte(runIdentity)), OpenedAt: opened, PinnedAt: pinned,
 						TargetRevisions: []omev1beta1.RolloutRunTarget{{
@@ -305,8 +319,9 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 				tt.mutate(isvc, status, projectedSteps)
 			}
 
-			assert.Equal(t, tt.valid, canaryevidence.ValidPausedNonRaisingRepinBoundary(
+			assert.Equal(t, tt.valid, canaryevidence.ValidRepinBoundary(
 				isvc, omev1beta1.EngineComponent, tt.phase, projectedSteps, status,
+				isvc.Status.Components[omev1beta1.EngineComponent].Traffic,
 			))
 		})
 	}

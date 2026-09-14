@@ -3,7 +3,6 @@
 package canaryevidence
 
 import (
-	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -13,15 +12,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/pinnedevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 	omevalidation "sigs.k8s.io/ome/pkg/validation"
 )
 
 var revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
-
-var rolloutRunHashPattern = regexp.MustCompile(`^[0-9a-f]{12}$`)
 
 // Primary returns the component whose traffic is authoritative for a canary
 // group and whether every member is unique and supported. The selected value
@@ -166,8 +163,8 @@ func PhaseBindsStepTraffic(phase reportv1alpha1.RolloutPhase) bool {
 
 // ObservedTrafficMatchesStep accepts the current step, the controller's
 // documented one-write canary advance residue where the new index is visible
-// before its traffic is applied, and a valid repin pre-step hold that binds a
-// lower previously-programmed traffic weight to the clamped step.
+// before its traffic is applied. A PreStepHold needs active-run evidence and
+// is therefore accepted only by ValidRepinBoundary.
 func ObservedTrafficMatchesStep(
 	phase reportv1alpha1.RolloutPhase,
 	steps []omev1beta1.RolloutGroupStep,
@@ -184,7 +181,7 @@ func ObservedTrafficMatchesStep(
 		return false
 	}
 	if status.PreStepHold {
-		return validPreStepHold(phase, steps, status)
+		return false
 	}
 	if status.ObservedTrafficWeight == steps[current].Traffic {
 		return true
@@ -201,6 +198,15 @@ func ValidPhaseStepResidue(
 	steps []omev1beta1.RolloutGroupStep,
 	status *omev1beta1.CanaryStatus,
 ) bool {
+	return validPhaseStepResidue(phase, steps, status, false)
+}
+
+func validPhaseStepResidue(
+	phase reportv1alpha1.RolloutPhase,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+	allowPreStepHold bool,
+) bool {
 	if status == nil {
 		return false
 	}
@@ -211,8 +217,10 @@ func ValidPhaseStepResidue(
 	if current < 0 || current >= len(steps) {
 		return false
 	}
-	if status.PreStepHold && !validPreStepHold(phase, steps, status) {
-		return false
+	if status.PreStepHold {
+		if !allowPreStepHold || !validPreStepHold(phase, steps, status) {
+			return false
+		}
 	}
 	last := len(steps) - 1
 	switch phase {
@@ -251,28 +259,41 @@ func ValidPhaseStepResidue(
 	return true
 }
 
-// ValidPausedNonRaisingRepinBoundary recognizes the exact boundary the
-// controller can persist when it replaces an active run's pinned plan and a
-// global rollout pause prevents the canary executor from reconciling the old
-// phase and step evidence against that new plan. It applies only to repins
-// that hold or lower exposure; a raising repin is represented by PreStepHold.
+// ValidRepinBoundary recognizes the exact boundary the controller can persist
+// after replacing an active run's pinned plan. Raising repins carry
+// PreStepHold; a global pause can durably preserve a non-raising boundary.
 //
-// PinnedAt alone is not sufficient evidence. A valid boundary must carry a
-// structurally bound active run, a pin strictly newer than both the run open
-// and the current step entry, the same canary target, and the exact pinned
-// steps being projected. These constraints preserve fail-closed handling for
-// stale or externally malformed status.
-func ValidPausedNonRaisingRepinBoundary(
+// A formatted PinnedAt alone is insufficient. The complete pinned plan,
+// provenance, topology, target map, canary step body, typed traffic, and
+// strictly advancing run/step clocks must all bind to one active epoch.
+func ValidRepinBoundary(
 	isvc *omev1beta1.InferenceService,
 	primary omev1beta1.ComponentType,
 	phase reportv1alpha1.RolloutPhase,
 	steps []omev1beta1.RolloutGroupStep,
 	status *omev1beta1.CanaryStatus,
+	traffic []omev1beta1.ComponentTrafficTarget,
 ) bool {
-	if isvc == nil || status == nil || status.PreStepHold || len(steps) == 0 ||
-		!promotingTrafficComplete(phase, status) {
+	if isvc == nil || status == nil || len(steps) == 0 ||
+		!promotingTrafficComplete(phase, status) ||
+		!pinnedevidence.ValidCanaryRepin(
+			isvc, primary, steps, status.CanaryRevisionHash, status.StepEnteredTime,
+		) ||
+		!ActiveTrafficMatches(isvc.Name, primary, phase, status, traffic) {
 		return false
 	}
+	if status.PreStepHold {
+		return validPhaseStepResidue(phase, steps, status, true)
+	}
+	return validPausedNonRaisingBoundary(isvc, phase, steps, status)
+}
+
+func validPausedNonRaisingBoundary(
+	isvc *omev1beta1.InferenceService,
+	phase reportv1alpha1.RolloutPhase,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+) bool {
 	paused, _ := constants.RolloutPauseState(isvc.Annotations)
 	if !paused {
 		return false
@@ -296,79 +317,7 @@ func ValidPausedNonRaisingRepinBoundary(
 		status.StepEnteredTime == nil || status.StepEnteredTime.IsZero() {
 		return false
 	}
-
-	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
-		return false
-	}
-	run := isvc.Status.Rollout.ActiveRun
-	prefix := isvc.Name + "-"
-	if !strings.HasPrefix(run.RunID, prefix) ||
-		!rolloutRunHashPattern.MatchString(strings.TrimPrefix(run.RunID, prefix)) ||
-		run.OpenedAt.IsZero() || run.PinnedAt.IsZero() ||
-		!run.PinnedAt.Time.After(run.OpenedAt.Time) ||
-		!run.PinnedAt.Time.After(status.StepEnteredTime.Time) {
-		return false
-	}
-
-	expectedTargets := make(map[omev1beta1.ComponentType]struct{}, 3)
-	matchingCanary := 0
-	canaryGroups := 0
-	for i := range run.Plan.Groups {
-		pinnedGroup := &run.Plan.Groups[i]
-		group := &pinnedGroup.Group
-		if group.Canary != nil && !ValidCanaryPlan(group.Canary) {
-			return false
-		}
-		digest, err := rolloutpolicy.ProgressionDigest(group)
-		if err != nil || digest == "" || digest != pinnedGroup.PortableDigest || group.PolicyRef != nil {
-			return false
-		}
-		switch pinnedGroup.Source {
-		case omev1beta1.RolloutPlanSourceInline:
-			if pinnedGroup.PolicyRef != nil || pinnedGroup.PolicyGeneration != 0 {
-				return false
-			}
-		case omev1beta1.RolloutPlanSourcePolicy:
-			if pinnedGroup.PolicyRef == nil || pinnedGroup.PolicyRef.Name == "" || pinnedGroup.PolicyGeneration < 0 {
-				return false
-			}
-		default:
-			return false
-		}
-		for _, component := range group.Components {
-			if !supportedComponent(component) {
-				return false
-			}
-			if _, seen := expectedTargets[component]; seen {
-				return false
-			}
-			expectedTargets[component] = struct{}{}
-		}
-		if group.Canary == nil {
-			continue
-		}
-		canaryGroups++
-		groupPrimary, valid := Primary(group.Components)
-		if valid && groupPrimary == primary && reflect.DeepEqual(group.Canary.Steps, steps) {
-			matchingCanary++
-		}
-	}
-	if canaryGroups != 1 || matchingCanary != 1 || len(run.TargetRevisions) != len(expectedTargets) {
-		return false
-	}
-
-	targets := make(map[omev1beta1.ComponentType]string, len(run.TargetRevisions))
-	for _, target := range run.TargetRevisions {
-		if _, expected := expectedTargets[target.Component]; !expected ||
-			!SafeRevisionHash(target.Revision) {
-			return false
-		}
-		if _, duplicate := targets[target.Component]; duplicate {
-			return false
-		}
-		targets[target.Component] = target.Revision
-	}
-	return targets[primary] == status.CanaryRevisionHash
+	return true
 }
 
 // promotingTrafficComplete rejects an impossible promoting phase before any

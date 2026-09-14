@@ -433,8 +433,8 @@ func (b *projector) validCanaryEpoch(
 			component.Traffic,
 		)
 	}
-	repinBoundary := canaryevidence.ValidPausedNonRaisingRepinBoundary(
-		b.isvc, primary, phase, steps, status,
+	repinBoundary := canaryevidence.ValidRepinBoundary(
+		b.isvc, primary, phase, steps, status, component.Traffic,
 	)
 	if !canaryevidence.PhaseNeedsStatus(phase) ||
 		(!canaryevidence.ValidPhaseStepResidue(phase, steps, status) && !repinBoundary) {

@@ -11,16 +11,15 @@ import (
 	"knative.dev/pkg/apis"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/pinnedevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
 var (
 	autoscalerPortableDigestPattern = regexp.MustCompile(`^pv1:[0-9a-f]{12}$`)
 	autoscalerResolvedDigestPattern = regexp.MustCompile(`^rv1:[0-9a-f]{12}$`)
-	shortHashPattern                = regexp.MustCompile(`^[0-9a-f]{12}$`)
 )
 
 // ProjectValidation validates the stored rollout-related configuration and
@@ -464,79 +463,7 @@ func validRolloutPlanCondition(condition *apis.Condition, status *omev1beta1.Rol
 }
 
 func validPinnedRolloutPlan(isvc *omev1beta1.InferenceService) bool {
-	active := isvc.Status.Rollout.ActiveRun
-	if !validActiveRolloutRun(isvc.Name, active) {
-		return false
-	}
-	copy := isvc.DeepCopy()
-	groups := active.Plan.Groups
-	copy.Spec.Rollout = active.Plan.AsRolloutSpec(copy.Spec.Rollout)
-	if !validStoredRolloutPlan(&copy.Spec) ||
-		validation.ValidateRolloutPolicyRefs(&copy.Spec, true) != nil ||
-		validation.ValidateRolloutOrderingEnforced(&copy.Spec) != nil {
-		return false
-	}
-	if len(invalidPinnedPlanGroups(groups)) != 0 {
-		return false
-	}
-	for i := range groups {
-		group := &groups[i]
-		digest, err := rolloutpolicy.ProgressionDigest(&group.Group)
-		strategy, strategyValid := pinnedGroupStrategy(&group.Group)
-		if !strategyValid || group.Group.PolicyRef != nil ||
-			err != nil || digest == "" || digest != group.PortableDigest {
-			return false
-		}
-		switch group.Source {
-		case omev1beta1.RolloutPlanSourceInline:
-			if group.PolicyRef != nil || group.PolicyGeneration != 0 {
-				return false
-			}
-		case omev1beta1.RolloutPlanSourcePolicy:
-			if projectPinnedPolicyRef(group.PolicyRef, strategy) == nil ||
-				group.PolicyGeneration < 0 || !validPinnedPolicyBody(&group.Group) {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func validActiveRolloutRun(subjectName string, run *omev1beta1.RolloutRun) bool {
-	prefix := subjectName + "-"
-	if run == nil || !strings.HasPrefix(run.RunID, prefix) ||
-		!shortHashPattern.MatchString(strings.TrimPrefix(run.RunID, prefix)) ||
-		run.OpenedAt.IsZero() || run.PinnedAt.IsZero() ||
-		run.PinnedAt.Time.Before(run.OpenedAt.Time) || len(run.Plan.Groups) == 0 {
-		return false
-	}
-
-	expectedComponents := make(map[omev1beta1.ComponentType]struct{}, 3)
-	for i := range run.Plan.Groups {
-		for _, component := range run.Plan.Groups[i].Group.Components {
-			if _, seen := expectedComponents[component]; seen {
-				return false
-			}
-			expectedComponents[component] = struct{}{}
-		}
-	}
-	if len(run.TargetRevisions) != len(expectedComponents) {
-		return false
-	}
-	targets := make(map[omev1beta1.ComponentType]string, len(run.TargetRevisions))
-	for _, target := range run.TargetRevisions {
-		if _, expected := expectedComponents[target.Component]; !expected ||
-			!safeRevisionHash(target.Revision) {
-			return false
-		}
-		if _, duplicate := targets[target.Component]; duplicate {
-			return false
-		}
-		targets[target.Component] = target.Revision
-	}
-	return true
+	return pinnedevidence.ValidActiveRun(isvc)
 }
 
 func validTrafficReadyCondition(condition *metav1.Condition) bool {
