@@ -762,11 +762,18 @@ func (b *projector) hasRolloutStatusResidue() bool {
 	if b.isvc.Status.Canary != nil || b.isvc.Status.RolloutCoordination != nil {
 		return true
 	}
+	if rollout := b.isvc.Status.Rollout; rollout != nil &&
+		(rollout.ActiveRun != nil || rollout.LastRun != nil || len(rollout.Groups) > 0) {
+		return true
+	}
 	if b.hasComponentStatusResidue() {
 		return true
 	}
 	for _, condition := range b.isvc.Status.Conditions {
-		if condition.Type == apis.ConditionType(omev1beta1.RolloutCoordinationReady) {
+		switch condition.Type {
+		case apis.ConditionType(omev1beta1.RolloutCoordinationReady),
+			apis.ConditionType(omev1beta1.RolloutPlanReadyCondition),
+			apis.ConditionType(omev1beta1.RolloutPlanDriftCondition):
 			return true
 		}
 	}

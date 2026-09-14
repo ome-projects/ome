@@ -2037,6 +2037,109 @@ func TestProjectTreatsCoordinationConditionAsIndependentStatusResidue(t *testing
 	assertStatusDerivedSummary(t, got, reportv1alpha1.RolloutStateUnknown)
 }
 
+func TestProjectTreatsRunModelEvidenceAsStatusResidue(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService)
+	}{
+		{
+			name: "active run",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.Rollout = &omev1beta1.RolloutStatus{
+					ActiveRun: &omev1beta1.RolloutRun{},
+				}
+			},
+		},
+		{
+			name: "last run",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.Rollout = &omev1beta1.RolloutStatus{
+					LastRun: &omev1beta1.RolloutRunRecord{},
+				}
+			},
+		},
+		{
+			name: "resolution",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.Rollout = &omev1beta1.RolloutStatus{
+					Groups: []omev1beta1.RolloutGroupResolution{{}},
+				}
+			},
+		},
+		{
+			name: "plan ready condition",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.SetCondition(apis.ConditionType(omev1beta1.RolloutPlanReadyCondition), &apis.Condition{
+					Type:    apis.ConditionType(omev1beta1.RolloutPlanReadyCondition),
+					Status:  corev1.ConditionTrue,
+					Reason:  omev1beta1.RolloutPlanReasonNoRun,
+					Message: "SECRET_RUN_CONDITION",
+				})
+			},
+		},
+		{
+			name: "plan drift condition",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.SetCondition(apis.ConditionType(omev1beta1.RolloutPlanDriftCondition), &apis.Condition{
+					Type:    apis.ConditionType(omev1beta1.RolloutPlanDriftCondition),
+					Status:  corev1.ConditionFalse,
+					Reason:  omev1beta1.RolloutPlanDriftReasonInSync,
+					Message: "SECRET_RUN_CONDITION",
+				})
+			},
+		},
+		{
+			name: "retained no-run condition pair",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.SetCondition(apis.ConditionType(omev1beta1.RolloutPlanReadyCondition), &apis.Condition{
+					Type:    apis.ConditionType(omev1beta1.RolloutPlanReadyCondition),
+					Status:  corev1.ConditionTrue,
+					Reason:  omev1beta1.RolloutPlanReasonNoRun,
+					Message: "no rollout in progress",
+				})
+				isvc.Status.SetCondition(apis.ConditionType(omev1beta1.RolloutPlanDriftCondition), &apis.Condition{
+					Type:   apis.ConditionType(omev1beta1.RolloutPlanDriftCondition),
+					Status: corev1.ConditionFalse,
+					Reason: omev1beta1.RolloutPlanDriftReasonInSync,
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := baseInferenceService()
+			isvc.Spec.Engine.Annotations = map[string]string{
+				constants.DeploymentMode: string(constants.RawDeployment),
+			}
+			tt.mutate(isvc)
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+			require.NoError(t, err)
+			assertStatusDerivedSummary(t, got, reportv1alpha1.RolloutStateUnknown)
+
+			encoded, marshalErr := json.Marshal(got)
+			require.NoError(t, marshalErr)
+			assert.NotContains(t, string(encoded), "SECRET_RUN_CONDITION")
+		})
+	}
+}
+
+func TestProjectKeepsEmptyRunModelStatusNotConfigured(t *testing.T) {
+	isvc := baseInferenceService()
+	isvc.Spec.Engine.Annotations = map[string]string{
+		constants.DeploymentMode: string(constants.RawDeployment),
+	}
+	isvc.Status.Rollout = &omev1beta1.RolloutStatus{}
+
+	got, err := rolloutprojection.Project(isvc, fixedClock())
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.RolloutStateNotConfigured, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.RolloutStateNotConfigured, got.Content.Summary.ReportedState)
+	assert.Equal(t, reportv1alpha1.EvidenceDeclared, got.Content.Summary.Evidence)
+	assert.Equal(t, reportv1alpha1.RolloutEpochNotApplicable, got.Content.Summary.Epoch)
+}
+
 func TestProjectDoesNotUseTopLevelObservedGenerationAsRolloutFreshness(t *testing.T) {
 	isvc := baseInferenceService()
 	isvc.Generation = 8
