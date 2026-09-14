@@ -43,9 +43,9 @@ func newRootCmd(f factory.Factory, configFlags *genericclioptions.ConfigFlags, s
   kubectl ome <command>
 
 It provides model-centric visibility into OME resources: rich listings,
-controller-reported accelerator, autoscaling, logical-instance, migration,
-and traffic evidence, InferenceService readiness and rollout diagnosis,
-runtime-selection explanations and component-aware log streaming.`,
+controller-reported autoscaling, logical-instance, migration, and traffic
+evidence, InferenceService readiness and rollout diagnosis, runtime-selection
+explanations, accelerator-selection evidence, and component-aware log streaming.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
