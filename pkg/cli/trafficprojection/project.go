@@ -102,7 +102,7 @@ func (b *projector) projectTrafficStatus() {
 	unavailable := source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnavailable)
 	b.content.Summary = reportv1alpha1.TrafficSummary{
 		State:       reportv1alpha1.TrafficStateUnavailable,
-		Translator:  reportv1alpha1.TrafficTranslatorUnknown,
+		Translator:  reportv1alpha1.TrafficTranslatorUnavailable,
 		Algorithm:   reportv1alpha1.TrafficAlgorithmUnknown,
 		PolicyReady: reportv1alpha1.TrafficConditionValue{Status: reportv1alpha1.TrafficConditionUnknown, Reason: reportv1alpha1.TrafficReasonNotReported},
 		Unsupported: reportv1alpha1.TrafficUnsupportedUnknown,
@@ -135,7 +135,6 @@ func (b *projector) projectTrafficStatus() {
 		b.partial = true
 	}
 	b.content.Summary.Source.Algorithm = source(reportv1alpha1.EvidenceReported, conditionFreshness)
-	b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, conditionFreshness)
 
 	algorithm, ok := projectAlgorithm(status.Algorithm)
 	if !ok {
@@ -174,6 +173,7 @@ func (b *projector) projectTrafficStatus() {
 
 	if b.ready != nil && b.ready.Reason == reportv1alpha1.TrafficReasonNoTranslatorAvailable && status.BackendPolicyResource == nil {
 		b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorNoop
+		b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, b.ready.Source.Freshness)
 	}
 }
 
@@ -269,6 +269,7 @@ func (b *projector) projectPolicy(ref *omev1beta1.BackendPolicyRef, freshness re
 		b.addIssue(reportv1alpha1.TrafficIssuePolicyKindUnsupported, "", true)
 		return
 	}
+	b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, freshness)
 	b.content.Policy = &reportv1alpha1.TrafficPolicy{
 		APIVersion: ref.APIVersion, Kind: kind, Namespace: b.isvc.Namespace,
 		Name: ref.Name, Source: source(reportv1alpha1.EvidenceReported, freshness),
@@ -391,6 +392,7 @@ func (b *projector) projectAllocations() {
 }
 
 func (b *projector) projectComponentAllocations(component omev1beta1.ComponentType, status omev1beta1.ComponentStatusSpec) {
+	projectedComponent := projectComponent(component)
 	type candidate struct {
 		name    string
 		hash    string
@@ -403,13 +405,13 @@ func (b *projector) projectComponentAllocations(component omev1beta1.ComponentTy
 		total += target.Percent
 		hash, validName := revisionTargetHash(b.isvc.Name, component, target.RevisionName)
 		if target.Percent < 0 || target.Percent > 100 || !validName {
-			b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectComponent(component), true)
+			b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
 			continue
 		}
 		candidates = append(candidates, candidate{name: target.RevisionName, hash: hash, percent: target.Percent, latest: target.LatestRevision})
 	}
 	if total != 100 {
-		b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectComponent(component), true)
+		b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].name != candidates[j].name {
@@ -423,27 +425,27 @@ func (b *projector) projectComponentAllocations(component omev1beta1.ComponentTy
 	unique := candidates[:0]
 	for _, candidate := range candidates {
 		if len(unique) > 0 && unique[len(unique)-1].name == candidate.name {
-			b.addIssue(reportv1alpha1.TrafficIssueAllocationConflict, projectComponent(component), true)
+			b.addIssue(reportv1alpha1.TrafficIssueAllocationConflict, projectedComponent, true)
 			continue
 		}
 		unique = append(unique, candidate)
 	}
 	if len(unique) > maxAllocationsPerClass {
 		unique = unique[:maxAllocationsPerClass]
-		b.addIssue(reportv1alpha1.TrafficIssueAllocationsTruncated, projectComponent(component), false)
+		b.addIssue(reportv1alpha1.TrafficIssueAllocationsTruncated, projectedComponent, false)
 		b.markTruncated()
 	}
 	for _, candidate := range unique {
 		b.content.Allocations = append(b.content.Allocations, reportv1alpha1.TrafficAllocation{
-			Component: projectComponent(component), Role: b.allocationRole(candidate.hash, candidate.name, candidate.latest, status),
+			Component: projectedComponent, Role: b.allocationRole(projectedComponent, candidate.hash, candidate.name, candidate.latest, status),
 			RevisionName: candidate.name, RevisionHash: candidate.hash, Percent: candidate.percent,
 			Source: source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnverifiable),
 		})
 	}
 }
 
-func (b *projector) allocationRole(hash, name string, latest bool, status omev1beta1.ComponentStatusSpec) reportv1alpha1.TrafficAllocationRole {
-	if b.content.Canary != nil {
+func (b *projector) allocationRole(component reportv1alpha1.RuntimeComponentType, hash, name string, latest bool, status omev1beta1.ComponentStatusSpec) reportv1alpha1.TrafficAllocationRole {
+	if b.content.Canary != nil && b.content.Canary.Component == component {
 		if b.content.Canary.StableRevisionHash != "" && hash == b.content.Canary.StableRevisionHash {
 			return reportv1alpha1.TrafficRoleStable
 		}

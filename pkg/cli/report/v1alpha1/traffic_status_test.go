@@ -63,7 +63,12 @@ func TestTrafficStatusCanonicalizesWithoutMutatingCaller(t *testing.T) {
 		UID: "uid-chat", Generation: 7, Evidence: v1alpha1.EvidenceReported,
 	}}
 	value.Warnings = []v1alpha1.TrafficWarning{{Code: v1alpha1.WarningTruncated}, {Code: v1alpha1.WarningTruncated}}
-	before := value
+	originalRouteName := value.Content.Routes[0].Name
+	originalAllocationName := value.Content.Allocations[0].RevisionName
+	originalConditionReason := value.Content.Conditions[0].Reason
+	originalSourceName := value.Sources[0].Name
+	originalPolicyName := value.Content.Policy.Name
+	originalCanaryHash := value.Content.Canary.CanaryRevisionHash
 
 	canonical := value.Canonical()
 
@@ -85,7 +90,12 @@ func TestTrafficStatusCanonicalizesWithoutMutatingCaller(t *testing.T) {
 	canonical.Sources[0].Name = "changed"
 	canonical.Content.Policy.Name = "changed"
 	canonical.Content.Canary.CanaryRevisionHash = "ffffffff"
-	assert.Equal(t, before, value, "Canonical must not mutate or alias caller-owned state")
+	assert.Equal(t, originalRouteName, value.Content.Routes[0].Name)
+	assert.Equal(t, originalAllocationName, value.Content.Allocations[0].RevisionName)
+	assert.Equal(t, originalConditionReason, value.Content.Conditions[0].Reason)
+	assert.Equal(t, originalSourceName, value.Sources[0].Name)
+	assert.Equal(t, originalPolicyName, value.Content.Policy.Name)
+	assert.Equal(t, originalCanaryHash, value.Content.Canary.CanaryRevisionHash)
 }
 
 func TestTrafficStatusCompactAndWideTables(t *testing.T) {

@@ -79,7 +79,7 @@ func TestProjectMapsControllerConditionsHonestly(t *testing.T) {
 			isvc.Status.Traffic.BackendPolicyResource = nil
 			isvc.Status.Traffic.TargetedHTTPRoutes = nil
 			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonConflictingPolicy, 7)
-		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnknown, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnavailable, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
 		{name: "unsupported fields", mutate: func(isvc *omev1beta1.InferenceService) {
 			setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
 			isvc.Status.Traffic.Conditions = append(isvc.Status.Traffic.Conditions, trafficCondition(omev1beta1.TrafficConditionBackendPolicyUnsupportedFields, metav1.ConditionTrue, omev1beta1.TrafficReasonUnsupportedField, 7))
@@ -93,7 +93,7 @@ func TestProjectMapsControllerConditionsHonestly(t *testing.T) {
 			isvc.Status.Traffic.BackendPolicyResource = nil
 			isvc.Status.Traffic.TargetedHTTPRoutes = nil
 			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonTranslationFailed, 7)
-		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnknown, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnavailable, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
 		{name: "stale", mutate: func(isvc *omev1beta1.InferenceService) {
 			setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 6)
 		}, wantState: reportv1alpha1.TrafficStatePartial, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessStale},
@@ -123,6 +123,22 @@ func TestProjectMissingTrafficStatusIsUnavailable(t *testing.T) {
 	assert.Equal(t, reportv1alpha1.TrafficStateUnavailable, got.Content.Summary.State)
 	assert.Equal(t, reportv1alpha1.TrafficUnsupportedUnknown, got.Content.Summary.Unsupported)
 	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueTrafficStatusMissing})
+}
+
+func TestProjectMarksTranslatorUnavailableWithoutARecognizedPolicy(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.BackendPolicyResource = nil
+	isvc.Status.Traffic.TargetedHTTPRoutes = nil
+	setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonConflictingPolicy, 7)
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficTranslatorUnavailable, got.Content.Summary.Translator)
+	assert.Equal(t, reportv1alpha1.TrafficValueSource{
+		Evidence:  reportv1alpha1.EvidenceComputed,
+		Freshness: reportv1alpha1.TrafficFreshnessUnavailable,
+	}, got.Content.Summary.Source.Translator)
 }
 
 func TestProjectAllowsAValidStatusBeforeEndpointsArePublished(t *testing.T) {
@@ -195,6 +211,30 @@ func TestProjectCanaryPrimaryFollowsControllerPriority(t *testing.T) {
 			assert.Equal(t, reportv1alpha1.RuntimeComponentRouter, got.Content.Canary.Component)
 		})
 	}
+}
+
+func TestProjectCanaryRolesAreScopedToThePrimaryComponent(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Rollout.Groups[0].Components = []omev1beta1.ComponentType{
+		omev1beta1.EngineComponent,
+		omev1beta1.RouterComponent,
+	}
+	engine := isvc.Status.Components[omev1beta1.EngineComponent]
+	engine.Traffic = []omev1beta1.ComponentTrafficTarget{{
+		RevisionName:   "chat-engine-rev-e5f6a7b8",
+		Percent:        100,
+		LatestRevision: true,
+	}}
+	isvc.Status.Components[omev1beta1.EngineComponent] = engine
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentRouter, got.Content.Canary.Component)
+	require.Len(t, got.Content.Allocations, 1)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Allocations[0].Component)
+	assert.Equal(t, reportv1alpha1.TrafficRoleStable, got.Content.Allocations[0].Role)
 }
 
 func TestProjectRejectsEqualStableAndCanaryRevisionHashes(t *testing.T) {
@@ -420,8 +460,8 @@ func TestProjectRecognizesOnlyExactPolicyGVKs(t *testing.T) {
 	}{
 		{apiVersion: "gateway.envoyproxy.io/v1alpha1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorEnvoyGateway},
 		{apiVersion: "networking.istio.io/v1", kind: "DestinationRule", want: reportv1alpha1.TrafficTranslatorIstio},
-		{apiVersion: "gateway.envoyproxy.io/v1beta1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorUnknown, invalid: true},
-		{apiVersion: "networking.istio.io/v1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorUnknown, invalid: true},
+		{apiVersion: "gateway.envoyproxy.io/v1beta1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorUnavailable, invalid: true},
+		{apiVersion: "networking.istio.io/v1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorUnavailable, invalid: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.apiVersion+"/"+tt.kind, func(t *testing.T) {

@@ -53,7 +53,7 @@ const (
 	TrafficTranslatorEnvoyGateway TrafficTranslator = "envoy-gateway"
 	TrafficTranslatorIstio        TrafficTranslator = "istio"
 	TrafficTranslatorNoop         TrafficTranslator = "noop"
-	TrafficTranslatorUnknown      TrafficTranslator = "Unknown"
+	TrafficTranslatorUnavailable  TrafficTranslator = "Unavailable"
 )
 
 // TrafficAlgorithm is the closed set written by the OME traffic controller.
