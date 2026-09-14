@@ -368,9 +368,7 @@ func copyMigrations(
 	}
 	identities := make(map[string]int, len(input))
 	for i := range input {
-		if input[i].SourceInstance == limits.SelectedIndex || (input[i].SurgeInstance != nil && *input[i].SurgeInstance == limits.SelectedIndex) {
-			identities[input[i].RequestUUID]++
-		}
+		identities[input[i].RequestUUID]++
 	}
 	selected := make([]omev1beta1.MigrationStatus, 0, min(len(input), limits.MaxMigrations))
 	for i := range input {

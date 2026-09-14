@@ -257,7 +257,7 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 	}
 	maxEventTargets := min(o.deps.projectionLimits.MaxPods, o.deps.eventLimits.MaxTargets)
 	targets, skippedEventTargets := instancestatusprojection.EventTargets(
-		isvc, ir, o.index, pods.Items, o.deps.projectionLimits.MaxPodConditions, maxEventTargets,
+		isvc, ir, o.index, pods.Items, o.deps.projectionLimits, maxEventTargets,
 	)
 	events, eventErr := observation.CollectWarningEvents(ctx, kubeClient.CoreV1(), targets, o.deps.eventLimits)
 	input.Events = events

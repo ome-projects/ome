@@ -251,3 +251,43 @@ func TestInstanceStatusWideTableDoesNotJoinOrTruncateSafeFields(t *testing.T) {
 	assert.Contains(t, text, target)
 	assert.NotContains(t, text, first+","+second)
 }
+
+func TestInstanceStatusWideTableRetainsEnvelopeAndProvenanceFields(t *testing.T) {
+	t.Parallel()
+	collected := time.Date(2026, 9, 14, 23, 1, 2, 0, time.UTC)
+	sourceTime := collected.Add(-time.Minute)
+	report := NewInstanceStatusReport(Metadata{Namespace: "prod", Name: "chat"}, InstanceStatusContent{
+		Summary:  InstanceStatusSummary{State: InstanceStatusStatePartial, Component: RuntimeComponentEngine, Index: 2, Evidence: InstanceEvidenceStale, Truncated: true},
+		Instance: &InstanceStatusInstance{Index: 2, Conditions: []InstanceStatusCondition{}, Migrations: []InstanceStatusMigration{}},
+		Issues:   []InstanceStatusIssue{{Code: InstanceStatusIssueEventsUnavailable, UnavailableReason: UnavailableForbidden}},
+	}, ClockFunc(func() time.Time { return collected }))
+	report.Sources = []SourceReference{{
+		Kind: "PodList", Namespace: "prod", Name: "chat/engine/2", UID: "source-uid",
+		Generation: 7, Evidence: EvidenceUnavailable, CollectedAt: sourceTime,
+		UnavailableReason: UnavailableForbidden,
+	}}
+	report.Warnings = []InstanceStatusWarning{{Code: WarningSourceUnavailable}}
+
+	wide := report.WideTable()
+	for _, row := range [][]string{
+		{"apiVersion", APIVersion},
+		{"kind", InstanceStatusReportKind},
+		{"metadata namespace", "prod"},
+		{"metadata name", "chat"},
+		{"collected at", collected.Format(time.RFC3339)},
+		{"source[0] kind", "PodList"},
+		{"source[0] namespace", "prod"},
+		{"source[0] name", "chat/engine/2"},
+		{"source[0] uid", "source-uid"},
+		{"source[0] generation", "7"},
+		{"source[0] evidence", string(EvidenceUnavailable)},
+		{"source[0] collected at", sourceTime.Format(time.RFC3339)},
+		{"source[0] unavailable", string(UnavailableForbidden)},
+		{"instance index", "2"},
+		{"issue[0] code", string(InstanceStatusIssueEventsUnavailable)},
+		{"issue[0] unavailable", string(UnavailableForbidden)},
+		{"warning[0] code", string(WarningSourceUnavailable)},
+	} {
+		assert.Contains(t, wide.Rows, row)
+	}
+}

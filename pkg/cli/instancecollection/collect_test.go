@@ -352,6 +352,28 @@ func TestCollectRelatedDropsMigrationDetailsBeyondScanBound(t *testing.T) {
 	assert.Contains(t, got.DetailsTruncated, instancecollection.DetailTruncation{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailMigrations})
 }
 
+func TestCollectRelatedRejectsGlobalDuplicateMigrationIdentity(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{Index: 2, Phase: omev1beta1.OMENativeInstanceReady}}
+	ir.Status.Migrations = []omev1beta1.MigrationStatus{
+		{RequestUUID: "duplicate", SourceInstance: 2},
+		{RequestUUID: "duplicate", SourceInstance: 9},
+	}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8, MaxMigrations: 4, MaxScannedMigrations: 8, SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2}
+
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+	}), isvc, limits)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Empty(t, got.Items[0].Status.Migrations)
+	assert.Contains(t, got.DetailsTruncated, instancecollection.DetailTruncation{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailMigrations})
+}
+
 func TestCollectRelatedBoundsAndDefensivelyCopiesRetryBlocks(t *testing.T) {
 	t.Parallel()
 

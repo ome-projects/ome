@@ -58,7 +58,7 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 	out, err := executeStatus(t, factory.Static{OME: ome, Kube: kube, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine")
 
 	require.NoError(t, err)
-	for _, want := range []string{"FIELD", "VALUE", "Reported", "chat-engine", "chat-engine-0", "FailedMount"} {
+	for _, want := range []string{"FIELD", "VALUE", "Reported", "chat-engine", pod.Name, "FailedMount"} {
 		assert.Contains(t, out, want)
 	}
 	require.Len(t, ome.Actions(), 2)
@@ -406,7 +406,7 @@ func TestStatusRepresentsCollectionPodAndEventFailuresWithoutLosingAuthority(t *
 		out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kube, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
 		require.NoError(t, err)
 		assert.Contains(t, out, `"code": "EventsUnavailable"`)
-		assert.Contains(t, out, `"name": "chat-engine-0"`)
+		assert.Contains(t, out, `"name": "`+pod.Name+`"`)
 		assert.NotContains(t, out, "SECRET")
 	})
 }
@@ -646,13 +646,14 @@ func statusCommandDependencies() statusDependencies {
 
 func commandStatusPod(isvc *omev1beta1.InferenceService, ir *omev1beta1.InferenceReplica, name string) corev1.Pod {
 	controller := true
+	canonicalName := query.PodName(isvc.Name, "engine", 0, "default", 0)
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: isvc.Namespace, UID: types.UID("uid-" + name),
+			Name: canonicalName, Namespace: isvc.Namespace, UID: types.UID("uid-" + name),
 			Labels: map[string]string{
 				constants.InferenceServicePodLabelKey: isvc.Name, constants.OMEComponentLabel: "engine",
 				query.LabelManagedBy: query.ManagedByOMENative, query.LabelInstanceIdx: "0",
-				query.LabelInstanceIncarnation: "1", query.LabelRunner: "default", query.LabelRevisionHash: "a1b2c3",
+				query.LabelInstanceIncarnation: "1", query.LabelRunner: "default", query.LabelRevisionHash: "a1b2c3", query.LabelPodOrdinal: "0",
 			},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: omev1beta1.SchemeGroupVersion.String(), Kind: "InferenceReplica", Name: ir.Name, UID: ir.UID, Controller: &controller}},
 		},

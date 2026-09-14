@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,6 +55,19 @@ type Input struct {
 	Events                observation.EventCollection
 }
 
+type selectedPodCandidate struct {
+	value    reportv1alpha1.InstanceStatusPod
+	uid      types.UID
+	priority int
+}
+
+type selectedPodSet struct {
+	items            []selectedPodCandidate
+	identityRejected bool
+	detailsRejected  bool
+	truncated        bool
+}
+
 // EventTargets returns exact selected Pods in deterministic cap priority.
 // Parent and InferenceReplica events are intentionally excluded because the
 // controller emits them for multiple logical instances on the same target.
@@ -62,67 +76,37 @@ func EventTargets(
 	ir *omev1beta1.InferenceReplica,
 	index int32,
 	pods []corev1.Pod,
-	maxPodConditions int,
+	limits Limits,
 	maxTargets int,
 ) ([]observation.ObjectRef, int) {
-	if isvc == nil || ir == nil || maxPodConditions <= 0 || maxTargets <= 0 {
+	if isvc == nil || ir == nil || limits.MaxPods <= 0 || limits.MaxContainerStatuses <= 0 ||
+		limits.MaxPodConditions <= 0 || maxTargets <= 0 {
 		return []observation.ObjectRef{}, 0
 	}
-	result := []observation.ObjectRef{}
-	expectedIncarnation, authoritativeRows := int64(0), 0
+	var row *omev1beta1.OMENativeInstanceStatus
+	authoritativeRows := 0
 	for i := range ir.Status.InstanceStatuses {
 		if ir.Status.InstanceStatuses[i].Index == index {
-			expectedIncarnation = ir.Status.InstanceStatuses[i].Incarnation
+			row = &ir.Status.InstanceStatuses[i]
 			authoritativeRows++
 		}
 	}
-	if authoritativeRows != 1 || expectedIncarnation < 0 {
+	if authoritativeRows != 1 || row.Incarnation < 0 {
 		return []observation.ObjectRef{}, 0
 	}
-	valid := make([]*corev1.Pod, 0, len(pods))
-	names, uids := map[string]int{}, map[types.UID]int{}
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Namespace == isvc.Namespace && len(validation.IsDNS1123Subdomain(pod.Name)) == 0 && validUID(pod.UID) {
-			names[pod.Name]++
-			uids[pod.UID]++
-		}
-		if !validSelectedPod(pod, isvc, ir, index) {
-			continue
-		}
-		valid = append(valid, pod)
-	}
-	for _, pod := range valid {
-		if names[pod.Name] != 1 || uids[pod.UID] != 1 {
-			continue
-		}
-		ready, readyOK := podCondition(pod.Status.Conditions, corev1.PodReady, maxPodConditions)
-		serving, servingOK := podCondition(pod.Status.Conditions, query.ServingConditionType, maxPodConditions)
+	selected := selectPods(isvc, ir, index, pods, row, limits)
+	result := make([]observation.ObjectRef, 0, len(selected.items))
+	for _, pod := range selected.items {
 		priority := 10
-		if pod.DeletionTimestamp != nil {
+		if pod.priority == 0 {
 			priority = 25
-		} else if pod.Status.Phase != corev1.PodRunning || !readyOK || !servingOK ||
-			ready != string(corev1.ConditionTrue) || serving != string(corev1.ConditionTrue) {
-			priority = 20
-		} else if incarnation, err := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64); err != nil || incarnation != expectedIncarnation {
+		} else if pod.priority == 1 {
 			priority = 20
 		}
 		result = append(result, observation.ObjectRef{
-			Namespace: isvc.Namespace, Kind: "Pod", Name: pod.Name, UID: pod.UID, Priority: priority,
+			Namespace: isvc.Namespace, Kind: "Pod", Name: pod.value.Name, UID: pod.uid, Priority: priority,
 		})
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Priority != result[j].Priority {
-			return result[i].Priority > result[j].Priority
-		}
-		if result[i].Kind != result[j].Kind {
-			return result[i].Kind < result[j].Kind
-		}
-		if result[i].Name != result[j].Name {
-			return result[i].Name < result[j].Name
-		}
-		return result[i].UID < result[j].UID
-	})
 	skipped := 0
 	if len(result) > maxTargets {
 		skipped = len(result) - maxTargets
@@ -246,9 +230,9 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 	copyListIssues(&report, list, input.Component, component.InferenceReplica, input.Index)
 	copyDetailCompleteness(&report, input.Collection, ir.Name, input.Component, input.Index)
 
-	acceptedPods := projectPods(input, ir, rawRow, limits, &report)
+	acceptedPods, acceptedPodUIDs := projectPods(input, ir, rawRow, limits, &report)
 	report.Content.Pods = acceptedPods
-	projectEvents(input, acceptedPods, limits, &report)
+	projectEvents(input, acceptedPodUIDs, limits, &report)
 	return finish(report), nil
 }
 
@@ -289,8 +273,12 @@ func projectAuthoritative(
 			addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
 			continue
 		}
+		if condition.ObservedGeneration < 0 || condition.ObservedGeneration > ir.Generation {
+			addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
+			continue
+		}
 		evidence := reportv1alpha1.InstanceEvidenceReported
-		if condition.ObservedGeneration != ir.Generation {
+		if condition.ObservedGeneration < ir.Generation {
 			evidence = reportv1alpha1.InstanceEvidenceStale
 			addIssue(report, reportv1alpha1.InstanceStatusIssueConditionGenerationStale, "")
 		}
@@ -361,7 +349,7 @@ func projectPods(
 	row *omev1beta1.OMENativeInstanceStatus,
 	limits Limits,
 	report *reportv1alpha1.InstanceStatusReport,
-) []reportv1alpha1.InstanceStatusPod {
+) ([]reportv1alpha1.InstanceStatusPod, map[string]types.UID) {
 	report.Sources = append(report.Sources, reportv1alpha1.SourceReference{
 		Kind: "PodList", Namespace: input.InferenceService.Namespace,
 		Name:     input.InferenceService.Name + "/" + string(input.Component) + "/" + strconv.FormatInt(int64(input.Index), 10),
@@ -371,39 +359,62 @@ func projectPods(
 		report.Sources[len(report.Sources)-1].Evidence = reportv1alpha1.EvidenceUnavailable
 		addIssue(report, reportv1alpha1.InstanceStatusIssuePodsUnavailable, input.PodsUnavailable)
 	}
-	type candidate struct {
-		value    reportv1alpha1.InstanceStatusPod
-		priority int
+	selected := selectPods(input.InferenceService, ir, input.Index, input.Pods.Items, row, limits)
+	if selected.identityRejected {
+		addIssue(report, reportv1alpha1.InstanceStatusIssuePodIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
 	}
-	validPods := make([]*corev1.Pod, 0, min(len(input.Pods.Items), limits.MaxPods))
+	if selected.detailsRejected {
+		addIssue(report, reportv1alpha1.InstanceStatusIssuePodDetailsTruncated, reportv1alpha1.UnavailableMalformedPayload)
+	}
+	if input.Pods.Truncated || selected.truncated {
+		addIssue(report, reportv1alpha1.InstanceStatusIssuePodsTruncated, "")
+		report.Content.Summary.Truncated = true
+	}
+	result := make([]reportv1alpha1.InstanceStatusPod, len(selected.items))
+	acceptedUIDs := make(map[string]types.UID, len(selected.items))
+	for i := range selected.items {
+		result[i] = selected.items[i].value
+		acceptedUIDs[selected.items[i].value.Name] = selected.items[i].uid
+	}
+	return result, acceptedUIDs
+}
+
+func selectPods(
+	isvc *omev1beta1.InferenceService,
+	ir *omev1beta1.InferenceReplica,
+	index int32,
+	pods []corev1.Pod,
+	row *omev1beta1.OMENativeInstanceStatus,
+	limits Limits,
+) selectedPodSet {
+	result := selectedPodSet{items: []selectedPodCandidate{}}
 	names, uids := map[string]int{}, map[types.UID]int{}
-	for i := range input.Pods.Items {
-		pod := &input.Pods.Items[i]
-		if pod.Namespace == input.InferenceService.Namespace && len(validation.IsDNS1123Subdomain(pod.Name)) == 0 && validUID(pod.UID) {
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Namespace == isvc.Namespace && len(validation.IsDNS1123Subdomain(pod.Name)) == 0 && validUID(pod.UID) {
 			names[pod.Name]++
 			uids[pod.UID]++
 		}
-		if !validSelectedPod(pod, input.InferenceService, ir, input.Index) {
-			addIssue(report, reportv1alpha1.InstanceStatusIssuePodIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if !validSelectedPod(pod, isvc, ir, index) {
+			result.identityRejected = true
 			continue
 		}
-		validPods = append(validPods, pod)
-	}
-	candidates := make([]candidate, 0, min(len(validPods), limits.MaxPods))
-	for _, pod := range validPods {
 		if names[pod.Name] != 1 || uids[pod.UID] != 1 {
-			addIssue(report, reportv1alpha1.InstanceStatusIssuePodIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
+			result.identityRejected = true
 			continue
 		}
 		ready, conditionsOK := podCondition(pod.Status.Conditions, corev1.PodReady, limits.MaxPodConditions)
 		serving, servingOK := podCondition(pod.Status.Conditions, query.ServingConditionType, limits.MaxPodConditions)
 		if !conditionsOK || !servingOK {
-			addIssue(report, reportv1alpha1.InstanceStatusIssuePodDetailsTruncated, reportv1alpha1.UnavailableMalformedPayload)
+			result.detailsRejected = true
 			continue
 		}
 		restarts, statusesOK := restartTotal(pod, limits.MaxContainerStatuses)
 		if !statusesOK {
-			addIssue(report, reportv1alpha1.InstanceStatusIssuePodDetailsTruncated, reportv1alpha1.UnavailableMalformedPayload)
+			result.detailsRejected = true
 			continue
 		}
 		incarnation, _ := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64)
@@ -419,31 +430,27 @@ func projectPods(
 			serving != string(corev1.ConditionTrue) || incarnation != row.Incarnation {
 			priority = 1
 		}
-		candidates = append(candidates, candidate{value: value, priority: priority})
+		result.items = append(result.items, selectedPodCandidate{value: value, uid: pod.UID, priority: priority})
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].priority != candidates[j].priority {
-			return candidates[i].priority < candidates[j].priority
+	sort.Slice(result.items, func(i, j int) bool {
+		if result.items[i].priority != result.items[j].priority {
+			return result.items[i].priority < result.items[j].priority
 		}
-		return candidates[i].value.Name < candidates[j].value.Name
+		if result.items[i].value.Name != result.items[j].value.Name {
+			return result.items[i].value.Name < result.items[j].value.Name
+		}
+		return result.items[i].uid < result.items[j].uid
 	})
-	if input.Pods.Truncated || len(candidates) > limits.MaxPods {
-		addIssue(report, reportv1alpha1.InstanceStatusIssuePodsTruncated, "")
-		report.Content.Summary.Truncated = true
-	}
-	if len(candidates) > limits.MaxPods {
-		candidates = candidates[:limits.MaxPods]
-	}
-	result := make([]reportv1alpha1.InstanceStatusPod, len(candidates))
-	for i := range candidates {
-		result[i] = candidates[i].value
+	if len(result.items) > limits.MaxPods {
+		result.truncated = true
+		result.items = result.items[:limits.MaxPods]
 	}
 	return result
 }
 
 func projectEvents(
 	input Input,
-	pods []reportv1alpha1.InstanceStatusPod,
+	acceptedPodUIDs map[string]types.UID,
 	limits Limits,
 	report *reportv1alpha1.InstanceStatusReport,
 ) {
@@ -463,15 +470,6 @@ func projectEvents(
 			addIssue(report, reportv1alpha1.InstanceStatusIssueEventsUnavailable, reason)
 		}
 		report.Sources[len(report.Sources)-1].UnavailableReason = reasons[0]
-	}
-	acceptedPodUIDs := make(map[string]types.UID, len(pods))
-	for _, projected := range pods {
-		for i := range input.Pods.Items {
-			if input.Pods.Items[i].Name == projected.Name {
-				acceptedPodUIDs[projected.Name] = input.Pods.Items[i].UID
-				break
-			}
-		}
 	}
 	items := make([]reportv1alpha1.InstanceStatusEvent, 0, min(len(input.Events.Items), limits.MaxEvents))
 	for i := range input.Events.Items {
@@ -633,12 +631,16 @@ func validSelectedPod(pod *corev1.Pod, isvc *omev1beta1.InferenceService, ir *om
 		(pod.Labels[query.LabelRevisionHash] != "" && len(validation.IsDNS1123Label(pod.Labels[query.LabelRevisionHash])) != 0) {
 		return false
 	}
+	ordinal := int64(0)
 	if rawOrdinal, present := pod.Labels[query.LabelPodOrdinal]; present {
-		ordinal, err := strconv.ParseInt(rawOrdinal, 10, 32)
+		ordinal, err = strconv.ParseInt(rawOrdinal, 10, 32)
 		if err != nil || ordinal < 0 || rawOrdinal != strconv.FormatInt(ordinal, 10) ||
-			pod.Name != query.PodName(isvc.Name, workload.ComponentType(ir.Spec.Component), index, pod.Labels[query.LabelRunner], int32(ordinal)) {
+			ordinal > int64(^uint32(0)>>1) {
 			return false
 		}
+	}
+	if pod.Name != query.PodName(isvc.Name, workload.ComponentType(ir.Spec.Component), index, pod.Labels[query.LabelRunner], int32(ordinal)) {
+		return false
 	}
 	return exactControllerOwner(pod.OwnerReferences, "InferenceReplica", ir.Name, ir.UID)
 }
@@ -646,6 +648,10 @@ func validSelectedPod(pod *corev1.Pod, isvc *omev1beta1.InferenceService, ir *om
 func validSelectedEvent(event *corev1.Event, namespace string, pods map[string]types.UID) bool {
 	if event == nil || event.Namespace != namespace || event.Type != corev1.EventTypeWarning ||
 		event.Count < 0 || (event.Series != nil && event.Series.Count < 0) {
+		return false
+	}
+	firstSeen, lastSeen := eventFirstSeen(event), eventLastSeen(event)
+	if firstSeen != nil && lastSeen != nil && lastSeen.Before(*firstSeen) {
 		return false
 	}
 	ref := event.InvolvedObject
@@ -764,11 +770,13 @@ func validFailure(failure *omev1beta1.InstanceTermination) bool {
 }
 
 func validMigration(migration *omev1beta1.MigrationStatus) bool {
-	if migration == nil || migration.RequestUUID == "" || migration.SourceInstance < 0 || migration.Attempt < 0 ||
+	if migration == nil || !validMigrationRequestID(migration.RequestUUID) || migration.SourceInstance < 0 ||
 		(migration.SurgeInstance != nil && (*migration.SurgeInstance < 0 || *migration.SurgeInstance == migration.SourceInstance)) {
 		return false
 	}
-	if migration.Trigger != omev1beta1.MigrationTriggerManual && migration.Trigger != omev1beta1.MigrationTriggerAuto {
+	manual := migration.Trigger == omev1beta1.MigrationTriggerManual
+	auto := migration.Trigger == omev1beta1.MigrationTriggerAuto
+	if !manual && !auto {
 		return false
 	}
 	switch migration.Phase {
@@ -776,10 +784,60 @@ func validMigration(migration *omev1beta1.MigrationStatus) bool {
 		omev1beta1.MigrationPhaseSurgeReady, omev1beta1.MigrationPhaseDraining,
 		omev1beta1.MigrationPhaseCompleted, omev1beta1.MigrationPhaseFailed,
 		omev1beta1.MigrationPhaseRelocated:
-		return true
 	default:
 		return false
 	}
+	if (manual && migration.Phase == omev1beta1.MigrationPhaseRelocated) ||
+		(auto && migration.Phase != omev1beta1.MigrationPhaseRelocated) {
+		return false
+	}
+	hasSurge := migration.SurgeInstance != nil
+	hasAllocation := migration.AllocatedAt != nil && !migration.AllocatedAt.IsZero()
+	if hasSurge != hasAllocation {
+		return false
+	}
+	switch migration.Phase {
+	case omev1beta1.MigrationPhaseAccepted, omev1beta1.MigrationPhaseRelocated:
+		if hasSurge || hasAllocation {
+			return false
+		}
+	case omev1beta1.MigrationPhaseSurgePending, omev1beta1.MigrationPhaseSurgeReady,
+		omev1beta1.MigrationPhaseDraining, omev1beta1.MigrationPhaseCompleted:
+		if !hasSurge || !hasAllocation {
+			return false
+		}
+	}
+	hasCompletion := migration.CompletedAt != nil && !migration.CompletedAt.IsZero()
+	if migration.Phase.Terminal() != hasCompletion || migration.StartedAt.IsZero() || migration.Deadline.IsZero() ||
+		migration.Deadline.Time.Before(migration.StartedAt.Time) {
+		return false
+	}
+	if hasAllocation && migration.AllocatedAt.Time.Before(migration.StartedAt.Time) {
+		return false
+	}
+	if hasCompletion && (migration.CompletedAt.Time.Before(migration.StartedAt.Time) ||
+		(hasAllocation && migration.CompletedAt.Time.Before(migration.AllocatedAt.Time))) {
+		return false
+	}
+	if (auto && migration.Attempt <= 0) || (manual && migration.Attempt != 0) {
+		return false
+	}
+	if migration.Succeeded != nil && (!auto || migration.Phase != omev1beta1.MigrationPhaseRelocated || !*migration.Succeeded) {
+		return false
+	}
+	if migration.FromNode != "" && len(validation.IsDNS1123Subdomain(migration.FromNode)) != 0 {
+		return false
+	}
+	for _, node := range migration.HintTargetNodes {
+		if node == "" || len(validation.IsDNS1123Subdomain(node)) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func validMigrationRequestID(value string) bool {
+	return value != "" && len(value) <= 63 && !strings.Contains(value, "/") && len(validation.IsQualifiedName(value)) == 0
 }
 
 func metaTimePointer(value metav1.Time) *time.Time {

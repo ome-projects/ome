@@ -459,6 +459,22 @@ func (r InstanceStatusReport) WideTable() report.Table {
 	add := func(field, value string) {
 		table.Rows = append(table.Rows, []string{printers.BoundedCell(field, 32), printers.BoundedCell(value, 256)})
 	}
+	add("apiVersion", c.APIVersion)
+	add("kind", c.Kind)
+	add("metadata namespace", dash(c.Metadata.Namespace))
+	add("metadata name", dash(c.Metadata.Name))
+	add("collected at", statusTime(&c.CollectedAt))
+	for index, source := range c.Sources {
+		prefix := fmt.Sprintf("source[%d] ", index)
+		add(prefix+"kind", source.Kind)
+		add(prefix+"namespace", dash(source.Namespace))
+		add(prefix+"name", source.Name)
+		add(prefix+"uid", dash(source.UID))
+		add(prefix+"generation", strconv.FormatInt(source.Generation, 10))
+		add(prefix+"evidence", string(source.Evidence))
+		add(prefix+"collected at", statusTime(&source.CollectedAt))
+		add(prefix+"unavailable", dash(string(source.UnavailableReason)))
+	}
 	add("state", string(c.Content.Summary.State))
 	add("component", string(c.Content.Summary.Component))
 	add("index", strconv.FormatInt(int64(c.Content.Summary.Index), 10))
@@ -468,14 +484,13 @@ func (r InstanceStatusReport) WideTable() report.Table {
 	add("deployment source", dash(string(c.Content.Deployment.Source)))
 	add("deployment origin", dash(c.Content.Deployment.Origin))
 	add("deployment evidence", string(c.Content.Deployment.Evidence))
-	if c.Content.Deployment.UnavailableReason != "" {
-		add("deployment unavailable", string(c.Content.Deployment.UnavailableReason))
-	}
+	add("deployment unavailable", dash(string(c.Content.Deployment.UnavailableReason)))
 	add("encoding name", dash(c.Content.Encoding.Name))
 	add("encoding evidence", string(c.Content.Encoding.Evidence))
 	add("encoding unavailable", dash(string(c.Content.Encoding.UnavailableReason)))
 	if instance := c.Content.Instance; instance != nil {
 		add("inference replica", instance.InferenceReplica)
+		add("instance index", strconv.FormatInt(int64(instance.Index), 10))
 		add("incarnation", strconv.FormatInt(instance.Incarnation, 10))
 		add("phase", string(instance.Phase))
 		add("running revision", dash(instance.RunningRevision))
@@ -486,13 +501,14 @@ func (r InstanceStatusReport) WideTable() report.Table {
 		add("persisted available", strconv.FormatInt(int64(instance.Pods.Available), 10))
 		add("ready since", statusTime(instance.ReadySince))
 		add("active ordinal", statusInt32(instance.ActiveOrdinal))
-		for _, condition := range instance.Conditions {
-			add("condition type", condition.Type)
-			add("condition status", condition.Status)
-			add("condition generation", strconv.FormatInt(condition.ObservedGeneration, 10))
-			add("condition evidence", string(condition.Evidence))
-			add("condition reason", dash(condition.Reason))
-			add("condition transition", statusTime(condition.LastTransitionTime))
+		for index, condition := range instance.Conditions {
+			prefix := fmt.Sprintf("condition[%d] ", index)
+			add(prefix+"type", condition.Type)
+			add(prefix+"status", condition.Status)
+			add(prefix+"generation", strconv.FormatInt(condition.ObservedGeneration, 10))
+			add(prefix+"evidence", string(condition.Evidence))
+			add(prefix+"reason", dash(condition.Reason))
+			add(prefix+"transition", statusTime(condition.LastTransitionTime))
 		}
 		if operation := instance.Operation; operation != nil {
 			add("operation id", operation.ID)
@@ -521,49 +537,60 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add("failure exit code", statusInt32(failure.ExitCode))
 			add("failure time", statusTime(failure.Time))
 		}
-		for _, migration := range instance.Migrations {
-			add("migration request UUID", migration.RequestUUID)
-			add("migration role", migration.Role)
-			add("migration trigger", migration.Trigger)
-			add("migration source index", strconv.FormatInt(int64(migration.SourceInstance), 10))
-			add("migration surge index", statusInt32(migration.SurgeInstance))
-			add("migration phase", migration.Phase)
-			add("migration attempt", strconv.FormatInt(int64(migration.Attempt), 10))
-			add("migration from node", dash(migration.FromNode))
-			for _, node := range migration.TargetNodeHints {
-				add("migration target node", node)
+		for index, migration := range instance.Migrations {
+			prefix := fmt.Sprintf("migration[%d] ", index)
+			add(prefix+"request UUID", migration.RequestUUID)
+			add(prefix+"role", migration.Role)
+			add(prefix+"trigger", migration.Trigger)
+			add(prefix+"source index", strconv.FormatInt(int64(migration.SourceInstance), 10))
+			add(prefix+"surge index", statusInt32(migration.SurgeInstance))
+			add(prefix+"phase", migration.Phase)
+			add(prefix+"attempt", strconv.FormatInt(int64(migration.Attempt), 10))
+			add(prefix+"from node", dash(migration.FromNode))
+			if len(migration.TargetNodeHints) == 0 {
+				add(prefix+"target node", "-")
 			}
-			add("migration reason", dash(migration.Reason))
-			add("migration message", dash(migration.Message))
-			add("migration started", statusTime(migration.StartedAt))
-			add("migration allocated", statusTime(migration.AllocatedAt))
-			add("migration deadline", statusTime(migration.Deadline))
-			add("migration completed", statusTime(migration.CompletedAt))
-			add("migration succeeded", statusBool(migration.Succeeded))
+			for _, node := range migration.TargetNodeHints {
+				add(prefix+"target node", node)
+			}
+			add(prefix+"reason", dash(migration.Reason))
+			add(prefix+"message", dash(migration.Message))
+			add(prefix+"started", statusTime(migration.StartedAt))
+			add(prefix+"allocated", statusTime(migration.AllocatedAt))
+			add(prefix+"deadline", statusTime(migration.Deadline))
+			add(prefix+"completed", statusTime(migration.CompletedAt))
+			add(prefix+"succeeded", statusBool(migration.Succeeded))
 		}
 	}
-	for _, pod := range c.Content.Pods {
-		add("pod name", pod.Name)
-		add("pod runner", dash(pod.Runner))
-		add("pod revision", dash(pod.Revision))
-		add("pod incarnation", strconv.FormatInt(pod.Incarnation, 10))
-		add("pod phase", pod.Phase)
-		add("pod ready", pod.Ready)
-		add("pod serving ready", pod.ServingReady)
-		add("pod node", dash(pod.Node))
-		add("pod restarts", strconv.FormatInt(int64(pod.RestartCount), 10))
-		add("pod deleting", strconv.FormatBool(pod.Deleting))
+	for index, pod := range c.Content.Pods {
+		prefix := fmt.Sprintf("pod[%d] ", index)
+		add(prefix+"name", pod.Name)
+		add(prefix+"runner", dash(pod.Runner))
+		add(prefix+"revision", dash(pod.Revision))
+		add(prefix+"incarnation", strconv.FormatInt(pod.Incarnation, 10))
+		add(prefix+"phase", pod.Phase)
+		add(prefix+"ready", pod.Ready)
+		add(prefix+"serving ready", pod.ServingReady)
+		add(prefix+"node", dash(pod.Node))
+		add(prefix+"restarts", strconv.FormatInt(int64(pod.RestartCount), 10))
+		add(prefix+"deleting", strconv.FormatBool(pod.Deleting))
 	}
-	for _, event := range c.Content.Events {
-		add("event target kind", event.TargetKind)
-		add("event target name", event.TargetName)
-		add("event reason", event.Reason)
-		add("event count", strconv.FormatInt(int64(event.Count), 10))
-		add("event first seen", statusTime(event.FirstSeen))
-		add("event last seen", statusTime(event.LastSeen))
+	for index, event := range c.Content.Events {
+		prefix := fmt.Sprintf("event[%d] ", index)
+		add(prefix+"target kind", event.TargetKind)
+		add(prefix+"target name", event.TargetName)
+		add(prefix+"reason", event.Reason)
+		add(prefix+"count", strconv.FormatInt(int64(event.Count), 10))
+		add(prefix+"first seen", statusTime(event.FirstSeen))
+		add(prefix+"last seen", statusTime(event.LastSeen))
 	}
-	for _, issue := range c.Content.Issues {
-		add("issue", string(issue.Code)+" "+string(issue.UnavailableReason))
+	for index, issue := range c.Content.Issues {
+		prefix := fmt.Sprintf("issue[%d] ", index)
+		add(prefix+"code", string(issue.Code))
+		add(prefix+"unavailable", dash(string(issue.UnavailableReason)))
+	}
+	for index, warning := range c.Warnings {
+		add(fmt.Sprintf("warning[%d] code", index), string(warning.Code))
 	}
 	return table
 }
