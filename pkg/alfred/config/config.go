@@ -11,6 +11,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	"sigs.k8s.io/yaml"
 )
 
@@ -50,7 +51,8 @@ type Config struct {
 	// empty disables advancement. A pass is never interrupted.
 	EarlyTickOn []string `json:"earlyTickOn"`
 
-	Policies Policies `json:"policies"`
+	Policies   Policies          `json:"policies"`
+	Scheduling scheduling.Config `json:"scheduling,omitempty"`
 
 	DefaultMovable                 *bool `json:"defaultMovable"`
 	RecentPlacementCooldownMinutes int   `json:"recentPlacementCooldownMinutes"`
@@ -293,6 +295,9 @@ func (c *Config) validate() error {
 		if trigger != EarlyTickNodeConditionChange {
 			return fmt.Errorf("unknown earlyTickOn trigger %q", trigger)
 		}
+	}
+	if err := c.Scheduling.Validate(); err != nil {
+		return err
 	}
 
 	d := &c.Policies.Defragmentation

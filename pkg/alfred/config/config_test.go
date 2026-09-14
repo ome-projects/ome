@@ -9,6 +9,9 @@ import (
 
 func TestDefaultIsSafeAndComplete(t *testing.T) {
 	cfg := Default()
+	if cfg.Scheduling.Profiles != nil {
+		t.Fatalf("default scheduling profiles = %#v, want none", cfg.Scheduling.Profiles)
+	}
 
 	if cfg.Mode != ModeRecommendOnly {
 		t.Fatalf("default mode = %q, want recommend-only", cfg.Mode)
@@ -113,6 +116,13 @@ spotPolicy:
   avoidAsTarget: false
   preemptibleLabels: [custom.io/spot]
 logLevel: debug
+scheduling:
+  profiles:
+    custom-gang:
+      backend: custom-gang-v030
+      schedulerVersion: v0.30.1
+      configurationID: sha256:gang
+      gangScheduling: true
 `)
 	cfg, err := Load(raw)
 	if err != nil {
@@ -139,6 +149,10 @@ logLevel: debug
 	}
 	if *cfg.SpotPolicy.AvoidAsTarget || cfg.SpotPolicy.PreemptibleLabels[0] != "custom.io/spot" {
 		t.Fatalf("spot parse: %+v", cfg.SpotPolicy)
+	}
+	profile := cfg.Scheduling.Profiles["custom-gang"]
+	if profile.Backend != "custom-gang-v030" || !profile.GangScheduling {
+		t.Fatalf("scheduling profile parse: %+v", profile)
 	}
 	// Unset sections still default.
 	if cfg.MaxMigrationsPerHour != 10 || cfg.PerWorkloadCooldownMinutes != 30 {
@@ -174,6 +188,7 @@ func TestLoadRejectsInvalidConfigs(t *testing.T) {
 		{"negative cooldown", "schemaVersion: 1\nrecentPlacementCooldownMinutes: -5", "must be positive"},
 		{"negative cap", "schemaVersion: 1\nmaxInFlightMigrations: -1", "must be positive"},
 		{"negative tau", "schemaVersion: 1\npolicies:\n  defragmentation:\n    scoring:\n      pendingUrgencyTauMinutes: -30", "must be positive"},
+		{"invalid scheduling profile", "schemaVersion: 1\nscheduling:\n  profiles:\n    custom-gang:\n      backend: simulator\n      schedulerVersion: ' v1'\n      configurationID: config", "schedulerVersion"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
