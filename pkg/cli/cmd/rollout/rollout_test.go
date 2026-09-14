@@ -103,7 +103,7 @@ func TestRolloutCommandsRejectUnboundInferenceServiceResponses(t *testing.T) {
 			isvc.UID = ""
 		}, want: rolloutprojection.ErrSubjectUIDRequired},
 	}
-	for _, command := range []string{"status", "explain"} {
+	for _, command := range []string{"status", "explain", "history"} {
 		for _, tt := range tests {
 			t.Run(command+" "+tt.name, func(t *testing.T) {
 				returned := minimalInferenceService()

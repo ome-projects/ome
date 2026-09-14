@@ -14,11 +14,12 @@ import (
 // RolloutStatusReportKind identifies the rollout status report schema.
 const RolloutStatusReportKind = "RolloutStatusReport"
 
-// RolloutSourceKind is the closed set of objects read by rollout status.
+// RolloutSourceKind is the closed set of objects read by rollout reports.
 type RolloutSourceKind string
 
 const (
-	// RolloutSourceInferenceService is the single object read by rollout status.
+	// RolloutSourceInferenceService is the single object read by rollout status,
+	// explain, history, and validation projections.
 	RolloutSourceInferenceService RolloutSourceKind = "InferenceService"
 )
 

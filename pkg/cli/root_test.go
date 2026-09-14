@@ -37,6 +37,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome migration status",
 		"ome rollout",
 		"ome rollout explain",
+		"ome rollout history",
 		"ome rollout status",
 		"ome rollout validate",
 		"ome runtime",
@@ -75,6 +76,13 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if validate.Use != "validate INFERENCESERVICE" || validate.Short != "Validate rollout, traffic, and autoscaling configuration" {
 		t.Fatalf("rollout validate contract changed: Use=%q Short=%q", validate.Use, validate.Short)
+	}
+	history, _, err := root.Find([]string{"rollout", "history"})
+	if err != nil {
+		t.Fatalf("find rollout history: %v", err)
+	}
+	if history.Use != "history INFERENCESERVICE" || history.Short != "Show bounded retained rollout evidence" {
+		t.Fatalf("rollout history contract changed: Use=%q Short=%q", history.Use, history.Short)
 	}
 	retryBlocks, _, err := root.Find([]string{"instance", "retry-blocks"})
 	if err != nil {
