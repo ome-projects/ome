@@ -35,6 +35,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome rollout",
 		"ome rollout explain",
 		"ome rollout status",
+		"ome rollout validate",
 		"ome runtime",
 		"ome runtime effective",
 		"ome runtime explain",
@@ -62,6 +63,13 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if tree.Use != "tree RUNTIME" || tree.Short != "Show runtime inheritance and InferenceService users" {
 		t.Fatalf("runtime tree contract changed: Use=%q Short=%q", tree.Use, tree.Short)
+	}
+	validate, _, err := root.Find([]string{"rollout", "validate"})
+	if err != nil {
+		t.Fatalf("find rollout validate: %v", err)
+	}
+	if validate.Use != "validate INFERENCESERVICE" || validate.Short != "Validate rollout, traffic, and autoscaling configuration" {
+		t.Fatalf("rollout validate contract changed: Use=%q Short=%q", validate.Use, validate.Short)
 	}
 }
 

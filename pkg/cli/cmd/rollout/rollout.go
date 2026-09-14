@@ -48,6 +48,7 @@ func newCmdWithClock(
 	}
 	cmd.AddCommand(newStatusCmd(f, streams, clock))
 	cmd.AddCommand(newExplainCmd(f, streams, clock))
+	cmd.AddCommand(newValidateCmd(f, streams, clock))
 	return cmd
 }
 

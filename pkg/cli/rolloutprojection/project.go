@@ -100,6 +100,13 @@ func Project(
 // already-stored object safely. Validator error text is intentionally dropped:
 // report diagnostics are code-only and must never copy arbitrary input.
 func validStoredRolloutSpec(spec *omev1beta1.InferenceServiceSpec) bool {
+	return validStoredRolloutPlan(spec) && omevalidation.ValidateRolloutOrderingEnforced(spec) == nil
+}
+
+// validStoredRolloutPlan mirrors CRD-only bounds and every pure rollout-body
+// validator except ordering. Keeping ordering separate lets validation reports
+// distinguish an unsupported sequence from a malformed progression body.
+func validStoredRolloutPlan(spec *omev1beta1.InferenceServiceSpec) bool {
 	groups := spec.GetRolloutGroups()
 	if len(groups) > 3 {
 		return false
@@ -152,7 +159,7 @@ func validStoredRolloutSpec(spec *omev1beta1.InferenceServiceSpec) bool {
 	if err := omevalidation.ValidateLifecycle(spec); err != nil {
 		return false
 	}
-	return omevalidation.ValidateRolloutOrderingEnforced(spec) == nil
+	return true
 }
 
 type projector struct {
