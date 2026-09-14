@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	"sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 )
@@ -334,6 +336,96 @@ func TestRuntimeHistoryTableContract(t *testing.T) {
 	)
 
 	assert.Equal(t, report.Table{
+		Headers: []string{"WINDOW", "REVISION", "CREATED", "ROLES", "CHECK", "LIVE", "ISSUES"},
+		Rows: [][]string{
+			{"P/I/2/3", "revision-a", "26-08-31T18:20Z", "AQRH", "BAD", "MATCH", "R2/G2"},
+			{"P/I/2/3", "revision-b", "26-08-31T18:20Z", "H", "BAD", "DIFF", "R1/G2"},
+			{"P/I/2/3", "revision-old", "26-08-31T18:10Z", "-", "?", "?", "R0/G2"},
+		},
+	}, reportValue.Table())
+
+	var output bytes.Buffer
+	require.NoError(t, report.Write(&output, report.FormatTable, reportValue))
+	for _, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
+		assert.LessOrEqual(t, len(line), 80, "compact output line %q", line)
+	}
+}
+
+func TestRuntimeHistoryCompactTableBoundsSanitizedUnicodeByDisplayWidth(t *testing.T) {
+	name := "\t\n\r\u202e" + strings.Repeat("界", 100)
+	content := v1alpha1.RuntimeHistoryContent{
+		Observation:  v1alpha1.HistoryObservationStateComplete,
+		Completeness: v1alpha1.HistoryCompletenessRetentionBounded,
+		Revisions: []v1alpha1.RuntimeRevisionEntry{{
+			Revision: v1alpha1.RuntimeRevisionReference{Name: name},
+		}},
+	}
+
+	table := content.Table()
+	require.Len(t, table.Rows, 1)
+	assert.NotContains(t, table.Rows[0][1], "\t")
+	assert.NotContains(t, table.Rows[0][1], "\n")
+	assert.NotContains(t, table.Rows[0][1], "\r")
+	assert.NotContains(t, table.Rows[0][1], "\u202e")
+	assert.Equal(t, table.Rows[0][1], printers.BoundedMiddleCell(table.Rows[0][1], 14))
+
+	var output bytes.Buffer
+	require.NoError(t, table.Write(&output))
+	for _, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
+		assert.Equal(t, line, printers.BoundedCell(line, 80), "display width of line %q", line)
+	}
+}
+
+func TestRuntimeHistoryCompactTableMapsUnknownAndEmptyStatesClosed(t *testing.T) {
+	zero := time.Time{}
+	tests := []struct {
+		name        string
+		consistency v1alpha1.RevisionConsistency
+		relation    v1alpha1.RevisionRelation
+		wantCheck   string
+		wantLive    string
+	}{
+		{name: "empty", wantCheck: "-", wantLive: "-"},
+		{
+			name: "ambiguous live relation", consistency: v1alpha1.RevisionConsistencyConsistent,
+			relation: v1alpha1.RevisionRelationAmbiguous, wantCheck: "OK", wantLive: "AMB",
+		},
+		{
+			name: "future values", consistency: v1alpha1.RevisionConsistency("FutureConsistency"),
+			relation: v1alpha1.RevisionRelation("FutureRelation"), wantCheck: "OTHER", wantLive: "OTHER",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := v1alpha1.RuntimeHistoryContent{
+				Observation:    v1alpha1.HistoryObservationState("FutureObservation"),
+				Completeness:   v1alpha1.HistoryCompleteness("FutureCompleteness"),
+				ObservedPages:  -1,
+				RequestedPages: 100,
+				Revisions: []v1alpha1.RuntimeRevisionEntry{{
+					Revision:       v1alpha1.RuntimeRevisionReference{Name: "revision", CreatedAt: &zero},
+					Consistency:    tt.consistency,
+					RelationToLive: tt.relation,
+				}},
+			}
+
+			row := content.Table().Rows[0]
+			assert.Equal(t, "?/?/?/99+", row[0])
+			assert.Equal(t, "-", row[2])
+			assert.Equal(t, tt.wantCheck, row[4])
+			assert.Equal(t, tt.wantLive, row[5])
+		})
+	}
+}
+
+func TestRuntimeHistoryWideTablePreservesCompleteLegacyView(t *testing.T) {
+	reportValue := v1alpha1.NewRuntimeHistoryReport(
+		v1alpha1.Metadata{Namespace: "prod", Name: "chat"},
+		runtimeHistoryContent(),
+		fixedClock{now: time.Date(2026, time.August, 31, 18, 30, 0, 0, time.UTC)},
+	)
+
+	assert.Equal(t, report.Table{
 		Headers: []string{
 			"OBSERVATION", "COMPLETENESS", "PAGES", "REVISION", "CREATED", "HASH", "ROLES", "SOURCE",
 			"CONSISTENCY", "RELATION", "REVISION-ISSUES", "REPORT-ISSUES",
@@ -343,16 +435,55 @@ func TestRuntimeHistoryTableContract(t *testing.T) {
 			{"Partial", "Incomplete", "2/3", "revision-b", "2026-08-31T18:20:00Z", "bbbbbbbb", "History", "ServingRuntime/prod/vllm", "Inconsistent", "DiffersFromLive", "RevisionSourceMismatch", "HistoryTruncated,RevisionHashCollision(revision-b)"},
 			{"Partial", "Incomplete", "2/3", "revision-old", "2026-08-31T18:10:00Z", "-", "-", "-", "Unknown", "Unknown", "-", "HistoryTruncated,RevisionHashCollision(revision-b)"},
 		},
-	}, reportValue.Table())
+	}, reportValue.Content.WideTable())
+}
+
+func TestRuntimeHistoryCompactTableBoundsAndDisambiguatesHostileValues(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 31, 18, 20, 0, 0, time.UTC)
+	content := v1alpha1.RuntimeHistoryContent{
+		Observation:    v1alpha1.HistoryObservationStatePartial,
+		Completeness:   v1alpha1.HistoryCompletenessIncomplete,
+		ObservedPages:  100,
+		RequestedPages: 101,
+		Revisions: []v1alpha1.RuntimeRevisionEntry{
+			{
+				Revision: v1alpha1.RuntimeRevisionReference{
+					Name: "shared-prefix-first-distinct-middle-shared-suffix", CreatedAt: runtimeReportTime(createdAt),
+				},
+				Roles: []v1alpha1.RuntimeRevisionRole{
+					v1alpha1.RuntimeRevisionRoleActive, v1alpha1.RuntimeRevisionRoleRequested,
+					v1alpha1.RuntimeRevisionRoleReported, v1alpha1.RuntimeRevisionRoleHistory,
+					v1alpha1.RuntimeRevisionRole("FutureRole"),
+				},
+				Consistency:    v1alpha1.RevisionConsistency("FutureConsistency"),
+				RelationToLive: v1alpha1.RevisionRelation("FutureRelation"),
+				Issues:         make([]v1alpha1.RuntimeIssueCode, 10),
+			},
+			{
+				Revision: v1alpha1.RuntimeRevisionReference{
+					Name: "shared-prefix-second-distinct-middle-shared-suffix", CreatedAt: runtimeReportTime(createdAt),
+				},
+			},
+		},
+		Issues: make([]v1alpha1.RuntimeIssue, 10),
+	}
+
+	table := content.Table()
+	require.Len(t, table.Rows, 2)
+	assert.Equal(t, "P/I/99+/99+", table.Rows[0][0])
+	assert.Equal(t, "AQRH?", table.Rows[0][3])
+	assert.Equal(t, "OTHER", table.Rows[0][4])
+	assert.Equal(t, "OTHER", table.Rows[0][5])
+	assert.Equal(t, "R9+/G9+", table.Rows[0][6])
+	assert.NotEqual(t, table.Rows[0][1], table.Rows[1][1])
+	assert.Contains(t, table.Rows[0][1], "#")
+	assert.Contains(t, table.Rows[1][1], "#")
 
 	var output bytes.Buffer
-	require.NoError(t, report.Write(&output, report.FormatTable, reportValue))
-	assert.Equal(t,
-		"OBSERVATION   COMPLETENESS   PAGES   REVISION       CREATED                HASH       ROLES                               SOURCE                     CONSISTENCY    RELATION          REVISION-ISSUES                            REPORT-ISSUES\n"+
-			"Partial       Incomplete     2/3     revision-a     2026-08-31T18:20:00Z   aaaaaaaa   Active,Requested,Reported,History   ServingRuntime/prod/vllm   Inconsistent   MatchesLive       RevisionHashInvalid,RevisionNameMismatch   HistoryTruncated,RevisionHashCollision(revision-b)\n"+
-			"Partial       Incomplete     2/3     revision-b     2026-08-31T18:20:00Z   bbbbbbbb   History                             ServingRuntime/prod/vllm   Inconsistent   DiffersFromLive   RevisionSourceMismatch                     HistoryTruncated,RevisionHashCollision(revision-b)\n"+
-			"Partial       Incomplete     2/3     revision-old   2026-08-31T18:10:00Z   -          -                                   -                          Unknown        Unknown           -                                          HistoryTruncated,RevisionHashCollision(revision-b)\n",
-		output.String())
+	require.NoError(t, table.Write(&output))
+	for _, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
+		assert.LessOrEqual(t, len(line), 80, "compact output line %q", line)
+	}
 }
 
 func TestRuntimeHistoryEmptyFormsHaveDiagnosticSummaryRow(t *testing.T) {
@@ -364,14 +495,14 @@ func TestRuntimeHistoryEmptyFormsHaveDiagnosticSummaryRow(t *testing.T) {
 			content: v1alpha1.RuntimeHistoryContent{
 				Observation: v1alpha1.HistoryObservationStateNotRequested, Completeness: v1alpha1.HistoryCompletenessNotRequested,
 			},
-			want: []string{"NotRequested", "NotRequested", "0/0", "-", "-", "-", "-", "-", "-", "-", "-", "-"},
+			want: []string{"N/N/0/0", "-", "-", "-", "-", "-", "R0/G0"},
 		},
 		{
 			content: v1alpha1.RuntimeHistoryContent{
 				Observation: v1alpha1.HistoryObservationStateComplete, Completeness: v1alpha1.HistoryCompletenessRetentionBounded,
 				RequestedPages: 1, ObservedPages: 1,
 			},
-			want: []string{"Complete", "RetentionBounded", "1/1", "-", "-", "-", "-", "-", "-", "-", "-", "-"},
+			want: []string{"C/B/1/1", "-", "-", "-", "-", "-", "R0/G0"},
 		},
 		{
 			content: v1alpha1.RuntimeHistoryContent{
@@ -380,7 +511,7 @@ func TestRuntimeHistoryEmptyFormsHaveDiagnosticSummaryRow(t *testing.T) {
 				RequestedPages: 1,
 				Issues:         []v1alpha1.RuntimeIssue{{Code: v1alpha1.RuntimeIssueHistoryUnavailable}},
 			},
-			want: []string{"Unavailable", "Incomplete", "0/1", "-", "-", "-", "-", "-", "-", "-", "-", "HistoryUnavailable"},
+			want: []string{"U/I/0/1", "-", "-", "-", "-", "-", "R0/G1"},
 		},
 	}
 	for _, tt := range tests {
@@ -388,6 +519,10 @@ func TestRuntimeHistoryEmptyFormsHaveDiagnosticSummaryRow(t *testing.T) {
 		assert.NotNil(t, canonical.Revisions)
 		assert.Equal(t, [][]string{tt.want}, canonical.Table().Rows)
 	}
+
+	assert.Equal(t, [][]string{{
+		"Unavailable", "Incomplete", "0/1", "-", "-", "-", "-", "-", "-", "-", "-", "HistoryUnavailable",
+	}}, tests[2].content.WideTable().Rows)
 }
 
 func TestRuntimeHistoryMachineOutputContract(t *testing.T) {

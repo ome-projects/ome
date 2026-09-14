@@ -27,13 +27,20 @@ InferenceService's resolved runtime.
 The command reads at most two pages and 1,000 revisions, and reports whether
 the observed window is complete or truncated. Raw runtime specs,
 ControllerRevision data, status messages, resource versions, and
-synchronization tokens are never printed.`, cmd.Long)
+synchronization tokens are never printed.
+
+The compact table keeps each line within 80 columns. WINDOW is
+OBS/BOUND/SEEN/ASKED: C=complete, P=partial, U=unavailable, N=not requested;
+B=retention-bounded and I=incomplete. ROLES uses A=active, Q=requested,
+R=reported, and H=history. CHECK uses OK, BAD, or ?; LIVE uses MATCH, DIFF,
+AMB, or ?. ISSUES uses R/G for revision/global report counts. Use -o wide
+for full timestamps, hashes, sources, and exact issue codes.`, cmd.Long)
 
 	output := cmd.Flags().Lookup("output")
 	require.NotNil(t, output)
 	assert.Equal(t, "o", output.Shorthand)
 	assert.Equal(t, "table", output.DefValue)
-	assert.Equal(t, "Output format: table, json or yaml", output.Usage)
+	assert.Equal(t, "Output format: table, wide, json or yaml", output.Usage)
 	omeNamespace := cmd.Flags().Lookup("ome-namespace")
 	require.NotNil(t, omeNamespace)
 	assert.Equal(t, "ome", omeNamespace.DefValue)
@@ -65,12 +72,19 @@ the observed window is complete or truncated. Raw runtime specs,
 ControllerRevision data, status messages, resource versions, and
 synchronization tokens are never printed.
 
+The compact table keeps each line within 80 columns. WINDOW is
+OBS/BOUND/SEEN/ASKED: C=complete, P=partial, U=unavailable, N=not requested;
+B=retention-bounded and I=incomplete. ROLES uses A=active, Q=requested,
+R=reported, and H=history. CHECK uses OK, BAD, or ?; LIVE uses MATCH, DIFF,
+AMB, or ?. ISSUES uses R/G for revision/global report counts. Use -o wide
+for full timestamps, hashes, sources, and exact issue codes.
+
 Usage:
   runtime history INFERENCESERVICE [flags]
 
 Flags:
   -h, --help                   help for history
       --ome-namespace string   Namespace where the OME control plane is installed (default "ome")
-  -o, --output string          Output format: table, json or yaml (default "table")
+  -o, --output string          Output format: table, wide, json or yaml (default "table")
 `, out.String())
 }

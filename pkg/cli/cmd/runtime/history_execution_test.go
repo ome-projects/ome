@@ -114,7 +114,7 @@ func TestHistoryReadsExactlyOneTargetAndBoundedHistory(t *testing.T) {
 	assert.Equal(t, int64(500), recordingKube.listOptions[0].Limit)
 	assert.Empty(t, recordingKube.listOptions[0].Continue)
 	assert.Equal(t, constants.RuntimeRevisionOfLabelKey+"=cluster-runtime", recordingKube.listOptions[0].LabelSelector)
-	assert.Contains(t, out.String(), "RetentionBounded")
+	assert.Contains(t, out.String(), "C/B/1/1")
 	assert.Empty(t, errOut)
 }
 
@@ -138,15 +138,13 @@ func TestHistoryStopsAfterTwoPages(t *testing.T) {
 	assert.Equal(t, int64(500), recordingKube.listOptions[1].Limit)
 	assert.Empty(t, recordingKube.listOptions[0].Continue)
 	assert.Equal(t, "second-page", recordingKube.listOptions[1].Continue)
-	assert.Contains(t, out.String(), "Partial")
-	assert.Contains(t, out.String(), "Incomplete")
-	assert.Contains(t, out.String(), "2/2")
-	assert.Contains(t, out.String(), "HistoryTruncated")
+	assert.Contains(t, out.String(), "P/I/2/2")
+	assert.Contains(t, out.String(), "R0/G1")
 	assert.Empty(t, errOut)
 }
 
 func TestHistoryHealthyPinnedFormats(t *testing.T) {
-	for _, format := range []string{"table", "json", "yaml"} {
+	for _, format := range []string{"table", "wide", "json", "yaml"} {
 		t.Run(format, func(t *testing.T) {
 			f, _ := healthyPinnedFactory(t)
 			var out bytes.Buffer
@@ -157,6 +155,13 @@ func TestHistoryHealthyPinnedFormats(t *testing.T) {
 			assert.Empty(t, errOut)
 
 			if format == "table" {
+				assert.Equal(t, []string{
+					"WINDOW", "REVISION", "CREATED", "ROLES", "CHECK", "LIVE", "ISSUES",
+					"C/B/1/1", "cr...#2130c7ba", "26-08-30T01:02Z", "AQRH", "OK", "MATCH", "R0/G0",
+				}, strings.Fields(out.String()))
+				return
+			}
+			if format == "wide" {
 				assert.Equal(t, []string{
 					"OBSERVATION", "COMPLETENESS", "PAGES", "REVISION", "CREATED", "HASH", "ROLES", "SOURCE",
 					"CONSISTENCY", "RELATION", "REVISION-ISSUES", "REPORT-ISSUES",
@@ -333,9 +338,18 @@ func TestHistoryOptionalListFailureIsBoundedDiagnostic(t *testing.T) {
 	errOut, err := executeHistory(t, f, &out, "service", "--ome-namespace", "control-plane")
 
 	require.NoError(t, err)
-	assert.Contains(t, out.String(), "HistoryUnavailable")
+	assert.Contains(t, out.String(), "R0/G1")
 	assert.NotContains(t, out.String(), canary)
 	assert.NotContains(t, errOut, canary)
+	assert.Empty(t, errOut)
+
+	var wide bytes.Buffer
+	errOut, err = executeHistory(
+		t, f, &wide, "service", "--ome-namespace", "control-plane", "--output", "wide",
+	)
+	require.NoError(t, err)
+	assert.Contains(t, wide.String(), "HistoryUnavailable")
+	assert.NotContains(t, wide.String(), canary)
 	assert.Empty(t, errOut)
 }
 
@@ -350,7 +364,7 @@ func TestHistoryPreservesWriterFailures(t *testing.T) {
 		{name: "short write", writer: failingWriter{short: true}, want: io.ErrShortWrite},
 	}
 	for _, test := range tests {
-		for _, format := range []string{"table", "json", "yaml"} {
+		for _, format := range []string{"table", "wide", "json", "yaml"} {
 			t.Run(test.name+"/"+format, func(t *testing.T) {
 				f, _ := healthyPinnedFactory(t)
 				errOut, err := executeHistory(

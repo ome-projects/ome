@@ -2,12 +2,16 @@ package v1alpha1
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 )
 
@@ -112,8 +116,36 @@ func compareRuntimeObjectReferences(a, b *RuntimeObjectReference) int {
 	return 0
 }
 
-// Table returns the deterministic human-readable revision history view.
+// Table returns a compact deterministic revision history view. Every cell has
+// a fixed display-width bound so the complete table fits an 80-column terminal.
 func (c RuntimeHistoryContent) Table() report.Table {
+	canonical := c.Canonical()
+	table := report.Table{
+		Headers: []string{"WINDOW", "REVISION", "CREATED", "ROLES", "CHECK", "LIVE", "ISSUES"},
+		Rows:    make([][]string, 0, len(canonical.Revisions)),
+	}
+	window := compactRuntimeHistoryWindow(canonical)
+	for _, entry := range canonical.Revisions {
+		table.Rows = append(table.Rows, []string{
+			window,
+			compactRuntimeHistoryIdentity(entry.Revision.Name),
+			compactRuntimeHistoryTime(entry.Revision.CreatedAt),
+			compactRuntimeHistoryRoles(entry.Roles),
+			compactRuntimeHistoryConsistency(entry.Consistency),
+			compactRuntimeHistoryRelation(entry.RelationToLive),
+			compactRuntimeHistoryIssues(len(entry.Issues), len(canonical.Issues)),
+		})
+	}
+	if len(table.Rows) == 0 {
+		table.Rows = append(table.Rows, []string{
+			window, "-", "-", "-", "-", "-", compactRuntimeHistoryIssues(0, len(canonical.Issues)),
+		})
+	}
+	return table
+}
+
+// WideTable returns the complete legacy human-readable revision history view.
+func (c RuntimeHistoryContent) WideTable() report.Table {
 	canonical := c.Canonical()
 	table := report.Table{
 		Headers: []string{
@@ -148,6 +180,155 @@ func (c RuntimeHistoryContent) Table() report.Table {
 		})
 	}
 	return table
+}
+
+const compactRuntimeHistoryRevisionWidth = 14
+
+func compactRuntimeHistoryWindow(content RuntimeHistoryContent) string {
+	return compactRuntimeHistoryObservation(content.Observation) + "/" +
+		compactRuntimeHistoryCompleteness(content.Completeness) + "/" +
+		compactRuntimeHistoryPageCount(content.ObservedPages) + "/" +
+		compactRuntimeHistoryPageCount(content.RequestedPages)
+}
+
+func compactRuntimeHistoryObservation(observation HistoryObservationState) string {
+	switch observation {
+	case HistoryObservationStateNotRequested:
+		return "N"
+	case HistoryObservationStateComplete:
+		return "C"
+	case HistoryObservationStatePartial:
+		return "P"
+	case HistoryObservationStateUnavailable:
+		return "U"
+	default:
+		return "?"
+	}
+}
+
+func compactRuntimeHistoryCompleteness(completeness HistoryCompleteness) string {
+	switch completeness {
+	case HistoryCompletenessNotRequested:
+		return "N"
+	case HistoryCompletenessRetentionBounded:
+		return "B"
+	case HistoryCompletenessIncomplete:
+		return "I"
+	default:
+		return "?"
+	}
+}
+
+func compactRuntimeHistoryPageCount(count int) string {
+	switch {
+	case count < 0:
+		return "?"
+	case count > 99:
+		return "99+"
+	default:
+		return strconv.Itoa(count)
+	}
+}
+
+func compactRuntimeHistoryIdentity(value string) string {
+	const normalizedIdentityLimit = 1024
+	clean := printers.BoundedMiddleCell(orDash(value), normalizedIdentityLimit)
+	if printers.BoundedMiddleCell(clean, compactRuntimeHistoryRevisionWidth) == clean {
+		return clean
+	}
+	digest := sha256.Sum256([]byte(clean))
+	prefix := printers.BoundedCell(clean, compactRuntimeHistoryRevisionWidth-1-8)
+	return prefix + "#" + hex.EncodeToString(digest[:4])
+}
+
+func compactRuntimeHistoryTime(createdAt *time.Time) string {
+	if createdAt == nil || createdAt.IsZero() {
+		return "-"
+	}
+	return createdAt.UTC().Format("06-01-02T15:04Z")
+}
+
+func compactRuntimeHistoryRoles(roles []RuntimeRevisionRole) string {
+	hasActive := false
+	hasRequested := false
+	hasReported := false
+	hasHistory := false
+	hasUnknown := false
+	for _, role := range roles {
+		switch role {
+		case RuntimeRevisionRoleActive:
+			hasActive = true
+		case RuntimeRevisionRoleRequested:
+			hasRequested = true
+		case RuntimeRevisionRoleReported:
+			hasReported = true
+		case RuntimeRevisionRoleHistory:
+			hasHistory = true
+		default:
+			hasUnknown = true
+		}
+	}
+	var result strings.Builder
+	if hasActive {
+		result.WriteByte('A')
+	}
+	if hasRequested {
+		result.WriteByte('Q')
+	}
+	if hasReported {
+		result.WriteByte('R')
+	}
+	if hasHistory {
+		result.WriteByte('H')
+	}
+	if hasUnknown {
+		result.WriteByte('?')
+	}
+	return orDash(result.String())
+}
+
+func compactRuntimeHistoryConsistency(consistency RevisionConsistency) string {
+	switch consistency {
+	case RevisionConsistencyConsistent:
+		return "OK"
+	case RevisionConsistencyInconsistent:
+		return "BAD"
+	case RevisionConsistencyUnknown:
+		return "?"
+	case "":
+		return "-"
+	default:
+		return "OTHER"
+	}
+}
+
+func compactRuntimeHistoryRelation(relation RevisionRelation) string {
+	switch relation {
+	case RevisionRelationMatchesLive:
+		return "MATCH"
+	case RevisionRelationDiffersFromLive:
+		return "DIFF"
+	case RevisionRelationAmbiguous:
+		return "AMB"
+	case RevisionRelationUnknown:
+		return "?"
+	case "":
+		return "-"
+	default:
+		return "OTHER"
+	}
+}
+
+func compactRuntimeHistoryIssues(revisionIssues, reportIssues int) string {
+	return "R" + compactRuntimeHistoryIssueCount(revisionIssues) +
+		"/G" + compactRuntimeHistoryIssueCount(reportIssues)
+}
+
+func compactRuntimeHistoryIssueCount(count int) string {
+	if count > 9 {
+		return "9+"
+	}
+	return strconv.Itoa(count)
 }
 
 func (entry RuntimeRevisionEntry) canonical() RuntimeRevisionEntry {

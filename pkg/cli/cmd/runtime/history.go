@@ -39,6 +39,7 @@ type historyOptions struct {
 	output           string
 	name             string
 	format           report.Format
+	wide             bool
 }
 
 func newHistoryCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -71,7 +72,14 @@ InferenceService's resolved runtime.
 The command reads at most two pages and 1,000 revisions, and reports whether
 the observed window is complete or truncated. Raw runtime specs,
 ControllerRevision data, status messages, resource versions, and
-synchronization tokens are never printed.`,
+synchronization tokens are never printed.
+
+The compact table keeps each line within 80 columns. WINDOW is
+OBS/BOUND/SEEN/ASKED: C=complete, P=partial, U=unavailable, N=not requested;
+B=retention-bounded and I=incomplete. ROLES uses A=active, Q=requested,
+R=reported, and H=history. CHECK uses OK, BAD, or ?; LIVE uses MATCH, DIFF,
+AMB, or ?. ISSUES uses R/G for revision/global report counts. Use -o wide
+for full timestamps, hashes, sources, and exact issue codes.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.name = args[0]
@@ -81,21 +89,35 @@ synchronization tokens are never printed.`,
 			return o.run(cmd.Context(), f)
 		},
 	}
-	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, json or yaml")
+	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	o.namespaceOptions.AddOMEFlags(cmd.Flags())
 	return cmd
 }
 
 func (o *historyOptions) validate() error {
-	format, err := report.ParseFormat(o.output)
+	format, wide, err := parseHistoryOutput(o.output)
 	if err != nil {
 		return err
 	}
 	o.format = format
+	o.wide = wide
 	if problems := validation.IsDNS1123Subdomain(o.name); len(problems) > 0 {
 		return fmt.Errorf("InferenceService name %q is invalid: %s", o.name, strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func parseHistoryOutput(value string) (report.Format, bool, error) {
+	if value == "wide" {
+		return report.FormatTable, true, nil
+	}
+	format, err := report.ParseFormat(value)
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"unsupported output format %q (supported: table, wide, json, yaml)", value,
+		)
+	}
+	return format, false, nil
 }
 
 func (o *historyOptions) run(ctx context.Context, f factory.Factory) error {
@@ -111,6 +133,12 @@ func (o *historyOptions) run(ctx context.Context, f factory.Factory) error {
 	)
 	if err != nil {
 		return fmt.Errorf("project runtime history evidence: %w", err)
+	}
+	if o.wide {
+		if err := projected.Content.WideTable().Write(o.Out); err != nil {
+			return fmt.Errorf("write runtime history report: %w", err)
+		}
+		return nil
 	}
 	if err := report.Write(o.Out, o.format, projected); err != nil {
 		return fmt.Errorf("write runtime history report: %w", err)
