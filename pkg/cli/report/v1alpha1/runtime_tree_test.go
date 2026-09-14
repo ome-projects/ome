@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	"sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 )
@@ -106,9 +109,9 @@ func TestRuntimeTreeTablePreservesContextAndHeadPaths(t *testing.T) {
 		"Issue: ParentMissing subject=ServingRuntime/orphan parent=missing\n"+
 		"Issue path: ServingRuntime/orphan -> ClusterServingRuntime/root\n"+
 		"Snapshot: Partial\n"+
-		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=2\n"+
-		"Collection: ServingRuntime scope=AllNamespaces status=Truncated pages=1 items=2\n"+
-		"Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=3\n"+
+		"Collection: ClusterServingRuntime Cluster status=Complete pages=1 items=2\n"+
+		"Collection: ServingRuntime AllNamespaces status=Truncated pages=1 items=2\n"+
+		"Collection: InferenceService AllNamespaces status=Complete pages=1 items=3\n"+
 		"Warning: PartialData\n"+
 		"Warning: Truncated\n",
 		output.String())
@@ -136,9 +139,9 @@ func TestRuntimeTreeTableMakesEveryCollectionScopeExplicit(t *testing.T) {
 	table := content.Table()
 
 	require.Len(t, table.Rows, 5)
-	assert.Equal(t, []string{"Collection: ClusterServingRuntime scope=Cluster status= pages=0 items=0"}, table.Rows[2])
-	assert.Equal(t, []string{"Collection: ServingRuntime scope=AllNamespaces status= pages=0 items=0"}, table.Rows[3])
-	assert.Equal(t, []string{"Collection: InferenceService scope=Namespace/team-a status= pages=0 items=0"}, table.Rows[4])
+	assert.Equal(t, []string{"Collection: ClusterServingRuntime Cluster status= pages=0 items=0"}, table.Rows[2])
+	assert.Equal(t, []string{"Collection: ServingRuntime AllNamespaces status= pages=0 items=0"}, table.Rows[3])
+	assert.Equal(t, []string{"Collection: InferenceService Namespace/team-a status= pages=0 items=0"}, table.Rows[4])
 }
 
 func TestRuntimeTreeTableShowsCycleClosingEdge(t *testing.T) {
@@ -187,10 +190,60 @@ func TestRuntimeTreeTableShowsCycleClosingEdge(t *testing.T) {
 		"Issue: CycleDetected subject=ServingRuntime/a parent=a\n"+
 		"Issue path: ServingRuntime/a -> ServingRuntime/b -> ServingRuntime/a\n"+
 		"Snapshot: Complete\n"+
-		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=0\n"+
-		"Collection: ServingRuntime scope=Namespace/team-a status=Complete pages=1 items=2\n"+
-		"Collection: InferenceService scope=Namespace/team-a status=Complete pages=1 items=0\n",
+		"Collection: ClusterServingRuntime Cluster status=Complete pages=1 items=0\n"+
+		"Collection: ServingRuntime Namespace/team-a status=Complete pages=1 items=2\n"+
+		"Collection: InferenceService Namespace/team-a status=Complete pages=1 items=0\n",
 		output.String())
+}
+
+func TestRuntimeTreeDefaultOutputBoundsEveryLineByDisplayWidth(t *testing.T) {
+	reportValue := hostileLongRuntimeTreeReport()
+
+	first := renderTreeReport(t, reportValue, report.FormatTable)
+	second := renderTreeReport(t, reportValue, report.FormatTable)
+
+	assert.Equal(t, first, second, "default output must remain deterministic")
+	for number, line := range strings.Split(strings.TrimSuffix(first, "\n"), "\n") {
+		assert.Equalf(
+			t, line, printers.BoundedCell(line, 80),
+			"line %d exceeds 80 terminal columns: %q", number+1, line,
+		)
+	}
+	for _, marker := range []string{
+		"RUNTIME TREE", "Target: ", "Context: Namespaced/",
+		" (resolution: Complete)", "Head: ServingRuntime/", " [selected]",
+		"`-- ", "InferenceService/", "Snapshot: Complete",
+		"Collection: ClusterServingRuntime", "Collection: ServingRuntime",
+		"Collection: InferenceService", " status=Complete pages=1 items=1",
+	} {
+		assert.Contains(t, first, marker)
+	}
+	assert.NotContains(t, first, "\t")
+	assert.NotContains(t, first, "\r")
+	assert.NotContains(t, first, "\x1b")
+	assert.NotContains(t, first, "\u202e")
+	assert.NotContains(t, first, "\u2066")
+	assert.Contains(t, first, `\n`)
+	assert.Contains(t, first, `\u202e`)
+	assert.Contains(t, first, `\u2066`)
+}
+
+func TestRuntimeTreeMachineFormatsKeepCompleteIdentitiesWhenTableClips(t *testing.T) {
+	reportValue := hostileLongRuntimeTreeReport()
+	want := reportValue.Canonical()
+
+	for _, format := range []report.Format{report.FormatJSON, report.FormatYAML} {
+		t.Run(string(format), func(t *testing.T) {
+			output := renderTreeReport(t, reportValue, format)
+			var got v1alpha1.RuntimeEnvelope[v1alpha1.RuntimeTreeContent]
+			if format == report.FormatJSON {
+				require.NoError(t, json.Unmarshal([]byte(output), &got))
+			} else {
+				require.NoError(t, yaml.Unmarshal([]byte(output), &got))
+			}
+			assert.Equal(t, want, got)
+		})
+	}
 }
 
 func TestRuntimeTreeCanonicalIsDeterministicImmutableAndNonNil(t *testing.T) {
@@ -487,6 +540,44 @@ func TestRuntimeTreeSchemaIsStrictlyAllowlisted(t *testing.T) {
 
 func treeIdentity(kind v1alpha1.RuntimeKind, namespace, name string) v1alpha1.RuntimeTreeIdentity {
 	return v1alpha1.RuntimeTreeIdentity{Kind: kind, Namespace: namespace, Name: name}
+}
+
+func hostileLongRuntimeTreeReport() v1alpha1.RuntimeEnvelope[v1alpha1.RuntimeTreeContent] {
+	namespace := "ns\t" + strings.Repeat("namespace-", 14) + "\u2066end"
+	parentName := "parent-" + strings.Repeat("runtime-", 18) + "tail"
+	targetName := "bad\n" + strings.Repeat("runtime-", 18) + "\u202eend"
+	serviceName := "service\r" + strings.Repeat("inference-", 18) + "tail"
+	parent := treeIdentity(v1alpha1.RuntimeKindClusterServingRuntime, "", parentName)
+	target := treeIdentity(v1alpha1.RuntimeKindServingRuntime, namespace, targetName)
+	return v1alpha1.NewRuntimeTreeReport(
+		v1alpha1.Metadata{Namespace: namespace, Name: targetName},
+		v1alpha1.RuntimeTreeContent{
+			Target: target,
+			Snapshot: v1alpha1.RuntimeTreeSnapshot{
+				Completeness: v1alpha1.RuntimeTreeSnapshotComplete,
+				Collections: []v1alpha1.RuntimeTreeCollection{
+					{Kind: v1alpha1.RuntimeTreeCollectionClusterServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeCluster, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 1},
+					{Kind: v1alpha1.RuntimeTreeCollectionServingRuntime, Scope: v1alpha1.RuntimeTreeCollectionScopeNamespace, Namespace: namespace, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 1},
+					{Kind: v1alpha1.RuntimeTreeCollectionInferenceService, Scope: v1alpha1.RuntimeTreeCollectionScopeNamespace, Namespace: namespace, Status: v1alpha1.RuntimeTreeCollectionStatusComplete, ObservedPages: 1, ObservedItems: 1},
+				},
+			},
+			Contexts: []v1alpha1.RuntimeTreeContext{{
+				Context:                v1alpha1.RuntimeTreeResolutionContext{Mode: v1alpha1.RuntimeTreeResolutionModeNamespaced, Namespace: namespace},
+				ResolutionCompleteness: v1alpha1.RuntimeTreeSnapshotComplete,
+				Paths: []v1alpha1.RuntimeTreePath{{
+					Head: target,
+					Runtimes: []v1alpha1.RuntimeTreeRuntime{
+						{Identity: parent},
+						{Identity: target, ParentName: parentName, ResolvedParent: &parent},
+					},
+					Dependents: []v1alpha1.RuntimeTreeDependent{{
+						Kind: v1alpha1.RuntimeTreeDependentInferenceService, Namespace: namespace, Name: serviceName,
+					}},
+				}},
+			}},
+		},
+		treeClock(),
+	)
 }
 
 func treeIdentityPointer(kind v1alpha1.RuntimeKind, namespace, name string) *v1alpha1.RuntimeTreeIdentity {

@@ -6,10 +6,15 @@ import (
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 )
 
-const RuntimeTreeReportKind = "RuntimeTreeReport"
+const (
+	RuntimeTreeReportKind           = "RuntimeTreeReport"
+	runtimeTreeTableWidth           = 80
+	runtimeTreeCollectionScopeWidth = 19
+)
 
 // RuntimeTreeSnapshotCompleteness describes whether every requested list was
 // observed without a bounded-page cutoff or source failure.
@@ -283,7 +288,13 @@ func (c RuntimeTreeContent) tableWithWarnings(warnings []RuntimeWarning) report.
 	for _, warning := range warnings {
 		rows = append(rows, []string{"Warning: " + string(warning.Code)})
 	}
-	return report.Table{Headers: []string{"RUNTIME TREE"}, Rows: rows}
+	for i := range rows {
+		rows[i][0] = printers.BoundedMiddleCell(rows[i][0], runtimeTreeTableWidth)
+	}
+	return report.Table{
+		Headers: []string{printers.BoundedMiddleCell("RUNTIME TREE", runtimeTreeTableWidth)},
+		Rows:    rows,
+	}
 }
 
 func selectedSuffix(selected bool) string {
@@ -352,7 +363,10 @@ func formatRuntimeTreeIssuePath(
 
 func formatRuntimeTreeCollection(collection RuntimeTreeCollection) string {
 	return "Collection: " + string(collection.Kind) +
-		" scope=" + formatRuntimeTreeCollectionScope(collection) +
+		" " + printers.BoundedMiddleCell(
+		formatRuntimeTreeCollectionScope(collection),
+		runtimeTreeCollectionScopeWidth,
+	) +
 		" status=" + string(collection.Status) +
 		" pages=" + strconv.Itoa(collection.ObservedPages) +
 		" items=" + strconv.Itoa(collection.ObservedItems)
