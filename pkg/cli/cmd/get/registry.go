@@ -1201,4 +1201,5 @@ var registry = []*entry{
 	runtimesEntry, servingRuntimesEntry, clusterServingRuntimesEntry,
 	acceleratorClassesEntry, acceleratorQuotasEntry, benchmarkJobsEntry,
 	fineTunedWeightsEntry, inferenceReplicasEntry, workloadClustersEntry, rolloutPoliciesEntry,
+	autoscalerPoliciesEntry,
 }
