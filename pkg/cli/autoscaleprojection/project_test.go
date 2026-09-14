@@ -750,7 +750,7 @@ func TestProjectUnknownComponentAndHostileFieldsCannotLeak(t *testing.T) {
 
 	var compact bytes.Buffer
 	require.NoError(t, report.Write(&compact, report.FormatTable, got))
-	assert.Contains(t, compact.String(), "UnknownCom...")
+	assert.Contains(t, compact.String(), "UnknownComp")
 	assert.NotContains(t, compact.String(), "SECRET_")
 
 	var wide bytes.Buffer

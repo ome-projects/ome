@@ -60,7 +60,22 @@ func newStatusCmd(
 It does not query HPA, KEDA ScaledObject, Deployment, or InferenceReplica
 objects, so "Reported" describes controller-reported evidence, not freshness.
 The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
-as UTC MonDD HH:MMZ; use -o wide for complete identities and timestamps.`,
+as UTC MonDD HH:MMZ. ISSUES uses compact aliases:
+  UnknownComp=UnknownComponentStatus
+  NoAutoscaler=AutoscalerNotReported
+  NoTarget=ScaleTargetNotReported
+  BadClass=ClassInvalid
+  BadManager=ManagedByInvalid
+  OwnerMismatch=OwnershipMismatch
+  BadSpecSource=SpecSourceInvalid
+  UnexpectedEv=UnexpectedScalerEvidence
+  ReplicaAmbig=ReplicaEvidenceAmbiguous
+  BadReplica=ReplicaEvidenceInvalid
+  BadTarget=ScaleTargetInvalid
+  BadCondition=ConditionInvalid
+  CondConflict=ConditionConflict
+Unknown or future issue codes use X# followed by a stable 10-digit hex digest.
+Use -o wide for exact issue codes, complete identities, and timestamps.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.run(cmd.Context(), f, args[0])

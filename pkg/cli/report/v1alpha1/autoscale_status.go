@@ -2,6 +2,8 @@ package v1alpha1
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"slices"
 	"sort"
 	"strconv"
@@ -363,11 +365,26 @@ func (c AutoscaleStatusContent) Table() report.Table {
 		})
 	}
 	if len(canonical.Issues) > 0 {
-		row := []string{"ISSUES", compactAutoscaleIssueCell("", canonical.Issues)}
-		for _, componentType := range componentTypes {
-			row = append(row, compactAutoscaleIssueCell(componentType, canonical.Issues))
+		scopes := append([]RuntimeComponentType{""}, componentTypes...)
+		aliasesByScope := make([][]string, len(scopes))
+		issueRows := 0
+		for index, scope := range scopes {
+			aliasesByScope[index] = compactAutoscaleIssueAliases(scope, canonical.Issues)
+			issueRows = max(issueRows, len(aliasesByScope[index]))
 		}
-		table.Rows = append(table.Rows, row)
+		// Keep one alias per scope and row. Joining aliases into one bounded
+		// cell would hide every issue after the first truncation point.
+		for issueIndex := range issueRows {
+			row := []string{"ISSUES"}
+			for _, aliases := range aliasesByScope {
+				alias := "-"
+				if issueIndex < len(aliases) {
+					alias = aliases[issueIndex]
+				}
+				row = append(row, alias)
+			}
+			table.Rows = append(table.Rows, row)
+		}
 	}
 	return table
 }
@@ -468,20 +485,56 @@ func compactAutoscaleCell(values []string) string {
 	return printers.BoundedCell(strings.Join(clean, ";"), compactAutoscaleCellWidth)
 }
 
-func compactAutoscaleIssueCell(component RuntimeComponentType, issues []AutoscaleIssue) string {
+func compactAutoscaleIssueAliases(component RuntimeComponentType, issues []AutoscaleIssue) []string {
 	values := make([]string, 0, len(issues))
 	for _, issue := range issues {
 		if component == "" {
 			if issue.Component == "" || autoscaleComponentRank(issue.Component) >= 3 {
-				values = append(values, string(issue.Code))
+				values = append(values, compactAutoscaleIssueAlias(issue.Code))
 			}
 			continue
 		}
 		if issue.Component == component {
-			values = append(values, string(issue.Code))
+			values = append(values, compactAutoscaleIssueAlias(issue.Code))
 		}
 	}
-	return compactAutoscaleCell(values)
+	return values
+}
+
+func compactAutoscaleIssueAlias(code AutoscaleIssueCode) string {
+	switch code {
+	case AutoscaleIssueUnknownComponentStatus:
+		return "UnknownComp"
+	case AutoscaleIssueAutoscalerNotReported:
+		return "NoAutoscaler"
+	case AutoscaleIssueScaleTargetNotReported:
+		return "NoTarget"
+	case AutoscaleIssueClassInvalid:
+		return "BadClass"
+	case AutoscaleIssueManagedByInvalid:
+		return "BadManager"
+	case AutoscaleIssueOwnershipMismatch:
+		return "OwnerMismatch"
+	case AutoscaleIssueSpecSourceInvalid:
+		return "BadSpecSource"
+	case AutoscaleIssueUnexpectedScalerEvidence:
+		return "UnexpectedEv"
+	case AutoscaleIssueReplicaEvidenceAmbiguous:
+		return "ReplicaAmbig"
+	case AutoscaleIssueReplicaEvidenceInvalid:
+		return "BadReplica"
+	case AutoscaleIssueScaleTargetInvalid:
+		return "BadTarget"
+	case AutoscaleIssueConditionInvalid:
+		return "BadCondition"
+	case AutoscaleIssueConditionConflict:
+		return "CondConflict"
+	default:
+		// Future values are outside the closed issue vocabulary. Avoid
+		// echoing an untrusted value while retaining a stable 40-bit identity.
+		digest := sha256.Sum256([]byte(code))
+		return "X#" + hex.EncodeToString(digest[:5])
+	}
 }
 
 // WideTable returns the deterministic complete autoscaling view that preceded

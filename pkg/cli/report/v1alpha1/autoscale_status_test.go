@@ -296,9 +296,94 @@ func TestAutoscaleStatusTableSurfacesGlobalIssuesWithoutEchoingUnknownComponents
 	require.NotEmpty(t, table.Rows)
 	issues := table.Rows[len(table.Rows)-1]
 	assert.Equal(t, "ISSUES", issues[0])
-	assert.Equal(t, "UnknownCom...", issues[1])
-	assert.Equal(t, "ScaleTarge...", issues[2])
+	assert.Equal(t, "UnknownComp", issues[1])
+	assert.Equal(t, "NoTarget", issues[2])
 	assert.NotContains(t, strings.Join(issues, " "), "SECRET_COMPONENT")
+}
+
+func TestAutoscaleStatusCompactIssueAliasesAreDistinctAndBounded(t *testing.T) {
+	tests := []struct {
+		code v1alpha1.AutoscaleIssueCode
+		want string
+	}{
+		{code: v1alpha1.AutoscaleIssueUnknownComponentStatus, want: "UnknownComp"},
+		{code: v1alpha1.AutoscaleIssueAutoscalerNotReported, want: "NoAutoscaler"},
+		{code: v1alpha1.AutoscaleIssueScaleTargetNotReported, want: "NoTarget"},
+		{code: v1alpha1.AutoscaleIssueClassInvalid, want: "BadClass"},
+		{code: v1alpha1.AutoscaleIssueManagedByInvalid, want: "BadManager"},
+		{code: v1alpha1.AutoscaleIssueOwnershipMismatch, want: "OwnerMismatch"},
+		{code: v1alpha1.AutoscaleIssueSpecSourceInvalid, want: "BadSpecSource"},
+		{code: v1alpha1.AutoscaleIssueUnexpectedScalerEvidence, want: "UnexpectedEv"},
+		{code: v1alpha1.AutoscaleIssueReplicaEvidenceAmbiguous, want: "ReplicaAmbig"},
+		{code: v1alpha1.AutoscaleIssueReplicaEvidenceInvalid, want: "BadReplica"},
+		{code: v1alpha1.AutoscaleIssueScaleTargetInvalid, want: "BadTarget"},
+		{code: v1alpha1.AutoscaleIssueConditionInvalid, want: "BadCondition"},
+		{code: v1alpha1.AutoscaleIssueConditionConflict, want: "CondConflict"},
+	}
+
+	seen := make(map[string]v1alpha1.AutoscaleIssueCode, len(tests))
+	for _, test := range tests {
+		t.Run(string(test.code), func(t *testing.T) {
+			content := v1alpha1.AutoscaleStatusContent{
+				Summary: v1alpha1.AutoscaleSummary{State: v1alpha1.AutoscaleStateInvalid},
+				Issues:  []v1alpha1.AutoscaleIssue{{Code: test.code}},
+			}
+
+			table := content.Table()
+			require.Len(t, table.Rows, 2)
+			got := table.Rows[1][1]
+			assert.Equal(t, test.want, got)
+			assert.LessOrEqual(t, len(got), 13)
+			if previous, found := seen[got]; found {
+				t.Fatalf("compact alias %q collides for %q and %q", got, previous, test.code)
+			}
+			seen[got] = test.code
+		})
+	}
+}
+
+func TestAutoscaleStatusCompactUnknownIssueAliasesAreStableSafeAndDistinct(t *testing.T) {
+	codes := []v1alpha1.AutoscaleIssueCode{
+		"FutureIssueOne",
+		"FutureIssueTwo",
+		"future\n\u202eSECRET",
+	}
+	seen := make(map[string]v1alpha1.AutoscaleIssueCode, len(codes))
+	for _, code := range codes {
+		content := v1alpha1.AutoscaleStatusContent{
+			Summary: v1alpha1.AutoscaleSummary{State: v1alpha1.AutoscaleStateInvalid},
+			Issues:  []v1alpha1.AutoscaleIssue{{Code: code}},
+		}
+
+		first := content.Table().Rows[1][1]
+		second := content.Table().Rows[1][1]
+		assert.Equal(t, first, second)
+		assert.Regexp(t, `^X#[0-9a-f]{10}$`, first)
+		assert.NotContains(t, first, "Future")
+		assert.NotContains(t, first, "SECRET")
+		assert.LessOrEqual(t, len(first), 13)
+		if previous, found := seen[first]; found {
+			t.Fatalf("future issue alias %q collides for %q and %q", first, previous, code)
+		}
+		seen[first] = code
+	}
+}
+
+func TestAutoscaleStatusCompactTableKeepsEveryIssueAliasVisible(t *testing.T) {
+	content := v1alpha1.AutoscaleStatusContent{
+		Summary: v1alpha1.AutoscaleSummary{State: v1alpha1.AutoscaleStateInvalid},
+		Issues: []v1alpha1.AutoscaleIssue{
+			{Code: v1alpha1.AutoscaleIssueScaleTargetNotReported},
+			{Code: v1alpha1.AutoscaleIssueScaleTargetInvalid},
+			{Code: v1alpha1.AutoscaleIssueReplicaEvidenceInvalid, Component: v1alpha1.RuntimeComponentEngine},
+			{Code: v1alpha1.AutoscaleIssueReplicaEvidenceAmbiguous, Component: v1alpha1.RuntimeComponentEngine},
+		},
+	}
+
+	rows := content.Table().Rows
+	require.Len(t, rows, 3)
+	assert.Equal(t, []string{"ISSUES", "BadTarget", "ReplicaAmbig", "-", "-"}, rows[1])
+	assert.Equal(t, []string{"ISSUES", "NoTarget", "BadReplica", "-", "-"}, rows[2])
 }
 
 func TestAutoscaleStatusTableShowsUnavailableSummaryWithoutComponents(t *testing.T) {
