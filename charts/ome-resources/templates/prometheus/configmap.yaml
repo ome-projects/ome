@@ -124,6 +124,10 @@ data:
           # ome.io/-prefixed one -- so source the unprefixed label.
           - source_labels: [__meta_kubernetes_pod_label_component]
             target_label: component
+          # Revision identity, so a query can scope to the pods one rollout
+          # created instead of every pod of the component.
+          - source_labels: [__meta_kubernetes_pod_label_ome_io_revision_hash]
+            target_label: revision_hash
         {{- with .Values.prometheus.metricRelabelConfigs }}
         metric_relabel_configs:
           {{- toYaml . | nindent 10 }}
@@ -169,5 +173,8 @@ data:
         static_configs:
           - targets:
               - {{ printf "127.0.0.1:%v" .Values.prometheus.listenPort | quote }}
+      {{- end }}
+      {{- with .Values.prometheus.extraScrapeConfigs }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
 {{- end }}

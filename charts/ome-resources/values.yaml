@@ -763,6 +763,30 @@ prometheus:
   # job. Use this to keep only the series needed by autoscaling and canary
   # queries. Empty keeps every metric exposed by scraped pods.
   metricRelabelConfigs: []
+  # Additional raw scrape_configs entries appended to the generated ones. The
+  # InferenceService job discovers only pods labelled ome.io/inferenceservice,
+  # so a signal from anything else -- an ingress proxy, a shared exporter --
+  # needs its own job here. Each entry is a complete scrape_config.
+  #
+  # Scope every job by namespace: the InferenceService job's label selector is
+  # a server-side informer filter, and a job without an equivalent bound makes
+  # the informer cache every pod in the cluster.
+  #
+  # extraScrapeConfigs:
+  #   - job_name: ingress-proxies
+  #     kubernetes_sd_configs:
+  #       - role: pod
+  #         namespaces:
+  #           names: [some-gateway-namespace]
+  #     relabel_configs:
+  #       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+  #         regex: "true"
+  #         action: keep
+  #     metric_relabel_configs:
+  #       - source_labels: [__name__]
+  #         regex: "some_metric_family_total"
+  #         action: keep
+  extraScrapeConfigs: []
   # Optional per-scrape guardrails. Set an individual value to 0 or empty to
   # leave the corresponding Prometheus limit unset.
   scrapeLimits:

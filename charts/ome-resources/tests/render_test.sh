@@ -193,6 +193,23 @@ opt_in_scrape_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --show-only templates/prometheus/configmap.yaml)"
 grep -Fq 'regex: "true;.*|.*;true"' <<<"${opt_in_scrape_config}" ||
   fail "Prometheus scrape annotation opt-in was not rendered"
+
+grep -Fq 'target_label: revision_hash' <<<"${prometheus_config}" ||
+  fail "Prometheus revision_hash relabel was not rendered"
+
+if grep -Fq -- '- job_name: extra-probe' <<<"${prometheus_config}"; then
+  fail "extra scrape configs were rendered when unset"
+fi
+
+extra_scrape_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set 'prometheus.extraScrapeConfigs[0].job_name=extra-probe' \
+  --set 'prometheus.extraScrapeConfigs[0].static_configs[0].targets[0]=127.0.0.1:1234' \
+  --show-only templates/prometheus/configmap.yaml)"
+grep -Fq -- '- job_name: extra-probe' <<<"${extra_scrape_config}" ||
+  fail "extra scrape config job was not rendered"
+grep -Fq 'job_name: ome-inferenceservice-pods' <<<"${extra_scrape_config}" ||
+  fail "generated scrape jobs were lost when extraScrapeConfigs was set"
 grep -Fq '__meta_kubernetes_pod_annotation_ome_io_enable_prometheus_scraping' <<<"${opt_in_scrape_config}" ||
   fail "OME Prometheus scrape opt-in annotation was not rendered"
 

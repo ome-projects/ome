@@ -70,6 +70,7 @@ OME Resources and Controller
 | prometheus.externalLabels | object | `{"cluster":"ome"}` | Labels identifying this Prometheus to remote-write, federation, and alerting consumers. |
 | prometheus.goMemLimit | string | `""` | Optional Go soft memory limit, for example `9GiB`; leave headroom below the container limit for mmap and other non-heap memory. |
 | prometheus.listenPort | int | `9090` | Internal Prometheus HTTP listen port. |
+| prometheus.extraScrapeConfigs | list | `[]` | Additional raw `scrape_configs` entries appended to the generated ones, for signals outside the InferenceService pod set. Scope each job by namespace. |
 | prometheus.metricRelabelConfigs | list | `[]` | Prometheus `metric_relabel_configs` for the InferenceService scrape job. |
 | prometheus.persistence.accessModes | list | `["ReadWriteOnce"]` | Access modes for a chart-managed Prometheus PVC. |
 | prometheus.persistence.annotations | object | `{}` | Annotations for a chart-managed Prometheus PVC. |
