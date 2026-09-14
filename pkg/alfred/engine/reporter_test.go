@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -197,7 +198,7 @@ func TestCrossPolicyDecisionsKeyedSeparately(t *testing.T) {
 	}
 }
 
-func TestReportCycleExecuteModeAdmits(t *testing.T) {
+func TestReportCycleAdmissionWithoutDispatchIsWithheld(t *testing.T) {
 	r, _, recorder, cl := newTestReporter(t, recommendationsCM(nil))
 	cfg := config.Default()
 	cfg.Mode = config.ModeExecute
@@ -206,15 +207,89 @@ func TestReportCycleExecuteModeAdmits(t *testing.T) {
 	r.ReportCycle(context.Background(), []policy.Candidate{c},
 		[]Decision{{Candidate: c, Admitted: true, Target: "node2"}}, cfg, testNow)
 
-	if events := drainEvents(recorder); !hasEvent(events, "RecommendationAdmitted") {
-		t.Fatalf("execute-mode admission must not read as withheld: %v", events)
+	if events := drainEvents(recorder); !hasEvent(events, "RecommendationWithheld") || hasEvent(events, "will dispatch") {
+		t.Fatalf("admission alone must not claim a dispatch: %v", events)
 	}
 	var cm corev1.ConfigMap
 	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cm.Data[recommendationsKey], `"outcome":"`+OutcomeAdmitted+`"`) {
+	if !strings.Contains(cm.Data[recommendationsKey], `"outcome":"`+OutcomeWithheld+`"`) {
 		t.Fatalf("record outcome: %s", cm.Data[recommendationsKey])
+	}
+}
+
+func TestReportCyclePreservesDispatchOutcomesForAdvisoryCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		status, outcome, event string
+	}{
+		{"submitted", "submitted", "MigrationSubmitted"},
+		{"acknowledged", "acknowledged", "MigrationAcknowledged"},
+		{"completed", "completed", "MigrationCompleted"},
+		{"failed", "failed", "MigrationFailed"},
+		{"stalled", "stalled", "MigrationStalled"},
+		{"withheld", "withheld", "RecommendationWithheld"},
+		{"prepared", "withheld", "RecommendationWithheld"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			r, _, recorder, cl := newTestReporter(t, recommendationsCM(nil))
+			c := cand("prod/a", "node1")
+			c.Executable = false
+			c.AdvisoryReason = "WorkloadBusy"
+			d := Decision{Candidate: c, DispatchStatus: tc.status, RequestUUID: "request-uuid", DispatchReason: "CurrentRequestState"}
+			// Disabling new execution must not hide a previously submitted request.
+			r.ReportCycle(context.Background(), []policy.Candidate{c}, []Decision{d}, config.Default(), testNow)
+			var cm corev1.ConfigMap
+			if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
+				t.Fatal(err)
+			}
+			var record struct {
+				Recommendations []struct {
+					Outcome, DispatchStatus, RequestUUID, DispatchReason string
+				}
+			}
+			if err := json.Unmarshal([]byte(cm.Data[recommendationsKey]), &record); err != nil {
+				t.Fatal(err)
+			}
+			if len(record.Recommendations) != 1 {
+				t.Fatalf("dispatch observation missing: %s", cm.Data[recommendationsKey])
+			}
+			got := record.Recommendations[0]
+			if got.Outcome != tc.outcome || got.DispatchStatus != tc.outcome || got.RequestUUID != "request-uuid" || got.DispatchReason != "CurrentRequestState" {
+				t.Fatalf("dispatch observation misreported: %+v", got)
+			}
+			events := drainEvents(recorder)
+			if !hasEvent(events, tc.event) || !hasEvent(events, "request-uuid") || hasEvent(events, "will dispatch") || hasEvent(events, "FragmentationRecommendationProduced") {
+				t.Fatalf("dispatch event misreported: %v", events)
+			}
+		})
+	}
+}
+
+func TestReportCycleKeepsOldRequestSeparateFromChangedSource(t *testing.T) {
+	r, _, _, cl := newTestReporter(t, recommendationsCM(nil))
+	old := cand("prod/a", "node1")
+	old.Executable = false
+	current := cand("prod/a", "node3")
+	decisions := []Decision{
+		{Candidate: old, DispatchStatus: "failed", RequestUUID: "old-request"},
+		{Candidate: current, Reason: RejectCooldown},
+	}
+	r.ReportCycle(context.Background(), []policy.Candidate{old, current}, decisions, config.Default(), testNow)
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	var cycle cycleRecord
+	if err := json.Unmarshal([]byte(cm.Data[recommendationsKey]), &cycle); err != nil {
+		t.Fatal(err)
+	}
+	if len(cycle.Recommendations) != 2 {
+		t.Fatalf("old request or new source observation missing: %+v", cycle)
+	}
+	oldView, currentView := cycle.Recommendations[0], cycle.Recommendations[1]
+	if oldView.FromNode != "node1" || oldView.Outcome != "failed" || oldView.RequestUUID != "old-request" || currentView.FromNode != "node3" || currentView.Outcome != "rejected" || currentView.RequestUUID != "" {
+		t.Fatalf("request observations were paired with the wrong source: %+v", cycle.Recommendations)
 	}
 }
 

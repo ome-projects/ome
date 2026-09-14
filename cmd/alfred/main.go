@@ -1,12 +1,12 @@
 // Alfred is the OME GPU cluster caretaker (OEP-0008): a leader-elected
-// controller that observes the physical GPU layer, recommends corrective
-// migrations. Future execution will use migration-request annotations handled
-// by the workload-owning controllers; no dispatcher is wired yet.
+// controller that observes the physical GPU layer and recommends corrective
+// migrations. Explicit operator compatibility configuration enables guarded
+// migration-request annotations handled by the workload-owning controllers.
 //
 // This binary wires two loops onto a controller-runtime manager:
 //   - the observation loop (every replica): snapshot + gauges, read-only;
-//   - the decision loop (leader only): policies → optional prediction → arbiter → reporter →
-//     dispatcher (added by later change sets).
+//   - the decision loop (leader only): policies → optional prediction or guarded
+//     dispatch and arbitration → reporter.
 package main
 
 import (
@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -31,11 +32,13 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/engine"
+	"sigs.k8s.io/ome/pkg/alfred/guard"
 	"sigs.k8s.io/ome/pkg/alfred/metrics"
 	"sigs.k8s.io/ome/pkg/alfred/observer"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling/process"
+	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -61,15 +64,19 @@ func init() {
 
 // Options holds the command-line configuration.
 type Options struct {
-	metricsAddr          string
-	probeAddr            string
-	enableLeaderElection bool
-	namespace            string
-	configMapName        string
-	configMapKey         string
-	simulationWorkers    string
-	simulationTimeout    time.Duration
-	zapOpts              zap.Options
+	metricsAddr             string
+	probeAddr               string
+	enableLeaderElection    bool
+	namespace               string
+	configMapName           string
+	configMapKey            string
+	simulationWorkers       string
+	simulationTimeout       time.Duration
+	migrationAPIVersion     string
+	migrationServiceAccount string
+	migrationAckTimeout     time.Duration
+	migrationFailureBackoff time.Duration
+	zapOpts                 zap.Options
 }
 
 // DefaultOptions returns the flag defaults. The namespace defaults from the
@@ -77,13 +84,15 @@ type Options struct {
 // flag.
 func DefaultOptions() Options {
 	return Options{
-		metricsAddr:          ":8080",
-		probeAddr:            ":8081",
-		enableLeaderElection: true,
-		namespace:            constants.OMENamespace,
-		configMapName:        "alfred-config",
-		configMapKey:         "config.yaml",
-		simulationTimeout:    10 * time.Second,
+		metricsAddr:             ":8080",
+		probeAddr:               ":8081",
+		enableLeaderElection:    true,
+		namespace:               constants.OMENamespace,
+		configMapName:           "alfred-config",
+		configMapKey:            "config.yaml",
+		simulationTimeout:       10 * time.Second,
+		migrationAckTimeout:     2 * time.Minute,
+		migrationFailureBackoff: 5 * time.Minute,
 	}
 }
 
@@ -100,6 +109,10 @@ func GetOptions() Options {
 	flag.StringVar(&opts.configMapKey, "config-key", opts.configMapKey, "Key inside the ConfigMap holding config.yaml.")
 	flag.StringVar(&opts.simulationWorkers, "simulation-workers", "", "Absolute path to the trusted startup worker registry JSON; empty disables prediction.")
 	flag.DurationVar(&opts.simulationTimeout, "simulation-timeout", opts.simulationTimeout, "Whole-process timeout per scheduler prediction (positive, at most 1m).")
+	flag.StringVar(&opts.migrationAPIVersion, "migration-api-version", "", "Operator-confirmed migration API compatibility (v1); empty disables migration dispatch.")
+	flag.StringVar(&opts.migrationServiceAccount, "migration-service-account", "", "Alfred service account name enforced by the migration admission guard; required with migration-api-version.")
+	flag.DurationVar(&opts.migrationAckTimeout, "migration-ack-timeout", opts.migrationAckTimeout, "Timeout before marking an unacknowledged request stalled (positive, at most 1h).")
+	flag.DurationVar(&opts.migrationFailureBackoff, "migration-failure-backoff", opts.migrationFailureBackoff, "Backoff after migration failure (positive, at most 1h).")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -108,6 +121,10 @@ func GetOptions() Options {
 func main() {
 	opts := GetOptions()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts.zapOpts)))
+	if err := validateOptions(opts); err != nil {
+		setupLog.Error(err, "invalid startup configuration")
+		os.Exit(1)
+	}
 	ctx := ctrl.SetupSignalHandler()
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), manager.Options{
@@ -182,9 +199,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Decision side: leader-only loop over policies → arbiter → reporter.
-	// The dispatcher joins in the execute path; until then admitted
-	// candidates are withheld and reported as such.
+	// The leader decides and, when explicitly configured, submits guarded
+	// migration requests through the existing OME migration API.
 	earlyTicker := &engine.EarlyTicker{
 		Cache: mgr.GetCache(),
 		Store: store,
@@ -219,6 +235,10 @@ func main() {
 		Log:       ctrl.Log.WithName("alfred-decision"),
 		EarlyTick: earlyTicker.C,
 	}
+	if err := configureMigration(opts, mgr.GetAPIReader(), mgr.GetClient(), observationLoop, decisionLoop); err != nil {
+		setupLog.Error(err, "unable to configure migration dispatch")
+		os.Exit(1)
+	}
 	if err := mgr.Add(decisionLoop); err != nil {
 		setupLog.Error(err, "unable to add decision loop")
 		os.Exit(1)
@@ -251,6 +271,55 @@ func main() {
 		setupLog.Error(err, "problem running alfred")
 		os.Exit(1)
 	}
+}
+
+func validateOptions(opts Options) error {
+	if opts.migrationAPIVersion != "" && opts.migrationAPIVersion != "v1" {
+		return fmt.Errorf("migration-api-version must be empty or v1")
+	}
+	if opts.migrationAckTimeout <= 0 || opts.migrationAckTimeout > time.Hour {
+		return fmt.Errorf("migration-ack-timeout must be positive and at most 1h")
+	}
+	if opts.migrationFailureBackoff <= 0 || opts.migrationFailureBackoff > time.Hour {
+		return fmt.Errorf("migration-failure-backoff must be positive and at most 1h")
+	}
+	if opts.migrationAPIVersion == "" {
+		return nil
+	}
+	if opts.migrationServiceAccount == "" || len(validation.IsDNS1123Subdomain(opts.migrationServiceAccount)) != 0 {
+		return fmt.Errorf("migration-service-account must be a nonempty DNS1123 name")
+	}
+	if !opts.enableLeaderElection {
+		return fmt.Errorf("migration dispatch requires leader election")
+	}
+	if opts.simulationWorkers == "" {
+		return fmt.Errorf("migration dispatch requires simulation-workers")
+	}
+	return nil
+}
+
+func configureMigration(opts Options, reader client.Reader, cl client.Client, observations *observer.Loop, decisions *engine.DecisionLoop) error {
+	if err := validateOptions(opts); err != nil {
+		return err
+	}
+	if opts.migrationAPIVersion == "" {
+		return nil
+	}
+	if decisions.Predictions == nil || decisions.Predictions.Simulator == nil {
+		return fmt.Errorf("migration dispatch requires a successfully loaded simulation worker")
+	}
+	admissionGuard := &guard.Guard{Reader: reader, Namespace: opts.namespace, ServiceAccount: opts.migrationServiceAccount}
+	decisions.Dispatcher = &engine.Dispatcher{
+		Reader: reader, Client: cl, Simulator: decisions.Predictions.Simulator,
+		Guard: admissionGuard.Check, Namespace: opts.namespace,
+		Options: engine.DispatchOptions{APIVersion: opts.migrationAPIVersion,
+			AcknowledgementTimeout: opts.migrationAckTimeout, FailureBackoff: opts.migrationFailureBackoff},
+		Policies: decisions.Policies, Store: decisions.Store,
+	}
+	observations.OMENativeExecutor = func(context.Context) snapshot.OMENativeExecutorState {
+		return snapshot.OMENativeExecutorState{Available: true, WireVersion: "v1", Reason: "OperatorConfigured"}
+	}
+	return nil
 }
 
 func predictionStage(ctx context.Context, reader client.Reader, opts Options) (*engine.PredictionStage, error) {

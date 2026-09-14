@@ -6,11 +6,139 @@ against private clients populated only from the JSON request. It does not read a
 kubeconfig, use in-cluster credentials, contact an API server, or change a live
 cluster.
 
-Alfred can opt into this worker for **recommendations only**. Its leader-only
+Alfred can opt into this worker for recommendations. Its leader-only
 decision loop captures full public cluster objects through the uncached API
 reader, builds predictive relocation requests, and invokes an exact-profile
 worker from its startup registry. Supplying a worker or profile never enables
-migration execution, even with `mode: execute`; the Dispatcher is not wired.
+migration execution by itself. The separately guarded execution path below
+requires explicit startup opt-in as well as `mode: execute`.
+
+## Enable guarded OMENative migration
+
+First configure and verify the exact worker profiles as below. Then set Helm
+`migration.apiVersion: v1` and policy `alfredConfig.mode: execute` with
+`alfredConfig.omenativeMigrationEnabled: true`. Recommendation-only remains the
+default. Leader election is mandatory. The chart installs a fail-closed
+`ValidatingAdmissionPolicy`/Deny binding for the Alfred service account and
+precreates `alfred-dispatch-state`. Kubernetes 1.30+ is required; unchecked,
+missing or drifted admission configuration withholds execution.
+
+`migration.apiVersion` is the operator's assertion that the existing OME v1
+migration API is enabled and compatible. It is **not controller liveness
+discovery**; Alfred does not depend on an OME capability Lease or add controller
+code. RawDeployment, LWS and non-OME workloads are not actuated by this path.
+Native Kubernetes eviction is a separate future adapter, not a gang fallback.
+
+Only original executable policy candidates enter execution. Alfred replays
+policy and safety checks against fresh API reads, simulates the complete
+instance, rechecks source UIDs/incarnation/revisions/member Pods and scheduling
+objects, and submits one UID/resourceVersion-conditioned migration annotation.
+Execution also requires source node affinity to match the public runner-template
+baseline. A source retaining an earlier migration's overlay, or another
+unexplained affinity change, is withheld instead of simulating accumulated hints
+that the next migration would not reproduce.
+For migration simulation, `migrationFromNode` explicitly identifies the single
+excluded source node; all other source Pods remain occupied. The replacement
+Pods carry the API's required hostname exclusion and weight-50 soft target
+hints. Recommendations without that field retain their all-source exclusion
+contract. Update Alfred and its bundled worker together; older workers reject
+this new optional request field.
+
+Execution is serial: **one unresolved Alfred request at a time**, even with
+larger configured limits. Other active migrations also block new requests.
+The journal persists the UUID, exact payload and source fingerprint before a
+write attempt. Uncertain retries reuse that intent; only the matching current
+InferenceReplica UUID status acknowledges it. Annotation disappearance is not
+completion. Default acknowledgement timeout is two minutes
+(`migration.acknowledgementTimeout`), and failure backoff is five minutes
+(`migration.failureBackoff`); both must be positive and at most one hour.
+A timeout becomes `stalled`, remains unresolved and blocks new requests. Late
+terminal status can resolve it. No automatic cancellation, annotation deletion
+or replacement UUID is performed. Preserve the journal across upgrades and
+leader changes; do not clear it merely because a request timed out. If status
+was lost or an owner was recreated, an operator must reconcile the request
+with the owning controller before repairing that state.
+The Helm journal is retained when execution is disabled or the release is
+uninstalled. Re-enabling execution must adopt its existing state, not initialize
+an empty journal. Retained ConfigMaps may need deliberate ownership/adoption
+handling when moving to a different release. Terminal history is retained for
+at least an hour and for longer configured cooldown windows; size/entry limits
+withhold new work rather than dropping unresolved or still-needed history.
+
+The journal and recommendation records distinguish `withheld`, `submitted`,
+`acknowledged`, `completed`, `failed`, and `stalled`, with UUIDs and bounded
+reasons. Admission alone is never reported as a submitted migration.
+
+Predicted placements and hints are **not reservations**. The scheduler may
+choose other nodes. API v1 also lacks an expected-incarnation/UID field: Alfred
+checks identity before submission, but cannot fence a queued request against
+changes before the consumer accepts it. These are explicit limits of the
+existing API, not guarantees supplied by simulation.
+
+For Kustomize, add the same worker mount and startup flags:
+`--migration-api-version=v1`, `--migration-service-account=ome-alfred`,
+`--migration-ack-timeout=2m`, `--migration-failure-backoff=5m`.
+The base leaves these execution flags absent. If changing namespace or service
+account, update the admission policy's exact username and RBAC subjects along
+with the explicitly namespaced resources. One configured Alfred identity is
+supported per cluster. Alfred cannot install or modify its own admission guard.
+
+### Kustomize journal lifecycle
+
+`config/alfred/dispatch-state.yaml` is a **bootstrap-only initializer**, excluded
+from the recurring Kustomize base. The runtime never creates this ConfigMap;
+a missing or malformed journal withholds execution. Recommendation-only
+installation does not require creating an empty migration journal.
+
+Before the first migration-enabled installation, confirm the target cluster and
+namespace and check for retained state:
+
+```sh
+kubectl -n ome get configmap alfred-dispatch-state -o yaml
+```
+
+Only a confirmed `NotFound`, together with confirmation that there is no earlier
+Alfred dispatch history to recover, permits this one-time bootstrap:
+
+```sh
+kubectl create -f config/alfred/dispatch-state.yaml
+```
+
+Never use `apply`, `replace`, `--force`, or delete/recreate with this initializer.
+`AlreadyExists` means **stop and inspect the existing journal**; it is not an
+error to suppress or a reason to overwrite it. An API/read failure is not proof
+that no journal exists. A custom namespace needs the same explicitly reviewed
+namespace change in this bootstrap file as in the deployment, RBAC and guard.
+
+For normal install, upgrade and reinstall, use `kubectl apply -k config/alfred`
+or `make install-alfred`. The latter's force-conflict server-side apply cannot
+reset the journal because the journal is not in the base resource set. Uninstall
+with `kubectl delete -k config/alfred` or `make uninstall-alfred`; both leave the
+journal intact. Preserve the namespace too: deleting it or using a broad
+ConfigMap cleanup still deletes durable history. Do not apply/delete the
+initializer through recursive directory operations or a GitOps resource list.
+
+When adopting an installation that previously managed the journal through
+Kustomize or another release, first stop Alfred so both dispatch and journal
+reconciliation are paused, then inventory/back up the live object's UID and
+exact data, including unrelated keys. Remove the
+journal from recurring apply **and deletion/pruning ownership** before enabling
+the new resource set; GitOps removal must not prune it. Reuse the existing
+ConfigMap without changing its UID or state bytes. Changing Helm release
+ownership requires an intentional metadata-only adoption consistent with the
+retained release; never bootstrap over the existing data. Re-enable execution
+only after its namespace/identity, guard and worker configuration are verified.
+
+Recovery is an explicit operator action, not an installation step. If state is
+missing, malformed, or stalled, keep execution disabled and stop Alfred before
+modifying the ConfigMap. Preserve all available
+journal/backup bytes, and reconcile every retained UUID with request annotations,
+authoritative InferenceReplica status and the owning controller. Annotation
+disappearance, timeout or absent status alone does not prove cancellation.
+Restore or repair reviewed history only after establishing the outcomes of
+possibly applied requests and the still-needed budgets/cooldowns; do not clear
+unknown entries to unblock execution. Reinstalling Alfred is not journal
+recovery, and an empty initializer is not a substitute for lost history.
 
 ## Enable recommendation simulation
 

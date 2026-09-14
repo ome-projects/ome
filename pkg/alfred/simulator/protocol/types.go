@@ -39,6 +39,9 @@ type Request struct {
 	SnapshotTime    metav1.Time            `json:"snapshotTime"`
 	RequireGang     bool                   `json:"requireGang,omitempty"`
 	ExcludedNodes   []string               `json:"excludedNodes"`
+	// MigrationFromNode selects the public migration API's single-node exclusion.
+	// Empty retains the recommendation contract excluding every source node.
+	MigrationFromNode string `json:"migrationFromNode,omitempty"`
 }
 
 type Decision string

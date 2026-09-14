@@ -82,6 +82,50 @@ func TestEvaluateSourceOccupancy(t *testing.T) {
 	}
 }
 
+// Migration excludes only from_node. Another source node remains a possible
+// destination, but its original Pod must still consume scheduler capacity.
+func TestMigrationKeepsOtherSourceSchedulableAndOccupied(t *testing.T) {
+	p := testProfile(t, defaultConfig)
+	for _, tc := range []struct {
+		name, gpus string
+		feasible   bool
+	}{{"room beside occupied source", "3", true}, {"occupied source consumes capacity", "2", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := testRequest(t, p)
+			r.MigrationFromNode = "source"
+			replaceObject(t, &r, 1, testNode("destination", tc.gpus))
+			second := testPod("second-source", "destination")
+			r.SourcePods = append(r.SourcePods, second)
+			addObject(t, &r, second)
+			r.ReplacementPods = append(r.ReplacementPods, testPod("replacement-two", ""))
+			for i := range r.ReplacementPods {
+				r.ReplacementPods[i].Spec.Affinity = &v1.Affinity{NodeAffinity: &v1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{NodeSelectorTerms: []v1.NodeSelectorTerm{{MatchExpressions: []v1.NodeSelectorRequirement{{Key: v1.LabelHostname, Operator: v1.NodeSelectorOpNotIn, Values: []string{"source"}}}}}}}}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			got, err := p.Evaluate(ctx, r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got.Decision == protocol.DecisionFeasible) != tc.feasible {
+				t.Fatalf("got %+v, feasible want %v", got, tc.feasible)
+			}
+			if tc.feasible {
+				if len(got.Placements) != 2 {
+					t.Fatalf("partial placement: %+v", got)
+				}
+				for _, placement := range got.Placements {
+					if placement.NodeName != "destination" {
+						t.Fatalf("unexpected placement: %+v", placement)
+					}
+				}
+			} else if len(got.Placements) != 0 {
+				t.Fatalf("partial placement escaped: %+v", got)
+			}
+		})
+	}
+}
+
 func TestEvaluateOMEGang(t *testing.T) {
 	p := testProfile(t, omeConfig)
 	r := gangRequest(t, p)

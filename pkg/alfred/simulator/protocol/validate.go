@@ -262,6 +262,31 @@ func addSelectorDependency(snapshot *Snapshot, kind, namespace, name string) err
 }
 
 func validateSnapshotReferences(request Request, snapshot *Snapshot) error {
+	if from := request.MigrationFromNode; from != "" {
+		if len(validation.IsDNS1123Subdomain(from)) != 0 {
+			return fmt.Errorf("migrationFromNode must be a DNS1123 node name")
+		}
+		if len(request.ExcludedNodes) != 1 || request.ExcludedNodes[0] != from {
+			return fmt.Errorf("migration request must exclude exactly migrationFromNode")
+		}
+		if node := snapshot.Nodes[from]; node == nil || node.DeletionTimestamp != nil {
+			return fmt.Errorf("migrationFromNode must be a known live snapshot node")
+		}
+		hostsSource := false
+		for i := range request.SourcePods {
+			if request.SourcePods[i].Spec.NodeName == from {
+				hostsSource = true
+			}
+		}
+		if !hostsSource {
+			return fmt.Errorf("migrationFromNode does not host a source Pod")
+		}
+		for i := range request.ReplacementPods {
+			if !hasMigrationExclusion(&request.ReplacementPods[i], from) {
+				return fmt.Errorf("replacementPods[%d] lacks required migration hostname exclusion in every affinity term", i)
+			}
+		}
+	}
 	excluded := make(map[string]struct{}, len(request.ExcludedNodes))
 	for i, nodeName := range request.ExcludedNodes {
 		if err := validIdentifier("excluded node", nodeName); err != nil {
@@ -381,7 +406,7 @@ func validateSnapshotReferences(request Request, snapshot *Snapshot) error {
 		if pod.Spec.NodeName == "" {
 			return fmt.Errorf("source Pod %s is not bound", key.String())
 		}
-		if _, exists := excluded[pod.Spec.NodeName]; !exists {
+		if _, exists := excluded[pod.Spec.NodeName]; !exists && request.MigrationFromNode == "" {
 			return fmt.Errorf("source Node %q for Pod %s is not explicitly excluded", pod.Spec.NodeName, key.String())
 		}
 		if err := validateSupportedPod(pod); err != nil {
@@ -396,6 +421,32 @@ func validateSnapshotReferences(request Request, snapshot *Snapshot) error {
 		}
 	}
 	return nil
+}
+
+func hasMigrationExclusion(pod *corev1.Pod, from string) bool {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return false
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) == 0 {
+		return false
+	}
+	for _, term := range required.NodeSelectorTerms {
+		found := false
+		for _, requirement := range term.MatchExpressions {
+			if requirement.Key == corev1.LabelHostname && requirement.Operator == corev1.NodeSelectorOpNotIn {
+				for _, value := range requirement.Values {
+					if value == from {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func podKey(pod *corev1.Pod) (types.NamespacedName, error) {

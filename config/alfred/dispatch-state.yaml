@@ -1,0 +1,12 @@
+# BOOTSTRAP ONLY: after confirming this cluster has no existing dispatch history,
+# run `kubectl create -f config/alfred/dispatch-state.yaml` exactly once.
+# Never apply, replace, or include this file in recurring Kustomize/GitOps sync
+# or uninstall resources: state.json becomes runtime-owned durable intent.
+# AlreadyExists means STOP and inspect/adopt the existing journal; never reset it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alfred-dispatch-state
+  namespace: ome
+data:
+  state.json: '{"version":"v1","entries":[]}'

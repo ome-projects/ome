@@ -1,0 +1,25 @@
+{{- if and .Values.enabled .Values.migration.apiVersion }}
+{{- $existing := lookup "v1" "ConfigMap" .Release.Namespace "alfred-dispatch-state" }}
+{{- if and $existing (not (hasKey ($existing.data | default dict) "state.json")) }}
+{{- fail "existing alfred-dispatch-state is missing state.json; restore its journal before enabling migration" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alfred-dispatch-state
+  namespace: {{ .Release.Namespace }}
+  # Unresolved intent must survive disabling migration or uninstalling Alfred.
+  # The retained ConfigMap becomes operator-managed when Helm drops ownership.
+  annotations:
+    "helm.sh/resource-policy": keep
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+data:
+  {{- if $existing }}
+  # Preserve even malformed state: the runtime decoder will withhold execution.
+  # Never reset uncertain intents while upgrading or adopting a retained map.
+  {{- toYaml $existing.data | nindent 2 }}
+  {{- else }}
+  state.json: '{"version":"v1","entries":[]}'
+  {{- end }}
+{{- end }}

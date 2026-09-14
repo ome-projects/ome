@@ -1,0 +1,80 @@
+{{- if and .Values.enabled .Values.migration.apiVersion }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ome-alfred-migration-writes
+spec:
+  failurePolicy: Fail
+  matchConditions:
+  - expression: request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:ome-alfred"
+    name: alfred-identity
+  matchConstraints:
+    matchPolicy: Exact
+    namespaceSelector: {}
+    objectSelector: {}
+    resourceRules:
+    - apiGroups:
+      - ome.io
+      apiVersions:
+      - v1beta1
+      operations:
+      - UPDATE
+      resources:
+      - inferenceservices
+      - inferenceservices/status
+      scope: Namespaced
+  validations:
+  - expression: has(object.apiVersion) == has(oldObject.apiVersion) && (!has(oldObject.apiVersion)
+      || object.apiVersion == oldObject.apiVersion) && has(object.kind) == has(oldObject.kind)
+      && (!has(oldObject.kind) || object.kind == oldObject.kind) && has(object.spec)
+      == has(oldObject.spec) && (!has(oldObject.spec) || object.spec == oldObject.spec)
+      && has(object.status) == has(oldObject.status) && (!has(oldObject.status) ||
+      object.status == oldObject.status) && has(object.metadata.name) == has(oldObject.metadata.name)
+      && (!has(oldObject.metadata.name) || object.metadata.name == oldObject.metadata.name)
+      && has(object.metadata.generateName) == has(oldObject.metadata.generateName)
+      && (!has(oldObject.metadata.generateName) || object.metadata.generateName ==
+      oldObject.metadata.generateName) && has(object.metadata.namespace) == has(oldObject.metadata.namespace)
+      && (!has(oldObject.metadata.namespace) || object.metadata.namespace == oldObject.metadata.namespace)
+      && has(object.metadata.uid) == has(oldObject.metadata.uid) && (!has(oldObject.metadata.uid)
+      || object.metadata.uid == oldObject.metadata.uid) && has(object.metadata.selfLink)
+      == has(oldObject.metadata.selfLink) && (!has(oldObject.metadata.selfLink) ||
+      object.metadata.selfLink == oldObject.metadata.selfLink) && has(object.metadata.creationTimestamp)
+      == has(oldObject.metadata.creationTimestamp) && (!has(oldObject.metadata.creationTimestamp)
+      || object.metadata.creationTimestamp == oldObject.metadata.creationTimestamp)
+      && has(object.metadata.generation) == has(oldObject.metadata.generation) &&
+      (!has(oldObject.metadata.generation) || object.metadata.generation == oldObject.metadata.generation)
+      && has(object.metadata.deletionTimestamp) == has(oldObject.metadata.deletionTimestamp)
+      && (!has(oldObject.metadata.deletionTimestamp) || object.metadata.deletionTimestamp
+      == oldObject.metadata.deletionTimestamp) && has(object.metadata.deletionGracePeriodSeconds)
+      == has(oldObject.metadata.deletionGracePeriodSeconds) && (!has(oldObject.metadata.deletionGracePeriodSeconds)
+      || object.metadata.deletionGracePeriodSeconds == oldObject.metadata.deletionGracePeriodSeconds)
+      && has(object.metadata.labels) == has(oldObject.metadata.labels) && (!has(oldObject.metadata.labels)
+      || object.metadata.labels == oldObject.metadata.labels) && has(object.metadata.ownerReferences)
+      == has(oldObject.metadata.ownerReferences) && (!has(oldObject.metadata.ownerReferences)
+      || object.metadata.ownerReferences == oldObject.metadata.ownerReferences) &&
+      has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) && (!has(oldObject.metadata.finalizers)
+      || object.metadata.finalizers == oldObject.metadata.finalizers)
+    message: Alfred may not change workload fields or non-annotation metadata
+  - expression: '(has(oldObject.metadata.annotations) ? oldObject.metadata.annotations
+      : {}).all(k, k in (has(object.metadata.annotations) ? object.metadata.annotations
+      : {}) && (has(object.metadata.annotations) ? object.metadata.annotations : {})[k]
+      == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {})[k])'
+    message: Alfred may not remove or replace existing annotations
+  - expression: '(has(object.metadata.annotations) ? object.metadata.annotations :
+      {}).size() <= (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations
+      : {}).size() + 1 && (has(object.metadata.annotations) ? object.metadata.annotations
+      : {}).all(k, k in (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations
+      : {}) || (k.matches(''^ome[.]io/migration-request-v1-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'')
+      && bytes((has(object.metadata.annotations) ? object.metadata.annotations : {})[k]).size()
+      <= 4096))'
+    message: Alfred may add only one bounded v1 migration request
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ome-alfred-migration-writes
+spec:
+  policyName: ome-alfred-migration-writes
+  validationActions:
+  - Deny
+{{- end }}

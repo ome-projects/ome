@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/component: "ome-alfred"
 rules:
   # ConfigMaps: read for policy loading — Alfred's informer cache is scoped to
-  # this namespace — and write only to the two pre-created Alfred-owned
+  # this namespace — and write only to the pre-created Alfred-owned
   # ConfigMaps, which it never creates at runtime.
   - apiGroups: [ "" ]
     resources: [ "configmaps" ]
@@ -22,6 +22,7 @@ rules:
     resourceNames:
       - alfred-config
       - alfred-recommendations
+      - alfred-dispatch-state
 
   # Leader election — the alfred.ome.io Lease lives in Alfred's namespace.
   - apiGroups: [ "coordination.k8s.io" ]

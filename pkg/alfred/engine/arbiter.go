@@ -48,6 +48,10 @@ const (
 type Decision struct {
 	Candidate policy.Candidate
 	Admitted  bool
+	// Dispatch fields describe observed request state, never merely admission.
+	DispatchStatus string
+	RequestUUID    string
+	DispatchReason string
 	// Reason is the rejection code; empty when admitted.
 	Reason string
 	// Target is the claimed placement for an admitted candidate: the

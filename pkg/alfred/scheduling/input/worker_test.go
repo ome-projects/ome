@@ -33,14 +33,18 @@ func TestWorkerIntegration(t *testing.T) {
 		t.Fatal("ALFRED_SIMULATOR_BINARY must be an absolute path")
 	}
 	for _, tc := range []struct {
-		name     string
-		gang     bool
-		capacity bool
+		name      string
+		gang      bool
+		capacity  bool
+		execution bool
 	}{
-		{"single_fits_elsewhere", false, true},
-		{"single_source_occupancy_blocks_same_zone", false, false},
-		{"whole_gang_fits", true, true},
-		{"partial_gang_capacity_rejected", true, false},
+		{"single_fits_elsewhere", false, true, false},
+		{"single_source_occupancy_blocks_same_zone", false, false, false},
+		{"whole_gang_fits", true, true, false},
+		{"partial_gang_capacity_rejected", true, false, false},
+		{"migration_single_fits", false, true, true},
+		{"migration_whole_gang_fits", true, true, true},
+		{"migration_partial_gang_rejected", true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			objects, source := validSingleSourceObjects()
@@ -76,7 +80,12 @@ func TestWorkerIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request, err := BuildRequest(snap, source, profiles, "real-worker-"+tc.name, captureTime.Add(time.Second), time.Minute)
+			var request scheduling.Request
+			if tc.execution {
+				request, err = BuildExecutionRequest(snap, source, profiles, "real-worker-"+tc.name, []string{"target-a"}, captureTime.Add(time.Second), time.Minute)
+			} else {
+				request, err = BuildRequest(snap, source, profiles, "real-worker-"+tc.name, captureTime.Add(time.Second), time.Minute)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

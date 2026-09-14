@@ -4,7 +4,13 @@ kind: Kustomization
 # Alfred is opt-in: it is deliberately not part of config/default, so a cluster
 # installs it with `make install-alfred` (or `kubectl apply -k config/alfred`)
 # once OME itself is running.
-namespace: ome
+# Resources explicitly use namespace ome. Older Kustomize namespace transformers
+# misclassify v1 admission policies as namespaced; do not add a blanket namespace
+# transform. Overlays must patch namespaced resources, binding subjects, and the
+# actor in migration-guard.yaml together.
+# dispatch-state.yaml is deliberately excluded: bootstrap it once with kubectl
+# create before enabling migration, never through recurring apply/delete. See
+# pkg/alfred/simulator/README.md for journal upgrade/adoption/recovery procedures.
 
 resources:
   - serviceaccount.yaml
@@ -15,3 +21,4 @@ resources:
   - configmap.yaml
   - service.yaml
   - deployment.yaml
+  - migration-guard.yaml

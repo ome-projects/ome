@@ -19,6 +19,11 @@ metadata:
   labels:
     {{- include "ome-alfred.labels" . | nindent 4 }}
 rules:
+  # Alfred verifies this cluster-fixed guard but cannot install or alter it.
+  - apiGroups: [ "admissionregistration.k8s.io" ]
+    resources: [ "validatingadmissionpolicies", "validatingadmissionpolicybindings" ]
+    resourceNames: [ "ome-alfred-migration-writes" ]
+    verbs: [ "get" ]
   # Nodes (read-only) — no cordon, no drain, no patch.
   - apiGroups: [ "" ]
     resources: [ "nodes" ]
@@ -99,7 +104,7 @@ metadata:
     {{- include "ome-alfred.labels" . | nindent 4 }}
 rules:
   # ConfigMaps: read for policy loading — Alfred's informer cache is scoped
-  # to this namespace — and write only to the two pre-created Alfred-owned
+  # to this namespace — and write only to the pre-created Alfred-owned
   # ConfigMaps, which it never creates or deletes at runtime.
   - apiGroups: [ "" ]
     resources: [ "configmaps" ]
@@ -110,6 +115,9 @@ rules:
     resourceNames:
       - {{ .Values.configMapName }}
       - {{ include "ome-alfred.recommendationsName" . }}
+      {{- if .Values.migration.apiVersion }}
+      - alfred-dispatch-state
+      {{- end }}
 
   # Leader election — the alfred.ome.io Lease lives in Alfred's namespace.
   - apiGroups: [ "coordination.k8s.io" ]

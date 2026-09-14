@@ -94,7 +94,7 @@ recommendations `ConfigMap`.
 
 Exactly two policies are in scope: **Policy #1 — Capacity Descheduling
 (Defragmentation)** is implemented as observation, scoring, arbitration, and
-reporting; execution is not yet wired. **Policy #2 — Node-Health Evacuation**
+reporting, with guarded opt-in OMENative migration execution. **Policy #2 — Node-Health Evacuation**
 is planned: on a bad node condition, evacuate eligible OME workloads off the
 node *and emit a remediation signal* — it does **not** cordon, drain, terminate,
 or reboot the node. Alfred introduces **no new CRDs**: configuration lives in a
@@ -241,7 +241,7 @@ Alfred reads:
 - InferenceServices.
 - InferenceReplicas (OMENative Instance lifecycle and migration status).
 - OMENative per-owner migration-audit ConfigMaps (durable UUID history).
-- The OMENative executor capability Lease (read-only liveness/capability proof).
+- The named admission guard and Alfred's durable dispatch journal.
 - BaseModels / ClusterBaseModels.
 - PersistentVolumeClaims / PersistentVolumes (PVC-backed model topology).
 - Alfred's own ConfigMap for policy configuration.
@@ -252,6 +252,7 @@ table](#the-engine-snapshot--policies--arbiter--dispatcher--reporter)):
 - K8s Events on InferenceServices and Nodes (recommendations, migrations,
   evacuation signals, skip reasons).
 - Optional `alfred-recommendations` ConfigMap in its own namespace.
+- Precreated `alfred-dispatch-state` ConfigMap in its own namespace when opted in.
 - Migration-request annotations on InferenceServices (only in execute mode; the
   single migration verb, and only for a deployment mode with a confirmed
   consumer).
@@ -267,14 +268,14 @@ At the 2026-09-14 baseline, the source tree has the following status:
 |------|--------|------------------|
 | Observation and configuration | Implemented | Every replica builds snapshots and publishes gauges; configuration hot-reloads with last-known-good fallback. |
 | Capacity-descheduling Policy #1 | Partially implemented | Fragmentation scoring, cheap candidate generation, arbitration, and reporting run; GPU arithmetic is not scheduler feasibility. |
-| Arbiter and Reporter | Partially implemented | Core admission gates and outputs exist; positive-benefit/regression admission and dispatch/outcome-fed ledger state are not connected. |
+| Arbiter and Reporter | Implemented baseline | Core admission gates and truthful UUID request outcomes are connected. Durable serial dispatch bookkeeping complements retained status, cooldowns and the in-memory breaker. |
 | Node-Health Policy #2 | Not implemented | Node conditions only exclude unhealthy nodes as defrag targets and enqueue a coalesced early decision request. That request currently reads the latest cached snapshot without first refreshing it; no evacuation candidates or remediation signals are produced. |
-| Scheduler profile selection and simulation protocol | Initial gate implemented | Alfred selects a configured profile from the checked runner templates' effective `schedulerName`, defines a versioned request/result contract, and validates whole-placement results. The standalone worker mirrors that contract without importing the root module. Production Alfred still has no lossless predictive-input collection or worker invocation wired into its decision loop, so every Candidate remains withheld. Pre-existing Alfred snapshot imports of controller internals remain technical debt. |
-| Predictive simulation inputs | Library implemented | `pkg/alfred/scheduling/input` captures full public cluster objects and constructs private relocation Pods/PodGroups from checked live source cohorts. It preserves source occupancy, rejects stale/ambiguous inputs, and requires no workload preview API or controller imports. Real-worker integration tests cover its output; production observation/worker wiring remains separate. |
-| Scheduler simulation worker | Standalone worker implemented | The separate `pkg/alfred/simulator` module runs the compiled Kubernetes v1.35.4 scheduler for one complete externally supplied request, with default and OMEGangPack profiles and private snapshot-only clients. It performs no live reservation or cluster write. The executable is not registered with or called by production Alfred, and no profile in Alfred configuration can make execution ready by itself. |
-| Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Current `mode: execute` reporting says "will dispatch" despite performing no write; that mode is unsupported and must fail closed to recommend-only until the Dispatcher and its guards land. |
+| Scheduler profile selection and simulation protocol | Implemented | Exact effective scheduler profiles select trusted startup workers. Whole-placement responses are fenced to request/snapshot/profile identity. Optional `migrationFromNode` distinguishes the actual API's one-node exclusion from recommendation all-source exclusion. |
+| Predictive simulation inputs | Implemented | Full public objects and checked source cohorts produce private Pods/PodGroups without a workload preview or renderer import. Execution overlays the existing API's required hostname exclusion and weight-50 soft hints; sources remain occupied. |
+| Scheduler simulation worker | Implemented | The separate `pkg/alfred/simulator` module runs Kubernetes v1.35.4 plus the same OMEGangPack plugin through private snapshot-only clients. Production invokes its trusted exact-profile subprocess registry; profile configuration alone never enables migration. |
+| Dispatcher | Guarded opt-in baseline | Fresh original policy eligibility, safety checks, whole-instance simulation and verified admission precede a conditional v1 request annotation. Durable UUID intents make uncertain writes/restarts conservative. One unresolved request at a time; timeout is not cancellation. No Pod/node mutations or eviction fallback. |
 | OMENative state | Implemented | Alfred normalizes checked `InferenceReplica.Status`, joins live Pods by Instance index and incarnation for physical placement/readiness, and reads `InferenceReplica.Status.Migrations`. |
-| OMENative executor readiness | Not implemented | CRD discovery and current status do not prove the controller is still running. Alpha execution requires a fresh OMENative capability Lease; until that signal exists and Alfred consumes it, OMENative candidates remain advisory. |
+| OMENative compatibility | Operator opt-in | `--migration-api-version=v1` asserts compatible consumer configuration, not liveness. Missing acknowledgement stalls the durable request. No capability-Lease publisher or controller change is required. |
 | RawDeployment and LWS execution | Deferred | Both are advisory-only. Neither has a validated migration-request consumer, so neither can reach execution. |
 
 The remaining sections describe the target architecture unless they explicitly
@@ -979,14 +980,13 @@ The following properties of the read surface are load-bearing for later sections
   active lifecycle operation, rollout, scale transition, or migration. A
   missing/stale status, label mismatch, incomplete Pod set, or readiness
   mismatch fails closed to an advisory Candidate.
-- **Executor liveness needs a positive signal.** CRD discovery and a coherent
-  InferenceReplica snapshot prove API compatibility, not that the controller is
-  still running. The OMENative controller publishes a namespaced capability
-  Lease only while the InferenceReplica executor is enabled and cache-synced.
-  Alfred requires a supported wire-version marker and a fresh `renewTime` before
-  dispatch; an absent, stale, or incompatible Lease makes every Candidate
-  advisory. This Lease is a target Alpha dependency and is not implemented in
-  the current baseline.
+- **Execution requires explicit operator compatibility opt-in.** CRD discovery
+  and current status do not prove controller liveness. Startup
+  `--migration-api-version=v1` asserts that the operator has enabled a compatible
+  existing migration consumer; it does not discover liveness. No capability
+  Lease publisher is required. Matching UUID acknowledgement, a bounded timeout,
+  durable unresolved intent and failure backoff constrain an unavailable
+  consumer without changing its code. Missing opt-in keeps recommendations only.
 - **Placement feasibility fails closed.** GPU room, model locality, storage
   topology, and Alfred's target hints are only cheap shortlist inputs. Before a
   Candidate becomes executable, a matching scheduler worker must simulate the
@@ -1028,8 +1028,8 @@ F_observed(c) = sum over s: w(c, s) * Frag(c, s)
 
 **Step 3 — reclaimable vs. observed.** Hypothetically repack only Instances
 that could become executable under the current compatibility baseline:
-OMENative, `Movable=true`, a checked InferenceReplica-plus-Pod view, a fresh
-compatible executor Lease, steady lifecycle state, and a supported placement
+OMENative, `Movable=true`, a checked InferenceReplica-plus-Pod view, explicit
+compatible consumer opt-in, steady lifecycle state, and a supported placement
 proof. Hold everything else fixed in
 place: non-OME occupants, `Movable=false` workloads, RawDeployment, and
 LWS-backed Instances. FFD is a cheap upper-bound/shortlist heuristic, not
@@ -1078,8 +1078,8 @@ When the score is above threshold, the policy turns the snapshot into a ranked `
    top-K shortlist per cycle. They are necessary bounds, never placement proof.
 2. **Classify by deployment mode** — this sets the `Executable` flag, it does not drop the candidate:
    - **OMENative**: potentially executable via the OMENative migration verb,
-     subject to the checked InferenceReplica-plus-Pod view, a fresh compatible
-     executor Lease, and fail-closed placement checks.
+     subject to the checked InferenceReplica-plus-Pod view, explicit compatible
+     consumer opt-in, and fail-closed placement checks.
    - **RawDeployment** (any replica count): `Executable=false` until a Raw
      migration-request consumer exists. Still emit the Candidate so operators
      see the opportunity.
@@ -1245,11 +1245,12 @@ Registry paths and fixed process arguments cannot be supplied by hot-reloaded
 policy configuration. The Alfred image bundles the offline worker; deployment
 and matching-profile setup are documented in
 [the simulator guide](../../pkg/alfred/simulator/README.md).
-There is still no Dispatcher: even a feasible prediction is advisory-only in
-execute mode and consumes no migration budget. Adding a profile or worker
-cannot activate execution. The protocol and worker depend on public contracts rather than
-controller internals, but pre-existing Alfred snapshot imports remain separate
-debt.
+Recommendation diagnostics never authorize a write or consume a migration
+budget. The separately opted-in Dispatcher starts from original executable
+policy output and repeats fresh policy, source, safety and request-equivalent
+simulation checks. Adding a profile or worker alone cannot activate execution.
+The protocol and worker depend on public contracts rather than controller
+internals; this change adds no workload/controller implementation imports.
 
 #### Execution
 
@@ -1687,9 +1688,8 @@ config.yaml: |
   # Execution surfaces (all annotation-mediated; the owning controllers execute)
   rawDeploymentMigrationEnabled: false # reserved; Raw is advisory until a consumer exists
   omenativeMigrationEnabled: true      # OMENative controller: Instance surge
-  omenativeCapabilityLeaseName: ome-inferencereplica-executor
-  omenativeCapabilityLeaseNamespace: ome
-  omenativeCapabilityMaxStaleness: 30s # absent/stale/incompatible = recommend-only
+  # Also requires immutable startup --migration-api-version=v1 and a verified
+  # admission guard; these are not hot policy settings or liveness discovery.
   lwsRecommendationsEnabled: true      # produce recommendations for LWS (never execute)
 
   # Output
@@ -2075,30 +2075,30 @@ decision, performed manually outside Alfred.
 
 ### Degraded mode
 
-The caretaker executes migrations only through a confirmed lifecycle-owner
-consumer. In this phase that consumer is OMENative. CRD discovery alone is not
-an availability proof: a cluster can retain the InferenceReplica CRD while the
-controller is disabled or unavailable, and a current status object can outlive
-the process that wrote it. Alfred establishes execution readiness from **both**:
+The current consumer is OMENative's existing v1 migration API. Execution requires
+operator startup opt-in (`--migration-api-version=v1`), current checked
+InferenceReplica-plus-Pod state, a matching worker, leader election, a verified
+fail-closed admission guard and hot policy `mode: execute`. The compatibility
+marker is `OperatorConfigured`, not a liveness signal. No OME controller Lease
+publisher, preview API or workload-package changes are required.
 
-1. a readable InferenceReplica whose observed generation is current and whose
-   status representation is valid; and
-2. a fresh `ome-inferencereplica-executor` capability Lease carrying a supported
-   migration wire version, renewed only while that controller is enabled and
-   cache-synced.
+The Alfred-owned `alfred-dispatch-state` ConfigMap persists each UUID, exact
+payload, source identity and attempt before the ISVC write. One unresolved
+Alfred request is allowed globally; existing other active requests also block
+new submissions. Retained UUID statuses, pending annotations and journal rows
+are deduplicated for rolling-hour budgets. A missing acknowledgement after two
+minutes becomes `stalled` and applies five-minute failure backoff, but remains
+unresolved: a timeout does not cancel a request. Matching current IR identity
+and UUID terminal status resolves it; annotation disappearance never does.
+Uncertain retries preserve the same UUID/payload and repeat fresh preflight.
+Late acknowledgement/completion remains observable across leader changes.
 
-A missing, stale, or incompatible input fails closed. The capability Lease is a
-target Alpha prerequisite; because the current baseline does not publish or
-consume it, current Alfred must remain recommendation-only even when the CRD and
-apparently current status are present.
-
-The target Lease is namespaced, defaults to
-`ome/ome-inferencereplica-executor`, and carries
-`ome.io/migration-request-schema: v1`. Its holder identity names the active OME
-manager replica. Alfred considers it fresh only when `renewTime` is present and
-no older than `omenativeCapabilityMaxStaleness`; it does not infer freshness
-from the Lease object's resource version. The OME manager stops renewing when
-the InferenceReplica controller is disabled, not cache-synced, or shutting down.
+The admission guard and simulation are checked again before submission. The
+request hard-excludes only `from_node`; hints are preferred hostname affinity
+with weight 50. A complete gang is simulated while all sources remain occupied.
+Neither hints nor predictions reserve capacity. API v1 does not carry expected
+source incarnation/UID, so preflight cannot guarantee identity through later
+consumer acceptance. These residual races remain explicit limits of this API.
 
 **If OMENative execution readiness cannot be established:**
 
@@ -2133,8 +2133,8 @@ dependencies:
 - OME `InferenceService` CRD installed.
 - A fresh, valid InferenceReplica status surface for OMENative execution
   (otherwise degraded mode — see above).
-- A fresh, compatible OMENative executor capability Lease for execution
-  (otherwise degraded mode — see above).
+- Operator opt-in to the compatible existing v1 migration consumer, a matching
+  worker and a verified admission guard (otherwise execution is withheld).
 
 ### Leader election
 
@@ -2210,10 +2210,10 @@ the eviction verb:
   resources: [leases]
   verbs: [create, get, update]
 
-# OMENative executor capability (read-only, configured namespace)
-- apiGroups: [coordination.k8s.io]
-  resources: [leases]
-  resourceNames: [ome-inferencereplica-executor]
+# Admission guard verification (read-only, fixed cluster names)
+- apiGroups: [admissionregistration.k8s.io]
+  resources: [validatingadmissionpolicies, validatingadmissionpolicybindings]
+  resourceNames: [ome-alfred-migration-writes]
   verbs: [get]
 
 # OME CRDs (read)
@@ -2244,9 +2244,9 @@ perform on that resource:
 | `pods` | get, list, watch | nothing — read-only | physical placement and current readiness; Alfred never performs pod-level lifecycle actions |
 | `persistentvolumeclaims`, `persistentvolumes` | get, list, watch | nothing — read-only | model-volume access modes and topology for placement feasibility |
 | `inferencereplicas` | get, list, watch | nothing — read-only | stable OMENative Instance identity, lifecycle state, and authoritative migration status |
-| OMENative capability `lease` | get | nothing — read-only | proves that a compatible InferenceReplica executor is currently enabled and renewing |
+| named admission policy/binding | get | nothing — read-only | verifies the fail-closed write boundary for Alfred's exact service account |
 | `inferenceservices` | patch | add/retry one `ome.io/migration-request-v1-*` annotation only | the consuming controller owns acknowledgement deletion; Alfred's patch must not touch spec, status, labels, finalizers, or other annotations (enforced cluster-side, below) |
-| `configmaps` (named) | update, patch | mutate only `alfred-config` / `alfred-recommendations` | the caretaker does not create ConfigMaps at runtime; Helm pre-creates them |
+| `configmaps` (named) | update, patch | mutate only `alfred-config` / `alfred-recommendations` / `alfred-dispatch-state` | the caretaker does not create ConfigMaps at runtime; Helm or an explicit create-only bootstrap provisions the journal |
 | `events` | create, patch | emit observability events | events are the audit trail; no other side effect |
 | `leases` | create, get, update | leader-election Lease | standard controller pattern |
 
@@ -2262,12 +2262,11 @@ bounded the defragmenter's blast radius bounds the caretaker's even more
 tightly. The RBAC table above is the security contract; adding node-write or
 pod-write to it would be the moment the caretaker stops being safe-by-design.
 
-**Authorization boundary.** The dedicated Alfred service account is the only
-principal allowed to add or retry an OMENative migration request in v1. The
-configured OME manager service account must be allowed to delete a request after
-the InferenceReplica controller has persisted its acknowledgement. No other
-principal may add, change, or delete a migration annotation, even if generic
-InferenceService patch RBAC exists.
+**Authorization boundary.** The admission guard restricts the exact configured
+Alfred service-account username. It does not modify the authorization or normal
+behavior of the OME manager or other identities. The owning controller continues
+to acknowledge requests using its existing API. Alfred cannot install or change
+the guard; the cluster administrator owns it.
 
 **RBAC invariant.** The caretaker's only allowed `patch` effect on
 `InferenceService` is to add or retry one
@@ -2278,36 +2277,63 @@ runtime, but it is *not* the primary security boundary.
 
 **Mandatory cluster-side enforcement.** Execute mode requires a
 `ValidatingAdmissionPolicy` (K8s 1.30+) installed by the Helm chart. If the
-policy or binding is absent, the caretaker must refuse to start in
-`mode: execute` and fall back to recommend-only. The reference policy object
-belongs in the Helm chart template
-(`charts/ome-alfred/templates/admission-policy.yaml`, or the equivalent subtree
-under `charts/ome-resources/` if packaged there). The policy must enforce three
-invariants:
+policy or binding is absent, unchecked or drifted, execution is withheld. The
+chart template is `charts/ome-alfred/templates/migration-guard.yaml`, with
+equivalent Kustomize resources. Runtime reads require exact canonical specs,
+current warning-free type-check status and a Deny binding. The guard enforces:
 
-1. Only Alfred's service account may add or retry
-   `ome.io/migration-request-v1-*` annotations, and a retry must keep the same
-   UUID and canonical payload.
-2. Only the configured OME manager service account may delete a consumed
-   migration annotation; that acknowledgement update may not add or alter a
-   migration request.
-3. Neither service account may change `spec`, `status`, labels, finalizers,
-   owner references, or non-migration annotations as part of its permitted
-   mailbox write.
+1. Alfred may add at most one UUID-shaped `ome.io/migration-request-v1-*`
+   annotation, capped at 4096 bytes, or retry an unchanged payload.
+2. Alfred may not replace or remove any existing annotation, including its own
+   requests. The consumer owns acknowledgement.
+3. Alfred may not change `spec`, `status`, labels, finalizers, owner references,
+   identity, deletion fields or unrelated metadata. API-server resourceVersion
+   and managedFields normalization are bookkeeping exceptions. Alfred's writer
+   only tests UID/resourceVersion and adds the one annotation.
 
 The exact CEL expression is implementation detail and must be covered by
 negative integration tests; the design contract is the enforcement behavior
-above, not a sample snippet. The policy applies to both the OME manager's
-full-object acknowledgement `UPDATE` and Alfred's `PATCH`. The latter must be
-validated against both JSON merge patch and JSON Patch semantics. If the chosen
-admission checks cannot soundly prove the invariants above for a patch type the
-caretaker might send, execute mode must reject that patch type rather than rely
-on ambiguous CEL behavior.
+above, not a sample snippet. Tests exercise the actual API server admission
+path, first annotation maps, identical retries and prohibited metadata/spec/
+status changes. Runtime uses JSON Patch only. The manager remains unaffected.
 
 **ConfigMap write boundary.** The caretaker does not create ConfigMaps at
-runtime. Helm pre-creates `alfred-config` and, if recommendation snapshots are
-enabled, `alfred-recommendations`; the caretaker only updates/patches
-those named objects.
+runtime. Helm pre-creates `alfred-config`, `alfred-recommendations` when enabled,
+and `alfred-dispatch-state` when migration is opted in; the caretaker only
+updates/patches those named objects. The state journal is bounded to 512 KiB and
+256 entries, retains terminal history for at least an hour, and never expires
+unresolved entries. Missing or malformed state blocks execution.
+
+**Journal deployment lifecycle.** Kustomize deliberately excludes the journal
+from recurring `config/alfred` resources. Its separate
+`config/alfred/dispatch-state.yaml` initializer is bootstrap-only: after checking
+the intended cluster/namespace and confirming no prior dispatch history needs
+recovery, an administrator runs `kubectl create -f config/alfred/dispatch-state.yaml`
+once. It must never be applied, replaced, forced, or included in normal sync or
+delete/prune sets. `AlreadyExists` means stop and inspect/adopt the retained
+object, not overwrite it; a failed read does not establish absence.
+
+Normal `kubectl apply -k config/alfred` / `make install-alfred` upgrades, including
+force-conflict server-side apply, do not manage the journal. Likewise
+`kubectl delete -k config/alfred` / `make uninstall-alfred` leave it intact for
+reinstallation. Namespace deletion or broad ConfigMap cleanup is not a safe
+Alfred uninstall. Helm retains its journal on disable/uninstall and preserves
+existing bytes when adopted again.
+
+Before adopting an older Kustomize/GitOps/Helm installation, stop Alfred to pause
+dispatch and journal reconciliation, record and back up the live UID and exact
+journal/unrelated data, and detach the
+journal from any automated deletion/pruning ownership without deleting it.
+Reuse the same object and bytes; any release-ownership adjustment must be
+intentional and metadata-only. Re-enable execution only after the namespace,
+Alfred identity, guard and worker are verified. Missing or corrupt state is
+manual recovery, not an opportunity to recreate an empty journal: stop Alfred
+before modifying the ConfigMap, preserve
+evidence and reconcile possibly applied UUIDs with the owning controller and
+authoritative status before restoring/repairing reviewed history. Timeout,
+annotation disappearance or absent status alone cannot resolve an uncertain
+request. Installation must not erase unresolved requests or needed cooldowns.
+The simulator README provides the operational bootstrap and recovery procedure.
 
 ### Observability
 
@@ -2560,10 +2586,11 @@ New unit coverage for the engine refactor:
     `refresh → publish → evaluate`, a refresh failure performs no decision,
     concurrent refreshes serialize, and the early pass does not reset the
     regular decision cadence.
-13. **Executor capability fails closed.** With a valid CRD and current
-    InferenceReplica status, verify an absent, stale, or wire-incompatible
-    OMENative capability Lease still produces advisory Candidates only; a fresh
-    compatible Lease enables otherwise eligible Candidates.
+13. **Explicit execution opt-in fails closed.** Valid CRD/current status alone
+    never enables execution. Require startup v1 compatibility opt-in, hot
+    execute mode, leader election, a matching worker and a verified guard.
+    Verify missing acknowledgement stalls the durable UUID rather than releasing
+    it or generating another request.
 14. **Scheduler selection and mandatory-worker gate.** Verify omitted
     `schedulerName` selects only an explicitly configured `default-scheduler`
     profile; `ome-scheduler` and custom names select only their exact mappings;
@@ -2573,7 +2600,7 @@ New unit coverage for the engine refactor:
     dispatch path.
 15. **Protocol result validation and no live writes.** Reject mismatched request,
     snapshot, or profile identities; partial/duplicate/foreign Pod placements;
-    unknown or source nodes; and unsupported decisions. Worker tests must assert
+    unknown or explicitly excluded nodes; and unsupported decisions. Worker tests must assert
     that simulation never binds, evicts, patches, deletes, or mutates production
     scheduler state.
 16. **Bounded work and invalidation.** Verify cheap filters cap scheduler calls
@@ -2621,11 +2648,11 @@ following behavior end to end:
     fails within window; Alfred marks node suspect, backs off.
 14. **HPA coexistence**: HPA scaling the target ISVC; Alfred defers.
 15. **CA coexistence**: node marked `scale-down-disabled`; excluded from hints.
-16. **OMENative-unavailable degraded mode**: stop the controller while leaving
-    the CRD and its last current-looking InferenceReplica status installed.
-    Once the capability Lease becomes stale, Alfred enters degraded mode and
-    all workload types remain recommendation-only. CRD or status presence alone
-    must not enable dispatch.
+16. **OMENative consumer unavailable**: stop the controller after explicit
+    opt-in while retaining current-looking status. The first unacknowledged
+    request becomes stalled after the configured timeout and remains unresolved,
+    blocking further requests across leader changes. This is bounded failure
+    handling, not controller liveness detection.
 17. **Circuit breaker**: simulate 6+ failed migrations; verify circuit opens,
     pauses execution.
 18. **Non-OME workload**: Kubeflow Notebook Pod on a node; Alfred observes but
@@ -2634,10 +2661,9 @@ following behavior end to end:
     benefit workload in namespace B without explicit tenant-group annotation.
 20. **Spot node avoidance**: preemptible-labeled node excluded from targets;
     preemptible source prioritized.
-21. **Admission hardening and acknowledgement**: an unauthorized caller cannot
-    add, change, or delete `ome.io/migration-request-v1-*`. Alfred may add/retry
-    an identical UUID but may not delete it. The configured OME manager may
-    delete a consumed request but may not add or alter one.
+21. **Admission hardening and acknowledgement**: Alfred may add/retry an
+    identical UUID but may not replace/remove annotations or change unrelated
+    fields. The OME manager and other identities retain existing behavior.
 22. **Alfred narrow patch enforcement**: Alfred caller attempts to modify
     `spec` or non-migration annotations in the same patch; request rejected by
     admission policy.
@@ -2740,8 +2766,8 @@ slip without blocking the one below it.
 
 Scope: the engine refactor (`Policy` interface + `Arbiter` + `Reporter`), Defrag ported to
 **Policy #1**, **Policy #2 Node-Health Evacuation** (evacuate + remediation
-signal), the checked InferenceReplica-plus-Pod snapshot, OMENative executor
-capability Lease, Dispatcher, **arbitration-lite** (priority ordering + mutual
+signal), the checked InferenceReplica-plus-Pod snapshot, explicit compatible
+consumer opt-in, guarded Dispatcher, **arbitration-lite** (priority ordering + mutual
 exclusion, no forecasting), the isolated matching-scheduler worker, and
 the **OEP-0013 read-only seam**.
 
@@ -2752,8 +2778,8 @@ the **OEP-0013 read-only seam**.
   placement; migration state and cooldowns reconstruct from
   `InferenceReplica.Status.Migrations` and the workload audit ledger across
   leader failover.
-- A fresh, wire-compatible OMENative capability Lease gates every executable
-  Candidate; CRD and status presence alone fail the execution-readiness test.
+- Explicit v1 compatibility opt-in, a verified admission guard and matching
+  worker gate execution; CRD/status presence alone never enables it.
 - Every executable Candidate is simulated using Alfred-owned predictive copies
   of checked observed source Pods by a worker that matches the effective
   scheduler's immutable version/profile/plugins/arguments/feature gates.
@@ -2861,8 +2887,8 @@ engine must not preclude them.
   lifecycle state, and migrations; live Pods joined by Instance index and
   incarnation are authoritative for physical placement and current readiness.
   Request annotations are a mailbox and the workload audit ledger retains
-  durable history. A fresh capability Lease, not CRD/status presence alone,
-  proves executor availability. RawDeployment and LWS are advisory-only until
+  durable history. The original capability-Lease proposal was superseded by
+  explicit operator opt-in on 2026-09-14. RawDeployment and LWS are advisory-only until
   their lifecycle owner implements the request contract. Current implementation
   gaps (Node-Health and Dispatcher) are recorded explicitly.
 - 2026-09-14: Policy scope fixed at exactly two policies. Matching-scheduler
@@ -2873,8 +2899,13 @@ engine must not preclude them.
   checked observed Pods; an owner-side rendering/admission preview is not
   required. Opt-in production collection and exact-profile subprocess wiring
   now annotate recommendations; they do not promote or dispatch candidates.
-- TBD: Complete Alpha implementation (execution admission, capability Lease, Policy #2, Dispatcher,
-  and outcome-fed safety ledger).
+- 2026-09-14: Guarded OMENative execution adds an Alfred-only write-ahead UUID
+  journal, exact request-equivalent whole-instance simulation, admission guard,
+  fresh source/policy checks and truthful dispatch status. Explicit operator v1
+  compatibility replaces the unimplemented OME capability-Lease dependency.
+  Execution is serial, and acknowledgement timeouts never cancel pending work.
+  See `pkg/alfred/simulator/README.md` for activation and API limitations.
+- TBD: Complete Alpha implementation (Policy #2 and production hardening).
 - TBD: First Beta user.
 - TBD: First Beta release.
 - TBD: GA.
@@ -2886,8 +2917,8 @@ engine must not preclude them.
    to cluster-autoscaler. Multi-policy raises the stakes: the Arbiter is now a
    single point through which every policy's actions flow, so an Arbiter bug
    can mis-order or drop actions from **all** policies at once.
-2. **Requires OMENative for execution in Alpha.** Without a fresh, compatible
-   executor Lease plus a valid InferenceReplica-and-Pod snapshot, Alfred remains
+2. **Requires OMENative for execution in Alpha.** Without explicit compatible
+   consumer opt-in plus a valid InferenceReplica-and-Pod snapshot, Alfred remains
    useful for observation and recommendations but performs no workload
    migration. This is true for Node-Health evacuation too, not just Defrag.
 3. **Heuristic, not optimal.** Greedy candidate selection may miss non-obvious

@@ -94,14 +94,17 @@ type recommendationView struct {
 	Score          float64  `json:"score"`
 	Emergency      bool     `json:"emergency,omitempty"`
 	CooldownOver   bool     `json:"cooldownOverridden,omitempty"`
+	DispatchStatus string   `json:"dispatchStatus,omitempty"`
+	RequestUUID    string   `json:"requestUUID,omitempty"`
+	DispatchReason string   `json:"dispatchReason,omitempty"`
 
 	Scheduling *policy.SchedulingDiagnostics `json:"scheduling,omitempty"`
 }
 
 // ReportCycle publishes one decision pass: produced/accepted/rejected
 // counters, Events on the target InferenceServices, and (when enabled) the
-// recommendations ConfigMap record. decisions covers the executable
-// candidates; advisories appear only in candidates.
+// recommendations ConfigMap record. decisions includes executable candidates
+// and observations of outstanding requests, even when their source is advisory.
 func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidate, decisions []Decision, cfg *config.Config, now time.Time) {
 	record := cycleRecord{Timestamp: now, Mode: cfg.Mode}
 
@@ -132,6 +135,17 @@ func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidat
 			Scheduling:     c.Scheduling,
 		}
 
+		d, ok := decided[candidateKey(c)]
+		if ok && d.DispatchStatus != "" {
+			view.DispatchStatus = r.reportDispatch(c, d)
+			view.Outcome = view.DispatchStatus
+			view.RequestUUID = d.RequestUUID
+			view.DispatchReason = d.DispatchReason
+			view.Target = d.Target
+			view.CooldownOver = d.CooldownOverridden
+			record.Recommendations = append(record.Recommendations, view)
+			continue
+		}
 		if !c.Executable {
 			view.Outcome = OutcomeAdvisory
 			r.reportAdvisory(c)
@@ -139,7 +153,6 @@ func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidat
 			continue
 		}
 
-		d, ok := decided[candidateKey(c)]
 		if !ok {
 			// An executable candidate without a decision (the arbiter
 			// never saw it) is a wiring bug worth surfacing loudly.
@@ -148,10 +161,7 @@ func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidat
 			continue
 		}
 		if d.Admitted {
-			view.Outcome = OutcomeAdmitted
-			if cfg.Mode == config.ModeRecommendOnly {
-				view.Outcome = OutcomeWithheld
-			}
+			view.Outcome = OutcomeWithheld
 			view.Target = d.Target
 			view.CooldownOver = d.CooldownOverridden
 			r.reportAdmitted(c, d, cfg)
@@ -185,7 +195,7 @@ func (r *Reporter) reportAdmitted(c policy.Candidate, d Decision, cfg *config.Co
 	r.Metrics.RecommendationsAccepted.WithLabelValues(
 		c.Policy, c.Workload.String(), string(c.Component)).Inc()
 
-	reason, note := "RecommendationAdmitted", "will dispatch"
+	reason, note := "RecommendationWithheld", "not dispatched"
 	if cfg.Mode == config.ModeRecommendOnly {
 		reason, note = "RecommendationWithheld", "recommend-only: not dispatched"
 	}
@@ -197,6 +207,38 @@ func (r *Reporter) reportAdmitted(c policy.Candidate, d Decision, cfg *config.Co
 		"%s recommends migrating %s/%s instance %d off %s (target %s, score %.3f) — %s",
 		c.Policy, c.Workload.String(), c.Component, c.Instance, c.FromNode, target, c.Score, note)
 
+	r.reportCooldownOverride(c, d)
+}
+
+// reportDispatch reports what happened to the exact request UUID. Prepared or
+// unrecognized states cannot imply that a request has been submitted.
+func (r *Reporter) reportDispatch(c policy.Candidate, d Decision) string {
+	status, eventReason, eventType := d.DispatchStatus, "RecommendationWithheld", corev1.EventTypeNormal
+	switch status {
+	case "submitted":
+		eventReason = "MigrationSubmitted"
+	case "acknowledged":
+		eventReason = "MigrationAcknowledged"
+	case "completed":
+		eventReason = "MigrationCompleted"
+	case "failed":
+		eventReason, eventType = "MigrationFailed", corev1.EventTypeWarning
+	case "stalled":
+		eventReason, eventType = "MigrationStalled", corev1.EventTypeWarning
+	default:
+		status = OutcomeWithheld
+	}
+	if d.Admitted && (status == "submitted" || status == OutcomeWithheld) {
+		r.Metrics.RecommendationsAccepted.WithLabelValues(c.Policy, c.Workload.String(), string(c.Component)).Inc()
+		r.reportCooldownOverride(c, d)
+	}
+	r.event(c, eventType, eventReason,
+		"%s migration request uuid=%s for %s/%s instance %d: %s (%s)",
+		c.Policy, d.RequestUUID, c.Workload.String(), c.Component, c.Instance, status, d.DispatchReason)
+	return status
+}
+
+func (r *Reporter) reportCooldownOverride(c policy.Candidate, d Decision) {
 	if d.CooldownOverridden {
 		r.Metrics.CooldownOverrides.WithLabelValues(c.Policy).Inc()
 		r.event(c, corev1.EventTypeNormal, "CooldownOverriddenForEvacuation",
@@ -214,10 +256,10 @@ func (r *Reporter) ReportOMENativeState(available bool) {
 	enteringDegraded := degraded && (!r.omenativeSeeded || !r.omenativeDegraded)
 	if enteringDegraded {
 		r.Recorder.Eventf(r.namespaceRef(), corev1.EventTypeWarning, "OMENativeUnavailable",
-			"no OMENative executor is available; multi-pod candidates degrade to advisory")
+			"OMENative migration API compatibility is not configured; OMENative candidates remain advisory")
 	}
 	if r.omenativeSeeded && r.omenativeDegraded && available {
-		r.Log.Info("OMENative executor available again; degraded mode cleared")
+		r.Log.Info("OMENative migration API compatibility configured; degraded mode cleared")
 	}
 	r.omenativeSeeded, r.omenativeDegraded = true, degraded
 }
@@ -363,10 +405,9 @@ func producedEventReason(c policy.Candidate) string {
 	}
 }
 
-// candidateKey identifies one candidate within a cycle. The policy is part
-// of the key: node-health evacuation and defragmentation can both target the
-// same instance in one pass, and their decisions must not overwrite each
-// other in the report.
+// candidateKey identifies one candidate within a cycle. Policy and source node
+// separate competing recommendations and requests about an earlier placement
+// of the same instance.
 func candidateKey(c policy.Candidate) string {
-	return fmt.Sprintf("%s|%s|%s|%d", c.Policy, c.Workload.String(), c.Component, c.Instance)
+	return fmt.Sprintf("%s|%s|%s|%d|%s", c.Policy, c.Workload.String(), c.Component, c.Instance, c.FromNode)
 }

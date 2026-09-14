@@ -87,7 +87,7 @@ func predictionScenario(t *testing.T, gang bool) (*snapshot.ClusterSnapshot, *pr
 			Runners: []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1, Template: corev1.PodTemplateSpec{Spec: podSpec}}}},
 		Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 1, CurrentRevision: "a-engine-rev-a", UpdateRevision: "a-engine-rev-a",
 			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
-				RunningRevision: "a-engine-rev-a", TargetRevision: "a-engine-rev-a", PodCount: 1, ServingPodCount: 1, AvailablePodCount: 1, Admitted: true}}}}
+				RunningRevision: "a-engine-rev-a", PodCount: 1, ServingPodCount: 1, AvailablePodCount: 1, Admitted: true}}}}
 	ir.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceService", Name: isvc.Name, UID: isvc.UID, Controller: ptr.To(true)}}
 	pod := &corev1.Pod{ObjectMeta: meta("source-pod", "pod-uid"), Spec: *podSpec.DeepCopy(),
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}

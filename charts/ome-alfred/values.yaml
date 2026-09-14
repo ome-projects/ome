@@ -66,6 +66,13 @@ simulation:
   configMapName: ""
   timeout: 10s
 
+# Operator opt-in to the existing OME v1 migration API. Requires the exact
+# simulation worker configuration and a verified Kubernetes admission guard.
+migration:
+  apiVersion: ""
+  acknowledgementTimeout: 2m
+  failureBackoff: 5m
+
 # Alfred's policy configuration (OEP-0008 §Configuration), rendered verbatim
 # into <configMapName>'s config.yaml and hot-reloaded by every replica. A
 # config that fails schema validation is rejected at reload and the
@@ -84,8 +91,8 @@ alfredConfig:
   earlyTickOn: [NodeConditionChange]
 
   # Scheduler simulation is mandatory before execution. Profiles are keyed by
-  # the effective replacement Pod schedulerName. Opt-in worker integration
-  # produces recommendations only, even in execute mode. The shipped default
+  # the effective replacement Pod schedulerName. Execution also requires
+  # migration.apiVersion=v1 and the verified admission guard. The shipped default
   # is intentionally empty. Copy the exact worker --print-profile identity:
   # profiles:
   #   default-scheduler:
@@ -134,7 +141,7 @@ alfredConfig:
 
   # Reserved compatibility field; RawDeployment remains advisory-only.
   rawDeploymentMigrationEnabled: false
-  # Future execution surfaces; owning controllers execute annotations.
+  # OMENative execution uses the owning controller's migration annotations.
   omenativeMigrationEnabled: true
   lwsRecommendationsEnabled: true
 

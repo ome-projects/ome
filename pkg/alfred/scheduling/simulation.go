@@ -6,10 +6,12 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // SimulationSchemaV1 is the only simulation contract understood here.
@@ -50,6 +52,9 @@ type Request struct {
 	SnapshotTime    metav1.Time            `json:"snapshotTime"`
 	RequireGang     bool                   `json:"requireGang,omitempty"`
 	ExcludedNodes   []string               `json:"excludedNodes"`
+	// MigrationFromNode selects the public migration API's single-node exclusion.
+	// Empty retains the recommendation contract excluding every source node.
+	MigrationFromNode string `json:"migrationFromNode,omitempty"`
 }
 
 // Decision is a closed set of simulator outcomes.
@@ -214,6 +219,11 @@ func validateRequest(request Request) (map[PodIdentity]struct{}, map[string]stru
 		}
 		excluded[nodeName] = struct{}{}
 	}
+	if request.MigrationFromNode != "" {
+		if err := validateMigrationRequest(request); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	expected := make(map[PodIdentity]struct{}, len(request.ReplacementPods))
 	replacementNames := make(map[string]struct{}, len(request.ReplacementPods))
@@ -257,11 +267,139 @@ func validateRequest(request Request) (map[PodIdentity]struct{}, map[string]stru
 		if pod.Spec.NodeName == "" {
 			return nil, nil, fmt.Errorf("source pod %s/%s is not bound", pod.Namespace, pod.Name)
 		}
-		if _, explicit := excluded[pod.Spec.NodeName]; !explicit {
+		if _, explicit := excluded[pod.Spec.NodeName]; !explicit && request.MigrationFromNode == "" {
 			return nil, nil, fmt.Errorf("source node %q for pod %s/%s is not explicitly excluded", pod.Spec.NodeName, pod.Namespace, pod.Name)
 		}
 	}
 	return expected, excluded, nil
+}
+
+// validateMigrationRequest preserves occupancy while allowing the API's single
+// from_node exclusion. It never grants capacity credit for an original Pod.
+func validateMigrationRequest(request Request) error {
+	from := request.MigrationFromNode
+	if len(validation.IsDNS1123Subdomain(from)) != 0 {
+		return fmt.Errorf("migrationFromNode must be a DNS1123 node name")
+	}
+	if len(request.ExcludedNodes) != 1 || request.ExcludedNodes[0] != from {
+		return fmt.Errorf("migration request must exclude exactly migrationFromNode")
+	}
+	nodes := map[string]*corev1.Node{}
+	pods := map[types.NamespacedName]*corev1.Pod{}
+	for i, extension := range request.ClusterObjects {
+		if extension.Object != nil && len(extension.Raw) != 0 {
+			return fmt.Errorf("clusterObjects[%d] has ambiguous representations", i)
+		}
+		var node *corev1.Node
+		var pod *corev1.Pod
+		switch object := extension.Object.(type) {
+		case *corev1.Node:
+			node = object
+		case *corev1.Pod:
+			pod = object
+		default:
+			raw := extension.Raw
+			if extension.Object != nil {
+				var err error
+				raw, err = json.Marshal(extension.Object)
+				if err != nil {
+					return fmt.Errorf("clusterObjects[%d]: %w", i, err)
+				}
+			}
+			var header metav1.TypeMeta
+			if err := json.Unmarshal(raw, &header); err != nil {
+				return fmt.Errorf("clusterObjects[%d]: %w", i, err)
+			}
+			if header.APIVersion == "v1" {
+				switch header.Kind {
+				case "Node":
+					node = &corev1.Node{}
+					if err := json.Unmarshal(raw, node); err != nil {
+						return err
+					}
+				case "Pod":
+					pod = &corev1.Pod{}
+					if err := json.Unmarshal(raw, pod); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if node != nil {
+			if node.APIVersion != "" && node.APIVersion != "v1" || node.Kind != "" && node.Kind != "Node" {
+				return fmt.Errorf("conflicting snapshot Node type")
+			}
+			if _, exists := nodes[node.Name]; exists {
+				return fmt.Errorf("duplicate snapshot Node")
+			}
+			nodes[node.Name] = node
+		}
+		if pod != nil {
+			if pod.APIVersion != "" && pod.APIVersion != "v1" || pod.Kind != "" && pod.Kind != "Pod" {
+				return fmt.Errorf("conflicting snapshot Pod type")
+			}
+			key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+			if _, exists := pods[key]; exists {
+				return fmt.Errorf("duplicate snapshot Pod")
+			}
+			pods[key] = pod
+		}
+	}
+	if node := nodes[from]; node == nil || node.DeletionTimestamp != nil {
+		return fmt.Errorf("migrationFromNode must be a known live snapshot node")
+	}
+	hostsSource := false
+	for i := range request.SourcePods {
+		source := request.SourcePods[i].DeepCopy()
+		if source.Spec.NodeName == from {
+			hostsSource = true
+		}
+		occupied := pods[types.NamespacedName{Namespace: source.Namespace, Name: source.Name}]
+		if occupied == nil {
+			return fmt.Errorf("migration source Pod is missing from snapshot occupancy")
+		}
+		actual := occupied.DeepCopy()
+		source.TypeMeta = metav1.TypeMeta{}
+		actual.TypeMeta = metav1.TypeMeta{}
+		if !apiequality.Semantic.DeepEqual(source, actual) {
+			return fmt.Errorf("migration source Pod does not match snapshot occupancy")
+		}
+	}
+	if !hostsSource {
+		return fmt.Errorf("migrationFromNode does not host a source Pod")
+	}
+	for i := range request.ReplacementPods {
+		if !hasMigrationExclusion(&request.ReplacementPods[i], from) {
+			return fmt.Errorf("replacementPods[%d] lacks required migration hostname exclusion in every affinity term", i)
+		}
+	}
+	return nil
+}
+
+func hasMigrationExclusion(pod *corev1.Pod, from string) bool {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return false
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) == 0 {
+		return false
+	}
+	for _, term := range required.NodeSelectorTerms {
+		found := false
+		for _, requirement := range term.MatchExpressions {
+			if requirement.Key == corev1.LabelHostname && requirement.Operator == corev1.NodeSelectorOpNotIn {
+				for _, value := range requirement.Values {
+					if value == from {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func (p ProfileIdentity) validate() error {

@@ -37,13 +37,14 @@ type ClusterSnapshot struct {
 	// (a virtual entry is a blocked evacuation fed back by the engine).
 	PendingPods []PendingPod
 
-	// OMENativeExecutor is the checked capability observation for the
-	// cluster's OMENative executor. Its zero value is unavailable.
+	// OMENativeExecutor carries operator-configured migration API compatibility.
+	// Its zero value disables execution. It does not establish executor liveness.
 	OMENativeExecutor OMENativeExecutorState
 }
 
-// OMENativeExecutorState is the structured executor capability observed for
-// this snapshot.
+// OMENativeExecutorState retains the compatibility observation shape. Available
+// means that the operator opted into the supported migration API version;
+// RenewTime is retained for compatibility and is not a liveness signal.
 type OMENativeExecutorState struct {
 	Available   bool
 	WireVersion string

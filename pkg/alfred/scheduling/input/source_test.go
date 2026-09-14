@@ -299,6 +299,10 @@ func TestBuildRequestRejectsUntrustworthySourceState(t *testing.T) {
 		{name: "IR owner UID mismatch", mutate: func(objects []client.Object) { sourceIR(objects).OwnerReferences[0].UID = "other-isvc" }, want: "owner"},
 		{name: "pod owner UID mismatch", mutate: func(objects []client.Object) { sourcePods(objects)[0].OwnerReferences[0].UID = "other-ir" }, want: "owner"},
 		{name: "revision mismatch", mutate: func(objects []client.Object) { sourcePods(objects)[0].Labels[labelRevisionHash] = "other" }, want: "revision"},
+		{name: "Ready with target revision", mutate: func(objects []client.Object) {
+			ir := sourceIR(objects)
+			ir.Status.InstanceStatuses[0].TargetRevision = ir.Status.InstanceStatuses[0].RunningRevision
+		}, want: "revision"},
 		{name: "reused ordinal", gang: true, mutate: func(objects []client.Object) {
 			sourcePods(objects)[1].Labels[labelRunner] = sourcePods(objects)[0].Labels[labelRunner]
 		}, want: "member"},
@@ -468,7 +472,7 @@ func baseSourceObjects(runners []v1beta1.Runner, count int32) ([]client.Object, 
 			CurrentRevision: "svc-engine-rev-a", UpdateRevision: "svc-engine-rev-a",
 			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{
 				Index: 2, Incarnation: 7, Phase: v1beta1.OMENativeInstanceReady,
-				RunningRevision: "svc-engine-rev-a", TargetRevision: "svc-engine-rev-a", PodCount: count,
+				RunningRevision: "svc-engine-rev-a", PodCount: count,
 				ServingPodCount: count, AvailablePodCount: count, Admitted: true,
 			}},
 		},

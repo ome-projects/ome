@@ -8,6 +8,7 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-logr/logr v1.4.4
 	github.com/go-playground/validator/v10 v10.30.2
+	github.com/google/cel-go v0.29.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/kedacore/keda/v2 v2.20.2
@@ -39,6 +40,7 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	istio.io/client-go v1.19.4
 	k8s.io/api v0.36.2
+	k8s.io/apiextensions-apiserver v0.36.2
 	k8s.io/apimachinery v0.36.2
 	k8s.io/apiserver v0.36.2
 	k8s.io/cli-runtime v0.36.2
@@ -108,7 +110,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/btree v1.1.3 // indirect
-	github.com/google/cel-go v0.29.0 // indirect
 	github.com/google/gnostic-models v0.7.1 // indirect
 	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936 // indirect
 	github.com/grafana/regexp v0.0.0-20250905093917-f7b3be9d1853 // indirect
@@ -184,7 +185,6 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	istio.io/api v1.19.4 // indirect
-	k8s.io/apiextensions-apiserver v0.36.2 // indirect
 	k8s.io/component-base v0.36.2 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect

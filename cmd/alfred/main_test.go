@@ -10,6 +10,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"sigs.k8s.io/ome/pkg/alfred/config"
+	"sigs.k8s.io/ome/pkg/alfred/engine"
+	"sigs.k8s.io/ome/pkg/alfred/observer"
+	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 )
 
 func resetFlags(t *testing.T, args []string) {
@@ -50,6 +56,121 @@ func TestGetOptionsDefaults(t *testing.T) {
 	}
 	if !opts.enableLeaderElection || opts.configMapName != "alfred-config" || opts.configMapKey != "config.yaml" {
 		t.Fatalf("defaults not applied: %+v", opts)
+	}
+}
+
+func TestMigrationStartupDefaultsAndFlags(t *testing.T) {
+	resetFlags(t, []string{"alfred"})
+	opts := GetOptions()
+	if opts.migrationAPIVersion != "" || opts.migrationServiceAccount != "" {
+		t.Fatalf("migration execution must require explicit compatibility and identity configuration: %+v", opts)
+	}
+	if opts.migrationAckTimeout != 2*time.Minute || opts.migrationFailureBackoff != 5*time.Minute {
+		t.Fatalf("migration acknowledgement timeout and failure backoff must be bounded: %+v", opts)
+	}
+	if err := validateOptions(opts); err != nil {
+		t.Fatalf("recommend-only defaults rejected: %v", err)
+	}
+	resetFlags(t, []string{"alfred", "--migration-api-version=v1", "--migration-service-account=caretaker", "--migration-ack-timeout=3m", "--migration-failure-backoff=7m", "--simulation-workers=/etc/alfred/workers.json"})
+	opts = GetOptions()
+	if opts.migrationAPIVersion != "v1" || opts.migrationServiceAccount != "caretaker" || opts.migrationAckTimeout != 3*time.Minute || opts.migrationFailureBackoff != 7*time.Minute {
+		t.Fatalf("migration startup flags not parsed: %+v", opts)
+	}
+	if err := validateOptions(opts); err != nil {
+		t.Fatalf("valid migration startup rejected: %v", err)
+	}
+}
+
+func TestMigrationStartupRejectsUnsafeOptions(t *testing.T) {
+	valid := DefaultOptions()
+	valid.migrationAPIVersion = "v1"
+	valid.migrationServiceAccount = "ome-alfred"
+	valid.simulationWorkers = "/etc/alfred/workers.json"
+	for _, tc := range []struct {
+		name   string
+		change func(*Options)
+	}{
+		{"unsupported API", func(o *Options) { o.migrationAPIVersion = "v2" }},
+		{"missing account", func(o *Options) { o.migrationServiceAccount = "" }},
+		{"invalid account", func(o *Options) { o.migrationServiceAccount = "Bad_Account" }},
+		{"missing worker", func(o *Options) { o.simulationWorkers = "" }},
+		{"leader election disabled", func(o *Options) { o.enableLeaderElection = false }},
+		{"zero acknowledgement timeout", func(o *Options) { o.migrationAckTimeout = 0 }},
+		{"negative acknowledgement timeout", func(o *Options) { o.migrationAckTimeout = -time.Second }},
+		{"long acknowledgement timeout", func(o *Options) { o.migrationAckTimeout = time.Hour + time.Second }},
+		{"zero failure backoff", func(o *Options) { o.migrationFailureBackoff = 0 }},
+		{"negative failure backoff", func(o *Options) { o.migrationFailureBackoff = -time.Second }},
+		{"long failure backoff", func(o *Options) { o.migrationFailureBackoff = time.Hour + time.Second }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := valid
+			tc.change(&opts)
+			if err := validateOptions(opts); err == nil {
+				t.Fatalf("unsafe startup configuration accepted: %+v", opts)
+			}
+		})
+	}
+	valid.migrationAckTimeout, valid.migrationFailureBackoff = time.Hour, time.Hour
+	if err := validateOptions(valid); err != nil {
+		t.Fatalf("inclusive timeout limits rejected: %v", err)
+	}
+}
+
+type startupSimulator struct{}
+
+func (startupSimulator) Evaluate(context.Context, scheduling.Request) (scheduling.Result, error) {
+	return scheduling.Result{}, nil
+}
+
+func TestConfigureMigrationRequiresOptInAndLoadedWorker(t *testing.T) {
+	opts := DefaultOptions()
+	observations := &observer.Loop{}
+	decisions := &engine.DecisionLoop{Store: config.NewStore()}
+	if _, err := decisions.Store.Update([]byte("schemaVersion: 1\nmode: execute")); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureMigration(opts, nil, nil, observations, decisions); err != nil {
+		t.Fatal(err)
+	}
+	if observations.OMENativeExecutor != nil || decisions.Dispatcher != nil {
+		t.Fatal("execute configuration cannot bypass the startup compatibility opt-in")
+	}
+	opts.migrationAPIVersion, opts.migrationServiceAccount = "v1", "ome-alfred"
+	opts.simulationWorkers = "/etc/alfred/workers.json"
+	if err := configureMigration(opts, nil, nil, observations, decisions); err == nil {
+		t.Fatal("opt-in without a successfully loaded worker must fail startup")
+	}
+	decisions.Predictions = &engine.PredictionStage{}
+	if err := configureMigration(opts, nil, nil, observations, decisions); err == nil {
+		t.Fatal("a prediction stage without its simulator must fail startup")
+	}
+}
+
+func TestConfigureMigrationReusesWorkerAndChecksGuard(t *testing.T) {
+	opts := DefaultOptions()
+	opts.namespace = "caretaker"
+	opts.migrationAPIVersion, opts.migrationServiceAccount = "v1", "custom-alfred"
+	opts.simulationWorkers = "/etc/alfred/workers.json"
+	opts.migrationAckTimeout, opts.migrationFailureBackoff = 3*time.Minute, 7*time.Minute
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	observations := &observer.Loop{}
+	decisions := &engine.DecisionLoop{Store: config.NewStore(), Predictions: &engine.PredictionStage{Reader: cl, Simulator: &startupSimulator{}}}
+	if err := configureMigration(opts, cl, cl, observations, decisions); err != nil {
+		t.Fatal(err)
+	}
+	compatibility := observations.OMENativeExecutor(context.Background())
+	if !compatibility.Available || compatibility.WireVersion != "v1" || compatibility.Reason != "OperatorConfigured" || !compatibility.RenewTime.IsZero() {
+		t.Fatalf("operator compatibility must not claim a liveness observation: %+v", compatibility)
+	}
+	dispatcher, ok := decisions.Dispatcher.(*engine.Dispatcher)
+	if !ok || dispatcher.Reader != cl || dispatcher.Client != cl || dispatcher.Simulator != decisions.Predictions.Simulator || dispatcher.Store != decisions.Store {
+		t.Fatalf("dispatcher did not reuse the direct reader, worker and configuration: %+v", decisions.Dispatcher)
+	}
+	if dispatcher.Namespace != "caretaker" || dispatcher.Options.APIVersion != "v1" || dispatcher.Options.AcknowledgementTimeout != 3*time.Minute || dispatcher.Options.FailureBackoff != 7*time.Minute {
+		t.Fatalf("dispatcher startup bounds or identity namespace changed: %+v", dispatcher)
+	}
+	if dispatcher.Guard == nil || dispatcher.Guard(context.Background()) == nil {
+		t.Fatal("missing admission objects must fail the wired dispatcher guard")
 	}
 }
 

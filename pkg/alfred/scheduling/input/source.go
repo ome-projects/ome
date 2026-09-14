@@ -236,7 +236,7 @@ func resolveSource(s *Snapshot, source Source) (*sourceState, error) {
 	if state.row == nil || state.row.Phase != v1beta1.OMENativeInstanceReady || state.row.Operation != nil {
 		return nil, fmt.Errorf("source instance is not Ready and operation-free")
 	}
-	if state.row.Incarnation <= 0 || state.row.RunningRevision == "" || state.row.RunningRevision != state.row.TargetRevision ||
+	if state.row.Incarnation <= 0 || state.row.RunningRevision == "" || state.row.TargetRevision != "" ||
 		state.row.RunningRevision != state.ir.Status.CurrentRevision {
 		return nil, fmt.Errorf("source instance revision or incarnation is invalid")
 	}

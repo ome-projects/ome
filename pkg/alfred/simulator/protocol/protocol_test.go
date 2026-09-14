@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,97 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 )
+
+func migrationRequest() Request {
+	r := validRequest()
+	r.MigrationFromNode = "source-node"
+	r.RequireGang = true
+	second := r.SourcePods[0].DeepCopy()
+	second.Name = "source-two"
+	second.UID = "source-two-uid"
+	second.Spec.NodeName = "other-source"
+	r.SourcePods = append(r.SourcePods, *second)
+	r.ClusterObjects = append(r.ClusterObjects, runtime.RawExtension{Object: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "other-source"}}}, runtime.RawExtension{Object: second.DeepCopy()})
+	replacement := r.ReplacementPods[0].DeepCopy()
+	replacement.Name = "replacement-two"
+	replacement.UID = "replacement-two-uid"
+	r.ReplacementPods = append(r.ReplacementPods, *replacement)
+	for i := range r.ReplacementPods {
+		r.ReplacementPods[i].Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"source-node"}}}}}}}}
+	}
+	return r
+}
+
+func TestMigrationSingleSourceExclusion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*Request)
+		want bool
+	}{
+		{"whole gang", func(*Request) {}, true},
+		{"legacy exclusion", func(r *Request) { r.MigrationFromNode = "" }, false},
+		{"not a source", func(r *Request) {
+			r.ClusterObjects = append(r.ClusterObjects, runtime.RawExtension{Object: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "destination"}}})
+			r.MigrationFromNode = "destination"
+			r.ExcludedNodes = []string{"destination"}
+		}, false},
+		{"invalid DNS", func(r *Request) { r.MigrationFromNode = "SOURCE_NODE"; r.ExcludedNodes = []string{"SOURCE_NODE"} }, false},
+		{"extra exclusion", func(r *Request) { r.ExcludedNodes = append(r.ExcludedNodes, "other-source") }, false},
+		{"duplicate exclusion", func(r *Request) { r.ExcludedNodes = append(r.ExcludedNodes, "source-node") }, false},
+		{"mismatched exclusion", func(r *Request) { r.ExcludedNodes = []string{"other-source"} }, false},
+		{"missing exclusion", func(r *Request) { r.ExcludedNodes = nil }, false},
+		{"unknown source node", func(r *Request) { r.ClusterObjects = r.ClusterObjects[1:] }, false},
+		{"deleting source node", func(r *Request) {
+			now := metav1.Now()
+			r.ClusterObjects[0].Object.(*corev1.Node).DeletionTimestamp = &now
+		}, false},
+		{"missing occupancy", func(r *Request) { r.ClusterObjects = r.ClusterObjects[:len(r.ClusterObjects)-1] }, false},
+		{"changed occupancy", func(r *Request) {
+			r.ClusterObjects[len(r.ClusterObjects)-1].Object.(*corev1.Pod).Spec.NodeName = "source-node"
+		}, false},
+		{"missing overlay", func(r *Request) { r.ReplacementPods[1].Spec.Affinity = nil }, false},
+		{"unguarded OR term", func(r *Request) {
+			na := r.ReplacementPods[0].Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+			na.NodeSelectorTerms = append(na.NodeSelectorTerms, corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"west"}}}})
+		}, false},
+		{"wrong hostname key", func(r *Request) {
+			r.ReplacementPods[0].Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Key = "other"
+		}, false},
+		{"wrong operator", func(r *Request) {
+			r.ReplacementPods[0].Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Operator = corev1.NodeSelectorOpIn
+		}, false},
+		{"superset", func(r *Request) {
+			r.ReplacementPods[0].Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values = []string{"source-node", "unrelated"}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := migrationRequest()
+			tc.edit(&r)
+			before := make([]runtime.RawExtension, len(r.ClusterObjects))
+			for i := range r.ClusterObjects {
+				before[i] = *r.ClusterObjects[i].DeepCopy()
+			}
+			snapshot, err := Validate(r)
+			if (err == nil) != tc.want {
+				t.Fatalf("Validate()=%v, allowed want %v", err, tc.want)
+			}
+			if reason := map[string]string{"not a source": "does not host a source Pod", "invalid DNS": "DNS1123"}[tc.name]; reason != "" && (err == nil || !strings.Contains(err.Error(), reason)) {
+				t.Fatalf("Validate()=%v, want %s", err, reason)
+			}
+			if !reflect.DeepEqual(before, r.ClusterObjects) {
+				t.Fatal("validation changed snapshot occupancy")
+			}
+			if err == nil {
+				for _, source := range r.SourcePods {
+					actual := snapshot.Pods[types.NamespacedName{Namespace: source.Namespace, Name: source.Name}]
+					if actual == nil || actual.UID != source.UID || actual.Spec.NodeName != source.Spec.NodeName {
+						t.Fatal("source Pod absent from validated occupancy")
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestValidateRequiresSourceOccupancy(t *testing.T) {
 	req := validRequest()

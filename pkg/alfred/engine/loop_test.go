@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,10 +11,12 @@ import (
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 type stubSource struct{ snap *snapshot.ClusterSnapshot }
@@ -103,6 +106,51 @@ func TestRunOnceWithoutSnapshotSkips(t *testing.T) {
 	loop.RunOnce(context.Background())
 	if atomic.LoadInt64(&p.calls) != 0 {
 		t.Fatal("no snapshot means no evaluation")
+	}
+}
+
+type loopDispatcher struct {
+	received  []policy.Candidate
+	mode      string
+	out       []policy.Candidate
+	decisions []Decision
+}
+
+func (d *loopDispatcher) Execute(_ context.Context, _ *snapshot.ClusterSnapshot, candidates []policy.Candidate, cfg *config.Config, _ *Arbiter) ([]policy.Candidate, []Decision) {
+	d.received = append([]policy.Candidate(nil), candidates...)
+	d.mode = cfg.Mode
+	return d.out, d.decisions
+}
+
+func TestRunOnceDispatchReceivesUngatedExecutionCandidates(t *testing.T) {
+	for _, mode := range []string{config.ModeExecute, config.ModeRecommendOnly} {
+		t.Run(mode, func(t *testing.T) {
+			c := cand("prod/a", "node1")
+			c.Mode = constants.OMENative
+			loop, reporter, _ := newTestLoop(t, scenario().Build(), &stubPolicy{out: []policy.Candidate{c}})
+			if _, err := loop.Store.Update([]byte("schemaVersion: 1\nmode: " + mode)); err != nil {
+				t.Fatal(err)
+			}
+			pending := c
+			pending.Executable = false
+			dispatcher := &loopDispatcher{out: []policy.Candidate{pending}, decisions: []Decision{{Candidate: pending, DispatchStatus: "acknowledged", RequestUUID: "pending-request"}}}
+			loop.Dispatcher = dispatcher
+			loop.Predictions = &PredictionStage{}
+			loop.RunOnce(context.Background())
+			if dispatcher.mode != mode || len(dispatcher.received) != 1 {
+				t.Fatalf("dispatcher did not receive the decision pass in %s: %+v", mode, dispatcher.received)
+			}
+			if dispatcher.received[0].Executable != (mode == config.ModeExecute) {
+				t.Fatalf("execution gating used the wrong mode: %+v", dispatcher.received[0])
+			}
+			var cm corev1.ConfigMap
+			if err := reporter.Client.Get(context.Background(), client.ObjectKey{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(cm.Data[recommendationsKey], `"requestUUID":"pending-request"`) || !strings.Contains(cm.Data[recommendationsKey], `"outcome":"acknowledged"`) {
+				t.Fatalf("outstanding request returned by dispatcher was not reported: %s", cm.Data[recommendationsKey])
+			}
+		})
 	}
 }
 

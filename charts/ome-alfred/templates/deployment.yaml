@@ -1,4 +1,12 @@
 {{- if .Values.enabled }}
+{{- if .Values.migration.apiVersion }}
+{{- if ne .Values.migration.apiVersion "v1" }}
+{{- fail "migration.apiVersion must be v1 when enabled" }}
+{{- end }}
+{{- if not .Values.simulation.configMapName }}
+{{- fail "migration.apiVersion requires simulation.configMapName" }}
+{{- end }}
+{{- end }}
 # Alfred, the GPU cluster caretaker (OEP-0008). Every replica runs the
 # read-only observation loop; only the leader decides and dispatches.
 apiVersion: apps/v1
@@ -46,6 +54,12 @@ spec:
           - "--leader-elect=true"
           - "--config-name={{ .Values.configMapName }}"
           - "--config-key=config.yaml"
+          {{- if .Values.migration.apiVersion }}
+          - "--migration-api-version=v1"
+          - "--migration-service-account=ome-alfred"
+          - {{ printf "--migration-ack-timeout=%s" .Values.migration.acknowledgementTimeout | quote }}
+          - {{ printf "--migration-failure-backoff=%s" .Values.migration.failureBackoff | quote }}
+          {{- end }}
           {{- if .Values.simulation.configMapName }}
           - "--simulation-workers=/etc/alfred-simulation/workers.json"
           - {{ printf "--simulation-timeout=%s" .Values.simulation.timeout | quote }}

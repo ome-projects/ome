@@ -10,6 +10,11 @@ metadata:
   labels:
     app.kubernetes.io/component: "ome-alfred"
 rules:
+  # Alfred verifies this cluster-fixed guard but cannot install or alter it.
+  - apiGroups: [ "admissionregistration.k8s.io" ]
+    resources: [ "validatingadmissionpolicies", "validatingadmissionpolicybindings" ]
+    resourceNames: [ "ome-alfred-migration-writes" ]
+    verbs: [ "get" ]
   # Nodes (read-only) — no cordon, no drain, no patch.
   - apiGroups: [ "" ]
     resources: [ "nodes" ]

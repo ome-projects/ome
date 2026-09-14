@@ -19,8 +19,14 @@ type SnapshotSource interface {
 	Latest() *snapshot.ClusterSnapshot
 }
 
-// DecisionLoop is the leader-only decision Runnable: policies → arbiter →
-// reporter (→ dispatcher, in the execute path) on the configured cadence.
+// MigrationDispatcher reconciles requests and gates new submissions. It also
+// returns outstanding request observations that no policy currently emits.
+type MigrationDispatcher interface {
+	Execute(context.Context, *snapshot.ClusterSnapshot, []policy.Candidate, *config.Config, *Arbiter) ([]policy.Candidate, []Decision)
+}
+
+// DecisionLoop is the leader-only decision Runnable: policies → optional
+// dispatch and arbitration → reporter on the configured cadence.
 // One pass at a time by construction — a single goroutine runs RunOnce, so
 // an overrunning pass delays the next tick and never overlaps it: every
 // safety bound assumes admissions are totally ordered.
@@ -30,6 +36,7 @@ type DecisionLoop struct {
 	Policies  []policy.Policy
 	// Predictions is optional and can only enrich non-executable advice.
 	Predictions *PredictionStage
+	Dispatcher  MigrationDispatcher
 	Arbiter     *Arbiter
 	Reporter    *Reporter
 	Metrics     *metrics.Metrics
@@ -87,14 +94,23 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 	for _, p := range l.Policies {
 		candidates = append(candidates, p.Evaluate(snap, cfg)...)
 	}
-	if l.Predictions != nil {
-		candidates = l.Predictions.Annotate(ctx, snap, cfg, candidates)
-	} else {
-		for i, candidate := range candidates {
-			candidates[i] = gateSchedulingCandidate(snap, cfg, candidate)
+	if l.Dispatcher == nil || cfg.Mode != config.ModeExecute {
+		if l.Predictions != nil {
+			candidates = l.Predictions.Annotate(ctx, snap, cfg, candidates)
+		} else {
+			for i, candidate := range candidates {
+				candidates[i] = gateSchedulingCandidate(snap, cfg, candidate)
+			}
 		}
 	}
-	decisions := l.Arbiter.Admit(snap, candidates, cfg, l.now())
+	var decisions []Decision
+	if l.Dispatcher != nil {
+		// Execute also reconciles outstanding requests in recommend-only
+		// mode, without submitting annotations in that mode.
+		candidates, decisions = l.Dispatcher.Execute(ctx, snap, candidates, cfg, l.Arbiter)
+	} else {
+		decisions = l.Arbiter.Admit(snap, candidates, cfg, l.now())
+	}
 
 	if l.Arbiter.Ledger != nil && l.Arbiter.Ledger.BreakerOpen(l.now()) {
 		l.Metrics.CircuitBreakerState.Set(1)
@@ -102,8 +118,6 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 		l.Metrics.CircuitBreakerState.Set(0)
 	}
 
-	// The Dispatcher joins in the execute path (with the VAP guard); until
-	// then every admitted candidate is withheld and the Reporter says so.
 	l.Reporter.ReportCycle(ctx, candidates, decisions, cfg, l.now())
 
 	l.Metrics.DecisionLoopDuration.Observe(l.now().Sub(started).Seconds())
