@@ -33,8 +33,10 @@ The compact table keeps each line within 80 columns. WINDOW is
 OBS/BOUND/SEEN/ASKED: C=complete, P=partial, U=unavailable, N=not requested;
 B=retention-bounded and I=incomplete. ROLES uses A=active, Q=requested,
 R=reported, and H=history. CHECK uses OK, BAD, or ?; LIVE uses MATCH, DIFF,
-AMB, or ?. ISSUES uses R/G for revision/global report counts. Use -o wide
-for full timestamps, hashes, sources, and exact issue codes.`, cmd.Long)
+AMB, or ?. ISSUES uses R/G for revision/global report counts. Long revision
+names use PREFIX#DIGEST, with an eight-hex display-only digest of the complete
+revision name. It is not a Kubernetes identity or runtime hash. Use -o wide
+for full revision names, timestamps, hashes, sources, and exact issue codes.`, cmd.Long)
 
 	output := cmd.Flags().Lookup("output")
 	require.NotNil(t, output)
@@ -76,8 +78,10 @@ The compact table keeps each line within 80 columns. WINDOW is
 OBS/BOUND/SEEN/ASKED: C=complete, P=partial, U=unavailable, N=not requested;
 B=retention-bounded and I=incomplete. ROLES uses A=active, Q=requested,
 R=reported, and H=history. CHECK uses OK, BAD, or ?; LIVE uses MATCH, DIFF,
-AMB, or ?. ISSUES uses R/G for revision/global report counts. Use -o wide
-for full timestamps, hashes, sources, and exact issue codes.
+AMB, or ?. ISSUES uses R/G for revision/global report counts. Long revision
+names use PREFIX#DIGEST, with an eight-hex display-only digest of the complete
+revision name. It is not a Kubernetes identity or runtime hash. Use -o wide
+for full revision names, timestamps, hashes, sources, and exact issue codes.
 
 Usage:
   runtime history INFERENCESERVICE [flags]

@@ -232,11 +232,12 @@ func compactRuntimeHistoryPageCount(count int) string {
 
 func compactRuntimeHistoryIdentity(value string) string {
 	const normalizedIdentityLimit = 1024
-	clean := printers.BoundedMiddleCell(orDash(value), normalizedIdentityLimit)
+	identity := orDash(value)
+	digest := sha256.Sum256([]byte(identity))
+	clean := printers.BoundedMiddleCell(identity, normalizedIdentityLimit)
 	if printers.BoundedMiddleCell(clean, compactRuntimeHistoryRevisionWidth) == clean {
 		return clean
 	}
-	digest := sha256.Sum256([]byte(clean))
 	prefix := printers.BoundedCell(clean, compactRuntimeHistoryRevisionWidth-1-8)
 	return prefix + "#" + hex.EncodeToString(digest[:4])
 }

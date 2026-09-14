@@ -376,6 +376,30 @@ func TestRuntimeHistoryCompactTableBoundsSanitizedUnicodeByDisplayWidth(t *testi
 	}
 }
 
+func TestRuntimeHistoryCompactTableDisambiguatesBeyondSafetyClip(t *testing.T) {
+	prefix := strings.Repeat("a", 511)
+	suffix := strings.Repeat("z", 510)
+	firstName := prefix + "first-distinct-middle" + suffix
+	secondName := prefix + "second-distinct-middle" + suffix
+	content := v1alpha1.RuntimeHistoryContent{
+		Revisions: []v1alpha1.RuntimeRevisionEntry{
+			{Revision: v1alpha1.RuntimeRevisionReference{Name: firstName}},
+			{Revision: v1alpha1.RuntimeRevisionReference{Name: secondName}},
+		},
+	}
+
+	first := content.Table()
+	second := content.Table()
+	require.Len(t, first.Rows, 2)
+	require.Len(t, second.Rows, 2)
+	assert.Equal(t, "aa...#4a16bd72", first.Rows[0][1])
+	assert.Equal(t, "aa...#7933716b", first.Rows[1][1])
+	assert.Equal(t, first, second)
+	for _, row := range first.Rows {
+		assert.Equal(t, row[1], printers.BoundedMiddleCell(row[1], 14))
+	}
+}
+
 func TestRuntimeHistoryCompactTableMapsUnknownAndEmptyStatesClosed(t *testing.T) {
 	zero := time.Time{}
 	tests := []struct {
