@@ -7,6 +7,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"unicode"
+	"unicode/utf8"
 )
 
 const tablePadding = 3
@@ -15,7 +16,10 @@ func writeTable(w io.Writer, headers []string, rows [][]string, sanitizeNonTermi
 	width, terminal := TerminalWidth(w)
 	if !terminal {
 		if sanitizeNonTerminal {
-			headers, rows = sanitizedTable(headers, rows)
+			cleanHeaders, cleanRows := sanitizedTable(headers, rows)
+			return writeTerminalAlignedTable(
+				w, cleanHeaders, cleanRows, columnWidths(cleanHeaders, cleanRows),
+			)
 		}
 		return writeAlignedTable(w, headers, rows)
 	}
@@ -563,6 +567,89 @@ func displayWidth(value string) int {
 		width += cluster.width
 	}
 	return width
+}
+
+// BoundedCell sanitizes value and clips its suffix so the result occupies at
+// most maxWidth terminal columns. The ASCII ellipsis makes truncation explicit.
+func BoundedCell(value string, maxWidth int) string {
+	return boundedCell(value, maxWidth, false)
+}
+
+// BoundedMiddleCell sanitizes value and clips its middle so the result
+// occupies at most maxWidth terminal columns. It preserves both ends of
+// resource identities while making truncation explicit with an ASCII ellipsis.
+func BoundedMiddleCell(value string, maxWidth int) string {
+	return boundedCell(value, maxWidth, true)
+}
+
+func boundedCell(value string, maxWidth int, middle bool) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	clean := normalizedBoundedCell(value)
+	if displayWidth(clean) <= maxWidth {
+		return clean
+	}
+	const marker = "..."
+	if maxWidth <= len(marker) {
+		return marker[:maxWidth]
+	}
+	contentWidth := maxWidth - len(marker)
+	if !middle {
+		return displayPrefix(clean, contentWidth) + marker
+	}
+	leftWidth := (contentWidth + 1) / 2
+	rightWidth := contentWidth - leftWidth
+	return displayPrefix(clean, leftWidth) + marker + displaySuffix(clean, rightWidth)
+}
+
+// normalizedBoundedCell gives every output cluster a positive, bounded byte
+// representation before clipping. This prevents standalone zero-width input
+// or an adversarially long combining sequence from bypassing a display-width
+// limit while preserving ordinary Unicode graphemes and emoji.
+func normalizedBoundedCell(value string) string {
+	clean := sanitizeCell(value)
+	var result strings.Builder
+	for _, cluster := range displayClusters(clean) {
+		if cluster.width <= 0 || utf8.RuneCountInString(cluster.value) > 16 {
+			quoted := strconv.QuoteToASCII(cluster.value)
+			result.WriteString(quoted[1 : len(quoted)-1])
+			continue
+		}
+		result.WriteString(cluster.value)
+	}
+	return result.String()
+}
+
+func displayPrefix(value string, maxWidth int) string {
+	var result strings.Builder
+	width := 0
+	for _, cluster := range displayClusters(value) {
+		if width+cluster.width > maxWidth {
+			break
+		}
+		result.WriteString(cluster.value)
+		width += cluster.width
+	}
+	return result.String()
+}
+
+func displaySuffix(value string, maxWidth int) string {
+	clusters := displayClusters(value)
+	start := len(clusters)
+	width := 0
+	for i := len(clusters) - 1; i >= 0; i-- {
+		if width+clusters[i].width > maxWidth {
+			break
+		}
+		start = i
+		width += clusters[i].width
+	}
+	var result strings.Builder
+	for _, cluster := range clusters[start:] {
+		result.WriteString(cluster.value)
+	}
+	return result.String()
 }
 
 type displayCluster struct {

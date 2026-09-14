@@ -177,6 +177,27 @@ func TestTablePreservesLegacyNonTerminalCells(t *testing.T) {
 	assert.Equal(t, want.String(), got.String())
 }
 
+func TestSanitizedNonTerminalTableAlignsMixedRowsByDisplayWidth(t *testing.T) {
+	table := Table{
+		Headers: []string{"REASON", "VALUE"},
+		Rows: [][]string{
+			{strings.Repeat("a", 20), "x"},
+			{strings.Repeat("界", 10), "x"},
+		},
+	}
+	var output bytes.Buffer
+
+	require.NoError(t, table.WriteSanitized(&output))
+
+	assertPhysicalLinesWithin(t, output.String(), 28)
+	assert.Equal(t,
+		"REASON                 VALUE\n"+
+			"aaaaaaaaaaaaaaaaaaaa   x\n"+
+			"界界界界界界界界界界   x\n",
+		output.String(),
+	)
+}
+
 func TestTableAlignsTerminalCellsAtExactBoundary(t *testing.T) {
 	w := &terminalBuffer{width: 6, terminal: true}
 	table := Table{
@@ -242,6 +263,40 @@ func TestDisplayWidthTreatsEmojiSequencesAsOneCluster(t *testing.T) {
 		{value: "B\u200d", width: 1},
 		{value: "C", width: 1},
 	}, displayClusters("A\u200dB\u200dC"))
+}
+
+func TestBoundedCellSanitizesBeforeClippingByDisplayWidth(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		width int
+		want  string
+	}{
+		{name: "control expansion", value: "\n\n\n\n", width: 7, want: `\n\n...`},
+		{name: "wide glyph", value: "界界界", width: 5, want: "界..."},
+		{name: "middle identity", value: "abcdefghij", width: 7, want: "ab...ij"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := BoundedCell(test.value, test.width)
+			if test.name == "middle identity" {
+				got = BoundedMiddleCell(test.value, test.width)
+			}
+			assert.Equal(t, test.want, got)
+			assert.LessOrEqual(t, displayWidth(got), test.width)
+		})
+	}
+}
+
+func TestBoundedCellBoundsZeroWidthAndOversizedClusters(t *testing.T) {
+	for _, value := range []string{
+		strings.Repeat("\u200b", 20),
+		"a" + strings.Repeat("\u0301", 20),
+	} {
+		got := BoundedCell(value, 12)
+		assert.LessOrEqual(t, displayWidth(got), 12)
+		assert.LessOrEqual(t, len([]rune(got)), 12)
+	}
 }
 
 func TestEmojiZWJSequencesRetainPositiveWidthExtendRunes(t *testing.T) {

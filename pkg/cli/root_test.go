@@ -28,6 +28,8 @@ func TestRootCommandTree(t *testing.T) {
 		"ome autoscale",
 		"ome autoscale status",
 		"ome get",
+		"ome instance",
+		"ome instance list",
 		"ome logs",
 		"ome rollout",
 		"ome rollout explain",
@@ -59,6 +61,23 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if tree.Use != "tree RUNTIME" || tree.Short != "Show runtime inheritance and InferenceService users" {
 		t.Fatalf("runtime tree contract changed: Use=%q Short=%q", tree.Use, tree.Short)
+	}
+}
+
+func TestRootHelpListsLogicalInstanceInspection(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	root := NewRootCmdWithFactory(factory.Static{NS: "default"}, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: &output, ErrOut: &output,
+	})
+	root.SetArgs([]string{"--help"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !bytes.Contains(output.Bytes(), []byte("  instance    Inspect controller-reported logical instances\n")) {
+		t.Fatalf("root help does not list instance command:\n%s", output.String())
 	}
 }
 
