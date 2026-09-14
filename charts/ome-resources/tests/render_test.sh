@@ -328,6 +328,28 @@ multicluster_access="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --show-only templates/ome-controller/rbac/multicluster_access.yaml)"
 grep -Fqx '  - inferencereplicas' <<<"${multicluster_access}" ||
   fail "multicluster-access ClusterRole does not grant inferencereplicas"
+# Direct gateway publication follows the generated route to its parent Gateway;
+# the workload-cluster credential must be able to read both objects.
+grep -Fqx '  - gateways' <<<"${multicluster_access}" ||
+  fail "multicluster-access ClusterRole does not grant gateways"
+grep -Fqx '  - httproutes' <<<"${multicluster_access}" ||
+  fail "multicluster-access ClusterRole does not grant httproutes"
+
+gateway_backend_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.config.endpoint.gatewayBackend.rewriteHostname=true \
+  --set ome.multicluster.config.endpoint.gatewayBackend.tls.enabled=true \
+  --set-string ome.multicluster.config.endpoint.gatewayBackend.tls.wellKnownCACertificates=System \
+  --set ome.multicluster.config.endpoint.gatewayBackend.endpointSlices.enabled=true \
+  --set-string ome.multicluster.config.endpoint.gatewayBackend.endpointSlices.addressRefreshInterval=1m \
+  --show-only templates/ome-controller/configmap.yaml)"
+for expected in \
+  '"rewriteHostname": true' \
+  '"wellKnownCACertificates": "System"' \
+  '"addressRefreshInterval": "1m"'; do
+  grep -Fq "${expected}" <<<"${gateway_backend_config}" ||
+    fail "gateway backend setting was not rendered: ${expected}"
+done
 
 # acceleratorResources has no in-code default: the chart default is the only
 # source of any non-nvidia recognition. It stays nvidia-only so upgrading the

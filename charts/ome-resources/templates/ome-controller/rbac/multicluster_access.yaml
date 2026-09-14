@@ -97,6 +97,16 @@ rules:
   - get
   - list
   - watch
+# Gateway API: read-only. The control-plane endpoint publisher follows each
+# derived InferenceService's generated HTTPRoute to its parent Gateway and reads
+# the Gateway's advertised addresses. Both resources remain workload-owned.
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gateways
+  - httproutes
+  verbs:
+  - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

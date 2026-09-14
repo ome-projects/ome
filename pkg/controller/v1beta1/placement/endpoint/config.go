@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
+	"time"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -38,7 +39,7 @@ type Config struct {
 	GlobalGateway string
 
 	// RouteNamespace is the namespace the published HTTPRoute and its backing
-	// ExternalName Service are created in. Empty falls back to the
+	// resources are created in. Empty falls back to the
 	// InferenceService's own namespace (so the route is co-located with — and
 	// garbage-collected alongside — its source object by default).
 	RouteNamespace string
@@ -49,9 +50,55 @@ type Config struct {
 	// (IsEnabled()==false) instead — supply it via config.
 	BackendPort int32
 
+	// GatewayBackend configures hostname rewriting, backend TLS, and the optional
+	// direct-address fallback for each workload cluster Gateway.
+	GatewayBackend GatewayBackendConfig
+
 	// Labels are stamped onto every resource the publisher creates, so an
 	// operator can select/observe published backends. Optional.
 	Labels map[string]string
+}
+
+// GatewayBackendConfig configures how the global Gateway connects to each
+// workload cluster Gateway while retaining an ExternalName Service as the
+// baseline backend representation.
+//
+// +kubebuilder:object:generate=false
+type GatewayBackendConfig struct {
+	// RewriteHostname replaces the request Host header with the selected home's
+	// ingress hostname before forwarding.
+	RewriteHostname bool
+
+	// TLS configures HTTPS origination and certificate validation independently
+	// of how the backing Service obtains addresses.
+	TLS GatewayBackendTLSConfig
+
+	// EndpointSlices enables the direct-address fallback for environments where
+	// the ExternalName resolves to an address the global Gateway cannot reach.
+	EndpointSlices GatewayBackendEndpointSliceConfig
+}
+
+// GatewayBackendTLSConfig configures a BackendTLSPolicy for every home.
+//
+// +kubebuilder:object:generate=false
+type GatewayBackendTLSConfig struct {
+	Enabled bool
+
+	// WellKnownCACertificates selects the trust roots used to authenticate each
+	// backend Gateway. It is written verbatim to BackendTLSPolicy.
+	WellKnownCACertificates string
+}
+
+// GatewayBackendEndpointSliceConfig configures direct Gateway address
+// publication for every home.
+//
+// +kubebuilder:object:generate=false
+type GatewayBackendEndpointSliceConfig struct {
+	Enabled bool
+
+	// AddressRefreshInterval controls how often published gateway addresses are
+	// re-read. Required when Enabled; a zero value schedules no periodic refresh.
+	AddressRefreshInterval time.Duration
 }
 
 // HostTemplateData is the field set GlobalHostTemplate is evaluated against.

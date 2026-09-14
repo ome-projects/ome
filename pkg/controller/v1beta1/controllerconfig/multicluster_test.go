@@ -163,7 +163,7 @@ func TestNewMultiClusterConfig(t *testing.T) {
 	}
 }
 
-// A stated-but-unparseable duration must fail at startup rather than read as
+// A stated-but-unparsable duration must fail at startup rather than read as
 // "not set": the forgiving accessors would discard the operator's intended
 // value for the life of the process, with the built-in default silently
 // standing in.
@@ -193,6 +193,35 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 			cfg:  MultiClusterConfig{Endpoint: EndpointConfig{BackendPort: 99999}},
 			want: "endpoint.backendPort",
 		},
+		{
+			name: "gateway backend missing refresh interval",
+			cfg: MultiClusterConfig{Endpoint: EndpointConfig{
+				GlobalGateway: "infra/global-gw", BackendPort: 443,
+				GatewayBackend: EndpointGatewayBackendConfig{
+					EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{Enabled: true},
+				},
+			}},
+			want: "endpoint.gatewayBackend.endpointSlices.addressRefreshInterval",
+		},
+		{
+			name: "gateway backend missing trust roots",
+			cfg: MultiClusterConfig{Endpoint: EndpointConfig{
+				GlobalGateway: "infra/global-gw", BackendPort: 443,
+				GatewayBackend: EndpointGatewayBackendConfig{
+					TLS: EndpointGatewayBackendTLSConfig{Enabled: true},
+				},
+			}},
+			want: "endpoint.gatewayBackend.tls.wellKnownCACertificates",
+		},
+		{
+			name: "endpoint slice settings ignored while disabled",
+			cfg: MultiClusterConfig{Endpoint: EndpointConfig{
+				GatewayBackend: EndpointGatewayBackendConfig{
+					EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{AddressRefreshInterval: "1m"},
+				},
+			}},
+			want: "endpoint.gatewayBackend.endpointSlices.enabled",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -213,8 +242,33 @@ func TestMultiClusterConfig_ValidateAcceptsEmptyAndWellFormed(t *testing.T) {
 	require.NoError(t, MultiClusterConfig{
 		WorkloadCluster: WorkloadClusterConfig{HealthInterval: "30s", EstablishMax: "10m"},
 		Placement:       PlacementConfig{GCInterval: "5m", LocalQueue: "gpu-queue"},
-		Endpoint:        EndpointConfig{BackendPort: 8080},
+		Endpoint: EndpointConfig{
+			GlobalGateway: "infra/global-gw",
+			BackendPort:   443,
+			GatewayBackend: EndpointGatewayBackendConfig{
+				RewriteHostname: true,
+				TLS: EndpointGatewayBackendTLSConfig{
+					Enabled:                 true,
+					WellKnownCACertificates: "System",
+				},
+				EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{
+					Enabled:                true,
+					AddressRefreshInterval: "1m",
+				},
+			},
+		},
 	}.Validate())
+	for _, gatewayBackend := range []EndpointGatewayBackendConfig{
+		{RewriteHostname: true},
+		{TLS: EndpointGatewayBackendTLSConfig{Enabled: true, WellKnownCACertificates: "System"}},
+		{EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{Enabled: true, AddressRefreshInterval: "1m"}},
+	} {
+		require.NoError(t, MultiClusterConfig{Endpoint: EndpointConfig{
+			GlobalGateway:  "infra/global-gw",
+			BackendPort:    443,
+			GatewayBackend: gatewayBackend,
+		}}.Validate(), "gateway backend features can be enabled independently")
+	}
 }
 
 // Loading stays forgiving by contract: a malformed knob must NOT fail the load

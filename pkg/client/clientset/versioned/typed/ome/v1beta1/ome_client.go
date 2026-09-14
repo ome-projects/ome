@@ -23,6 +23,7 @@ type OmeV1beta1Interface interface {
 	InferenceReplicasGetter
 	InferenceServicesGetter
 	ServingRuntimesGetter
+	TrafficMapsGetter
 	WorkloadClustersGetter
 }
 
@@ -73,6 +74,10 @@ func (c *OmeV1beta1Client) InferenceServices(namespace string) InferenceServiceI
 
 func (c *OmeV1beta1Client) ServingRuntimes(namespace string) ServingRuntimeInterface {
 	return newServingRuntimes(c, namespace)
+}
+
+func (c *OmeV1beta1Client) TrafficMaps(namespace string) TrafficMapInterface {
+	return newTrafficMaps(c, namespace)
 }
 
 func (c *OmeV1beta1Client) WorkloadClusters() WorkloadClusterInterface {

@@ -30,6 +30,8 @@ type Interface interface {
 	InferenceServices() InferenceServiceInformer
 	// ServingRuntimes returns a ServingRuntimeInformer.
 	ServingRuntimes() ServingRuntimeInformer
+	// TrafficMaps returns a TrafficMapInformer.
+	TrafficMaps() TrafficMapInformer
 	// WorkloadClusters returns a WorkloadClusterInformer.
 	WorkloadClusters() WorkloadClusterInformer
 }
@@ -98,6 +100,11 @@ func (v *version) InferenceServices() InferenceServiceInformer {
 // ServingRuntimes returns a ServingRuntimeInformer.
 func (v *version) ServingRuntimes() ServingRuntimeInformer {
 	return &servingRuntimeInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// TrafficMaps returns a TrafficMapInformer.
+func (v *version) TrafficMaps() TrafficMapInformer {
+	return &trafficMapInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // WorkloadClusters returns a WorkloadClusterInformer.

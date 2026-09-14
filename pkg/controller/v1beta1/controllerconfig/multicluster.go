@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // MultiClusterConfigName is the inferenceservice-config ConfigMap key holding
@@ -38,6 +40,7 @@ type MultiClusterConfig struct {
 	WorkloadCluster WorkloadClusterConfig `json:"workloadCluster,omitempty"`
 	Placement       PlacementConfig       `json:"placement,omitempty"`
 	Endpoint        EndpointConfig        `json:"endpoint,omitempty"`
+	Routing         RoutingConfig         `json:"routing,omitempty"`
 }
 
 // +kubebuilder:object:generate=false
@@ -134,11 +137,211 @@ type EndpointConfig struct {
 	// published HTTPRoute attaches to. Empty makes the publisher a no-op.
 	GlobalGateway string `json:"globalGateway,omitempty"`
 	// RouteNamespace is the namespace for the published HTTPRoute and backing
-	// Service. Empty uses the ISVC's own namespace.
+	// resources. Empty uses the ISVC's own namespace.
 	RouteNamespace string `json:"routeNamespace,omitempty"`
 	// BackendPort is the port on the winner cluster's ingress the global host
 	// forwards to.
 	BackendPort int `json:"backendPort,omitempty"`
+	// GatewayBackend configures hostname rewriting, backend TLS, and an optional
+	// direct-address fallback while retaining ExternalName as the baseline.
+	GatewayBackend EndpointGatewayBackendConfig `json:"gatewayBackend,omitempty"`
+}
+
+// +kubebuilder:object:generate=false
+// EndpointGatewayBackendConfig configures the standard Gateway API behavior
+// used when forwarding from the global Gateway to workload cluster Gateways.
+type EndpointGatewayBackendConfig struct {
+	// RewriteHostname replaces the forwarded Host header with the selected
+	// workload cluster ingress hostname.
+	RewriteHostname bool `json:"rewriteHostname,omitempty"`
+	// TLS configures backend TLS independently of address resolution.
+	TLS EndpointGatewayBackendTLSConfig `json:"tls,omitempty"`
+	// EndpointSlices configures the direct-address fallback for environments
+	// where ExternalName DNS does not return a routable Gateway address.
+	EndpointSlices EndpointGatewayBackendEndpointSliceConfig `json:"endpointSlices,omitempty"`
+}
+
+// +kubebuilder:object:generate=false
+// EndpointGatewayBackendTLSConfig configures BackendTLSPolicy publication.
+type EndpointGatewayBackendTLSConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// WellKnownCACertificates is the Gateway API trust-root set written to each
+	// BackendTLSPolicy. The currently supported standard value is "System".
+	WellKnownCACertificates string `json:"wellKnownCACertificates,omitempty"`
+}
+
+// +kubebuilder:object:generate=false
+// EndpointGatewayBackendEndpointSliceConfig configures direct Gateway address
+// publication through EndpointSlices.
+type EndpointGatewayBackendEndpointSliceConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// AddressRefreshInterval is how often child Gateway status addresses are
+	// refreshed.
+	AddressRefreshInterval string `json:"addressRefreshInterval,omitempty"`
+}
+
+// AddressRefreshIntervalDuration returns the parsed refresh interval, or zero
+// when absent or malformed. MultiClusterConfig.Validate rejects a malformed or
+// missing value when EndpointSlice publication is enabled.
+func (c EndpointGatewayBackendEndpointSliceConfig) AddressRefreshIntervalDuration() time.Duration {
+	return parseDurationOrZero(c.AddressRefreshInterval)
+}
+
+// +kubebuilder:object:generate=false
+// RoutingConfig tunes the TrafficMap routing controller (control plane only),
+// which projects a placed InferenceService into the capacity-aware, health-gated
+// TrafficMap a gateway consumes. Generation is off by default: the field exists
+// so an operator opts in, never so the control plane silently starts writing a
+// routing table.
+type RoutingConfig struct {
+	// Enabled turns on TrafficMap generation. False (the default) leaves the
+	// routing controller a no-op that reaps any TrafficMap it previously created,
+	// so enabling or disabling the feature is reversible without stranding objects.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Probe configures the optional active end-to-end health probe. Absent (no
+	// path) means no probing and the health gate stays readyReplicas > 0.
+	Probe ProbeConfig `json:"probe,omitempty"`
+
+	// Capacity configures the optional endpoint-reported capacity ceiling.
+	// Absent (no path) means allocation comes from the control-plane plan alone.
+	// Independent of Probe: enabling one never enables the other.
+	Capacity CapacityConfig `json:"capacity,omitempty"`
+}
+
+// +kubebuilder:object:generate=false
+// CapacityConfig is the operator-supplied configuration for polling each home
+// for what it can currently serve, applied as a ceiling on the planned
+// allocation -- never a raise.
+type CapacityConfig struct {
+	// Path is the capacity endpoint appended to each home's endpoint. Empty
+	// turns the input off.
+	Path string `json:"path,omitempty"`
+
+	// Method is the HTTP method for the capacity request.
+	Method string `json:"method,omitempty"`
+
+	// Format names the response shape the home answers with. Empty means
+	// "Report", the built-in servable-count object. Other formats come from
+	// optional packages compiled into the binary; naming one this build does
+	// not carry is a startup error rather than a silent fallback.
+	Format string `json:"format,omitempty"`
+
+	// Options carries settings specific to the selected format, interpreted by
+	// that format and opaque to the control plane.
+	Options map[string]string `json:"options,omitempty"`
+
+	// Samples is how many recent readings the applied ceiling is derived from.
+	// Zero uses the routing package's default.
+	Samples int `json:"samples,omitempty"`
+
+	// Quorum is how many readings must corroborate a lower value before it is
+	// applied -- the ceiling is the Quorum-th smallest, not the smallest, so a
+	// single misbehaving reporter cannot set it. Zero uses the routing
+	// package's default.
+	Quorum int `json:"quorum,omitempty"`
+
+	// Period is how often each home is polled, as a duration string.
+	Period string `json:"period,omitempty"`
+
+	// Timeout bounds one capacity request, as a duration string.
+	Timeout string `json:"timeout,omitempty"`
+
+	// MaxAge is how old a report's observedAt stamp may be and still be
+	// applied, as a duration string. Beyond it the poller falls open to the
+	// plan, so a home whose reporter froze releases its ceiling rather than
+	// pinning a stale one forever.
+	MaxAge string `json:"maxAge,omitempty"`
+}
+
+// PeriodDuration parses Period, yielding 0 on an unparsable value so Validate
+// rejects it rather than a default being silently substituted.
+func (c CapacityConfig) PeriodDuration() time.Duration {
+	d, err := time.ParseDuration(c.Period)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// TimeoutDuration parses Timeout, with the same rejection-over-substitution
+// rule as PeriodDuration.
+func (c CapacityConfig) TimeoutDuration() time.Duration {
+	d, err := time.ParseDuration(c.Timeout)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// MaxAgeDuration parses MaxAge, with the same rejection-over-substitution rule.
+func (c CapacityConfig) MaxAgeDuration() time.Duration {
+	d, err := time.ParseDuration(c.MaxAge)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// +kubebuilder:object:generate=false
+// ProbeConfig is the operator-supplied configuration for the active end-to-end
+// health probe: the control plane periodically requests each home's
+// externally-addressable endpoint, so the verdict covers the whole serving path
+// rather than pod readiness inside the home.
+//
+// Every field is required once Path is set, and none has an in-code default. A
+// guessed probe path would be a behavioral value baked into the binary, and its
+// particular harm is that it looks like it works: a shallow probe against a
+// wrong-but-live path returns 200 forever while catching nothing.
+type ProbeConfig struct {
+	// Path is the request path appended to each home's endpoint. Empty turns
+	// probing off — it is the enable switch, not just an unset default.
+	Path string `json:"path,omitempty"`
+
+	// Method is the HTTP method for the probe request.
+	Method string `json:"method,omitempty"`
+
+	// AcceptStatuses are the response codes counted as a pass.
+	AcceptStatuses []int `json:"acceptStatuses,omitempty"`
+
+	// GateStatuses are the response codes counted as a failure. Codes in
+	// neither list are inconclusive and move nothing: 429 means alive and
+	// overloaded, and 401/403 means the prober's own credentials are wrong.
+	GateStatuses []int `json:"gateStatuses,omitempty"`
+
+	// Period is how often each home is probed, as a duration string.
+	Period string `json:"period,omitempty"`
+
+	// Timeout bounds one probe request, as a duration string.
+	Timeout string `json:"timeout,omitempty"`
+
+	// FailureThreshold is the number of consecutive failures before a home is
+	// gated to weight 0.
+	FailureThreshold int `json:"failureThreshold,omitempty"`
+
+	// SuccessThreshold is the number of consecutive passes before a gated home
+	// is restored.
+	SuccessThreshold int `json:"successThreshold,omitempty"`
+}
+
+// PeriodDuration parses Period. An unparsable value yields 0, which the
+// routing config's Validate rejects rather than silently substituting a rate.
+func (p ProbeConfig) PeriodDuration() time.Duration {
+	d, err := time.ParseDuration(p.Period)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// TimeoutDuration parses Timeout, with the same rejection-over-substitution
+// rule as PeriodDuration.
+func (p ProbeConfig) TimeoutDuration() time.Duration {
+	d, err := time.ParseDuration(p.Timeout)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 // NewMultiClusterConfig loads the "multicluster" block from the
@@ -170,21 +373,27 @@ func parseMultiClusterConfig(configMap *v1.ConfigMap) (*MultiClusterConfig, erro
 // composition root calls this so the deploy fails loudly instead.
 func (c MultiClusterConfig) Validate() error {
 	durations := map[string]string{
-		"workloadCluster.perCallTimeout":       c.WorkloadCluster.PerCallTimeout,
-		"workloadCluster.healthInterval":       c.WorkloadCluster.HealthInterval,
-		"workloadCluster.connectionGrace":      c.WorkloadCluster.ConnectionGrace,
-		"workloadCluster.eventsBatchPeriod":    c.WorkloadCluster.EventsBatchPeriod,
-		"workloadCluster.establishInitial":     c.WorkloadCluster.EstablishInitial,
-		"workloadCluster.establishMax":         c.WorkloadCluster.EstablishMax,
-		"workloadCluster.reconnectRetryMax":    c.WorkloadCluster.ReconnectRetryMax,
-		"workloadCluster.funnelResyncInterval": c.WorkloadCluster.FunnelResyncInterval,
-		"placement.requeueInterval":            c.Placement.RequeueInterval,
-		"placement.gcInterval":                 c.Placement.GCInterval,
-		"placement.fanoutTimeout":              c.Placement.FanoutTimeout,
-		"placement.winnerLostGrace":            c.Placement.WinnerLostGrace,
-		"placement.statusBatchPeriod":          c.Placement.StatusBatchPeriod,
-		"placement.statusSafetyRequeue":        c.Placement.StatusSafetyRequeue,
-		"placement.dispatcherRoundTimeout":     c.Placement.DispatcherRoundTimeout,
+		"workloadCluster.perCallTimeout":                                c.WorkloadCluster.PerCallTimeout,
+		"workloadCluster.healthInterval":                                c.WorkloadCluster.HealthInterval,
+		"workloadCluster.connectionGrace":                               c.WorkloadCluster.ConnectionGrace,
+		"workloadCluster.eventsBatchPeriod":                             c.WorkloadCluster.EventsBatchPeriod,
+		"workloadCluster.establishInitial":                              c.WorkloadCluster.EstablishInitial,
+		"workloadCluster.establishMax":                                  c.WorkloadCluster.EstablishMax,
+		"workloadCluster.reconnectRetryMax":                             c.WorkloadCluster.ReconnectRetryMax,
+		"workloadCluster.funnelResyncInterval":                          c.WorkloadCluster.FunnelResyncInterval,
+		"placement.requeueInterval":                                     c.Placement.RequeueInterval,
+		"placement.gcInterval":                                          c.Placement.GCInterval,
+		"placement.fanoutTimeout":                                       c.Placement.FanoutTimeout,
+		"placement.winnerLostGrace":                                     c.Placement.WinnerLostGrace,
+		"placement.statusBatchPeriod":                                   c.Placement.StatusBatchPeriod,
+		"placement.statusSafetyRequeue":                                 c.Placement.StatusSafetyRequeue,
+		"placement.dispatcherRoundTimeout":                              c.Placement.DispatcherRoundTimeout,
+		"endpoint.gatewayBackend.endpointSlices.addressRefreshInterval": c.Endpoint.GatewayBackend.EndpointSlices.AddressRefreshInterval,
+		"routing.probe.period":                                          c.Routing.Probe.Period,
+		"routing.probe.timeout":                                         c.Routing.Probe.Timeout,
+		"routing.capacity.period":                                       c.Routing.Capacity.Period,
+		"routing.capacity.timeout":                                      c.Routing.Capacity.Timeout,
+		"routing.capacity.maxAge":                                       c.Routing.Capacity.MaxAge,
 	}
 	keys := make([]string, 0, len(durations))
 	for k := range durations {
@@ -215,6 +424,26 @@ func (c MultiClusterConfig) Validate() error {
 	// otherwise publish nothing and report nothing.
 	if c.Endpoint.GlobalGateway != "" && c.Endpoint.BackendPort <= 0 {
 		errs = append(errs, fmt.Errorf("endpoint.backendPort: must be set when endpoint.globalGateway is configured (%q)", c.Endpoint.GlobalGateway))
+	}
+	gb := c.Endpoint.GatewayBackend
+	if gb.RewriteHostname || gb.TLS.Enabled || gb.EndpointSlices.Enabled {
+		if strings.TrimSpace(c.Endpoint.GlobalGateway) == "" {
+			errs = append(errs, errors.New("endpoint.globalGateway: must be set when gateway backend features are enabled"))
+		}
+	}
+	if gb.TLS.Enabled {
+		if gb.TLS.WellKnownCACertificates != string(gatewayapiv1.WellKnownCACertificatesSystem) {
+			errs = append(errs, fmt.Errorf("endpoint.gatewayBackend.tls.wellKnownCACertificates: %q must be %q when enabled", gb.TLS.WellKnownCACertificates, gatewayapiv1.WellKnownCACertificatesSystem))
+		}
+	} else if gb.TLS.WellKnownCACertificates != "" {
+		errs = append(errs, errors.New("endpoint.gatewayBackend.tls.enabled: must be true when TLS settings are supplied"))
+	}
+	if gb.EndpointSlices.Enabled {
+		if strings.TrimSpace(gb.EndpointSlices.AddressRefreshInterval) == "" {
+			errs = append(errs, errors.New("endpoint.gatewayBackend.endpointSlices.addressRefreshInterval: must be set when enabled"))
+		}
+	} else if gb.EndpointSlices.AddressRefreshInterval != "" {
+		errs = append(errs, errors.New("endpoint.gatewayBackend.endpointSlices.enabled: must be true when EndpointSlice settings are supplied"))
 	}
 	return errors.Join(errs...)
 }

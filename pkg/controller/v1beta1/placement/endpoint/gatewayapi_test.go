@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,6 +46,26 @@ func baseConfig() Config {
 		BackendPort:        8080,
 		Labels:             map[string]string{"team": "platform"},
 	}
+}
+
+func gatewayBackendConfig() Config {
+	cfg := baseConfig()
+	cfg.BackendPort = 443
+	cfg.GatewayBackend = GatewayBackendConfig{
+		RewriteHostname: true,
+		TLS: GatewayBackendTLSConfig{
+			Enabled:                 true,
+			WellKnownCACertificates: string(gatewayapiv1.WellKnownCACertificatesSystem),
+		},
+		EndpointSlices: GatewayBackendEndpointSliceConfig{Enabled: true},
+	}
+	return cfg
+}
+
+type staticBackendAddressResolver map[string][]BackendAddress
+
+func (r staticBackendAddressResolver) Resolve(_ context.Context, _ *v1beta1.InferenceService, home Home) ([]BackendAddress, error) {
+	return r[home.Cluster], nil
 }
 
 // oneHome builds a single-home Target (Single mode shape).
@@ -102,6 +123,7 @@ func TestBuildHTTPRoute_SingleHome(t *testing.T) {
 	assert.Equal(t, gatewayapiv1.PortNumber(8080), *br.Port)
 	require.NotNil(t, br.Weight)
 	assert.Equal(t, int32(1), *br.Weight)
+	assert.Empty(t, br.Filters, "portable ExternalName mode keeps backend filters optional")
 
 	require.Len(t, route.Spec.Rules[0].Matches, 1)
 	require.NotNil(t, route.Spec.Rules[0].Matches[0].Path)
@@ -126,6 +148,24 @@ func TestBuildHTTPRoute_MultiHomeEqualWeightSorted(t *testing.T) {
 	require.NotNil(t, refs[1].Weight)
 	assert.Equal(t, int32(1), *refs[0].Weight, "equal weight across homes")
 	assert.Equal(t, int32(1), *refs[1].Weight)
+}
+
+func TestBuildHTTPRoute_GatewayBackendRewritesEachHomeHostname(t *testing.T) {
+	p := NewGatewayAPIPublisher(nil, gatewayBackendConfig())
+	target := Target{GlobalHost: "h", Homes: []Home{
+		{Cluster: "cluster-b", BackendHost: "b.example"},
+		{Cluster: "cluster-a", BackendHost: "a.example"},
+	}}
+
+	refs := p.buildHTTPRoute(testISVC(), target).Spec.Rules[0].BackendRefs
+	require.Len(t, refs, 2)
+	for i, hostname := range []gatewayapiv1.PreciseHostname{"a.example", "b.example"} {
+		require.Len(t, refs[i].Filters, 1)
+		assert.Equal(t, gatewayapiv1.HTTPRouteFilterURLRewrite, refs[i].Filters[0].Type)
+		require.NotNil(t, refs[i].Filters[0].URLRewrite)
+		require.NotNil(t, refs[i].Filters[0].URLRewrite.Hostname)
+		assert.Equal(t, hostname, *refs[i].Filters[0].URLRewrite.Hostname)
+	}
 }
 
 func TestBuildResources_RouteNamespaceOverride(t *testing.T) {
@@ -212,6 +252,152 @@ func TestPublish_MultiHomeCreatesPerHomeServices(t *testing.T) {
 	require.Len(t, route.Spec.Rules[0].BackendRefs, 2, "route load-balances across both homes")
 }
 
+func TestPublish_GatewayBackendCreatesEndpointSlicesAndTLSPolicy(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	p := NewGatewayAPIPublisher(c, gatewayBackendConfig(), WithBackendAddressResolver(staticBackendAddressResolver{
+		"cluster-a": {
+			{Address: "192.0.2.10", Type: discoveryv1.AddressTypeIPv4},
+			{Address: "2001:db8::10", Type: discoveryv1.AddressTypeIPv6},
+		},
+	}))
+	isvc := testISVC()
+
+	require.NoError(t, p.Publish(context.Background(), isvc,
+		oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example")))
+
+	for name, addressType := range map[string]discoveryv1.AddressType{
+		"svc-global-cluster-a-ipv4": discoveryv1.AddressTypeIPv4,
+		"svc-global-cluster-a-ipv6": discoveryv1.AddressTypeIPv6,
+	} {
+		endpointSlice := &discoveryv1.EndpointSlice{}
+		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "prod"}, endpointSlice))
+		assert.Equal(t, addressType, endpointSlice.AddressType)
+		assert.Equal(t, "svc-global-cluster-a", endpointSlice.Labels[discoveryv1.LabelServiceName])
+		assert.Equal(t, ManagedByValue, endpointSlice.Labels[discoveryv1.LabelManagedBy])
+		require.Len(t, endpointSlice.Ports, 1)
+		require.NotNil(t, endpointSlice.Ports[0].Port)
+		assert.Equal(t, int32(443), *endpointSlice.Ports[0].Port)
+		require.Len(t, endpointSlice.Endpoints, 1)
+		require.NotNil(t, endpointSlice.Endpoints[0].Conditions.Ready)
+		assert.True(t, *endpointSlice.Endpoints[0].Conditions.Ready)
+		require.NotNil(t, endpointSlice.Endpoints[0].Conditions.Serving)
+		assert.True(t, *endpointSlice.Endpoints[0].Conditions.Serving)
+		require.NotNil(t, endpointSlice.Endpoints[0].Conditions.Terminating)
+		assert.False(t, *endpointSlice.Endpoints[0].Conditions.Terminating)
+	}
+
+	policy := &gatewayapiv1.BackendTLSPolicy{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a", Namespace: "prod"}, policy))
+	require.Len(t, policy.Spec.TargetRefs, 1)
+	assert.Empty(t, policy.Spec.TargetRefs[0].Group)
+	assert.Equal(t, gatewayapiv1.Kind(constants.ServiceKind), policy.Spec.TargetRefs[0].Kind)
+	assert.Equal(t, gatewayapiv1.ObjectName("svc-global-cluster-a"), policy.Spec.TargetRefs[0].Name)
+	assert.Equal(t, gatewayapiv1.PreciseHostname("svc.prod.cloud-a.example"), policy.Spec.Validation.Hostname)
+	require.NotNil(t, policy.Spec.Validation.WellKnownCACertificates)
+	assert.Equal(t, gatewayapiv1.WellKnownCACertificatesSystem, *policy.Spec.Validation.WellKnownCACertificates)
+}
+
+func TestPublish_GatewayBackendUpdatesAddressesAndPrunesStaleFamily(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	resolver := staticBackendAddressResolver{
+		"cluster-a": {
+			{Address: "192.0.2.10", Type: discoveryv1.AddressTypeIPv4},
+			{Address: "2001:db8::10", Type: discoveryv1.AddressTypeIPv6},
+		},
+	}
+	p := NewGatewayAPIPublisher(c, gatewayBackendConfig(), WithBackendAddressResolver(resolver))
+	isvc := testISVC()
+	target := oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example")
+	require.NoError(t, p.Publish(context.Background(), isvc, target))
+
+	resolver["cluster-a"] = []BackendAddress{{Address: "2001:db8::20", Type: discoveryv1.AddressTypeIPv6}}
+	require.NoError(t, p.Publish(context.Background(), isvc, target))
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a-ipv4", Namespace: "prod"}, &discoveryv1.EndpointSlice{})
+	assert.True(t, apierrors.IsNotFound(err), "address-family slice is pruned after the Gateway stops advertising that family")
+	endpointSlice := &discoveryv1.EndpointSlice{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a-ipv6", Namespace: "prod"}, endpointSlice))
+	require.Len(t, endpointSlice.Endpoints, 1)
+	assert.Equal(t, []string{"2001:db8::20"}, endpointSlice.Endpoints[0].Addresses)
+}
+
+func TestPublish_GatewayBackendIsIdempotent(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	p := NewGatewayAPIPublisher(c, gatewayBackendConfig(), WithBackendAddressResolver(staticBackendAddressResolver{
+		"cluster-a": {{Address: "2001:db8::10", Type: discoveryv1.AddressTypeIPv6}},
+	}))
+	isvc := testISVC()
+	target := oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example")
+	require.NoError(t, p.Publish(context.Background(), isvc, target))
+
+	endpointSlice := &discoveryv1.EndpointSlice{}
+	sliceKey := types.NamespacedName{Name: "svc-global-cluster-a-ipv6", Namespace: "prod"}
+	require.NoError(t, c.Get(context.Background(), sliceKey, endpointSlice))
+	sliceVersion := endpointSlice.ResourceVersion
+	policy := &gatewayapiv1.BackendTLSPolicy{}
+	policyKey := types.NamespacedName{Name: "svc-global-cluster-a", Namespace: "prod"}
+	require.NoError(t, c.Get(context.Background(), policyKey, policy))
+	policyVersion := policy.ResourceVersion
+
+	require.NoError(t, p.Publish(context.Background(), isvc, target))
+	require.NoError(t, c.Get(context.Background(), sliceKey, endpointSlice))
+	assert.Equal(t, sliceVersion, endpointSlice.ResourceVersion)
+	require.NoError(t, c.Get(context.Background(), policyKey, policy))
+	assert.Equal(t, policyVersion, policy.ResourceVersion)
+}
+
+func TestPublish_DisablingEndpointSlicesKeepsExternalNameTLSRouting(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	cfg := gatewayBackendConfig()
+	p := NewGatewayAPIPublisher(c, cfg, WithBackendAddressResolver(staticBackendAddressResolver{
+		"cluster-a": {{Address: "192.0.2.10", Type: discoveryv1.AddressTypeIPv4}},
+	}))
+	isvc := testISVC()
+	target := oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example")
+	require.NoError(t, p.Publish(context.Background(), isvc, target))
+
+	p.config.GatewayBackend.EndpointSlices.Enabled = false
+	require.NoError(t, p.Publish(context.Background(), isvc, target))
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a-ipv4", Namespace: "prod"}, &discoveryv1.EndpointSlice{})
+	assert.True(t, apierrors.IsNotFound(err), "the direct-address fallback is removed")
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a", Namespace: "prod"}, &gatewayapiv1.BackendTLSPolicy{}),
+		"backend TLS remains configured")
+	route := &gatewayapiv1.HTTPRoute{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc-global", Namespace: "prod"}, route))
+	require.Len(t, route.Spec.Rules[0].BackendRefs[0].Filters, 1, "the hostname rewrite remains configured")
+}
+
+func TestPublish_ExternalNameTLSDoesNotRequireAddressResolver(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	cfg := gatewayBackendConfig()
+	cfg.GatewayBackend.EndpointSlices.Enabled = false
+	p := NewGatewayAPIPublisher(c, cfg)
+
+	require.NoError(t, p.Publish(context.Background(), testISVC(),
+		oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example")))
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a", Namespace: "prod"}, &gatewayapiv1.BackendTLSPolicy{}))
+	assert.True(t, apierrors.IsNotFound(c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a-ipv4", Namespace: "prod"}, &discoveryv1.EndpointSlice{})))
+}
+
+func TestPublish_GatewayBackendRequiresAddressResolver(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	p := NewGatewayAPIPublisher(c, gatewayBackendConfig())
+
+	err := p.Publish(context.Background(), testISVC(),
+		oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no backend address resolver")
+	assert.True(t, apierrors.IsNotFound(c.Get(context.Background(), types.NamespacedName{Name: "svc-global", Namespace: "prod"}, &gatewayapiv1.HTTPRoute{})),
+		"resolution fails before changing the existing publication")
+}
+
 func TestPublish_Idempotent(t *testing.T) {
 	s := pubScheme(t)
 	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
@@ -292,6 +478,24 @@ func TestUnpublish_DeletesRouteAndAllServices(t *testing.T) {
 	}
 	err := c.Get(context.Background(), types.NamespacedName{Name: "svc-global", Namespace: "prod"}, &gatewayapiv1.HTTPRoute{})
 	assert.True(t, apierrors.IsNotFound(err), "HTTPRoute deleted")
+}
+
+func TestUnpublish_DeletesGatewayBackendResources(t *testing.T) {
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	p := NewGatewayAPIPublisher(c, gatewayBackendConfig(), WithBackendAddressResolver(staticBackendAddressResolver{
+		"cluster-a": {{Address: "2001:db8::10", Type: discoveryv1.AddressTypeIPv6}},
+	}))
+	isvc := testISVC()
+	require.NoError(t, p.Publish(context.Background(), isvc,
+		oneHome("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example")))
+
+	require.NoError(t, p.Unpublish(context.Background(), isvc))
+
+	err := c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a-ipv6", Namespace: "prod"}, &discoveryv1.EndpointSlice{})
+	assert.True(t, apierrors.IsNotFound(err), "EndpointSlice deleted")
+	err = c.Get(context.Background(), types.NamespacedName{Name: "svc-global-cluster-a", Namespace: "prod"}, &gatewayapiv1.BackendTLSPolicy{})
+	assert.True(t, apierrors.IsNotFound(err), "BackendTLSPolicy deleted")
 }
 
 func TestUnpublish_MissingIsNoOp(t *testing.T) {

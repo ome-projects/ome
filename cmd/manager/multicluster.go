@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/placement"
 	placementendpoint "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/endpoint"
+	placementrouting "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/routing"
 	workloadcluster "sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 )
 
@@ -50,12 +51,13 @@ type mcWiring struct {
 	funnelBufferSize       int
 
 	endpoint placementendpoint.Config
+	routing  placementrouting.Config
 }
 
 // resolveMCWiring maps a loaded MultiClusterConfig to the wiring values used to
 // build the multi-cluster controllers.
 func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
-	wc, pl, ep := mc.WorkloadCluster, mc.Placement, mc.Endpoint
+	wc, pl, ep, rt := mc.WorkloadCluster, mc.Placement, mc.Endpoint, mc.Routing
 
 	// Status-convergence backstop: with the cache (and thus the watch funnel) on,
 	// events drive freshness and the safety requeue only recovers a missed event;
@@ -99,6 +101,41 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 			GlobalGateway:      ep.GlobalGateway,
 			RouteNamespace:     ep.RouteNamespace,
 			BackendPort:        int32(ep.BackendPort),
+			GatewayBackend: placementendpoint.GatewayBackendConfig{
+				RewriteHostname: ep.GatewayBackend.RewriteHostname,
+				TLS: placementendpoint.GatewayBackendTLSConfig{
+					Enabled:                 ep.GatewayBackend.TLS.Enabled,
+					WellKnownCACertificates: ep.GatewayBackend.TLS.WellKnownCACertificates,
+				},
+				EndpointSlices: placementendpoint.GatewayBackendEndpointSliceConfig{
+					Enabled:                ep.GatewayBackend.EndpointSlices.Enabled,
+					AddressRefreshInterval: ep.GatewayBackend.EndpointSlices.AddressRefreshIntervalDuration(),
+				},
+			},
+		},
+		routing: placementrouting.Config{
+			Enabled: rt.Enabled,
+			Probe: placementrouting.ProbeConfig{
+				Path:             rt.Probe.Path,
+				Method:           rt.Probe.Method,
+				AcceptStatuses:   rt.Probe.AcceptStatuses,
+				GateStatuses:     rt.Probe.GateStatuses,
+				Period:           rt.Probe.PeriodDuration(),
+				Timeout:          rt.Probe.TimeoutDuration(),
+				FailureThreshold: rt.Probe.FailureThreshold,
+				SuccessThreshold: rt.Probe.SuccessThreshold,
+			},
+			Capacity: placementrouting.CapacityConfig{
+				Path:    rt.Capacity.Path,
+				Method:  rt.Capacity.Method,
+				Format:  placementrouting.CapacityFormat(rt.Capacity.Format),
+				Options: rt.Capacity.Options,
+				Samples: rt.Capacity.Samples,
+				Quorum:  rt.Capacity.Quorum,
+				Period:  rt.Capacity.PeriodDuration(),
+				Timeout: rt.Capacity.TimeoutDuration(),
+				MaxAge:  rt.Capacity.MaxAgeDuration(),
+			},
 		},
 	}
 }
@@ -139,6 +176,15 @@ func setupMultiCluster(mgr manager.Manager, clientSet kubernetes.Interface, opti
 	w := resolveMCWiring(mcConfig)
 	if err := validateDispatcherMode(w.dispatcherMode); err != nil {
 		return err
+	}
+	// A half-configured probe is worse than none: it reads as enabled while
+	// behaving arbitrarily. Validate after resolution so the check sees the
+	// parsed durations rather than the raw strings.
+	if err := w.routing.Probe.Validate(); err != nil {
+		return fmt.Errorf("invalid multi-cluster configuration: %w", err)
+	}
+	if err := w.routing.Capacity.Validate(); err != nil {
+		return fmt.Errorf("invalid multi-cluster configuration: %w", err)
 	}
 
 	clusterManager := workloadcluster.NewManager(mgr.GetScheme())
@@ -251,12 +297,44 @@ func setupMultiCluster(mgr manager.Manager, clientSet kubernetes.Interface, opti
 	utilruntime.Must(gatewayapiv1.Install(mgr.GetScheme()))
 	setupLog.Info("Setting up multi-cluster endpoint publisher")
 	if err := (&placementendpoint.Reconciler{
-		Client:    mgr.GetClient(),
-		Log:       ctrl.Log.WithName("controllers").WithName("PlacementEndpoint"),
-		Publisher: placementendpoint.NewGatewayAPIPublisher(mgr.GetClient(), w.endpoint),
-		Config:    w.endpoint,
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("PlacementEndpoint"),
+		Publisher: placementendpoint.NewGatewayAPIPublisher(
+			mgr.GetClient(),
+			w.endpoint,
+			placementendpoint.WithBackendAddressResolver(
+				placementendpoint.NewGatewayAddressResolver(clusterManager),
+			),
+		),
+		Config: w.endpoint,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("create PlacementEndpoint controller: %w", err)
+	}
+
+	// Both observed inputs talk to the same homes with the same credentials, so
+	// they share one HTTP client: two would mean two transports and two auth
+	// paths for one conversation.
+	observerClient := placementrouting.NewObserverClient()
+
+	// Project placement into the capacity-aware TrafficMap the publisher consumes.
+	// Always wired: when disabled the controller is a no-op that reaps any
+	// TrafficMap it previously created, so toggling the feature (a restart, since
+	// config loads once) reverses cleanly without stranding routing tables.
+	setupLog.Info("Setting up multi-cluster TrafficMap routing controller", "enabled", w.routing.Enabled,
+		// Optional capacity formats are compiled in, so log what this build
+		// carries: a binary missing one should be obvious here rather than at
+		// the first poll.
+		"capacityFormats", placementrouting.RegisteredCapacityFormats())
+	if err := (&placementrouting.Reconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("PlacementRouting"),
+		Config: w.routing,
+		Prober: placementrouting.NewProber(w.routing.Probe, observerClient,
+			ctrl.Log.WithName("controllers").WithName("PlacementRoutingProbe")),
+		Capacity: placementrouting.NewCapacityPoller(w.routing.Capacity, observerClient,
+			ctrl.Log.WithName("controllers").WithName("PlacementRoutingCapacity")),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("create PlacementRouting controller: %w", err)
 	}
 	return nil
 }

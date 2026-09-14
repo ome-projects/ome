@@ -1,5 +1,7 @@
 package v1beta1
 
+import "k8s.io/apimachinery/pkg/api/resource"
+
 // PlacementMode is the cardinality of a multi-cluster placement: how many
 // workload clusters end up serving the InferenceService.
 // +kubebuilder:validation:Enum=Single;All;Split
@@ -59,6 +61,18 @@ type PlacementSpec struct {
 	// distribute the engine's minReplicas, packed onto the fewest clusters.
 	// +optional
 	Split *SplitSpec `json:"split,omitempty"`
+
+	// CapacityFactors overrides the per-replica relative serving capacity of
+	// named workload clusters, keyed by WorkloadCluster name. It weights traffic
+	// for heterogeneous hardware where one cluster's replica serves more (or less)
+	// than another's: a home's routed share scales with its admitted replicas
+	// times this factor. A quantity of "2" means each replica on that cluster
+	// carries twice the share of a factor-1 replica; "500m" means half. A cluster
+	// absent from the map (or the whole field unset) uses the identity factor 1.
+	// This is a routing weight only — it does not influence placement or how many
+	// replicas a cluster admits.
+	// +optional
+	CapacityFactors map[string]resource.Quantity `json:"capacityFactors,omitempty"`
 }
 
 // SplitSpec tunes how Split mode distributes replicas across candidate

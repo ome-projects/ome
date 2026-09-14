@@ -45,7 +45,7 @@ ome:
   # cluster.
   multiclusterAccess:
     enabled: true
-  # multicluster enables the OEP-0018 control-plane fan-out placement controllers.
+  # multicluster enables the control-plane fan-out placement controllers.
   # Alpha; default off. On the CONTROL-PLANE cluster set enabled: true and
   # role: control-plane (this disables the local InferenceService->pods reconciler
   # and runs the placement + WorkloadCluster controllers). Leave default on
@@ -104,8 +104,21 @@ ome:
       endpoint:
         globalHostTemplate: ""  # text/template for the global host ("" => only annotated ISVCs publish)
         globalGateway: ""       # "namespace/name" of the global Gateway ("" => publisher is a no-op)
-        routeNamespace: ""      # namespace for the published HTTPRoute + Service ("" => the ISVC's namespace)
+        routeNamespace: ""      # namespace for the published HTTPRoute + backing resources ("" => the ISVC's namespace)
         backendPort: 0          # port on the winner's ingress the global host forwards to
+        gatewayBackend:
+          rewriteHostname: false          # rewrite Host independently for each selected home
+          tls:
+            enabled: false                # manage one BackendTLSPolicy per home
+            wellKnownCACertificates: ""   # required when TLS is enabled; currently "System"
+          endpointSlices:
+            enabled: false                # fallback for gateways that cannot resolve ExternalName DNS: publish child Gateway IPs
+            addressRefreshInterval: ""    # required refresh cadence when EndpointSlices are enabled
+      # routing: the TrafficMap routing controller (control plane only), which
+      # projects a placed InferenceService into a capacity-aware, health-gated
+      # TrafficMap a gateway consumes. Alpha; default off.
+      routing:
+        enabled: false          # generate TrafficMaps for placed InferenceServices
   # autoscalerPolicy is the single gate for the reusable AutoscalerPolicy
   # feature: the manager's policy RBAC, the policy validating webhook, and the
   # autoscalerPolicy config block all install together on this one value —

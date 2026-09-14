@@ -70,6 +70,14 @@ type ServingRuntimeListerExpansion interface{}
 // ServingRuntimeNamespaceLister.
 type ServingRuntimeNamespaceListerExpansion interface{}
 
+// TrafficMapListerExpansion allows custom methods to be added to
+// TrafficMapLister.
+type TrafficMapListerExpansion interface{}
+
+// TrafficMapNamespaceListerExpansion allows custom methods to be added to
+// TrafficMapNamespaceLister.
+type TrafficMapNamespaceListerExpansion interface{}
+
 // WorkloadClusterListerExpansion allows custom methods to be added to
 // WorkloadClusterLister.
 type WorkloadClusterListerExpansion interface{}

@@ -140,7 +140,21 @@ data:
         "globalHostTemplate": "{{ .Values.ome.multicluster.config.endpoint.globalHostTemplate | default "" }}",
         "globalGateway": "{{ .Values.ome.multicluster.config.endpoint.globalGateway | default "" }}",
         "routeNamespace": "{{ .Values.ome.multicluster.config.endpoint.routeNamespace | default "" }}",
-        "backendPort": {{ .Values.ome.multicluster.config.endpoint.backendPort | default 0 }}
+        "backendPort": {{ .Values.ome.multicluster.config.endpoint.backendPort | default 0 }},
+        "gatewayBackend": {
+          "rewriteHostname": {{ .Values.ome.multicluster.config.endpoint.gatewayBackend.rewriteHostname | default false }},
+          "tls": {
+            "enabled": {{ .Values.ome.multicluster.config.endpoint.gatewayBackend.tls.enabled | default false }},
+            "wellKnownCACertificates": "{{ .Values.ome.multicluster.config.endpoint.gatewayBackend.tls.wellKnownCACertificates | default "" }}"
+          },
+          "endpointSlices": {
+            "enabled": {{ .Values.ome.multicluster.config.endpoint.gatewayBackend.endpointSlices.enabled | default false }},
+            "addressRefreshInterval": "{{ .Values.ome.multicluster.config.endpoint.gatewayBackend.endpointSlices.addressRefreshInterval | default "" }}"
+          }
+        }
+      },
+      "routing": {
+        "enabled": {{ .Values.ome.multicluster.config.routing.enabled | default false }}
       }
     }
 {{- if .Values.ome.autoscalerPolicy.enabled }}

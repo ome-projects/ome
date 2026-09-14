@@ -3,6 +3,7 @@ package endpoint
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,6 +81,25 @@ func TestReconcile_PlacedPublishesAndFinalizes(t *testing.T) {
 	assert.True(t, controllerutil.ContainsFinalizer(got, EndpointFinalizer))
 }
 
+func TestReconcile_GatewayBackendSchedulesAddressRefresh(t *testing.T) {
+	cfg := gatewayBackendConfig()
+	cfg.GatewayBackend.EndpointSlices.AddressRefreshInterval = 45 * time.Second
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&v1beta1.InferenceService{}).
+		WithObjects(placedISVC("cluster-a", "svc.prod.cloud-a.example")).Build()
+	publisher := NewGatewayAPIPublisher(c, cfg, WithBackendAddressResolver(staticBackendAddressResolver{
+		"cluster-a": {{Address: "192.0.2.10", Type: "IPv4"}},
+	}))
+	r := &Reconciler{Client: c, Log: log.Log, Publisher: publisher, Config: cfg}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "svc", Namespace: "prod"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Second, result.RequeueAfter)
+}
+
 func TestReconcile_RepointsOnReplacement(t *testing.T) {
 	r, c := newReconciler(t, baseConfig(), placedISVC("cluster-a", "svc.prod.cloud-a.example"))
 	reconcile(t, r)
@@ -121,6 +141,45 @@ func TestReconcile_UnplacedTearsDownAndDropsFinalizer(t *testing.T) {
 	got := &v1beta1.InferenceService{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc", Namespace: "prod"}, got))
 	assert.False(t, controllerutil.ContainsFinalizer(got, EndpointFinalizer), "finalizer dropped after teardown")
+}
+
+func TestReconcile_PublishesTrafficMapWeights(t *testing.T) {
+	// A Split ISVC with two admitted homes whose reactive ready-replica ratio is
+	// 5:2, plus a TrafficMap the routing controller published carrying a
+	// capacity-aware 1:3 split. The route must honor the TrafficMap.
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "uid-1"},
+		Status: v1beta1.InferenceServiceStatus{Placement: &v1beta1.PlacementStatus{
+			Phase: v1beta1.PlacementPhasePlaced,
+			Candidates: []v1beta1.CandidatePlacement{
+				{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("a.example"), ReadyReplicas: 5},
+				{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("b.example"), ReadyReplicas: 2},
+			},
+		}},
+	}
+	tm := &v1beta1.TrafficMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"},
+		Spec: v1beta1.TrafficMapSpec{
+			Service: "svc",
+			Entries: []v1beta1.TrafficMapEntry{
+				{Cluster: "a", Weight: 1, Healthy: true},
+				{Cluster: "b", Weight: 3, Healthy: true},
+			},
+		},
+	}
+	r, c := newReconciler(t, baseConfig(), isvc, tm)
+
+	reconcile(t, r)
+
+	route := &gatewayapiv1.HTTPRoute{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc-global", Namespace: "prod"}, route))
+	refs := route.Spec.Rules[0].BackendRefs
+	require.Len(t, refs, 2)
+	require.NotNil(t, refs[0].Weight)
+	require.NotNil(t, refs[1].Weight)
+	// backendRefs are cluster-sorted: a then b.
+	assert.Equal(t, int32(1), *refs[0].Weight, "home a takes the TrafficMap weight, not its 5 ready replicas")
+	assert.Equal(t, int32(3), *refs[1].Weight, "home b takes the TrafficMap weight, not its 2 ready replicas")
 }
 
 func TestReconcile_PendingNeverPublishes(t *testing.T) {
@@ -236,7 +295,7 @@ func TestResolveTarget(t *testing.T) {
 	r := &Reconciler{Config: baseConfig()}
 
 	t.Run("placed + endpoint -> ok", func(t *testing.T) {
-		tgt, ok, err := r.resolveTarget(placedISVC("cloud-a", "h.example"))
+		tgt, ok, err := r.resolveTarget(placedISVC("cloud-a", "h.example"), nil)
 		require.NoError(t, err)
 		require.True(t, ok)
 		assert.Equal(t, "svc.prod.global.example", tgt.GlobalHost)
@@ -246,7 +305,7 @@ func TestResolveTarget(t *testing.T) {
 	})
 
 	t.Run("nil placement -> not ok", func(t *testing.T) {
-		_, ok, err := r.resolveTarget(&v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"}})
+		_, ok, err := r.resolveTarget(&v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"}}, nil)
 		require.NoError(t, err)
 		assert.False(t, ok)
 	})
@@ -263,7 +322,7 @@ func TestResolveTarget(t *testing.T) {
 				},
 			}},
 		}
-		tgt, ok, err := r.resolveTarget(isvc)
+		tgt, ok, err := r.resolveTarget(isvc, nil)
 		require.NoError(t, err)
 		require.True(t, ok)
 		require.Len(t, tgt.Homes, 2, "only admitted+addressable candidates are homes")
@@ -281,7 +340,7 @@ func TestResolveTarget(t *testing.T) {
 				Candidates: []v1beta1.CandidatePlacement{{Cluster: "workload-1", Phase: v1beta1.CandidatePhasePlaced}},
 			}},
 		}
-		_, ok, err := r.resolveTarget(isvc)
+		_, ok, err := r.resolveTarget(isvc, nil)
 		require.NoError(t, err)
 		assert.False(t, ok)
 	})
@@ -298,7 +357,7 @@ func TestResolveTarget(t *testing.T) {
 				},
 			}},
 		}
-		tgt, ok, err := r.resolveTarget(isvc)
+		tgt, ok, err := r.resolveTarget(isvc, nil)
 		require.NoError(t, err)
 		require.True(t, ok)
 		require.Len(t, tgt.Homes, 1)
@@ -317,12 +376,54 @@ func TestResolveTarget(t *testing.T) {
 				},
 			}},
 		}
-		tgt, ok, err := r.resolveTarget(isvc)
+		tgt, ok, err := r.resolveTarget(isvc, nil)
 		require.NoError(t, err)
 		require.True(t, ok)
 		require.Len(t, tgt.Homes, 2)
 		assert.Equal(t, int32(5), tgt.Homes[0].Weight, "home a weight = its ready replicas")
 		assert.Equal(t, int32(2), tgt.Homes[1].Weight, "home b weight = its ready replicas")
+	})
+
+	t.Run("TrafficMap weights override the reactive ready-replica split", func(t *testing.T) {
+		isvc := &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"},
+			Status: v1beta1.InferenceServiceStatus{Placement: &v1beta1.PlacementStatus{
+				Phase: v1beta1.PlacementPhasePlaced,
+				Candidates: []v1beta1.CandidatePlacement{
+					{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("a.example"), ReadyReplicas: 5},
+					{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("b.example"), ReadyReplicas: 2},
+				},
+			}},
+		}
+		// The routing controller published a capacity-aware split (e.g. b has a
+		// faster accelerator) that differs from the raw ready-replica ratio.
+		tgt, ok, err := r.resolveTarget(isvc, map[string]int32{"a": 1, "b": 3})
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Len(t, tgt.Homes, 2)
+		assert.Equal(t, int32(1), tgt.Homes[0].Weight, "home a takes the TrafficMap weight, not its 5 ready replicas")
+		assert.Equal(t, int32(3), tgt.Homes[1].Weight, "home b takes the TrafficMap weight, not its 2 ready replicas")
+	})
+
+	t.Run("home absent from the TrafficMap keeps its reactive weight", func(t *testing.T) {
+		isvc := &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"},
+			Status: v1beta1.InferenceServiceStatus{Placement: &v1beta1.PlacementStatus{
+				Phase: v1beta1.PlacementPhasePlaced,
+				Candidates: []v1beta1.CandidatePlacement{
+					{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("a.example"), ReadyReplicas: 5},
+					{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("b.example"), ReadyReplicas: 2},
+				},
+			}},
+		}
+		// TrafficMap lags placement: it only knows about home a. Home b falls back
+		// to its live ready-replica count rather than dropping to zero.
+		tgt, ok, err := r.resolveTarget(isvc, map[string]int32{"a": 9})
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Len(t, tgt.Homes, 2)
+		assert.Equal(t, int32(9), tgt.Homes[0].Weight, "home a takes its TrafficMap weight")
+		assert.Equal(t, int32(2), tgt.Homes[1].Weight, "home b, absent from the map, keeps its reactive weight")
 	})
 }
 

@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/placement"
 	placementendpoint "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/endpoint"
+	placementrouting "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/routing"
 	workloadcluster "sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 )
 
@@ -59,8 +60,14 @@ func TestResolveMCWiringFullConfig(t *testing.T) {
 		},
 		"endpoint": {
 			"globalHostTemplate": "{{.Name}}.global", "globalGateway": "ome/gw",
-			"routeNamespace": "ome-routes", "backendPort": 8080
-		}
+			"routeNamespace": "ome-routes", "backendPort": 443,
+			"gatewayBackend": {
+				"rewriteHostname": true,
+				"tls": {"enabled": true, "wellKnownCACertificates": "System"},
+				"endpointSlices": {"enabled": true, "addressRefreshInterval": "1m"}
+			}
+		},
+		"routing": { "enabled": true }
 	}`)
 
 	// WorkloadCluster transport.
@@ -93,7 +100,15 @@ func TestResolveMCWiringFullConfig(t *testing.T) {
 	assert.Equal(t, "{{.Name}}.global", w.endpoint.GlobalHostTemplate)
 	assert.Equal(t, "ome/gw", w.endpoint.GlobalGateway)
 	assert.Equal(t, "ome-routes", w.endpoint.RouteNamespace)
-	assert.Equal(t, int32(8080), w.endpoint.BackendPort)
+	assert.Equal(t, int32(443), w.endpoint.BackendPort)
+	assert.True(t, w.endpoint.GatewayBackend.RewriteHostname)
+	assert.True(t, w.endpoint.GatewayBackend.TLS.Enabled)
+	assert.Equal(t, "System", w.endpoint.GatewayBackend.TLS.WellKnownCACertificates)
+	assert.True(t, w.endpoint.GatewayBackend.EndpointSlices.Enabled)
+	assert.Equal(t, time.Minute, w.endpoint.GatewayBackend.EndpointSlices.AddressRefreshInterval)
+
+	// Routing.
+	assert.True(t, w.routing.Enabled)
 }
 
 // TestResolveMCWiringSafetyRequeueDependsOnCache pins the one non-trivial bit of
@@ -133,6 +148,7 @@ func TestResolveMCWiringAbsentBlockIsZero(t *testing.T) {
 	assert.Equal(t, 0, w.funnelBufferSize)
 	assert.Equal(t, placement.DispatcherMode(""), w.dispatcherMode)
 	assert.Equal(t, placementendpoint.Config{}, w.endpoint)
+	assert.Equal(t, placementrouting.Config{}, w.routing)
 }
 
 // TestResolveMCWiringMissingConfigMapErrors confirms the loader (and thus

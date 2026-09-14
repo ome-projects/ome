@@ -104,8 +104,12 @@ rules:
   resources:
   - endpointslices
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - gateway.envoyproxy.io
@@ -122,6 +126,7 @@ rules:
 - apiGroups:
   - gateway.networking.k8s.io
   resources:
+  - backendtlspolicies
   - httproutes
   verbs:
   - create
@@ -244,6 +249,7 @@ rules:
   - inferenceservices/finalizers
   - servingruntimes
   - servingruntimes/finalizers
+  - trafficmaps
   - workloadclusters
   verbs:
   - create
@@ -277,6 +283,7 @@ rules:
   - inferenceservices/status
   - rolloutpolicies/status
   - servingruntimes/status
+  - trafficmaps/status
   - workloadclusters/status
   verbs:
   - get
