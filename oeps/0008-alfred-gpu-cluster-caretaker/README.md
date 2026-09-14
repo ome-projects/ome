@@ -269,7 +269,8 @@ At the 2026-09-14 baseline, the source tree has the following status:
 | Capacity-descheduling Policy #1 | Partially implemented | Fragmentation scoring, cheap candidate generation, arbitration, and reporting run; GPU arithmetic is not scheduler feasibility. |
 | Arbiter and Reporter | Partially implemented | Core admission gates and outputs exist; positive-benefit/regression admission and dispatch/outcome-fed ledger state are not connected. |
 | Node-Health Policy #2 | Not implemented | Node conditions only exclude unhealthy nodes as defrag targets and enqueue a coalesced early decision request. That request currently reads the latest cached snapshot without first refreshing it; no evacuation candidates or remediation signals are produced. |
-| Scheduler profile selection and simulation protocol | Initial gate implemented | Alfred selects a configured profile from the checked runner templates' effective `schedulerName`, defines a versioned request/result contract, and validates whole-placement results. The standalone worker mirrors that contract without importing the root module. Production Alfred still has no authoritative replacement renderer/admission integration or worker invocation, so every Candidate remains withheld. Pre-existing Alfred snapshot imports of controller internals remain technical debt. |
+| Scheduler profile selection and simulation protocol | Initial gate implemented | Alfred selects a configured profile from the checked runner templates' effective `schedulerName`, defines a versioned request/result contract, and validates whole-placement results. The standalone worker mirrors that contract without importing the root module. Production Alfred still has no lossless predictive-input collection or worker invocation wired into its decision loop, so every Candidate remains withheld. Pre-existing Alfred snapshot imports of controller internals remain technical debt. |
+| Predictive simulation inputs | Library implemented | `pkg/alfred/scheduling/input` captures full public cluster objects and constructs private relocation Pods/PodGroups from checked live source cohorts. It preserves source occupancy, rejects stale/ambiguous inputs, and requires no workload preview API or controller imports. Real-worker integration tests cover its output; production observation/worker wiring remains separate. |
 | Scheduler simulation worker | Standalone worker implemented | The separate `pkg/alfred/simulator` module runs the compiled Kubernetes v1.35.4 scheduler for one complete externally supplied request, with default and OMEGangPack profiles and private snapshot-only clients. It performs no live reservation or cluster write. The executable is not registered with or called by production Alfred, and no profile in Alfred configuration can make execution ready by itself. |
 | Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Current `mode: execute` reporting says "will dispatch" despite performing no write; that mode is unsupported and must fail closed to recommend-only until the Dispatcher and its guards land. |
 | OMENative state | Implemented | Alfred normalizes checked `InferenceReplica.Status`, joins live Pods by Instance index and incarnation for physical placement/readiness, and reads `InferenceReplica.Status.Migrations`. |
@@ -1174,12 +1175,22 @@ falls back from one scheduler to another. A multi-pod replacement whose members
 select different schedulers is unsupported.
 
 Initial routing may inspect the checked current public InferenceReplica runner
-templates. That is sufficient only to choose a prospective profile: later
-rendering and admission add instance labels, gang identity, topology, source
-exclusions, migration hints, and defaults. The real worker request must contain
-the actual fully rendered and admitted replacement Pods. Alfred repeats profile
-routing after that step and rejects the Candidate if the effective scheduler or
-profile changed.
+templates, but that only chooses a prospective profile. Actual simulation inputs
+come from full observed source Pods, including their admitted scheduling
+constraints. Alfred builds private unbound counterparts, consistently remapping
+supported per-instance identities and intra-gang references while preserving
+component-wide constraints. These are hypothetical relocation Pods, not an
+authoritative prediction of the workload controller's exact future objects.
+Alfred repeats profile routing on these counterparts and rejects mismatches.
+
+Alfred does not require an OME rendering/admission preview and does not duplicate
+the workload renderer. It checks public source ownership, incarnation, revision,
+readiness and full gang membership before modeling a move. If placement policy
+has drifted, identity-dependent constraints cannot be safely remapped, or the
+gang mechanism is unsupported, it declines the candidate. Workload/admission
+changes and concurrent scheduling can still invalidate a prediction; the
+existing migration owner remains responsible for real replacement readiness
+and safe source draining.
 
 **Immutable profile identity.** A configured profile contains the opaque worker
 identity `backend`, the exact `schedulerVersion`, an immutable
@@ -1195,7 +1206,7 @@ default-scheduler filter pass is insufficient.
 
 **Isolation and protocol.** The worker runs out of process with scheduler state
 created solely for the request. It receives a versioned request containing a
-request ID, snapshot ID/time, immutable profile identity, actual replacement
+request ID, snapshot ID/time, immutable profile identity, predictive relocation
 Pods, immutable source-Pod identities, explicit source-node exclusions, the
 gang requirement, and all relevant snapshot objects (including Nodes, other
 Pods, storage and scheduling objects). It performs no production bind, evict,
@@ -1221,9 +1232,10 @@ Diagnostics record `schedulerName`, `backend`, `schedulerVersion`,
 `ProfileNotConfigured`, `NoTemplates`, `TemplateBound`, `ProfileInvalid`,
 `GangUnsupported`, `MixedSchedulers`, `SimulationUnavailable`, and
 `OMENativeObservationInvalid`. The original advisory reason remains alongside
-these diagnostics. A standalone worker now evaluates complete externally
-supplied replacement Pods and snapshot objects, but production Alfred has no
-authoritative renderer/admission integration, worker registry or invocation,
+these diagnostics. A standalone worker evaluates complete supplied relocation
+Pods and snapshot objects. Alfred's input library can now construct those
+requests without an owner-side preview, but production Alfred has no lossless
+input collection, worker registry or invocation wired into the decision loop,
 or Dispatcher. Consequently every Candidate remains non-executable in
 practice, and adding a profile to Alfred configuration cannot activate
 execution. The protocol and worker depend on public contracts rather than
@@ -2843,10 +2855,12 @@ engine must not preclude them.
 - 2026-09-14: Policy scope fixed at exactly two policies. Matching-scheduler
   simulation became a mandatory gate between the cheap shortlist and Arbiter
   admission. Public profile selection, a versioned request/result contract, and
-  fail-closed unavailable-worker diagnostics landed; the renderer/admission
-  bridge, isolated worker, and Dispatcher remain unimplemented.
-- TBD: Complete Alpha implementation (replacement rendering/admission bridge,
-  isolated matching-scheduler worker, capability Lease, Policy #2, Dispatcher,
+  fail-closed unavailable-worker diagnostics landed, followed by the isolated
+  scheduler worker and Alfred-owned predictive input library. Inputs model
+  checked observed Pods; an owner-side rendering/admission preview is not
+  required. Production worker wiring and Dispatcher remain unimplemented.
+- TBD: Complete Alpha implementation (production lossless input collection and
+  matching-scheduler worker integration, capability Lease, Policy #2, Dispatcher,
   and outcome-fed safety ledger).
 - TBD: First Beta user.
 - TBD: First Beta release.

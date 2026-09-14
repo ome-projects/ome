@@ -6,10 +6,11 @@ against private clients populated only from the JSON request. It does not read a
 kubeconfig, use in-cluster credentials, contact an API server, or change a live
 cluster.
 
-This worker is not connected to production Alfred. The current controller has
-no authoritative replacement-Pod renderer/admission input, worker registry, or
-worker invocation. Supplying a profile in Alfred configuration therefore does
-not enable migration execution.
+This worker is not connected to production Alfred. Alfred's
+`pkg/alfred/scheduling/input` package can capture full public cluster objects
+and build predictive relocation requests; production collection, worker
+registry/invocation, and dispatch are not yet wired. Supplying a profile in
+Alfred configuration therefore does not enable migration execution.
 
 ## Build and test
 
@@ -118,9 +119,14 @@ API-server, or service-account option.
 
 ## Input boundary
 
-Requests must contain complete, externally rendered and admitted replacement
-Pods—not templates, IR fragments, or copies synthesized from source Pods. They
-must also carry the full dependency closure needed for the prediction:
+Requests contain simulation-only relocation copies of checked, observed Pods.
+These are complete scheduling inputs, not bare templates or a claim about the
+exact future Pods a workload controller will create. Alfred's input builder
+preserves constraints, consistently remaps supported per-instance/gang
+identities, and rejects ambiguous models. It does not call a workload renderer,
+request an admission preview, or change the existing migration API.
+
+Requests must also carry the full dependency closure needed for the prediction:
 
 - every Node and Namespace referenced by the request;
 - every bound Pod whose occupancy or topology can affect placement;
@@ -152,6 +158,39 @@ manufacture feasibility.
 
 Even a `Feasible` result is only a bounded prediction from the supplied
 snapshot. It creates no live scheduler reservation, and cluster state may change
-immediately after the result. Production dispatch still requires authoritative
-replacement inputs, a configured worker integration, Arbiter revalidation, and
-the separate guarded migration dispatcher; none is provided here.
+immediately after the result. Workload configuration and admission behavior may
+also change before real replacements are created. Unsupported or drifted input
+models must not be treated as feasible. Production dispatch still requires a
+configured worker integration, fresh source/profile checks, Arbiter
+revalidation, and the separate guarded migration dispatcher; no live execution
+is provided here.
+
+### Building predictive inputs
+
+The root-module `scheduling/input.Capture` API reads full Nodes, nonterminal
+Pods (including pending and terminating Pods), Namespaces, Services, RCs, RSs,
+STSs, PodGroups, and public InferenceService/InferenceReplica objects. Use a
+lossless API reader with a context deadline; Alfred's normal transformed Pod
+cache drops fields required by scheduling and cannot be used here. The reader
+needs list permissions for every listed resource, including the PodGroup CRD.
+Any failed or partial list makes the capture unavailable.
+
+Captures retain object and list resource versions and a content digest.
+Freshness is measured from the first read, not the end of collection. Lists
+across resource kinds are not an atomic Kubernetes snapshot.
+
+`scheduling/input.BuildRequest` validates the source and its complete observed
+cohort, constructs isolated relocation identities, and selects the configured
+profile from those Pods. Original Pods remain in the snapshot: replacement
+capacity must be available before the migration owner drains the source. The
+builder declines unsupported inputs rather than copying workload-controller
+rendering logic.
+
+The dedicated simulator CI runs a real-binary roundtrip from these input APIs.
+Run it locally after building the worker:
+
+```sh
+# From the repository root.
+ALFRED_SIMULATOR_BINARY="$PWD/pkg/alfred/simulator/bin/alfred-simulator" \
+  go test ./pkg/alfred/scheduling/input -run TestWorkerIntegration -v
+```

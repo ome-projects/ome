@@ -25,6 +25,9 @@ type PodIdentity struct {
 	UID       types.UID `json:"uid,omitempty"`
 }
 
+// Request contains isolated predictive Pods plus observed source occupancy.
+// Replacement identities belong only to this simulation, never the live API.
+// Feasibility does not assert exact future rendering or reserve capacity.
 type Request struct {
 	SchemaVersion   string                 `json:"schemaVersion"`
 	RequestID       string                 `json:"requestID"`

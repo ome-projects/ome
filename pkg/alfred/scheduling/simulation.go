@@ -33,11 +33,12 @@ type PodIdentity struct {
 }
 
 // Request is a complete, immutable scheduling-simulation input. ReplacementPods
-// must be the fully rendered and admitted replacement Pods, including all
-// topology and migration metadata. Pod templates are sufficient only for
-// profile selection and must not be passed to Evaluate as replacement inputs.
-// This package defines the contract but does not render those Pods or build a
-// cluster snapshot.
+// are private predictive counterparts of observed Pods, not a promise of the
+// exact objects a workload controller will create. They preserve scheduling
+// constraints and consistently remap supported intra-gang identities. Bare
+// templates are insufficient; unsupported or ambiguous models must be rejected.
+// Alfred's scheduling/input package constructs these models from full public
+// API observations without invoking a workload renderer or admission preview.
 type Request struct {
 	SchemaVersion   string                 `json:"schemaVersion"`
 	RequestID       string                 `json:"requestID"`

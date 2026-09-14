@@ -14,7 +14,7 @@ const schedulingSimulationUnavailable = "SimulationUnavailable"
 
 // gateSchedulingCandidate runs before arbitration, independently of policy
 // eligibility. A selected profile never authorizes a GPU-heuristic move:
-// authoritative replacement rendering and a simulation worker are not wired.
+// lossless predictive input collection and a simulation worker are not wired.
 // Candidate is copied by value, and its diagnostic is newly allocated so
 // policies can retain their output without sharing mutable engine state.
 func gateSchedulingCandidate(snap *snapshot.ClusterSnapshot, cfg *config.Config, c policy.Candidate) policy.Candidate {
