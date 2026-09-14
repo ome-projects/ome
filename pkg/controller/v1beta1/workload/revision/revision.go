@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -257,25 +258,34 @@ func HashWithWorkerTopologyAndPairing(template, workerSpec *corev1.PodSpec, temp
 // owner would drift every Component's revision hash — including
 // Components that aren't the migration target — and force a phantom
 // rollout that envtest cannot complete.
+//
+// Not the only annotation exclusion, and the smaller one. The
+// InferenceReplica reconciler first drops every key named by
+// ome.io/revision-excluded-annotation-keys — the irprojector stamps it
+// with every ISVC annotation NOT declared under
+// spec.<component>.annotations. So ISVC-level annotations never reach
+// this function; only component-declared ones do. Predicting an
+// annotation-driven rollout means reading both. Labels have no dynamic
+// exclusion: for them the static list below is the whole story.
 func TemplateMeta(src *metav1.ObjectMeta) *metav1.ObjectMeta {
 	if src == nil || (len(src.Labels) == 0 && len(src.Annotations) == 0) {
 		return nil
 	}
 	filtered := src.Annotations
-	if hasLifecycleAnnotation(src.Annotations) {
+	if hasDerivedAnnotation(src.Annotations) {
 		filtered = make(map[string]string, len(src.Annotations))
 		for k, v := range src.Annotations {
-			if isLifecycleAnnotation(k) {
+			if isDerivedAnnotation(k) {
 				continue
 			}
 			filtered[k] = v
 		}
 	}
 	labels := src.Labels
-	if hasSchedulingLabel(src.Labels) {
+	if hasDerivedLabel(src.Labels) {
 		labels = make(map[string]string, len(src.Labels))
 		for k, v := range src.Labels {
-			if isSchedulingLabel(k) {
+			if isDerivedLabel(k) {
 				continue
 			}
 			labels[k] = v
@@ -319,23 +329,61 @@ func isSchedulingLabel(key string) bool {
 	return false
 }
 
-// hasSchedulingLabel reports whether any key is admission-plane owned. Fast path
-// so the common case skips the copy in TemplateMeta.
-func hasSchedulingLabel(labels map[string]string) bool {
+// isPlacementMarker reports whether the label is one the multi-cluster control
+// plane stamps on a derived workload to record its provenance: which source
+// InferenceService it was derived from, and which control plane derived it.
+//
+// It is identity bookkeeping, not workload configuration — the values are a UID
+// and a control-plane name, neither of which a running pod can act on. Hashing
+// it would make taking an already-running workload under control-plane
+// management a full rollout of that workload, which is precisely the downtime a
+// live migration exists to avoid. The markers are also written by the placer
+// rather than by whoever authored the spec, so they are not user intent.
+func isPlacementMarker(key string) bool {
+	switch key {
+	case constants.PlacementOrigin, constants.PlacementControlPlane:
+		return true
+	}
+	return false
+}
+
+// isDerivedLabel reports whether a label is written by a controller from
+// cluster state rather than authored by the user, and so must not feed the
+// pod-template revision hash. Two families qualify: the admission plane's queue
+// assignment and the control plane's placement provenance.
+func isDerivedLabel(key string) bool {
+	return isSchedulingLabel(key) || isPlacementMarker(key)
+}
+
+// hasDerivedLabel reports whether any key is controller-written. Fast path so
+// the common case skips the copy in TemplateMeta.
+func hasDerivedLabel(labels map[string]string) bool {
 	for k := range labels {
-		if isSchedulingLabel(k) {
+		if isDerivedLabel(k) {
 			return true
 		}
 	}
 	return false
 }
 
-// hasLifecycleAnnotation reports whether any key in annotations is a
-// controller-written lifecycle annotation. Fast path so the common
-// no-lifecycle-annotation case skips the copy in TemplateMeta.
-func hasLifecycleAnnotation(annotations map[string]string) bool {
+// isSchedulingAnnotation reports whether the annotation selects where the
+// admission plane places the workload. The annotation mirror of
+// isSchedulingLabel: this one names the queue, that one carries it.
+func isSchedulingAnnotation(key string) bool {
+	return key == constants.LocalQueue
+}
+
+// isDerivedAnnotation reports whether an annotation is controller-owned rather
+// than authored intent, and so must not feed the pod-template revision hash.
+func isDerivedAnnotation(key string) bool {
+	return isLifecycleAnnotation(key) || isSchedulingAnnotation(key)
+}
+
+// hasDerivedAnnotation reports whether any key is controller-owned. Fast path
+// so the common case skips the copy in TemplateMeta.
+func hasDerivedAnnotation(annotations map[string]string) bool {
 	for k := range annotations {
-		if isLifecycleAnnotation(k) {
+		if isDerivedAnnotation(k) {
 			return true
 		}
 	}

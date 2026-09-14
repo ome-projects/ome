@@ -61,9 +61,18 @@ func DeriveISVC(src *v1beta1.InferenceService, controlPlaneID, localQueue string
 	}
 	d.Annotations[PlacementOriginUIDAnnotation] = string(src.UID)
 	// Strip control-plane-only directives so they do not ride along to the
-	// worker (placement selectors + rollout operator verbs).
+	// worker: the placement selectors, the rollout operator verbs, and the
+	// source's GitOps bookkeeping.
 	for _, k := range controlPlaneOnlyAnnotations {
 		delete(d.Annotations, k)
+	}
+	for k := range d.Annotations {
+		for _, p := range controlPlaneOnlyAnnotationPrefixes {
+			if strings.HasPrefix(k, p) {
+				delete(d.Annotations, k)
+				break
+			}
+		}
 	}
 
 	// Stamp Kueue gating on each component. An unresolved queue leaves the label

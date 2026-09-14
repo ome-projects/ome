@@ -506,6 +506,140 @@ func TestRevisionHash_SchedulingLabelsDoNotDriftHash(t *testing.T) {
 	}
 }
 
+// The annotation that SELECTS the queue is excluded for the same reason as the
+// labels it produces. Backfilling it across a fleet is preparation, not a spec
+// change, and hashing it would turn that preparation into a rollout of every
+// workload annotated.
+func TestRevisionHash_LocalQueueAnnotationDoesNotDriftHash(t *testing.T) {
+	ps := basicPodSpecForRevision()
+	base := &metav1.ObjectMeta{Annotations: map[string]string{"ome.io/deploymentMode": "OMENative"}}
+
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+	}{
+		{
+			name: "annotated where there was none",
+			annotations: map[string]string{
+				"ome.io/deploymentMode": "OMENative",
+				"ome.io/local-queue":    "team-a",
+			},
+		},
+		{
+			name: "re-pointed at another queue",
+			annotations: map[string]string{
+				"ome.io/deploymentMode": "OMENative",
+				"ome.io/local-queue":    "team-b",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hBase, _, _ := Hash(ps, base, nil, "")
+			hWith, _, _ := Hash(ps, &metav1.ObjectMeta{Annotations: tc.annotations}, nil, "")
+			if hBase != hWith {
+				t.Errorf("the queue annotation must not reach the revision hash: base=%s with=%s", hBase, hWith)
+			}
+		})
+	}
+}
+
+// Mirrors the labels-only case: a template carrying nothing but the queue
+// annotation has to hash as though it carried no metadata, or the exclusion
+// just relocates the drift.
+func TestRevisionHash_OnlyLocalQueueAnnotationEqualsNoMeta(t *testing.T) {
+	ps := basicPodSpecForRevision()
+	only := &metav1.ObjectMeta{Annotations: map[string]string{"ome.io/local-queue": "team-a"}}
+
+	hNil, _, _ := Hash(ps, nil, nil, "")
+	hOnly, _, _ := Hash(ps, only, nil, "")
+	if hNil != hOnly {
+		t.Errorf("a template carrying only the queue annotation must hash as no metadata: nil=%s only=%s", hNil, hOnly)
+	}
+}
+
+// Taking an already-running workload under multi-cluster management stamps
+// provenance LABELS on it: which source it derives from, and which control
+// plane placed it. That is identity bookkeeping written by the placer, not
+// spec the user authored, and a running pod cannot act on it — so it must not
+// mint a revision. Hashing it makes a live migration a full rollout.
+//
+// Labels only. The annotation half (ome.io/placement-origin-uid) is stripped
+// before this function ever sees it, by the InferenceReplica reconciler's
+// ome.io/revision-excluded-annotation-keys set — asserting it here would pass
+// for a reason that does not hold in production.
+func TestRevisionHash_PlacementMarkersDoNotDriftHash(t *testing.T) {
+	ps := basicPodSpecForRevision()
+	base := &metav1.ObjectMeta{
+		Labels:      map[string]string{"app": "llama"},
+		Annotations: map[string]string{"ome.io/deploymentMode": "OMENative"},
+	}
+
+	for _, tc := range []struct {
+		name string
+		meta *metav1.ObjectMeta
+	}{
+		{
+			name: "origin label stamped on adoption",
+			meta: &metav1.ObjectMeta{
+				Labels: map[string]string{
+					"app":                     "llama",
+					"ome.io/placement-origin": "11111111-1111-4111-8111-111111111111",
+				},
+				Annotations: map[string]string{"ome.io/deploymentMode": "OMENative"},
+			},
+		},
+		{
+			name: "control-plane identity added when a second control plane appears",
+			meta: &metav1.ObjectMeta{
+				Labels: map[string]string{
+					"app":                            "llama",
+					"ome.io/placement-origin":        "11111111-1111-4111-8111-111111111111",
+					"ome.io/placement-control-plane": "control-plane-a",
+				},
+				Annotations: map[string]string{"ome.io/deploymentMode": "OMENative"},
+			},
+		},
+		{
+			name: "re-derived from a recreated source, so every marker changes value",
+			meta: &metav1.ObjectMeta{
+				Labels: map[string]string{
+					"app":                            "llama",
+					"ome.io/placement-origin":        "0e2f1a77-0000-4000-8000-000000000000",
+					"ome.io/placement-control-plane": "control-plane-b",
+				},
+				Annotations: map[string]string{"ome.io/deploymentMode": "OMENative"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hBase, _, _ := Hash(ps, base, nil, "")
+			hWith, _, _ := Hash(ps, tc.meta, nil, "")
+			if hBase != hWith {
+				t.Errorf("placement provenance must not reach the revision hash: base=%s with=%s", hBase, hWith)
+			}
+		})
+	}
+}
+
+// Mirrors the queue cases: a template carrying nothing but the provenance
+// labels has to hash as though it carried no metadata, or the exclusion merely
+// relocates the drift.
+func TestRevisionHash_OnlyPlacementMarkersEqualNoMeta(t *testing.T) {
+	ps := basicPodSpecForRevision()
+	only := &metav1.ObjectMeta{
+		Labels: map[string]string{
+			"ome.io/placement-origin":        "11111111-1111-4111-8111-111111111111",
+			"ome.io/placement-control-plane": "control-plane-a",
+		},
+	}
+
+	hNil, _, _ := Hash(ps, nil, nil, "")
+	hOnly, _, _ := Hash(ps, only, nil, "")
+	if hNil != hOnly {
+		t.Errorf("a template carrying only placement provenance must hash as no metadata: nil=%s only=%s", hNil, hOnly)
+	}
+}
+
 // The exclusion is scoped to the admission plane's own keys. A user label is
 // spec the user wrote, and changing it is a rollout they asked for.
 func TestRevisionHash_UserLabelsStillDriftHash(t *testing.T) {

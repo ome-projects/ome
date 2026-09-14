@@ -84,6 +84,51 @@ func TestDeriveISVC(t *testing.T) {
 	assert.Nil(t, src.Spec.Engine.ComponentExtensionSpec.Labels, "source ISVC must be untouched")
 }
 
+// Leaving it on overwrites the member object's own tracking-id, which is what
+// ArgoCD reads to decide ownership — reassigning it to an application on
+// another cluster that does not manage it.
+func TestDeriveISVC_StripsGitOpsAnnotations(t *testing.T) {
+	src := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc", Namespace: "prod", UID: "uid-123",
+			Annotations: map[string]string{
+				"argocd.argoproj.io/tracking-id":     "source-app:ome.io/InferenceService:prod/svc",
+				"argocd.argoproj.io/sync-options":    "Prune=false",
+				"argocd.argoproj.io/compare-options": "IgnoreExtraneous",
+				"argocd.argoproj.io/sync-wave":       "1",
+				// Not the control plane's tooling: a user annotation on a
+				// lookalike-but-different domain must survive.
+				"argocd.argoproj.io.example.com/keep": "yes",
+				constants.NetworkVisibility:           "cluster-local",
+			},
+		},
+		Spec: v1beta1.InferenceServiceSpec{
+			Engine: &v1beta1.EngineSpec{
+				Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "ome-container", Image: "img"}},
+			},
+		},
+	}
+
+	d := DeriveISVC(src, "cp-east", "")
+
+	for _, k := range []string{
+		"argocd.argoproj.io/tracking-id",
+		"argocd.argoproj.io/sync-options",
+		"argocd.argoproj.io/compare-options",
+		"argocd.argoproj.io/sync-wave",
+	} {
+		_, present := d.Annotations[k]
+		assert.False(t, present, "%s must not ride along to the derived copy", k)
+	}
+	assert.Equal(t, "yes", d.Annotations["argocd.argoproj.io.example.com/keep"],
+		"the prefix must match the family, not merely a leading substring")
+	assert.Equal(t, "cluster-local", d.Annotations[constants.NetworkVisibility],
+		"unrelated annotations still ride along")
+	// The source is untouched: DeriveISVC works on a deep copy.
+	assert.Equal(t, "source-app:ome.io/InferenceService:prod/svc",
+		src.Annotations["argocd.argoproj.io/tracking-id"])
+}
+
 func TestSetDerivedReplicas(t *testing.T) {
 	newISVC := func(engMax int, withDecoder bool) *v1beta1.InferenceService {
 		i := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
