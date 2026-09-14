@@ -16,20 +16,21 @@ concurrency:
   group: dev-images-${{ inputs.express && 'express' || 'full' }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write # For signing images with cosign
+permissions: {}
 
 env:
   # Image registry configuration
   REGISTRY: ghcr.io
-  IMAGE_ORG: moirai-internal
+  IMAGE_ORG: ome-projects
   # Go version
   GO_VERSION: '1.26'
 
 jobs:
   build-and-push-images:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # For signing images with cosign
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -46,6 +47,9 @@ jobs:
           - name: ome-scheduler
             dockerfile: dockerfiles/ome-scheduler.Dockerfile
             image: ome-scheduler
+          - name: alfred
+            dockerfile: dockerfiles/alfred.Dockerfile
+            image: alfred
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -68,7 +72,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.MOIRAI_REGISTRY_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -77,22 +81,29 @@ jobs:
         id: version
         run: |
           # Generate version info for dev builds
-          SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)
-          TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
-          DEV_VERSION="dev-${TIMESTAMP}-${SHORT_SHA}"
-          echo "version=${DEV_VERSION}" >> $GITHUB_OUTPUT
-          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          TIMESTAMP="$(date -u +'%Y%m%d%H%M%S')"
+          if [[ "${{ inputs.express }}" == "true" ]]; then
+            DEV_VERSION="dev-${TIMESTAMP}-${SHORT_SHA}-amd64"
+            IMAGE_TAG="dev-${SHORT_SHA}-amd64"
+          else
+            DEV_VERSION="dev-${TIMESTAMP}-${SHORT_SHA}"
+            IMAGE_TAG="dev-${SHORT_SHA}"
+          fi
+          echo "version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}"
-          if [ "${{ inputs.express }}" = "true" ]; then
-            # Express pins only the SHA tag; :dev stays multi-arch.
-            echo "tags=${IMAGE}:dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          if [[ "${{ inputs.express }}" == "true" ]]; then
+            # Express has its own immutable tag and never replaces multi-arch.
+            echo "tags=${IMAGE}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           else
             {
               echo "tags<<EOF"
               echo "${IMAGE}:dev"
-              echo "${IMAGE}:dev-${SHORT_SHA}"
+              echo "${IMAGE}:${IMAGE_TAG}"
               echo "EOF"
-            } >> $GITHUB_OUTPUT
+            } >> "$GITHUB_OUTPUT"
           fi
           echo "📦 Building dev version: ${DEV_VERSION}"
 
@@ -107,35 +118,213 @@ jobs:
           tags: ${{ steps.version.outputs.tags }}
           cache-from: type=gha,scope=${{ matrix.component.image }}
           cache-to: type=gha,scope=${{ matrix.component.image }},mode=max,ignore-error=true
+          provenance: mode=max
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             GIT_TAG=dev
             GIT_COMMIT=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Sign image
-        env:
-          COSIGN_EXPERIMENTAL: 1
+      - name: Record image provenance
         run: |
-          # Sign both the :dev tag and the SHA-specific tag
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}@${{ steps.build.outputs.digest }}
+          echo "### ${{ matrix.component.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Digest | Platforms |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}:${{ steps.version.outputs.image_tag }}\` | \`${{ steps.build.outputs.digest }}\` | \`${{ inputs.express && 'linux/amd64' || 'linux/amd64,linux/arm64' }}\` |" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          output-file: ${{ matrix.component.image }}-sbom.spdx.json
-
-      - name: Attach SBOM to image
+      - name: Sign image index
         env:
-          COSIGN_EXPERIMENTAL: 1
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          # Attach SBOM to the image using cosign
-          cosign attach sbom --sbom ${{ matrix.component.image }}-sbom.spdx.json ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}@${{ steps.build.outputs.digest }}
+          cosign sign --yes "${IMAGE}@${IMAGE_DIGEST}"
 
-  publish-dev-charts:
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate signed per-platform SBOM attestations
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          expected_platforms=(linux/amd64)
+          if [[ "${{ inputs.express }}" != "true" ]]; then
+            expected_platforms+=(linux/arm64)
+          fi
+
+          manifest_json="$(docker buildx imagetools inspect "${IMAGE}@${IMAGE_DIGEST}" --raw)"
+          if ! jq -e '(.manifests | type) == "array"' <<<"${manifest_json}" >/dev/null; then
+            echo "::error::Published image is not an OCI index: ${IMAGE}@${IMAGE_DIGEST}"
+            exit 1
+          fi
+          mapfile -t platform_manifests < <(
+            jq -r '
+              .manifests[]
+              | select(.platform.os == "linux")
+              | select(.platform.architecture == "amd64" or .platform.architecture == "arm64")
+              | [(.platform.os + "/" + .platform.architecture), .digest]
+              | @tsv
+            ' <<<"${manifest_json}"
+          )
+          if [[ "${#platform_manifests[@]}" -ne "${#expected_platforms[@]}" ]]; then
+            echo "::error::Expected ${#expected_platforms[@]} platform manifests, found ${#platform_manifests[@]}"
+            exit 1
+          fi
+          for expected_platform in "${expected_platforms[@]}"; do
+            present=false
+            for row in "${platform_manifests[@]}"; do
+              IFS=$'\t' read -r platform _ <<<"${row}"
+              if [[ "${platform}" == "${expected_platform}" ]]; then
+                present=true
+                break
+              fi
+            done
+            if [[ "${present}" != "true" ]]; then
+              echo "::error::Missing platform manifest: ${expected_platform}"
+              exit 1
+            fi
+          done
+
+          echo "### Signed SBOM attestations" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Platform | Child manifest | Predicate |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for row in "${platform_manifests[@]}"; do
+            IFS=$'\t' read -r platform digest <<<"${row}"
+            platform_slug="${platform/\//-}"
+            sbom_file="${{ matrix.component.image }}-${platform_slug}-sbom.spdx.json"
+            "${SYFT}" "registry:${IMAGE}@${digest}" -o "spdx-json=${sbom_file}"
+            jq -e '.spdxVersion | startswith("SPDX-")' "${sbom_file}" >/dev/null
+            cosign attest \
+              --yes \
+              --type https://spdx.dev/Document \
+              --predicate "${sbom_file}" \
+              "${IMAGE}@${digest}"
+            echo "| \`${platform}\` | \`${digest}\` | \`https://spdx.dev/Document\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  verify-public-images:
+    permissions: {}
     needs: build-and-push-images
     runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # This job intentionally has no registry login. A successful inspection
+      # proves a fresh Moirai node can pull every SHA-pinned image anonymously.
+      - name: Verify anonymous image pulls
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          CERTIFICATE_IDENTITY="https://github.com/${GITHUB_WORKFLOW_REF}"
+          CERTIFICATE_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+          if [[ "${{ inputs.express }}" == "true" ]]; then
+            IMAGE_TAG="dev-${SHORT_SHA}-amd64"
+            expected_platforms=(linux/amd64)
+          else
+            IMAGE_TAG="dev-${SHORT_SHA}"
+            expected_platforms=(linux/amd64 linux/arm64)
+          fi
+          for image in ome-manager model-agent ome-agent ome-scheduler alfred; do
+            image_repository="${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${image}"
+            reference="${image_repository}:${IMAGE_TAG}"
+            verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if manifest_json="$(docker buildx imagetools inspect "${reference}" --raw)"; then
+                verified=true
+                break
+              fi
+              echo "Waiting for ${reference} to become anonymously readable (attempt ${attempt}/6)"
+              sleep 10
+            done
+            if [[ "${verified}" != "true" ]]; then
+              echo "::error::Image is not anonymously readable: ${reference}"
+              echo "If this is the first publish, confirm the package visibility is Public:"
+              echo "https://github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${image}/settings"
+              exit 1
+            fi
+
+            mapfile -t platform_manifests < <(
+              jq -r '
+                .manifests[]
+                | select(.platform.os == "linux")
+                | select(.platform.architecture == "amd64" or .platform.architecture == "arm64")
+                | [(.platform.os + "/" + .platform.architecture), .digest]
+                | @tsv
+              ' <<<"${manifest_json}"
+            )
+            if [[ "${#platform_manifests[@]}" -ne "${#expected_platforms[@]}" ]]; then
+              echo "::error::${reference} has ${#platform_manifests[@]} platform manifests; expected ${#expected_platforms[@]}"
+              exit 1
+            fi
+            for expected_platform in "${expected_platforms[@]}"; do
+              present=false
+              for row in "${platform_manifests[@]}"; do
+                IFS=$'\t' read -r platform _ <<<"${row}"
+                if [[ "${platform}" == "${expected_platform}" ]]; then
+                  present=true
+                  break
+                fi
+              done
+              if [[ "${present}" != "true" ]]; then
+                echo "::error::${reference} is missing ${expected_platform}"
+                exit 1
+              fi
+            done
+
+            supply_chain_verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if ! cosign verify \
+                --certificate-identity "${CERTIFICATE_IDENTITY}" \
+                --certificate-oidc-issuer "${CERTIFICATE_OIDC_ISSUER}" \
+                "${reference}" >/dev/null; then
+                echo "Waiting for the signature on ${reference} (attempt ${attempt}/6)"
+                sleep 10
+                continue
+              fi
+
+              attestations_verified=true
+              for row in "${platform_manifests[@]}"; do
+                IFS=$'\t' read -r platform digest <<<"${row}"
+                if ! cosign verify-attestation \
+                  --type https://spdx.dev/Document \
+                  --certificate-identity "${CERTIFICATE_IDENTITY}" \
+                  --certificate-oidc-issuer "${CERTIFICATE_OIDC_ISSUER}" \
+                  "${image_repository}@${digest}" >/dev/null; then
+                  attestations_verified=false
+                  echo "Waiting for the signed ${platform} SBOM on ${reference} (attempt ${attempt}/6)"
+                  break
+                fi
+              done
+              if [[ "${attestations_verified}" == "true" ]]; then
+                supply_chain_verified=true
+                break
+              fi
+              sleep 10
+            done
+            if [[ "${supply_chain_verified}" != "true" ]]; then
+              echo "::error::Signature or per-platform SBOM verification failed: ${reference}"
+              exit 1
+            fi
+          done
+
+  publish-dev-charts:
+    permissions:
+      contents: read
+      packages: write
+    needs: build-and-push-images
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -150,76 +339,161 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.MOIRAI_REGISTRY_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update chart for dev
+      - name: Prepare SHA-pinned dev charts
+        id: version
         run: |
-          # Get short SHA for version
-          SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)
-          TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          TIMESTAMP="$(date -u +'%Y%m%d%H%M%S')"
           DEV_VERSION="0.0.0-dev.${TIMESTAMP}+${SHORT_SHA}"
-
-          # Update chart versions with dev version
-          for chart in charts/*/; do
-            chart_name=$(basename ${chart})
-            dev_chart="charts/${chart_name}-dev"
-
-            # Create a copy of the chart for dev
-            cp -r ${chart} ${dev_chart}/
-
-
-            # Update versions in the dev copy
-            yq eval -i ".version = \"${DEV_VERSION}\"" ${dev_chart}/Chart.yaml
-            yq eval -i ".appVersion = \"dev\"" ${dev_chart}/Chart.yaml
-
-            # Update image tags in values.yaml for ome-resources chart
-            if [[ -f ${dev_chart}/values.yaml ]] && [[ $chart_name == "ome-resources" ]]; then
-              # Update all image tags to use dev
-              yq eval -i ".ome.version = \"dev\"" ${dev_chart}/values.yaml
-              yq eval -i ".ome.benchmarkJob.tag = \"dev\"" ${dev_chart}/values.yaml
-              yq eval -i ".ome.omeAgent.tag = \"dev\"" ${dev_chart}/values.yaml
-              yq eval -i ".modelAgent.image.tag = \"dev\"" ${dev_chart}/values.yaml
-            fi
-          done
+          if [[ "${{ inputs.express }}" == "true" ]]; then
+            IMAGE_TAG="dev-${SHORT_SHA}-amd64"
+          else
+            IMAGE_TAG="dev-${SHORT_SHA}"
+          fi
+          echo "version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          hack/prepare-dev-charts.sh \
+            charts \
+            .dev-charts \
+            "${DEV_VERSION}" \
+            "${IMAGE_TAG}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}"
 
       - name: Package and push dev charts
         run: |
-          for chart in charts/*-dev/; do
-            # Package the dev chart
-            helm package ${chart}
+          mkdir -p .dev-packages
+          for chart in .dev-charts/*/; do
+            helm package "${chart}" --destination .dev-packages
+          done
+          for chart_package in .dev-packages/*.tgz; do
+            helm push "${chart_package}" oci://${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/charts
+          done
 
-            # Get the chart name from the packaged file
-            CHART_FILE=$(ls -1 *.tgz | tail -n1)
+      - name: Record chart provenance
+        run: |
+          echo "### SHA-pinned Helm charts" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Version: \`${{ steps.version.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image tag: \`${{ steps.version.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Chart | OCI reference |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`ome-crd\` | \`oci://ghcr.io/ome-projects/charts/ome-crd\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`ome-resources\` | \`oci://ghcr.io/ome-projects/charts/ome-resources\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`ome-scheduler\` | \`oci://ghcr.io/ome-projects/charts/ome-scheduler\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`ome-alfred\` | \`oci://ghcr.io/ome-projects/charts/ome-alfred\` |" >> "$GITHUB_STEP_SUMMARY"
 
-            # Push to OCI registry with dev tag
-            helm push ${CHART_FILE} oci://${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/charts
+  verify-dev-charts:
+    permissions: {}
+    needs: publish-dev-charts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
 
-            # Clean up
-            rm ${CHART_FILE}
-            rm -rf ${chart}
+      # This job intentionally has no registry login. It gates the install
+      # instructions on the exact OCI charts being publicly retrievable.
+      - name: Verify anonymous chart pulls
+        env:
+          DEV_CHART_VERSION: ${{ needs.publish-dev-charts.outputs.version }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/dev-charts"
+          for chart in ome-crd ome-resources ome-scheduler ome-alfred; do
+            verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if helm pull \
+                "oci://${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/charts/${chart}" \
+                --version "${DEV_CHART_VERSION}" \
+                --destination "${RUNNER_TEMP}/dev-charts"; then
+                verified=true
+                break
+              fi
+              echo "Waiting for ${chart} ${DEV_CHART_VERSION} to become anonymously readable (attempt ${attempt}/6)"
+              sleep 10
+            done
+            if [[ "${verified}" != "true" ]]; then
+              echo "::error::Chart is not anonymously readable: ${chart} ${DEV_CHART_VERSION}"
+              echo "If this is the first publish, confirm the package visibility is Public:"
+              echo "https://github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/charts%2F${chart}/settings"
+              exit 1
+            fi
           done
 
   notify:
-    needs: [build-and-push-images, publish-dev-charts]
+    permissions: {}
+    needs: [build-and-push-images, verify-public-images, publish-dev-charts, verify-dev-charts]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Summary
         run: |
-          echo "## 🚀 Dev Images Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "The following dev images have been published:" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Image |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| OME Manager | \`ghcr.io/moirai-internal/ome-manager:dev\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Model Agent | \`ghcr.io/moirai-internal/model-agent:dev\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| OME Agent | \`ghcr.io/moirai-internal/ome-agent:dev\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Helm Charts" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Dev Helm charts are available:" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "helm install ome-crd oci://ghcr.io/moirai-internal/charts/ome-crd --version 0.0.0-dev.*" >> $GITHUB_STEP_SUMMARY
-          echo "helm install ome oci://ghcr.io/moirai-internal/charts/ome-resources --version 0.0.0-dev.*" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          if [[ "${{ inputs.express }}" == "true" ]]; then
+            IMAGE_TAG="dev-${SHORT_SHA}-amd64"
+          else
+            IMAGE_TAG="dev-${SHORT_SHA}"
+          fi
+          artifacts_verified=false
+          if [[ "${{ needs.build-and-push-images.result }}" == "success" && \
+                "${{ needs.verify-public-images.result }}" == "success" && \
+                "${{ needs.publish-dev-charts.result }}" == "success" && \
+                "${{ needs.verify-dev-charts.result }}" == "success" ]]; then
+            artifacts_verified=true
+            echo "## Dev artifacts published and verified" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Dev artifact publication did not complete" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | SHA-pinned image |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OME Manager | \`${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/ome-manager:${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Model Agent | \`${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/model-agent:${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OME Agent | \`${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/ome-agent:${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OME Scheduler | \`${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/ome-scheduler:${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Alfred | \`${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/alfred:${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Gate | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image builds | \`${{ needs.build-and-push-images.result }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Anonymous image pulls | \`${{ needs.verify-public-images.result }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Chart publication | \`${{ needs.publish-dev-charts.result }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Anonymous chart pulls | \`${{ needs.verify-dev-charts.result }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ needs.build-and-push-images.result }}" == "success" && \
+                "${{ needs.publish-dev-charts.result }}" == "success" && \
+                "${artifacts_verified}" != "true" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### One-time GHCR visibility setup" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The first dispatch creates all nine packages as private. Change each package to Public, then rerun this workflow. GitHub treats that change as irreversible." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            for image in ome-manager model-agent ome-agent ome-scheduler alfred; do
+              echo "- [\`${image}\`](https://github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${image}/settings)" >> "$GITHUB_STEP_SUMMARY"
+            done
+            for chart in ome-crd ome-resources ome-scheduler ome-alfred; do
+              echo "- [\`charts/${chart}\`](https://github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/charts%2F${chart}/settings)" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+          if [[ "${artifacts_verified}" == "true" && -n "${{ needs.publish-dev-charts.outputs.version }}" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Helm chart version: \`${{ needs.publish-dev-charts.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Chart | OCI reference |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`ome-crd\` | \`oci://ghcr.io/ome-projects/charts/ome-crd\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`ome-resources\` | \`oci://ghcr.io/ome-projects/charts/ome-resources\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`ome-scheduler\` | \`oci://ghcr.io/ome-projects/charts/ome-scheduler\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`ome-alfred\` | \`oci://ghcr.io/ome-projects/charts/ome-alfred\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Install this exact build" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+            echo "helm upgrade --install ome-crd oci://ghcr.io/ome-projects/charts/ome-crd --version '${{ needs.publish-dev-charts.outputs.version }}' --namespace ome --create-namespace" >> "$GITHUB_STEP_SUMMARY"
+            echo "helm upgrade --install ome oci://ghcr.io/ome-projects/charts/ome-resources --version '${{ needs.publish-dev-charts.outputs.version }}' --namespace ome" >> "$GITHUB_STEP_SUMMARY"
+            echo "helm upgrade --install ome-scheduler oci://ghcr.io/ome-projects/charts/ome-scheduler --version '${{ needs.publish-dev-charts.outputs.version }}' --namespace ome" >> "$GITHUB_STEP_SUMMARY"
+            echo "helm upgrade --install ome-alfred oci://ghcr.io/ome-projects/charts/ome-alfred --version '${{ needs.publish-dev-charts.outputs.version }}' --namespace ome" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -36,6 +36,14 @@ repos:
 
   - repo: local
     hooks:
+      - id: dev-images-contract
+        name: dev image and chart contract
+        description: Verify the complete dev image matrix and SHA-pinned chart preparation.
+        entry: bash hack/dev-images_test.sh
+        language: system
+        files: ^(\.github/workflows/(dev-images\.yaml|pr-validation\.yml)|hack/(dev-images_test|prepare-dev-charts(_test)?)\.sh)$
+        pass_filenames: false
+
       - id: go-fmt
         name: go fmt
         description: Format Go code with gofmt

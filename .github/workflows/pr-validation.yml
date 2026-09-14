@@ -176,7 +176,7 @@ jobs:
         id: filter
         run: |
           if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | \
-             grep -qE '^(dockerfiles/|Makefile|pkg/xet/|scheduler/|go\.(mod|sum)|\.github/workflows/pr-validation\.yml)'; then
+             grep -qE '^(dockerfiles/|Makefile|pkg/xet/|scheduler/|go\.(mod|sum)|\.github/workflows/(dev-images\.yaml|pr-validation\.yml))'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -190,7 +190,7 @@ jobs:
     if: needs.docker-changes.outputs.docker == 'true'
     strategy:
       matrix:
-        image: [ome-image, model-agent-image, ome-agent-image, ome-scheduler-image]
+        image: [ome-image, model-agent-image, ome-agent-image, ome-scheduler-image, alfred-image]
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
