@@ -79,6 +79,79 @@ func TestInstanceStatusJSONKeepsEmptyCollectionsAsArrays(t *testing.T) {
 	}
 }
 
+func TestInstanceStatusCanonicalRedactsCredentialShapesWithoutKeywordFalsePositives(t *testing.T) {
+	t.Parallel()
+
+	shapes := []string{
+		"ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+		"sk-proj-0123456789abcdefghijklmnopqrstuvwxyz",
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl",
+		"AKIAIOSFODNN7EXAMPLE",
+	}
+	for _, shape := range shapes {
+		report := NewInstanceStatusReport(Metadata{Name: "chat"}, InstanceStatusContent{
+			Summary: InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+			Instance: &InstanceStatusInstance{Conditions: []InstanceStatusCondition{{
+				Type: "Ready", Status: "False", Reason: "failure-" + shape,
+			}}},
+			Events: []InstanceStatusEvent{{TargetKind: "Pod", TargetName: "pod", Reason: "reason-" + shape}},
+		}, ClockFunc(func() time.Time { return time.Unix(0, 0) })).Canonical()
+		require.NotNil(t, report.Content.Instance)
+		assert.Equal(t, "[REDACTED]", report.Content.Instance.Conditions[0].Reason)
+		assert.Equal(t, "[REDACTED]", report.Content.Events[0].Reason)
+	}
+
+	report := NewInstanceStatusReport(Metadata{Name: "chat"}, InstanceStatusContent{
+		Summary: InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+		Instance: &InstanceStatusInstance{Conditions: []InstanceStatusCondition{
+			{Type: "Ready", Status: "False", Reason: "TokenExpired"},
+			{Type: "Healthy", Status: "False", Reason: "SecretNotFound"},
+		}},
+	}, ClockFunc(func() time.Time { return time.Unix(0, 0) })).Canonical()
+	require.NotNil(t, report.Content.Instance)
+	assert.Equal(t, "SecretNotFound", report.Content.Instance.Conditions[0].Reason)
+	assert.Equal(t, "TokenExpired", report.Content.Instance.Conditions[1].Reason)
+}
+
+func TestInstanceStatusCanonicalUsesTotalOrderingForHostileDuplicates(t *testing.T) {
+	t.Parallel()
+	first := time.Date(2026, 9, 14, 1, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+	content := InstanceStatusContent{
+		Summary: InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+		Instance: &InstanceStatusInstance{Conditions: []InstanceStatusCondition{
+			{Type: "Ready", Status: "False", Reason: "Same", LastTransitionTime: &second},
+			{Type: "Ready", Status: "False", Reason: "Same", LastTransitionTime: &first},
+		}},
+		Pods: []InstanceStatusPod{
+			{Name: "duplicate", Runner: "worker", Revision: "z"},
+			{Name: "duplicate", Runner: "worker", Revision: "a"},
+		},
+		Events: []InstanceStatusEvent{
+			{TargetKind: "Pod", TargetName: "duplicate", Reason: "Same", Count: 1, LastSeen: &second},
+			{TargetKind: "Pod", TargetName: "duplicate", Reason: "Same", Count: 1, LastSeen: &first},
+		},
+	}
+	reversed := content
+	instanceCopy := *content.Instance
+	reversed.Instance = &instanceCopy
+	reversed.Instance.Conditions = append([]InstanceStatusCondition{}, content.Instance.Conditions...)
+	reversed.Pods = append([]InstanceStatusPod{}, content.Pods...)
+	reversed.Events = append([]InstanceStatusEvent{}, content.Events...)
+	slicesReverseStatus(reversed.Instance.Conditions)
+	slicesReverseStatus(reversed.Pods)
+	slicesReverseStatus(reversed.Events)
+	left := NewInstanceStatusReport(Metadata{Name: "chat"}, content, ClockFunc(func() time.Time { return first })).Canonical()
+	right := NewInstanceStatusReport(Metadata{Name: "chat"}, reversed, ClockFunc(func() time.Time { return first })).Canonical()
+	assert.Equal(t, left, right)
+}
+
+func slicesReverseStatus[T any](values []T) {
+	for i, j := 0, len(values)-1; i < j; i, j = i+1, j-1 {
+		values[i], values[j] = values[j], values[i]
+	}
+}
+
 func TestInstanceStatusTableIsUsefulAndAtMost80DisplayColumns(t *testing.T) {
 	t.Parallel()
 
@@ -107,5 +180,24 @@ func TestInstanceStatusTableIsUsefulAndAtMost80DisplayColumns(t *testing.T) {
 	assert.Contains(t, text, "exit=137")
 	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
 		assert.LessOrEqual(t, printers.CellDisplayWidth(line), 80, "line %q", line)
+	}
+}
+
+func TestInstanceStatusWideTableRetainsCompleteBoundedOperationalFields(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 14, 23, 1, 2, 0, time.UTC)
+	revision := strings.Repeat("r", 200)
+	report := NewInstanceStatusReport(Metadata{Name: "chat"}, InstanceStatusContent{
+		Summary:    InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+		Deployment: InstanceStatusDeployment{Mode: DeploymentModeOMENative, Source: DeploymentModeSourceComponentAnnotation, Evidence: EvidenceReported},
+		Instance: &InstanceStatusInstance{InferenceReplica: "chat-engine", RunningRevision: revision, TargetRevision: revision,
+			Operation: &InstanceStatusOperation{ID: "operation-id", Type: "Migrate", Step: "Move", FromNode: "node-old", TargetNodeHints: []string{"node-new"}, StartedAt: &now, LastProgressAt: &now, Deadline: &now}},
+		Pods: []InstanceStatusPod{{Name: "pod", Revision: revision, Node: "node-new"}},
+	}, ClockFunc(func() time.Time { return now }))
+	var out bytes.Buffer
+	require.NoError(t, report.WideTable().Write(&out))
+	text := out.String()
+	for _, want := range []string{revision, "OMENative", "ComponentAnnotation", "operation-id", "node-old", "node-new", now.Format(time.RFC3339)} {
+		assert.Contains(t, text, want)
 	}
 }

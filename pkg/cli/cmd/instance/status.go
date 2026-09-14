@@ -18,6 +18,7 @@ import (
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
+	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/instancecollection"
 	"sigs.k8s.io/ome/pkg/cli/instancestatusprojection"
@@ -41,6 +42,7 @@ type statusDependencies struct {
 	podLimits        paging.Limits
 	eventLimits      observation.EventLimits
 	projectionLimits instancestatusprojection.Limits
+	runtimeLimits    paging.Limits
 }
 
 func defaultInstanceStatusDependencies() statusDependencies {
@@ -53,7 +55,8 @@ func defaultInstanceStatusDependencies() statusDependencies {
 				MaxConditions: 16, MaxScannedConditions: 64, MaxNodeHints: 16, MaxScannedNodeHints: 64,
 			},
 		},
-		podLimits: paging.Limits{PageSize: 32, MaxItems: 64, MaxPages: 2, RequestTimeout: 10 * time.Second},
+		podLimits:     paging.Limits{PageSize: 32, MaxItems: 64, MaxPages: 2, RequestTimeout: 10 * time.Second},
+		runtimeLimits: paging.Limits{PageSize: 20, MaxItems: 60, MaxPages: 3, RequestTimeout: 10 * time.Second},
 		eventLimits: observation.EventLimits{
 			Paging:     paging.Limits{PageSize: 25, MaxItems: 50, MaxPages: 2, RequestTimeout: 10 * time.Second},
 			MaxTargets: 17, MaxConcurrent: 4,
@@ -69,6 +72,7 @@ type statusOptions struct {
 	output    string
 	component string
 	format    report.Format
+	wide      bool
 	index     int32
 	deps      statusDependencies
 }
@@ -96,9 +100,10 @@ Event messages are never shown; only safe target, reason, count, and time
 fields are retained. Operation/failure and condition free-form text is
 sanitized, credential-shaped text is redacted, and machine output is capped.
 
-The command is read-only. Output formats are table, json or yaml. The default
+The command is read-only. Output formats are table, wide, json or yaml. The default
 table uses a vertical FIELD/VALUE view whose physical lines are at most 80
-display columns; JSON and YAML retain the complete safe bounded values.`,
+display columns. Wide shows complete bounded identities, revisions, nodes,
+operation details, and timestamps. JSON and YAML retain the same safe report.`,
 		Example: `  kubectl ome instance status chat 0 --component engine -n prod
   kubectl ome instance status chat 2 --component decoder -o json`,
 		Args: cobra.ExactArgs(2),
@@ -110,12 +115,17 @@ display columns; JSON and YAML retain the complete safe bounded values.`,
 		},
 	}
 	cmd.Flags().StringVar(&o.component, "component", "", "Component: engine, decoder or router (required)")
-	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, json or yaml")
+	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
 }
 
 func (o *statusOptions) validate(name, rawIndex string) error {
-	format, err := report.ParseFormat(o.output)
+	requested := strings.ToLower(strings.TrimSpace(o.output))
+	o.wide = requested == "wide"
+	if o.wide {
+		requested = "table"
+	}
+	format, err := report.ParseFormat(requested)
 	if err != nil {
 		return err
 	}
@@ -163,18 +173,25 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 		return err
 	}
 	component := omev1beta1.ComponentType(o.component)
+	mode := resolveStatusDeployment(ctx, f, isvc, component, o.deps.runtimeLimits)
 	input := instancestatusprojection.Input{
 		InferenceService: isvc, Component: component, Index: o.index,
-		NotOMENative: explicitlyNotOMENative(isvc, component),
-		Pods:         observation.Collection[corev1.Pod]{Items: []corev1.Pod{}},
-		Events:       observation.EventCollection{Items: []corev1.Event{}, Failures: []observation.SourceFailure{}},
+		NotOMENative:          mode.resolved && mode.mode != constants.OMENative,
+		DeploymentMode:        reportv1alpha1.DeploymentMode(mode.mode),
+		DeploymentModeSource:  reportv1alpha1.DeploymentModeSource(mode.source),
+		DeploymentUnavailable: mode.unavailable,
+		Pods:                  observation.Collection[corev1.Pod]{Items: []corev1.Pod{}},
+		Events:                observation.EventCollection{Items: []corev1.Event{}, Failures: []observation.SourceFailure{}},
 	}
 	if input.NotOMENative {
 		return o.projectAndWrite(input, namespace, name)
 	}
 
+	irLimits := o.deps.irLimits
+	irLimits.Details.SelectedComponent = component
+	irLimits.Details.SelectedIndex = o.index
 	collection, collectionErr := instancecollection.CollectRelated(
-		ctx, omeClient.OmeV1beta1().InferenceReplicas(namespace), isvc, o.deps.irLimits,
+		ctx, omeClient.OmeV1beta1().InferenceReplicas(namespace), isvc, irLimits,
 	)
 	input.Collection = collection
 	if collectionErr != nil {
@@ -221,9 +238,13 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 		}
 		input.PodsUnavailable = unavailableReason(podErr)
 	}
-	targets := instancestatusprojection.EventTargets(isvc, ir, o.index, pods.Items, o.deps.projectionLimits.MaxPodConditions)
+	maxEventTargets := min(o.deps.projectionLimits.MaxPods, o.deps.eventLimits.MaxTargets)
+	targets, skippedEventTargets := instancestatusprojection.EventTargets(
+		isvc, ir, o.index, pods.Items, o.deps.projectionLimits.MaxPodConditions, maxEventTargets,
+	)
 	events, eventErr := observation.CollectWarningEvents(ctx, kubeClient.CoreV1(), targets, o.deps.eventLimits)
 	input.Events = events
+	input.Events.SkippedTargets += skippedEventTargets
 	if eventErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -245,10 +266,77 @@ func (o *statusOptions) projectAndWrite(input instancestatusprojection.Input, na
 }
 
 func (o *statusOptions) write(projected reportv1alpha1.InstanceStatusReport) error {
+	if o.wide {
+		if err := projected.WideTable().Write(o.streams.Out); err != nil {
+			return fmt.Errorf("write instance status: %w", err)
+		}
+		return nil
+	}
 	if err := report.Write(o.streams.Out, o.format, projected); err != nil {
 		return fmt.Errorf("write instance status: %w", err)
 	}
 	return nil
+}
+
+type statusDeploymentResolution struct {
+	mode        constants.DeploymentModeType
+	source      effective.ComponentDeploymentModeSource
+	resolved    bool
+	unavailable reportv1alpha1.UnavailableReason
+}
+
+func resolveStatusDeployment(ctx context.Context, f factory.Factory, isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType, limits paging.Limits) statusDeploymentResolution {
+	if mode, source, ok := definitiveStatusDeployment(isvc, component); ok {
+		return statusDeploymentResolution{mode: mode, source: source, resolved: true}
+	}
+	client, err := f.RuntimeClient()
+	if err != nil {
+		return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableUnreadable}
+	}
+	resolver, err := effective.NewBoundedRuntimeResolver(client, limits)
+	if err != nil {
+		return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableUnreadable}
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, limits.RequestTimeout)
+	defer cancel()
+	configuration, err := resolver.ResolveLive(resolveCtx, isvc)
+	if err != nil {
+		return statusDeploymentResolution{unavailable: unavailableReason(err)}
+	}
+	for _, candidate := range configuration.Components {
+		if candidate.Type == component {
+			return statusDeploymentResolution{mode: candidate.DeploymentMode, source: candidate.DeploymentModeSource, resolved: true}
+		}
+	}
+	return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableNotConfigured}
+}
+
+func definitiveStatusDeployment(isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType) (constants.DeploymentModeType, effective.ComponentDeploymentModeSource, bool) {
+	if value, present := isvc.Annotations[constants.DeploymentMode]; present && constants.DeploymentModeType(value) == constants.VirtualDeployment {
+		return constants.VirtualDeployment, effective.DeploymentModeServiceAnnotation, true
+	}
+	var annotations map[string]string
+	switch component {
+	case omev1beta1.EngineComponent:
+		if isvc.Spec.Engine != nil {
+			annotations = isvc.Spec.Engine.Annotations
+		}
+	case omev1beta1.DecoderComponent:
+		if isvc.Spec.Decoder != nil {
+			annotations = isvc.Spec.Decoder.Annotations
+		}
+	case omev1beta1.RouterComponent:
+		if isvc.Spec.Router != nil {
+			annotations = isvc.Spec.Router.Annotations
+		}
+	}
+	if value, present := annotations[constants.DeploymentMode]; present {
+		mode := constants.DeploymentModeType(value)
+		if mode.IsValid() {
+			return mode, effective.DeploymentModeComponentAnnotation, true
+		}
+	}
+	return "", "", false
 }
 
 func validateReturnedISVC(isvc *omev1beta1.InferenceService, namespace, name string) error {
@@ -272,38 +360,6 @@ func validateReturnedISVC(isvc *omev1beta1.InferenceService, namespace, name str
 
 func validStatusComponent(value string) bool {
 	return value == string(omev1beta1.EngineComponent) || value == string(omev1beta1.DecoderComponent) || value == string(omev1beta1.RouterComponent)
-}
-
-func explicitlyNotOMENative(isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType) bool {
-	// The controller handles a service-level VirtualDeployment annotation as
-	// a global early exit before component reconciliation. It therefore wins
-	// even over a per-component OMENative escape hatch.
-	if value, present := isvc.Annotations[constants.DeploymentMode]; present &&
-		constants.DeploymentModeType(value) == constants.VirtualDeployment {
-		return true
-	}
-	annotations := map[string]string(nil)
-	switch component {
-	case omev1beta1.EngineComponent:
-		if isvc.Spec.Engine != nil {
-			annotations = isvc.Spec.Engine.Annotations
-		}
-	case omev1beta1.DecoderComponent:
-		if isvc.Spec.Decoder != nil {
-			annotations = isvc.Spec.Decoder.Annotations
-		}
-	case omev1beta1.RouterComponent:
-		if isvc.Spec.Router != nil {
-			annotations = isvc.Spec.Router.Annotations
-		}
-	}
-	if value, present := annotations[constants.DeploymentMode]; present {
-		mode := constants.DeploymentModeType(value)
-		if mode.IsValid() {
-			return mode != constants.OMENative
-		}
-	}
-	return isvc.Spec.DeploymentMode != nil && *isvc.Spec.DeploymentMode != constants.OMENative
 }
 
 func exactComponentReplica(collection instancecollection.Result, component omev1beta1.ComponentType) *omev1beta1.InferenceReplica {

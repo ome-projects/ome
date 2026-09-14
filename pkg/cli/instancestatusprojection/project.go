@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -43,30 +44,44 @@ type Input struct {
 	Component             omev1beta1.ComponentType
 	Index                 int32
 	NotOMENative          bool
+	DeploymentMode        reportv1alpha1.DeploymentMode
+	DeploymentModeSource  reportv1alpha1.DeploymentModeSource
+	DeploymentUnavailable reportv1alpha1.UnavailableReason
 	Pods                  observation.Collection[corev1.Pod]
 	PodsUnavailable       reportv1alpha1.UnavailableReason
 	Events                observation.EventCollection
 }
 
-// EventTargets returns the exact accepted IR and exact selected Pods in
-// deterministic cap priority. Callers pass the bounded Pod observation; this
-// helper does not copy Pod specs or statuses into the target set.
+// EventTargets returns exact selected Pods in deterministic cap priority.
+// Parent and InferenceReplica events are intentionally excluded because the
+// controller emits them for multiple logical instances on the same target.
 func EventTargets(
 	isvc *omev1beta1.InferenceService,
 	ir *omev1beta1.InferenceReplica,
 	index int32,
 	pods []corev1.Pod,
 	maxPodConditions int,
-) []observation.ObjectRef {
-	if isvc == nil || ir == nil || maxPodConditions <= 0 {
-		return []observation.ObjectRef{}
+	maxTargets int,
+) ([]observation.ObjectRef, int) {
+	if isvc == nil || ir == nil || maxPodConditions <= 0 || maxTargets <= 0 {
+		return []observation.ObjectRef{}, 0
 	}
-	result := []observation.ObjectRef{{
-		Namespace: isvc.Namespace, Kind: "InferenceReplica", Name: ir.Name, UID: ir.UID, Priority: 30,
-	}}
+	result := []observation.ObjectRef{}
+	valid := make([]*corev1.Pod, 0, len(pods))
+	names, uids := map[string]int{}, map[types.UID]int{}
 	for i := range pods {
 		pod := &pods[i]
+		if pod.Namespace == isvc.Namespace && len(validation.IsDNS1123Subdomain(pod.Name)) == 0 && validUID(pod.UID) {
+			names[pod.Name]++
+			uids[pod.UID]++
+		}
 		if !validSelectedPod(pod, isvc, ir, index) {
+			continue
+		}
+		valid = append(valid, pod)
+	}
+	for _, pod := range valid {
+		if names[pod.Name] != 1 || uids[pod.UID] != 1 {
 			continue
 		}
 		ready, readyOK := podCondition(pod.Status.Conditions, corev1.PodReady, maxPodConditions)
@@ -93,7 +108,12 @@ func EventTargets(
 		}
 		return result[i].UID < result[j].UID
 	})
-	return result
+	skipped := 0
+	if len(result) > maxTargets {
+		skipped = len(result) - maxTargets
+		result = result[:maxTargets]
+	}
+	return result, skipped
 }
 
 // Project derives all output forms from the same safe report. It delegates
@@ -122,14 +142,34 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 			State: reportv1alpha1.InstanceStatusStateReported, Component: reportv1alpha1.RuntimeComponentType(input.Component),
 			Index: input.Index, Evidence: reportv1alpha1.InstanceEvidenceReported,
 		},
+		Deployment: reportv1alpha1.InstanceStatusDeployment{
+			Mode: input.DeploymentMode, Source: input.DeploymentModeSource,
+			Evidence: reportv1alpha1.EvidenceReported, UnavailableReason: input.DeploymentUnavailable,
+		},
 		Pods: []reportv1alpha1.InstanceStatusPod{}, Events: []reportv1alpha1.InstanceStatusEvent{},
 		Issues: []reportv1alpha1.InstanceStatusIssue{},
 	}, reportv1alpha1.ClockFunc(func() time.Time { return list.CollectedAt }))
+	if input.DeploymentUnavailable != "" || input.DeploymentMode == "" {
+		report.Content.Deployment.Evidence = reportv1alpha1.EvidenceUnavailable
+	}
 	report.Sources = append(report.Sources, list.Sources...)
 	if input.NotOMENative {
 		report.Content.Summary.State = reportv1alpha1.InstanceStatusStateNotOMENative
 		report.Content.Summary.Evidence = reportv1alpha1.InstanceEvidenceUnavailable
 		addIssue(&report, reportv1alpha1.InstanceStatusIssueNotOMENative, reportv1alpha1.UnavailableNotConfigured)
+		return finish(report), nil
+	}
+	if input.CollectionUnavailable != "" || input.Collection.Truncated {
+		report.Content.Summary.State = reportv1alpha1.InstanceStatusStateUnavailable
+		report.Content.Summary.Evidence = reportv1alpha1.InstanceEvidenceUnavailable
+		if input.CollectionUnavailable != "" {
+			addIssue(&report, reportv1alpha1.InstanceStatusIssueCollectionUnavailable, input.CollectionUnavailable)
+		}
+		if input.Collection.Truncated {
+			report.Content.Summary.Truncated = true
+			addIssue(&report, reportv1alpha1.InstanceStatusIssueCollectionTruncated, "")
+		}
+		copyListIssues(&report, list, input.Component, "", input.Index)
 		return finish(report), nil
 	}
 
@@ -147,14 +187,14 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 			report.Content.Summary.State = reportv1alpha1.InstanceStatusStatePartial
 			addIssue(&report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
 		}
-		copyListCompleteness(&report, list)
+		copyListIssues(&report, list, input.Component, component.InferenceReplica, input.Index)
 		return finish(report), nil
 	}
 	report.Content.Summary.Evidence = component.State
 	if component.State == reportv1alpha1.InstanceEvidenceMalformed || component.State == reportv1alpha1.InstanceEvidenceUnavailable {
 		report.Content.Summary.State = stateForInvalidEvidence(component.State)
 		addIssue(&report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, evidenceUnavailableReason(component.State))
-		copyListCompleteness(&report, list)
+		copyListIssues(&report, list, input.Component, component.InferenceReplica, input.Index)
 		return finish(report), nil
 	}
 	row, rowCount := findInstance(list, input.Component, component.InferenceReplica, input.Index)
@@ -166,7 +206,7 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		} else {
 			addIssue(&report, reportv1alpha1.InstanceStatusIssueInstanceMissing, reportv1alpha1.UnavailableNotFound)
 		}
-		copyListCompleteness(&report, list)
+		copyListIssues(&report, list, input.Component, component.InferenceReplica, input.Index)
 		return finish(report), nil
 	}
 	ir, irCount := findReplica(input.Collection, input.Component, component.InferenceReplica)
@@ -185,12 +225,12 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 	if component.State == reportv1alpha1.InstanceEvidenceStale {
 		report.Content.Summary.State = reportv1alpha1.InstanceStatusStatePartial
 	}
-	copyListCompleteness(&report, list)
+	copyListIssues(&report, list, input.Component, component.InferenceReplica, input.Index)
 	copyDetailCompleteness(&report, input.Collection, ir.Name, input.Component, input.Index)
 
 	acceptedPods := projectPods(input, ir, rawRow, limits, &report)
 	report.Content.Pods = acceptedPods
-	projectEvents(input, ir, acceptedPods, limits, &report)
+	projectEvents(input, acceptedPods, limits, &report)
 	return finish(report), nil
 }
 
@@ -261,13 +301,25 @@ func projectPods(
 	}
 	type candidate struct {
 		value    reportv1alpha1.InstanceStatusPod
-		uid      types.UID
 		priority int
 	}
-	candidates := make([]candidate, 0, min(len(input.Pods.Items), limits.MaxPods))
+	validPods := make([]*corev1.Pod, 0, min(len(input.Pods.Items), limits.MaxPods))
+	names, uids := map[string]int{}, map[types.UID]int{}
 	for i := range input.Pods.Items {
 		pod := &input.Pods.Items[i]
+		if pod.Namespace == input.InferenceService.Namespace && len(validation.IsDNS1123Subdomain(pod.Name)) == 0 && validUID(pod.UID) {
+			names[pod.Name]++
+			uids[pod.UID]++
+		}
 		if !validSelectedPod(pod, input.InferenceService, ir, input.Index) {
+			addIssue(report, reportv1alpha1.InstanceStatusIssuePodIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
+			continue
+		}
+		validPods = append(validPods, pod)
+	}
+	candidates := make([]candidate, 0, min(len(validPods), limits.MaxPods))
+	for _, pod := range validPods {
+		if names[pod.Name] != 1 || uids[pod.UID] != 1 {
 			addIssue(report, reportv1alpha1.InstanceStatusIssuePodIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
 			continue
 		}
@@ -275,10 +327,14 @@ func projectPods(
 		serving, servingOK := podCondition(pod.Status.Conditions, query.ServingConditionType, limits.MaxPodConditions)
 		if !conditionsOK || !servingOK {
 			addIssue(report, reportv1alpha1.InstanceStatusIssuePodDetailsTruncated, reportv1alpha1.UnavailableMalformedPayload)
+			continue
 		}
 		restarts, statusesOK := restartTotal(pod, limits.MaxContainerStatuses)
 		if !statusesOK {
 			addIssue(report, reportv1alpha1.InstanceStatusIssuePodDetailsTruncated, reportv1alpha1.UnavailableMalformedPayload)
+			if len(pod.Status.ContainerStatuses)+len(pod.Status.InitContainerStatuses) <= limits.MaxContainerStatuses {
+				continue
+			}
 		}
 		incarnation, _ := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64)
 		value := reportv1alpha1.InstanceStatusPod{
@@ -292,7 +348,7 @@ func projectPods(
 		} else if pod.Status.Phase != corev1.PodRunning || !ready || !serving || incarnation != row.Incarnation {
 			priority = 1
 		}
-		candidates = append(candidates, candidate{value: value, uid: pod.UID, priority: priority})
+		candidates = append(candidates, candidate{value: value, priority: priority})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].priority != candidates[j].priority {
@@ -316,7 +372,6 @@ func projectPods(
 
 func projectEvents(
 	input Input,
-	ir *omev1beta1.InferenceReplica,
 	pods []reportv1alpha1.InstanceStatusPod,
 	limits Limits,
 	report *reportv1alpha1.InstanceStatusReport,
@@ -328,8 +383,15 @@ func projectEvents(
 	})
 	if len(input.Events.Failures) > 0 {
 		report.Sources[len(report.Sources)-1].Evidence = reportv1alpha1.EvidenceUnavailable
-		report.Sources[len(report.Sources)-1].UnavailableReason = reportv1alpha1.UnavailableUnreadable
-		addIssue(report, reportv1alpha1.InstanceStatusIssueEventsUnavailable, reportv1alpha1.UnavailableUnreadable)
+		reasons := make([]reportv1alpha1.UnavailableReason, 0, len(input.Events.Failures))
+		for _, failure := range input.Events.Failures {
+			reasons = append(reasons, eventFailureReason(failure.Err))
+		}
+		sort.Slice(reasons, func(i, j int) bool { return reasons[i] < reasons[j] })
+		for _, reason := range reasons {
+			addIssue(report, reportv1alpha1.InstanceStatusIssueEventsUnavailable, reason)
+		}
+		report.Sources[len(report.Sources)-1].UnavailableReason = reasons[0]
 	}
 	acceptedPodUIDs := make(map[string]types.UID, len(pods))
 	for _, projected := range pods {
@@ -343,7 +405,7 @@ func projectEvents(
 	items := make([]reportv1alpha1.InstanceStatusEvent, 0, min(len(input.Events.Items), limits.MaxEvents))
 	for i := range input.Events.Items {
 		event := &input.Events.Items[i]
-		if !validSelectedEvent(event, input.InferenceService.Namespace, ir, acceptedPodUIDs) {
+		if !validSelectedEvent(event, input.InferenceService.Namespace, acceptedPodUIDs) {
 			addIssue(report, reportv1alpha1.InstanceStatusIssueEventIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
 			continue
 		}
@@ -416,14 +478,32 @@ func findRawRow(ir *omev1beta1.InferenceReplica, index int32) (*omev1beta1.OMENa
 	return found, count
 }
 
-func copyListCompleteness(report *reportv1alpha1.InstanceStatusReport, list reportv1alpha1.InstanceListReport) {
-	if list.Content.Summary.Truncated {
-		report.Content.Summary.Truncated = true
-		addIssue(report, reportv1alpha1.InstanceStatusIssueCollectionTruncated, "")
-	}
+func copyListIssues(report *reportv1alpha1.InstanceStatusReport, list reportv1alpha1.InstanceListReport, component omev1beta1.ComponentType, ir string, index int32) {
 	for _, issue := range list.Content.Issues {
+		if issue.Component != "" && issue.Component != reportv1alpha1.RuntimeComponentType(component) {
+			continue
+		}
 		if issue.Code == reportv1alpha1.InstanceIssueIdentityRejected {
 			addIssue(report, reportv1alpha1.InstanceStatusIssueIdentityRejected, reportv1alpha1.UnavailableMalformedPayload)
+			continue
+		}
+		if issue.InferenceReplica != "" && ir != "" && issue.InferenceReplica != ir {
+			continue
+		}
+		if issue.Index != nil && *issue.Index != index {
+			continue
+		}
+		if issue.Code == reportv1alpha1.InstanceIssueSparseIndices {
+			continue
+		}
+		code := reportv1alpha1.InstanceStatusIssueCode(issue.Code)
+		reason := issue.UnavailableReason
+		addIssue(report, code, reason)
+		switch issue.Code {
+		case reportv1alpha1.InstanceIssueCollectionTruncated,
+			reportv1alpha1.InstanceIssueStatusRowsTruncated,
+			reportv1alpha1.InstanceIssueOutputTruncated:
+			report.Content.Summary.Truncated = true
 		}
 	}
 }
@@ -453,7 +533,8 @@ func validSelectedPod(pod *corev1.Pod, isvc *omev1beta1.InferenceService, ir *om
 		pod.Labels[query.LabelInstanceIdx] != strconv.FormatInt(int64(index), 10) {
 		return false
 	}
-	if _, err := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64); err != nil {
+	incarnation, err := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64)
+	if err != nil || incarnation < 0 || pod.Labels[query.LabelInstanceIncarnation] != strconv.FormatInt(incarnation, 10) {
 		return false
 	}
 	if len(validation.IsDNS1123Label(pod.Labels[query.LabelRunner])) != 0 ||
@@ -463,16 +544,13 @@ func validSelectedPod(pod *corev1.Pod, isvc *omev1beta1.InferenceService, ir *om
 	return exactControllerOwner(pod.OwnerReferences, "InferenceReplica", ir.Name, ir.UID)
 }
 
-func validSelectedEvent(event *corev1.Event, namespace string, ir *omev1beta1.InferenceReplica, pods map[string]types.UID) bool {
+func validSelectedEvent(event *corev1.Event, namespace string, pods map[string]types.UID) bool {
 	if event == nil || event.Namespace != namespace || event.Type != corev1.EventTypeWarning || event.Count < 0 {
 		return false
 	}
 	ref := event.InvolvedObject
 	if ref.Namespace != "" && ref.Namespace != namespace {
 		return false
-	}
-	if ref.Kind == "InferenceReplica" {
-		return ref.Name == ir.Name && ref.UID == ir.UID
 	}
 	if ref.Kind != "Pod" {
 		return false
@@ -498,12 +576,17 @@ func podCondition(conditions []corev1.PodCondition, kind corev1.PodConditionType
 	if len(conditions) > max {
 		return false, false
 	}
+	found := false
+	value := false
 	for _, condition := range conditions {
 		if condition.Type == kind {
-			return condition.Status == corev1.ConditionTrue, true
+			if found {
+				return false, false
+			}
+			found, value = true, condition.Status == corev1.ConditionTrue
 		}
 	}
-	return false, true
+	return value, true
 }
 
 func restartTotal(pod *corev1.Pod, max int) (int32, bool) {
@@ -513,13 +596,29 @@ func restartTotal(pod *corev1.Pod, max int) (int32, bool) {
 	var total int64
 	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
 		for _, status := range statuses {
+			if status.RestartCount < 0 {
+				return 0, false
+			}
 			total += int64(status.RestartCount)
 			if total > int64(^uint32(0)>>1) {
-				return int32(^uint32(0) >> 1), true
+				return 0, false
 			}
 		}
 	}
 	return int32(total), true
+}
+
+func eventFailureReason(err error) reportv1alpha1.UnavailableReason {
+	switch {
+	case apierrors.IsForbidden(err):
+		return reportv1alpha1.UnavailableForbidden
+	case apierrors.IsNotFound(err):
+		return reportv1alpha1.UnavailableNotFound
+	case apierrors.IsMethodNotSupported(err):
+		return reportv1alpha1.UnavailableUnsupportedAPI
+	default:
+		return reportv1alpha1.UnavailableUnreadable
+	}
 }
 
 func validConditionStatus(status metav1.ConditionStatus) bool {
@@ -579,6 +678,9 @@ func finish(report reportv1alpha1.InstanceStatusReport) reportv1alpha1.InstanceS
 	}
 	if report.Content.Summary.State == reportv1alpha1.InstanceStatusStatePartial {
 		report.Warnings = append(report.Warnings, reportv1alpha1.InstanceStatusWarning{Code: reportv1alpha1.WarningPartialData})
+	}
+	if report.Content.Summary.Evidence == reportv1alpha1.InstanceEvidenceStale {
+		report.Warnings = append(report.Warnings, reportv1alpha1.InstanceStatusWarning{Code: reportv1alpha1.WarningStaleEvidence})
 	}
 	for _, issue := range report.Content.Issues {
 		if issue.Code == reportv1alpha1.InstanceStatusIssuePodsUnavailable || issue.Code == reportv1alpha1.InstanceStatusIssueEventsUnavailable || issue.Code == reportv1alpha1.InstanceStatusIssueCollectionUnavailable {

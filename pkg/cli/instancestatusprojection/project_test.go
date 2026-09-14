@@ -3,6 +3,8 @@ package instancestatusprojection_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -39,7 +43,6 @@ func TestProjectJoinsNormalMultiPodInstanceWithAuthoritativeDetails(t *testing.T
 	input.Pods.Items[0].Status.ContainerStatuses = []corev1.ContainerStatus{{RestartCount: 3}, {RestartCount: 4}}
 	input.Events.Items = []corev1.Event{
 		warningEvent("event-pod", "Pod", input.Pods.Items[0].Name, input.Pods.Items[0].UID, "FailedMount"),
-		warningEvent("event-ir", "InferenceReplica", "chat-engine", input.Collection.Items[0].UID, "OperationStuck"),
 	}
 
 	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
@@ -60,7 +63,7 @@ func TestProjectJoinsNormalMultiPodInstanceWithAuthoritativeDetails(t *testing.T
 	assert.Equal(t, int32(7), got.Content.Pods[1].RestartCount)
 	assert.True(t, got.Content.Pods[0].Ready)
 	assert.True(t, got.Content.Pods[0].ServingReady)
-	require.Len(t, got.Content.Events, 2)
+	require.Len(t, got.Content.Events, 1)
 	assert.NotContains(t, mustJSON(t, got), "never emit")
 }
 
@@ -70,15 +73,16 @@ func TestProjectRejectsSelectorBlindWrongNamespaceLabelsIndexAndOwner(t *testing
 	input := statusInput()
 	valid := statusPod(input.InferenceService, &input.Collection.Items[0], "valid", "leader", true, true)
 	wrongNamespace := valid.DeepCopy()
-	wrongNamespace.Name, wrongNamespace.Namespace = "wrong-namespace", "other"
+	wrongNamespace.Name, wrongNamespace.Namespace, wrongNamespace.UID = "wrong-namespace", "other", "uid-wrong-namespace"
 	wrongLabel := valid.DeepCopy()
-	wrongLabel.Name, wrongLabel.Labels[constants.InferenceServicePodLabelKey] = "wrong-label", "other"
+	wrongLabel.Name, wrongLabel.UID, wrongLabel.Labels[constants.InferenceServicePodLabelKey] = "wrong-label", "uid-wrong-label", "other"
 	wrongIndex := valid.DeepCopy()
-	wrongIndex.Name, wrongIndex.Labels[query.LabelInstanceIdx] = "wrong-index", "3"
+	wrongIndex.Name, wrongIndex.UID, wrongIndex.Labels[query.LabelInstanceIdx] = "wrong-index", "uid-wrong-index", "3"
 	wrongOwner := valid.DeepCopy()
-	wrongOwner.Name, wrongOwner.OwnerReferences[0].UID = "wrong-owner", "foreign"
+	wrongOwner.Name, wrongOwner.UID, wrongOwner.OwnerReferences[0].UID = "wrong-owner", "uid-wrong-owner", "foreign"
 	ownerShaped := valid.DeepCopy()
 	ownerShaped.Name = "owner-shaped"
+	ownerShaped.UID = "uid-owner-shaped"
 	delete(ownerShaped.Labels, query.LabelManagedBy)
 	input.Pods.Items = []corev1.Pod{*wrongOwner, *wrongIndex, valid, *wrongLabel, *ownerShaped, *wrongNamespace}
 	input.Events.Items = []corev1.Event{
@@ -151,6 +155,10 @@ func TestProjectFailsClosedForMalformedDuplicateAndStaleAuthority(t *testing.T) 
 			if test.name != "stale IR" {
 				assert.Nil(t, got.Content.Instance)
 				assert.Empty(t, got.Content.Pods)
+			} else {
+				require.NotNil(t, got.Content.Instance)
+				require.Len(t, got.Content.Pods, 1)
+				assert.Contains(t, warningCodes(got), reportv1alpha1.WarningStaleEvidence)
 			}
 			assert.NotEqual(t, reportv1alpha1.InstanceStatusStateReported, got.Content.Summary.State)
 		})
@@ -190,6 +198,94 @@ func TestProjectRepresentsCollectionRawDeploymentAndOptionalSourceFailures(t *te
 	})
 }
 
+func TestProjectNeverEstablishesAuthorityFromIncompleteCollection(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name      string
+		truncated bool
+		reason    reportv1alpha1.UnavailableReason
+		issue     reportv1alpha1.InstanceStatusIssueCode
+	}{
+		{name: "truncated", truncated: true, issue: reportv1alpha1.InstanceStatusIssueCollectionTruncated},
+		{name: "later page forbidden", reason: reportv1alpha1.UnavailableForbidden, issue: reportv1alpha1.InstanceStatusIssueCollectionUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := statusInput()
+			input.Collection.Truncated = test.truncated
+			input.CollectionUnavailable = test.reason
+			pod := statusPod(input.InferenceService, &input.Collection.Items[0], "selected", "leader", true, true)
+			input.Pods.Items = []corev1.Pod{pod}
+			input.Events.Items = []corev1.Event{warningEvent("warning", "Pod", pod.Name, pod.UID, "FailedMount")}
+
+			got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.InstanceStatusStateUnavailable, got.Content.Summary.State)
+			assert.Equal(t, reportv1alpha1.InstanceEvidenceUnavailable, got.Content.Summary.Evidence)
+			assert.Nil(t, got.Content.Instance)
+			assert.Empty(t, got.Content.Pods)
+			assert.Empty(t, got.Content.Events)
+			assert.Contains(t, issueCodes(got), test.issue)
+			if test.reason != "" {
+				assert.Contains(t, got.Content.Issues, reportv1alpha1.InstanceStatusIssue{Code: test.issue, UnavailableReason: test.reason})
+			}
+		})
+	}
+}
+
+func TestProjectPreservesPreciseAuthorityIssuesAndStaleWarnings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		code   reportv1alpha1.InstanceStatusIssueCode
+		mutate func(*omev1beta1.InferenceReplica)
+	}{
+		{name: "parent missing", code: "ParentGenerationMissing", mutate: func(ir *omev1beta1.InferenceReplica) {
+			delete(ir.Annotations, constants.InferenceReplicaParentGenerationAnnotationKey)
+		}},
+		{name: "parent invalid", code: "ParentGenerationInvalid", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "invalid"
+		}},
+		{name: "parent stale", code: "ParentGenerationStale", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "3"
+		}},
+		{name: "parent ahead", code: "ParentGenerationAhead", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "5"
+		}},
+		{name: "status unobserved", code: "StatusUnobserved", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Status.ObservedGeneration = 0 }},
+		{name: "observed invalid", code: "ObservedGenerationInvalid", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Status.ObservedGeneration = 3 }},
+		{name: "observed stale", code: "StaleGeneration", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Status.ObservedGeneration = 1 }},
+		{name: "rows missing", code: "StatusesNotReported", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Status.InstanceStatuses = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := statusInput()
+			test.mutate(&input.Collection.Items[0])
+			got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+			require.NoError(t, err)
+			assert.Contains(t, issueCodes(got), test.code)
+			if got.Content.Summary.Evidence == reportv1alpha1.InstanceEvidenceStale {
+				assert.Contains(t, warningCodes(got), reportv1alpha1.WarningStaleEvidence)
+			}
+		})
+	}
+}
+
+func TestProjectPreservesStatusRowTruncationAndRefusesSupplements(t *testing.T) {
+	t.Parallel()
+	input := statusInput()
+	input.Collection.Items[0].Status.InstanceStatuses = nil
+	input.Collection.StatusRowsTruncated = []instancecollection.StatusRowsTruncation{{Name: "chat-engine", Component: omev1beta1.EngineComponent}}
+	input.Pods.Items = []corev1.Pod{statusPod(input.InferenceService, &input.Collection.Items[0], "selected", "leader", true, true)}
+	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.InstanceStatusStateUnavailable, got.Content.Summary.State)
+	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueStatusRowsTruncated)
+	assert.Empty(t, got.Content.Pods)
+	assert.Empty(t, got.Content.Events)
+}
+
 func TestProjectReportsAuthoritativeDetailTruncationPrecisely(t *testing.T) {
 	t.Parallel()
 
@@ -198,7 +294,6 @@ func TestProjectReportsAuthoritativeDetailTruncationPrecisely(t *testing.T) {
 		{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailConditions},
 		{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailNodeHints},
 	}
-	input.Collection.Truncated = true
 	input.Collection.Rejected = []instancecollection.Rejection{{Name: "hostile", Reason: instancecollection.RejectionMetadata}}
 
 	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
@@ -208,7 +303,6 @@ func TestProjectReportsAuthoritativeDetailTruncationPrecisely(t *testing.T) {
 	assert.True(t, got.Content.Summary.Truncated)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueConditionsTruncated)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationDetailsTruncated)
-	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueCollectionTruncated)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueIdentityRejected)
 }
 
@@ -308,14 +402,14 @@ func TestEventTargetsKeepExactIRAndPrioritizeUnhealthyPodsDeterministically(t *t
 	unhealthy := statusPod(input.InferenceService, ir, "z-unhealthy", "worker", false, false)
 	foreign := statusPod(input.InferenceService, ir, "foreign", "worker", false, false)
 	foreign.OwnerReferences[0].UID = "other"
-	targets := instancestatusprojection.EventTargets(
-		input.InferenceService, ir, input.Index, []corev1.Pod{healthy, foreign, unhealthy}, 16,
+	targets, skipped := instancestatusprojection.EventTargets(
+		input.InferenceService, ir, input.Index, []corev1.Pod{healthy, foreign, unhealthy}, 16, 2,
 	)
 
-	require.Len(t, targets, 3)
-	assert.Equal(t, []string{"chat-engine", "z-unhealthy", "a-healthy"}, []string{targets[0].Name, targets[1].Name, targets[2].Name})
+	require.Len(t, targets, 2)
+	assert.Zero(t, skipped)
+	assert.Equal(t, []string{"z-unhealthy", "a-healthy"}, []string{targets[0].Name, targets[1].Name})
 	assert.Greater(t, targets[0].Priority, targets[1].Priority)
-	assert.Greater(t, targets[1].Priority, targets[2].Priority)
 }
 
 func TestEventTargetsRejectInvalidInputsAndPrioritizeTerminatingPods(t *testing.T) {
@@ -326,14 +420,98 @@ func TestEventTargetsRejectInvalidInputsAndPrioritizeTerminatingPods(t *testing.
 	terminating := statusPod(input.InferenceService, ir, "terminating", "worker", true, true)
 	now := metav1.NewTime(time.Now())
 	terminating.DeletionTimestamp = &now
-	assert.Empty(t, instancestatusprojection.EventTargets(nil, ir, input.Index, nil, 16))
-	assert.Empty(t, instancestatusprojection.EventTargets(input.InferenceService, nil, input.Index, nil, 16))
-	assert.Empty(t, instancestatusprojection.EventTargets(input.InferenceService, ir, input.Index, nil, 0))
+	targets, _ := instancestatusprojection.EventTargets(nil, ir, input.Index, nil, 16, 1)
+	assert.Empty(t, targets)
+	targets, _ = instancestatusprojection.EventTargets(input.InferenceService, nil, input.Index, nil, 16, 1)
+	assert.Empty(t, targets)
+	targets, _ = instancestatusprojection.EventTargets(input.InferenceService, ir, input.Index, nil, 0, 1)
+	assert.Empty(t, targets)
 
-	targets := instancestatusprojection.EventTargets(input.InferenceService, ir, input.Index, []corev1.Pod{terminating}, 16)
-	require.Len(t, targets, 2)
-	assert.Equal(t, "chat-engine", targets[0].Name)
-	assert.Equal(t, "terminating", targets[1].Name)
+	targets, _ = instancestatusprojection.EventTargets(input.InferenceService, ir, input.Index, []corev1.Pod{terminating}, 16, 1)
+	require.Len(t, targets, 1)
+	assert.Equal(t, "terminating", targets[0].Name)
+}
+
+func TestEventTargetsApplyCapAfterUnhealthyPriority(t *testing.T) {
+	t.Parallel()
+	input := statusInput()
+	ir := &input.Collection.Items[0]
+	healthy := statusPod(input.InferenceService, ir, "a-healthy", "worker", true, true)
+	unhealthy := statusPod(input.InferenceService, ir, "z-unhealthy", "worker", false, false)
+	targets, skipped := instancestatusprojection.EventTargets(input.InferenceService, ir, input.Index, []corev1.Pod{healthy, unhealthy}, 16, 1)
+	require.Len(t, targets, 1)
+	assert.Equal(t, 1, skipped)
+	assert.Equal(t, "z-unhealthy", targets[0].Name)
+}
+
+func TestProjectRejectsUnscopedInferenceReplicaEvents(t *testing.T) {
+	t.Parallel()
+	input := statusInput()
+	input.Events.Items = []corev1.Event{warningEvent("sibling", "InferenceReplica", "chat-engine", input.Collection.Items[0].UID, "SiblingFailed")}
+	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+	require.NoError(t, err)
+	assert.Empty(t, got.Content.Events)
+	assert.NotContains(t, mustJSON(t, got), "SiblingFailed")
+}
+
+func TestProjectRejectsAmbiguousAndMalformedPodDetailsOrderIndependently(t *testing.T) {
+	t.Parallel()
+	project := func(reverse bool) reportv1alpha1.InstanceStatusReport {
+		input := statusInput()
+		duplicateName := statusPod(input.InferenceService, &input.Collection.Items[0], "duplicate", "leader", true, true)
+		duplicateName2 := duplicateName.DeepCopy()
+		duplicateName2.UID = "different-uid"
+		duplicateUID := statusPod(input.InferenceService, &input.Collection.Items[0], "uid-a", "leader", true, true)
+		duplicateUID2 := statusPod(input.InferenceService, &input.Collection.Items[0], "uid-b", "leader", true, true)
+		duplicateUID2.UID = duplicateUID.UID
+		negative := statusPod(input.InferenceService, &input.Collection.Items[0], "negative", "leader", true, true)
+		negative.Labels[query.LabelInstanceIncarnation] = "-1"
+		noncanonical := statusPod(input.InferenceService, &input.Collection.Items[0], "noncanonical", "leader", true, true)
+		noncanonical.Labels[query.LabelInstanceIncarnation] = "07"
+		badRestarts := statusPod(input.InferenceService, &input.Collection.Items[0], "restarts", "leader", true, true)
+		badRestarts.Status.ContainerStatuses = []corev1.ContainerStatus{{RestartCount: -1}}
+		overflow := statusPod(input.InferenceService, &input.Collection.Items[0], "overflow", "leader", true, true)
+		overflow.Status.ContainerStatuses = []corev1.ContainerStatus{{RestartCount: math.MaxInt32}, {RestartCount: 1}}
+		conflicting := statusPod(input.InferenceService, &input.Collection.Items[0], "conditions", "leader", true, true)
+		conflicting.Status.Conditions = append(conflicting.Status.Conditions, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionFalse})
+		input.Pods.Items = []corev1.Pod{duplicateName, *duplicateName2, duplicateUID, duplicateUID2, negative, noncanonical, badRestarts, overflow, conflicting}
+		if reverse {
+			slicesReverse(input.Pods.Items)
+		}
+		got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+		require.NoError(t, err)
+		return got
+	}
+	left, right := project(false), project(true)
+	assert.Equal(t, left, right)
+	assert.Empty(t, left.Content.Pods)
+	assert.Empty(t, left.Content.Events)
+}
+
+func TestProjectClassifiesEventFailuresWithoutRawErrorsDeterministically(t *testing.T) {
+	t.Parallel()
+	project := func(reverse bool) reportv1alpha1.InstanceStatusReport {
+		input := statusInput()
+		failures := []observation.SourceFailure{
+			{Err: apierrors.NewForbidden(schema.GroupResource{Resource: "events"}, "", errors.New("secret raw error"))},
+			{Err: apierrors.NewNotFound(schema.GroupResource{Resource: "events"}, "")},
+			{Err: apierrors.NewMethodNotSupported(schema.GroupResource{Resource: "events"}, "list")},
+			{Err: context.DeadlineExceeded},
+		}
+		if reverse {
+			slicesReverse(failures)
+		}
+		input.Events.Failures = failures
+		got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+		require.NoError(t, err)
+		return got
+	}
+	left, right := project(false), project(true)
+	assert.Equal(t, left, right)
+	for _, reason := range []reportv1alpha1.UnavailableReason{reportv1alpha1.UnavailableForbidden, reportv1alpha1.UnavailableNotFound, reportv1alpha1.UnavailableUnsupportedAPI, reportv1alpha1.UnavailableUnreadable} {
+		assert.Contains(t, left.Content.Issues, reportv1alpha1.InstanceStatusIssue{Code: reportv1alpha1.InstanceStatusIssueEventsUnavailable, UnavailableReason: reason})
+	}
+	assert.NotContains(t, mustJSON(t, left), "secret raw error")
 }
 
 func TestProjectRejectsInvalidArguments(t *testing.T) {
@@ -521,6 +699,14 @@ func issueCodes(report reportv1alpha1.InstanceStatusReport) []reportv1alpha1.Ins
 	codes := make([]reportv1alpha1.InstanceStatusIssueCode, len(report.Content.Issues))
 	for i := range report.Content.Issues {
 		codes[i] = report.Content.Issues[i].Code
+	}
+	return codes
+}
+
+func warningCodes(report reportv1alpha1.InstanceStatusReport) []reportv1alpha1.WarningCode {
+	codes := make([]reportv1alpha1.WarningCode, len(report.Warnings))
+	for i := range report.Warnings {
+		codes[i] = report.Warnings[i].Code
 	}
 	return codes
 }

@@ -438,6 +438,7 @@ func TestCollectRelatedOptionallyCopiesBoundedInstanceDetails(t *testing.T) {
 	limits := collectionLimits()
 	limits.Details = instancecollection.DetailLimits{
 		MaxConditions: 2, MaxScannedConditions: 4, MaxNodeHints: 2, MaxScannedNodeHints: 4,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
 	}
 
 	got, err := instancecollection.CollectRelated(context.Background(), lister, isvc, limits)
@@ -463,6 +464,45 @@ func TestCollectRelatedOptionallyCopiesBoundedInstanceDetails(t *testing.T) {
 	assert.Equal(t, "node-a", row.Operation.HintTargetNodes[0])
 }
 
+func TestCollectRelatedCopiesDetailsOnlyForSelectedInstance(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	engine := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	engine.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: omev1beta1.OMENativeInstanceReady, RunningRevision: strings.Repeat("r", 10000), Conditions: []metav1.Condition{{Type: "NONSELECTED_SENTINEL"}}, Operation: &omev1beta1.InstanceOperation{Reason: "NONSELECTED_SENTINEL"}, LastFailure: &omev1beta1.InstanceTermination{Reason: "NONSELECTED_SENTINEL"}},
+		{Index: 2, Phase: omev1beta1.OMENativeInstanceReady, Conditions: []metav1.Condition{{Type: "Selected", Status: metav1.ConditionTrue}}, Operation: &omev1beta1.InstanceOperation{ID: "op", Type: omev1beta1.InstanceOperationUpdate, Step: "step"}, LastFailure: &omev1beta1.InstanceTermination{PodName: "pod", Reason: "selected"}},
+	}
+	decoder := relatedReplica(isvc, "chat-decoder", omev1beta1.DecoderComponent)
+	decoder.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{Index: 2, Conditions: []metav1.Condition{{Type: "NONSELECTED_SENTINEL"}}, Operation: &omev1beta1.InstanceOperation{Reason: "NONSELECTED_SENTINEL"}}}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{
+		MaxConditions: 2, MaxScannedConditions: 2, MaxNodeHints: 2, MaxScannedNodeHints: 2,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+	}
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{decoder, engine}}, nil
+	}), isvc, limits)
+	require.NoError(t, err)
+	encoded, err := json.Marshal(got.Items)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "NONSELECTED_SENTINEL")
+	var engineCopy omev1beta1.InferenceReplica
+	for _, item := range got.Items {
+		if item.Spec.Component == omev1beta1.EngineComponent {
+			engineCopy = item
+		}
+	}
+	require.Len(t, engineCopy.Status.InstanceStatuses, 2)
+	assert.Nil(t, engineCopy.Status.InstanceStatuses[0].Operation)
+	assert.Nil(t, engineCopy.Status.InstanceStatuses[0].LastFailure)
+	assert.Empty(t, engineCopy.Status.InstanceStatuses[0].Conditions)
+	assert.LessOrEqual(t, len(engineCopy.Status.InstanceStatuses[0].RunningRevision), 1024)
+	require.NotNil(t, engineCopy.Status.InstanceStatuses[1].Operation)
+	require.NotNil(t, engineCopy.Status.InstanceStatuses[1].LastFailure)
+	assert.Equal(t, "Selected", engineCopy.Status.InstanceStatuses[1].Conditions[0].Type)
+}
+
 func TestCollectRelatedDropsDetailsThatExceedScanBounds(t *testing.T) {
 	t.Parallel()
 
@@ -476,6 +516,7 @@ func TestCollectRelatedDropsDetailsThatExceedScanBounds(t *testing.T) {
 	limits := collectionLimits()
 	limits.Details = instancecollection.DetailLimits{
 		MaxConditions: 1, MaxScannedConditions: 2, MaxNodeHints: 1, MaxScannedNodeHints: 2,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 0,
 	}
 	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
 		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
@@ -510,6 +551,7 @@ func TestCollectRelatedBoundsEveryCopiedDetailStringByBytes(t *testing.T) {
 	limits := collectionLimits()
 	limits.Details = instancecollection.DetailLimits{
 		MaxConditions: 2, MaxScannedConditions: 2, MaxNodeHints: 2, MaxScannedNodeHints: 2,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 0,
 	}
 	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
 		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil

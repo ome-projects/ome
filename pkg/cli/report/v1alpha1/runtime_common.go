@@ -41,6 +41,7 @@ const (
 	DeploymentModeMultiNode         DeploymentMode = "MultiNode"
 	DeploymentModeVirtualDeployment DeploymentMode = "VirtualDeployment"
 	DeploymentModeOMENative         DeploymentMode = "OMENative"
+	DeploymentModePDDisaggregated   DeploymentMode = "PDDisaggregated"
 )
 
 // DeploymentModeSource identifies the evidence used to determine a mode.

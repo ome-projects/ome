@@ -35,6 +35,7 @@ const (
 	maxRetryRevisionBytes  = 1024
 	maxRetryReasonBytes    = 4096
 	maxInstanceDetailBytes = 1024
+	maxInstanceBaseBytes   = 1024
 )
 
 type RejectionReason string
@@ -71,6 +72,8 @@ type DetailLimits struct {
 	MaxScannedConditions int
 	MaxNodeHints         int
 	MaxScannedNodeHints  int
+	SelectedComponent    omev1beta1.ComponentType
+	SelectedIndex        int32
 }
 
 type DetailKind string
@@ -271,12 +274,13 @@ func boundedReplicaCopy(
 			Replicas:           ir.Status.Replicas, ReadyReplicas: ir.Status.ReadyReplicas,
 			ServingReplicas: ir.Status.ServingReplicas, AvailableReplicas: ir.Status.AvailableReplicas,
 			UpdatedReplicas: ir.Status.UpdatedReplicas, UpdatedReadyReplicas: ir.Status.UpdatedReadyReplicas,
-			CurrentRevision: ir.Status.CurrentRevision, UpdateRevision: ir.Status.UpdateRevision,
+			CurrentRevision: boundedClone(ir.Status.CurrentRevision, maxInstanceBaseBytes),
+			UpdateRevision:  boundedClone(ir.Status.UpdateRevision, maxInstanceBaseBytes),
 		},
 	}
 	if parentGeneration, present := ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]; present {
 		result.Annotations = map[string]string{
-			constants.InferenceReplicaParentGenerationAnnotationKey: parentGeneration,
+			constants.InferenceReplicaParentGenerationAnnotationKey: boundedClone(parentGeneration, maxInstanceBaseBytes),
 		}
 	}
 	if !copyRows {
@@ -288,12 +292,13 @@ func boundedReplicaCopy(
 		source := &ir.Status.InstanceStatuses[i]
 		row := omev1beta1.OMENativeInstanceStatus{
 			Index: source.Index, Incarnation: source.Incarnation, Phase: source.Phase,
-			RunningRevision: source.RunningRevision, TargetRevision: source.TargetRevision,
-			PodCount: source.PodCount, ServingPodCount: source.ServingPodCount,
+			RunningRevision: boundedClone(source.RunningRevision, maxInstanceBaseBytes),
+			TargetRevision:  boundedClone(source.TargetRevision, maxInstanceBaseBytes),
+			PodCount:        source.PodCount, ServingPodCount: source.ServingPodCount,
 			AvailablePodCount: source.AvailablePodCount,
 			Admitted:          source.Admitted,
 		}
-		if detailLimits.enabled() {
+		if detailLimits.selects(ir.Spec.Component, source.Index) {
 			row.Conditions, truncations = copyConditions(
 				source.Conditions, detailLimits, ir, source.Index, truncations,
 			)
@@ -331,7 +336,7 @@ func boundedReplicaCopy(
 				failure.Message = ""
 				row.LastFailure = &failure
 			}
-		} else {
+		} else if !detailLimits.enabled() {
 			if source.Operation != nil {
 				row.Operation = &omev1beta1.InstanceOperation{}
 			}
@@ -349,12 +354,27 @@ func validDetailLimits(limits DetailLimits) bool {
 		return limits == (DetailLimits{})
 	}
 	return limits.MaxConditions > 0 && limits.MaxScannedConditions >= limits.MaxConditions &&
-		limits.MaxNodeHints > 0 && limits.MaxScannedNodeHints >= limits.MaxNodeHints
+		limits.MaxNodeHints > 0 && limits.MaxScannedNodeHints >= limits.MaxNodeHints &&
+		validDetailComponent(limits.SelectedComponent) && limits.SelectedIndex >= 0
 }
 
 func (limits DetailLimits) enabled() bool {
 	return limits.MaxConditions != 0 || limits.MaxScannedConditions != 0 ||
-		limits.MaxNodeHints != 0 || limits.MaxScannedNodeHints != 0
+		limits.MaxNodeHints != 0 || limits.MaxScannedNodeHints != 0 ||
+		limits.SelectedComponent != "" || limits.SelectedIndex != 0
+}
+
+func (limits DetailLimits) selects(component omev1beta1.ComponentType, index int32) bool {
+	return limits.enabled() && limits.SelectedComponent == component && limits.SelectedIndex == index
+}
+
+func validDetailComponent(component omev1beta1.ComponentType) bool {
+	switch component {
+	case omev1beta1.EngineComponent, omev1beta1.DecoderComponent, omev1beta1.RouterComponent:
+		return true
+	default:
+		return false
+	}
 }
 
 func copyConditions(

@@ -22,6 +22,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
@@ -42,7 +44,6 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 	ir := commandIR(isvc)
 	pod := commandStatusPod(isvc, ir, "chat-engine-0")
 	events := []corev1.Event{
-		commandStatusEvent("ir-warning", "InferenceReplica", ir.Name, ir.UID),
 		commandStatusEvent("pod-warning", "Pod", pod.Name, pod.UID),
 	}
 	kube := kubefake.NewSimpleClientset(&pod)
@@ -75,7 +76,7 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 			eventRequests++
 		}
 	}
-	assert.Equal(t, 2, eventRequests)
+	assert.Equal(t, 1, eventRequests)
 }
 
 func TestStatusValidatesArgumentsComponentIndexAndOutputBeforeFactoryAccess(t *testing.T) {
@@ -94,7 +95,7 @@ func TestStatusValidatesArgumentsComponentIndexAndOutputBeforeFactoryAccess(t *t
 		{name: "overflow", args: []string{"chat", "2147483648", "--component", "engine"}, want: ErrStatusIndexInvalid.Error()},
 		{name: "not number", args: []string{"chat", "x", "--component", "engine"}, want: ErrStatusIndexInvalid.Error()},
 		{name: "bad name", args: []string{"Bad_Name", "0", "--component", "engine"}, want: ErrInvalidInferenceServiceName.Error()},
-		{name: "bad output", args: []string{"chat", "0", "--component", "engine", "-o", "wide"}, want: `unsupported output format "wide"`},
+		{name: "bad output", args: []string{"chat", "0", "--component", "engine", "-o", "csv"}, want: `unsupported output format "csv"`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -139,8 +140,7 @@ func TestStatusReportsRawDeploymentWithoutListingIRPodsOrEvents(t *testing.T) {
 	t.Parallel()
 
 	isvc := commandISVC()
-	mode := constants.RawDeployment
-	isvc.Spec.DeploymentMode = &mode
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(constants.RawDeployment)}}}
 	ome := omefake.NewSimpleClientset(isvc)
 
 	out, err := executeStatus(t, factory.Static{OME: ome, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
@@ -149,6 +149,68 @@ func TestStatusReportsRawDeploymentWithoutListingIRPodsOrEvents(t *testing.T) {
 	assert.Contains(t, out, `"state": "NotOMENative"`)
 	require.Len(t, ome.Actions(), 1)
 	assert.Equal(t, "get", ome.Actions()[0].GetVerb())
+}
+
+func TestStatusEffectiveRuntimeComponentModeOverridesServiceSpecBothWays(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, runtimeMode string
+		serviceMode       constants.DeploymentModeType
+		wantState         string
+	}{
+		{name: "runtime native overrides service raw", runtimeMode: string(constants.OMENative), serviceMode: constants.RawDeployment, wantState: "Reported"},
+		{name: "runtime raw overrides service native", runtimeMode: string(constants.RawDeployment), serviceMode: constants.OMENative, wantState: "NotOMENative"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isvc := commandISVC()
+			kind := "ServingRuntime"
+			isvc.Spec.Runtime = &omev1beta1.ServingRuntimeRef{Name: "runtime", Kind: &kind}
+			isvc.Spec.DeploymentMode = &test.serviceMode
+			isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+			ir := commandIR(isvc)
+			scheme := runtime.NewScheme()
+			require.NoError(t, omev1beta1.AddToScheme(scheme))
+			runtimeObject := &omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "prod", UID: "runtime-uid", ResourceVersion: "1"}, Spec: omev1beta1.ServingRuntimeSpec{
+				EngineConfig: &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: test.runtimeMode}}},
+			}}
+			ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(runtimeObject).Build()
+			out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+			require.NoError(t, err)
+			assert.Contains(t, out, `"state": "`+test.wantState+`"`)
+			assert.Contains(t, out, `"mode": "`+test.runtimeMode+`"`)
+			assert.Contains(t, out, `"source": "ComponentAnnotation"`)
+		})
+	}
+}
+
+func TestStatusResolutionUnavailableKeepsExactCurrentIRAndReportsModeEvidence(t *testing.T) {
+	t.Parallel()
+	isvc := commandISVC()
+	unknown := constants.DeploymentModeType("Future")
+	isvc.Spec.DeploymentMode = &unknown
+	ir := commandIR(isvc)
+	out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"state": "Reported"`)
+	assert.Contains(t, out, `"deployment": {`)
+	assert.Contains(t, out, `"evidence": "Unavailable"`)
+}
+
+func TestStatusWideOutputAndWriterFailure(t *testing.T) {
+	t.Parallel()
+	isvc := commandISVC()
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(constants.OMENative)}}}
+	ir := commandIR(isvc)
+	ir.Status.InstanceStatuses[0].Operation = &omev1beta1.InstanceOperation{ID: "wide-operation", Type: omev1beta1.InstanceOperationMigrate, Step: "Move", FromNode: "node-old"}
+	out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "wide")
+	require.NoError(t, err)
+	assert.Contains(t, out, "wide-operation")
+	assert.Contains(t, out, "running revision")
+
+	want := errors.New("wide writer failed")
+	cmd := newStatusCmdWithDependencies(factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), NS: "prod"}, genericiooptions.IOStreams{Out: errorWriter{err: want}}, statusCommandDependencies())
+	cmd.SetArgs([]string{"chat", "0", "--component", "engine", "-o", "wide"})
+	assert.ErrorIs(t, cmd.Execute(), want)
 }
 
 func TestStatusServiceVirtualAnnotationOverridesComponentOMENative(t *testing.T) {
@@ -215,6 +277,42 @@ func TestStatusRepresentsCollectionPodAndEventFailuresWithoutLosingAuthority(t *
 	})
 }
 
+func TestStatusIncompleteIRPaginationNeverJoinsLiveSources(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		failSecond bool
+		want       string
+	}{
+		{name: "later page forbidden", failSecond: true, want: `"unavailableReason": "Forbidden"`},
+		{name: "page cap", want: `"code": "CollectionTruncated"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isvc := commandISVC()
+			ir := commandIR(isvc)
+			ome := omefake.NewSimpleClientset(isvc)
+			calls := 0
+			ome.PrependReactor("list", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
+				calls++
+				if calls == 2 && test.failSecond {
+					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "inferencereplicas"}, "", errors.New("hidden"))
+				}
+				return true, &omev1beta1.InferenceReplicaList{ListMeta: metav1.ListMeta{Continue: "next"}, Items: []omev1beta1.InferenceReplica{*ir}}, nil
+			})
+			deps := statusCommandDependencies()
+			if !test.failSecond {
+				deps.irLimits.Paging.MaxPages = 1
+			}
+			kube := kubefake.NewSimpleClientset()
+			out, err := executeStatus(t, factory.Static{OME: ome, Kube: kube, NS: "prod"}, deps, "chat", "0", "--component", "engine", "-o", "json")
+			require.NoError(t, err)
+			assert.Contains(t, out, `"state": "Unavailable"`)
+			assert.Contains(t, out, test.want)
+			assert.Empty(t, kube.Actions())
+		})
+	}
+}
+
 func TestStatusReturnsParentCancellationAndWriterErrors(t *testing.T) {
 	t.Parallel()
 
@@ -228,8 +326,7 @@ func TestStatusReturnsParentCancellationAndWriterErrors(t *testing.T) {
 
 	want := errors.New("writer failed")
 	isvc = commandISVC()
-	mode := constants.RawDeployment
-	isvc.Spec.DeploymentMode = &mode
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(constants.RawDeployment)}}}
 	cmd := newStatusCmdWithDependencies(factory.Static{OME: omefake.NewSimpleClientset(isvc), NS: "prod"}, genericiooptions.IOStreams{Out: errorWriter{err: want}}, statusCommandDependencies())
 	cmd.SetArgs([]string{"chat", "0", "--component", "engine"})
 	err = cmd.Execute()
@@ -322,13 +419,13 @@ func TestStatusHelpDefinesFieldsBoundsAndReadOnlyBehavior(t *testing.T) {
 	require.NoError(t, cmd.Execute())
 	for _, want := range []string{
 		"IR status is authoritative", "serving readiness gate", "Event messages are never shown",
-		"POD restarts", "table, json or yaml", "read-only",
+		"POD restarts", "table, wide, json or yaml", "read-only",
 	} {
 		assert.Contains(t, out.String(), want)
 	}
 }
 
-func TestStatusExplicitDeploymentModeResolutionIsFailClosed(t *testing.T) {
+func TestStatusDefinitiveDeploymentModeResolutionIsFailClosed(t *testing.T) {
 	t.Parallel()
 
 	raw, native := constants.RawDeployment, constants.OMENative
@@ -338,7 +435,7 @@ func TestStatusExplicitDeploymentModeResolutionIsFailClosed(t *testing.T) {
 		mutate    func(*omev1beta1.InferenceService)
 		want      bool
 	}{
-		{name: "typed raw", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &raw }, want: true},
+		{name: "typed raw requires runtime merge", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &raw }, want: false},
 		{name: "typed native", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &native }, want: false},
 		{name: "engine annotation raw", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(raw)}}}
@@ -363,7 +460,8 @@ func TestStatusExplicitDeploymentModeResolutionIsFailClosed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			isvc := commandISVC()
 			test.mutate(isvc)
-			assert.Equal(t, test.want, explicitlyNotOMENative(isvc, test.component))
+			_, _, got := definitiveStatusDeployment(isvc, test.component)
+			assert.Equal(t, test.want, got)
 		})
 	}
 }
@@ -398,7 +496,8 @@ func statusCommandDependencies() statusDependencies {
 			Paging: paging.Limits{PageSize: 2, MaxItems: 6, MaxPages: 3, RequestTimeout: time.Second}, MaxStatusRows: 100,
 			Details: instancecollection.DetailLimits{MaxConditions: 8, MaxScannedConditions: 16, MaxNodeHints: 8, MaxScannedNodeHints: 16},
 		},
-		podLimits: paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
+		podLimits:     paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
+		runtimeLimits: paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
 		eventLimits: observation.EventLimits{
 			Paging: paging.Limits{PageSize: 3, MaxItems: 6, MaxPages: 2, RequestTimeout: time.Second}, MaxTargets: 9, MaxConcurrent: 2,
 		},
@@ -446,13 +545,16 @@ func firstCoreAction(t *testing.T, actions []ktesting.Action, resource string) k
 
 type statusFactory struct {
 	factory.Factory
-	ns      string
-	ome     versioned.Interface
-	kube    kubernetes.Interface
-	omeErr  error
-	kubeErr error
+	ns         string
+	ome        versioned.Interface
+	kube       kubernetes.Interface
+	omeErr     error
+	kubeErr    error
+	runtime    ctrlclient.Client
+	runtimeErr error
 }
 
 func (f statusFactory) Namespace() (string, bool, error)          { return f.ns, false, nil }
 func (f statusFactory) OMEClient() (versioned.Interface, error)   { return f.ome, f.omeErr }
 func (f statusFactory) KubeClient() (kubernetes.Interface, error) { return f.kube, f.kubeErr }
+func (f statusFactory) RuntimeClient() (ctrlclient.Client, error) { return f.runtime, f.runtimeErr }

@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
+	"sigs.k8s.io/ome/pkg/cli/safetext"
 )
 
 const (
@@ -35,6 +37,26 @@ const (
 	InstanceStatusIssueCollectionTruncated       InstanceStatusIssueCode = "CollectionTruncated"
 	InstanceStatusIssueIdentityRejected          InstanceStatusIssueCode = "IdentityRejected"
 	InstanceStatusIssueAuthoritativeInvalid      InstanceStatusIssueCode = "AuthoritativeInvalid"
+	InstanceStatusIssueDuplicateComponent        InstanceStatusIssueCode = "DuplicateComponent"
+	InstanceStatusIssueParentGenerationMissing   InstanceStatusIssueCode = "ParentGenerationMissing"
+	InstanceStatusIssueParentGenerationInvalid   InstanceStatusIssueCode = "ParentGenerationInvalid"
+	InstanceStatusIssueParentGenerationStale     InstanceStatusIssueCode = "ParentGenerationStale"
+	InstanceStatusIssueParentGenerationAhead     InstanceStatusIssueCode = "ParentGenerationAhead"
+	InstanceStatusIssueStatusUnobserved          InstanceStatusIssueCode = "StatusUnobserved"
+	InstanceStatusIssueObservedGenerationInvalid InstanceStatusIssueCode = "ObservedGenerationInvalid"
+	InstanceStatusIssueStaleGeneration           InstanceStatusIssueCode = "StaleGeneration"
+	InstanceStatusIssueRevisionInvalid           InstanceStatusIssueCode = "RevisionInvalid"
+	InstanceStatusIssueAggregateInvalid          InstanceStatusIssueCode = "AggregateInvalid"
+	InstanceStatusIssueStatusesNotReported       InstanceStatusIssueCode = "StatusesNotReported"
+	InstanceStatusIssueStatusRowsTruncated       InstanceStatusIssueCode = "StatusRowsTruncated"
+	InstanceStatusIssueOutputTruncated           InstanceStatusIssueCode = "OutputTruncated"
+	InstanceStatusIssueSparseIndices             InstanceStatusIssueCode = "SparseIndices"
+	InstanceStatusIssueDuplicateIndex            InstanceStatusIssueCode = "DuplicateIndex"
+	InstanceStatusIssueIndexInvalid              InstanceStatusIssueCode = "IndexInvalid"
+	InstanceStatusIssuePhaseInvalid              InstanceStatusIssueCode = "PhaseInvalid"
+	InstanceStatusIssueInstanceRevisionInvalid   InstanceStatusIssueCode = "InstanceRevisionInvalid"
+	InstanceStatusIssuePodCountsInvalid          InstanceStatusIssueCode = "PodCountsInvalid"
+	InstanceStatusIssueIncarnationInvalid        InstanceStatusIssueCode = "IncarnationInvalid"
 	InstanceStatusIssueInstanceMissing           InstanceStatusIssueCode = "InstanceMissing"
 	InstanceStatusIssueNotOMENative              InstanceStatusIssueCode = "NotOMENative"
 	InstanceStatusIssueConditionsTruncated       InstanceStatusIssueCode = "ConditionsTruncated"
@@ -56,6 +78,13 @@ type InstanceStatusSummary struct {
 	Index     int32                 `json:"index"`
 	Evidence  InstanceEvidenceState `json:"evidence"`
 	Truncated bool                  `json:"truncated"`
+}
+
+type InstanceStatusDeployment struct {
+	Mode              DeploymentMode       `json:"mode,omitempty"`
+	Source            DeploymentModeSource `json:"source,omitempty"`
+	Evidence          EvidenceLevel        `json:"evidence"`
+	UnavailableReason UnavailableReason    `json:"unavailableReason,omitempty"`
 }
 
 type InstanceStatusCondition struct {
@@ -135,11 +164,12 @@ type InstanceStatusWarning struct {
 }
 
 type InstanceStatusContent struct {
-	Summary  InstanceStatusSummary   `json:"summary"`
-	Instance *InstanceStatusInstance `json:"instance,omitempty"`
-	Pods     []InstanceStatusPod     `json:"pods"`
-	Events   []InstanceStatusEvent   `json:"events"`
-	Issues   []InstanceStatusIssue   `json:"issues"`
+	Summary    InstanceStatusSummary    `json:"summary"`
+	Deployment InstanceStatusDeployment `json:"deployment"`
+	Instance   *InstanceStatusInstance  `json:"instance,omitempty"`
+	Pods       []InstanceStatusPod      `json:"pods"`
+	Events     []InstanceStatusEvent    `json:"events"`
+	Issues     []InstanceStatusIssue    `json:"issues"`
 }
 
 type InstanceStatusReport struct {
@@ -194,6 +224,9 @@ func (r InstanceStatusReport) Canonical() InstanceStatusReport {
 
 func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusContent {
 	out := in
+	if out.Deployment.Evidence == "" {
+		out.Deployment.Evidence = EvidenceUnavailable
+	}
 	out.Pods = append([]InstanceStatusPod{}, in.Pods...)
 	for i := range out.Pods {
 		pod := &out.Pods[i]
@@ -204,7 +237,14 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 		pod.Node = safeInstanceStatusText(pod.Node, 253)
 	}
 	sort.SliceStable(out.Pods, func(i, j int) bool {
-		return cmp.Or(cmp.Compare(out.Pods[i].Name, out.Pods[j].Name), cmp.Compare(out.Pods[i].Runner, out.Pods[j].Runner)) < 0
+		a, b := out.Pods[i], out.Pods[j]
+		return cmp.Or(
+			cmp.Compare(a.Name, b.Name), cmp.Compare(a.Runner, b.Runner),
+			cmp.Compare(a.Revision, b.Revision), cmp.Compare(a.Incarnation, b.Incarnation),
+			cmp.Compare(a.Phase, b.Phase), compareInstanceStatusBool(a.Ready, b.Ready),
+			compareInstanceStatusBool(a.ServingReady, b.ServingReady), cmp.Compare(a.Node, b.Node),
+			cmp.Compare(a.RestartCount, b.RestartCount), compareInstanceStatusBool(a.Deleting, b.Deleting),
+		) < 0
 	})
 	out.Events = append([]InstanceStatusEvent{}, in.Events...)
 	for i := range out.Events {
@@ -217,7 +257,11 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 	}
 	sort.SliceStable(out.Events, func(i, j int) bool {
 		a, b := out.Events[i], out.Events[j]
-		return cmp.Or(cmp.Compare(a.TargetKind, b.TargetKind), cmp.Compare(a.TargetName, b.TargetName), cmp.Compare(a.Reason, b.Reason), cmp.Compare(a.Count, b.Count)) < 0
+		return cmp.Or(
+			cmp.Compare(a.TargetKind, b.TargetKind), cmp.Compare(a.TargetName, b.TargetName),
+			cmp.Compare(a.Reason, b.Reason), cmp.Compare(a.Count, b.Count),
+			compareInstanceStatusTime(a.FirstSeen, b.FirstSeen), compareInstanceStatusTime(a.LastSeen, b.LastSeen),
+		) < 0
 	})
 	out.Issues = append([]InstanceStatusIssue{}, in.Issues...)
 	sort.Slice(out.Issues, func(i, j int) bool {
@@ -242,7 +286,10 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 	}
 	sort.SliceStable(instance.Conditions, func(i, j int) bool {
 		a, b := instance.Conditions[i], instance.Conditions[j]
-		return cmp.Or(cmp.Compare(a.Type, b.Type), cmp.Compare(a.Status, b.Status), cmp.Compare(a.Reason, b.Reason)) < 0
+		return cmp.Or(
+			cmp.Compare(a.Type, b.Type), cmp.Compare(a.Status, b.Status),
+			cmp.Compare(a.Reason, b.Reason), compareInstanceStatusTime(a.LastTransitionTime, b.LastTransitionTime),
+		) < 0
 	})
 	if in.Instance.Operation != nil {
 		operation := *in.Instance.Operation
@@ -285,6 +332,7 @@ func (r InstanceStatusReport) Table() report.Table {
 		table.Rows = append(table.Rows, []string{printers.BoundedCell(field, 12), printers.BoundedCell(value, 64)})
 	}
 	add("state", fmt.Sprintf("%s %s[%d] evidence=%s", c.Content.Summary.State, c.Content.Summary.Component, c.Content.Summary.Index, c.Content.Summary.Evidence))
+	add("deployment", fmt.Sprintf("mode=%s source=%s evidence=%s", dash(string(c.Content.Deployment.Mode)), dash(string(c.Content.Deployment.Source)), c.Content.Deployment.Evidence))
 	if instance := c.Content.Instance; instance != nil {
 		add("instance", fmt.Sprintf("%s inc=%d phase=%s admitted=%t", instance.InferenceReplica, instance.Incarnation, instance.Phase, instance.Admitted))
 		add("revisions", fmt.Sprintf("running=%s target=%s", dash(instance.RunningRevision), dash(instance.TargetRevision)))
@@ -319,14 +367,114 @@ func (r InstanceStatusReport) Table() report.Table {
 	return table
 }
 
-func safeInstanceStatusText(value string, width int) string {
-	lower := strings.ToLower(value)
-	for _, marker := range []string{"bearer ", "token", "password", "secret", "authorization", "credential", "api_key", "apikey", "private key"} {
-		if strings.Contains(lower, marker) {
-			return "[REDACTED]"
+// WideTable renders the same canonical report without compact-table identity
+// elision. Values remain bounded by the typed report's canonical limits.
+func (r InstanceStatusReport) WideTable() report.Table {
+	c := r.Canonical()
+	table := report.Table{Headers: []string{"FIELD", "VALUE"}, Rows: [][]string{}}
+	add := func(field, value string) {
+		table.Rows = append(table.Rows, []string{printers.BoundedCell(field, 32), printers.BoundedCell(value, 256)})
+	}
+	add("state", string(c.Content.Summary.State))
+	add("component", string(c.Content.Summary.Component))
+	add("index", strconv.FormatInt(int64(c.Content.Summary.Index), 10))
+	add("evidence", string(c.Content.Summary.Evidence))
+	add("truncated", strconv.FormatBool(c.Content.Summary.Truncated))
+	add("deployment mode", dash(string(c.Content.Deployment.Mode)))
+	add("deployment source", dash(string(c.Content.Deployment.Source)))
+	add("deployment evidence", string(c.Content.Deployment.Evidence))
+	if c.Content.Deployment.UnavailableReason != "" {
+		add("deployment unavailable", string(c.Content.Deployment.UnavailableReason))
+	}
+	if instance := c.Content.Instance; instance != nil {
+		add("inference replica", instance.InferenceReplica)
+		add("incarnation", strconv.FormatInt(instance.Incarnation, 10))
+		add("phase", string(instance.Phase))
+		add("running revision", dash(instance.RunningRevision))
+		add("target revision", dash(instance.TargetRevision))
+		add("admitted", strconv.FormatBool(instance.Admitted))
+		add("persisted pods", strconv.FormatInt(int64(instance.Pods.Total), 10))
+		add("persisted serving", strconv.FormatInt(int64(instance.Pods.Serving), 10))
+		add("persisted available", strconv.FormatInt(int64(instance.Pods.Available), 10))
+		for _, condition := range instance.Conditions {
+			add("condition type", condition.Type)
+			add("condition status", condition.Status)
+			add("condition reason", dash(condition.Reason))
+			add("condition transition", statusTime(condition.LastTransitionTime))
+		}
+		if operation := instance.Operation; operation != nil {
+			add("operation id", operation.ID)
+			add("operation type", operation.Type)
+			add("operation step", operation.Step)
+			add("operation revision", dash(operation.TargetRevision))
+			add("operation reason", dash(operation.Reason))
+			add("operation retries", strconv.FormatInt(int64(operation.RetryCount), 10))
+			add("operation surge index", statusInt32(operation.SurgeIndex))
+			add("operation from node", dash(operation.FromNode))
+			add("operation target nodes", dash(strings.Join(operation.TargetNodeHints, ",")))
+			add("operation request UUID", dash(operation.RequestUUID))
+			add("operation started", statusTime(operation.StartedAt))
+			add("operation progress", statusTime(operation.LastProgressAt))
+			add("operation deadline", statusTime(operation.Deadline))
+		}
+		if failure := instance.LastFailure; failure != nil {
+			add("failure pod", failure.PodName)
+			add("failure container", dash(failure.ContainerName))
+			add("failure reason", dash(failure.Reason))
+			add("failure exit code", statusInt32(failure.ExitCode))
+			add("failure time", statusTime(failure.Time))
 		}
 	}
-	return printers.BoundedCell(value, width)
+	for _, pod := range c.Content.Pods {
+		add("pod name", pod.Name)
+		add("pod runner", dash(pod.Runner))
+		add("pod revision", dash(pod.Revision))
+		add("pod incarnation", strconv.FormatInt(pod.Incarnation, 10))
+		add("pod phase", pod.Phase)
+		add("pod ready", strconv.FormatBool(pod.Ready))
+		add("pod serving ready", strconv.FormatBool(pod.ServingReady))
+		add("pod node", dash(pod.Node))
+		add("pod restarts", strconv.FormatInt(int64(pod.RestartCount), 10))
+		add("pod deleting", strconv.FormatBool(pod.Deleting))
+	}
+	for _, event := range c.Content.Events {
+		add("event target", event.TargetKind+"/"+event.TargetName)
+		add("event reason", event.Reason)
+		add("event count", strconv.FormatInt(int64(event.Count), 10))
+		add("event first seen", statusTime(event.FirstSeen))
+		add("event last seen", statusTime(event.LastSeen))
+	}
+	for _, issue := range c.Content.Issues {
+		add("issue", string(issue.Code)+" "+string(issue.UnavailableReason))
+	}
+	return table
+}
+
+func safeInstanceStatusText(value string, width int) string {
+	return safetext.Sanitize(value, width)
+}
+
+func compareInstanceStatusBool(left, right bool) int {
+	if left == right {
+		return 0
+	}
+	if !left {
+		return -1
+	}
+	return 1
+}
+
+func compareInstanceStatusTime(left, right *time.Time) int {
+	if left == nil && right == nil {
+		return 0
+	}
+	if left == nil {
+		return -1
+	}
+	if right == nil {
+		return 1
+	}
+	return left.Compare(*right)
 }
 
 func copyInstanceStatusTime(value *time.Time) *time.Time {
