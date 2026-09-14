@@ -1,0 +1,136 @@
+{
+  "request": {
+    "schemaVersion": "v1",
+    "requestID": "fixture-request",
+    "profile": {
+      "schedulerName": "default-scheduler",
+      "backend": "fixture-backend",
+      "schedulerVersion": "v1.35.4",
+      "configurationID": "sha256:fixture"
+    },
+    "replacementPods": [
+      {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+          "namespace": "fixture",
+          "name": "replacement-explicit",
+          "uid": "replacement-explicit-uid"
+        },
+        "spec": {
+          "schedulerName": "default-scheduler",
+          "containers": [{"name": "model", "image": "example.invalid/model:latest"}]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+          "namespace": "fixture",
+          "name": "replacement-pending-uid"
+        },
+        "spec": {
+          "schedulerName": "default-scheduler",
+          "containers": [{"name": "model", "image": "example.invalid/model:latest"}]
+        }
+      }
+    ],
+    "sourcePods": [
+      {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+          "namespace": "fixture",
+          "name": "source",
+          "uid": "source-uid"
+        },
+        "spec": {
+          "nodeName": "source-node",
+          "containers": [{"name": "model", "image": "example.invalid/model:current"}]
+        }
+      }
+    ],
+    "clusterObjects": [
+      {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {"name": "source-node", "uid": "source-node-uid"},
+        "status": {
+          "capacity": {"cpu": "8", "memory": "32Gi", "pods": "32", "nvidia.com/gpu": "1"},
+          "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "32", "nvidia.com/gpu": "1"}
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {"name": "destination-a", "uid": "destination-a-uid"},
+        "status": {
+          "capacity": {"cpu": "8", "memory": "32Gi", "pods": "32", "nvidia.com/gpu": "1"},
+          "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "32", "nvidia.com/gpu": "1"}
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {"name": "destination-b", "uid": "destination-b-uid"},
+        "status": {
+          "capacity": {"cpu": "8", "memory": "32Gi", "pods": "32", "nvidia.com/gpu": "1"},
+          "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "32", "nvidia.com/gpu": "1"}
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": "fixture", "uid": "fixture-namespace-uid"}
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+          "namespace": "fixture",
+          "name": "source",
+          "uid": "source-uid"
+        },
+        "spec": {
+          "nodeName": "source-node",
+          "containers": [{"name": "model", "image": "example.invalid/model:current"}]
+        }
+      }
+    ],
+    "snapshotID": "fixture-snapshot",
+    "snapshotTime": "2026-09-14T12:00:00Z",
+    "requireGang": false,
+    "excludedNodes": ["source-node"]
+  },
+  "result": {
+    "schemaVersion": "v1",
+    "requestID": "fixture-request",
+    "snapshotID": "fixture-snapshot",
+    "snapshotTime": "2026-09-14T12:00:00Z",
+    "profile": {
+      "schedulerName": "default-scheduler",
+      "backend": "fixture-backend",
+      "schedulerVersion": "v1.35.4",
+      "configurationID": "sha256:fixture"
+    },
+    "decision": "Feasible",
+    "reason": "PlacementFound",
+    "placements": [
+      {
+        "pod": {
+          "namespace": "fixture",
+          "name": "replacement-explicit",
+          "uid": "replacement-explicit-uid"
+        },
+        "nodeName": "destination-a"
+      },
+      {
+        "pod": {
+          "namespace": "fixture",
+          "name": "replacement-pending-uid"
+        },
+        "nodeName": "destination-b"
+      }
+    ]
+  }
+}

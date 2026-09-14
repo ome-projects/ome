@@ -269,8 +269,8 @@ At the 2026-09-14 baseline, the source tree has the following status:
 | Capacity-descheduling Policy #1 | Partially implemented | Fragmentation scoring, cheap candidate generation, arbitration, and reporting run; GPU arithmetic is not scheduler feasibility. |
 | Arbiter and Reporter | Partially implemented | Core admission gates and outputs exist; positive-benefit/regression admission and dispatch/outcome-fed ledger state are not connected. |
 | Node-Health Policy #2 | Not implemented | Node conditions only exclude unhealthy nodes as defrag targets and enqueue a coalesced early decision request. That request currently reads the latest cached snapshot without first refreshing it; no evacuation candidates or remediation signals are produced. |
-| Scheduler profile selection and simulation protocol | Initial gate implemented | New code selects a configured profile from the checked runner templates' effective `schedulerName`, defines a versioned request/result contract, validates whole-placement results, and always withholds execution because simulation is unavailable. It uses public API types and does not import controller or scheduler internals. This is preliminary routing only: no renderer/admission integration or simulation worker exists. Pre-existing Alfred snapshot imports of controller internals remain technical debt. |
-| Scheduler simulation worker | Not implemented | Neither worker integration nor a worker is shipped. Therefore every otherwise executable Candidate stops at the mandatory simulation gate with an unavailable/unsupported diagnostic; no profile in configuration can make execution ready by itself. |
+| Scheduler profile selection and simulation protocol | Initial gate implemented | Alfred selects a configured profile from the checked runner templates' effective `schedulerName`, defines a versioned request/result contract, and validates whole-placement results. The standalone worker mirrors that contract without importing the root module. Production Alfred still has no authoritative replacement renderer/admission integration or worker invocation, so every Candidate remains withheld. Pre-existing Alfred snapshot imports of controller internals remain technical debt. |
+| Scheduler simulation worker | Standalone worker implemented | The separate `pkg/alfred/simulator` module runs the compiled Kubernetes v1.35.4 scheduler for one complete externally supplied request, with default and OMEGangPack profiles and private snapshot-only clients. It performs no live reservation or cluster write. The executable is not registered with or called by production Alfred, and no profile in Alfred configuration can make execution ready by itself. |
 | Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Current `mode: execute` reporting says "will dispatch" despite performing no write; that mode is unsupported and must fail closed to recommend-only until the Dispatcher and its guards land. |
 | OMENative state | Implemented | Alfred normalizes checked `InferenceReplica.Status`, joins live Pods by Instance index and incarnation for physical placement/readiness, and reads `InferenceReplica.Status.Migrations`. |
 | OMENative executor readiness | Not implemented | CRD discovery and current status do not prove the controller is still running. Alpha execution requires a fresh OMENative capability Lease; until that signal exists and Alfred consumes it, OMENative candidates remain advisory. |
@@ -1213,20 +1213,22 @@ that uncertainty with freshness limits, cache invalidation on relevant object or
 profile changes, and Arbiter revalidation immediately before dispatch. The live
 scheduler and other actors can still consume capacity after simulation.
 
-**Current gate.** The first scheduler-safety change implements public profile
-selection, the request/result protocol and validation, and a mandatory gate that
-returns structured `scheduling` diagnostics. Diagnostics record
-`schedulerName`, `backend`, `schedulerVersion`, `configurationID`, `status`, and
-`reason`; status is `Unavailable` or `Unsupported` at the current gate. Current
-reasons include `ProfileNotConfigured`, `NoTemplates`, `TemplateBound`,
-`ProfileInvalid`, `GangUnsupported`, `MixedSchedulers`, `SimulationUnavailable`, and
+**Current gate.** Public profile selection, the request/result protocol and
+validation, and a mandatory gate return structured `scheduling` diagnostics.
+Diagnostics record `schedulerName`, `backend`, `schedulerVersion`,
+`configurationID`, `status`, and `reason`; status is `Unavailable` or
+`Unsupported` at the current gate. Current reasons include
+`ProfileNotConfigured`, `NoTemplates`, `TemplateBound`, `ProfileInvalid`,
+`GangUnsupported`, `MixedSchedulers`, `SimulationUnavailable`, and
 `OMENativeObservationInvalid`. The original advisory reason remains alongside
-these diagnostics. There is no renderer/admission integration, worker registry,
-worker, or Dispatcher in this change. Consequently every Candidate remains
-non-executable in practice, and every concrete OMENative Candidate is withheld
-at this gate; adding a profile to configuration cannot activate execution.
-The new package depends on public contracts rather than controller/scheduler
-internals, but pre-existing Alfred snapshot imports remain separate debt.
+these diagnostics. A standalone worker now evaluates complete externally
+supplied replacement Pods and snapshot objects, but production Alfred has no
+authoritative renderer/admission integration, worker registry or invocation,
+or Dispatcher. Consequently every Candidate remains non-executable in
+practice, and adding a profile to Alfred configuration cannot activate
+execution. The protocol and worker depend on public contracts rather than
+controller internals, but pre-existing Alfred snapshot imports remain separate
+debt.
 
 #### Execution
 
