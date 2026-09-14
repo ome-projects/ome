@@ -207,7 +207,7 @@ func ValidPhaseStepResidue(
 			return false
 		}
 	case reportv1alpha1.RolloutPhaseCanarying:
-		if current == last &&
+		if !status.PreStepHold && current == last &&
 			(current == 0 || status.ObservedTrafficWeight != steps[current-1].Traffic) {
 			return false
 		}
@@ -231,10 +231,11 @@ func ValidPhaseStepResidue(
 	return true
 }
 
-// validPreStepHold recognizes only states the canary reconciler can preserve
-// after clampCanary arms a hold. The held traffic must be a bounded, strictly
-// lower exposure than the clamped step; equality or a reduction cannot have
-// armed PreStepHold.
+// validPreStepHold recognizes only states the controller can persist after
+// clampCanary arms a hold. A run boundary is flushed before the canary executor
+// replaces the prior Canarying phase, and a global pause can keep that boundary
+// durable. The held traffic must remain a bounded, strictly lower exposure than
+// the clamped step; equality or a reduction cannot have armed PreStepHold.
 func validPreStepHold(
 	phase reportv1alpha1.RolloutPhase,
 	steps []omev1beta1.RolloutGroupStep,
@@ -246,6 +247,7 @@ func validPreStepHold(
 	}
 	switch phase {
 	case reportv1alpha1.RolloutPhasePending,
+		reportv1alpha1.RolloutPhaseCanarying,
 		reportv1alpha1.RolloutPhasePaused,
 		reportv1alpha1.RolloutPhaseFailed:
 	default:

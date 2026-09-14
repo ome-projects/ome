@@ -612,10 +612,13 @@ func TestProjectRejectsContradictoryCanaryEpochEvidence(t *testing.T) {
 
 func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	tests := []struct {
-		name  string
-		phase omev1beta1.RolloutPhase
+		name        string
+		phase       omev1beta1.RolloutPhase
+		globalPause string
 	}{
 		{name: "capacity pending", phase: omev1beta1.RolloutPhasePending},
+		{name: "immediately persisted repin boundary", phase: omev1beta1.RolloutPhaseCanarying},
+		{name: "globally paused repin boundary", phase: omev1beta1.RolloutPhaseCanarying, globalPause: "true"},
 		{name: "ready and paused", phase: omev1beta1.RolloutPhasePaused},
 		{name: "capacity wait failed", phase: omev1beta1.RolloutPhaseFailed},
 	}
@@ -631,6 +634,12 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 			component := isvc.Status.Components[omev1beta1.EngineComponent]
 			component.RolloutPhase = tt.phase
 			isvc.Status.Components[omev1beta1.EngineComponent] = component
+			if tt.globalPause != "" {
+				// A run-boundary repin is flushed before canary reconciliation.
+				// Global pause then returns without replacing the pre-repin phase,
+				// so this boundary remains durable until the operator resumes.
+				isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: tt.globalPause}
+			}
 
 			got, err := trafficprojection.Project(isvc, projectionClock)
 
@@ -649,6 +658,7 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 func TestProjectRejectsMalformedPreStepHold(t *testing.T) {
 	tests := []struct {
 		name   string
+		phase  omev1beta1.RolloutPhase
 		mutate func(*omev1beta1.InferenceService)
 	}{
 		{name: "impossible phase", mutate: func(isvc *omev1beta1.InferenceService) {
@@ -679,6 +689,28 @@ func TestProjectRejectsMalformedPreStepHold(t *testing.T) {
 		{name: "contradictory current step", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Canary.CurrentStep = 1
 		}},
+		{name: "canarying boundary target does not raise traffic", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Spec.Rollout.Groups[0].Canary.Steps[0].Traffic = 20
+		}},
+		{name: "canarying boundary missing typed traffic", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic = nil
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "canarying boundary typed traffic disagrees", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic[0].Percent = 30
+			component.Traffic[1].Percent = 70
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "canarying boundary observed traffic is unsafe", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.ObservedTrafficWeight = 101
+		}},
+		{name: "canarying boundary step is completed", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.CurrentStep = 1
+			isvc.Status.Canary.ObservedTrafficWeight = 100
+			isvc.Status.Canary.StableRevisionHash = ""
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -688,7 +720,10 @@ func TestProjectRejectsMalformedPreStepHold(t *testing.T) {
 			}}
 			isvc.Status.Canary.PreStepHold = true
 			component := isvc.Status.Components[omev1beta1.EngineComponent]
-			component.RolloutPhase = omev1beta1.RolloutPhasePending
+			component.RolloutPhase = tt.phase
+			if component.RolloutPhase == "" {
+				component.RolloutPhase = omev1beta1.RolloutPhasePending
+			}
 			isvc.Status.Components[omev1beta1.EngineComponent] = component
 			tt.mutate(isvc)
 

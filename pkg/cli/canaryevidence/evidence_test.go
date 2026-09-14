@@ -114,7 +114,7 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 		{name: "repin hold pending", phase: reportv1alpha1.RolloutPhasePending, status: heldStatus(2, 30), traffic: true, residue: true},
 		{name: "repin hold paused on clamped final step", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(2, 30), traffic: true, residue: true},
 		{name: "repin hold failed capacity gate", phase: reportv1alpha1.RolloutPhaseFailed, status: heldStatus(2, 30), traffic: true, residue: true},
-		{name: "repin hold cannot remain canarying", phase: reportv1alpha1.RolloutPhaseCanarying, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "persisted repin boundary can remain canarying", phase: reportv1alpha1.RolloutPhaseCanarying, status: heldStatus(2, 30), traffic: true, residue: true},
 		{name: "repin hold cannot remain promoting", phase: reportv1alpha1.RolloutPhasePromoting, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot remain rolling back", phase: reportv1alpha1.RolloutPhaseRollingBack, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot remain rolled back", phase: reportv1alpha1.RolloutPhaseRolledBack, status: heldStatus(2, 30), traffic: false, residue: false},
@@ -144,6 +144,7 @@ func TestPreStepHoldBindsTypedTrafficInEverySupportedPhase(t *testing.T) {
 	}
 	for _, phase := range []reportv1alpha1.RolloutPhase{
 		reportv1alpha1.RolloutPhasePending,
+		reportv1alpha1.RolloutPhaseCanarying,
 		reportv1alpha1.RolloutPhasePaused,
 		reportv1alpha1.RolloutPhaseFailed,
 	} {

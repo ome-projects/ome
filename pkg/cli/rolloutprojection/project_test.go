@@ -1044,11 +1044,14 @@ func TestProjectRejectsControllerImpossibleCanaryStateMatrix(t *testing.T) {
 
 func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	tests := []struct {
-		name      string
-		phase     omev1beta1.RolloutPhase
-		wantState reportv1alpha1.RolloutState
+		name        string
+		phase       omev1beta1.RolloutPhase
+		globalPause string
+		wantState   reportv1alpha1.RolloutState
 	}{
 		{name: "capacity pending", phase: omev1beta1.RolloutPhasePending, wantState: reportv1alpha1.RolloutStateInProgress},
+		{name: "immediately persisted repin boundary", phase: omev1beta1.RolloutPhaseCanarying, wantState: reportv1alpha1.RolloutStateInProgress},
+		{name: "globally paused repin boundary", phase: omev1beta1.RolloutPhaseCanarying, globalPause: "true", wantState: reportv1alpha1.RolloutStateInProgress},
 		{name: "ready and paused", phase: omev1beta1.RolloutPhasePaused, wantState: reportv1alpha1.RolloutStatePaused},
 		{name: "capacity wait failed", phase: omev1beta1.RolloutPhaseFailed, wantState: reportv1alpha1.RolloutStateFailed},
 	}
@@ -1064,6 +1067,11 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 			component := isvc.Status.Components[omev1beta1.EngineComponent]
 			component.RolloutPhase = tt.phase
 			isvc.Status.Components[omev1beta1.EngineComponent] = component
+			if tt.globalPause != "" {
+				// Repin boundaries flush before the canary executor. A global
+				// pause makes the old Canarying phase durable until resume.
+				isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: tt.globalPause}
+			}
 
 			got, err := rolloutprojection.Project(isvc, fixedClock())
 
@@ -1082,24 +1090,66 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	}
 }
 
-func TestProjectPreStepHoldRequiresTypedTrafficEvidence(t *testing.T) {
-	isvc := activeCanaryInferenceService()
-	isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
-		Capacity: intstr.FromString("100%"), Traffic: 100,
-	}}
-	isvc.Status.Canary.PreStepHold = true
-	component := isvc.Status.Components[omev1beta1.EngineComponent]
-	component.RolloutPhase = omev1beta1.RolloutPhasePending
-	component.Traffic = nil
-	isvc.Status.Components[omev1beta1.EngineComponent] = component
+func TestProjectPreStepHoldRequiresExactTypedTrafficEvidence(t *testing.T) {
+	tests := []struct {
+		name     string
+		phase    omev1beta1.RolloutPhase
+		mutate   func(*omev1beta1.InferenceService)
+		wantCode reportv1alpha1.RolloutIssueCode
+	}{
+		{name: "pending missing", phase: omev1beta1.RolloutPhasePending, mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic = nil
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "canarying missing", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic = nil
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "canarying different split", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic[0].Percent = 60
+			component.Traffic[1].Percent = 40
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "canarying target does not raise exposure", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Spec.Rollout.Groups[0].Canary.Steps[0].Traffic = 50
+		}},
+		{name: "canarying unsafe observed weight", phase: omev1beta1.RolloutPhaseCanarying, mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.ObservedTrafficWeight = 101
+		}},
+		{name: "canarying completed step", phase: omev1beta1.RolloutPhaseCanarying, wantCode: reportv1alpha1.RolloutIssueCanaryStepInvalid, mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.CurrentStep = 1
+			isvc.Status.Canary.ObservedTrafficWeight = 100
+			isvc.Status.Canary.StableRevisionHash = ""
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := activeCanaryInferenceService()
+			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+				Capacity: intstr.FromString("100%"), Traffic: 100,
+			}}
+			isvc.Status.Canary.PreStepHold = true
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = tt.phase
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+			tt.mutate(isvc)
 
-	got, err := rolloutprojection.Project(isvc, fixedClock())
+			got, err := rolloutprojection.Project(isvc, fixedClock())
 
-	require.NoError(t, err)
-	assert.Equal(t, reportv1alpha1.RolloutStateUnknown, got.Content.Summary.State)
-	assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
-		Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
-	})
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.RolloutStateUnknown, got.Content.Summary.State)
+			wantCode := tt.wantCode
+			if wantCode == "" {
+				wantCode = reportv1alpha1.RolloutIssueStatusMalformed
+			}
+			assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+				Code: wantCode, Group: ptrInt(0),
+			})
+		})
+	}
 }
 
 func TestProjectAcceptsEqualWeightFinalStepAdvanceEdge(t *testing.T) {
