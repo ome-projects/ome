@@ -4,6 +4,7 @@ package rollout
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -67,15 +68,28 @@ func newStatusCmd(
 		Short: "Show rollout progress for an InferenceService",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, err := report.ParseFormat(options.output)
+			format, wide, err := parseStatusOutput(options.output)
 			if err != nil {
 				return err
 			}
-			return options.run(cmd.Context(), f, args[0], format)
+			return options.run(cmd.Context(), f, args[0], format, wide)
 		},
 	}
-	cmd.Flags().StringVarP(&options.output, "output", "o", "table", "Output format: table, json, or yaml")
+	cmd.Flags().StringVarP(&options.output, "output", "o", "table", "Output format: table, wide, json, or yaml")
 	return cmd
+}
+
+func parseStatusOutput(value string) (report.Format, bool, error) {
+	if value == "wide" {
+		return report.FormatTable, true, nil
+	}
+	format, err := report.ParseFormat(value)
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"unsupported output format %q (supported: table, wide, json, yaml)", value,
+		)
+	}
+	return format, false, nil
 }
 
 func (o *statusOptions) run(
@@ -83,6 +97,7 @@ func (o *statusOptions) run(
 	f factory.Factory,
 	name string,
 	format report.Format,
+	wide bool,
 ) error {
 	if problems := utilvalidation.IsDNS1123Subdomain(name); len(problems) > 0 {
 		return ErrInvalidInferenceServiceName
@@ -111,6 +126,12 @@ func (o *statusOptions) run(
 	reportValue, err := rolloutprojection.Project(isvc, o.clock)
 	if err != nil {
 		return err
+	}
+	if wide {
+		if err := reportValue.WideTable().Write(o.streams.Out); err != nil {
+			return fmt.Errorf("write report table: %w", err)
+		}
+		return nil
 	}
 	return report.Write(o.streams.Out, format, reportValue)
 }

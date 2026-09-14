@@ -30,10 +30,10 @@ import (
 
 func TestStatusRejectsOutputBeforeNamespaceOrClient(t *testing.T) {
 	f := &trackingFactory{}
-	_, err := execute(t, f, fixedClock(), "status", "chat", "-o", "wide")
+	_, err := execute(t, f, fixedClock(), "status", "chat", "-o", "csv")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "supported: table, json, yaml")
+	assert.Contains(t, err.Error(), "supported: table, wide, json, yaml")
 	assert.Zero(t, f.namespaceCalls)
 	assert.Zero(t, f.omeCalls)
 }
@@ -72,8 +72,12 @@ func TestStatusPerformsExactlyOneInferenceServiceGet(t *testing.T) {
 	output, err := execute(t, f, fixedClock(), "status", "chat")
 	require.NoError(t, err)
 	assert.Equal(t,
-		"STATE           REPORTED-STATE   EVIDENCE   EPOCH           GROUP   STRATEGY   GROUP-PHASE   CURRENT-COMPONENT   PREVIOUS-COMPONENT   COMPONENT   COMPONENT-PHASE   STEP   GATE   CAPACITY   TARGET-TRAFFIC   OBSERVED-TRAFFIC   ROLLED-OUT   READY   PREVIOUS   ISSUES\n"+
-			"NotConfigured   NotConfigured    Declared   NotApplicable   -       -          -             -                   -                    -           -                 -      -      -          -                -                  -            -       -          -\n",
+		"FIELD          SERVICE         ENGINE   DECODER   ROUTER\n"+
+			"STATE          NotConfigured   -        -         -\n"+
+			"REPORTED       NotConfigured   -        -         -\n"+
+			"EVIDENCE       Declared        -        -         -\n"+
+			"EPOCH          NotApplicable   -        -         -\n"+
+			"COORDINATION   NotApplicable   -        -         -\n",
 		output,
 	)
 	require.Len(t, client.Actions(), 1)
@@ -207,6 +211,18 @@ func TestStatusWritesExactIndependentFormats(t *testing.T) {
 	}{
 		{
 			name: "table",
+			want: "FIELD          SERVICE             ENGINE        DECODER   ROUTER\n" +
+				"STATE          Unknown             -             -         -\n" +
+				"REPORTED       Succeeded           -             -         -\n" +
+				"EVIDENCE       Reported            -             -         -\n" +
+				"EPOCH          Unverifiable        -             -         -\n" +
+				"COORDINATION   NotApplicable       -             -         -\n" +
+				"STRATEGY       -                   Independent   -         -\n" +
+				"PHASE          -                   Stable        -         -\n" +
+				"ISSUES         EpochUnverifiable   -             -         -\n",
+		},
+		{
+			name: "wide", format: "wide",
 			want: "STATE     REPORTED-STATE   EVIDENCE   EPOCH          GROUP   STRATEGY      GROUP-PHASE   CURRENT-COMPONENT   PREVIOUS-COMPONENT   COMPONENT   COMPONENT-PHASE   STEP   GATE   CAPACITY   TARGET-TRAFFIC   OBSERVED-TRAFFIC   ROLLED-OUT   READY   PREVIOUS   ISSUES\n" +
 				"Unknown   Succeeded        Reported   Unverifiable   -       Independent   -             -                   -                    engine      Stable            -      -      -          -                -                  -            -       -          EpochUnverifiable\n",
 		},
@@ -319,6 +335,41 @@ func TestStatusReturnsFriendlyGetError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, strings.ToLower(err.Error()), "not found")
 	assert.Empty(t, output)
+}
+
+func TestStatusCompactTableBoundsEveryPhysicalLineAtSupportedTerminalWidths(t *testing.T) {
+	for _, width := range []int{80, 120} {
+		client := omefake.NewSimpleClientset(independentInferenceService())
+		output := &narrowTerminalBuffer{width: width}
+		streams := genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: output, ErrOut: &bytes.Buffer{}}
+		cmd := newCmdWithClock(factory.Static{OME: client, NS: "prod"}, streams, fixedClock())
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+		cmd.SetArgs([]string{"status", "chat"})
+
+		require.NoError(t, cmd.Execute())
+		assert.Contains(t, output.String(), "FIELD")
+		assert.Contains(t, output.String(), "SERVICE")
+		assert.Contains(t, output.String(), "ENGINE")
+		for lineNumber, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
+			assert.LessOrEqual(t, len(line), width, "width %d line %d: %q", width, lineNumber+1, line)
+		}
+	}
+}
+
+func TestStatusWidePropagatesWriterError(t *testing.T) {
+	client := omefake.NewSimpleClientset(independentInferenceService())
+	want := errors.New("wide write failed")
+	streams := genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: failingWriter{err: want}, ErrOut: &bytes.Buffer{},
+	}
+	cmd := newCmdWithClock(factory.Static{OME: client, NS: "prod"}, streams, fixedClock())
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{"status", "chat", "-o", "wide"})
+
+	require.ErrorIs(t, cmd.Execute(), want)
+	require.Len(t, client.Actions(), 1)
 }
 
 func TestExplainRejectsArgumentsAndOutputBeforeReads(t *testing.T) {
@@ -460,7 +511,7 @@ Usage:
 
 Flags:
   -h, --help            help for status
-  -o, --output string   Output format: table, json, or yaml (default "table")
+  -o, --output string   Output format: table, wide, json, or yaml (default "table")
 `, output.String())
 }
 

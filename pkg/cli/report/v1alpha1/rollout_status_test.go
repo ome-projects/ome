@@ -287,7 +287,7 @@ func TestRolloutStatusReportCanonicalPreservesAbsentOptionalAnalysis(t *testing.
 	assert.NotContains(t, output.String(), `"analysis"`)
 }
 
-func TestRolloutStatusReportTableUsesTypedContent(t *testing.T) {
+func TestRolloutStatusReportWideTableUsesTypedContent(t *testing.T) {
 	reportValue := rolloutStatusFixture()
 
 	assert.Equal(t, report.Table{
@@ -299,14 +299,109 @@ func TestRolloutStatusReportTableUsesTypedContent(t *testing.T) {
 		Rows: [][]string{{
 			"Unknown", "InProgress", "Reported", "Unverifiable", "0", "Canary", "Canarying", "-", "-", "engine", "Canarying",
 			"2/3", "Manual", "50%", "20%", "20%", "aaaaaaaa", "bbbbbbbb", "-", "-",
-		}}}, reportValue.Table())
+		}}}, reportValue.WideTable())
 
 	var output bytes.Buffer
-	require.NoError(t, report.Write(&output, report.FormatTable, reportValue))
+	require.NoError(t, reportValue.WideTable().Write(&output))
 	assert.Equal(t,
 		"STATE     REPORTED-STATE   EVIDENCE   EPOCH          GROUP   STRATEGY   GROUP-PHASE   CURRENT-COMPONENT   PREVIOUS-COMPONENT   COMPONENT   COMPONENT-PHASE   STEP   GATE     CAPACITY   TARGET-TRAFFIC   OBSERVED-TRAFFIC   ROLLED-OUT   READY      PREVIOUS   ISSUES\n"+
 			"Unknown   InProgress       Reported   Unverifiable   0       Canary     Canarying     -                   -                    engine      Canarying         2/3    Manual   50%        20%              20%                aaaaaaaa     bbbbbbbb   -          -\n",
 		output.String())
+}
+
+func TestRolloutStatusReportTableUsesCompactComponentMatrix(t *testing.T) {
+	reportValue := rolloutStatusFixture()
+
+	assert.Equal(t, report.Table{
+		Headers: []string{"FIELD", "SERVICE", "ENGINE", "DECODER", "ROUTER"},
+		Rows: [][]string{
+			{"STATE", "Unknown", "-", "-", "-"},
+			{"REPORTED", "InProgress", "-", "-", "-"},
+			{"EVIDENCE", "Reported", "-", "-", "-"},
+			{"EPOCH", "Unverifiable", "-", "-", "-"},
+			{"COORDINATION", "NotApplicable", "-", "-", "-"},
+			{"GROUP", "-", "0", "-", "-"},
+			{"STRATEGY", "-", "Canary", "-", "-"},
+			{"GROUP-PHASE", "-", "Canarying", "-", "-"},
+			{"PHASE", "-", "Canarying", "-", "-"},
+			{"STEP", "-", "2/3", "-", "-"},
+			{"GATE", "-", "Manual", "-", "-"},
+			{"CAPACITY", "-", "50%", "-", "-"},
+			{"TRAFFIC", "-", "20% -> 20%", "-", "-"},
+			{"ROLLED-OUT", "-", "aaaaaaaa", "-", "-"},
+			{"READY", "-", "bbbbbbbb", "-", "-"},
+		},
+	}, reportValue.Table())
+}
+
+func TestRolloutStatusReportTableAlignsAllComponentsAndListsIssuesOnce(t *testing.T) {
+	groupZero, groupOne := 0, 1
+	content := v1alpha1.RolloutStatusContent{
+		Summary: v1alpha1.RolloutSummary{
+			State:             v1alpha1.RolloutStateInProgress,
+			ReportedState:     v1alpha1.RolloutStateInProgress,
+			Evidence:          v1alpha1.EvidenceReported,
+			Epoch:             v1alpha1.RolloutEpochUnverifiable,
+			CoordinationReady: v1alpha1.RolloutConditionTrue,
+		},
+		Groups: []v1alpha1.RolloutGroupStatus{
+			{
+				Index: groupZero, Strategy: v1alpha1.RolloutStrategyCanary,
+				Phase: v1alpha1.RolloutPhaseCanarying,
+				Step: &v1alpha1.RolloutStepStatus{
+					Index: 0, Total: 2, Capacity: "25%", TargetTraffic: 10,
+					ObservedTraffic: 5, Gate: v1alpha1.RolloutGateManual,
+				},
+			},
+			{
+				Index: groupOne, Strategy: v1alpha1.RolloutStrategySequential,
+				Phase:             v1alpha1.RolloutPhaseAwaitingNextComponent,
+				CurrentComponent:  v1alpha1.RuntimeComponentRouter,
+				PreviousComponent: v1alpha1.RuntimeComponentDecoder,
+			},
+		},
+		Components: []v1alpha1.RolloutComponentStatus{
+			{
+				Type: v1alpha1.RuntimeComponentEngine, Strategy: v1alpha1.RolloutStrategyCanary,
+				Group: &groupZero, Phase: v1alpha1.RolloutPhaseCanarying,
+				RolledOutRevisionHash: "aaaaaaaa",
+			},
+			{
+				Type: v1alpha1.RuntimeComponentDecoder, Strategy: v1alpha1.RolloutStrategySequential,
+				Group: &groupOne, Phase: v1alpha1.RolloutPhaseStable,
+				ReadyRevisionHash: "bbbbbbbb",
+			},
+			{
+				Type: v1alpha1.RuntimeComponentRouter, Strategy: v1alpha1.RolloutStrategySequential,
+				Group: &groupOne, Phase: v1alpha1.RolloutPhaseWaiting,
+				PreviousRevisionHash: "cccccccc",
+			},
+		},
+		Issues: []v1alpha1.RolloutIssue{
+			{Code: v1alpha1.RolloutIssueEpochUnverifiable},
+			{Code: v1alpha1.RolloutIssueTrafficInvalid, Group: &groupZero, Component: v1alpha1.RuntimeComponentEngine},
+		},
+	}
+
+	table := content.Table()
+	require.Equal(t, []string{"FIELD", "SERVICE", "ENGINE", "DECODER", "ROUTER"}, table.Headers)
+	rows := make(map[string][]string, len(table.Rows))
+	for _, row := range table.Rows {
+		rows[row[0]] = row
+	}
+	assert.Equal(t, []string{"GROUP", "-", "0", "1", "1"}, rows["GROUP"])
+	assert.Equal(t, []string{"STRATEGY", "-", "Canary", "Sequential", "Sequential"}, rows["STRATEGY"])
+	assert.Equal(t, []string{"STEP", "-", "1/2", "-", "-"}, rows["STEP"])
+	assert.Equal(t, []string{"TRAFFIC", "-", "10% -> 5%", "-", "-"}, rows["TRAFFIC"])
+	assert.Equal(t, []string{"GROUP-CURRENT", "-", "-", "router", "router"}, rows["GROUP-CURRENT"])
+	assert.Equal(t, []string{"ROLLED-OUT", "-", "aaaaaaaa", "-", "-"}, rows["ROLLED-OUT"])
+	assert.Equal(t, []string{"READY", "-", "-", "bbbbbbbb", "-"}, rows["READY"])
+	assert.Equal(t, []string{"PREVIOUS", "-", "-", "-", "cccccccc"}, rows["PREVIOUS"])
+	require.Contains(t, rows, "ISSUES")
+	assert.Equal(t, "EpochUnverifiable", rows["ISSUES"][1])
+	assert.Equal(t, "TrafficInvalid(group=0)", rows["ISSUES"][2])
+	assert.Equal(t, 1, strings.Count(strings.Join(rows["ISSUES"], ","), "EpochUnverifiable"))
+	assert.Equal(t, 1, strings.Count(strings.Join(rows["ISSUES"], ","), "TrafficInvalid"))
 }
 
 func TestRolloutStatusReportComponentStrategyIsAuthoritativeAcrossFormats(t *testing.T) {
@@ -344,7 +439,7 @@ func TestRolloutStatusReportComponentStrategyIsAuthoritativeAcrossFormats(t *tes
 				fixedClock{now: time.Date(2026, time.August, 31, 18, 30, 0, 0, time.UTC)},
 			)
 
-			table := reportValue.Table()
+			table := reportValue.WideTable()
 			require.Len(t, table.Rows, 1)
 			assert.Equal(t, string(tt.want), table.Rows[0][5])
 
@@ -398,7 +493,7 @@ func TestRolloutStatusReportTableScopesIssuesToMatchingRows(t *testing.T) {
 	}
 	original := content.Canonical()
 
-	table := content.Table()
+	table := content.WideTable()
 	reversed := content
 	reversed.Components = append([]v1alpha1.RolloutComponentStatus{}, content.Components...)
 	reversed.Issues = append([]v1alpha1.RolloutIssue{}, content.Issues...)
@@ -408,7 +503,7 @@ func TestRolloutStatusReportTableScopesIssuesToMatchingRows(t *testing.T) {
 	for left, right := 0, len(reversed.Issues)-1; left < right; left, right = left+1, right-1 {
 		reversed.Issues[left], reversed.Issues[right] = reversed.Issues[right], reversed.Issues[left]
 	}
-	assert.Equal(t, table, reversed.Table(), "canonical table ordering must not depend on input order")
+	assert.Equal(t, table, reversed.WideTable(), "canonical table ordering must not depend on input order")
 	assert.Equal(t, original, content.Canonical(), "Table must not mutate its input")
 
 	issuesByRow := map[string]string{}
@@ -453,7 +548,7 @@ func TestRolloutStatusReportTableRetainsUnmatchedScopedIssues(t *testing.T) {
 	before, err := json.Marshal(content)
 	require.NoError(t, err)
 
-	table := content.Table()
+	table := content.WideTable()
 	require.Len(t, table.Rows, 3)
 	assert.Equal(t, "SpecMalformed,StatusMalformed(group=0)", table.Rows[0][19])
 	assert.Equal(t, "SpecMalformed", table.Rows[1][19])
@@ -472,7 +567,7 @@ func TestRolloutStatusReportTableRetainsUnmatchedScopedIssues(t *testing.T) {
 	for left, right := 0, len(reversed.Issues)-1; left < right; left, right = left+1, right-1 {
 		reversed.Issues[left], reversed.Issues[right] = reversed.Issues[right], reversed.Issues[left]
 	}
-	assert.Equal(t, table, reversed.Table())
+	assert.Equal(t, table, reversed.WideTable())
 	after, err := json.Marshal(content)
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "Table must not mutate source content")
@@ -501,7 +596,7 @@ func TestRolloutStatusReportTableRetainsAllIssuesWithoutComponentRows(t *testing
 		},
 	}
 
-	table := content.Table()
+	table := content.WideTable()
 	require.Len(t, table.Rows, 1)
 	assert.Equal(t,
 		"RevisionNameInvalid(component=engine),StatusMalformed(group=1)",
@@ -524,7 +619,7 @@ func TestRolloutStatusReportTableSeparatesCurrentAndReportedState(t *testing.T) 
 		fixedClock{now: time.Date(2026, time.August, 31, 18, 30, 0, 0, time.UTC)},
 	)
 
-	table := reportValue.Table()
+	table := reportValue.WideTable()
 	assert.Equal(t, []string{
 		"STATE", "REPORTED-STATE", "EVIDENCE", "EPOCH", "GROUP", "STRATEGY",
 		"GROUP-PHASE", "CURRENT-COMPONENT", "PREVIOUS-COMPONENT", "COMPONENT",
@@ -565,7 +660,7 @@ func TestRolloutStatusReportTableShowsSequentialCursor(t *testing.T) {
 		fixedClock{now: time.Date(2026, time.August, 31, 18, 30, 0, 0, time.UTC)},
 	)
 
-	table := reportValue.Table()
+	table := reportValue.WideTable()
 	assert.Equal(t, []string{
 		"STATE", "REPORTED-STATE", "EVIDENCE", "EPOCH", "GROUP", "STRATEGY",
 		"GROUP-PHASE", "CURRENT-COMPONENT", "PREVIOUS-COMPONENT", "COMPONENT",

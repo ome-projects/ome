@@ -402,8 +402,145 @@ func (c RolloutStatusContent) Canonical() RolloutStatusContent {
 // Table derives the human view from the report's typed content.
 func (r RolloutStatusReport) Table() report.Table { return r.Content.Table() }
 
-// Table returns the deterministic operator-focused rollout view.
+// WideTable derives the complete legacy human view from the report's typed
+// content. It is intentionally separate from the default compact matrix so
+// machine formats and detailed operator output remain stable.
+func (r RolloutStatusReport) WideTable() report.Table { return r.Content.WideTable() }
+
+// Table returns a deterministic component matrix sized for an operator's
+// terminal. Summary evidence occupies the service column while component
+// progress is read vertically under the engine, decoder, and router columns.
 func (c RolloutStatusContent) Table() report.Table {
+	canonical := c.Canonical()
+	table := report.Table{Headers: []string{"FIELD", "SERVICE", "ENGINE", "DECODER", "ROUTER"}}
+	table.Rows = append(table.Rows,
+		[]string{"STATE", orDash(string(canonical.Summary.State)), "-", "-", "-"},
+		[]string{"REPORTED", orDash(string(canonical.Summary.ReportedState)), "-", "-", "-"},
+		[]string{"EVIDENCE", orDash(string(canonical.Summary.Evidence)), "-", "-", "-"},
+		[]string{"EPOCH", orDash(string(canonical.Summary.Epoch)), "-", "-", "-"},
+		[]string{"COORDINATION", orDash(string(canonical.Summary.CoordinationReady)), "-", "-", "-"},
+	)
+
+	groups := make(map[int]RolloutGroupStatus, len(canonical.Groups))
+	for _, group := range canonical.Groups {
+		groups[group.Index] = group
+	}
+
+	componentValues := make(map[RuntimeComponentType]map[string][]string, 3)
+	for _, component := range canonical.Components {
+		values := compactRolloutComponentValues(component, groups)
+		if componentValues[component.Type] == nil {
+			componentValues[component.Type] = make(map[string][]string, len(values))
+		}
+		for field, value := range values {
+			componentValues[component.Type][field] = append(
+				componentValues[component.Type][field], value,
+			)
+		}
+	}
+
+	for _, field := range []string{
+		"GROUP", "STRATEGY", "GROUP-PHASE", "PHASE", "GROUP-CURRENT",
+		"GROUP-PREVIOUS", "STEP", "GATE", "CAPACITY", "TRAFFIC",
+		"ROLLED-OUT", "READY", "PREVIOUS",
+	} {
+		row := []string{field, "-"}
+		hasValue := false
+		for _, componentType := range []RuntimeComponentType{
+			RuntimeComponentEngine, RuntimeComponentDecoder, RuntimeComponentRouter,
+		} {
+			value := compactRolloutCell(componentValues[componentType][field])
+			row = append(row, value)
+			if value != "-" {
+				hasValue = true
+			}
+		}
+		if hasValue {
+			table.Rows = append(table.Rows, row)
+		}
+	}
+	if len(canonical.Issues) > 0 {
+		issuesByComponent := make(map[RuntimeComponentType][]RolloutIssue, 3)
+		serviceIssues := make([]RolloutIssue, 0, len(canonical.Issues))
+		for _, issue := range canonical.Issues {
+			if issue.Component == "" {
+				serviceIssues = append(serviceIssues, issue)
+				continue
+			}
+			issuesByComponent[issue.Component] = append(issuesByComponent[issue.Component], issue)
+		}
+		table.Rows = append(table.Rows, []string{
+			"ISSUES",
+			rolloutIssueDisplay(serviceIssues),
+			compactRolloutIssueDisplay(issuesByComponent[RuntimeComponentEngine]),
+			compactRolloutIssueDisplay(issuesByComponent[RuntimeComponentDecoder]),
+			compactRolloutIssueDisplay(issuesByComponent[RuntimeComponentRouter]),
+		})
+	}
+	return table
+}
+
+func compactRolloutComponentValues(
+	component RolloutComponentStatus,
+	groups map[int]RolloutGroupStatus,
+) map[string]string {
+	values := map[string]string{
+		"GROUP":          "-",
+		"STRATEGY":       orDash(string(component.Strategy)),
+		"GROUP-PHASE":    "-",
+		"PHASE":          orDash(string(component.Phase)),
+		"GROUP-CURRENT":  "-",
+		"GROUP-PREVIOUS": "-",
+		"STEP":           "-",
+		"GATE":           "-",
+		"CAPACITY":       "-",
+		"TRAFFIC":        "-",
+		"ROLLED-OUT":     orDash(component.RolledOutRevisionHash),
+		"READY":          orDash(component.ReadyRevisionHash),
+		"PREVIOUS":       orDash(component.PreviousRevisionHash),
+	}
+	if component.Group == nil {
+		return values
+	}
+	values["GROUP"] = fmt.Sprintf("%d", *component.Group)
+	values["GROUP-PHASE"] = string(RolloutPhaseUnknown)
+	group, found := groups[*component.Group]
+	if !found {
+		return values
+	}
+	values["GROUP-PHASE"] = orDash(string(group.Phase))
+	values["GROUP-CURRENT"] = orDash(string(group.CurrentComponent))
+	values["GROUP-PREVIOUS"] = orDash(string(group.PreviousComponent))
+	if group.Step != nil {
+		values["STEP"] = fmt.Sprintf("%d/%d", group.Step.Index+1, group.Step.Total)
+		values["GATE"] = orDash(string(group.Step.Gate))
+		values["CAPACITY"] = orDash(group.Step.Capacity)
+		values["TRAFFIC"] = fmt.Sprintf(
+			"%d%% -> %d%%", group.Step.TargetTraffic, group.Step.ObservedTraffic,
+		)
+	}
+	return values
+}
+
+func compactRolloutCell(values []string) string {
+	if len(values) == 0 {
+		return "-"
+	}
+	return strings.Join(values, "; ")
+}
+
+func compactRolloutIssueDisplay(issues []RolloutIssue) string {
+	withoutComponentScope := make([]RolloutIssue, len(issues))
+	copy(withoutComponentScope, issues)
+	for i := range withoutComponentScope {
+		withoutComponentScope[i].Component = ""
+	}
+	return rolloutIssueDisplay(withoutComponentScope)
+}
+
+// WideTable returns the deterministic, complete operator-focused rollout
+// view that preceded the compact component matrix.
+func (c RolloutStatusContent) WideTable() report.Table {
 	canonical := c.Canonical()
 	table := report.Table{Headers: []string{
 		"STATE", "REPORTED-STATE", "EVIDENCE", "EPOCH", "GROUP", "STRATEGY", "GROUP-PHASE",
