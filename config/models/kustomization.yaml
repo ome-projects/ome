@@ -5,6 +5,9 @@ resources:
   # adept
   - adept/persimmon-8b-chat.yaml
 
+  # aisingapore
+  - aisingapore/Qwen-SEA-LION-v4-32B-IT.yaml
+
   # Alibaba-NLP
   - Alibaba-NLP/gme-Qwen2-VL-2B-Instruct.yaml
   - Alibaba-NLP/gte-Qwen2-7B-instruct.yaml
