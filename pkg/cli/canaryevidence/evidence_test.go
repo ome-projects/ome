@@ -116,8 +116,6 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 		{name: "repin hold failed capacity gate", phase: reportv1alpha1.RolloutPhaseFailed, status: heldStatus(2, 30), traffic: true, residue: true},
 		{name: "persisted repin boundary can remain canarying", phase: reportv1alpha1.RolloutPhaseCanarying, status: heldStatus(2, 30), traffic: true, residue: true},
 		{name: "repin hold cannot remain promoting", phase: reportv1alpha1.RolloutPhasePromoting, status: heldStatus(2, 30), traffic: false, residue: false},
-		{name: "repin hold cannot remain rolling back", phase: reportv1alpha1.RolloutPhaseRollingBack, status: heldStatus(2, 30), traffic: false, residue: false},
-		{name: "repin hold cannot remain rolled back", phase: reportv1alpha1.RolloutPhaseRolledBack, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot remain stable", phase: reportv1alpha1.RolloutPhaseStable, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot use blue green phase", phase: reportv1alpha1.RolloutPhaseBlueGreenStandby, status: heldStatus(2, 30), traffic: false, residue: false},
 		{name: "repin hold cannot use unknown phase", phase: reportv1alpha1.RolloutPhaseUnknown, status: heldStatus(2, 30), traffic: false, residue: false},
@@ -134,6 +132,44 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 			assert.Equal(t, tt.residue, canaryevidence.ValidPhaseStepResidue(tt.phase, steps, tt.status))
 		})
 	}
+}
+
+func TestRollbackRepinHoldRemainsValidUntilCanaryReconcile(t *testing.T) {
+	steps := []omev1beta1.RolloutGroupStep{{
+		Capacity: intstr.FromString("100%"), Traffic: 100,
+	}}
+	status := heldStatus(0, 0)
+	status.RolledBackRevisionHash = status.CanaryRevisionHash
+
+	for _, phase := range []reportv1alpha1.RolloutPhase{
+		reportv1alpha1.RolloutPhaseRollingBack,
+		reportv1alpha1.RolloutPhaseRolledBack,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			assert.True(t, canaryevidence.ObservedTrafficMatchesStep(phase, steps, status))
+			assert.True(t, canaryevidence.ValidPhaseStepResidue(phase, steps, status))
+		})
+	}
+}
+
+func TestRepinHoldAcceptsPromotedThroughAfterBackwardClamp(t *testing.T) {
+	steps := []omev1beta1.RolloutGroupStep{{
+		Capacity: intstr.FromString("100%"), Traffic: 100,
+	}}
+	status := heldStatus(0, 20)
+	// advanceStep records any live promote annotation, including when an
+	// automatic gate caused the advance. A later shorter-plan repin can clamp
+	// that advanced index back to zero without clearing the durable record.
+	status.PromotedThrough = "old-opaque-command"
+
+	assert.True(t, canaryevidence.ValidPhaseStepResidue(
+		reportv1alpha1.RolloutPhaseCanarying, steps, status,
+	))
+
+	status.PreStepHold = false
+	assert.False(t, canaryevidence.ValidPhaseStepResidue(
+		reportv1alpha1.RolloutPhaseCanarying, steps, status,
+	))
 }
 
 func TestPreStepHoldBindsTypedTrafficInEverySupportedPhase(t *testing.T) {

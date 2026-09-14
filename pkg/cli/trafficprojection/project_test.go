@@ -655,6 +655,67 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	}
 }
 
+func TestProjectAcceptsRollbackRepinPreStepHold(t *testing.T) {
+	for _, phase := range []omev1beta1.RolloutPhase{
+		omev1beta1.RolloutPhaseRollingBack,
+		omev1beta1.RolloutPhaseRolledBack,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			// The run layer handles repin before closed-outcome detection. A
+			// one-step replacement therefore clamps the rolled-back status and
+			// persists its hold before the canary reconciler runs again.
+			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+				Capacity: intstr.FromString("100%"), Traffic: 100,
+			}}
+			isvc.Status.Canary.CurrentStep = 0
+			isvc.Status.Canary.ObservedTrafficWeight = 0
+			isvc.Status.Canary.PreStepHold = true
+			isvc.Status.Canary.RolledBackRevisionHash = isvc.Status.Canary.CanaryRevisionHash
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = phase
+			component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+				RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 100,
+			}}
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			require.NotNil(t, got.Content.Canary)
+			assert.Equal(t, int32(0), got.Content.Canary.CurrentStep)
+			assert.Equal(t, int32(0), got.Content.Canary.ObservedTraffic)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+				Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+			})
+		})
+	}
+}
+
+func TestProjectAcceptsPromotedThroughAfterBackwardRepinClamp(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+		Capacity: intstr.FromString("100%"), Traffic: 100,
+	}}
+	isvc.Status.Canary.PreStepHold = true
+	isvc.Status.Canary.PromotedThrough = "SECRET_OLD_PROMOTE"
+	// A global pause lets the phase and durable promotion record from the
+	// repin boundary remain visible until the executor resumes.
+	isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, int32(0), got.Content.Canary.CurrentStep)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+	})
+	var rendered bytes.Buffer
+	require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+	assert.NotContains(t, rendered.String(), "SECRET_OLD_PROMOTE")
+}
+
 func TestProjectRejectsMalformedPreStepHold(t *testing.T) {
 	tests := []struct {
 		name   string

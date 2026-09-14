@@ -222,7 +222,9 @@ func ValidPhaseStepResidue(
 		return true
 	}
 	if current < 1 {
-		return false
+		// A valid repin hold can move an already-advanced index back to zero
+		// without clearing the durable promotion record from the old ladder.
+		return status.PreStepHold
 	}
 	previousStep := steps[current-1]
 	if previousStep.Analysis == nil && previousStep.Pause != nil && previousStep.Pause.Duration == nil {
@@ -233,9 +235,11 @@ func ValidPhaseStepResidue(
 
 // validPreStepHold recognizes only states the controller can persist after
 // clampCanary arms a hold. A run boundary is flushed before the canary executor
-// replaces the prior Canarying phase, and a global pause can keep that boundary
-// durable. The held traffic must remain a bounded, strictly lower exposure than
-// the clamped step; equality or a reduction cannot have armed PreStepHold.
+// replaces the prior phase, and a global pause can keep that boundary durable.
+// Repin also runs before rolled-back run closure, so rollback phases can carry
+// the newly armed hold. The held traffic must remain a bounded, strictly lower
+// exposure than the clamped step; equality or a reduction cannot have armed
+// PreStepHold.
 func validPreStepHold(
 	phase reportv1alpha1.RolloutPhase,
 	steps []omev1beta1.RolloutGroupStep,
@@ -249,6 +253,8 @@ func validPreStepHold(
 	case reportv1alpha1.RolloutPhasePending,
 		reportv1alpha1.RolloutPhaseCanarying,
 		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhaseRollingBack,
+		reportv1alpha1.RolloutPhaseRolledBack,
 		reportv1alpha1.RolloutPhaseFailed:
 	default:
 		return false

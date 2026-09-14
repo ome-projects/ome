@@ -1090,6 +1090,72 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	}
 }
 
+func TestProjectAcceptsRollbackRepinPreStepHold(t *testing.T) {
+	tests := []struct {
+		phase     omev1beta1.RolloutPhase
+		wantState reportv1alpha1.RolloutState
+	}{
+		{phase: omev1beta1.RolloutPhaseRollingBack, wantState: reportv1alpha1.RolloutStateRollingBack},
+		{phase: omev1beta1.RolloutPhaseRolledBack, wantState: reportv1alpha1.RolloutStateRolledBack},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.phase), func(t *testing.T) {
+			isvc := activeCanaryInferenceService()
+			// Repin runs before closed-outcome detection, so clampCanary can
+			// persist a hold while the rejected revision is still rolling back
+			// or already held rolled back.
+			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+				Capacity: intstr.FromString("100%"), Traffic: 100,
+			}}
+			isvc.Status.Canary.CurrentStep = 0
+			isvc.Status.Canary.ObservedTrafficWeight = 0
+			isvc.Status.Canary.PreStepHold = true
+			isvc.Status.Canary.RolledBackRevisionHash = isvc.Status.Canary.CanaryRevisionHash
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = tt.phase
+			component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+				RevisionName: "chat-engine-rev-aaaaaaaa", Percent: 100,
+			}}
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+
+			require.NoError(t, err)
+			assertStatusDerivedSummary(t, got, tt.wantState)
+			require.Len(t, got.Content.Groups, 1)
+			require.NotNil(t, got.Content.Groups[0].Step)
+			assert.Equal(t, int32(0), got.Content.Groups[0].Step.Index)
+			assert.Equal(t, int32(0), got.Content.Groups[0].Step.ObservedTraffic)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+				Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+			})
+		})
+	}
+}
+
+func TestProjectAcceptsPromotedThroughAfterBackwardRepinClamp(t *testing.T) {
+	isvc := activeCanaryInferenceService()
+	isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+		Capacity: intstr.FromString("100%"), Traffic: 100,
+	}}
+	isvc.Status.Canary.PreStepHold = true
+	isvc.Status.Canary.PromotedThrough = "SECRET_OLD_PROMOTE"
+	// The globally paused executor preserves the phase written before repin,
+	// while the run boundary has already persisted the clamped step and hold.
+	isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
+
+	got, err := rolloutprojection.Project(isvc, fixedClock())
+
+	require.NoError(t, err)
+	assertStatusDerivedSummary(t, got, reportv1alpha1.RolloutStateInProgress)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+		Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+	})
+	encoded, marshalErr := json.Marshal(got)
+	require.NoError(t, marshalErr)
+	assert.NotContains(t, string(encoded), "SECRET_OLD_PROMOTE")
+}
+
 func TestProjectPreStepHoldRequiresExactTypedTrafficEvidence(t *testing.T) {
 	tests := []struct {
 		name     string
