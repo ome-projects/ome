@@ -1,6 +1,7 @@
 package kueue
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -20,13 +21,12 @@ import (
 // makes the whole queue inactive. None surfaces as a rejected write, so the
 // mapping is the only place they can be caught.
 
-func aq(name, parent string, role v1beta1.AcceleratorQuotaRole, namespaces []string, budgets ...v1beta1.AcceleratorBudget) v1beta1.AcceleratorQuota {
+func aq(name, parent string, role v1beta1.AcceleratorQuotaRole, budgets ...v1beta1.AcceleratorBudget) v1beta1.AcceleratorQuota {
 	q := v1beta1.AcceleratorQuota{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: v1beta1.AcceleratorQuotaSpec{
-			Role:       role,
-			Namespaces: namespaces,
-			Budgets:    budgets,
+			Role:    role,
+			Budgets: budgets,
 		},
 	}
 	if parent != "" {
@@ -56,13 +56,19 @@ func nodeFor(t *testing.T, quotas []v1beta1.AcceleratorQuota, name string) *tree
 	return n
 }
 
-func testOptions() Options {
+func testOptions() Options { return testOptionsIn("ns-a") }
+
+// testOptionsIn varies the enrolled namespace set, which is deploy config now
+// rather than anything a node declares: every leaf gets a LocalQueue in each of
+// these, and every ClusterQueue selects exactly this set.
+func testOptionsIn(namespaces ...string) Options {
 	return Options{
 		FieldManager: "ome-quota",
 		CoverResources: map[corev1.ResourceName]resource.Quantity{
 			corev1.ResourceCPU:    resource.MustParse("1k"),
 			corev1.ResourceMemory: resource.MustParse("1Ti"),
 		},
+		EnrolledNamespaces: namespaces,
 	}
 }
 
@@ -154,7 +160,10 @@ func TestRenderClusterQueue(t *testing.T) {
 		quotas  []v1beta1.AcceleratorQuota
 		leaf    string
 		flavors map[string]struct{}
-		want    []renderedCQ
+		// enrolled overrides the default single-namespace install, which is what
+		// the ClusterQueue's namespaceSelector now reads.
+		enrolled []string
+		want     []renderedCQ
 	}{
 		{
 			// The cover is in the same group as the accelerator, and the
@@ -162,9 +171,8 @@ func TestRenderClusterQueue(t *testing.T) {
 			// asking for cpu and a GPU can never be assigned this flavor.
 			name: "a leaf funds its accelerator alongside the cover",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-a"}, budget("nvidia.com/gpu", "a100", "8")),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8")),
 			},
 			leaf:    "team-a",
 			flavors: flavorSet("a100"),
@@ -193,10 +201,8 @@ func TestRenderClusterQueue(t *testing.T) {
 			// at zero rather than omitted, which Kueue requires.
 			name: "a flavor carries a resource it does not fund at zero",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-a"},
-					budget("nvidia.com/gpu", "a100", "8"),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8"),
 					budget("google.com/tpu", "tpu7x", "16")),
 			},
 			leaf:    "team-a",
@@ -238,10 +244,8 @@ func TestRenderClusterQueue(t *testing.T) {
 			// stop a tenant admitting anything at all.
 			name: "a budget naming an absent flavor is dropped, not rendered",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-a"},
-					budget("nvidia.com/gpu", "a100", "8"),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8"),
 					budget("google.com/tpu", "typo", "16")),
 			},
 			leaf:    "team-a",
@@ -270,9 +274,8 @@ func TestRenderClusterQueue(t *testing.T) {
 			// which would zero every tenant on a transient API failure.
 			name: "unreadable flavors drop nothing",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-a"}, budget("nvidia.com/gpu", "a100", "8")),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8")),
 			},
 			leaf:    "team-a",
 			flavors: nil,
@@ -296,16 +299,18 @@ func TestRenderClusterQueue(t *testing.T) {
 			}},
 		},
 		{
-			// A leaf binding several namespaces gets them all in one selector,
-			// sorted, so the apply is a no-op when nothing changed.
-			name: "bound namespaces are selected by name, sorted",
+			// Every enrolled namespace lands in one selector, sorted, so the
+			// apply is a no-op when nothing changed. Not a tenant boundary --
+			// every leaf's queue selects the same set -- but it is what stops a
+			// workload outside those namespaces charging any budget at all.
+			name: "the enrolled namespaces are selected by name, sorted",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-z", "ns-a"}, budget("nvidia.com/gpu", "a100", "8")),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8")),
 			},
-			leaf:    "team-a",
-			flavors: flavorSet("a100"),
+			leaf:     "team-a",
+			flavors:  flavorSet("a100"),
+			enrolled: []string{"ns-z", "ns-a"},
 			want: []renderedCQ{{
 				Name:       "team-a",
 				CohortName: "root",
@@ -330,7 +335,11 @@ func TestRenderClusterQueue(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			node := nodeFor(t, tc.quotas, tc.leaf)
-			got := Render(backend.Plan{Write: []*tree.Node{node}}, tc.flavors, testOptions())
+			opts := testOptions()
+			if tc.enrolled != nil {
+				opts = testOptionsIn(tc.enrolled...)
+			}
+			got := Render(backend.Plan{Write: []*tree.Node{node}}, tc.flavors, opts)
 
 			if diff := cmp.Diff(tc.want, flattenCQ(t, got)); diff != "" {
 				t.Errorf("Render() ClusterQueue mismatch (-want +got):\n%s", diff)
@@ -385,9 +394,8 @@ func TestRenderEmitsOneResourceGroup(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			quotas := []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-a"}, tc.budgets...),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, tc.budgets...),
 			}
 			node := nodeFor(t, quotas, "team-a")
 			got := Render(backend.Plan{Write: []*tree.Node{node}}, tc.flavors, testOptions())
@@ -417,7 +425,7 @@ func TestRenderCohort(t *testing.T) {
 			// cohort and treats an empty parent as "no parent".
 			name: "the reserved root emits no parent",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
 			},
 			node:       "root",
 			wantParent: "",
@@ -426,8 +434,8 @@ func TestRenderCohort(t *testing.T) {
 		{
 			name: "an internal node names its parent",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("org", "root", v1beta1.AcceleratorQuotaRoleCohort, nil),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("org", "root", v1beta1.AcceleratorQuotaRoleCohort),
 			},
 			node:       "org",
 			wantParent: "root",
@@ -439,9 +447,8 @@ func TestRenderCohort(t *testing.T) {
 			// quota on top of what the children already contribute.
 			name: "an internal node's budget does not materialize",
 			quotas: []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("org", "root", v1beta1.AcceleratorQuotaRoleCohort, nil,
-					budget("nvidia.com/gpu", "a100", "100")),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("org", "root", v1beta1.AcceleratorQuotaRoleCohort, budget("nvidia.com/gpu", "a100", "100")),
 			},
 			node:       "org",
 			wantParent: "root",
@@ -480,49 +487,71 @@ func TestRenderCohort(t *testing.T) {
 	}
 }
 
-// Every bound namespace gets a LocalQueue, and it takes Kueue's default-queue
-// name so Kueue's own defaulting stamps workloads there rather than leaving
-// them unstamped in the window before the queue lands.
+// Every leaf gets a LocalQueue in every enrolled namespace, named after the
+// leaf. The name is the tenant: Kueue offers no way to aim a workload at a
+// ClusterQueue directly, so the LocalQueue name in the queue-name label is the
+// only thing that picks one budget out of the many sharing a namespace.
 func TestRenderLocalQueues(t *testing.T) {
 	tests := []struct {
-		name       string
-		namespaces []string
-		want       []string
+		name     string
+		enrolled []string
+		leaves   []string
+		want     []string
 	}{
 		{
-			name:       "one namespace",
-			namespaces: []string{"ns-a"},
-			want:       []string{"ns-a/default"},
+			name:     "one enrolled namespace",
+			enrolled: []string{"ns-a"},
+			leaves:   []string{"team-a"},
+			want:     []string{"ns-a/team-a"},
 		},
 		{
-			name:       "several namespaces, sorted",
-			namespaces: []string{"ns-z", "ns-a", "ns-m"},
-			want:       []string{"ns-a/default", "ns-m/default", "ns-z/default"},
+			name:     "one leaf reaches every enrolled namespace, sorted",
+			enrolled: []string{"ns-z", "ns-a", "ns-m"},
+			leaves:   []string{"team-a"},
+			want:     []string{"ns-a/team-a", "ns-m/team-a", "ns-z/team-a"},
 		},
 		{
-			name:       "a leaf binding nothing emits no local queue",
-			namespaces: nil,
-			want:       []string{},
+			// The shape the design exists for: tenancy is not namespace-scoped,
+			// so several leaves coexist in one namespace, each with its own
+			// pointer at its own budget.
+			name:     "many leaves share one namespace, each with its own queue",
+			enrolled: []string{"ns-a"},
+			leaves:   []string{"team-a", "team-b", "team-c"},
+			want:     []string{"ns-a/team-a", "ns-a/team-b", "ns-a/team-c"},
+		},
+		{
+			name:     "no enrolled namespace leaves nowhere to point",
+			enrolled: nil,
+			leaves:   []string{"team-a"},
+			want:     []string{},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			quotas := []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					tc.namespaces, budget("nvidia.com/gpu", "a100", "8")),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
 			}
-			node := nodeFor(t, quotas, "team-a")
-			got := Render(backend.Plan{Write: []*tree.Node{node}}, flavorSet("a100"), testOptions())
+			for _, name := range tc.leaves {
+				quotas = append(quotas, aq(name, "root",
+					v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8")))
+			}
+			var write []*tree.Node
+			for _, name := range tc.leaves {
+				write = append(write, nodeFor(t, quotas, name))
+			}
+			got := Render(backend.Plan{Write: write}, flavorSet("a100"), testOptionsIn(tc.enrolled...))
 
 			names := []string{}
 			for _, lq := range got.LocalQueues {
 				names = append(names, *lq.Namespace+"/"+*lq.Name)
-				if got, want := string(*lq.Spec.ClusterQueue), "team-a"; got != want {
-					t.Errorf("LocalQueue points at %q, want %q", got, want)
+				// Named for the leaf and pointing at the leaf. That identity is
+				// what lets one queue name reach one budget.
+				if got := string(*lq.Spec.ClusterQueue); got != *lq.Name {
+					t.Errorf("LocalQueue %q points at %q, want its own name", *lq.Name, got)
 				}
 			}
+			sort.Strings(names)
 			if diff := cmp.Diff(tc.want, names); diff != "" {
 				t.Errorf("Render() LocalQueues mismatch (-want +got):\n%s", diff)
 			}
@@ -575,9 +604,8 @@ func TestRenderReportsMissingFlavors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			quotas := []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-a"}, tc.budgets...),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, tc.budgets...),
 			}
 			node := nodeFor(t, quotas, "team-a")
 			got := Render(backend.Plan{Write: []*tree.Node{node}}, tc.flavors, testOptions())
@@ -616,9 +644,8 @@ func TestRenderIsDeterministic(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			quotas := []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns-b", "ns-a"}, tc.budgets...),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, tc.budgets...),
 			}
 			node := nodeFor(t, quotas, "team-a")
 			plan := backend.Plan{Write: []*tree.Node{node}, Retain: sets.New[string]()}
@@ -660,9 +687,8 @@ func TestRenderDoesNotMutateInput(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			quotas := []v1beta1.AcceleratorQuota{
-				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					tc.namespaces, tc.budgets...),
+				aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, tc.budgets...),
 			}
 			node := nodeFor(t, quotas, "team-a")
 

@@ -90,6 +90,22 @@ rendering a flag the binary rejects at startup.
 {{- end -}}
 
 {{/*
+The namespaces this cluster serves budgeted workloads from, as a comma-separated
+list. Blank entries are dropped and the result is sorted, so an overlay cannot
+change the flag by reordering and duplicates in an overlay collapse.
+*/}}
+{{- define "ome-quota-manager.enrolledNamespaces" -}}
+{{- $materialize := .Values.quotaManager.materialize | default dict -}}
+{{- $out := list -}}
+{{- range $ns := ($materialize.enrolledNamespaces | default list) -}}
+{{- if trim (toString $ns) -}}
+{{- $out = append $out (trim (toString $ns)) -}}
+{{- end -}}
+{{- end -}}
+{{- join "," (sortAlpha (uniq $out)) -}}
+{{- end -}}
+
+{{/*
 The field manager that owns applied Kueue objects. Defaults to the component
 name so a single-manager install needs no configuration, while two managers on
 one cluster can be told apart.

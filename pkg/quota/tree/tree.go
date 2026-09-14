@@ -11,13 +11,6 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// PathSeparator joins node names into the root-to-node path reported in
-// status.path, and also leads it, so a path is absolute: "/root/org/team-a".
-// A slash, not a dot: node names are DNS subdomains and may contain dots, so a
-// dot-joined path could not be read back as ancestry even by eye. Display only
-// — Kueue object names come from metadata.name, never from ancestry.
-const PathSeparator = "/"
-
 // maxRenderedCyclePath bounds how many node names a cycle message spells out.
 // A large cycle would otherwise produce a message per member, each carrying
 // every name, which overruns both an admission response and the apiserver's
@@ -64,8 +57,6 @@ type Node struct {
 	// Depth is the distance from the root; 0 for the root, -1 when the node is
 	// not reachable from it.
 	Depth int
-	// Path is the root-to-node path, empty when the node is unreachable.
-	Path string
 }
 
 // Name returns the node's CR name.
@@ -74,7 +65,7 @@ func (n *Node) Name() string { return n.Quota.Name }
 // Role returns the node's declared role.
 func (n *Node) Role() v1beta1.AcceleratorQuotaRole { return n.Quota.Spec.Role }
 
-// IsLeaf reports whether this node carries the budget and binds namespaces. It
+// IsLeaf reports whether this node carries the budget and is a tenant. It
 // reads the declared role, never the presence of children: a grouping created
 // before its first child is still a grouping.
 func (n *Node) IsLeaf() bool {
@@ -231,7 +222,6 @@ func Build(quotas []v1beta1.AcceleratorQuota, opts Options) (*Tree, Violations, 
 	vs = append(vs, checkDepth(t, opts.MaxDepth)...)
 	vs = append(vs, checkNodeKind(t)...)
 	vs = append(vs, checkContainment(t)...)
-	vs = append(vs, checkNamespaces(t)...)
 
 	return t, vs.sorted(), nil
 }
@@ -363,10 +353,6 @@ func resolveRoot(t *Tree, rootName string) Violations {
 // Depth -1 they were built with.
 func assignDepth(root *Node) {
 	root.Depth = 0
-	// Leading separator, so the root reads as "/root" and every path is
-	// recognisably absolute. Without it a single-segment path is
-	// indistinguishable from a bare node name.
-	root.Path = PathSeparator + root.Name()
 	queue := []*Node{root}
 	for len(queue) > 0 {
 		n := queue[0]
@@ -376,7 +362,6 @@ func assignDepth(root *Node) {
 				continue
 			}
 			c.Depth = n.Depth + 1
-			c.Path = n.Path + PathSeparator + c.Name()
 			queue = append(queue, c)
 		}
 	}
@@ -465,9 +450,6 @@ func checkNodeKind(t *Tree) Violations {
 			}
 		case v1beta1.AcceleratorQuotaRoleCohort:
 			var set []string
-			if len(spec.Namespaces) > 0 {
-				set = append(set, "namespaces")
-			}
 			if spec.PriorityTier != "" {
 				set = append(set, "priorityTier")
 			}
@@ -554,58 +536,6 @@ func checkContainment(t *Tree) Violations {
 						k, b.Nominal.String(), sum.String()),
 				})
 			}
-		}
-	}
-	return vs
-}
-
-// checkNamespaces enforces that a namespace is bound by exactly one leaf.
-//
-// The incumbent keeps the namespace and the later binder is blamed, ordered by
-// creation timestamp: blaming whichever name sorts first would freeze a leaf
-// that has been serving for a year because someone created an alphabetically
-// earlier one.
-//
-// Scope matters: this checks the set of nodes it was handed, which on a member
-// is projections plus local CRs and on the management plane is the authored
-// tree. Neither is the whole fleet, so this is uniqueness within the caller's
-// visible set, not a fleet-wide guarantee.
-func checkNamespaces(t *Tree) Violations {
-	leaves := t.Leaves()
-	sort.SliceStable(leaves, func(i, j int) bool {
-		ti, tj := leaves[i].Quota.CreationTimestamp, leaves[j].Quota.CreationTimestamp
-		if !ti.Equal(&tj) {
-			return ti.Before(&tj)
-		}
-		return leaves[i].Name() < leaves[j].Name()
-	})
-
-	var vs Violations
-	owner := map[string]string{}
-	for _, n := range leaves {
-		bound := map[string]struct{}{}
-		for _, ns := range n.Quota.Spec.Namespaces {
-			if _, twice := bound[ns]; twice {
-				vs = append(vs, Violation{
-					Node:    n.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonNamespaceConflict,
-					Subject: ns,
-					Message: fmt.Sprintf("namespace %q is listed more than once", ns),
-				})
-				continue
-			}
-			bound[ns] = struct{}{}
-			if prev, taken := owner[ns]; taken {
-				vs = append(vs, Violation{
-					Node:    n.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonNamespaceConflict,
-					Subject: ns,
-					Message: fmt.Sprintf("namespace %q is already bound by leaf %q; a namespace charges exactly one leaf",
-						ns, prev),
-				})
-				continue
-			}
-			owner[ns] = n.Name()
 		}
 	}
 	return vs

@@ -695,11 +695,6 @@ func (in *AcceleratorQuotaSpec) DeepCopyInto(out *AcceleratorQuotaSpec) {
 		*out = new(AcceleratorQuotaParentRef)
 		**out = **in
 	}
-	if in.Namespaces != nil {
-		in, out := &in.Namespaces, &out.Namespaces
-		*out = make([]string, len(*in))
-		copy(*out, *in)
-	}
 	if in.Distribution != nil {
 		in, out := &in.Distribution, &out.Distribution
 		*out = new(AcceleratorQuotaDistribution)

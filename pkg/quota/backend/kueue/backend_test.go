@@ -60,9 +60,8 @@ func planFor(t *testing.T, quotas []v1beta1.AcceleratorQuota, write ...string) b
 
 func simpleTree() []v1beta1.AcceleratorQuota {
 	return []v1beta1.AcceleratorQuota{
-		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-			[]string{"ns-a"}, budget("nvidia.com/gpu", "a100", "8")),
+		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8")),
 	}
 }
 
@@ -116,12 +115,12 @@ func TestMaterializeRefusesForeignObjects(t *testing.T) {
 			refused:  objectRef{kind: "ClusterQueue", name: "team-a"},
 		},
 		{
-			name: "a hand-authored default LocalQueue in a bound namespace is refused",
+			name: "a hand-authored LocalQueue of the leaf's name is refused",
 			existing: withFlavor(&kueuev1beta2.LocalQueue{
-				ObjectMeta: metav1.ObjectMeta{Name: LocalQueueName, Namespace: "ns-a"},
+				ObjectMeta: metav1.ObjectMeta{Name: "team-a", Namespace: "ns-a"},
 			}),
 			wantNode: "team-a",
-			refused:  objectRef{kind: "LocalQueue", name: LocalQueueName, namespace: "ns-a"},
+			refused:  objectRef{kind: "LocalQueue", name: "team-a", namespace: "ns-a"},
 		},
 	}
 
@@ -185,11 +184,9 @@ func TestMaterializeRefusesForeignObjects(t *testing.T) {
 // alternative is one tenant's typo freezing quota fleet-wide.
 func TestMaterializeToleratesPerNodeFailure(t *testing.T) {
 	quotas := []v1beta1.AcceleratorQuota{
-		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-			[]string{"ns-a"}, budget("nvidia.com/gpu", "a100", "8")),
-		aq("team-b", "root", v1beta1.AcceleratorQuotaRoleClusterQueue,
-			[]string{"ns-b"}, budget("nvidia.com/gpu", "a100", "4")),
+		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "8")),
+		aq("team-b", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("nvidia.com/gpu", "a100", "4")),
 	}
 
 	tests := []struct {

@@ -240,7 +240,6 @@ func TestLongTailColumns(t *testing.T) {
 				ParentRef: &v1beta1.AcceleratorQuotaParentRef{Name: "root"},
 			},
 			Status: v1beta1.AcceleratorQuotaStatus{
-				Path:               "/root/team-a",
 				ObservedGeneration: 7,
 				Budgets: []v1beta1.AcceleratorBudgetStatus{{
 					ResourceName: "nvidia.com/gpu", ResourceFlavor: "h100",
@@ -251,7 +250,7 @@ func TestLongTailColumns(t *testing.T) {
 		}, map[string]string{
 			"NAME": "team-a", "ROLE": "ClusterQueue", "PARENT": "root",
 			"RESOURCE": "nvidia.com/gpu", "FLAVOR": "h100", "NOMINAL": "8",
-			"ADMITTED": "3", "SOURCE": "Reported", "READY": "True", "PATH": "/root/team-a",
+			"ADMITTED": "3", "SOURCE": "Reported", "READY": "True",
 		}},
 		{"inferencereplicas", &v1beta1.InferenceReplica{
 			ObjectMeta: metav1.ObjectMeta{Name: "rep"},

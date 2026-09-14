@@ -3,10 +3,9 @@
 //
 // The tree is the graph of spec.parentRef edges, so no single CR can be checked
 // in isolation: whether a node's parent resolves, whether it sits inside a
-// cycle, how deep it is, whether its budget fits inside its parent's, and
-// whether its namespaces collide with another leaf's are all properties of the
-// whole set. This package is that whole-set view, and it has two callers with
-// different needs:
+// cycle, how deep it is, and whether its budget fits inside its parent's are
+// all properties of the whole set. This package is that whole-set view, and it
+// has two callers with different needs:
 //
 //   - The validating webhook splices the object under review into the live set
 //     and rejects the write if the result is not a well-formed tree. It wants

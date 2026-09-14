@@ -60,14 +60,6 @@ func leaf(name, parent string, budgets ...v1beta1.AcceleratorBudget) v1beta1.Acc
 	}
 }
 
-// boundTo names the namespaces a leaf claims, with a creation time so
-// conflict blame is decided by age rather than by name order.
-func boundTo(l v1beta1.AcceleratorQuota, at int64, namespaces ...string) v1beta1.AcceleratorQuota {
-	l.CreationTimestamp = metav1.NewTime(time.Unix(at, 0))
-	l.Spec.Namespaces = namespaces
-	return l
-}
-
 func mustBuild(t *testing.T, quotas []v1beta1.AcceleratorQuota, o Options) (*Tree, Violations) {
 	t.Helper()
 	tr, vs, err := Build(quotas, o)
@@ -86,7 +78,6 @@ func mustBuild(t *testing.T, quotas []v1beta1.AcceleratorQuota, o Options) (*Tre
 
 // shape is a Node reduced to its computed position.
 type shape struct {
-	Path      string
 	Depth     int
 	Leaf      bool
 	Reachable bool
@@ -96,7 +87,6 @@ func shapes(tr *Tree) map[string]shape {
 	out := map[string]shape{}
 	for _, n := range tr.Nodes() {
 		out[n.Name()] = shape{
-			Path:      n.Path,
 			Depth:     n.Depth,
 			Leaf:      n.IsLeaf(),
 			Reachable: n.Reachable(),
@@ -175,14 +165,6 @@ func TestBuild(t *testing.T) {
 			want: Violations{{
 				Node: "empty", Reason: v1beta1.AcceleratorQuotaReasonNodeKindInvalid,
 				Message: "a ClusterQueue node must carry at least one budget",
-			}},
-		},
-		{
-			name:   "a Cohort may not bind namespaces",
-			quotas: base(cohortWith(func(c *v1beta1.AcceleratorQuota) { c.Spec.Namespaces = []string{"ns"} })),
-			want: Violations{{
-				Node: "org", Reason: v1beta1.AcceleratorQuotaReasonNodeKindInvalid, Subject: "namespaces",
-				Message: "a Cohort node must not set namespaces; no workload binds to a grouping",
 			}},
 		},
 		{
@@ -301,27 +283,6 @@ func TestBuild(t *testing.T) {
 			}},
 		},
 		{
-			name:   "a namespace listed twice on one leaf reads as one clash",
-			quotas: base(boundTo(leaf("team-a", rootName, budget("10")), 1000, "svc", "svc")),
-			want: Violations{{
-				Node: "team-a", Reason: v1beta1.AcceleratorQuotaReasonNamespaceConflict, Subject: "svc",
-				Message: `namespace "svc" is listed more than once`,
-			}},
-		},
-		{
-			// Name order must not decide it, or an alphabetically-early
-			// newcomer freezes a live tenant. The incumbent keeps the binding.
-			name: "a namespace clash blames the newcomer",
-			quotas: base(
-				boundTo(leaf("zzz-prod", rootName, budget("10")), 1000, "svc"),
-				boundTo(leaf("aaa-test", rootName, budget("10")), 2000, "svc"),
-			),
-			want: Violations{{
-				Node: "aaa-test", Reason: v1beta1.AcceleratorQuotaReasonNamespaceConflict, Subject: "svc",
-				Message: `namespace "svc" is already bound by leaf "zzz-prod"; a namespace charges exactly one leaf`,
-			}},
-		},
-		{
 			// Every node beneath a break reports, so the freeze set is complete
 			// — otherwise a descendant would materialize under a parent that
 			// was never created.
@@ -412,10 +373,10 @@ func TestBuildTreeShape(t *testing.T) {
 			},
 			wantRoot: rootName,
 			want: map[string]shape{
-				rootName: {Path: "/root", Depth: 0, Reachable: true},
-				"org":    {Path: "/root/org", Depth: 1, Reachable: true},
-				"team-a": {Path: "/root/org/team-a", Depth: 2, Leaf: true, Reachable: true},
-				"team-b": {Path: "/root/org/team-b", Depth: 2, Leaf: true, Reachable: true},
+				rootName: {Depth: 0, Reachable: true},
+				"org":    {Depth: 1, Reachable: true},
+				"team-a": {Depth: 2, Leaf: true, Reachable: true},
+				"team-b": {Depth: 2, Leaf: true, Reachable: true},
 			},
 		},
 		{
@@ -430,7 +391,7 @@ func TestBuildTreeShape(t *testing.T) {
 			},
 			wantRoot: rootName,
 			want: map[string]shape{
-				rootName: {Path: "/root", Depth: 0, Reachable: true},
+				rootName: {Depth: 0, Reachable: true},
 				"x1":     {Depth: -1},
 				"x2":     {Depth: -1, Leaf: true},
 			},
@@ -990,19 +951,22 @@ func TestViolations(t *testing.T) {
 // A node broken several ways reports the cause an operator must fix first, not
 // whichever reason happens to sort earliest.
 func TestPrimary(t *testing.T) {
-	t.Run("the structural cause wins over the binding", func(t *testing.T) {
+	t.Run("the structural cause wins over the node's own shape", func(t *testing.T) {
+		// A leaf that is both parented on a node that does not exist and carrying
+		// no budget. Fixing its budget while it still hangs off nothing changes
+		// nothing, so the missing parent is what the node must report.
 		quotas := []v1beta1.AcceleratorQuota{
 			cohort(rootName, "", budget("128")),
-			boundTo(leaf("team-a", rootName, budget("10")), 1000, "svc"),
-			boundTo(leaf("team-b", "ghost", budget("10")), 2000, "svc"),
+			leaf("team-a", rootName, budget("10")),
+			leaf("team-b", "ghost"),
 		}
 		_, vs := mustBuild(t, quotas, opts())
 		got := vs.For("team-b")
 		if len(got) < 2 {
-			t.Fatalf("team-b should report both a missing parent and a namespace clash, got: %v", got)
+			t.Fatalf("team-b should report both a missing parent and a missing budget, got: %v", got)
 		}
 		if r := got.Primary().Reason; r != v1beta1.AcceleratorQuotaReasonParentMissing {
-			t.Errorf("Primary = %q, want ParentMissing (fix the structure before the binding)", r)
+			t.Errorf("Primary = %q, want ParentMissing (fix the structure before the shape)", r)
 		}
 	})
 

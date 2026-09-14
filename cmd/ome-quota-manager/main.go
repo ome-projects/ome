@@ -93,7 +93,11 @@ type options struct {
 	// damping rather than a default band.
 	capacityHysteresisPercent int
 	coverResources            string
-	fieldManager              string
+	// enrolledNamespaces are the namespaces this cluster serves budgeted
+	// workloads from. Deploy config rather than a field on the CR: it describes
+	// the cluster, not the budget.
+	enrolledNamespaces string
+	fieldManager       string
 	// enableWebhook serves the admission validator. It is separable from the
 	// controller because the two fail differently: a webhook outage with
 	// failurePolicy=Fail blocks writes, so an operator debugging a wedged
@@ -173,6 +177,14 @@ func main() {
 			"memory, so a queue budgeted only for accelerators admits nothing and reports the reason "+
 			"nowhere. These are a ceiling high enough not to be a budget, which is why they are "+
 			"configured rather than authored on the CR. Empty disables materialization.")
+	flag.StringVar(&opts.enrolledNamespaces, "enrolled-namespaces", opts.enrolledNamespaces,
+		"Comma-separated namespaces this cluster serves budgeted workloads from, e.g. "+
+			"\"ml-serving,ml-batch\". Every leaf gets a LocalQueue named after it in each of them, and "+
+			"every rendered ClusterQueue selects exactly this set. It is deploy config because it "+
+			"describes the cluster rather than the budget: a leaf is a tenant, and many tenants "+
+			"can share one namespace, so where workloads run is a property of the install. Empty "+
+			"disables materialization — a ClusterQueue selecting nothing admits nothing and says so "+
+			"nowhere. Workload mode only. Changing it needs a restart.")
 	flag.StringVar(&opts.fieldManager, "field-manager", opts.fieldManager,
 		"Field manager that owns the Kueue objects this process applies, and the value of the "+
 			"managed-by label it selects them by. Two managers pointed at one cluster must not share "+
@@ -349,7 +361,11 @@ func main() {
 			setupLog.Error(err, "invalid --cover-resources")
 			os.Exit(1)
 		}
-		backendOpts := kueuebackend.Options{FieldManager: opts.fieldManager, CoverResources: cover}
+		backendOpts := kueuebackend.Options{
+			FieldManager:       opts.fieldManager,
+			CoverResources:     cover,
+			EnrolledNamespaces: splitAndTrim(opts.enrolledNamespaces),
+		}
 		if err := backendOpts.Validate(); err != nil {
 			setupLog.Error(err, "invalid materialization configuration")
 			os.Exit(1)
@@ -364,7 +380,8 @@ func main() {
 			}
 			setupLog.Info("Materializing the quota tree into Kueue",
 				"fieldManager", backendOpts.FieldManager,
-				"coverResources", opts.coverResources)
+				"coverResources", opts.coverResources,
+				"enrolledNamespaces", backendOpts.EnrolledNamespaces)
 		}
 	}
 	var setupOpts []acceleratorquota.Option

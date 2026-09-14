@@ -36,7 +36,6 @@ const rootName = "root"
 // entry a transcription exercise; the cases that turn on message content assert
 // it separately.
 type nodeState struct {
-	Path     string
 	Parent   string
 	Ready    metav1.ConditionStatus
 	Degraded metav1.ConditionStatus
@@ -112,7 +111,7 @@ func observe(t *testing.T, c client.Client) map[string]nodeState {
 	out := make(map[string]nodeState, len(list.Items))
 	for i := range list.Items {
 		q := &list.Items[i]
-		st := nodeState{Path: q.Status.Path, Parent: q.Status.Parent}
+		st := nodeState{Parent: q.Status.Parent}
 		if c := apimeta.FindStatusCondition(q.Status.Conditions, v1beta1.AcceleratorQuotaReady); c != nil {
 			st.Ready = c.Status
 		}
@@ -151,27 +150,20 @@ func degradedMessage(t *testing.T, c client.Client, name string) string {
 	return cond.Message
 }
 
-// treePath renders the status.path a node at the given ancestry should report:
-// absolute, root-first. Spelled once so a table row cannot disagree with the
-// separator or the leading slash.
-func treePath(names ...string) string {
-	return tree.PathSeparator + strings.Join(append([]string{rootName}, names...), tree.PathSeparator)
-}
-
 // ok and bad are the two whole-node verdicts, spelled once so a table row reads
 // as the shape of the tree rather than a wall of condition constants.
-func ok(path, parent string) nodeState {
+func ok(parent string) nodeState {
 	return nodeState{
-		Path: path, Parent: parent,
-		Ready: metav1.ConditionTrue, Degraded: metav1.ConditionFalse,
+		Parent: parent,
+		Ready:  metav1.ConditionTrue, Degraded: metav1.ConditionFalse,
 		Reason: v1beta1.AcceleratorQuotaReasonAdmitted,
 	}
 }
 
-func bad(path, parent, reason string) nodeState {
+func bad(parent, reason string) nodeState {
 	return nodeState{
-		Path: path, Parent: parent,
-		Ready: metav1.ConditionFalse, Degraded: metav1.ConditionTrue,
+		Parent: parent,
+		Ready:  metav1.ConditionFalse, Degraded: metav1.ConditionTrue,
 		Reason: reason,
 	}
 }
@@ -197,10 +189,10 @@ func TestReconcile(t *testing.T) {
 				leaf("team-b", "org", budget("40")),
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"org":    ok(treePath("org"), rootName),
-				"team-a": ok(treePath("org", "team-a"), "org"),
-				"team-b": ok(treePath("org", "team-b"), "org"),
+				rootName: ok(""),
+				"org":    ok(rootName),
+				"team-a": ok("org"),
+				"team-b": ok("org"),
 			},
 		},
 		{
@@ -213,9 +205,9 @@ func TestReconcile(t *testing.T) {
 				leaf("big", "org", budget("60")),
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"org":    bad(treePath("org"), rootName, v1beta1.AcceleratorQuotaReasonContainmentViolated),
-				"big":    bad(treePath("org", "big"), "org", v1beta1.AcceleratorQuotaReasonContainmentViolated),
+				rootName: ok(""),
+				"org":    bad(rootName, v1beta1.AcceleratorQuotaReasonContainmentViolated),
+				"big":    bad("org", v1beta1.AcceleratorQuotaReasonContainmentViolated),
 			},
 			wantMessage: map[string]string{
 				"org": "children total 60",
@@ -234,9 +226,9 @@ func TestReconcile(t *testing.T) {
 				leaf("x2", "x1", budget("1")),
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"x1":     bad("", "", v1beta1.AcceleratorQuotaReasonParentMissing),
-				"x2":     bad("", "x1", v1beta1.AcceleratorQuotaReasonUnreachable),
+				rootName: ok(""),
+				"x1":     bad("", v1beta1.AcceleratorQuotaReasonParentMissing),
+				"x2":     bad("x1", v1beta1.AcceleratorQuotaReasonUnreachable),
 			},
 			wantMessage: map[string]string{"x2": `ancestor "x1" is unresolved`},
 		},
@@ -250,9 +242,9 @@ func TestReconcile(t *testing.T) {
 				leaf("orphan", "ghost", budget("1")),
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"good":   ok(treePath("good"), rootName),
-				"orphan": bad("", "", v1beta1.AcceleratorQuotaReasonParentMissing),
+				rootName: ok(""),
+				"good":   ok(rootName),
+				"orphan": bad("", v1beta1.AcceleratorQuotaReasonParentMissing),
 			},
 		},
 		{
@@ -262,8 +254,8 @@ func TestReconcile(t *testing.T) {
 				leaf("empty", rootName),
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"empty":  bad(treePath("empty"), rootName, v1beta1.AcceleratorQuotaReasonNodeKindInvalid),
+				rootName: ok(""),
+				"empty":  bad(rootName, v1beta1.AcceleratorQuotaReasonNodeKindInvalid),
 			},
 		},
 		{
@@ -320,9 +312,9 @@ func TestReconcileAfterEdit(t *testing.T) {
 				setNominal(t, c, "team-a", "500")
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"org":    bad(treePath("org"), rootName, v1beta1.AcceleratorQuotaReasonContainmentViolated),
-				"team-a": bad(treePath("org", "team-a"), "org", v1beta1.AcceleratorQuotaReasonContainmentViolated),
+				rootName: ok(""),
+				"org":    bad(rootName, v1beta1.AcceleratorQuotaReasonContainmentViolated),
+				"team-a": bad("org", v1beta1.AcceleratorQuotaReasonContainmentViolated),
 			},
 		},
 		{
@@ -336,9 +328,9 @@ func TestReconcileAfterEdit(t *testing.T) {
 				setNominal(t, c, "big", "40")
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"org":    ok(treePath("org"), rootName),
-				"big":    ok(treePath("org", "big"), "org"),
+				rootName: ok(""),
+				"org":    ok(rootName),
+				"big":    ok("org"),
 			},
 		},
 		{
@@ -351,8 +343,8 @@ func TestReconcileAfterEdit(t *testing.T) {
 			},
 			edit: nil,
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"team-a": ok(treePath("team-a"), rootName),
+				rootName: ok(""),
+				"team-a": ok(rootName),
 			},
 			wantUnchanged: []string{rootName, "team-a"},
 		},
@@ -372,8 +364,8 @@ func TestReconcileAfterEdit(t *testing.T) {
 				}
 			},
 			want: map[string]nodeState{
-				rootName: ok(treePath(), ""),
-				"team-a": bad("", "", v1beta1.AcceleratorQuotaReasonParentMissing),
+				rootName: ok(""),
+				"team-a": bad("", v1beta1.AcceleratorQuotaReasonParentMissing),
 			},
 		},
 	}
@@ -504,8 +496,8 @@ func TestReconcileReadsThroughAPIReader(t *testing.T) {
 	}
 
 	want := map[string]nodeState{
-		rootName: ok(treePath(), ""),
-		"late":   bad("", "", v1beta1.AcceleratorQuotaReasonParentMissing),
+		rootName: ok(""),
+		"late":   bad("", v1beta1.AcceleratorQuotaReasonParentMissing),
 	}
 	if diff := cmp.Diff(want, observe(t, c)); diff != "" {
 		t.Errorf("node status mismatch (-want +got):\n%s", diff)

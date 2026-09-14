@@ -1532,26 +1532,6 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorQuotaSpec(ref common.ReferenceCallba
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorQuotaParentRef"),
 						},
 					},
-					"namespaces": {
-						VendorExtensible: spec.VendorExtensible{
-							Extensions: spec.Extensions{
-								"x-kubernetes-list-type": "set",
-							},
-						},
-						SchemaProps: spec.SchemaProps{
-							Description: "Namespaces are the serving namespaces this leaf binds. Each becomes one LocalQueue pointing at the leaf's ClusterQueue, on every cluster the leaf has a share on. A namespace belongs to exactly one leaf fleet-wide, or a workload in it has no single queue to charge.",
-							Type:        []string{"array"},
-							Items: &spec.SchemaOrArray{
-								Schema: &spec.Schema{
-									SchemaProps: spec.SchemaProps{
-										Default: "",
-										Type:    []string{"string"},
-										Format:  "",
-									},
-								},
-							},
-						},
-					},
 					"priorityTier": {
 						SchemaProps: spec.SchemaProps{
 							Description: "PriorityTier names the WorkloadPriorityClass stamped on this leaf's workloads. It is a default, not a partition: a workload declaring its own priority keeps it, and the leaf's ClusterQueue admits mixed priorities. OME references the class and does not create it. Capped at AcceleratorQuotaMaxNameLength because it is stamped into a label value.",
@@ -1614,13 +1594,6 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorQuotaStatus(ref common.ReferenceCall
 					"parent": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Parent echoes the resolved parent's name, so a node's edge is readable from status alone once the controller has confirmed it resolves.",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-					"path": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Path is the computed root-to-node path, a node's human-readable identity. Materialized Kueue object names come from metadata.name instead, so re-parenting changes this and nothing else.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

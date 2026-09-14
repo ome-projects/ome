@@ -49,8 +49,7 @@ func (v Violation) String() string {
 
 // reasonRank orders reasons by which one an operator must act on first, so a
 // node broken several ways reports the cause rather than a symptom. A node with
-// no position in the tree cannot meaningfully be judged on its budget, and a
-// budget that does not fit makes a namespace complaint premature.
+// no position in the tree cannot meaningfully be judged on its budget.
 var reasonRank = map[string]int{
 	v1beta1.AcceleratorQuotaReasonParentMissing:       0,
 	v1beta1.AcceleratorQuotaReasonParentCycle:         1,
@@ -60,7 +59,6 @@ var reasonRank = map[string]int{
 	v1beta1.AcceleratorQuotaReasonDepthExceeded:       5,
 	v1beta1.AcceleratorQuotaReasonContainmentViolated: 6,
 	v1beta1.AcceleratorQuotaReasonShareUnresolved:     7,
-	v1beta1.AcceleratorQuotaReasonNamespaceConflict:   8,
 }
 
 func rankOf(reason string) int {

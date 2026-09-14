@@ -78,13 +78,9 @@ var (
 // member-status funnel. A fleet-wide query that mixed them would be summing
 // two different quantities.
 //
-// path carries the root-to-node position alongside quota, because a bare object
-// name does not say where in the tree a budget sits and two tenants under
-// different parents can be told apart only by their ancestry. It is derived from
-// quota rather than independent of it, so it multiplies no cardinality -- a node
-// has exactly one path -- but it does change when a node is reparented, which
-// recordBudgets handles rather than leaving two live series for one node. Empty
-// means the tree could not reach the node from the root, matching status.path.
+// A node's ancestry carries no label of its own. Nodes are named by their path,
+// so quota already spells out where in the tree a budget sits, and a second
+// label derived from the first would only add a way for the two to disagree.
 //
 // Lent is deliberately absent. The model has no lent figure -- an ancestor's
 // borrowed is recomputed rather than summed from its children, because a loan
@@ -113,7 +109,7 @@ var (
 	}, budgetLabels)
 )
 
-var budgetLabels = []string{"plane", "quota", "path", "role", "resource", "flavor"}
+var budgetLabels = []string{"plane", "quota", "role", "resource", "flavor"}
 
 // budgetVectors is every vector keyed by quota, so a sweep cannot miss one that
 // was added later.
@@ -121,10 +117,10 @@ func budgetVectors() []*prometheus.GaugeVec {
 	return []*prometheus.GaugeVec{budgetNominal, budgetAdmitted, budgetReserved, budgetBorrowed}
 }
 
-// recorded maps each quota name with live budget series to the path it was last
+// recorded maps each quota name with live budget series to the role it was last
 // published under, so a pass can drop the ones the tree no longer names and
-// spot the ones that moved. The reconcile is whole-tree and serialised on one
-// key, but the mutex costs nothing and removes the assumption.
+// spot the ones whose role flipped. The reconcile is whole-tree and serialised
+// on one key, but the mutex costs nothing and removes the assumption.
 var (
 	recordedMu sync.Mutex
 	recorded   = map[string]string{}
@@ -172,26 +168,27 @@ func init() {
 // published on change would come back from a restart with every budget series
 // missing until someone edited a spec. The gauge reports what the controller
 // resolved this pass, which is what the CR carries whenever the write succeeds.
-func recordBudgets(plane, quota, path, role string, budgets []v1beta1.AcceleratorBudgetStatus) {
+func recordBudgets(plane, quota, role string, budgets []v1beta1.AcceleratorBudgetStatus) {
 	if plane == "" || quota == "" {
 		return
 	}
 
-	// Reparenting moves a node without renaming it, and path is part of the key,
-	// so the series it used to occupy would keep reporting alongside its
-	// replacement and double the node in any sum. Drop the old one first.
+	// A leaf converted to a grouping keeps its name while role changes, and role
+	// is part of the key, so the series it used to occupy would keep reporting
+	// alongside its replacement and double the node in any sum. Drop the old one
+	// first.
 	recordedMu.Lock()
 	previous, seen := recorded[quota]
-	moved := seen && previous != path
-	recorded[quota] = path
+	changed := seen && previous != role
+	recorded[quota] = role
 	recordedMu.Unlock()
 
-	if moved {
+	if changed {
 		dropSeriesFor(quota)
 	}
 
 	for _, b := range budgets {
-		labels := []string{plane, quota, path, role, b.ResourceName, b.ResourceFlavor}
+		labels := []string{plane, quota, role, b.ResourceName, b.ResourceFlavor}
 		budgetNominal.WithLabelValues(labels...).Set(b.Nominal.AsApproximateFloat64())
 		budgetAdmitted.WithLabelValues(labels...).Set(b.Admitted.AsApproximateFloat64())
 		budgetReserved.WithLabelValues(labels...).Set(b.Reserved.AsApproximateFloat64())
@@ -210,9 +207,9 @@ func deleteQuotaSeries(quota string) {
 }
 
 // dropSeriesFor removes every budget series carrying one quota name, whatever
-// path it was published under. Matching on quota alone is what lets it clean up
-// after a node that moved, whose stale series is keyed on a path no caller still
-// holds.
+// role it was published under. Matching on quota alone is what lets it clean up
+// after a node whose role flipped, whose stale series is keyed on a role no
+// caller still holds.
 func dropSeriesFor(quota string) {
 	for _, v := range budgetVectors() {
 		v.DeletePartialMatch(prometheus.Labels{"quota": quota})

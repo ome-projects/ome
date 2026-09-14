@@ -167,12 +167,11 @@ func render(node *tree.Node, cluster string, given []Allowance, opts Options) (*
 	}
 
 	if !node.IsLeaf() {
-		// Topology only. Namespaces, tiers and budgets all belong to leaves, and
-		// a fleet total on a grouping tier would be a number no member can hold.
+		// Topology only. Tiers and budgets both belong to leaves, and a fleet
+		// total on a grouping tier would be a number no member can hold.
 		return out, nil
 	}
 
-	out.Spec.Namespaces = append([]string(nil), src.Spec.Namespaces...)
 	out.Spec.PriorityTier = src.Spec.PriorityTier
 
 	budgets, err := projectBudgets(src, given)

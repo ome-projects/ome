@@ -47,10 +47,6 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
-    - jsonPath: .status.path
-      name: Path
-      priority: 1
-      type: string
     name: v1beta1
     schema:
       openAPIV3Schema:

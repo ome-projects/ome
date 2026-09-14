@@ -90,8 +90,11 @@ spec:
         - "--accelerator-resources={{ . }}"
         - "--capacity-hysteresis-percent={{ ($.Values.quotaManager.capacity | default dict).hysteresisPercent | default 0 }}"
         {{- end }}
-        {{- with (include "ome-quota-manager.coverResources" .) }}
-        - "--cover-resources={{ . }}"
+        {{- $cover := include "ome-quota-manager.coverResources" . }}
+        {{- $enrolled := include "ome-quota-manager.enrolledNamespaces" . }}
+        {{- if and $cover $enrolled }}
+        - "--cover-resources={{ $cover }}"
+        - "--enrolled-namespaces={{ $enrolled }}"
         - "--field-manager={{ include "ome-quota-manager.fieldManager" $ }}"
         {{- end }}
         {{- end }}

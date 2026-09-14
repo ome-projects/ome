@@ -9,22 +9,11 @@ import (
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	kueuev1beta2 "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	kueueac "sigs.k8s.io/kueue/client-go/applyconfiguration/kueue/v1beta2"
-	kueueconstants "sigs.k8s.io/kueue/pkg/controller/constants"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/quota/backend"
 	"sigs.k8s.io/ome/pkg/quota/tree"
 )
-
-// LocalQueueName is the name every leaf's per-namespace LocalQueue takes.
-//
-// It is Kueue's own default-queue name rather than a value of ours: when a
-// LocalQueue by that name exists in a namespace, Kueue's webhook stamps
-// workloads there itself. Naming the leaf's queue anything else would leave a
-// window in which a workload created before the queue lands is either unstamped
-// or charged to a leftover queue from before quota existed. Taken from Kueue so
-// it tracks their contract instead of drifting from a copy.
-const LocalQueueName = string(kueueconstants.DefaultLocalQueueName)
 
 // Objects are the apply configurations one Plan renders to, grouped by kind so
 // the caller can order the writes: a Cohort must exist before the object naming
@@ -91,7 +80,7 @@ func renderClusterQueue(node *tree.Node, flavors map[string]struct{}, opts Optio
 	budgets, skipped := usableBudgets(node, flavors)
 
 	spec := kueueac.ClusterQueueSpec().
-		WithNamespaceSelector(namespaceSelector(node.Quota.Spec.Namespaces))
+		WithNamespaceSelector(namespaceSelector(opts.EnrolledNamespaces))
 	if parent := parentName(node); parent != "" {
 		spec = spec.WithCohortName(kueuev1beta2.CohortReference(parent))
 	}
@@ -221,12 +210,14 @@ func usableBudgets(node *tree.Node, flavors map[string]struct{}) ([]v1beta1.Acce
 	return usable, skipped
 }
 
-// namespaceSelector binds the leaf's namespaces by name.
+// namespaceSelector admits the cluster's enrolled namespaces by name.
 //
 // It is never omitted. A null selector admits nothing, and Kueue reports that
 // nowhere: the queue exists, its LocalQueues resolve, and every workload simply
-// stays pending. An empty namespace list renders a selector that matches
-// nothing, which is the honest reading of a leaf that binds nothing.
+// stays pending. This is not a tenant boundary — every leaf's queue selects the
+// same set, and which leaf a workload charges is decided by the queue name it
+// carries — but it does make the enrollment boundary something Kueue enforces
+// rather than something implied by where LocalQueues happen to exist.
 func namespaceSelector(namespaces []string) *metav1ac.LabelSelectorApplyConfiguration {
 	values := append([]string(nil), namespaces...)
 	sort.Strings(values)
@@ -237,13 +228,25 @@ func namespaceSelector(namespaces []string) *metav1ac.LabelSelectorApplyConfigur
 			WithValues(values...))
 }
 
+// renderLocalQueues gives the leaf one LocalQueue per enrolled namespace, named
+// after the leaf.
+//
+// Named after the leaf, because the name is the tenant: a workload reaches its
+// budget by carrying that name in kueue.x-k8s.io/queue-name, and Kueue offers no
+// way to name a ClusterQueue directly — spec.queueName is a LocalQueueName
+// resolved in the workload's own namespace. Many leaves may therefore
+// coexist in one namespace, each with its own pointer.
+//
+// The full cross product is the honest shape rather than over-materialization:
+// tenancy is not namespace-scoped, so any leaf's workloads may appear in any
+// enrolled namespace.
 func renderLocalQueues(node *tree.Node, opts Options) []*kueueac.LocalQueueApplyConfiguration {
-	namespaces := append([]string(nil), node.Quota.Spec.Namespaces...)
+	namespaces := append([]string(nil), opts.EnrolledNamespaces...)
 	sort.Strings(namespaces)
 
 	out := make([]*kueueac.LocalQueueApplyConfiguration, 0, len(namespaces))
 	for _, ns := range namespaces {
-		out = append(out, kueueac.LocalQueue(LocalQueueName, ns).
+		out = append(out, kueueac.LocalQueue(node.Name(), ns).
 			WithLabels(labelsFor(node, opts)).
 			WithSpec(kueueac.LocalQueueSpec().
 				WithClusterQueue(kueuev1beta2.ClusterQueueReference(node.Name()))))

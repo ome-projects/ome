@@ -94,7 +94,7 @@ rules:
   resources: ["acceleratorquotas"]
   verbs: ["create"]
 {{- end }}
-{{- if and (eq (include "ome-quota-manager.mode" .) "workload") (include "ome-quota-manager.coverResources" .) }}
+{{- if and (eq (include "ome-quota-manager.mode" .) "workload") (include "ome-quota-manager.coverResources" .) (include "ome-quota-manager.enrolledNamespaces" .) }}
 # Materializing the tree means writing Kueue's own objects: a Cohort per
 # internal node, a ClusterQueue per leaf, and a LocalQueue in every bound
 # namespace. This is the grant that made the quota plane a separate binary --

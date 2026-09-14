@@ -145,44 +145,72 @@ fi
 
 # --- materialization carries its own Kueue write RBAC, workload mode only ---
 
+# Materializing needs BOTH a cover and somewhere to put the queues. A leaf's
+# LocalQueue lives in an enrolled namespace and its ClusterQueue selects exactly
+# that set, so with none there is nothing to render: the queue would select no
+# namespace, admit nothing, and say so in no object.
+materializing="$(render --set quotaManager.mode=workload \
+  --set 'quotaManager.materialize.enrolledNamespaces={ml-serving}')"
+
 # Flags and grants have to appear together: flags without the grants is a
 # crash-looping RBAC error, grants without the flags is cluster-wide write on
 # Kueue that nothing uses.
-grep -Fq -- '--cover-resources=cpu=16M,memory=16Pi' <<<"${default}" ||
+grep -Fq -- '--cover-resources=cpu=16M,ephemeral-storage=16Pi,memory=16Pi' <<<"${materializing}" ||
   fail "the default cover resources were not passed"
+grep -Fq -- '--enrolled-namespaces=ml-serving' <<<"${materializing}" ||
+  fail "the enrolled namespaces were not passed"
 
-# An operator overrides one key and keeps the other: Helm merges the map rather
+# Sorted and deduplicated, so reordering an overlay cannot change the flag and a
+# repeated entry cannot reach the binary, which rejects a duplicate at startup.
+manyns="$(render --set quotaManager.mode=workload \
+  --set 'quotaManager.materialize.enrolledNamespaces={ml-serving,ml-batch,ml-serving}')"
+grep -Fq -- '--enrolled-namespaces=ml-batch,ml-serving' <<<"${manyns}" ||
+  fail "the enrolled namespaces were not sorted and deduplicated"
+
+# An operator overrides one key and keeps the rest: Helm merges the map rather
 # than replacing it, and the whole point of a default is that omitting a key
 # leaves it alone.
 onekey="$(render --set quotaManager.mode=workload \
+  --set 'quotaManager.materialize.enrolledNamespaces={ml-serving}' \
   --set quotaManager.materialize.coverResources.cpu=2k)"
-grep -Fq -- '--cover-resources=cpu=2k,memory=16Pi' <<<"${onekey}" ||
-  fail "overriding one cover resource did not leave the other at its default"
+grep -Fq -- '--cover-resources=cpu=2k,ephemeral-storage=16Pi,memory=16Pi' <<<"${onekey}" ||
+  fail "overriding one cover resource did not leave the others at their defaults"
 
 # A Cohort's subtree quota sums the cover across its children, and the Kueue this
 # repo compiles against wraps rather than clamps on int64 overflow. Ei-scale
 # defaults leave no room for that sum, and a wrapped ceiling is a wrong admission
 # decision rather than a failure.
-if grep -Eq -- '--cover-resources=[^ ]*[0-9]+(Ei|E)([,"]|$)' <<<"${default}"; then
+if grep -Eq -- '--cover-resources=[^ ]*[0-9]+(Ei|E)([,"]|$)' <<<"${materializing}"; then
   fail "the default cover resources reach Ei/E scale, leaving no room for a cohort subtree sum"
 fi
-grep -Fq -- '--field-manager=ome-quota-manager' <<<"${default}" ||
+grep -Fq -- '--field-manager=ome-quota-manager' <<<"${materializing}" ||
   fail "the field manager did not default to the component name"
-grep -Fq 'resources: ["cohorts", "clusterqueues", "localqueues"]' <<<"${default}" ||
+grep -Fq 'resources: ["cohorts", "clusterqueues", "localqueues"]' <<<"${materializing}" ||
   fail "workload mode did not grant the Kueue write materialization needs"
 # patch on the resource, not update on the finalizers subresource: a finalizer
 # is metadata, so claiming a node is an ordinary patch. Granting the subresource
 # instead leaves every reconcile failing on a forbidden patch, which is invisible
 # to a render test that only checks a grant is present.
-grep -Fq 'verbs: ["patch"]' <<<"${default}" ||
+grep -Fq 'verbs: ["patch"]' <<<"${materializing}" ||
   fail "the finalizer patch grant is missing, so no node could be claimed or reaped"
-if grep -Fq 'resources: ["acceleratorquotas/finalizers"]' <<<"${default}"; then
+if grep -Fq 'resources: ["acceleratorquotas/finalizers"]' <<<"${materializing}"; then
   fail "granted the finalizers subresource, which governs blockOwnerDeletion and is not what a finalizer needs"
 fi
 
+# No enrolled namespace is the default, and it must render no materialization at
+# all rather than a queue that selects nothing.
+for unwanted in 'resources: ["cohorts", "clusterqueues", "localqueues"]' '--cover-resources' \
+  '--enrolled-namespaces' '--field-manager'; do
+  if grep -Fq -- "${unwanted}" <<<"${default}"; then
+    fail "no enrolled namespace still rendered ${unwanted}"
+  fi
+done
+
 # A rename must carry the field manager with it, or two installs would claim
 # each other's objects.
-grep -Fq -- '--field-manager=aq-mgr' <<<"${renamed}" ||
+renamedmat="$(render --set quotaManager.mode=workload --set quotaManager.name=aq-mgr \
+  --set 'quotaManager.materialize.enrolledNamespaces={ml-serving}')"
+grep -Fq -- '--field-manager=aq-mgr' <<<"${renamedmat}" ||
   fail "the field manager did not follow the rename"
 
 # A management-mode install writes no Kueue object anywhere, so the write grant
@@ -197,9 +225,11 @@ done
 # spelling an operator might reach for.
 for off in \
   'quotaManager.materialize.coverResources=null' \
+  'quotaManager.materialize.enrolledNamespaces=null' \
   'quotaManager.materialize=null' \
   ; do
-  nomat="$(render --set quotaManager.mode=workload --set "${off}")" ||
+  nomat="$(render --set quotaManager.mode=workload \
+    --set 'quotaManager.materialize.enrolledNamespaces={ml-serving}' --set "${off}")" ||
     fail "--set ${off} failed to render at all"
   for unwanted in 'resources: ["cohorts", "clusterqueues", "localqueues"]' '--cover-resources' \
     'verbs: ["patch"]'; do
@@ -212,8 +242,10 @@ done
 # A blank quantity is not a cover resource. The chart must agree with the
 # binary, which rejects a valueless pair at startup.
 blankqty="$(render --set quotaManager.mode=workload \
+  --set 'quotaManager.materialize.enrolledNamespaces={ml-serving}' \
   --set quotaManager.materialize.coverResources.cpu= \
-  --set quotaManager.materialize.coverResources.memory=)"
+  --set quotaManager.materialize.coverResources.memory= \
+  --set quotaManager.materialize.coverResources.ephemeral-storage=)"
 if grep -Fq -- 'resources: ["cohorts", "clusterqueues", "localqueues"]' <<<"${blankqty}"; then
   fail "blank cover quantities still granted the Kueue write"
 fi

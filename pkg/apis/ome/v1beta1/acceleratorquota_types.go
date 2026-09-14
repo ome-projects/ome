@@ -1,7 +1,7 @@
 /*
 AcceleratorQuota is the fleet capacity-budget CRD. One CR is one node of a
 single-rooted quota tree: a Cohort node groups other nodes, a ClusterQueue node
-is a leaf that binds serving namespaces and carries an accelerator budget per
+is a leaf that is itself a tenant and carries an accelerator budget per
 (resource, flavor) pair, which is how Kueue keys quota. spec.parentRef is the
 edge to the parent; the tree is the graph of those edges, rooted at the single
 reserved parent-less node.
@@ -74,10 +74,6 @@ const (
 	// concurrent admissions can reach without either write being individually
 	// invalid.
 	AcceleratorQuotaReasonContainmentViolated = "ContainmentViolated"
-
-	// AcceleratorQuotaReasonNamespaceConflict marks a leaf binding a namespace
-	// another leaf already binds. A namespace charges exactly one leaf.
-	AcceleratorQuotaReasonNamespaceConflict = "NamespaceConflict"
 
 	// AcceleratorQuotaReasonCapacityExceeded marks a node whose budget exceeds
 	// observed capacity beyond the configured hysteresis band. The comparison
@@ -260,7 +256,6 @@ const (
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Degraded",type=string,JSONPath=`.status.conditions[?(@.type=="Degraded")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
-// +kubebuilder:printcolumn:name="Path",type=string,priority=1,JSONPath=`.status.path`
 type AcceleratorQuota struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -292,7 +287,7 @@ type AcceleratorQuotaList struct {
 // variant, so they are convenience, never the durable tier.
 //
 // +kubebuilder:validation:XValidation:rule="self.role != 'ClusterQueue' || has(self.parentRef)",message="a ClusterQueue node must set parentRef; only the reserved root node is parent-less"
-// +kubebuilder:validation:XValidation:rule="self.role != 'Cohort' || (!has(self.namespaces) && !has(self.priorityTier) && !has(self.distribution))",message="a Cohort node must not set namespaces, priorityTier, or distribution; no workload binds to a grouping"
+// +kubebuilder:validation:XValidation:rule="self.role != 'Cohort' || (!has(self.priorityTier) && !has(self.distribution))",message="a Cohort node must not set priorityTier or distribution; no workload binds to a grouping"
 // +kubebuilder:validation:XValidation:rule="self.role != 'Cohort' || !has(self.budgets) || self.budgets.all(b, !has(b.policy) && !has(b.borrowingLimit) && !has(b.lendingLimit) && !has(b.perCluster))",message="a Cohort node's budgets carry only resourceName, resourceFlavor, and nominal"
 // +kubebuilder:validation:XValidation:rule="self.role != 'ClusterQueue' || (has(self.budgets) && size(self.budgets) > 0)",message="a ClusterQueue node must carry at least one budget"
 // +kubebuilder:validation:XValidation:rule="!has(self.budgets) || self.budgets.all(b, !(has(b.policy) ? b.policy == 'Explicit' : (has(self.distribution) && has(self.distribution.policy) && self.distribution.policy == 'Explicit')) || has(b.perCluster))",message="a budget whose effective distribution policy is Explicit must set perCluster"
@@ -311,14 +306,6 @@ type AcceleratorQuotaSpec struct {
 	// admitted workloads all survive.
 	// +optional
 	ParentRef *AcceleratorQuotaParentRef `json:"parentRef,omitempty"`
-
-	// Namespaces are the serving namespaces this leaf binds. Each becomes one
-	// LocalQueue pointing at the leaf's ClusterQueue, on every cluster the leaf
-	// has a share on. A namespace belongs to exactly one leaf fleet-wide, or a
-	// workload in it has no single queue to charge.
-	// +optional
-	// +listType=set
-	Namespaces []string `json:"namespaces,omitempty"`
 
 	// PriorityTier names the WorkloadPriorityClass stamped on this leaf's
 	// workloads. It is a default, not a partition: a workload declaring its own
@@ -470,12 +457,6 @@ type AcceleratorQuotaStatus struct {
 	// from status alone once the controller has confirmed it resolves.
 	// +optional
 	Parent string `json:"parent,omitempty"`
-
-	// Path is the computed root-to-node path, a node's human-readable identity.
-	// Materialized Kueue object names come from metadata.name instead, so
-	// re-parenting changes this and nothing else.
-	// +optional
-	Path string `json:"path,omitempty"`
 
 	// SourceGeneration is the source CR's generation this node's materialization
 	// reflects, echoed from the projection annotation once the local controller

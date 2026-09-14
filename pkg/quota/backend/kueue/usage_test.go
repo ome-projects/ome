@@ -55,11 +55,9 @@ func clusterQueue(name, node string, status kueuev1beta2.ClusterQueueStatus) *ku
 // with no queue is indistinguishable from an idle one unless it is left out.
 func TestReadUsage(t *testing.T) {
 	quotas := []v1beta1.AcceleratorQuota{
-		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"a"},
-			budget("google.com/tpu", "tpu7x", "64")),
-		aq("team-b", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"b"},
-			budget("google.com/tpu", "tpu7x", "32")),
+		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("google.com/tpu", "tpu7x", "64")),
+		aq("team-b", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("google.com/tpu", "tpu7x", "32")),
 	}
 
 	tests := []struct {
@@ -223,9 +221,8 @@ func TestReadUsage(t *testing.T) {
 // result, leaving the handling to the caller.
 func TestReadUsageSurfacesAFailedList(t *testing.T) {
 	quotas := []v1beta1.AcceleratorQuota{
-		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"a"},
-			budget("google.com/tpu", "tpu7x", "64")),
+		aq("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		aq("team-a", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("google.com/tpu", "tpu7x", "64")),
 	}
 
 	tests := []struct {

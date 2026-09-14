@@ -55,7 +55,7 @@ func withSplit(b *v1beta1.AcceleratorBudget) {
 }
 
 func node(name, parent string, role v1beta1.AcceleratorQuotaRole,
-	namespaces []string, budgets ...v1beta1.AcceleratorBudget,
+	budgets ...v1beta1.AcceleratorBudget,
 ) v1beta1.AcceleratorQuota {
 	q := v1beta1.AcceleratorQuota{
 		ObjectMeta: metav1.ObjectMeta{
@@ -64,9 +64,8 @@ func node(name, parent string, role v1beta1.AcceleratorQuotaRole,
 			Generation: 7,
 		},
 		Spec: v1beta1.AcceleratorQuotaSpec{
-			Role:       role,
-			Namespaces: namespaces,
-			Budgets:    budgets,
+			Role:    role,
+			Budgets: budgets,
 		},
 	}
 	if parent != "" {
@@ -83,10 +82,10 @@ func fleet(t *testing.T, leafBudgets ...v1beta1.AcceleratorBudget) *tree.Tree {
 		leafBudgets = []v1beta1.AcceleratorBudget{budget("100")}
 	}
 	nodes := []v1beta1.AcceleratorQuota{
-		node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		node("org", "root", v1beta1.AcceleratorQuotaRoleCohort, nil, budget("200")),
-		node("team-a", "org", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"ns-a"}, leafBudgets...),
-		node("team-b", "org", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"ns-b"}, budget("50")),
+		node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		node("org", "root", v1beta1.AcceleratorQuotaRoleCohort, budget("200")),
+		node("team-a", "org", v1beta1.AcceleratorQuotaRoleClusterQueue, leafBudgets...),
+		node("team-b", "org", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("50")),
 	}
 	built, _, err := tree.Build(nodes, tree.Options{RootName: "root", MaxDepth: 5})
 	if err != nil {
@@ -186,9 +185,8 @@ func TestForRendersALeaf(t *testing.T) {
 	}
 
 	want := v1beta1.AcceleratorQuotaSpec{
-		Role:       v1beta1.AcceleratorQuotaRoleClusterQueue,
-		ParentRef:  &v1beta1.AcceleratorQuotaParentRef{Name: "org"},
-		Namespaces: []string{"ns-a"},
+		Role:      v1beta1.AcceleratorQuotaRoleClusterQueue,
+		ParentRef: &v1beta1.AcceleratorQuotaParentRef{Name: "org"},
 		Budgets: []v1beta1.AcceleratorBudget{{
 			ResourceName:   tpu,
 			ResourceFlavor: flavor,
@@ -355,8 +353,7 @@ func TestForIsDeterministicAndDoesNotMutate(t *testing.T) {
 // returns them in is part of the contract, not a presentation detail.
 //
 // Sorting by name alone satisfies this only when every parent happens to sort
-// before its children, which is why it survived a fleet named org/team-a and
-// failed on one named sim-tenants/sim-serving.
+// before its children; a parent whose name sorts after its child's breaks it.
 func TestForOrdersParentsBeforeChildren(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -367,10 +364,10 @@ func TestForOrdersParentsBeforeChildren(t *testing.T) {
 		{
 			name: "a leaf whose name sorts before its parent",
 			nodes: []v1beta1.AcceleratorQuota{
-				node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				node("sim-tenants", "root", v1beta1.AcceleratorQuotaRoleCohort, nil),
+				node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				node("sim-tenants", "root", v1beta1.AcceleratorQuotaRoleCohort),
 				node("sim-serving", "sim-tenants", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns"}, budget("100")),
+					budget("100")),
 			},
 			leaf: "sim-serving",
 			want: []string{"sim-tenants", "sim-serving"},
@@ -378,10 +375,10 @@ func TestForOrdersParentsBeforeChildren(t *testing.T) {
 		{
 			name: "a leaf whose name sorts after its parent",
 			nodes: []v1beta1.AcceleratorQuota{
-				node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				node("org", "root", v1beta1.AcceleratorQuotaRoleCohort, nil),
+				node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				node("org", "root", v1beta1.AcceleratorQuotaRoleCohort),
 				node("team-a", "org", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns"}, budget("100")),
+					budget("100")),
 			},
 			leaf: "team-a",
 			want: []string{"org", "team-a"},
@@ -391,11 +388,11 @@ func TestForOrdersParentsBeforeChildren(t *testing.T) {
 			// depth-first gets all of them wrong rather than one.
 			name: "every tier of a deep tree sorts against the alphabet",
 			nodes: []v1beta1.AcceleratorQuota{
-				node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				node("ccc", "root", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				node("bbb", "ccc", v1beta1.AcceleratorQuotaRoleCohort, nil),
+				node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				node("ccc", "root", v1beta1.AcceleratorQuotaRoleCohort),
+				node("bbb", "ccc", v1beta1.AcceleratorQuotaRoleCohort),
 				node("aaa", "bbb", v1beta1.AcceleratorQuotaRoleClusterQueue,
-					[]string{"ns"}, budget("100")),
+					budget("100")),
 			},
 			leaf: "aaa",
 			want: []string{"ccc", "bbb", "aaa"},

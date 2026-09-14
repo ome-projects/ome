@@ -31,9 +31,6 @@ func node(name, parent string, role v1beta1.AcceleratorQuotaRole, budgets ...v1b
 	if parent != "" {
 		q.Spec.ParentRef = &v1beta1.AcceleratorQuotaParentRef{Name: parent}
 	}
-	if role == v1beta1.AcceleratorQuotaRoleClusterQueue {
-		q.Spec.Namespaces = []string{name + "-ns"}
-	}
 	return q
 }
 

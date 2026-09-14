@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -504,6 +505,97 @@ func TestProjectReapsOnDeletion(t *testing.T) {
 
 	if _, stillThere := projectedOn(t, a)["team"]; stillThere {
 		t.Error("the tenant was deleted on the hub but its budget is still live on the member")
+	}
+}
+
+// The reserved root is the one name that stands on every cluster and is never
+// projected: a member's own controller creates it and derives that cluster's
+// capacity onto it. Reaping by name alone would take a member's root down with
+// the hub's, and the capacity and high-water marks every split is sized against
+// would go with it.
+func TestProjectDoesNotReapAMembersOwnRoot(t *testing.T) {
+	a := member(t, memberRoot("256"))
+	fleet := &fakeFleet{members: map[string]workloadcluster.SelectivelyCachingClient{"member-a": a}}
+
+	r, c := projectingReconciler(t, fleet,
+		registered("member-a"),
+		cohort(rootName, "", budget("128")),
+		leaf("team", rootName, budget("100")),
+	)
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+		t.Fatalf("first Reconcile() = %v", err)
+	}
+
+	// Leaf first, then the root, which is the order the delete webhook admits.
+	for _, name := range []string{"team", rootName} {
+		var live v1beta1.AcceleratorQuota
+		if err := c.Get(ctx, client.ObjectKey{Name: name}, &live); err != nil {
+			t.Fatalf("get %s on the hub: %v", name, err)
+		}
+		if err := c.Delete(ctx, &live); err != nil {
+			t.Fatalf("delete %s on the hub: %v", name, err)
+		}
+		if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+			t.Fatalf("Reconcile() after deleting %s = %v", name, err)
+		}
+	}
+
+	var hub v1beta1.AcceleratorQuota
+	if err := c.Get(ctx, client.ObjectKey{Name: rootName}, &hub); !apierrors.IsNotFound(err) {
+		t.Fatalf("the hub's own root outlived its delete: err = %v", err)
+	}
+
+	var onMember v1beta1.AcceleratorQuota
+	if err := a.Get(ctx, client.ObjectKey{Name: rootName}, &onMember); err != nil {
+		t.Fatalf("the member's own root was reaped along with the hub's: %v", err)
+	}
+	if len(onMember.Status.Capacity) == 0 {
+		t.Error("the member's derived capacity went with its root")
+	}
+}
+
+// The reap may only remove what this plane wrote, exactly as the sweep may. A
+// grouping with no leaf beneath it never projects, so the name it holds on a
+// member belongs to whoever put it there -- and deleting the hub's copy must
+// not reach through to an admin's own node or to another plane's.
+func TestProjectReapLeavesWhatItDoesNotOwn(t *testing.T) {
+	local := cohort("local-group", rootName)
+	foreign := cohort("foreign-group", rootName)
+	foreign.Labels = map[string]string{v1beta1.AcceleratorQuotaOriginLabel: "some-other-hub"}
+
+	a := member(t, memberRoot("1"), local, foreign)
+	fleet := &fakeFleet{members: map[string]workloadcluster.SelectivelyCachingClient{"member-a": a}}
+
+	r, c := projectingReconciler(t, fleet,
+		registered("member-a"),
+		cohort(rootName, "", budget("128")),
+		cohort("local-group", rootName),
+		cohort("foreign-group", rootName),
+	)
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+		t.Fatalf("first Reconcile() = %v", err)
+	}
+
+	for _, name := range []string{"local-group", "foreign-group"} {
+		var live v1beta1.AcceleratorQuota
+		if err := c.Get(ctx, client.ObjectKey{Name: name}, &live); err != nil {
+			t.Fatalf("get %s on the hub: %v", name, err)
+		}
+		if err := c.Delete(ctx, &live); err != nil {
+			t.Fatalf("delete %s on the hub: %v", name, err)
+		}
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile() = %v", err)
+	}
+
+	for _, name := range []string{"local-group", "foreign-group"} {
+		var onMember v1beta1.AcceleratorQuota
+		if err := a.Get(ctx, client.ObjectKey{Name: name}, &onMember); err != nil {
+			t.Errorf("the reap removed %s, which this plane does not own: %v", name, err)
+		}
 	}
 }
 

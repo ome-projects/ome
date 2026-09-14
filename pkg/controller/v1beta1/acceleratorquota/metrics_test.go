@@ -281,8 +281,7 @@ func oneBudget(t *testing.T, nominal, admitted, reserved, borrowed string) []v1b
 // make "at its ceiling" and "holding accelerators it has not started using" read the
 // same.
 func TestRecordBudgetsPublishesEveryFigure(t *testing.T) {
-	recordBudgets(string(ModeWorkload), "tenant-a", "/root/team/tenant-a",
-		string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "16", "8", "8", "0"))
+	recordBudgets(string(ModeWorkload), "tenant-a", string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "16", "8", "8", "0"))
 
 	l := budgetLabelsFor("tenant-a", "google.com/tpu")
 	for _, tc := range []struct {
@@ -303,9 +302,9 @@ func TestRecordBudgetsPublishesEveryFigure(t *testing.T) {
 // The same series name means the authored fleet total on one plane and one
 // cluster's share on the other, so the two must not merge.
 func TestRecordBudgetsSeparatesPlanes(t *testing.T) {
-	recordBudgets(string(ModeWorkload), "shared", "/shared", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets(string(ModeWorkload), "shared", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "16", "0", "0", "0"))
-	recordBudgets(string(ModeManagement), "shared", "/shared", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets(string(ModeManagement), "shared", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "64", "0", "0", "0"))
 
 	wl := prometheus.Labels{"quota": "shared", "plane": string(ModeWorkload)}
@@ -321,9 +320,9 @@ func TestRecordBudgetsSeparatesPlanes(t *testing.T) {
 // A blank plane or quota would land a series keyed on nothing, which no
 // dashboard can select and no sweep can find again.
 func TestRecordBudgetsDropsUnlabelledSamples(t *testing.T) {
-	recordBudgets("", "no-plane", "/no-plane", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets("", "no-plane", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "1", "0", "0", "0"))
-	recordBudgets(string(ModeWorkload), "", "", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets(string(ModeWorkload), "", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "1", "0", "0", "0"))
 
 	if got := sampleFor(t, "ome_quota_budget_nominal",
@@ -339,7 +338,7 @@ func TestRecordBudgetsDropsUnlabelledSamples(t *testing.T) {
 // Deleting a node has to take its series with it, or a deleted tenant's
 // allowance is reported forever.
 func TestDeleteQuotaSeriesDropsEveryVector(t *testing.T) {
-	recordBudgets(string(ModeWorkload), "doomed", "/doomed", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets(string(ModeWorkload), "doomed", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "8", "4", "4", "0"))
 	if got := sampleFor(t, "ome_quota_budget_nominal",
 		prometheus.Labels{"quota": "doomed"}); got != 8 {
@@ -361,9 +360,9 @@ func TestDeleteQuotaSeriesDropsEveryVector(t *testing.T) {
 // The finalizer is the ordinary path; this is the one that catches a node
 // force-stripped, or deleted while the manager was down.
 func TestSweepBudgetsDropsNodesNoLongerInTheTree(t *testing.T) {
-	recordBudgets(string(ModeWorkload), "stays", "/stays", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets(string(ModeWorkload), "stays", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "8", "0", "0", "0"))
-	recordBudgets(string(ModeWorkload), "vanished", "/vanished", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	recordBudgets(string(ModeWorkload), "vanished", string(v1beta1.AcceleratorQuotaRoleClusterQueue),
 		oneBudget(t, "4", "0", "0", "0"))
 
 	sweepBudgets(map[string]struct{}{"stays": {}})
@@ -378,55 +377,56 @@ func TestSweepBudgetsDropsNodesNoLongerInTheTree(t *testing.T) {
 	}
 }
 
-// A bare object name does not say where in the tree a budget sits, and two
-// tenants under different parents are distinguishable only by ancestry.
-func TestRecordBudgetsPublishesTheTreePath(t *testing.T) {
-	recordBudgets(string(ModeWorkload), "nested", "/root/team/nested",
+// Nodes are named by their path, so the quota label already says where a budget
+// sits and no second ancestry label is published beside it — two of them would
+// only give a query a way to disagree with itself.
+func TestRecordBudgetsCarriesNoSeparatePathLabel(t *testing.T) {
+	recordBudgets(string(ModeWorkload), "root.team.nested",
 		string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "12", "0", "0", "0"))
 
 	if got := sampleFor(t, "ome_quota_budget_nominal",
-		prometheus.Labels{"path": "/root/team/nested"}); got != 12 {
-		t.Errorf("nominal selected by path = %v, want 12", got)
+		prometheus.Labels{"quota": "root.team.nested"}); got != 12 {
+		t.Errorf("nominal selected by node name = %v, want 12", got)
 	}
 }
 
-// Reparenting moves a node without renaming it. path is part of the series key,
-// so the position it vacated has to stop reporting -- otherwise one node is
-// counted twice in every sum until the stale series ages out of the store.
-func TestRecordBudgetsReparentLeavesOneSeries(t *testing.T) {
-	const quota = "movable"
-	recordBudgets(string(ModeWorkload), quota, "/root/before",
+// A drained leaf converted to a grouping keeps its name while role changes, and
+// role is part of the series key, so the role it vacated has to stop reporting
+// -- otherwise one node is counted twice in every sum until the stale series
+// ages out of the store.
+func TestRecordBudgetsRoleFlipLeavesOneSeries(t *testing.T) {
+	const quota = "convertible"
+	recordBudgets(string(ModeWorkload), quota,
 		string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "8", "0", "0", "0"))
-	recordBudgets(string(ModeWorkload), quota, "/root/after",
-		string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "8", "0", "0", "0"))
+	recordBudgets(string(ModeWorkload), quota,
+		string(v1beta1.AcceleratorQuotaRoleCohort), oneBudget(t, "8", "0", "0", "0"))
 
-	if got := sampleFor(t, "ome_quota_budget_nominal",
-		prometheus.Labels{"path": "/root/before"}); got != 0 {
-		t.Errorf("the vacated path kept reporting: %v", got)
+	if got := sampleFor(t, "ome_quota_budget_nominal", prometheus.Labels{
+		"quota": quota, "role": string(v1beta1.AcceleratorQuotaRoleClusterQueue),
+	}); got != 0 {
+		t.Errorf("the vacated role kept reporting: %v", got)
 	}
-	if got := sampleFor(t, "ome_quota_budget_nominal",
-		prometheus.Labels{"path": "/root/after"}); got != 8 {
-		t.Errorf("nominal at the new path = %v, want 8", got)
+	if got := sampleFor(t, "ome_quota_budget_nominal", prometheus.Labels{
+		"quota": quota, "role": string(v1beta1.AcceleratorQuotaRoleCohort),
+	}); got != 8 {
+		t.Errorf("nominal under the new role = %v, want 8", got)
 	}
 	// Counted, not sampled: two series each reading 8 are indistinguishable from
 	// one by value, and it is the second series that does the damage in a sum.
 	if got := seriesFor(t, "ome_quota_budget_nominal",
 		prometheus.Labels{"quota": quota}); got != 1 {
-		t.Errorf("the node has %d series, want 1 -- the move left the old path behind", got)
+		t.Errorf("the node has %d series, want 1 -- the flip left the old role behind", got)
 	}
 }
 
 // Republishing a node that has not moved must not disturb its series, since
 // that is what every resync tick does.
 func TestRecordBudgetsRepublishesInPlace(t *testing.T) {
-	const path = "/root/steady"
-	recordBudgets(string(ModeWorkload), "steady", path,
-		string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "8", "2", "2", "0"))
-	recordBudgets(string(ModeWorkload), "steady", path,
-		string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "8", "6", "6", "0"))
+	recordBudgets(string(ModeWorkload), "steady", string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "8", "2", "2", "0"))
+	recordBudgets(string(ModeWorkload), "steady", string(v1beta1.AcceleratorQuotaRoleClusterQueue), oneBudget(t, "8", "6", "6", "0"))
 
 	if got := sampleFor(t, "ome_quota_budget_admitted",
-		prometheus.Labels{"path": path}); got != 6 {
+		prometheus.Labels{"quota": "steady"}); got != 6 {
 		t.Errorf("admitted = %v, want 6", got)
 	}
 }

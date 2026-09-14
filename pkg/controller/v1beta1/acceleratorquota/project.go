@@ -402,17 +402,6 @@ func keepOn(written []*v1beta1.AcceleratorQuota, frozen map[string]tree.Violatio
 	return keep
 }
 
-// sweepMember deletes the copies this plane owns on one member that no longer
-// belong there.
-//
-// Scoped by the origin label, so it can only ever remove what this management
-// plane wrote: a node an admin authored on the member carries no origin, and
-// another plane's copies carry a different one. Both are invisible here, which
-// is what lets two planes share a member without reaping each other.
-//
-// This is what makes a tenant deletable at all, and what removes a copy from a
-// cluster a leaf no longer matches — a share that fell to zero leaves a queue
-// behind that would otherwise keep granting quota nobody authorized.
 // sourceGenerationOf reads the generation the renderer stamped on a copy. It is
 // the same annotation the member echoes into status.sourceGeneration once it has
 // materialized, which is what makes the two numbers comparable.
@@ -458,6 +447,17 @@ func depthByParentRef(items []v1beta1.AcceleratorQuota) map[string]int {
 	return depth
 }
 
+// sweepMember deletes the copies this plane owns on one member that no longer
+// belong there.
+//
+// Scoped by the origin label, so it can only ever remove what this management
+// plane wrote: a node an admin authored on the member carries no origin, and
+// another plane's copies carry a different one. Both are invisible here, which
+// is what lets two planes share a member without reaping each other.
+//
+// This is what makes a tenant deletable at all, and what removes a copy from a
+// cluster a leaf no longer matches — a share that fell to zero leaves a queue
+// behind that would otherwise keep granting quota nobody authorized.
 func (r *Reconciler) sweepMember(ctx context.Context, remote client.Client,
 	cluster string, live []v1beta1.AcceleratorQuota, keep sets.Set[string],
 ) error {
@@ -502,6 +502,12 @@ func (r *Reconciler) sweepMember(ctx context.Context, remote client.Client,
 // longer describes; this is what happens when an admin says to delete the node
 // itself.
 //
+// Scoped by the origin label, exactly as the sweep is, because a name is not
+// proof of authorship. The reserved root stands on every member under the same
+// name and is that member's own — never projected, its capacity being the one
+// thing only the member can derive — so reaping by name alone takes a member's
+// root down with the hub's, and its capacity and high-water marks with it.
+//
 // Every member must answer before the finalizer is released. A member that is
 // unreachable keeps the node alive on the hub rather than letting it go with a
 // live budget still standing somewhere — which is the same reasoning as holding
@@ -513,9 +519,8 @@ func (r *Reconciler) reapProjections(ctx context.Context, name string) error {
 		if !ok {
 			continue
 		}
-		obj := &v1beta1.AcceleratorQuota{ObjectMeta: metav1.ObjectMeta{Name: name}}
-		if err := remote.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("reaping %s on %s: %w", name, cluster, err))
+		if err := r.reapProjectionOn(ctx, remote, cluster, name); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -529,6 +534,44 @@ func (r *Reconciler) reapProjections(ctx context.Context, name string) error {
 			name, absent))
 	}
 	return errors.Join(errs...)
+}
+
+// reapProjectionOn removes one node's copy from one member, when that copy is
+// this plane's to remove.
+//
+// The ownership read is metadata-only, and that is what makes it a LIVE read
+// rather than a convenience: the transport serves AcceleratorQuota from a
+// background cache, and a cached miss here would read as "nothing to reap" and
+// release the finalizer over a copy still standing on the member.
+// PartialObjectMetadata bypasses that cache, and carries everything the check
+// needs.
+func (r *Reconciler) reapProjectionOn(ctx context.Context, remote client.Client,
+	cluster, name string,
+) error {
+	var existing metav1.PartialObjectMetadata
+	existing.SetGroupVersionKind(acceleratorQuotaGVK)
+	if err := remote.Get(ctx, types.NamespacedName{Name: name}, &existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("reading %s on %s: %w", name, cluster, err)
+	}
+	if existing.Labels[v1beta1.AcceleratorQuotaOriginLabel] != r.Project.Origin {
+		return nil
+	}
+
+	// Guarded on the UID rather than the resourceVersion the sweep uses: a
+	// member's own controller restamps status on a copy continuously, so a
+	// resourceVersion read a moment ago would refuse the delete over a write
+	// that changed nothing this check depends on. Identity is what is worth
+	// pinning — a copy deleted and recreated between the two calls is a
+	// different object, and not the one this check cleared.
+	obj := &v1beta1.AcceleratorQuota{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if err := remote.Delete(ctx, obj, client.Preconditions{UID: &existing.UID}); err != nil &&
+		!apierrors.IsNotFound(err) {
+		return fmt.Errorf("reaping %s on %s: %w", name, cluster, err)
+	}
+	return nil
 }
 
 // fleetCapacity reads what each member says it has.
@@ -600,6 +643,11 @@ func authoredHere(items []v1beta1.AcceleratorQuota) []v1beta1.AcceleratorQuota {
 	}
 	return out
 }
+
+// acceleratorQuotaGVK is what a metadata-only read has to be told it is asking
+// for. A PartialObjectMetadata is the same Go type whatever it holds, so the
+// kind cannot be inferred from it and the client routes on what is stamped here.
+var acceleratorQuotaGVK = v1beta1.SchemeGroupVersion.WithKind("AcceleratorQuota")
 
 // setKind stamps the object's GroupVersionKind. A server-side apply carries no
 // kind of its own — the apiserver reads it off the payload — so an object built

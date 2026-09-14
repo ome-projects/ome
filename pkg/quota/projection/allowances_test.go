@@ -40,8 +40,8 @@ func allow(node, nominal string) Allowance {
 func oneLeaf(t *testing.T, budgets ...v1beta1.AcceleratorBudget) *tree.Tree {
 	t.Helper()
 	nodes := []v1beta1.AcceleratorQuota{
-		node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		node("team", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"ns"}, budgets...),
+		node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		node("team", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budgets...),
 	}
 	built, _, err := tree.Build(nodes, tree.Options{RootName: "root", MaxDepth: 5})
 	if err != nil {
@@ -160,8 +160,8 @@ func TestResolvePolicyPrecedence(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			nodes := []v1beta1.AcceleratorQuota{
-				node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-				node("team", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"ns"}, tc.budget),
+				node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+				node("team", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, tc.budget),
 			}
 			if tc.nodePol != "" {
 				nodes[1].Spec.Distribution = &v1beta1.AcceleratorQuotaDistribution{Policy: tc.nodePol}
@@ -267,13 +267,11 @@ func TestResolveUnresolved(t *testing.T) {
 // carries the good leaves and reports the bad one.
 func TestResolveIsolatesAFailedLeaf(t *testing.T) {
 	nodes := []v1beta1.AcceleratorQuota{
-		node("root", "", v1beta1.AcceleratorQuotaRoleCohort, nil),
-		node("good", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"ns-good"},
-			budget("100", withPolicy(v1beta1.AcceleratorQuotaDistributionProportional))),
+		node("root", "", v1beta1.AcceleratorQuotaRoleCohort),
+		node("good", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("100", withPolicy(v1beta1.AcceleratorQuotaDistributionProportional))),
 		// Explicit, and the shares do not add up.
-		node("bad", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, []string{"ns-bad"},
-			budget("100", withPolicy(v1beta1.AcceleratorQuotaDistributionExplicit),
-				withPerCluster([2]string{"member-a", "1"}))),
+		node("bad", "root", v1beta1.AcceleratorQuotaRoleClusterQueue, budget("100", withPolicy(v1beta1.AcceleratorQuotaDistributionExplicit),
+			withPerCluster([2]string{"member-a", "1"}))),
 	}
 	built, _, err := tree.Build(nodes, tree.Options{RootName: "root", MaxDepth: 5})
 	if err != nil {

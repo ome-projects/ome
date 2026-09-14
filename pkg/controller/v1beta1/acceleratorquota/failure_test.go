@@ -159,7 +159,7 @@ func TestReconcileWritesEveryNodeDespiteOneFailure(t *testing.T) {
 		t.Errorf("nodes attempted (-want +got):\n%s", diff)
 	}
 	// And the two that did not fail were actually written, not just attempted.
-	if got := observe(t, c)["team-a"]; got.Path != treePath("org", "team-a") {
+	if got := observe(t, c)["team-a"]; got.Parent != "org" {
 		t.Errorf("team-a status was not written: %+v", got)
 	}
 }

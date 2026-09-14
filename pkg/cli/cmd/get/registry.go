@@ -1017,7 +1017,6 @@ var acceleratorQuotasEntry = &entry{
 		{Name: "RESERVED", Wide: true, Extract: safeCol(func(q *v1beta1.AcceleratorQuota) string {
 			return printers.OrDash(firstAcceleratorQuotaBudget(q).reserved)
 		})},
-		{Name: "PATH", Wide: true, Extract: safeCol(func(q *v1beta1.AcceleratorQuota) string { return printers.OrDash(q.Status.Path) })},
 	},
 	TableRows: acceleratorQuotaTableRows,
 	List: func(ctx context.Context, f factory.Factory, ns string, opts metav1.ListOptions) ([]runtime.Object, error) {
@@ -1152,7 +1151,7 @@ func rolloutPolicyConditionStatus(policy *v1beta1.RolloutPolicy, conditionType s
 
 const (
 	acceleratorQuotaColumns     = 12
-	acceleratorQuotaWideColumns = 15
+	acceleratorQuotaWideColumns = 14
 )
 
 func acceleratorQuotaTableRows(obj runtime.Object, wide bool) [][]string {
@@ -1185,7 +1184,7 @@ func acceleratorQuotaTableRows(obj runtime.Object, wide bool) [][]string {
 			printers.Age(quota.CreationTimestamp),
 		}
 		if wide {
-			row = append(row, printers.OrDash(budget.borrowed), printers.OrDash(budget.reserved), printers.OrDash(quota.Status.Path))
+			row = append(row, printers.OrDash(budget.borrowed), printers.OrDash(budget.reserved))
 		}
 		rows = append(rows, row)
 	}

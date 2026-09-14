@@ -192,6 +192,10 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	if ! head -1 $$f | grep -q 'rolloutPolicy.enabled'; then \
 		{ echo '{{- if .Values.ome.rolloutPolicy.enabled }}'; cat $$f; echo '{{- end }}'; } > $$f.tmp && mv $$f.tmp $$f; \
 	fi
+	@# ome-quota-manager can optionally install the one CRD it needs, for a
+	@# standalone install with no ome-crd. Copied, not symlinked, because Helm
+	@# does not follow symlinks out of the chart directory.
+	@mkdir -p charts/ome-quota-manager/files && cp config/crd/full/ome.io_acceleratorquotas.yaml charts/ome-quota-manager/files/
 	@echo "✅ Manifests copied to Helm charts"
 
 	@echo "\n🎉 Manifest generation completed successfully!\n"

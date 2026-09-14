@@ -770,15 +770,6 @@
           "description": "Distribution is this leaf's default split policy, overridable per budget entry. Unset means the operator-level default from the quota config applies; absent that too, the node reports Degraded rather than guessing.",
           "$ref": "#/definitions/v1beta1.AcceleratorQuotaDistribution"
         },
-        "namespaces": {
-          "description": "Namespaces are the serving namespaces this leaf binds. Each becomes one LocalQueue pointing at the leaf's ClusterQueue, on every cluster the leaf has a share on. A namespace belongs to exactly one leaf fleet-wide, or a workload in it has no single queue to charge.",
-          "type": "array",
-          "items": {
-            "type": "string",
-            "default": ""
-          },
-          "x-kubernetes-list-type": "set"
-        },
         "parentRef": {
           "description": "ParentRef is the edge to this node's parent. Every node sets it except the single reserved root. It is mutable: re-parenting updates the materialized ClusterQueue's cohort in place, so the queue, its LocalQueues, and its admitted workloads all survive.",
           "$ref": "#/definitions/v1beta1.AcceleratorQuotaParentRef"
@@ -861,10 +852,6 @@
         },
         "parent": {
           "description": "Parent echoes the resolved parent's name, so a node's edge is readable from status alone once the controller has confirmed it resolves.",
-          "type": "string"
-        },
-        "path": {
-          "description": "Path is the computed root-to-node path, a node's human-readable identity. Materialized Kueue object names come from metadata.name instead, so re-parenting changes this and nothing else.",
           "type": "string"
         },
         "sourceGeneration": {
