@@ -141,9 +141,11 @@ ClusterServingRuntime/kome-tree-b4d9098-root
             `+"`"+`-- ServingRuntime/kome-tree-b4d9098-leaf-b
                 `+"`"+`-- InferenceService/kome-tree-b4d9098-isvc-leaf-b
 Snapshot: Complete
-Collection: ClusterServingRuntime Cluster status=Complete pages=1 items=3
-Collection: ServingRuntime Namespac...-b4d9098 status=Complete pages=1 items=5
-Collection: InferenceService Namespac...-b4d9098 status=Complete pages=1 items=5
+Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=3
+Collection: ServingRuntime scope=Namespace/ome-cli-tree-b4d9098
+  status=Complete pages=1 items=5
+Collection: InferenceService scope=Namespace/ome-cli-tree-b4d9098
+  status=Complete pages=1 items=5
 `, out.String())
 	assert.NotContains(t, out.String(), treeSecretCanary)
 }
@@ -198,7 +200,8 @@ func TestTreeReportsUnavailableInferenceServiceEvidence(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, errOut)
 	assert.Contains(t, out.String(), "Snapshot: Partial\n")
-	assert.Contains(t, out.String(), "Collection: InferenceService AllNamespaces status=Unavailable pages=0 items=0\n")
+	assert.Contains(t, out.String(),
+		"Collection: InferenceService scope=AllNamespaces\n  status=Unavailable pages=0 items=0\n")
 	assert.Contains(t, out.String(), "Warning: PartialData\n")
 	assert.Contains(t, out.String(), "Warning: SourceUnavailable\n")
 	assert.NotContains(t, out.String(), "private authorization detail")
@@ -320,11 +323,11 @@ func TestTreeReportsTruncatedInferenceServiceCollection(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, errOut)
 	assert.Contains(t, out.String(),
-		"Collection: ClusterServingRuntime Cluster status=Complete pages=1 items=1\n")
+		"Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=1\n")
 	assert.Contains(t, out.String(),
-		"Collection: ServingRuntime AllNamespaces status=Complete pages=1 items=0\n")
+		"Collection: ServingRuntime scope=AllNamespaces status=Complete pages=1 items=0\n")
 	assert.Contains(t, out.String(),
-		"Collection: InferenceService AllNamespaces status=Truncated pages=1 items=1\n")
+		"Collection: InferenceService scope=AllNamespaces\n  status=Truncated pages=1 items=1\n")
 	assert.Contains(t, out.String(), "Warning: PartialData\n")
 	assert.Contains(t, out.String(), "Warning: Truncated\n")
 	assert.NotContains(t, out.String(), "Warning: SourceUnavailable\n")
@@ -418,12 +421,13 @@ func TestTreeDrainsFinitePagesForEveryCollection(t *testing.T) {
 		assert.NotEmpty(t, requests[resource][1].Continue)
 	}
 	for _, collection := range []string{
-		"ClusterServingRuntime Cluster",
-		"ServingRuntime AllNamespaces",
-		"InferenceService AllNamespaces",
+		"ClusterServingRuntime scope=Cluster",
+		"ServingRuntime scope=AllNamespaces",
 	} {
 		assert.Contains(t, out.String(), "Collection: "+collection+" status=Complete pages=2 items=2\n")
 	}
+	assert.Contains(t, out.String(),
+		"Collection: InferenceService scope=AllNamespaces status=Complete pages=2 items=2\n")
 	assert.NotContains(t, out.String(), "Warning:")
 }
 

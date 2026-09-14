@@ -288,6 +288,17 @@ func TestBoundedCellSanitizesBeforeClippingByDisplayWidth(t *testing.T) {
 	}
 }
 
+func TestCellDisplayWidthUsesBoundedCellNormalization(t *testing.T) {
+	for value, want := range map[string]int{
+		"界🙂":     4,
+		"line\n": 6,
+		"\u202e": 6,
+		"\u200b": 6,
+	} {
+		assert.Equal(t, want, CellDisplayWidth(value), "display width of %q", value)
+	}
+}
+
 func TestBoundedCellBoundsZeroWidthAndOversizedClusters(t *testing.T) {
 	for _, value := range []string{
 		strings.Repeat("\u200b", 20),

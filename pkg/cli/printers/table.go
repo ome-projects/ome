@@ -569,6 +569,12 @@ func displayWidth(value string) int {
 	return width
 }
 
+// CellDisplayWidth returns the terminal width of value after applying the
+// same control-character and grapheme normalization as the bounded helpers.
+func CellDisplayWidth(value string) int {
+	return displayWidth(normalizedBoundedCell(value))
+}
+
 // BoundedCell sanitizes value and clips its suffix so the result occupies at
 // most maxWidth terminal columns. The ASCII ellipsis makes truncation explicit.
 func BoundedCell(value string, maxWidth int) string {
