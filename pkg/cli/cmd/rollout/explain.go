@@ -2,6 +2,7 @@ package rollout
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,14 +33,14 @@ func newExplainCmd(
 		Short: "Explain rollout intent, effective plan, and observed progress",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, err := report.ParseFormat(options.output)
+			format, wide, err := parseRolloutOutput(options.output)
 			if err != nil {
 				return err
 			}
-			return options.run(cmd.Context(), f, args[0], format)
+			return options.run(cmd.Context(), f, args[0], format, wide)
 		},
 	}
-	cmd.Flags().StringVarP(&options.output, "output", "o", "table", "Output format: table, json, or yaml")
+	cmd.Flags().StringVarP(&options.output, "output", "o", "table", "Output format: table, wide, json, or yaml")
 	return cmd
 }
 
@@ -48,6 +49,7 @@ func (o *explainOptions) run(
 	f factory.Factory,
 	name string,
 	format report.Format,
+	wide bool,
 ) error {
 	if problems := utilvalidation.IsDNS1123Subdomain(name); len(problems) > 0 {
 		return ErrInvalidInferenceServiceName
@@ -79,6 +81,12 @@ func (o *explainOptions) run(
 	reportValue, err := rolloutprojection.ProjectExplain(isvc, o.clock)
 	if err != nil {
 		return err
+	}
+	if wide {
+		if err := reportValue.WideTable().Write(o.streams.Out); err != nil {
+			return fmt.Errorf("write report table: %w", err)
+		}
+		return nil
 	}
 	return report.Write(o.streams.Out, format, reportValue)
 }

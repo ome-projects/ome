@@ -102,6 +102,29 @@ func TestRolloutExplainReportCanonicalizesWithoutMutatingAndBuildsNarrowTable(t 
 	assert.Equal(t, string(before), string(after))
 	assert.Equal(t, v1alpha1.RolloutExplainReportKind, reportValue.Kind)
 	assert.Equal(t, report.Table{
+		Headers: []string{"VIEW", "ITEM", "DETAIL"},
+		Rows: [][]string{
+			{"Declared", "PLAN", "groups=1"},
+			{"", "GROUP 0", "Canary; components=engine; source=Declared/Inline"},
+			{"", "STEP 1/1", "capacity=25%; traffic=10%; gate=Manual"},
+			{"Live", "PLAN", "mode=Live; groups=1"},
+			{"", "GROUP 0", "Canary; components=engine; source=Declared/Inline"},
+			{"", "STEP 1/1", "capacity=25%; traffic=10%; gate=Manual"},
+			{"Effective", "PLAN", "mode=Pinned; evidence=Reported; groups=1"},
+			{"", "READY", "True/Pinned; evidence=Reported"},
+			{"", "DRIFT", "True/SpecNewerThanRun; evidence=Reported"},
+			{"", "GROUP 0", "Canary; components=engine; source=Reported/Policy"},
+			{"", "CONFIG", "policy=RolloutPolicy/guarded@4"},
+			{"", "", "digest=rp1:aaaaaaaaaaaa"},
+			{"", "HOLD", "AnalysisGate; evidence=Reported"},
+			{"", "PHASE", "Canarying"},
+			{"", "REVISIONS", "stable=aaaaaaaa,target=bbbbbbbb"},
+			{"", "TRAFFIC", "engine:bbbbbbbb=20%"},
+			{"", "STEP 1/1", "capacity=50%; traffic=20%; gate=Analysis"},
+			{"", "ISSUES", "EpochUnverifiable"},
+		},
+	}, reportValue.Table())
+	assert.Equal(t, report.Table{
 		Headers: []string{
 			"VIEW", "GROUP", "EVIDENCE", "PLAN-MODE", "SOURCE", "STRATEGY", "COMPONENTS",
 			"CONFIG", "STEP", "GATE", "PHASE", "SEQUENCE", "PLAN-READY", "DRIFT", "HOLD",
@@ -112,7 +135,7 @@ func TestRolloutExplainReportCanonicalizesWithoutMutatingAndBuildsNarrowTable(t 
 			{"Live", "0", "Declared", "Live", "Inline", "Canary", "engine", "-", "1/1 25%/10%", "Manual", "-", "-", "-", "-", "-", "-", "-", "-"},
 			{"Effective", "0", "Reported", "Pinned", "Policy", "Canary", "engine", "policy=RolloutPolicy/guarded@4,digest=rp1:aaaaaaaaaaaa", "1/1 50%/20%", "Analysis", "Canarying", "-", "True/Pinned", "True/SpecNewerThanRun", "AnalysisGate", "stable=aaaaaaaa,target=bbbbbbbb", "engine:bbbbbbbb=20%", "EpochUnverifiable"},
 		},
-	}, reportValue.Table())
+	}, reportValue.WideTable())
 
 	var output bytes.Buffer
 	require.NoError(t, report.Write(&output, report.FormatJSON, reportValue))
@@ -177,7 +200,7 @@ func TestRolloutExplainCanonicalDoesNotCoerceUnknownOperationalClaims(t *testing
 	assert.NotEqual(t, v1alpha1.RolloutExplainIssueEffectivePlanMalformed, canonical.Issues[0].Code)
 }
 
-func TestRolloutExplainTableMapsCollapsedSequentialObservationToEachDeclaredGroup(t *testing.T) {
+func TestRolloutExplainWideTableMapsCollapsedSequentialObservationToEachDeclaredGroup(t *testing.T) {
 	zero := 0
 	content := v1alpha1.RolloutExplainContent{
 		Summary: v1alpha1.RolloutExplainSummary{
@@ -199,7 +222,7 @@ func TestRolloutExplainTableMapsCollapsedSequentialObservationToEachDeclaredGrou
 			},
 		},
 	}
-	table := content.Table()
+	table := content.WideTable()
 	require.Len(t, table.Rows, 2)
 	sequenceColumn := slices.Index(table.Headers, "SEQUENCE")
 	require.NotEqual(t, -1, sequenceColumn)
@@ -208,7 +231,7 @@ func TestRolloutExplainTableMapsCollapsedSequentialObservationToEachDeclaredGrou
 	assert.Equal(t, "engine:bbbbbbbb=100%", table.Rows[1][slices.Index(table.Headers, "TRAFFIC")])
 }
 
-func TestRolloutExplainTableKeepsUngroupedObservedComponentsVisible(t *testing.T) {
+func TestRolloutExplainWideTableKeepsUngroupedObservedComponentsVisible(t *testing.T) {
 	content := v1alpha1.RolloutExplainContent{
 		Summary: v1alpha1.RolloutExplainSummary{
 			EffectivePlan: v1alpha1.RolloutPlanSelection{Mode: v1alpha1.RolloutPlanModeLive, Evidence: v1alpha1.EvidenceDeclared},
@@ -222,7 +245,7 @@ func TestRolloutExplainTableKeepsUngroupedObservedComponentsVisible(t *testing.T
 			}},
 		},
 	}
-	table := content.Table()
+	table := content.WideTable()
 	require.Len(t, table.Rows, 2)
 	assert.Equal(t, "Effective", table.Rows[0][0])
 	assert.Equal(t, "Live", table.Rows[0][slices.Index(table.Headers, "PLAN-MODE")])
@@ -234,7 +257,31 @@ func TestRolloutExplainTableKeepsUngroupedObservedComponentsVisible(t *testing.T
 	assert.Equal(t, "engine:aaaaaaaa=100%", table.Rows[1][slices.Index(table.Headers, "TRAFFIC")])
 }
 
-func TestRolloutExplainTableAlwaysShowsEmptyPinnedEffectivePlan(t *testing.T) {
+func TestRolloutExplainCompactTableLabelsUngroupedComponentIssues(t *testing.T) {
+	content := v1alpha1.RolloutExplainContent{
+		Summary: v1alpha1.RolloutExplainSummary{
+			EffectivePlan: v1alpha1.RolloutPlanSelection{
+				Mode: v1alpha1.RolloutPlanModeLive, Evidence: v1alpha1.EvidenceDeclared,
+			},
+		},
+		Observed: v1alpha1.RolloutStatusContent{
+			Summary: v1alpha1.RolloutSummary{Evidence: v1alpha1.EvidenceReported},
+			Components: []v1alpha1.RolloutComponentStatus{{
+				Type: v1alpha1.RuntimeComponentEngine, Strategy: v1alpha1.RolloutStrategyIndependent,
+				Phase: v1alpha1.RolloutPhaseUnknown,
+			}},
+			Issues: []v1alpha1.RolloutIssue{{
+				Code: v1alpha1.RolloutIssueComponentStatusMissing, Component: v1alpha1.RuntimeComponentEngine,
+			}},
+		},
+	}
+
+	assert.Contains(t, content.Table().Rows, []string{
+		"", "ISSUES engine", "ComponentStatusMissing",
+	})
+}
+
+func TestRolloutExplainWideTableAlwaysShowsEmptyPinnedEffectivePlan(t *testing.T) {
 	content := v1alpha1.RolloutExplainContent{
 		Summary: v1alpha1.RolloutExplainSummary{
 			EffectivePlan: v1alpha1.RolloutPlanSelection{
@@ -251,7 +298,7 @@ func TestRolloutExplainTableAlwaysShowsEmptyPinnedEffectivePlan(t *testing.T) {
 		}},
 	}
 
-	table := content.Table()
+	table := content.WideTable()
 	modeColumn := slices.Index(table.Headers, "PLAN-MODE")
 	require.NotEqual(t, -1, modeColumn)
 	require.Len(t, table.Rows, 3)
@@ -268,7 +315,7 @@ func TestRolloutExplainTableAlwaysShowsEmptyPinnedEffectivePlan(t *testing.T) {
 	assert.Equal(t, "True/Pinned", table.Rows[2][slices.Index(table.Headers, "PLAN-READY")])
 }
 
-func TestRolloutExplainTableDoesNotDuplicateLiveViewWithoutActiveRun(t *testing.T) {
+func TestRolloutExplainWideTableDoesNotDuplicateLiveViewWithoutActiveRun(t *testing.T) {
 	content := v1alpha1.RolloutExplainContent{
 		Summary: v1alpha1.RolloutExplainSummary{EffectivePlan: v1alpha1.RolloutPlanSelection{
 			Mode: v1alpha1.RolloutPlanModeLive, Evidence: v1alpha1.EvidenceDeclared,
@@ -284,14 +331,14 @@ func TestRolloutExplainTableDoesNotDuplicateLiveViewWithoutActiveRun(t *testing.
 		}},
 	}
 
-	table := content.Table()
+	table := content.WideTable()
 	assert.Equal(t, [][]string{
 		{"Declared", "0", "Declared", "-", "Inline", "BlueGreen", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"},
 		{"Effective", "0", "Declared", "Live", "Inline", "BlueGreen", "-", "-", "-", "-", "-", "-", "Invalid", "Invalid", "-", "-", "-", "-"},
 	}, table.Rows)
 }
 
-func TestRolloutExplainTableLabelsIgnoredSettings(t *testing.T) {
+func TestRolloutExplainWideTableLabelsIgnoredSettings(t *testing.T) {
 	content := v1alpha1.RolloutExplainContent{
 		Summary: v1alpha1.RolloutExplainSummary{
 			EffectivePlan: v1alpha1.RolloutPlanSelection{
@@ -308,7 +355,7 @@ func TestRolloutExplainTableLabelsIgnoredSettings(t *testing.T) {
 		}},
 	}
 
-	table := content.Table()
+	table := content.WideTable()
 	require.Len(t, table.Rows, 1)
 	assert.Equal(t, "soak=1m0s(Configured;IgnoredFinalGroup)", table.Rows[0][slices.Index(table.Headers, "CONFIG")])
 }

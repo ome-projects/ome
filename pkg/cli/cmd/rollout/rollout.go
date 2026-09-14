@@ -68,7 +68,7 @@ func newStatusCmd(
 		Short: "Show rollout progress for an InferenceService",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, wide, err := parseStatusOutput(options.output)
+			format, wide, err := parseRolloutOutput(options.output)
 			if err != nil {
 				return err
 			}
@@ -79,7 +79,7 @@ func newStatusCmd(
 	return cmd
 }
 
-func parseStatusOutput(value string) (report.Format, bool, error) {
+func parseRolloutOutput(value string) (report.Format, bool, error) {
 	if value == "wide" {
 		return report.FormatTable, true, nil
 	}

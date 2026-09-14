@@ -376,7 +376,7 @@ func TestExplainRejectsArgumentsAndOutputBeforeReads(t *testing.T) {
 	for _, args := range [][]string{
 		{"explain"},
 		{"explain", "chat", "extra"},
-		{"explain", "chat", "-o", "wide"},
+		{"explain", "chat", "-o", "csv"},
 		{"explain", "bad/name"},
 	} {
 		f := &trackingFactory{}
@@ -441,6 +441,21 @@ func TestExplainPropagatesShortWrite(t *testing.T) {
 	require.Len(t, client.Actions(), 1)
 }
 
+func TestExplainWidePropagatesWriterError(t *testing.T) {
+	client := omefake.NewSimpleClientset(explainInferenceService())
+	want := errors.New("wide write failed")
+	streams := genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: failingWriter{err: want}, ErrOut: &bytes.Buffer{},
+	}
+	cmd := newCmdWithClock(factory.Static{OME: client, NS: "prod"}, streams, fixedClock())
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{"explain", "chat", "-o", "wide"})
+
+	require.ErrorIs(t, cmd.Execute(), want)
+	require.Len(t, client.Actions(), 1)
+}
+
 func TestExplainTableBoundsEveryPhysicalLineAtSupportedTerminalWidths(t *testing.T) {
 	for _, width := range []int{80, 120} {
 		client := omefake.NewSimpleClientset(explainInferenceService())
@@ -452,11 +467,13 @@ func TestExplainTableBoundsEveryPhysicalLineAtSupportedTerminalWidths(t *testing
 		cmd.SetArgs([]string{"explain", "chat"})
 
 		require.NoError(t, cmd.Execute())
-		assert.Contains(t, output.String(), "VIEW:         Declared")
-		assert.Contains(t, output.String(), "VIEW:         Live")
-		assert.Contains(t, output.String(), "VIEW:         Effective")
-		assert.Contains(t, output.String(), "PLAN-MODE:    Pinned")
-		assert.Contains(t, output.String(), "PLAN-READY:   True/Pinned")
+		assert.Contains(t, output.String(), "VIEW")
+		assert.Contains(t, output.String(), "Declared")
+		assert.Contains(t, output.String(), "Live")
+		assert.Contains(t, output.String(), "Effective")
+		assert.Contains(t, output.String(), "mode=Pinned")
+		assert.Contains(t, output.String(), "True/Pinned")
+		assert.NotContains(t, output.String(), "VIEW:")
 		for lineNumber, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
 			assert.LessOrEqual(t, len(line), width, "width %d line %d: %q", width, lineNumber+1, line)
 		}
@@ -466,6 +483,38 @@ func TestExplainTableBoundsEveryPhysicalLineAtSupportedTerminalWidths(t *testing
 func TestExplainExactOperatorExampleTable(t *testing.T) {
 	client := omefake.NewSimpleClientset(explainInferenceService())
 	output, err := execute(t, factory.Static{OME: client, NS: "prod"}, fixedClock(), "explain", "chat")
+
+	require.NoError(t, err)
+	assert.Equal(t, "VIEW        ITEM        DETAIL\n"+
+		"Declared    PLAN        groups=1\n"+
+		"            GROUP 0     Canary; components=engine; source=Declared/Inline\n"+
+		"            STEP 1/2    capacity=25%; traffic=10%; gate=Manual\n"+
+		"            STEP 2/2    capacity=100%; traffic=100%; gate=Immediate\n"+
+		"Live        PLAN        mode=Live; groups=1\n"+
+		"            GROUP 0     Canary; components=engine; source=Declared/Inline\n"+
+		"            STEP 1/2    capacity=25%; traffic=10%; gate=Manual\n"+
+		"            STEP 2/2    capacity=100%; traffic=100%; gate=Immediate\n"+
+		"Effective   PLAN        mode=Pinned; evidence=Reported; groups=1\n"+
+		"            READY       True/Pinned; evidence=Reported\n"+
+		"            DRIFT       True/SpecNewerThanRun; evidence=Reported\n"+
+		"            GROUP 0     Canary; components=engine; source=Reported/Policy\n"+
+		"            CONFIG      policy=RolloutPolicy/guarded@4\n"+
+		"                        digest=rp1:aaaaaaaaaaaa\n"+
+		"            PHASE       Canarying\n"+
+		"            REVISIONS   stable=aaaaaaaa,target=bbbbbbbb\n"+
+		"            TRAFFIC     engine:aaaaaaaa=80%,engine:bbbbbbbb=20%\n"+
+		"            STEP 1/2    capacity=50%; traffic=20%; gate=Manual\n"+
+		"            STEP 2/2    capacity=100%; traffic=100%; gate=Immediate\n"+
+		"            ISSUES      EpochUnverifiable\n",
+		output)
+}
+
+func TestExplainExactOperatorExampleWide(t *testing.T) {
+	client := omefake.NewSimpleClientset(explainInferenceService())
+	output, err := execute(
+		t, factory.Static{OME: client, NS: "prod"}, fixedClock(),
+		"explain", "chat", "-o", "wide",
+	)
 
 	require.NoError(t, err)
 	assert.Equal(t, "VIEW        GROUP   EVIDENCE   PLAN-MODE   SOURCE   STRATEGY   COMPONENTS   CONFIG                                                   STEP            GATE        PHASE       SEQUENCE   PLAN-READY    DRIFT                   HOLD   REVISIONS                         TRAFFIC                                   ISSUES\n"+
@@ -530,7 +579,7 @@ Usage:
 
 Flags:
   -h, --help            help for explain
-  -o, --output string   Output format: table, json, or yaml (default "table")
+  -o, --output string   Output format: table, wide, json, or yaml (default "table")
 `, output.String())
 }
 

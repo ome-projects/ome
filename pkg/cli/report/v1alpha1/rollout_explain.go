@@ -271,6 +271,13 @@ func (r RolloutExplainReport) Canonical() RolloutExplainReport {
 
 func (r RolloutExplainReport) Table() report.Table { return r.Canonical().Content.Table() }
 
+// WideTable derives the complete legacy operator view from the report's typed
+// content. It remains separate from the default outline so machine formats and
+// detailed troubleshooting output stay stable.
+func (r RolloutExplainReport) WideTable() report.Table {
+	return r.Canonical().Content.WideTable()
+}
+
 func (c RolloutExplainContent) Canonical() RolloutExplainContent {
 	result := c
 	result.Summary.EffectivePlan.Mode = canonicalRolloutPlanMode(c.Summary.EffectivePlan.Mode)
@@ -287,6 +294,256 @@ func (c RolloutExplainContent) Canonical() RolloutExplainContent {
 }
 
 func (c RolloutExplainContent) Table() report.Table {
+	canonical := c.Canonical()
+	table := report.Table{Headers: []string{"VIEW", "ITEM", "DETAIL"}}
+	for _, view := range []struct {
+		name   RolloutPlanView
+		groups []RolloutPlanGroup
+	}{
+		{name: RolloutPlanViewDeclared, groups: canonical.DeclaredGroups},
+		{name: RolloutPlanViewLive, groups: canonical.LiveGroups},
+		{name: RolloutPlanViewEffective, groups: canonical.EffectiveGroups},
+	} {
+		rows := compactRolloutPlanRows(canonical, view.name, view.groups)
+		rows[0][0] = string(view.name)
+		table.Rows = append(table.Rows, rows...)
+	}
+	return table
+}
+
+func compactRolloutPlanRows(
+	content RolloutExplainContent,
+	view RolloutPlanView,
+	groups []RolloutPlanGroup,
+) [][]string {
+	plan := fmt.Sprintf("groups=%d", len(groups))
+	if view == RolloutPlanViewLive {
+		plan = fmt.Sprintf("mode=%s; %s", RolloutPlanModeLive, plan)
+	}
+	if view == RolloutPlanViewEffective {
+		plan = fmt.Sprintf(
+			"mode=%s; evidence=%s; %s",
+			content.Summary.EffectivePlan.Mode,
+			content.Summary.EffectivePlan.Evidence,
+			plan,
+		)
+	}
+	rows := [][]string{{"", "PLAN", plan}}
+	if view == RolloutPlanViewEffective {
+		rows = append(rows,
+			[]string{"", "READY", compactRolloutPlanCondition(content.Summary.PlanReady)},
+			[]string{"", "DRIFT", compactRolloutPlanCondition(content.Summary.PlanDrift)},
+		)
+		rows = append(rows, compactRolloutHoldRows(content.Holds, nil, nil)...)
+	}
+	for _, group := range groups {
+		rows = append(rows, compactRolloutGroupRows(content, view, group)...)
+	}
+	if view == RolloutPlanViewEffective {
+		for _, component := range content.Observed.Components {
+			if component.Group == nil {
+				rows = append(rows, compactObservedComponentRows(content, component)...)
+			}
+		}
+	}
+	if issues := compactRolloutPlanIssues(content, view); len(issues) > 0 {
+		rows = append(rows, []string{"", "ISSUES", strings.Join(issues, ",")})
+	}
+	return rows
+}
+
+func compactRolloutPlanCondition(condition RolloutPlanCondition) string {
+	return fmt.Sprintf(
+		"%s; evidence=%s",
+		rolloutPlanConditionCell(condition),
+		orDash(string(condition.Evidence)),
+	)
+}
+
+func compactRolloutGroupRows(
+	content RolloutExplainContent,
+	view RolloutPlanView,
+	group RolloutPlanGroup,
+) [][]string {
+	rows := [][]string{{
+		"",
+		fmt.Sprintf("GROUP %d", group.Index),
+		fmt.Sprintf(
+			"%s; components=%s; source=%s/%s",
+			group.Strategy,
+			rolloutComponentsCell(group.Components),
+			group.Evidence,
+			group.Source,
+		),
+	}}
+	config := rolloutPlanConfigParts(group)
+	for index, value := range config {
+		item := ""
+		if index == 0 {
+			item = "CONFIG"
+		}
+		rows = append(rows, []string{"", item, value})
+	}
+	if view == RolloutPlanViewEffective {
+		groupIndex := group.Index
+		rows = append(rows, compactRolloutHoldRows(content.Holds, &groupIndex, nil)...)
+		phase, sequence, revisions, traffic := observedGroupCells(content.Observed, group)
+		for _, value := range []struct{ item, detail string }{
+			{item: "PHASE", detail: phase},
+			{item: "SEQUENCE", detail: sequence},
+			{item: "REVISIONS", detail: revisions},
+			{item: "TRAFFIC", detail: traffic},
+		} {
+			if value.detail != "-" {
+				rows = append(rows, []string{"", value.item, value.detail})
+			}
+		}
+	}
+	for _, step := range group.Steps {
+		rows = append(rows, []string{
+			"",
+			fmt.Sprintf("STEP %d/%d", step.Index+1, len(group.Steps)),
+			fmt.Sprintf(
+				"capacity=%s; traffic=%d%%; gate=%s",
+				orDash(step.Capacity),
+				step.Traffic,
+				step.Gate,
+			),
+		})
+		if view == RolloutPlanViewEffective {
+			groupIndex, stepIndex := group.Index, step.Index
+			rows = append(
+				rows,
+				compactRolloutHoldRows(content.Holds, &groupIndex, &stepIndex)...,
+			)
+		}
+	}
+	if issues := compactRolloutGroupIssues(content, view, group); len(issues) > 0 {
+		rows = append(rows, []string{"", "ISSUES", strings.Join(issues, ",")})
+	}
+	return rows
+}
+
+func compactRolloutHoldRows(
+	holds []RolloutExplainHold,
+	group *int,
+	step *int32,
+) [][]string {
+	rows := [][]string{}
+	for _, hold := range holds {
+		if compareOptionalInt(hold.Group, group) != 0 || compareOptionalInt32(hold.Step, step) != 0 {
+			continue
+		}
+		detail := fmt.Sprintf("%s; evidence=%s", hold.Kind, hold.Evidence)
+		if hold.Component != "" {
+			detail += "; component=" + string(hold.Component)
+		}
+		rows = append(rows, []string{"", "HOLD", detail})
+	}
+	return rows
+}
+
+func compactRolloutPlanIssues(content RolloutExplainContent, view RolloutPlanView) []string {
+	values := []string{}
+	for _, issue := range content.Issues {
+		if issue.Group != nil || (issue.View == "" && view != RolloutPlanViewEffective) ||
+			(issue.View != "" && issue.View != view) {
+			continue
+		}
+		values = append(values, string(issue.Code))
+	}
+	if view != RolloutPlanViewEffective {
+		return values
+	}
+	for _, issue := range content.Observed.Issues {
+		if issue.Group == nil && issue.Component == "" {
+			values = append(values, string(issue.Code))
+		}
+	}
+	return values
+}
+
+func compactRolloutGroupIssues(
+	content RolloutExplainContent,
+	view RolloutPlanView,
+	group RolloutPlanGroup,
+) []string {
+	values := []string{}
+	for _, issue := range content.Issues {
+		if issue.Group == nil || *issue.Group != group.Index ||
+			(issue.View == "" && view != RolloutPlanViewEffective) ||
+			(issue.View != "" && issue.View != view) {
+			continue
+		}
+		values = append(values, string(issue.Code))
+	}
+	if view != RolloutPlanViewEffective {
+		return values
+	}
+	for _, issue := range content.Observed.Issues {
+		matchesGroup := issue.Group != nil && *issue.Group == group.Index
+		matchesComponent := issue.Group == nil && issue.Component != "" &&
+			slices.Contains(group.Components, issue.Component)
+		if matchesGroup || matchesComponent {
+			values = append(values, string(issue.Code))
+		}
+	}
+	return values
+}
+
+func compactObservedComponentRows(
+	content RolloutExplainContent,
+	component RolloutComponentStatus,
+) [][]string {
+	rows := [][]string{{
+		"",
+		"COMPONENT " + string(component.Type),
+		fmt.Sprintf(
+			"%s; phase=%s; evidence=%s",
+			component.Strategy,
+			component.Phase,
+			content.Observed.Summary.Evidence,
+		),
+	}}
+	revisions := []string{}
+	for _, value := range []struct{ key, value string }{
+		{key: "current", value: component.RolledOutRevisionHash},
+		{key: "ready", value: component.ReadyRevisionHash},
+		{key: "previous", value: component.PreviousRevisionHash},
+	} {
+		if value.value != "" {
+			revisions = append(revisions, value.key+"="+value.value)
+		}
+	}
+	if len(revisions) > 0 {
+		rows = append(rows, []string{"", "REVISIONS", strings.Join(revisions, ",")})
+	}
+	traffic := []string{}
+	for _, target := range component.Traffic {
+		traffic = append(traffic, fmt.Sprintf(
+			"%s:%s=%d%%", component.Type, target.RevisionHash, target.Percent,
+		))
+	}
+	if len(traffic) > 0 {
+		rows = append(rows, []string{"", "TRAFFIC", strings.Join(traffic, ",")})
+	}
+	issues := []string{}
+	for _, issue := range content.Observed.Issues {
+		if issue.Group == nil && issue.Component == component.Type {
+			issues = append(issues, string(issue.Code))
+		}
+	}
+	if len(issues) > 0 {
+		rows = append(rows, []string{
+			"", "ISSUES " + string(component.Type), strings.Join(issues, ","),
+		})
+	}
+	return rows
+}
+
+// WideTable returns the deterministic, complete operator view that preceded
+// the compact plan outline.
+func (c RolloutExplainContent) WideTable() report.Table {
 	canonical := c.Canonical()
 	table := report.Table{Headers: []string{
 		"VIEW", "GROUP", "EVIDENCE", "PLAN-MODE", "SOURCE", "STRATEGY", "COMPONENTS",
@@ -498,6 +755,14 @@ func allRolloutComponentsPresent(haystack, needles []RuntimeComponentType) bool 
 }
 
 func rolloutPlanConfigCell(group RolloutPlanGroup) string {
+	parts := rolloutPlanConfigParts(group)
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ",")
+}
+
+func rolloutPlanConfigParts(group RolloutPlanGroup) []string {
 	parts := []string{}
 	switch group.ProgressionOrigin {
 	case RolloutProgressionOriginDefaulted:
@@ -533,10 +798,7 @@ func rolloutPlanConfigCell(group RolloutPlanGroup) string {
 	if group.MaintainRatio != nil {
 		parts = append(parts, "ratio="+settingCell(group.MaintainRatio.Tolerance))
 	}
-	if len(parts) == 0 {
-		return "-"
-	}
-	return strings.Join(parts, ",")
+	return parts
 }
 
 func settingCell(setting RolloutSetting) string {
