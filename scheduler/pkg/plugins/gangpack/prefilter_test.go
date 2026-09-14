@@ -45,6 +45,84 @@ func TestPinGang(t *testing.T) {
 	}
 }
 
+// TestPinGangDefersHardSpreadDomainChoice proves that GangPack does not commit
+// an unplaced gang to one rack before PodTopologySpread has run. PreFilter
+// exposes every rack that can hold the complete gang; Reserve then commits to
+// the rack of the node selected from the framework-filtered candidates.
+func TestPinGangDefersHardSpreadDomainChoice(t *testing.T) {
+	g := &GangPack{pins: placement.New()}
+	nodes := []framework.NodeInfo{
+		nodeInfo(gpuNode("a1", "a", "4")), nodeInfo(gpuNode("a2", "a", "4")),
+		nodeInfo(gpuNode("b1", "b", "4")), nodeInfo(gpuNode("b2", "b", "4")), nodeInfo(gpuNode("b3", "b", "4")),
+	}
+	pod := gpuPod("4")
+	pod.Spec.TopologySpreadConstraints = []v1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       "kubernetes.io/hostname",
+		WhenUnsatisfiable: v1.DoNotSchedule,
+	}}
+	state := newCycleState()
+	gang := gangInfo{key: "team/spread", uid: "uid-1", minMember: 2, topologyKey: testKey}
+
+	result, status := g.pinGang(state, nodes, gang, pod)
+	if !status.IsSuccess() {
+		t.Fatalf("pinGang status = %v, want Success", status)
+	}
+	if result == nil || !result.NodeNames.Equal(sets.New("a1", "a2", "b1", "b2", "b3")) {
+		t.Fatalf("deferred candidates = %v, want every whole-gang-feasible domain", result.NodeNames)
+	}
+	if pin := readPin(state); pin != nil {
+		t.Fatalf("PreFilter pin = %+v, want nil until framework filters select a node", pin)
+	}
+	if plan := readDeferredPin(state); plan == nil || plan.need != 2 || len(plan.free) != 2 {
+		t.Fatalf("deferred plan = %+v, want two feasible domains for two members", plan)
+	}
+
+	// Model PodTopologySpread filtering rack a away by selecting b1. Reserve must
+	// commit the gang to b even though ordinary GangPack best-fit preferred a.
+	if status := g.Reserve(context.Background(), state, pod, "b1"); !status.IsSuccess() {
+		t.Fatalf("Reserve = %v, want Success", status)
+	}
+	if domain, ok := g.pins.Get("team/spread"); !ok || domain != "b" {
+		t.Fatalf("reserved domain = %q,%v, want b,true", domain, ok)
+	}
+	if pin := readPin(state); pin == nil || pin.domain != "b" || pin.commitment == 0 {
+		t.Fatalf("Reserve pin = %+v, want owned domain b pin", pin)
+	}
+	reservations := g.pins.Reservations()
+	if len(reservations) != 1 || reservations[0].Remaining != 1 {
+		t.Fatalf("post-Reserve reservation = %+v, want one remaining member", reservations)
+	}
+}
+
+func TestDeferredSpreadPlanExcludesReservedDomain(t *testing.T) {
+	g := &GangPack{pins: placement.New()}
+	nodes := []framework.NodeInfo{
+		nodeInfo(gpuNode("a1", "a", "4")), nodeInfo(gpuNode("a2", "a", "4")),
+		nodeInfo(gpuNode("b1", "b", "4")), nodeInfo(gpuNode("b2", "b", "4")),
+	}
+	if _, _, ok := g.pins.ChooseInTopologyOnNodes("team/forming", testKey,
+		topology.FreeByDomain{"a": 2}, map[string][]string{"a": {"a1", "a2"}}, 2); !ok {
+		t.Fatal("reserve domain a for forming gang")
+	}
+	pod := gpuPod("4")
+	pod.Spec.TopologySpreadConstraints = []v1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       testKey,
+		WhenUnsatisfiable: v1.DoNotSchedule,
+	}}
+	state := newCycleState()
+
+	result, status := g.pinGang(state, nodes,
+		gangInfo{key: "team/spread", uid: "uid-1", minMember: 2, topologyKey: testKey}, pod)
+	if !status.IsSuccess() {
+		t.Fatalf("pinGang status = %v, want Success", status)
+	}
+	if result == nil || !result.NodeNames.Equal(sets.New("b1", "b2")) {
+		t.Fatalf("deferred candidates = %v, want only unreserved domain b", result.NodeNames)
+	}
+}
+
 // TestPinGangAdoptsBoundMembers: with the in-memory pin lost (restart) but a gang
 // member already placed in a domain, pinGang adopts that domain instead of
 // best-fitting fresh — even when a fresh best-fit would fail. Here domain "a" has

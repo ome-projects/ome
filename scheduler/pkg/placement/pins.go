@@ -168,6 +168,31 @@ func (p *Pins) ChooseForOwnerInTopologyOnNodes(group, owner, topologyKey string,
 		return c.domain.Name, c.id, true
 	}
 
+	eff := p.withoutReservedDomainsLocked(topologyKey, rawFree, nodesByDomain)
+
+	d, fit := topology.BestFit(eff, gangSize)
+	if !fit {
+		return "", 0, false
+	}
+	dom := Domain{TopologyKey: topologyKey, Name: d}
+	c := &commitment{domain: dom, owner: owner, id: p.nextCommitmentID(), nodes: nodeSet(nodesByDomain[d])}
+	p.byGroup[group] = c
+	p.setRemaining(c, gangSize)
+	return d, c.id, true
+}
+
+// WithoutReservedDomains returns a snapshot of rawFree with domains claimed by
+// another forming gang set to zero. GangPack uses it while deferring a hard
+// topology-spread gang's final domain choice until after the framework filters
+// run. ChooseForOwnerInTopologyOnNodes repeats the same check atomically when
+// Reserve commits the selected domain.
+func (p *Pins) WithoutReservedDomains(topologyKey string, rawFree topology.FreeByDomain, nodesByDomain map[string][]string) topology.FreeByDomain {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.withoutReservedDomainsLocked(topologyKey, rawFree, nodesByDomain)
+}
+
+func (p *Pins) withoutReservedDomainsLocked(topologyKey string, rawFree topology.FreeByDomain, nodesByDomain map[string][]string) topology.FreeByDomain {
 	// A forming gang exclusively owns its domain. Integer slot subtraction is not
 	// sound for heterogeneous pods: a reservation for a large or selector-bound
 	// member cannot be replaced by an arbitrary smaller slot. Hold the domain until
@@ -187,16 +212,7 @@ func (p *Pins) ChooseForOwnerInTopologyOnNodes(group, owner, topologyKey string,
 			eff[d] = f
 		}
 	}
-
-	d, fit := topology.BestFit(eff, gangSize)
-	if !fit {
-		return "", 0, false
-	}
-	dom := Domain{TopologyKey: topologyKey, Name: d}
-	c := &commitment{domain: dom, owner: owner, id: p.nextCommitmentID(), nodes: nodeSet(nodesByDomain[d])}
-	p.byGroup[group] = c
-	p.setRemaining(c, gangSize)
-	return d, c.id, true
+	return eff
 }
 
 // Place records that one of a group's members has landed on a real node in its
