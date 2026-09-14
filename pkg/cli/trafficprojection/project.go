@@ -190,7 +190,7 @@ func (b *projector) projectTrafficStatus() {
 			b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorUnavailable
 			b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, reportv1alpha1.TrafficFreshnessUnverifiable)
 		case status.BackendPolicyResource == nil:
-			b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorNoop
+			b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorUnavailable
 			b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, b.ready.Source.Freshness)
 		}
 	}
@@ -400,7 +400,7 @@ func (b *projector) projectCanary() {
 		return
 	}
 	component, primary, componentOK := canaryPrimary(group)
-	if !componentOK || group == nil || group.Canary == nil || len(group.Canary.Steps) == 0 || len(group.Canary.Steps) > 20 ||
+	if !componentOK || group == nil || group.Canary == nil || !canaryevidence.ValidCanaryPlan(group.Canary) || len(group.Canary.Steps) > 20 ||
 		!validCanaryStatus(status, len(group.Canary.Steps)) ||
 		!b.validCanaryEpoch(group.Canary.Steps, primary, status) {
 		b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)

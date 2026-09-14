@@ -274,9 +274,6 @@ func TestProjectValidationRejectsPinnedRunContractMismatches(t *testing.T) {
 		{name: "duplicate target", mutate: func(run *omev1beta1.RolloutRun) {
 			run.TargetRevisions = append(run.TargetRevisions, run.TargetRevisions[0])
 		}},
-		{name: "reordered targets", mutate: func(run *omev1beta1.RolloutRun) {
-			run.TargetRevisions[0], run.TargetRevisions[1] = run.TargetRevisions[1], run.TargetRevisions[0]
-		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -291,6 +288,30 @@ func TestProjectValidationRejectsPinnedRunContractMismatches(t *testing.T) {
 				reportv1alpha1.RolloutValidationIssueRolloutResolutionMalformed)
 		})
 	}
+}
+
+func TestProjectValidationAcceptsRepinnedComponentOrder(t *testing.T) {
+	groups := []omev1beta1.RolloutGroup{{
+		Components: []omev1beta1.ComponentType{
+			omev1beta1.EngineComponent, omev1beta1.DecoderComponent,
+		},
+		BlueGreen: &omev1beta1.GroupBlueGreen{},
+	}}
+	isvc := validationISVCWithPinnedRun(t, groups, true)
+	pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+	pinned.Group.Components[0], pinned.Group.Components[1] =
+		pinned.Group.Components[1], pinned.Group.Components[0]
+	digest, err := rolloutpolicy.ProgressionDigest(&pinned.Group)
+	require.NoError(t, err)
+	pinned.PortableDigest = digest
+
+	got, err := projectValidation(isvc)
+
+	require.NoError(t, err)
+	assert.NotContains(t, validationIssueCodes(got),
+		reportv1alpha1.RolloutValidationIssueRolloutResolutionMalformed)
+	assert.Contains(t, validationIssueCodes(got),
+		reportv1alpha1.RolloutValidationIssueRolloutResolutionFreshnessUnverifiable)
 }
 
 func TestProjectValidationRejectsPinnedDigestMismatchAfterLiveGroupsAreRemoved(t *testing.T) {

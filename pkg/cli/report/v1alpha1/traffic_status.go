@@ -46,13 +46,12 @@ const (
 )
 
 // TrafficTranslator is the allowlisted translator inferred from an exact
-// emitted-policy GVK or from the no-translator condition.
+// emitted-policy GVK. When no recognized policy proves one, it is unavailable.
 type TrafficTranslator string
 
 const (
 	TrafficTranslatorEnvoyGateway TrafficTranslator = "envoy-gateway"
 	TrafficTranslatorIstio        TrafficTranslator = "istio"
-	TrafficTranslatorNoop         TrafficTranslator = "noop"
 	TrafficTranslatorUnavailable  TrafficTranslator = "Unavailable"
 )
 

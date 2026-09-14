@@ -1092,7 +1092,7 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	}
 }
 
-func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
+func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 	tests := []struct {
 		name            string
 		oldSteps        []omev1beta1.RolloutGroupStep
@@ -1102,6 +1102,7 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 		phase           omev1beta1.RolloutPhase
 		promotedThrough string
 		wantTarget      int32
+		accepted        bool
 	}{
 		{
 			name: "lowering repin",
@@ -1119,6 +1120,7 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			observedTraffic: 50,
 			phase:           omev1beta1.RolloutPhasePaused,
 			wantTarget:      30,
+			accepted:        true,
 		},
 		{
 			name: "equal repin with promotion residue",
@@ -1134,6 +1136,39 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			phase:           omev1beta1.RolloutPhasePromoting,
 			promotedThrough: "SECRET_PREVIOUS_PROMOTION",
 			wantTarget:      100,
+			accepted:        true,
+		},
+		{
+			name: "promoting repin has incomplete traffic",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("100%"), Traffic: 80},
+			},
+			currentStep:     0,
+			observedTraffic: 80,
+			phase:           omev1beta1.RolloutPhasePromoting,
+			promotedThrough: "SECRET_PREVIOUS_PROMOTION",
+			wantTarget:      80,
+		},
+		{
+			name: "digest-correct plan has nonterminal final traffic",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 20},
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 10},
+				{Capacity: intstr.FromString("50%"), Traffic: 30},
+				{Capacity: intstr.FromString("100%"), Traffic: 80},
+			},
+			currentStep:     1,
+			observedTraffic: 50,
+			phase:           omev1beta1.RolloutPhasePaused,
+			wantTarget:      30,
 		},
 	}
 	for _, tt := range tests {
@@ -1193,6 +1228,12 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 
 			require.NoError(t, err)
 			require.Len(t, got.Content.Groups, 1)
+			if !tt.accepted {
+				assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+					Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+				})
+				return
+			}
 			require.NotNil(t, got.Content.Groups[0].Step)
 			assert.Equal(t, tt.currentStep, got.Content.Groups[0].Step.Index)
 			assert.Equal(t, int32(len(tt.steps)), got.Content.Groups[0].Step.Total)

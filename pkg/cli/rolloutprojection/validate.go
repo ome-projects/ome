@@ -513,25 +513,28 @@ func validActiveRolloutRun(subjectName string, run *omev1beta1.RolloutRun) bool 
 		return false
 	}
 
-	expectedComponents := make([]omev1beta1.ComponentType, 0, 3)
-	seen := make(map[omev1beta1.ComponentType]bool, 3)
+	expectedComponents := make(map[omev1beta1.ComponentType]struct{}, 3)
 	for i := range run.Plan.Groups {
 		for _, component := range run.Plan.Groups[i].Group.Components {
-			if seen[component] {
-				continue
+			if _, seen := expectedComponents[component]; seen {
+				return false
 			}
-			seen[component] = true
-			expectedComponents = append(expectedComponents, component)
+			expectedComponents[component] = struct{}{}
 		}
 	}
 	if len(run.TargetRevisions) != len(expectedComponents) {
 		return false
 	}
-	for i := range run.TargetRevisions {
-		target := run.TargetRevisions[i]
-		if target.Component != expectedComponents[i] || !safeRevisionHash(target.Revision) {
+	targets := make(map[omev1beta1.ComponentType]string, len(run.TargetRevisions))
+	for _, target := range run.TargetRevisions {
+		if _, expected := expectedComponents[target.Component]; !expected ||
+			!safeRevisionHash(target.Revision) {
 			return false
 		}
+		if _, duplicate := targets[target.Component]; duplicate {
+			return false
+		}
+		targets[target.Component] = target.Revision
 	}
 	return true
 }

@@ -108,7 +108,8 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 		{name: "one write advance", phase: reportv1alpha1.RolloutPhaseCanarying, status: canaryStatus(1, 20), traffic: true, residue: true},
 		{name: "wrong step traffic", phase: reportv1alpha1.RolloutPhasePaused, status: canaryStatus(1, 20), traffic: false, residue: true},
 		{name: "paused final step", phase: reportv1alpha1.RolloutPhasePaused, status: canaryStatus(2, 100), traffic: true, residue: false},
-		{name: "promoting before final", phase: reportv1alpha1.RolloutPhasePromoting, status: canaryStatus(1, 50), traffic: true, residue: false},
+		{name: "promoting requires full traffic", phase: reportv1alpha1.RolloutPhasePromoting, status: canaryStatus(1, 50), traffic: false, residue: false},
+		{name: "promoting terminal step requires full traffic", phase: reportv1alpha1.RolloutPhasePromoting, status: canaryStatus(2, 80), traffic: false, residue: false},
 		{name: "canarying final without residue", phase: reportv1alpha1.RolloutPhaseCanarying, status: canaryStatus(2, 100), traffic: true, residue: false},
 		{name: "manual promotion identity", phase: reportv1alpha1.RolloutPhaseCanarying, status: promotedStatus(1, 20, "bbbbbbbb"), traffic: true, residue: true},
 		{name: "wrong manual promotion identity", phase: reportv1alpha1.RolloutPhaseCanarying, status: promotedStatus(1, 20, "cccccccc"), traffic: true, residue: false},
@@ -208,8 +209,30 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 		{name: "target epoch differs", phase: reportv1alpha1.RolloutPhasePaused, mutate: func(isvc *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ []omev1beta1.RolloutGroupStep) {
 			isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = "cccccccc"
 		}},
+		{name: "repinned components may be reordered", phase: reportv1alpha1.RolloutPhasePaused, valid: true, mutate: func(isvc *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ []omev1beta1.RolloutGroupStep) {
+			run := isvc.Status.Rollout.ActiveRun
+			run.TargetRevisions = []omev1beta1.RolloutRunTarget{
+				{Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb"},
+				{Component: omev1beta1.DecoderComponent, Revision: "cccccccc"},
+			}
+			pinned := &run.Plan.Groups[0]
+			pinned.Group.Components = []omev1beta1.ComponentType{
+				omev1beta1.DecoderComponent, omev1beta1.EngineComponent,
+			}
+			digest, err := rolloutpolicy.ProgressionDigest(&pinned.Group)
+			require.NoError(t, err)
+			pinned.PortableDigest = digest
+		}},
 		{name: "pinned digest differs", phase: reportv1alpha1.RolloutPhasePaused, mutate: func(isvc *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ []omev1beta1.RolloutGroupStep) {
 			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PortableDigest = "rp1:000000000000"
+		}},
+		{name: "digest-correct plan is controller-invalid", phase: reportv1alpha1.RolloutPhasePaused, mutate: func(isvc *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, projected []omev1beta1.RolloutGroupStep) {
+			projected[2].Traffic = 80
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Group.Canary.Steps[2].Traffic = 80
+			digest, err := rolloutpolicy.ProgressionDigest(&pinned.Group)
+			require.NoError(t, err)
+			pinned.PortableDigest = digest
 		}},
 		{name: "raising repin uses pre-step hold", phase: reportv1alpha1.RolloutPhasePaused, mutate: func(isvc *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, projected []omev1beta1.RolloutGroupStep) {
 			projected[1].Traffic = 60
@@ -221,6 +244,7 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 		{name: "rollback residue contradicts phase", phase: reportv1alpha1.RolloutPhasePaused, mutate: func(_ *omev1beta1.InferenceService, status *omev1beta1.CanaryStatus, _ []omev1beta1.RolloutGroupStep) {
 			status.RolledBackRevisionHash = status.CanaryRevisionHash
 		}},
+		{name: "promoting requires full observed traffic", phase: reportv1alpha1.RolloutPhasePromoting},
 		{name: "phase cannot be preserved evidence", phase: reportv1alpha1.RolloutPhasePending},
 		{name: "projected steps differ from pin", phase: reportv1alpha1.RolloutPhasePaused, mutate: func(_ *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, projected []omev1beta1.RolloutGroupStep) {
 			projected[0].Traffic = 5

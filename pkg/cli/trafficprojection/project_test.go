@@ -86,11 +86,11 @@ func TestProjectMapsControllerConditionsHonestly(t *testing.T) {
 			setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
 			isvc.Status.Traffic.Conditions = append(isvc.Status.Traffic.Conditions, trafficCondition(omev1beta1.TrafficConditionBackendPolicyUnsupportedFields, metav1.ConditionTrue, omev1beta1.TrafficReasonUnsupportedField, 7))
 		}, wantState: reportv1alpha1.TrafficStatePartial, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedPresent, freshness: reportv1alpha1.TrafficFreshnessCurrent},
-		{name: "noop", mutate: func(isvc *omev1beta1.InferenceService) {
+		{name: "no translator", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Traffic.BackendPolicyResource = nil
 			isvc.Status.Traffic.TargetedHTTPRoutes = nil
 			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonNoTranslatorAvailable, 7)
-		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorNoop, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnavailable, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
 		{name: "translation failed", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Traffic.BackendPolicyResource = nil
 			isvc.Status.Traffic.TargetedHTTPRoutes = nil
@@ -141,6 +141,24 @@ func TestProjectMarksTranslatorUnavailableWithoutARecognizedPolicy(t *testing.T)
 		Evidence:  reportv1alpha1.EvidenceComputed,
 		Freshness: reportv1alpha1.TrafficFreshnessUnavailable,
 	}, got.Content.Summary.Source.Translator)
+}
+
+func TestProjectKeepsNoTranslatorUnavailable(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.BackendPolicyResource = nil
+	isvc.Status.Traffic.TargetedHTTPRoutes = nil
+	setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonNoTranslatorAvailable, 7)
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficTranslatorUnavailable, got.Content.Summary.Translator)
+	assert.Equal(t, reportv1alpha1.TrafficValueSource{
+		Evidence: reportv1alpha1.EvidenceComputed, Freshness: reportv1alpha1.TrafficFreshnessCurrent,
+	}, got.Content.Summary.Source.Translator)
+	encoded, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), `"translator":"noop"`)
 }
 
 func TestProjectDoesNotInferNoopFromInvalidReadyCondition(t *testing.T) {
@@ -657,7 +675,7 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	}
 }
 
-func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
+func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 	tests := []struct {
 		name            string
 		oldSteps        []omev1beta1.RolloutGroupStep
@@ -667,6 +685,7 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 		phase           omev1beta1.RolloutPhase
 		promotedThrough string
 		wantTarget      int32
+		accepted        bool
 	}{
 		{
 			name: "lowering repin",
@@ -684,6 +703,7 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			observedTraffic: 50,
 			phase:           omev1beta1.RolloutPhasePaused,
 			wantTarget:      30,
+			accepted:        true,
 		},
 		{
 			name: "equal repin with promotion residue",
@@ -699,6 +719,39 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			phase:           omev1beta1.RolloutPhasePromoting,
 			promotedThrough: "SECRET_PREVIOUS_PROMOTION",
 			wantTarget:      100,
+			accepted:        true,
+		},
+		{
+			name: "promoting repin has incomplete traffic",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("100%"), Traffic: 80},
+			},
+			currentStep:     0,
+			observedTraffic: 80,
+			phase:           omev1beta1.RolloutPhasePromoting,
+			promotedThrough: "SECRET_PREVIOUS_PROMOTION",
+			wantTarget:      80,
+		},
+		{
+			name: "digest-correct plan has nonterminal final traffic",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 20},
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 10},
+				{Capacity: intstr.FromString("50%"), Traffic: 30},
+				{Capacity: intstr.FromString("100%"), Traffic: 80},
+			},
+			currentStep:     1,
+			observedTraffic: 50,
+			phase:           omev1beta1.RolloutPhasePaused,
+			wantTarget:      30,
 		},
 	}
 	for _, tt := range tests {
@@ -757,6 +810,13 @@ func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			got, err := trafficprojection.Project(isvc, projectionClock)
 
 			require.NoError(t, err)
+			if !tt.accepted {
+				assert.Nil(t, got.Content.Canary)
+				assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+					Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+				})
+				return
+			}
 			require.NotNil(t, got.Content.Canary)
 			assert.Equal(t, tt.currentStep, got.Content.Canary.CurrentStep)
 			assert.Equal(t, int32(len(tt.steps)), got.Content.Canary.TotalSteps)

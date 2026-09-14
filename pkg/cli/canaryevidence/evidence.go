@@ -16,6 +16,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
+	omevalidation "sigs.k8s.io/ome/pkg/validation"
 )
 
 var revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
@@ -76,6 +77,13 @@ func ProjectPhase(phase omev1beta1.RolloutPhase) reportv1alpha1.RolloutPhase {
 // SafeRevisionHash reports whether a controller revision hash is canonical.
 func SafeRevisionHash(hash string) bool {
 	return revisionHashPattern.MatchString(hash)
+}
+
+// ValidCanaryPlan applies the same pure plan-body validation used by the
+// controller before it pins a canary plan. Projection must not trust a
+// digest-correct status shape that the controller could never produce.
+func ValidCanaryPlan(plan *omev1beta1.GroupCanary) bool {
+	return plan != nil && omevalidation.ValidateCanaryPlan("canary", plan) == nil
 }
 
 // RevisionHash extracts a canonical hash from a per-revision Service name.
@@ -168,6 +176,9 @@ func ObservedTrafficMatchesStep(
 	if status == nil {
 		return false
 	}
+	if !promotingTrafficComplete(phase, status) {
+		return false
+	}
 	current := int(status.CurrentStep)
 	if current < 0 || current >= len(steps) {
 		return false
@@ -191,6 +202,9 @@ func ValidPhaseStepResidue(
 	status *omev1beta1.CanaryStatus,
 ) bool {
 	if status == nil {
+		return false
+	}
+	if !promotingTrafficComplete(phase, status) {
 		return false
 	}
 	current := int(status.CurrentStep)
@@ -255,7 +269,8 @@ func ValidPausedNonRaisingRepinBoundary(
 	steps []omev1beta1.RolloutGroupStep,
 	status *omev1beta1.CanaryStatus,
 ) bool {
-	if isvc == nil || status == nil || status.PreStepHold || len(steps) == 0 {
+	if isvc == nil || status == nil || status.PreStepHold || len(steps) == 0 ||
+		!promotingTrafficComplete(phase, status) {
 		return false
 	}
 	paused, _ := constants.RolloutPauseState(isvc.Annotations)
@@ -295,13 +310,15 @@ func ValidPausedNonRaisingRepinBoundary(
 		return false
 	}
 
-	expectedTargets := make([]omev1beta1.ComponentType, 0, 3)
-	seenTargets := make(map[omev1beta1.ComponentType]struct{}, 3)
+	expectedTargets := make(map[omev1beta1.ComponentType]struct{}, 3)
 	matchingCanary := 0
 	canaryGroups := 0
 	for i := range run.Plan.Groups {
 		pinnedGroup := &run.Plan.Groups[i]
 		group := &pinnedGroup.Group
+		if group.Canary != nil && !ValidCanaryPlan(group.Canary) {
+			return false
+		}
 		digest, err := rolloutpolicy.ProgressionDigest(group)
 		if err != nil || digest == "" || digest != pinnedGroup.PortableDigest || group.PolicyRef != nil {
 			return false
@@ -322,11 +339,10 @@ func ValidPausedNonRaisingRepinBoundary(
 			if !supportedComponent(component) {
 				return false
 			}
-			if _, seen := seenTargets[component]; seen {
+			if _, seen := expectedTargets[component]; seen {
 				return false
 			}
-			seenTargets[component] = struct{}{}
-			expectedTargets = append(expectedTargets, component)
+			expectedTargets[component] = struct{}{}
 		}
 		if group.Canary == nil {
 			continue
@@ -341,17 +357,29 @@ func ValidPausedNonRaisingRepinBoundary(
 		return false
 	}
 
-	primaryBound := false
-	for i := range run.TargetRevisions {
-		target := run.TargetRevisions[i]
-		if target.Component != expectedTargets[i] || !SafeRevisionHash(target.Revision) {
+	targets := make(map[omev1beta1.ComponentType]string, len(run.TargetRevisions))
+	for _, target := range run.TargetRevisions {
+		if _, expected := expectedTargets[target.Component]; !expected ||
+			!SafeRevisionHash(target.Revision) {
 			return false
 		}
-		if target.Component == primary {
-			primaryBound = target.Revision == status.CanaryRevisionHash
+		if _, duplicate := targets[target.Component]; duplicate {
+			return false
 		}
+		targets[target.Component] = target.Revision
 	}
-	return primaryBound
+	return targets[primary] == status.CanaryRevisionHash
+}
+
+// promotingTrafficComplete rejects an impossible promoting phase before any
+// step or repin residue can qualify it. The controller enters Promoting only
+// after applying the terminal 100% traffic split.
+func promotingTrafficComplete(
+	phase reportv1alpha1.RolloutPhase,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	return phase != reportv1alpha1.RolloutPhasePromoting ||
+		status != nil && status.ObservedTrafficWeight == 100
 }
 
 // validPreStepHold recognizes only states the controller can persist after
