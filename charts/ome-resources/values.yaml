@@ -606,6 +606,32 @@ modelAgent:
   #     readOnly: true
   extraVolumeMounts: []
 
+  # stage:// support. A stage:// model is copied from an already-mounted source
+  # directory onto the node's local disk, so inference reads local disk instead
+  # of the share on every pod start.
+  #
+  # sourceRoots is a security boundary: a stage:// URI may only name a path
+  # under one of these roots, because whatever is staged gets mounted into
+  # inference pods. Empty (the default) disables staging entirely.
+  #
+  # Mount the source with extraVolumes/extraVolumeMounts and keep the mountPath
+  # IDENTICAL to the hostPath — storageUri is read inside the container while
+  # spec.storage.path is a node path, and only identical paths keep those two
+  # in the same coordinate system:
+  #
+  #   extraVolumes:
+  #     - name: nfs-src
+  #       hostPath: { path: /mnt/nfs-src }
+  #   extraVolumeMounts:
+  #     - name: nfs-src
+  #       mountPath: /mnt/nfs-src
+  #       readOnly: true
+  stage:
+    sourceRoots: []
+    # Staging is bounded by the share's egress, not by this node, so it gets a
+    # lower limit than the download workers.
+    concurrency: 2
+
   tolerations:
     - key: nvidia.com/gpu
       operator: Exists

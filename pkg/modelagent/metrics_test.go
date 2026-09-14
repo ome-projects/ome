@@ -10,7 +10,7 @@ import (
 
 func TestNewMetrics_RegistersMetrics(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	metrics := NewMetrics(reg)
+	metrics := NewMetrics(reg, t.TempDir())
 
 	// Test that custom counters are registered and can be incremented
 	metrics.modelDownloadsSuccessTotal.WithLabelValues("testtype", "testns", "testmodel").Inc()
@@ -33,7 +33,7 @@ func TestNewMetrics_RegistersMetrics(t *testing.T) {
 
 func TestGoRuntimeMetrics_AreSet(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	_ = NewMetrics(reg)
+	_ = NewMetrics(reg, t.TempDir())
 
 	// Wait for the goroutine to update runtime metrics
 	time.Sleep(200 * time.Millisecond)

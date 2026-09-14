@@ -410,6 +410,13 @@ func CacheCommitHashForRevision(storageFolder, revision, commitHash string) erro
 	return nil
 }
 
+// AvailableDiskSpace returns the available disk space in bytes for the given
+// directory, so callers outside this package can report free space rather than
+// only assert against it.
+func AvailableDiskSpace(dir string) (int64, error) {
+	return getAvailableDiskSpace(dir)
+}
+
 // getAvailableDiskSpace returns the available disk space in bytes for the given directory
 // This is a cross-platform implementation
 func getAvailableDiskSpace(dir string) (int64, error) {

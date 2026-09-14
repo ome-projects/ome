@@ -69,6 +69,12 @@ spec:
         - '1'
         - --same-path-wait-timeout
         - 30m
+        {{- with .Values.modelAgent.stage.sourceRoots }}
+        - --stage-source-roots
+        - {{ join "," . | quote }}
+        - --stage-concurrency
+        - {{ $.Values.modelAgent.stage.concurrency | quote }}
+        {{- end }}
         env:
         - name: NODE_NAME
           valueFrom:

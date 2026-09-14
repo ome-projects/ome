@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
@@ -26,6 +27,10 @@ const (
 	GitHubStoragePrefix = "github://"
 	// LocalStoragePrefix is the prefix for local filesystem storage URIs
 	LocalStoragePrefix = "local://"
+	// StageStoragePrefix is the prefix for staged filesystem storage URIs.
+	// A staged model is copied from an already-mounted source path onto the
+	// node's local disk, unlike local:// which is served in place.
+	StageStoragePrefix = "stage://"
 )
 
 // StorageType is a string enum for storage type
@@ -50,6 +55,8 @@ const (
 	StorageTypeGitHub StorageType = "GITHUB"
 	// StorageTypeLocal is the value for local filesystem storage
 	StorageTypeLocal StorageType = "LOCAL"
+	// StorageTypeStage is the value for staged filesystem storage
+	StorageTypeStage StorageType = "STAGE"
 )
 
 // OCIStorageComponents represents the components of an OCI storage URI
@@ -110,6 +117,11 @@ type GitHubStorageComponents struct {
 // LocalStorageComponents represents the components of a local filesystem storage URI
 type LocalStorageComponents struct {
 	Path string // Absolute or relative path to the model files
+}
+
+// StageStorageComponents represents the components of a staged storage URI
+type StageStorageComponents struct {
+	SourcePath string // Absolute path of the source directory, as seen by the model agent
 }
 
 // ParseOCIStorageURI parses an OCI storage URI and returns its components
@@ -539,6 +551,46 @@ func ValidateLocalStorageURI(uri string) error {
 	return err
 }
 
+// ParseStageStorageURI parses a staged storage URI and returns its components
+// Format: stage:///{absolute-source-path}
+//
+// The source path is a path already mounted into the model agent, not a network
+// address: mounting the underlying share (NFS, CephFS, ...) is the node's job.
+func ParseStageStorageURI(uri string) (*StageStorageComponents, error) {
+	if !strings.HasPrefix(uri, StageStoragePrefix) {
+		return nil, fmt.Errorf("invalid stage storage URI format: missing %s prefix", StageStoragePrefix)
+	}
+
+	sourcePath := strings.TrimPrefix(uri, StageStoragePrefix)
+	if sourcePath == "" {
+		return nil, fmt.Errorf("invalid stage storage URI format: missing source path")
+	}
+
+	// Absolute paths only: the same string has to be meaningful both inside the
+	// agent container and on the node, so relative and ~-based paths are out.
+	if !strings.HasPrefix(sourcePath, "/") {
+		return nil, fmt.Errorf("invalid stage storage URI format: source path %q must be an absolute path", sourcePath)
+	}
+
+	// Reject traversal before cleaning, otherwise Clean would silently resolve it
+	// and a URI could escape the configured source roots.
+	for _, segment := range strings.Split(sourcePath, "/") {
+		if segment == ".." {
+			return nil, fmt.Errorf("invalid stage storage URI format: source path %q must not contain \"..\" segments", sourcePath)
+		}
+	}
+
+	return &StageStorageComponents{
+		SourcePath: path.Clean(sourcePath),
+	}, nil
+}
+
+// ValidateStageStorageURI validates if the given URI matches staged storage format
+func ValidateStageStorageURI(uri string) error {
+	_, err := ParseStageStorageURI(uri)
+	return err
+}
+
 // GetStorageType determines the type of storage URI
 func GetStorageType(uri string) (StorageType, error) {
 	switch {
@@ -560,6 +612,8 @@ func GetStorageType(uri string) (StorageType, error) {
 		return StorageTypeGitHub, nil
 	case strings.HasPrefix(uri, LocalStoragePrefix):
 		return StorageTypeLocal, nil
+	case strings.HasPrefix(uri, StageStoragePrefix):
+		return StorageTypeStage, nil
 	default:
 		return "", fmt.Errorf("unknown storage type for URI: %s", uri)
 	}
@@ -591,6 +645,8 @@ func ValidateStorageURI(uri string) error {
 		return ValidateGitHubStorageURI(uri)
 	case StorageTypeLocal:
 		return ValidateLocalStorageURI(uri)
+	case StorageTypeStage:
+		return ValidateStageStorageURI(uri)
 	default:
 		return fmt.Errorf("unsupported storage type: %s", storageType)
 	}
