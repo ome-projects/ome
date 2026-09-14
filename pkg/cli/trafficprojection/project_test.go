@@ -610,6 +610,99 @@ func TestProjectRejectsContradictoryCanaryEpochEvidence(t *testing.T) {
 	}
 }
 
+func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
+	tests := []struct {
+		name  string
+		phase omev1beta1.RolloutPhase
+	}{
+		{name: "capacity pending", phase: omev1beta1.RolloutPhasePending},
+		{name: "ready and paused", phase: omev1beta1.RolloutPhasePaused},
+		{name: "capacity wait failed", phase: omev1beta1.RolloutPhaseFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			// clampCanary repinned a [20, 100] rollout while 20% was
+			// programmed to the shorter, final-only [100] ladder.
+			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+				Capacity: intstr.FromString("100%"), Traffic: 100,
+			}}
+			isvc.Status.Canary.PreStepHold = true
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = tt.phase
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			require.NotNil(t, got.Content.Canary)
+			assert.Equal(t, int32(0), got.Content.Canary.CurrentStep)
+			assert.Equal(t, int32(1), got.Content.Canary.TotalSteps)
+			assert.Equal(t, int32(20), got.Content.Canary.ObservedTraffic)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+				Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+			})
+		})
+	}
+}
+
+func TestProjectRejectsMalformedPreStepHold(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService)
+	}{
+		{name: "impossible phase", mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = omev1beta1.RolloutPhasePromoting
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "target does not raise traffic", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Spec.Rollout.Groups[0].Canary.Steps[0].Traffic = 20
+		}},
+		{name: "missing typed traffic", mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic = nil
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "incoherent typed traffic", mutate: func(isvc *omev1beta1.InferenceService) {
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic[0].Percent = 30
+			component.Traffic[1].Percent = 70
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+		}},
+		{name: "negative observed traffic", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.ObservedTrafficWeight = -1
+		}},
+		{name: "out of range observed traffic", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.ObservedTrafficWeight = 101
+		}},
+		{name: "contradictory current step", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.CurrentStep = 1
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+				Capacity: intstr.FromString("100%"), Traffic: 100,
+			}}
+			isvc.Status.Canary.PreStepHold = true
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = omev1beta1.RolloutPhasePending
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+			tt.mutate(isvc)
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Nil(t, got.Content.Canary)
+			assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+				Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+			})
+		})
+	}
+}
+
 func TestProjectDoesNotPromoteAnUnmatchedPrimaryCanaryTargetToStable(t *testing.T) {
 	isvc := currentTrafficISVC(t)
 	status := isvc.Status.Components[omev1beta1.EngineComponent]

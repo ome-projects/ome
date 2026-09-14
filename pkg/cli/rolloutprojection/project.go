@@ -370,7 +370,7 @@ func (b *projector) applyCanaryStatus(
 	if !validCanaryPhaseStepResidue(projected.Phase, group.Canary.Steps, status) {
 		b.markMalformed(reportv1alpha1.RolloutIssueStatusMalformed, ptrInt(projected.Index), "")
 	}
-	if canaryPhaseBindsTraffic(projected.Phase) &&
+	if canaryevidence.StatusBindsTraffic(projected.Phase, status) &&
 		!b.activeCanaryTrafficMatches(primary, projected.Phase, status) {
 		b.markMalformed(reportv1alpha1.RolloutIssueStatusMalformed, ptrInt(projected.Index), "")
 	}
@@ -1462,10 +1462,6 @@ func revisionRole(hash string, component *reportv1alpha1.RolloutComponentStatus)
 
 func canaryPhaseNeedsStatus(phase reportv1alpha1.RolloutPhase) bool {
 	return canaryevidence.PhaseNeedsStatus(phase)
-}
-
-func canaryPhaseBindsTraffic(phase reportv1alpha1.RolloutPhase) bool {
-	return canaryevidence.PhaseBindsTraffic(phase)
 }
 
 func canaryPhaseBindsStepTraffic(phase reportv1alpha1.RolloutPhase) bool {

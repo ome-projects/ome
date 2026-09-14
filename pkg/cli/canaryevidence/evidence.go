@@ -122,6 +122,23 @@ func PhaseBindsTraffic(phase reportv1alpha1.RolloutPhase) bool {
 	}
 }
 
+// StatusBindsTraffic reports whether primary Traffic must describe the same
+// applied epoch as CanaryStatus. A repin pre-step hold keeps the previously
+// programmed split while capacity converges or parks after its timeout, so
+// Pending and Failed become traffic-bound for that status even though they are
+// not traffic-bound during ordinary canary initialization and capacity waits.
+func StatusBindsTraffic(
+	phase reportv1alpha1.RolloutPhase,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	if PhaseBindsTraffic(phase) {
+		return true
+	}
+	return status != nil && status.PreStepHold &&
+		(phase == reportv1alpha1.RolloutPhasePending ||
+			phase == reportv1alpha1.RolloutPhaseFailed)
+}
+
 // PhaseBindsStepTraffic reports whether observed traffic must match a
 // configured canary step in this phase.
 func PhaseBindsStepTraffic(phase reportv1alpha1.RolloutPhase) bool {
@@ -135,9 +152,10 @@ func PhaseBindsStepTraffic(phase reportv1alpha1.RolloutPhase) bool {
 	}
 }
 
-// ObservedTrafficMatchesStep accepts the current step, plus the controller's
+// ObservedTrafficMatchesStep accepts the current step, the controller's
 // documented one-write canary advance residue where the new index is visible
-// before its traffic is applied.
+// before its traffic is applied, and a valid repin pre-step hold that binds a
+// lower previously-programmed traffic weight to the clamped step.
 func ObservedTrafficMatchesStep(
 	phase reportv1alpha1.RolloutPhase,
 	steps []omev1beta1.RolloutGroupStep,
@@ -149,6 +167,9 @@ func ObservedTrafficMatchesStep(
 	current := int(status.CurrentStep)
 	if current < 0 || current >= len(steps) {
 		return false
+	}
+	if status.PreStepHold {
+		return validPreStepHold(phase, steps, status)
 	}
 	if status.ObservedTrafficWeight == steps[current].Traffic {
 		return true
@@ -172,6 +193,9 @@ func ValidPhaseStepResidue(
 	if current < 0 || current >= len(steps) {
 		return false
 	}
+	if status.PreStepHold && !validPreStepHold(phase, steps, status) {
+		return false
+	}
 	last := len(steps) - 1
 	switch phase {
 	case reportv1alpha1.RolloutPhasePromoting:
@@ -179,7 +203,7 @@ func ValidPhaseStepResidue(
 			return false
 		}
 	case reportv1alpha1.RolloutPhasePaused:
-		if current >= last {
+		if current >= last && !status.PreStepHold {
 			return false
 		}
 	case reportv1alpha1.RolloutPhaseCanarying:
@@ -205,6 +229,34 @@ func ValidPhaseStepResidue(
 		return status.PromotedThrough == status.CanaryRevisionHash
 	}
 	return true
+}
+
+// validPreStepHold recognizes only states the canary reconciler can preserve
+// after clampCanary arms a hold. The held traffic must be a bounded, strictly
+// lower exposure than the clamped step; equality or a reduction cannot have
+// armed PreStepHold.
+func validPreStepHold(
+	phase reportv1alpha1.RolloutPhase,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	if status == nil || !status.PreStepHold ||
+		status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 {
+		return false
+	}
+	switch phase {
+	case reportv1alpha1.RolloutPhasePending,
+		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhaseFailed:
+	default:
+		return false
+	}
+	current := int(status.CurrentStep)
+	if current < 0 || current >= len(steps) {
+		return false
+	}
+	target := steps[current].Traffic
+	return target >= 0 && target <= 100 && status.ObservedTrafficWeight < target
 }
 
 // ActiveTrafficMatches validates that primary Traffic is the exact epoch
@@ -294,6 +346,7 @@ func CompletedStatusMatches(
 	traffic []omev1beta1.ComponentTrafficTarget,
 ) bool {
 	return status != nil &&
+		!status.PreStepHold &&
 		len(steps) > 0 &&
 		ValidCompletedStep(steps[len(steps)-1]) &&
 		int(status.CurrentStep) == len(steps) &&

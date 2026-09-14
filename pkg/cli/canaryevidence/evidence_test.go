@@ -111,6 +111,21 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 		{name: "manual promotion identity", phase: reportv1alpha1.RolloutPhaseCanarying, status: promotedStatus(1, 20, "bbbbbbbb"), traffic: true, residue: true},
 		{name: "wrong manual promotion identity", phase: reportv1alpha1.RolloutPhaseCanarying, status: promotedStatus(1, 20, "cccccccc"), traffic: true, residue: false},
 		{name: "rollback residue outside rollback", phase: reportv1alpha1.RolloutPhasePending, status: rolledBackStatus(0), traffic: true, residue: false},
+		{name: "repin hold pending", phase: reportv1alpha1.RolloutPhasePending, status: heldStatus(2, 30), traffic: true, residue: true},
+		{name: "repin hold paused on clamped final step", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(2, 30), traffic: true, residue: true},
+		{name: "repin hold failed capacity gate", phase: reportv1alpha1.RolloutPhaseFailed, status: heldStatus(2, 30), traffic: true, residue: true},
+		{name: "repin hold cannot remain canarying", phase: reportv1alpha1.RolloutPhaseCanarying, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold cannot remain promoting", phase: reportv1alpha1.RolloutPhasePromoting, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold cannot remain rolling back", phase: reportv1alpha1.RolloutPhaseRollingBack, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold cannot remain rolled back", phase: reportv1alpha1.RolloutPhaseRolledBack, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold cannot remain stable", phase: reportv1alpha1.RolloutPhaseStable, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold cannot use blue green phase", phase: reportv1alpha1.RolloutPhaseBlueGreenStandby, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold cannot use unknown phase", phase: reportv1alpha1.RolloutPhaseUnknown, status: heldStatus(2, 30), traffic: false, residue: false},
+		{name: "repin hold must precede target traffic", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(1, 50), traffic: false, residue: false},
+		{name: "repin hold cannot reduce target traffic", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(0, 30), traffic: false, residue: false},
+		{name: "repin hold rejects negative observed traffic", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(2, -1), traffic: false, residue: false},
+		{name: "repin hold rejects out of range observed traffic", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(2, 101), traffic: false, residue: false},
+		{name: "repin hold rejects missing current step", phase: reportv1alpha1.RolloutPhasePaused, status: heldStatus(3, 30), traffic: false, residue: false},
 	}
 
 	for _, tt := range tests {
@@ -119,6 +134,39 @@ func TestObservedTrafficAndPhaseResidue(t *testing.T) {
 			assert.Equal(t, tt.residue, canaryevidence.ValidPhaseStepResidue(tt.phase, steps, tt.status))
 		})
 	}
+}
+
+func TestPreStepHoldBindsTypedTrafficInEverySupportedPhase(t *testing.T) {
+	status := heldStatus(2, 30)
+	traffic := []omev1beta1.ComponentTrafficTarget{
+		{RevisionName: "chat-engine-rev-aaaaaaaa", Percent: 70},
+		{RevisionName: "chat-engine-rev-bbbbbbbb", Percent: 30},
+	}
+	for _, phase := range []reportv1alpha1.RolloutPhase{
+		reportv1alpha1.RolloutPhasePending,
+		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhaseFailed,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			assert.True(t, canaryevidence.StatusBindsTraffic(phase, status))
+			assert.True(t, canaryevidence.ActiveTrafficMatches(
+				"chat", omev1beta1.EngineComponent, phase, status, traffic,
+			))
+		})
+	}
+
+	assert.False(t, canaryevidence.StatusBindsTraffic(reportv1alpha1.RolloutPhasePending, canaryStatus(0, 20)))
+	assert.False(t, canaryevidence.ActiveTrafficMatches(
+		"chat", omev1beta1.EngineComponent, reportv1alpha1.RolloutPhasePending,
+		status, nil,
+	))
+	assert.False(t, canaryevidence.ActiveTrafficMatches(
+		"chat", omev1beta1.EngineComponent, reportv1alpha1.RolloutPhasePending,
+		status, []omev1beta1.ComponentTrafficTarget{
+			{RevisionName: "chat-engine-rev-aaaaaaaa", Percent: 60},
+			{RevisionName: "chat-engine-rev-bbbbbbbb", Percent: 40},
+		},
+	))
 }
 
 func TestActiveTrafficMatchesOneExactEpoch(t *testing.T) {
@@ -184,6 +232,9 @@ func TestCompletedStatusMatchesSentinelAndTrafficTogether(t *testing.T) {
 	assert.True(t, canaryevidence.ValidCompletedStep(steps[1]))
 	assert.True(t, canaryevidence.CompletedTrafficMatches("chat", omev1beta1.EngineComponent, "bbbbbbbb", traffic))
 	assert.True(t, canaryevidence.CompletedStatusMatches("chat", omev1beta1.EngineComponent, steps, status, traffic))
+	held := *status
+	held.PreStepHold = true
+	assert.False(t, canaryevidence.CompletedStatusMatches("chat", omev1beta1.EngineComponent, steps, &held, traffic))
 
 	active := *status
 	active.CurrentStep = 0
@@ -204,6 +255,12 @@ func canaryStatus(step, traffic int32) *omev1beta1.CanaryStatus {
 		StableRevisionHash: "aaaaaaaa", CanaryRevisionHash: "bbbbbbbb",
 		CurrentStep: step, ObservedTrafficWeight: traffic,
 	}
+}
+
+func heldStatus(step, traffic int32) *omev1beta1.CanaryStatus {
+	status := canaryStatus(step, traffic)
+	status.PreStepHold = true
+	return status
 }
 
 func promotedStatus(step, traffic int32, promotedThrough string) *omev1beta1.CanaryStatus {

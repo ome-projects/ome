@@ -437,7 +437,7 @@ func (b *projector) validCanaryEpoch(
 		!canaryevidence.ValidPhaseStepResidue(phase, steps, status) {
 		return false
 	}
-	if canaryevidence.PhaseBindsTraffic(phase) &&
+	if canaryevidence.StatusBindsTraffic(phase, status) &&
 		!canaryevidence.ActiveTrafficMatches(b.isvc.Name, primary, phase, status, component.Traffic) {
 		return false
 	}

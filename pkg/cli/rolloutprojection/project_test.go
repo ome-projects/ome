@@ -1042,6 +1042,66 @@ func TestProjectRejectsControllerImpossibleCanaryStateMatrix(t *testing.T) {
 	}
 }
 
+func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
+	tests := []struct {
+		name      string
+		phase     omev1beta1.RolloutPhase
+		wantState reportv1alpha1.RolloutState
+	}{
+		{name: "capacity pending", phase: omev1beta1.RolloutPhasePending, wantState: reportv1alpha1.RolloutStateInProgress},
+		{name: "ready and paused", phase: omev1beta1.RolloutPhasePaused, wantState: reportv1alpha1.RolloutStatePaused},
+		{name: "capacity wait failed", phase: omev1beta1.RolloutPhaseFailed, wantState: reportv1alpha1.RolloutStateFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := activeCanaryInferenceService()
+			// clampCanary repinned a [50, 100] rollout while 50% was
+			// programmed to the shorter, final-only [100] ladder.
+			isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+				Capacity: intstr.FromString("100%"), Traffic: 100,
+			}}
+			isvc.Status.Canary.PreStepHold = true
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = tt.phase
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+
+			require.NoError(t, err)
+			assertStatusDerivedSummary(t, got, tt.wantState)
+			require.Len(t, got.Content.Groups, 1)
+			require.NotNil(t, got.Content.Groups[0].Step)
+			assert.Equal(t, int32(0), got.Content.Groups[0].Step.Index)
+			assert.Equal(t, int32(1), got.Content.Groups[0].Step.Total)
+			assert.Equal(t, int32(100), got.Content.Groups[0].Step.TargetTraffic)
+			assert.Equal(t, int32(50), got.Content.Groups[0].Step.ObservedTraffic)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+				Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+			})
+		})
+	}
+}
+
+func TestProjectPreStepHoldRequiresTypedTrafficEvidence(t *testing.T) {
+	isvc := activeCanaryInferenceService()
+	isvc.Spec.Rollout.Groups[0].Canary.Steps = []omev1beta1.RolloutGroupStep{{
+		Capacity: intstr.FromString("100%"), Traffic: 100,
+	}}
+	isvc.Status.Canary.PreStepHold = true
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.RolloutPhase = omev1beta1.RolloutPhasePending
+	component.Traffic = nil
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+	got, err := rolloutprojection.Project(isvc, fixedClock())
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.RolloutStateUnknown, got.Content.Summary.State)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+		Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+	})
+}
+
 func TestProjectAcceptsEqualWeightFinalStepAdvanceEdge(t *testing.T) {
 	isvc := activeCanaryInferenceService()
 	isvc.Spec.Rollout.Groups[0].Canary.Steps[0].Traffic = 100
