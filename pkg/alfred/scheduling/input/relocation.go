@@ -69,7 +69,7 @@ func cloneMembers(s *Snapshot, source Source, members []podMember, requestID str
 		pod.DeletionTimestamp = nil
 		pod.DeletionGracePeriodSeconds = nil
 		pod.ManagedFields = nil
-		pod.SelfLink = ""
+		pod.SetSelfLink("")
 		pod.Spec.NodeName = ""
 		pod.Status = corev1.PodStatus{}
 		pod.Labels[labelInstanceIndex] = identity.index
