@@ -172,6 +172,118 @@ func TestSyntheticInstanceIdentityAvoidsLiveCohortIndexes(t *testing.T) {
 	}
 }
 
+func TestBuildRequestRejectsAmbiguousPrivateSelectorScope(t *testing.T) {
+	for _, kind := range []string{"label", "expression", "match-key", "mismatch-key", "scoped-negative", "incarnation", "spread", "spread-match-key"} {
+		t.Run(kind, func(t *testing.T) {
+			objects, source := validSingleSourceObjects()
+			pod := sourcePods(objects)[0]
+			term := corev1.PodAffinityTerm{TopologyKey: "topology.kubernetes.io/zone", LabelSelector: &metav1.LabelSelector{}}
+			switch kind {
+			case "label", "spread":
+				term.LabelSelector.MatchLabels = map[string]string{labelInstanceIndex: "2"}
+			case "expression":
+				term.LabelSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: labelInstanceIndex, Operator: metav1.LabelSelectorOpIn, Values: []string{"2"}}}
+			case "match-key":
+				term.MatchLabelKeys = []string{labelInstanceIndex}
+			case "mismatch-key":
+				term.MismatchLabelKeys = []string{labelInstanceIndex}
+			case "scoped-negative":
+				term.LabelSelector.MatchLabels = map[string]string{labelInferenceService: "svc", labelComponent: "engine"}
+				term.LabelSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: labelInstanceIndex, Operator: metav1.LabelSelectorOpNotIn, Values: []string{"2"}}}
+			case "spread-match-key":
+				term.MatchLabelKeys = []string{labelInstanceIndex}
+			case "incarnation":
+				term.LabelSelector.MatchLabels = map[string]string{labelInferenceService: "svc", labelComponent: "engine", labelInstanceIncarnation: "7"}
+			}
+			if kind == "spread" || kind == "spread-match-key" {
+				pod.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{MaxSkew: 1, TopologyKey: term.TopologyKey, WhenUnsatisfiable: corev1.DoNotSchedule, LabelSelector: term.LabelSelector, MatchLabelKeys: term.MatchLabelKeys}}
+			} else {
+				pod.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{term}}}
+			}
+			// A same-namespace Pod can share an index or incarnation without
+			// belonging to the source cohort. Rewriting a broad selector must
+			// not silently remove this Pod from its scheduling constraints.
+			other := readySourcePod("other-source", "other-source-uid", "target-a", v1beta1.RunnerNameDefault, 0, "default-scheduler")
+			other.Labels[labelInferenceService] = "other-service"
+			other.OwnerReferences = nil
+			if kind == "incarnation" {
+				other.Labels[labelInferenceService] = "svc"
+				other.Labels[labelInstanceIndex] = "3"
+			}
+			objects = append(objects, other)
+			snap := captureSourceFixture(t, objects)
+			_, err := BuildRequest(snap, source, testProfiles(false), "ambiguous", captureTime.Add(time.Second), time.Minute)
+			if err == nil || !strings.Contains(err.Error(), "identity") {
+				t.Fatalf("BuildRequest() error = %v, want ambiguous identity rejection", err)
+			}
+		})
+	}
+}
+
+func TestBuildRequestRetargetsScopedPrivateSelectors(t *testing.T) {
+	for _, kind := range []string{"label", "expression", "match-key", "spread-match-key", "pod-group", "group-match-key"} {
+		t.Run(kind, func(t *testing.T) {
+			objects, source := validGangSourceObjects()
+			leader := sourcePods(objects)[0]
+			term := corev1.PodAffinityTerm{
+				TopologyKey: "topology.kubernetes.io/zone",
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					labelInferenceService: "svc", labelComponent: "engine",
+				}},
+			}
+			switch kind {
+			case "label":
+				term.LabelSelector.MatchLabels[labelInstanceIndex] = "2"
+			case "expression":
+				term.LabelSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: labelInstanceIndex, Operator: metav1.LabelSelectorOpIn, Values: []string{"2"}}}
+			case "match-key", "spread-match-key":
+				term.MatchLabelKeys = []string{labelInstanceIndex}
+			case "pod-group":
+				term.LabelSelector.MatchLabels = map[string]string{labelPodGroup: "svc-engine-2"}
+			case "group-match-key":
+				term.LabelSelector.MatchLabels = nil
+				term.MatchLabelKeys = []string{labelPodGroup}
+			}
+			if kind == "spread-match-key" {
+				leader.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{MaxSkew: 1, TopologyKey: term.TopologyKey, WhenUnsatisfiable: corev1.DoNotSchedule, LabelSelector: term.LabelSelector, MatchLabelKeys: term.MatchLabelKeys}}
+			} else {
+				leader.Spec.Affinity = &corev1.Affinity{PodAffinity: &corev1.PodAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{term}}}
+			}
+			snap := captureSourceFixture(t, objects)
+			request, err := BuildRequest(snap, source, testProfiles(true), "scoped", captureTime.Add(time.Second), time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement := podByRunner(t, request.ReplacementPods, string(v1beta1.RunnerNameLeader))
+			if kind == "spread-match-key" {
+				if !reflect.DeepEqual(replacement.Spec.TopologySpreadConstraints[0].MatchLabelKeys, term.MatchLabelKeys) {
+					t.Fatal("dynamic topology spread key changed")
+				}
+				return
+			}
+			got := replacement.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+			switch kind {
+			case "label":
+				if got.LabelSelector.MatchLabels[labelInstanceIndex] != replacement.Labels[labelInstanceIndex] {
+					t.Fatal("static index selector did not follow replacement")
+				}
+			case "expression":
+				if got.LabelSelector.MatchExpressions[0].Values[0] != replacement.Labels[labelInstanceIndex] {
+					t.Fatal("index expression did not follow replacement")
+				}
+			case "pod-group":
+				if got.LabelSelector.MatchLabels[labelPodGroup] != replacement.Labels[labelPodGroup] {
+					t.Fatal("group selector did not follow replacement")
+				}
+			default:
+				if !reflect.DeepEqual(got.MatchLabelKeys, term.MatchLabelKeys) {
+					t.Fatal("dynamic affinity key changed")
+				}
+			}
+		})
+	}
+}
+
 func TestBuildRequestRejectsUntrustworthySourceState(t *testing.T) {
 	tests := []struct {
 		name    string

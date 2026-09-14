@@ -1137,9 +1137,10 @@ Each Candidate carries `HintTargetNodes`: a ranked, *advisory* list of nodes the
    - **Obvious required constraints fail closed** — cheap filtering may remove
      nodes that plainly violate resources, selectors, taints/tolerations, or
      storage reachability. This is an optimization only. The matching scheduler
-     worker is authoritative for predicted feasibility and must evaluate the
-     fully rendered/admitted Pods through its complete configured scheduling
-     cycle.
+     worker determines predicted feasibility by evaluating Alfred's checked,
+     simulation-only copies of observed source Pods through its complete
+     configured scheduling cycle. This is not a reservation or a guarantee
+     about future replacements.
    - **Model not available** — storage-aware, switching on `ModelAvailability.Backend`. *Per-node models*: the target must have the model ready, per `BaseModel.Status.NodesReady` or the node label `models.ome.io/{ns}.basemodel.{name}=Ready` (OEP-0007 Q-017) — migrating to a node that must first pull a multi-hundred-GB model defeats the purpose, and the pod's own readiness `nodeSelector` would block the placement anyway. *PVC-backed models*: `NodesReady` is intentionally empty and must **not** be used as a filter; the target set is the nodes that can mount the volume — for RWX/ROX storage, any node satisfying the PVC's CSI topology, with no model pull ever needed. *RWO (and RWOP) PVCs pin the workload*: the volume attaches to one node at a time and the source pod still holds it while a surge replacement starts, so no surge-shaped mechanism can run — the candidate is downgraded to advisory with reason `VolumePinned`.
    - **Unhealthy or cordoned**: excluded. Excluding unhealthy nodes from placement is existing defragmentation behavior — and it is the seam Policy #2 builds on: a node Policy #1 already refuses as a *target* is exactly the kind of node Policy #2 will reason about as a *source* to drain. Nodes inside their post-evacuation **suspicion window** are excluded too, even after the condition clears (see Policy #2's "stay suspicious" rule). (Mechanism for Policy #2 in its own section.)
    - **CA scale-down in progress**: a node with `scale-down-disabled` being processed is excluded, so Alfred and the cluster-autoscaler do not fight over it.
@@ -2569,7 +2570,7 @@ New unit coverage for the engine refactor:
     scheduler state.
 16. **Bounded work and invalidation.** Verify cheap filters cap scheduler calls
     at the configured top-K/per-cycle budget; relevant Pod, Node, storage,
-    scheduling-object, rendered-spec, and profile changes invalidate cached
+    scheduling-object, observed source-spec, and profile changes invalidate cached
     results; expired results are never admitted. Record benchmark evidence before
     claiming any throughput or latency improvement.
 
@@ -2658,14 +2659,17 @@ New integration coverage for the multi-policy engine:
     (replica count changing); verify no Alfred policy actuates against its
     workload until scaling settles. This is the integration-level twin of unit
     test 4.
-27. **Matching-scheduler differential suite.** Feed the isolated worker actual
-    fully rendered/admitted replacements and the same snapshot objects as a real
-    matching scheduler. Compare feasible/infeasible and whole-gang outcomes for
+27. **Matching-scheduler differential suite.** Feed the isolated worker Alfred's
+    predictive copies of checked observed source Pods and the same snapshot
+    objects as a matching scheduler in an isolated test environment. Compare
+    feasible/infeasible and whole-gang outcomes for
     tolerations, selectors, required affinity/anti-affinity, storage topology,
     topology spread, source exclusions, and atomic OME gangs through
-    Reserve/Permit. Verify admission/defaulting changes trigger profile
-    re-selection, stale results are rejected, source occupancy is retained, and
-    neither path performs a live bind, eviction, patch, or delete.
+    Reserve/Permit. Verify observed scheduler-name changes trigger exact profile
+    re-selection, stale or ambiguous input is rejected, source occupancy is
+    retained, and neither path performs a live bind, eviction, patch, or delete.
+    Future workload/admission changes remain prediction uncertainty, not a
+    requirement for an owner-side preview API.
 28. **PVC-backed model migration.** An ISVC backed by an RWX (or ROX) PVC model
     migrates with no model-ready filtering — verify the target set is the
     CSI-topology-reachable nodes and the migration completes with no model
@@ -2742,9 +2746,10 @@ the **OEP-0013 read-only seam**.
   leader failover.
 - A fresh, wire-compatible OMENative capability Lease gates every executable
   Candidate; CRD and status presence alone fail the execution-readiness test.
-- Every executable Candidate is simulated using actual fully rendered/admitted
-  replacement Pods by a worker that matches the effective scheduler's immutable
-  version/profile/plugins/arguments/feature gates. Whole OME gangs complete
+- Every executable Candidate is simulated using Alfred-owned predictive copies
+  of checked observed source Pods by a worker that matches the effective
+  scheduler's immutable version/profile/plugins/arguments/feature gates.
+  No owner-side rendering/admission preview is required. Whole OME gangs complete
   reservation and Permit simulation while sources remain occupied; no worker,
   unsupported input, stale state, or profile mismatch fails open.
 - `RawDeployment` and LWS are advisory-only. A future Raw executor is additive

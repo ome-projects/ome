@@ -2,6 +2,7 @@ package input
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -104,24 +105,24 @@ func normalizePrivateSelectors(pod *corev1.Pod, replacements map[string]string) 
 	if pod.Spec.Affinity != nil {
 		if pod.Spec.Affinity.PodAffinity != nil {
 			for i := range pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod.Namespace, replacements); err != nil {
+				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod, replacements); err != nil {
 					return err
 				}
 			}
 			for i := range pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
-				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, pod.Namespace, replacements); err != nil {
+				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, pod, replacements); err != nil {
 					return err
 				}
 			}
 		}
 		if pod.Spec.Affinity.PodAntiAffinity != nil {
 			for i := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod.Namespace, replacements); err != nil {
+				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod, replacements); err != nil {
 					return err
 				}
 			}
 			for i := range pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
-				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, pod.Namespace, replacements); err != nil {
+				if err := normalizeAffinityTerm(&pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, pod, replacements); err != nil {
 					return err
 				}
 			}
@@ -129,6 +130,11 @@ func normalizePrivateSelectors(pod *corev1.Pod, replacements map[string]string) 
 	}
 	for i := range pod.Spec.TopologySpreadConstraints {
 		constraint := &pod.Spec.TopologySpreadConstraints[i]
+		if selectorUsesPrivateIdentity(constraint.LabelSelector, constraint.MatchLabelKeys) {
+			if err := validatePrivateSelectorScope(constraint.LabelSelector, constraint.MatchLabelKeys, pod, replacements); err != nil {
+				return fmt.Errorf("topology spread identity: %w", err)
+			}
+		}
 		if err := normalizeLabelSelector(constraint.LabelSelector, replacements); err != nil {
 			return fmt.Errorf("topology spread identity: %w", err)
 		}
@@ -139,10 +145,15 @@ func normalizePrivateSelectors(pod *corev1.Pod, replacements map[string]string) 
 	return nil
 }
 
-func normalizeAffinityTerm(term *corev1.PodAffinityTerm, namespace string, replacements map[string]string) error {
+func normalizeAffinityTerm(term *corev1.PodAffinityTerm, pod *corev1.Pod, replacements map[string]string) error {
 	private := selectorUsesPrivateIdentity(term.LabelSelector, term.MatchLabelKeys, term.MismatchLabelKeys)
-	if private && (term.NamespaceSelector != nil || hasForeignNamespace(term.Namespaces, namespace)) {
+	if private && (term.NamespaceSelector != nil || hasForeignNamespace(term.Namespaces, pod.Namespace)) {
 		return fmt.Errorf("cross-namespace identity selector is ambiguous")
+	}
+	if private {
+		if err := validatePrivateSelectorScope(term.LabelSelector, term.MatchLabelKeys, pod, replacements); err != nil {
+			return fmt.Errorf("affinity identity: %w", err)
+		}
 	}
 	if err := normalizeLabelSelector(term.LabelSelector, replacements); err != nil {
 		return fmt.Errorf("affinity identity: %w", err)
@@ -154,6 +165,41 @@ func normalizeAffinityTerm(term *corev1.PodAffinityTerm, namespace string, repla
 		return fmt.Errorf("affinity mismatchLabelKeys identity: %w", err)
 	}
 	return nil
+}
+
+// Private indices and incarnations are not namespace-wide identities. Only
+// rewrite a selector when a positive constraint ties it to this PodGroup or
+// this service/component instance. Negative and existence constraints alone
+// cannot establish that scope, even if their values equal the source's labels.
+func validatePrivateSelectorScope(selector *metav1.LabelSelector, matchKeys []string, pod *corev1.Pod, replacements map[string]string) error {
+	selectsPrivate := func(key string) bool {
+		value := sourceIdentityValue(replacements, key)
+		return value != "" && (selectorSelectsValue(selector, key, value) || slices.Contains(matchKeys, key))
+	}
+	if selectsPrivate(labelPodGroup) {
+		return nil
+	}
+	if selectorSelectsValue(selector, labelInferenceService, pod.Labels[labelInferenceService]) &&
+		selectorSelectsValue(selector, labelComponent, pod.Labels[labelComponent]) && selectsPrivate(labelInstanceIndex) {
+		return nil
+	}
+	return fmt.Errorf("private identity selector is not scoped to the source cohort")
+}
+
+func selectorSelectsValue(selector *metav1.LabelSelector, key, value string) bool {
+	if selector == nil || value == "" {
+		return false
+	}
+	if selector.MatchLabels[key] == value {
+		return true
+	}
+	for _, requirement := range selector.MatchExpressions {
+		if requirement.Key == key && requirement.Operator == metav1.LabelSelectorOpIn &&
+			len(requirement.Values) == 1 && requirement.Values[0] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func selectorUsesPrivateIdentity(selector *metav1.LabelSelector, keySets ...[]string) bool {
