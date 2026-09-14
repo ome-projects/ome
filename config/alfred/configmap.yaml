@@ -19,8 +19,8 @@ data:
     # Loop cadence.
     decisionLoopInterval: 5m
     observationLoopInterval: 30s
-    # Advances the next decision tick; never interrupts a pass ([] disables).
-    earlyTickOn: [NodeConditionChange]
+    # Fresh supplemental passes; never interrupt or postpone cadence ([] disables).
+    earlyTickOn: [NodeConditionChange, NodeMaintenanceChange]
 
     # Scheduler simulation is mandatory before execution. Profiles are keyed by
     # the effective replacement Pod schedulerName. Workers are opt-in through
@@ -51,6 +51,16 @@ data:
         signalOnly: false
         healthCooldownFloorMinutes: 5
         nodeSuspicionWindowMinutes: 30
+        # Explicit planned-work signals, separate from unhealthy conditions.
+        # Empty by default: arbitrary labels and taints do not request evacuation.
+        maintenance:
+          triggers: []
+          # - name: patching-label
+          #   label: {key: maintenance.example.com/state, value: patching}
+          # - name: patching-taint
+          #   taint: {key: maintenance.example.com/patching, value: "true", effect: NoSchedule}
+          # - name: patching-condition
+          #   condition: {type: Patching, status: "True"}
 
     # Per-workload defaults; annotations on an InferenceService win over these.
     defaultMovable: true

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -47,12 +48,16 @@ type NodeOption func(*snapshot.Node)
 // NodeUnhealthy marks the node unhealthy with the given trigger conditions
 // (GpuUnhealthy when none given).
 func NodeUnhealthy(conditions ...string) NodeOption {
+	conditionTypes := append([]string(nil), conditions...)
+	if len(conditionTypes) == 0 {
+		conditionTypes = []string{"GpuUnhealthy"}
+	}
+	sort.Strings(conditionTypes)
 	return func(n *snapshot.Node) {
-		n.Unhealthy = true
-		if len(conditions) == 0 {
-			conditions = []string{"GpuUnhealthy"}
+		n.Health = snapshot.NodeHealthObservation{State: snapshot.NodeHealthUnhealthy}
+		for _, condition := range conditionTypes {
+			n.Health.Conditions = append(n.Health.Conditions, snapshot.NodeConditionObservation{Type: corev1.NodeConditionType(condition), Status: corev1.ConditionTrue, LastTransitionTime: ReferenceTime})
 		}
-		n.UnhealthyConditions = append(n.UnhealthyConditions, conditions...)
 	}
 }
 
@@ -69,7 +74,38 @@ func NodeScaleDownDisabled() NodeOption { return func(n *snapshot.Node) { n.Scal
 func NodeScaleDownMarked() NodeOption { return func(n *snapshot.Node) { n.ScaleDownMarked = true } }
 
 // NodeSuspect puts the node inside a suspicion window.
-func NodeSuspect() NodeOption { return func(n *snapshot.Node) { n.Suspect = true } }
+func NodeSuspect() NodeOption {
+	until := ReferenceTime.Add(snapshot.DefaultNodeSuspicionWindow)
+	return NodeHealth(snapshot.NodeHealthObservation{
+		State:        snapshot.NodeHealthSuspect,
+		Conditions:   []snapshot.NodeConditionObservation{{Type: "GpuUnhealthy", Status: corev1.ConditionFalse, LastTransitionTime: ReferenceTime}},
+		SuspectUntil: &until,
+	})
+}
+
+// NodeHealth sets a complete structured health observation.
+func NodeHealth(health snapshot.NodeHealthObservation) NodeOption {
+	return func(n *snapshot.Node) { n.Health = health }
+}
+
+// NodeUnknown marks a node quarantined without asserting a confirmed failure.
+func NodeUnknown() NodeOption {
+	return NodeHealth(snapshot.NodeHealthObservation{
+		State:      snapshot.NodeHealthUnknown,
+		Conditions: []snapshot.NodeConditionObservation{{Type: "GpuUnhealthy", Status: corev1.ConditionUnknown, LastTransitionTime: ReferenceTime}},
+	})
+}
+
+// NodeMaintenance marks a planned-work request without changing node health.
+func NodeMaintenance(triggers ...string) NodeOption {
+	return func(n *snapshot.Node) {
+		if len(triggers) == 0 {
+			triggers = []string{"maintenance"}
+		}
+		n.Maintenance = snapshot.NodeMaintenanceObservation{Requested: true, Triggers: append([]string(nil), triggers...)}
+		sort.Strings(n.Maintenance.Triggers)
+	}
+}
 
 // NodeLabels merges labels onto the node.
 func NodeLabels(labels map[string]string) NodeOption {
@@ -91,6 +127,8 @@ func (b *SnapshotBuilder) WithNode(name, pool string, totalGPUs int64, opts ...N
 	}
 	n := &snapshot.Node{
 		Name:        name,
+		UID:         types.UID("synthetic-node-" + name),
+		Health:      snapshot.NodeHealthObservation{State: snapshot.NodeHealthClear},
 		Labels:      map[string]string{},
 		GPUPool:     pool,
 		GPUResource: constants.NvidiaGPUResourceType,

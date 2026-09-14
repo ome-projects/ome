@@ -8,7 +8,6 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
-	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -172,7 +171,7 @@ func evaluateComponent(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compon
 	// Component-wide downgrades, most fundamental first; one advisory, not
 	// a stack.
 	from := componentPrimaryNode(comp)
-	if reason := modelMovabilityReason(ctx.snap, w); reason != "" {
+	if reason := policy.ModelAdvisoryReason(ctx.snap, w); reason != "" {
 		if componentPrimaryPool(ctx.snap, comp) != ctx.pool {
 			return nil
 		}
@@ -192,7 +191,12 @@ func evaluateComponent(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compon
 				policy.AdvisoryMigrationSurfaceDisabled, primaryNode(inst), 0))
 			continue
 		}
-		if reason := omenativeExecutionEligibility(ctx.snap, ctx.cfg, w, comp, inst, ctx.snap.Timestamp); reason != "" {
+		if inCooldown(w, ctx.cfg, ctx.snap.Timestamp) {
+			out = append(out, advisory(w, comp, inst.Index,
+				policy.AdvisoryOMENativeStateIneligible, primaryNode(inst), 0))
+			continue
+		}
+		if reason := policy.OMENativeEligibility(ctx.snap, w, comp, inst); reason != "" {
 			out = append(out, advisory(w, comp, inst.Index, reason, primaryNode(inst), 0))
 			continue
 		}
@@ -228,31 +232,21 @@ func rawAdvisories(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Component)
 func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Component,
 	inst *snapshot.Instance) (policy.Candidate, bool) {
 
-	prints := instanceFootprints(inst)
-	if len(prints) == 0 {
-		return policy.Candidate{}, false
-	}
 	from := primaryNode(inst)
-
-	exclude := make(map[string]bool, len(inst.NodesSet))
-	for node := range inst.NodesSet {
-		exclude[node] = true
-	}
-	// Rank targets that fit the SMALLEST member pod: a multi-pod
-	// instance's pods land on different targets, and excluding nodes that
-	// only fit the smaller pods would fabricate NoSurgeHeadroom.
-	// placeThenFree re-checks each footprint's size per target; for
-	// single-pod instances min and max coincide.
-	minPod := prints[len(prints)-1].gpus
-	ranked := rankTargets(ctx.snap, ctx.cfg, ctx.bins, w, minPod, exclude)
-
-	after, _, ok := placeThenFree(ctx.bins, prints, ranked)
+	plan, ok := policy.PlanAtomicSurge(ctx.snap, ctx.cfg, w, inst)
 	if !ok {
 		// Not dispatchable: without surge headroom the migration would
 		// stall in SurgePending until timeout.
 		c := advisory(w, comp, inst.Index, policy.AdvisoryNoSurgeHeadroom, from, inst.TotalGPUs)
 		c.SurgeShaped = true
 		return c, true
+	}
+	after, ok := simulateSurgePlan(ctx.bins, plan.Moves)
+	if !ok {
+		// A shared plan can only name schedulable pool targets with enough
+		// capacity. Keep this consumer fail-closed if that contract is ever
+		// violated rather than scoring invented capacity.
+		return policy.Candidate{}, false
 	}
 
 	benefit := ctx.before - weightedFrag(after, ctx.ladder, ctx.weights, ctx.totalFree)
@@ -278,15 +272,6 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		}
 	}
 
-	// Reporting retains the historical bounded ranked hints, while arbitration
-	// replays the complete ranked target set used by the successful simulation.
-	// The latter includes every proof node plus feasible alternates if an earlier
-	// same-cycle admission consumes one of the preferred targets.
-	placementTargets := deduplicateTargets(ranked)
-	hints := placementTargets
-	if len(hints) > maxHintTargets {
-		hints = hints[:maxHintTargets]
-	}
 	return policy.Candidate{
 		Policy:               PolicyName,
 		Workload:             w.NamespacedName,
@@ -295,8 +280,8 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		Mode:                 comp.DeploymentMode,
 		Reason:               policy.ReasonFragmentation,
 		FromNode:             from,
-		HintTargetNodes:      append([]string(nil), hints...),
-		PlacementTargetNodes: append([]string(nil), placementTargets...),
+		HintTargetNodes:      append([]string(nil), plan.HintTargetNodes...),
+		PlacementTargetNodes: append([]string(nil), plan.PlacementTargetNodes...),
 		Executable:           true,
 		SurgeShaped:          true,
 		FootprintGPUs:        inst.TotalGPUs,
@@ -305,83 +290,6 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		Score:                score,
 		Emergency:            emergency,
 	}, true
-}
-
-func deduplicateTargets(targets []string) []string {
-	seen := make(map[string]struct{}, len(targets))
-	out := make([]string, 0, len(targets))
-	for _, target := range targets {
-		if _, ok := seen[target]; ok {
-			continue
-		}
-		seen[target] = struct{}{}
-		out = append(out, target)
-	}
-	return out
-}
-
-// omenativeExecutionEligibility is the single fail-closed Alpha execution
-// baseline shared by candidate classification and executable repacking. It
-// returns the first stable advisory reason in deterministic check order; an
-// empty reason is the only executable result.
-func omenativeExecutionEligibility(snap *snapshot.ClusterSnapshot, cfg *config.Config,
-	w *snapshot.Workload, comp *snapshot.Component, inst *snapshot.Instance, now time.Time) string {
-
-	if !w.Movable || !w.MigrationStateValid || len(w.MalformedRequests) > 0 ||
-		len(w.ActiveMigrations) > 0 || inCooldown(w, cfg, now) {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	if comp.IR == nil || !comp.StatusFresh || !comp.ObservationValid {
-		return policy.AdvisoryOMENativeObservationInvalid
-	}
-	ir := comp.IR
-	if ir.Spec.Paused {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	if ir.Spec.Lifecycle != nil && ir.Spec.Lifecycle.MigrationPolicy != nil &&
-		ir.Spec.Lifecycle.MigrationPolicy.Mode == v1beta1.MigrationPolicyModeNever {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	desired := int32(1)
-	if ir.Spec.Replicas != nil {
-		desired = *ir.Spec.Replicas
-	}
-	status := &ir.Status
-	if desired <= 0 || int32(len(comp.Instances)) != desired || status.Replicas != desired || status.ReadyReplicas != desired ||
-		status.ServingReplicas != desired || status.AvailableReplicas != desired ||
-		status.UpdatedReplicas != desired || status.UpdatedReadyReplicas != desired {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	if status.CurrentRevision == "" || status.UpdateRevision == "" ||
-		status.CurrentRevision != status.UpdateRevision {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	// Structured capability is the sole authorization source.
-	if !snap.OMENativeExecutor.Available {
-		return policy.AdvisoryOMENativeUnavailable
-	}
-	if !inst.ObservationValid {
-		return policy.AdvisoryOMENativeObservationInvalid
-	}
-	if !inst.Admitted || inst.Phase != v1beta1.OMENativeInstanceReady || inst.Operation != nil {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	if inst.DesiredPods <= 0 || inst.StatusPods != inst.DesiredPods ||
-		inst.ObservedPods != inst.DesiredPods || int32(len(inst.Pods)) != inst.DesiredPods ||
-		inst.ReadyPods != inst.DesiredPods || inst.ServingPods != inst.DesiredPods ||
-		inst.AvailablePods != inst.DesiredPods {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	if inst.RunningRevision == "" || inst.RunningRevision != status.CurrentRevision ||
-		inst.TargetRevision != "" {
-		return policy.AdvisoryOMENativeStateIneligible
-	}
-	for i := range inst.Pods {
-		if !inst.Pods[i].Ready || inst.Pods[i].Terminating {
-			return policy.AdvisoryOMENativeStateIneligible
-		}
-	}
-	return ""
 }
 
 // unblocksOverAgePending reports whether the simulated after-state seats a
@@ -543,23 +451,6 @@ func sortedComponents(w *snapshot.Workload) []*snapshot.Component {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Type < out[j].Type })
 	return out
-}
-
-// modelMovabilityReason is the shared fail-closed model truth for candidate
-// classification and executable repacking. An empty reason is the only model
-// state that may move.
-func modelMovabilityReason(snap *snapshot.ClusterSnapshot, w *snapshot.Workload) string {
-	if w.ModelKey.Zero() {
-		return ""
-	}
-	avail, ok := snap.Models[w.ModelKey]
-	if !ok || avail.ResolveError != "" {
-		return policy.AdvisoryModelUnresolved
-	}
-	if avail.VolumePinned {
-		return policy.AdvisoryVolumePinned
-	}
-	return ""
 }
 
 func hasTerminating(inst *snapshot.Instance) bool {

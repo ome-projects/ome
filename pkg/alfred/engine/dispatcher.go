@@ -204,7 +204,21 @@ func withholdDecisions(ds []Decision, reason string) []Decision {
 }
 
 func entryCandidate(e dispatchEntry) policy.Candidate {
-	return policy.Candidate{Policy: "migration-dispatch", Workload: e.Workload, Component: e.Component, Instance: e.Instance, Mode: constants.OMENative, FromNode: e.FromNode, Executable: true, SurgeShaped: true}
+	c := policy.Candidate{Policy: "migration-dispatch", Workload: e.Workload, Component: e.Component, Instance: e.Instance, Mode: constants.OMENative, FromNode: e.FromNode, Executable: true, SurgeShaped: true}
+	// The immutable public request already retains the original cause. Recover
+	// it without changing the journal schema, so a restarted leader cannot
+	// retry maintenance under another policy's health cooldown exemption.
+	if req, err := requestForEntry(e); err == nil {
+		c.Reason = req.Reason
+		c.HintTargetNodes = append([]string(nil), req.HintTargetNodes...)
+		switch req.Reason {
+		case policy.ReasonNodeUnhealthy, policy.ReasonNodeMaintenance:
+			c.Policy = "nodehealth"
+		case policy.ReasonFragmentation:
+			c.Policy = "defragmentation"
+		}
+	}
+	return c
 }
 
 func reportDispatchEntry(cs []policy.Candidate, ds []Decision, e dispatchEntry) ([]policy.Candidate, []Decision) {
@@ -215,14 +229,14 @@ func reportDispatchEntry(cs []policy.Candidate, ds []Decision, e dispatchEntry) 
 	}
 	decision := Decision{Candidate: c, Admitted: true, DispatchStatus: status, RequestUUID: e.UUID, DispatchReason: e.Reason}
 	for i := range ds {
-		if sameDispatchSource(ds[i].Candidate, c) {
+		if sameDispatchSource(ds[i].Candidate, c) && sameDispatchCause(ds[i].Candidate, c) {
 			decision.Candidate = ds[i].Candidate
 			ds[i] = decision
 			return cs, ds
 		}
 	}
 	for _, existing := range cs {
-		if sameDispatchSource(existing, c) {
+		if sameDispatchSource(existing, c) && sameDispatchCause(existing, c) {
 			decision.Candidate = existing
 			return cs, append(ds, decision)
 		}
@@ -232,4 +246,8 @@ func reportDispatchEntry(cs []policy.Candidate, ds []Decision, e dispatchEntry) 
 
 func sameDispatchSource(a, b policy.Candidate) bool {
 	return a.Workload == b.Workload && a.Component == b.Component && a.Instance == b.Instance && a.FromNode == b.FromNode
+}
+
+func sameDispatchCause(a, b policy.Candidate) bool {
+	return a.Policy == b.Policy && a.Reason == b.Reason
 }

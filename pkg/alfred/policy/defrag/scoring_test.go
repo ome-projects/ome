@@ -155,6 +155,18 @@ func TestMaxOverPools(t *testing.T) {
 
 // TestUnschedulableFreeCapacityIsAMirage: free GPUs on an unhealthy node
 // must not count as slots — they cannot seat anything.
+func TestNodeAvailabilityFiltersScoringBins(t *testing.T) {
+	for _, state := range []snapshot.NodeHealthState{snapshot.NodeHealthClear, snapshot.NodeHealthUnknown, snapshot.NodeHealthSuspect, snapshot.NodeHealthUnhealthy} {
+		for _, maintenance := range []bool{false, true} {
+			node := &snapshot.Node{Health: snapshot.NodeHealthObservation{State: state}, Maintenance: snapshot.NodeMaintenanceObservation{Requested: maintenance}}
+			want := state == snapshot.NodeHealthClear && !maintenance
+			if got := nodeSchedulable(node, false); got != want {
+				t.Fatalf("state=%s maintenance=%t schedulable=%t, want %t", state, maintenance, got, want)
+			}
+		}
+	}
+}
+
 func TestUnschedulableFreeCapacityIsAMirage(t *testing.T) {
 	b := testutil.NewSnapshot().
 		WithNode("node1", "h100", 8).

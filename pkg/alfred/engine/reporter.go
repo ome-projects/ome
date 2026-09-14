@@ -70,6 +70,13 @@ type Reporter struct {
 	// flapping condition must not spam fresh signals): node name → the
 	// condition fingerprint last signaled. Policy #2 drives this.
 	nodeSignals map[string]string
+
+	// Lifecycle phase is retained locally after failed persistence so the next
+	// cycle retries records without replaying Events. Initialization outlives
+	// an episode: clearing must not revive stale durable state on re-entry.
+	nodeRecords     map[string]nodeRemediationRecord
+	nodeInitialized map[string]struct{}
+	nodeObservedAt  time.Time
 }
 
 // cycleRecord is the JSON document written to the recommendations ConfigMap.
@@ -105,15 +112,28 @@ type recommendationView struct {
 // counters, Events on the target InferenceServices, and (when enabled) the
 // recommendations ConfigMap record. decisions includes executable candidates
 // and observations of outstanding requests, even when their source is advisory.
-func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidate, decisions []Decision, cfg *config.Config, now time.Time) {
+// observedAt, when supplied, is the successful complete snapshot's timestamp;
+// it permits clearing absent node markers. Without it, only marker timestamps
+// provide observation evidence; report time never advances node lifecycle.
+func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidate, decisions []Decision, cfg *config.Config, now time.Time, observedAt ...time.Time) {
 	record := cycleRecord{Timestamp: now, Mode: cfg.Mode}
+	var markers []*policy.NodeRemediation
+	workloadCandidates := make([]policy.Candidate, 0, len(candidates))
+	for _, c := range candidates {
+		if c.Remediation != nil {
+			markers = append(markers, c.Remediation)
+		} else {
+			workloadCandidates = append(workloadCandidates, c)
+		}
+	}
+	nodeRecords, observation, reconcileNodes := r.reconcileNodeRemediations(ctx, markers, cfg, now, observedAt)
 
 	decided := map[string]Decision{}
 	for _, d := range decisions {
 		decided[candidateKey(d.Candidate)] = d
 	}
 
-	for _, c := range candidates {
+	for _, c := range workloadCandidates {
 		executable := "false"
 		if c.Executable {
 			executable = "true"
@@ -178,7 +198,7 @@ func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidat
 	}
 
 	if *cfg.RecommendationsConfigMapEnabled {
-		r.writeRecord(ctx, cfg.RecommendationsConfigMapName, record)
+		r.writeRecord(ctx, cfg.RecommendationsConfigMapName, record, nodeRecords, observation, reconcileNodes)
 	}
 }
 
@@ -313,7 +333,7 @@ func (r *Reporter) ClearNodeSignal(node string) {
 	delete(r.nodeSignals, node)
 }
 
-func (r *Reporter) writeRecord(ctx context.Context, name string, rec cycleRecord) {
+func (r *Reporter) writeRecord(ctx context.Context, name string, rec cycleRecord, nodes map[string]nodeRemediationRecord, observedAt time.Time, reconcileNodes bool) {
 	raw, err := json.Marshal(rec)
 	if err != nil {
 		r.Log.Error(err, "marshal recommendations record")
@@ -322,6 +342,9 @@ func (r *Reporter) writeRecord(ctx context.Context, name string, rec cycleRecord
 	// A failed cycle record needs no unwinding: the next pass rewrites it.
 	_ = r.updateConfigMap(ctx, name, func(cm *corev1.ConfigMap) {
 		cm.Data[recommendationsKey] = string(raw)
+		if reconcileNodes {
+			writeNodeRecords(cm, nodes, observedAt)
+		}
 	})
 }
 
@@ -396,7 +419,7 @@ func producedEventReason(c policy.Candidate) string {
 		return policy.AdvisoryRawDeploymentMigrationUnsupported
 	}
 	switch c.Reason {
-	case policy.ReasonNodeUnhealthy:
+	case policy.ReasonNodeUnhealthy, policy.ReasonNodeMaintenance:
 		return "EvacuationRecommendationProduced"
 	case policy.ReasonRemediationSignal:
 		return "RemediationSignalProduced"
@@ -405,9 +428,9 @@ func producedEventReason(c policy.Candidate) string {
 	}
 }
 
-// candidateKey identifies one candidate within a cycle. Policy and source node
-// separate competing recommendations and requests about an earlier placement
-// of the same instance.
+// candidateKey separates policy, source and cause. An outstanding maintenance
+// request must not become the outcome of a later health recommendation for the
+// same instance, just as an earlier placement must not replace a current one.
 func candidateKey(c policy.Candidate) string {
-	return fmt.Sprintf("%s|%s|%s|%d|%s", c.Policy, c.Workload.String(), c.Component, c.Instance, c.FromNode)
+	return fmt.Sprintf("%s|%s|%s|%d|%s|%s", c.Policy, c.Workload.String(), c.Component, c.Instance, c.FromNode, c.Reason)
 }

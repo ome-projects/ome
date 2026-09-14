@@ -190,7 +190,7 @@ func schedulableBins(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool st
 }
 
 func nodeSchedulable(node *snapshot.Node, avoidSpot bool) bool {
-	if node.Unhealthy || node.Cordoned || node.ScaleDownMarked || node.Suspect {
+	if node.UnavailableAsTarget() {
 		return false
 	}
 	if avoidSpot && node.Preemptible {

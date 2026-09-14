@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -125,6 +126,11 @@ func TestBuildOMENativeRejectsInvalidIRAndPodEvidence(t *testing.T) {
 		{name: "negative incarnation", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIncarnation] = "-1" }},
 		{name: "wrong managed by", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelManagedBy] = "Deployment" }},
 		{name: "wrong Pod controller UID", mutate: func(f *omeNativeFixture) { f.pods[0].OwnerReferences[0].UID = "other-ir" }},
+		{name: "wrong Pod controller name", mutate: func(f *omeNativeFixture) { f.pods[0].OwnerReferences[0].Name = "other-ir" }},
+		{name: "wrong Pod controller kind", mutate: func(f *omeNativeFixture) { f.pods[0].OwnerReferences[0].Kind = "Deployment" }},
+		{name: "wrong Pod controller API version", mutate: func(f *omeNativeFixture) {
+			f.pods[0].OwnerReferences[0].APIVersion = "apps/v1"
+		}},
 		{name: "stale incarnation", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIncarnation] = "2" }},
 		{name: "missing Pod", mutate: func(f *omeNativeFixture) { f.pods = nil }},
 		{name: "extra Pod", mutate: func(f *omeNativeFixture) { f.pods = append(f.pods, omeNativePod(f, 3, 1, "default", 1, "node-b")) }},
@@ -383,6 +389,240 @@ func TestBuildOMENativeRejectsOwnedPodsWithInvalidISVCEvidence(t *testing.T) {
 	}
 }
 
+func TestBuildProjectsOwnerResolvedIdentityIntoNodeOccupancy(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{
+			name: "missing ISVC label",
+			mutate: func(pod *corev1.Pod) {
+				delete(pod.Labels, constants.InferenceServicePodLabelKey)
+			},
+		},
+		{
+			name: "wrong ISVC label",
+			mutate: func(pod *corev1.Pod) {
+				pod.Labels[constants.InferenceServicePodLabelKey] = "wrong-svc"
+			},
+		},
+		{
+			name: "missing component label",
+			mutate: func(pod *corev1.Pod) {
+				delete(pod.Labels, constants.OMEComponentLabel)
+			},
+		},
+		{
+			name: "wrong component label",
+			mutate: func(pod *corev1.Pod) {
+				pod.Labels[constants.OMEComponentLabel] = string(v1beta1.DecoderComponent)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newOMENativeFixture()
+			test.mutate(fixture.pods[0])
+			snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
+
+			node := snap.Nodes["node-a"]
+			if node.AllocatedGPUs != 1 || node.FreeGPUs != 7 {
+				t.Fatalf("GPU accounting = %d allocated/%d free, want 1/7", node.AllocatedGPUs, node.FreeGPUs)
+			}
+			if len(node.OtherOccupants) != 0 || len(node.OMEPods) != 1 {
+				t.Fatalf("occupants = OME %+v, other %+v, want one canonical OME occupant", node.OMEPods, node.OtherOccupants)
+			}
+			occupant := node.OMEPods[0]
+			wantISVC := types.NamespacedName{Namespace: "prod", Name: "svc"}
+			if occupant.ISVC != wantISVC || occupant.Component != v1beta1.EngineComponent {
+				t.Fatalf("occupant identity = %s/%s, want %s/%s", occupant.ISVC, occupant.Component, wantISVC, v1beta1.EngineComponent)
+			}
+
+			component := snap.Workloads[wantISVC].Components[v1beta1.EngineComponent]
+			assertInvalidOMENativeObservation(t, component)
+		})
+	}
+}
+
+func TestBuildProjectsEveryAmbiguousOwnerTargetWithoutDoubleCounting(t *testing.T) {
+	fixture := newOMENativeFixture()
+	otherISVC := fixture.isvc.DeepCopy()
+	otherISVC.Name = "other-svc"
+	otherISVC.UID = "other-isvc-uid"
+	otherIR := fixture.ir.DeepCopy()
+	otherIR.Spec.ParentRef.Name = otherISVC.Name
+	otherIR.OwnerReferences[0].Name = otherISVC.Name
+	otherIR.OwnerReferences[0].UID = otherISVC.UID
+	// Deliberately retain the first IR's full name/UID identity while changing
+	// its target. A corrupt duplicate list row makes both targets plausible.
+	fixture.extra = append(fixture.extra, otherISVC)
+
+	snap := buildOMENativeFixtureSnapshotWithIRList(t, fixture,
+		[]v1beta1.InferenceReplica{*fixture.ir.DeepCopy(), *otherIR}, gpuNode("node-a", "8", nil))
+	node := snap.Nodes["node-a"]
+	if node.AllocatedGPUs != 1 || node.FreeGPUs != 7 {
+		t.Fatalf("ambiguous Pod counted more than once: allocated/free = %d/%d", node.AllocatedGPUs, node.FreeGPUs)
+	}
+	if len(node.OtherOccupants) != 0 || len(node.OMEPods) != 2 {
+		t.Fatalf("ambiguous occupants = OME %+v, other %+v, want two logical blockers", node.OMEPods, node.OtherOccupants)
+	}
+	got := []string{
+		node.OMEPods[0].ISVC.String() + "/" + string(node.OMEPods[0].Component),
+		node.OMEPods[1].ISVC.String() + "/" + string(node.OMEPods[1].Component),
+	}
+	sort.Strings(got)
+	want := []string{"prod/other-svc/engine", "prod/svc/engine"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical blockers = %v, want %v", got, want)
+	}
+}
+
+func TestBuildProjectsOwnerTargetWithoutDeclaredOMENativeLayout(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*omeNativeFixture)
+		wantISVC  types.NamespacedName
+		component v1beta1.ComponentType
+	}{
+		{
+			name: "undeclared component",
+			mutate: func(fixture *omeNativeFixture) {
+				fixture.ir.Spec.Component = v1beta1.DecoderComponent
+			},
+			wantISVC:  types.NamespacedName{Namespace: "prod", Name: "svc"},
+			component: v1beta1.DecoderComponent,
+		},
+		{
+			name: "missing parent workload",
+			mutate: func(fixture *omeNativeFixture) {
+				fixture.ir.Spec.ParentRef.Name = "missing-svc"
+			},
+			wantISVC:  types.NamespacedName{Namespace: "prod", Name: "missing-svc"},
+			component: v1beta1.EngineComponent,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newOMENativeFixture()
+			delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
+			test.mutate(fixture)
+			snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
+
+			node := snap.Nodes["node-a"]
+			if node.AllocatedGPUs != 1 || node.FreeGPUs != 7 {
+				t.Fatalf("GPU accounting = %d allocated/%d free, want 1/7", node.AllocatedGPUs, node.FreeGPUs)
+			}
+			if len(node.OtherOccupants) != 0 || len(node.OMEPods) != 1 {
+				t.Fatalf("owner-proven occupant = OME %+v, other %+v", node.OMEPods, node.OtherOccupants)
+			}
+			occupant := node.OMEPods[0]
+			if occupant.ISVC != test.wantISVC || occupant.Component != test.component {
+				t.Fatalf("owner-proven identity = %s/%s, want %s/%s",
+					occupant.ISVC, occupant.Component, test.wantISVC, test.component)
+			}
+		})
+	}
+}
+
+func TestBuildDoesNotProjectMalformedNonInferenceReplicaOwner(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*metav1.OwnerReference)
+	}{
+		{
+			name: "wrong API version",
+			mutate: func(owner *metav1.OwnerReference) {
+				owner.APIVersion = "apps/v1"
+			},
+		},
+		{
+			name: "wrong kind",
+			mutate: func(owner *metav1.OwnerReference) {
+				owner.Kind = "Deployment"
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newOMENativeFixture()
+			delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
+			delete(fixture.pods[0].Labels, query.LabelManagedBy)
+			test.mutate(&fixture.pods[0].OwnerReferences[0])
+			snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
+
+			node := snap.Nodes["node-a"]
+			if node.AllocatedGPUs != 1 || node.FreeGPUs != 7 {
+				t.Fatalf("GPU accounting = %d allocated/%d free, want 1/7", node.AllocatedGPUs, node.FreeGPUs)
+			}
+			if len(node.OMEPods) != 0 || len(node.OtherOccupants) != 1 {
+				t.Fatalf("malformed non-IR owner was trusted: OME %+v, other %+v", node.OMEPods, node.OtherOccupants)
+			}
+		})
+	}
+}
+
+func TestBuildDoesNotCanonicalizeUnmatchedInferenceReplicaOwnerName(t *testing.T) {
+	fixture := newOMENativeFixture()
+	delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
+	delete(fixture.pods[0].Labels, query.LabelManagedBy)
+	fixture.pods[0].OwnerReferences[0].Name = "missing-ir"
+	snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
+
+	node := snap.Nodes["node-a"]
+	if len(node.OMEPods) != 1 || len(node.OtherOccupants) != 0 {
+		t.Fatalf("unmatched IR owner = OME %+v, other %+v", node.OMEPods, node.OtherOccupants)
+	}
+	occupant := node.OMEPods[0]
+	if occupant.ISVC.Name != "" || occupant.Component != v1beta1.EngineComponent ||
+		occupant.ControllerOwnerName != "missing-ir" {
+		t.Fatalf("unmatched owner was canonicalized to a different IR: %+v", occupant)
+	}
+}
+
+func TestBuildKeepsOrphanInferenceReplicaOwnerAsUnresolvedOMEOccupant(t *testing.T) {
+	fixture := newOMENativeFixture()
+	delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
+	delete(fixture.pods[0].Labels, query.LabelManagedBy)
+	fixture.ir = nil
+	snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
+
+	node := snap.Nodes["node-a"]
+	if node.AllocatedGPUs != 1 || node.FreeGPUs != 7 {
+		t.Fatalf("GPU accounting = %d allocated/%d free, want 1/7", node.AllocatedGPUs, node.FreeGPUs)
+	}
+	if len(node.OMEPods) != 1 || len(node.OtherOccupants) != 0 {
+		t.Fatalf("exact orphan IR owner = OME %+v, other %+v", node.OMEPods, node.OtherOccupants)
+	}
+	occupant := node.OMEPods[0]
+	if occupant.ISVC.Name != "" || occupant.Component != v1beta1.EngineComponent ||
+		!occupant.ControllerOwnerValid || occupant.ControllerOwnerName != "svc-engine" {
+		t.Fatalf("unresolved OME identity = %+v", occupant)
+	}
+}
+
+func TestBuildKeepsManagedByOMENativeAsUnresolvedOMEOccupant(t *testing.T) {
+	fixture := newOMENativeFixture()
+	delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
+	fixture.pods[0].OwnerReferences = nil
+	snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
+
+	node := snap.Nodes["node-a"]
+	if node.AllocatedGPUs != 1 || node.FreeGPUs != 7 {
+		t.Fatalf("GPU accounting = %d allocated/%d free, want 1/7", node.AllocatedGPUs, node.FreeGPUs)
+	}
+	if len(node.OMEPods) != 1 || len(node.OtherOccupants) != 0 {
+		t.Fatalf("managed-by OMENative evidence = OME %+v, other %+v", node.OMEPods, node.OtherOccupants)
+	}
+	occupant := node.OMEPods[0]
+	if occupant.ISVC.Name != "" || occupant.Component != v1beta1.EngineComponent ||
+		occupant.ManagedBy != query.ManagedByOMENative || occupant.ControllerOwnerPresent {
+		t.Fatalf("unresolved managed-by identity = %+v", occupant)
+	}
+}
+
 func TestBuildOMENativeRejectsAmbiguousOwnerUIDAcrossComponents(t *testing.T) {
 	baselineFixture := newOMENativeFixture()
 	addOMENativeDecoder(baselineFixture)
@@ -395,10 +635,17 @@ func TestBuildOMENativeRejectsAmbiguousOwnerUIDAcrossComponents(t *testing.T) {
 
 	fixture := newOMENativeFixture()
 	decoderIR, decoderPod := addOMENativeDecoder(fixture)
+	decoderIR.Name = fixture.ir.Name
 	decoderIR.UID = fixture.ir.UID
+	decoderPod.OwnerReferences[0].Name = fixture.ir.Name
 	decoderPod.OwnerReferences[0].UID = fixture.ir.UID
+	// The decoder IR is supplied through an intentionally corrupt List result
+	// because a real API store cannot contain duplicate namespace/name keys.
+	fixture.extra = nil
 
-	workload := buildOMENativeFixtureWorkload(t, fixture)
+	snap := buildOMENativeFixtureSnapshotWithIRList(t, fixture,
+		[]v1beta1.InferenceReplica{*fixture.ir.DeepCopy(), *decoderIR})
+	workload := snap.Workloads[types.NamespacedName{Namespace: fixture.isvc.Namespace, Name: fixture.isvc.Name}]
 	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
 		t.Run(string(component), func(t *testing.T) {
 			assertInvalidOMENativeObservation(t, workload.Components[component])
@@ -661,16 +908,36 @@ func buildOMENativeFixture(t *testing.T, fixture *omeNativeFixture) *Component {
 
 func buildOMENativeFixtureWorkload(t *testing.T, fixture *omeNativeFixture) *Workload {
 	t.Helper()
-	reader := fake.NewClientBuilder().WithScheme(testScheme(t)).WithRuntimeObjects(fixture.runtimeObjects()...).Build()
-	snap, err := Build(context.Background(), reader, Options{Now: func() time.Time { return buildNow }})
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
+	snap := buildOMENativeFixtureSnapshot(t, fixture)
 	workload := snap.Workloads[types.NamespacedName{Namespace: fixture.isvc.Namespace, Name: fixture.isvc.Name}]
 	if workload == nil || workload.Components[v1beta1.EngineComponent] == nil {
 		t.Fatalf("engine component missing from snapshot: %+v", workload)
 	}
 	return workload
+}
+
+func buildOMENativeFixtureSnapshot(t *testing.T, fixture *omeNativeFixture, extra ...runtime.Object) *ClusterSnapshot {
+	t.Helper()
+	objects := append(fixture.runtimeObjects(), extra...)
+	reader := fake.NewClientBuilder().WithScheme(testScheme(t)).WithRuntimeObjects(objects...).Build()
+	snap, err := Build(context.Background(), reader, Options{Now: func() time.Time { return buildNow }})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	return snap
+}
+
+func buildOMENativeFixtureSnapshotWithIRList(t *testing.T, fixture *omeNativeFixture,
+	items []v1beta1.InferenceReplica, extra ...runtime.Object) *ClusterSnapshot {
+	t.Helper()
+	objects := append(fixture.runtimeObjects(), extra...)
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithRuntimeObjects(objects...).Build()
+	reader := &inferenceReplicaListOverrideReader{Reader: base, items: items}
+	snap, err := Build(context.Background(), reader, Options{Now: func() time.Time { return buildNow }})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	return snap
 }
 
 func assertInvalidOMENativeObservation(t *testing.T, component *Component) {
@@ -693,6 +960,19 @@ type inferenceReplicaListErrorReader struct{ client.Reader }
 func (r *inferenceReplicaListErrorReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
 	if _, ok := list.(*v1beta1.InferenceReplicaList); ok {
 		return errors.New("synthetic IR list failure with secret payload")
+	}
+	return r.Reader.List(ctx, list, opts...)
+}
+
+type inferenceReplicaListOverrideReader struct {
+	client.Reader
+	items []v1beta1.InferenceReplica
+}
+
+func (r *inferenceReplicaListOverrideReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if irs, ok := list.(*v1beta1.InferenceReplicaList); ok {
+		irs.Items = append([]v1beta1.InferenceReplica(nil), r.items...)
+		return nil
 	}
 	return r.Reader.List(ctx, list, opts...)
 }

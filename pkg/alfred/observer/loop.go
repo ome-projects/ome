@@ -8,6 +8,7 @@ package observer
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,7 +41,8 @@ type Loop struct {
 	// Now overrides the clock in tests.
 	Now func() time.Time
 
-	latest atomic.Pointer[snapshot.ClusterSnapshot]
+	refreshMu sync.Mutex
+	latest    atomic.Pointer[snapshot.ClusterSnapshot]
 }
 
 var _ manager.Runnable = &Loop{}
@@ -80,14 +82,25 @@ func (l *Loop) Start(ctx context.Context) error {
 // RunOnce builds one snapshot and publishes gauges. Exported so tests (and a
 // forced pre-decision refresh) can drive passes directly.
 func (l *Loop) RunOnce(ctx context.Context) error {
+	return l.Refresh(ctx)
+}
+
+// Refresh serializes the entire build and publication, including gauges and
+// scorer output, across periodic observation and forced decision refreshes.
+func (l *Loop) Refresh(ctx context.Context) error {
+	l.refreshMu.Lock()
+	defer l.refreshMu.Unlock()
+
 	started := l.now()
 	cfg := l.Store.Get()
 
 	opts := snapshot.Options{
-		TriggerConditions: cfg.Policies.NodeHealth.TriggerConditions,
-		PreemptibleLabels: cfg.SpotPolicy.PreemptibleLabels,
-		DefaultMovable:    cfg.DefaultMovable,
-		Now:               l.Now,
+		TriggerConditions:   cfg.Policies.NodeHealth.TriggerConditions,
+		NodeSuspicionWindow: cfg.NodeSuspicionWindow(),
+		MaintenanceTriggers: cfg.Policies.NodeHealth.Maintenance.Triggers,
+		PreemptibleLabels:   cfg.SpotPolicy.PreemptibleLabels,
+		DefaultMovable:      cfg.DefaultMovable,
+		Now:                 l.Now,
 	}
 	if l.OMENativeExecutor != nil {
 		opts.OMENativeExecutor = l.OMENativeExecutor(ctx)
@@ -140,7 +153,7 @@ func (l *Loop) publish(snap *snapshot.ClusterSnapshot, cfg *config.Config) {
 	for _, pool := range snap.GPUPools() {
 		var headroom int64
 		for _, node := range snap.PoolNodes(pool) {
-			if node.Cordoned || node.Unhealthy || node.ScaleDownMarked || node.Suspect {
+			if node.UnavailableAsTarget() {
 				continue
 			}
 			if node.FreeGPUs > headroom {

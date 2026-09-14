@@ -503,27 +503,38 @@ func TestEmergencyBoost(t *testing.T) {
 	}
 }
 
-// TestInstanceFootprintsDeterministicOrder: the tie-break must travel with
-// the sorted elements. The mixed-size shape below is the regression: the
-// size comparison swaps the 8s past the 1 first, and a tie-break read
-// through a stale parallel index would then leave "y" ahead of "x".
-func TestInstanceFootprintsDeterministicOrder(t *testing.T) {
-	inst := &snapshot.Instance{Pods: []snapshot.PodInfo{
-		{Namespace: "p", Name: "a", Node: "n1", GPUs: 1},
-		{Namespace: "p", Name: "y", Node: "n2", GPUs: 8},
-		{Namespace: "p", Name: "x", Node: "n3", GPUs: 8},
-	}}
-	got := instanceFootprints(inst)
-	wantNodes := []string{"n3", "n2", "n1"} // 8@p/x, 8@p/y, 1@p/a
-	wantGPUs := []int64{8, 8, 1}
-	if len(got) != len(wantNodes) {
-		t.Fatalf("footprints = %+v", got)
+// TestSimulateSurgePlanReplaysCompletePlaceThenFree locks the Defrag-specific
+// bridge from the shared pod-level placement proof back to fragmentation
+// scoring bins. Targets are consumed before every source is released.
+func TestSimulateSurgePlanReplaysCompletePlaceThenFree(t *testing.T) {
+	observed := []binState{
+		{name: "source-a", free: 6, cap: 8},
+		{name: "source-b", free: 7, cap: 8},
+		{name: "target", free: 3, cap: 8},
 	}
-	for i := range wantNodes {
-		if got[i].node != wantNodes[i] || got[i].gpus != wantGPUs[i] {
-			t.Fatalf("footprint[%d] = %+v, want %d GPUs from %s (largest first, name tie-break)",
-				i, got[i], wantGPUs[i], wantNodes[i])
+	moves := []policy.SurgeMove{
+		{FromNode: "source-a", TargetNode: "target", GPUs: 2},
+		{FromNode: "source-b", TargetNode: "target", GPUs: 1},
+	}
+
+	got, ok := simulateSurgePlan(observed, moves)
+	if !ok {
+		t.Fatal("complete shared surge plan must replay into scoring bins")
+	}
+	want := []binState{
+		{name: "source-a", free: 8, cap: 8},
+		{name: "source-b", free: 8, cap: 8},
+		{name: "target", free: 0, cap: 8},
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("bin[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+	if _, ok := simulateSurgePlan(observed, []policy.SurgeMove{{
+		FromNode: "source-a", TargetNode: "missing", GPUs: 1,
+	}}); ok {
+		t.Fatal("a plan naming a non-scoring target must fail closed")
 	}
 }
 

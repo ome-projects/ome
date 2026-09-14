@@ -84,11 +84,11 @@ alfredConfig:
   # policies, arbitration and reporting all run, only the dispatcher is off.
   mode: recommend-only
 
-  # Loop cadence. earlyTickOn advances the next decision tick on the named
-  # events; it never interrupts a pass ([] disables).
+  # Named events request fresh supplemental passes without interrupting a pass
+  # or postponing the regular deadline ([] disables).
   decisionLoopInterval: 5m
   observationLoopInterval: 30s
-  earlyTickOn: [NodeConditionChange]
+  earlyTickOn: [NodeConditionChange, NodeMaintenanceChange]
 
   # Scheduler simulation is mandatory before execution. Profiles are keyed by
   # the effective replacement Pod schedulerName. Execution also requires
@@ -131,6 +131,16 @@ alfredConfig:
       signalOnly: false
       healthCooldownFloorMinutes: 5
       nodeSuspicionWindowMinutes: 30
+      # Match any explicitly configured planned-maintenance signal. No default
+      # rules: arbitrary labels and taints do not request evacuation.
+      maintenance:
+        triggers: []
+        # - name: patching-label
+        #   label: {key: maintenance.example.com/state, value: patching}
+        # - name: patching-taint
+        #   taint: {key: maintenance.example.com/patching, value: "true", effect: NoSchedule}
+        # - name: patching-condition
+        #   condition: {type: Patching, status: "True"}
 
   # Per-workload defaults; alfred.ome.io/* annotations on an
   # InferenceService win over these.

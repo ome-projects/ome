@@ -31,6 +31,7 @@ type dispatchEvidence struct {
 func (d *Dispatcher) freshObservation(ctx context.Context, cfg *config.Config) (*snapshot.ClusterSnapshot, error) {
 	return snapshot.Build(ctx, d.Reader, snapshot.Options{Now: d.now, DefaultMovable: cfg.DefaultMovable,
 		TriggerConditions: cfg.Policies.NodeHealth.TriggerConditions, PreemptibleLabels: cfg.SpotPolicy.PreemptibleLabels,
+		NodeSuspicionWindow: cfg.NodeSuspicionWindow(), MaintenanceTriggers: cfg.Policies.NodeHealth.Maintenance.Triggers,
 		OMENativeExecutor: snapshot.OMENativeExecutorState{Available: true, WireVersion: "v1", Reason: "OperatorConfigured"}})
 }
 
@@ -39,7 +40,7 @@ func (d *Dispatcher) freshObservation(ctx context.Context, cfg *config.Config) (
 func (d *Dispatcher) freshCandidate(s *snapshot.ClusterSnapshot, c policy.Candidate, cfg *config.Config) (policy.Candidate, bool) {
 	for _, p := range d.Policies {
 		for _, fresh := range p.Evaluate(s, cfg) {
-			if fresh.Executable && fresh.Mode == constants.OMENative && sameDispatchSource(fresh, c) {
+			if fresh.Executable && fresh.Mode == constants.OMENative && sameDispatchSource(fresh, c) && sameDispatchCause(fresh, c) {
 				return fresh, true
 			}
 		}
@@ -156,7 +157,7 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	targets := map[string]bool{}
 	for _, placement := range result.Placements {
 		node := final.Nodes[placement.NodeName]
-		if !allowed[placement.NodeName] || node == nil || node.Unhealthy || node.Cordoned || node.ScaleDownMarked || node.Suspect || !capturedNodeReady(finalCapture, placement.NodeName) {
+		if !allowed[placement.NodeName] || node.UnavailableAsTarget() || !capturedNodeReady(finalCapture, placement.NodeName) {
 			return empty, "PredictedTargetUnsafe"
 		}
 		if journalNodeCooling(j, placement.NodeName, cfg.PerNodeCooldown(), d.now(), existing) {

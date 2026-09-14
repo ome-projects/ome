@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
@@ -43,6 +44,11 @@ type Options struct {
 	// TriggerConditions are the node condition types that mark a node
 	// Unhealthy (policies.nodeHealth.triggerConditions).
 	TriggerConditions []string
+	// NodeSuspicionWindow quarantines recently cleared failure conditions.
+	// Zero uses DefaultNodeSuspicionWindow.
+	NodeSuspicionWindow time.Duration
+	// MaintenanceTriggers observe planned work separately from failure health.
+	MaintenanceTriggers []config.MaintenanceTrigger
 	// PreemptibleLabels are node-label keys whose presence (with any
 	// value but "false") marks a node spot/preemptible.
 	PreemptibleLabels []string
@@ -69,6 +75,13 @@ func (o *Options) defaultMovable() bool {
 	return *o.DefaultMovable
 }
 
+func (o *Options) nodeSuspicionWindow() time.Duration {
+	if o.NodeSuspicionWindow <= 0 {
+		return DefaultNodeSuspicionWindow
+	}
+	return o.NodeSuspicionWindow
+}
+
 func (o *Options) now() time.Time {
 	if o.Now == nil {
 		return time.Now()
@@ -89,6 +102,8 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 		Models:            map[ModelKey]*ModelAvailability{},
 		OMENativeExecutor: opts.OMENativeExecutor,
 	}
+	// Every node uses the same instant, including quarantine expiry boundaries.
+	opts.Now = func() time.Time { return s.Timestamp }
 
 	var nodeList corev1.NodeList
 	if err := r.List(ctx, &nodeList); err != nil {
@@ -132,7 +147,8 @@ func Build(ctx context.Context, r client.Reader, opts Options) (*ClusterSnapshot
 	var irList v1beta1.InferenceReplicaList
 	irListErr := r.List(ctx, &irList)
 	irIndex := indexInferenceReplicas(irList.Items)
-	routedPods := routeWorkloadPods(podEvidence, isvcList.Items, irIndex)
+	routedPods, ownerResolvedTargets := routeWorkloadPods(podEvidence, isvcList.Items, irIndex)
+	projectOwnerResolvedNodeOccupancy(s.Nodes, ownerResolvedTargets)
 	for i := range isvcList.Items {
 		isvc := &isvcList.Items[i]
 		key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}
@@ -148,6 +164,7 @@ func buildNode(node *corev1.Node, opts *Options) *Node {
 	resource, total := NodeGPUAllocatable(node)
 	n := &Node{
 		Name:              node.Name,
+		UID:               node.UID,
 		Labels:            node.Labels,
 		GPUPool:           GPUPoolForNode(node, resource),
 		GPUResource:       resource,
@@ -167,20 +184,8 @@ func buildNode(node *corev1.Node, opts *Options) *Node {
 			break
 		}
 	}
-	triggers := opts.triggerConditions()
-	for _, cond := range node.Status.Conditions {
-		if cond.Status != corev1.ConditionTrue {
-			continue
-		}
-		for _, trigger := range triggers {
-			if string(cond.Type) == trigger {
-				n.Unhealthy = true
-				n.UnhealthyConditions = append(n.UnhealthyConditions, trigger)
-				break
-			}
-		}
-	}
-	sort.Strings(n.UnhealthyConditions)
+	n.Health = observeNodeHealth(node.Status.Conditions, opts.triggerConditions(), opts.now(), opts.nodeSuspicionWindow())
+	n.Maintenance = ObserveNodeMaintenance(node, opts.MaintenanceTriggers)
 	return n
 }
 
@@ -199,6 +204,7 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 		GPUs:        gpus,
 		Ready:       podIsReady(pod),
 		Terminating: pod.DeletionTimestamp != nil,
+		Component:   component,
 		ManagedBy:   pod.Labels[query.LabelManagedBy],
 	}
 	parseOMENativePodIdentity(&info, pod)
@@ -208,7 +214,6 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 	}
 	if isvcName != "" {
 		info.ISVC = types.NamespacedName{Namespace: pod.Namespace, Name: isvcName}
-		info.Component = component
 	}
 
 	// Node occupancy: GPU-holding pods only.
@@ -218,7 +223,7 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 			if info.Terminating {
 				node.TerminatingGPUs += gpus
 			}
-			if isvcName != "" {
+			if isvcName != "" || info.ControllerOwnerValid || info.ManagedBy == query.ManagedByOMENative {
 				node.OMEPods = append(node.OMEPods, info)
 			} else {
 				node.OtherOccupants = append(node.OtherOccupants, info)
@@ -361,8 +366,12 @@ func parseOMENativePodIdentity(info *PodInfo, pod *corev1.Pod) {
 			return
 		}
 		info.ControllerOwnerPresent = true
+		info.ControllerOwnerAPIVersion = owner.APIVersion
+		info.ControllerOwnerKind = owner.Kind
+		info.ControllerOwnerName = owner.Name
 		info.ControllerOwnerUID = owner.UID
-		info.ControllerOwnerValid = owner.UID != ""
+		info.ControllerOwnerValid = owner.APIVersion == v1beta1.SchemeGroupVersion.String() &&
+			owner.Kind == "InferenceReplica" && owner.Name != "" && owner.UID != ""
 	}
 }
 

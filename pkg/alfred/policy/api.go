@@ -6,6 +6,8 @@
 package policy
 
 import (
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -21,6 +23,7 @@ import (
 const (
 	ReasonFragmentation     = "Fragmentation"
 	ReasonNodeUnhealthy     = "NodeUnhealthy"
+	ReasonNodeMaintenance   = "NodeMaintenance"
 	ReasonRemediationSignal = "RemediationSignal"
 )
 
@@ -68,6 +71,19 @@ const (
 // recommendation). Component-wide candidates are never dispatched.
 const ComponentWideInstance int32 = -1
 
+// NodeRemediation is a complete observation of a node's desired remediation
+// state. Physical OME GPU occupancy is retained even when workload identity
+// cannot be resolved, so an unjoined Pod cannot make a node appear drained.
+type NodeRemediation struct {
+	Node                   string
+	NodeUID                types.UID
+	ObservedAt             time.Time
+	Health                 snapshot.NodeHealthObservation
+	Maintenance            snapshot.NodeMaintenanceObservation
+	Workloads              []string
+	OMEGPUOccupantsPresent bool
+}
+
 // Candidate is a single proposed action — "migrate Component X's Instance Y
 // off Node Z" — with explicit, cross-policy-comparable benefit and cost so
 // the Arbiter can rank on a common axis instead of trusting each policy's
@@ -86,9 +102,11 @@ type Candidate struct {
 
 	// Reason is the event-facing cause (Fragmentation, NodeUnhealthy, ...).
 	Reason string
+	// Remediation is set only on node markers, never workload move findings.
+	Remediation *NodeRemediation
 
-	// FromNode is the node the move vacates (for a multi-node instance,
-	// the node holding the largest share of its GPUs).
+	// FromNode is an actual member node selected by the policy. Evacuation
+	// prefers an unhealthy member, then a member requesting maintenance.
 	FromNode string
 	// HintTargetNodes is the bounded, ranked policy-supplied target set for
 	// operator-facing reporting. The scheduler still makes the final pod-level
@@ -120,8 +138,8 @@ type Candidate struct {
 	Benefit float64
 	// Cost is the disruption risk keyed off the migration mode.
 	Cost float64
-	// Score = Benefit - CostWeight*Cost, emergency-boosted when the move
-	// unblocks an over-age pending pod.
+	// Score ranks candidates within their priority class. Defrag uses
+	// benefit-minus-cost; evacuation uses the workload's numeric priority.
 	Score float64
 	// Emergency marks a candidate whose move unblocks a pending pod older
 	// than emergencyPendingAgeMinutes.

@@ -308,7 +308,7 @@ func TestBuildNodeAccounting(t *testing.T) {
 	if node1.TotalGPUs != 8 || node1.AllocatedGPUs != 5 || node1.FreeGPUs != 3 {
 		t.Fatalf("node1 accounting: total=%d allocated=%d free=%d, want 8/5/3", node1.TotalGPUs, node1.AllocatedGPUs, node1.FreeGPUs)
 	}
-	if !node1.ScaleDownDisabled || node1.Cordoned || node1.Unhealthy {
+	if !node1.ScaleDownDisabled || node1.Cordoned || node1.Health.State != NodeHealthClear {
 		t.Fatalf("node1 flags: %+v", node1)
 	}
 	if len(node1.OMEPods) != 1 || len(node1.OtherOccupants) != 1 {
@@ -322,7 +322,7 @@ func TestBuildNodeAccounting(t *testing.T) {
 	if node2.AllocatedGPUs != 3 || node2.FreeGPUs != 5 || node2.TerminatingGPUs != 2 {
 		t.Fatalf("node2 accounting: allocated=%d free=%d terminating=%d, want 3/5/2", node2.AllocatedGPUs, node2.FreeGPUs, node2.TerminatingGPUs)
 	}
-	if !node2.Unhealthy || len(node2.UnhealthyConditions) != 1 || node2.UnhealthyConditions[0] != "GpuUnhealthy" {
+	if node2.Health.State != NodeHealthUnhealthy || len(node2.Health.Conditions) != 1 || node2.Health.Conditions[0].Type != "GpuUnhealthy" {
 		t.Fatalf("node2 health: %+v", node2)
 	}
 

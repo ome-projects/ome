@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/observer"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
+	"sigs.k8s.io/ome/pkg/alfred/policy/nodehealth"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling/process"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -60,6 +61,10 @@ const (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(v1beta1.AddToScheme(scheme))
+}
+
+func decisionPolicies() []policy.Policy {
+	return []policy.Policy{&nodehealth.Policy{}, &defrag.Policy{}}
 }
 
 // Options holds the command-line configuration.
@@ -219,7 +224,7 @@ func main() {
 	decisionLoop := &engine.DecisionLoop{
 		Snapshots:   observationLoop,
 		Store:       store,
-		Policies:    []policy.Policy{&defrag.Policy{}},
+		Policies:    decisionPolicies(),
 		Predictions: predictions,
 		Arbiter:     &engine.Arbiter{Ledger: engine.NewLedger()},
 		Reporter: &engine.Reporter{

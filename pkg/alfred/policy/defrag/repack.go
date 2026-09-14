@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
+	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -139,8 +140,11 @@ func movableForRepack(snap *snapshot.ClusterSnapshot, cfg *config.Config, worklo
 	if !instanceInPool(snap, instance, pool) {
 		return false
 	}
-	if modelMovabilityReason(snap, workload) != "" {
+	if policy.ModelAdvisoryReason(snap, workload) != "" {
 		return false
 	}
-	return omenativeExecutionEligibility(snap, cfg, workload, component, instance, snap.Timestamp) == ""
+	if inCooldown(workload, cfg, snap.Timestamp) {
+		return false
+	}
+	return policy.OMENativeEligibility(snap, workload, component, instance) == ""
 }

@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
+	"sigs.k8s.io/ome/pkg/alfred/policy/nodehealth"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/alfred/testutil"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -18,6 +19,107 @@ import (
 )
 
 var testNow = testutil.ReferenceTime
+
+func TestMaintenancePriorityAndCooldowns(t *testing.T) {
+	b := scenario().WithNode("node4", "h100", 8).
+		WithInstance("prod/c", v1beta1.EngineComponent, constants.RawDeployment, "node4", 2)
+	m := cand("prod/b", "node3")
+	m.Reason = policy.ReasonNodeMaintenance
+	m.Score = -100
+	h := health("prod/c", "node4")
+	h.Score = -1000
+	got := admit(t, &Arbiter{}, b.Build(), config.Default(), cand("prod/a", "node1"), m, h)
+	if len(got) != 3 || got[0].Candidate.Reason != policy.ReasonNodeUnhealthy ||
+		got[1].Candidate.Reason != policy.ReasonNodeMaintenance || got[2].Candidate.Reason != policy.ReasonFragmentation {
+		t.Fatalf("priority must be health, planned maintenance, defrag: %+v", got)
+	}
+	for _, placement := range []bool{false, true} {
+		t.Run(fmt.Sprintf("placement=%t", placement), func(t *testing.T) {
+			snap := scenario().Build()
+			w := snap.Workloads[m.Workload]
+			last := testNow.Add(-6 * time.Minute)
+			want := RejectCooldown
+			if placement {
+				w.Components[v1beta1.EngineComponent].Instances[0].Pods[0].StartTime = &last
+				want = RejectPlacementCooldown
+			} else {
+				w.LastMigration = &last
+			}
+			cfg := config.Default()
+			cfg.PerWorkloadCooldownMinutes = 30
+			cfg.RecentPlacementCooldownMinutes = 30
+			got := admit(t, &Arbiter{}, snap, cfg, m)
+			if len(got) != 1 || got[0].Admitted || got[0].Reason != want || got[0].CooldownOverridden {
+				t.Fatalf("maintenance must not use health floor: %+v", got)
+			}
+		})
+	}
+}
+
+func TestArbiterRejectsUnavailableTargetsFromUntrustedHints(t *testing.T) {
+	for _, state := range []string{"unhealthy", "unknown", "suspect", "maintenance", "cordoned", "scale-down"} {
+		t.Run(state, func(t *testing.T) {
+			snap := scenario().Build()
+			node := snap.Nodes["node2"]
+			switch state {
+			case "unhealthy":
+				node.Health.State = snapshot.NodeHealthUnhealthy
+			case "unknown":
+				node.Health.State = snapshot.NodeHealthUnknown
+			case "suspect":
+				node.Health.State = snapshot.NodeHealthSuspect
+			case "maintenance":
+				node.Maintenance.Requested = true
+			case "cordoned":
+				node.Cordoned = true
+			case "scale-down":
+				node.ScaleDownMarked = true
+			}
+			for _, reason := range []string{policy.ReasonNodeUnhealthy, policy.ReasonNodeMaintenance, policy.ReasonFragmentation} {
+				for _, exhaustive := range []bool{false, true} {
+					c := cand("prod/a", "node1")
+					c.Reason = reason
+					if exhaustive {
+						c.HintTargetNodes = []string{"node3"}
+						c.PlacementTargetNodes = []string{"node2"}
+					}
+					got := admit(t, &Arbiter{}, snap, config.Default(), c)
+					if len(got) != 1 || got[0].Admitted || got[0].Reason != RejectTargetUnavailable {
+						t.Fatalf("%s policy hint admitted unavailable %s target: %+v", reason, state, got)
+					}
+				}
+			}
+			got := admit(t, &Arbiter{}, snap, config.Default(), cand("prod/a", "node1", "node2", "node3"))
+			if len(got) != 1 || !got[0].Admitted || got[0].Target != "node3" {
+				t.Fatalf("unavailable first hint hid feasible alternate: %+v", got)
+			}
+		})
+	}
+}
+
+func TestPlannedMaintenanceRetainsGlobalBudgetsAndNodeCooldown(t *testing.T) {
+	m := cand("prod/a", "node1")
+	m.Reason = policy.ReasonNodeMaintenance
+	for _, gate := range []string{RejectHourlyCap, RejectInFlightCap, RejectNodeCooldown} {
+		t.Run(gate, func(t *testing.T) {
+			cfg := config.Default()
+			ledger := NewLedger()
+			switch gate {
+			case RejectHourlyCap:
+				cfg.MaxMigrationsPerHour = 0
+			case RejectInFlightCap:
+				cfg.MaxInFlightMigrations = 0
+			case RejectNodeCooldown:
+				ledger.RecordDispatch(DispatchRecord{Workload: types.NamespacedName{Namespace: "prod", Name: "earlier"},
+					FromNode: "previous", Target: "node1", GPUs: 1, At: testNow.Add(-time.Minute)})
+			}
+			d := admit(t, &Arbiter{Ledger: ledger}, scenario().Build(), cfg, m)[0]
+			if d.Admitted || d.Reason != gate || d.CooldownOverridden {
+				t.Fatalf("maintenance bypassed %s: %+v", gate, d)
+			}
+		})
+	}
+}
 
 // scenario: prod/a (2 GPUs) on node1, prod/b (2 GPUs) on node3, node2 empty.
 func scenario() *testutil.SnapshotBuilder {
@@ -62,6 +164,28 @@ func health(workload, from string, hints ...string) policy.Candidate {
 	c.Reason = policy.ReasonNodeUnhealthy
 	c.Score = 0.1 // deliberately below the defrag scores in tests
 	return c
+}
+
+func nodeHealthScenario() *snapshot.ClusterSnapshot {
+	return testutil.NewSnapshot().
+		WithNode("bad", "h100", 8, testutil.NodeUnhealthy()).
+		WithNode("target", "h100", 8).
+		WithInstance("prod/model", v1beta1.EngineComponent, constants.OMENative, "bad", 1).
+		Build()
+}
+
+func actualHealthCandidate(t *testing.T, snap *snapshot.ClusterSnapshot, cfg *config.Config) policy.Candidate {
+	t.Helper()
+	for _, candidate := range (&nodehealth.Policy{}).Evaluate(snap, cfg) {
+		if candidate.Remediation == nil && candidate.Reason == policy.ReasonNodeUnhealthy {
+			if !candidate.Executable {
+				t.Fatalf("actual node-health candidate is advisory: %+v", candidate)
+			}
+			return candidate
+		}
+	}
+	t.Fatal("actual node-health policy produced no workload candidate")
+	return policy.Candidate{}
 }
 
 func admit(t *testing.T, a *Arbiter, snap *snapshot.ClusterSnapshot, cfg *config.Config, cands ...policy.Candidate) []Decision {
@@ -343,6 +467,66 @@ func TestClassAwareWorkloadCooldown(t *testing.T) {
 	}
 }
 
+func TestHealthWorkloadCooldownExactBoundaries(t *testing.T) {
+	tests := []struct {
+		name           string
+		age            time.Duration
+		wantAdmitted   bool
+		wantReason     string
+		wantOverridden bool
+	}{
+		{name: "just inside health floor", age: 5*time.Minute - time.Nanosecond, wantReason: RejectCooldown},
+		{name: "at health floor", age: 5 * time.Minute, wantAdmitted: true, wantOverridden: true},
+		{name: "just inside standard window", age: 30*time.Minute - time.Nanosecond, wantAdmitted: true, wantOverridden: true},
+		{name: "at standard window", age: 30 * time.Minute, wantAdmitted: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			snap := nodeHealthScenario()
+			at := testNow.Add(-tt.age)
+			snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "model"}].LastMigration = &at
+			candidate := actualHealthCandidate(t, snap, cfg)
+
+			decision := admit(t, &Arbiter{}, snap, cfg, candidate)[0]
+			if decision.Admitted != tt.wantAdmitted || decision.Reason != tt.wantReason ||
+				decision.CooldownOverridden != tt.wantOverridden {
+				t.Fatalf("decision = %+v, want admitted=%v reason=%q overridden=%v",
+					decision, tt.wantAdmitted, tt.wantReason, tt.wantOverridden)
+			}
+		})
+	}
+}
+
+func TestHealthPlacementCooldownExactBoundary(t *testing.T) {
+	tests := []struct {
+		name         string
+		age          time.Duration
+		wantAdmitted bool
+		wantReason   string
+	}{
+		{name: "just inside health floor", age: 5*time.Minute - time.Nanosecond, wantReason: RejectPlacementCooldown},
+		{name: "at health floor", age: 5 * time.Minute, wantAdmitted: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			snap := nodeHealthScenario()
+			at := testNow.Add(-tt.age)
+			inst := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "model"}].
+				Components[v1beta1.EngineComponent].Instances[0]
+			inst.Pods[0].StartTime = &at
+			candidate := actualHealthCandidate(t, snap, cfg)
+
+			decision := admit(t, &Arbiter{}, snap, cfg, candidate)[0]
+			if decision.Admitted != tt.wantAdmitted || decision.Reason != tt.wantReason {
+				t.Fatalf("decision = %+v, want admitted=%v reason=%q",
+					decision, tt.wantAdmitted, tt.wantReason)
+			}
+		})
+	}
+}
+
 func TestPlacementCooldownAuthorshipBlind(t *testing.T) {
 	cfg := config.Default()
 	placed := func(age time.Duration) *snapshot.ClusterSnapshot {
@@ -564,12 +748,12 @@ func TestSurgeWithoutPodDetailStillClaims(t *testing.T) {
 	}
 }
 
-func TestEvictionNeedsNoHeadroom(t *testing.T) {
+func TestFreeBeforePlaceNeedsNoHeadroom(t *testing.T) {
 	b := scenario()
 	b.WithOtherOccupant("node2", 8) // every hint is full
-	evict := cand("prod/a", "node1")
-	evict.SurgeShaped = false
-	d := admit(t, &Arbiter{}, b.Build(), config.Default(), evict)[0]
+	freeBeforePlace := cand("prod/a", "node1")
+	freeBeforePlace.SurgeShaped = false
+	d := admit(t, &Arbiter{}, b.Build(), config.Default(), freeBeforePlace)[0]
 	if !d.Admitted || d.Target != "" {
 		t.Fatalf("free-then-place cannot deadlock and needs no claim: %+v", d)
 	}
@@ -624,8 +808,8 @@ func TestLedgerReleasesClaimsOfDeletedWorkloads(t *testing.T) {
 	}
 }
 
-// TestNodeCoolingIgnoresEmptyName: eviction records carry an empty Target;
-// querying an empty node name must not match them.
+// TestNodeCoolingIgnoresEmptyName: free-before-place records carry an empty
+// Target; querying an empty node name must not match them.
 func TestNodeCoolingIgnoresEmptyName(t *testing.T) {
 	ledger := NewLedger()
 	ledger.RecordDispatch(DispatchRecord{

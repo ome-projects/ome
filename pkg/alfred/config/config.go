@@ -32,8 +32,11 @@ const (
 	AggressivenessAggressive   = "aggressive"
 )
 
-// EarlyTickNodeConditionChange is the only earlyTickOn trigger defined today.
-const EarlyTickNodeConditionChange = "NodeConditionChange"
+// Early tick triggers request a supplemental fresh decision pass.
+const (
+	EarlyTickNodeConditionChange   = "NodeConditionChange"
+	EarlyTickNodeMaintenanceChange = "NodeMaintenanceChange"
+)
 
 // SupportedSchemaVersion is the config schema this build understands.
 const SupportedSchemaVersion = 1
@@ -47,8 +50,8 @@ type Config struct {
 
 	DecisionLoopInterval    metav1.Duration `json:"decisionLoopInterval"`
 	ObservationLoopInterval metav1.Duration `json:"observationLoopInterval"`
-	// EarlyTickOn advances the next decision tick on the named events;
-	// empty disables advancement. A pass is never interrupted.
+	// EarlyTickOn requests supplemental fresh decision passes on named events
+	// without moving the regular cadence; empty disables these passes.
 	EarlyTickOn []string `json:"earlyTickOn"`
 
 	Policies   Policies          `json:"policies"`
@@ -125,9 +128,12 @@ type NodeHealth struct {
 	// HealthCooldownFloorMinutes is the per-workload cooldown floor for
 	// NodeUnhealthy candidates (instead of the standard cooldown).
 	HealthCooldownFloorMinutes int `json:"healthCooldownFloorMinutes"`
-	// NodeSuspicionWindowMinutes keeps evacuated nodes out of target
-	// hints even after the condition clears.
+	// NodeSuspicionWindowMinutes keeps nodes with recently cleared failure
+	// conditions out of placement targets during recovery.
 	NodeSuspicionWindowMinutes int `json:"nodeSuspicionWindowMinutes"`
+	// Maintenance observes operator-selected planned-work signals. No triggers
+	// means maintenance observation is disabled.
+	Maintenance Maintenance `json:"maintenance"`
 }
 
 // SpotPolicy configures spot/preemptible node handling.
@@ -190,7 +196,7 @@ func (c *Config) applyDefaults() {
 		c.ObservationLoopInterval = metav1.Duration{Duration: 30 * time.Second}
 	}
 	if c.EarlyTickOn == nil {
-		c.EarlyTickOn = []string{EarlyTickNodeConditionChange}
+		c.EarlyTickOn = []string{EarlyTickNodeConditionChange, EarlyTickNodeMaintenanceChange}
 	}
 
 	d := &c.Policies.Defragmentation
@@ -292,7 +298,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("observationLoopInterval must be >= 1s, got %s", c.ObservationLoopInterval.Duration)
 	}
 	for _, trigger := range c.EarlyTickOn {
-		if trigger != EarlyTickNodeConditionChange {
+		if trigger != EarlyTickNodeConditionChange && trigger != EarlyTickNodeMaintenanceChange {
 			return fmt.Errorf("unknown earlyTickOn trigger %q", trigger)
 		}
 	}
@@ -354,6 +360,9 @@ func (c *Config) validate() error {
 	n := &c.Policies.NodeHealth
 	if _, ok := validAggressiveness[n.Aggressiveness]; !ok {
 		return fmt.Errorf("policies.nodeHealth.aggressiveness %q invalid", n.Aggressiveness)
+	}
+	if err := n.validateTriggers(); err != nil {
+		return err
 	}
 
 	// Zero values were defaulted above, so anything non-positive here is an

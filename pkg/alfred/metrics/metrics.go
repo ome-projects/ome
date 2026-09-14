@@ -32,9 +32,10 @@ type Metrics struct {
 	LWSRecommendations      *prometheus.CounterVec // isvc, action
 
 	// Node-health counters (Reporter-only).
-	NodeHealthEvacuations *prometheus.CounterVec // node, workload, surface, outcome
-	NodeHealthSignals     *prometheus.CounterVec // node, reason
-	CooldownOverrides     *prometheus.CounterVec // policy
+	NodeHealthEvacuations  *prometheus.CounterVec // node, workload, surface, outcome
+	NodeHealthSignals      *prometheus.CounterVec // node, reason
+	NodeMaintenanceSignals *prometheus.CounterVec // node, reason
+	CooldownOverrides      *prometheus.CounterVec // policy
 
 	// Loop / operational.
 	ObservationLoopDuration prometheus.Histogram
@@ -118,6 +119,10 @@ func New(reg prometheus.Registerer) *Metrics {
 		NodeHealthSignals: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "alfred_nodehealth_signals_total",
 			Help: "Signal-only outcomes where the caretaker emitted a signal instead of acting.",
+		}, []string{"node", "reason"}),
+		NodeMaintenanceSignals: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "alfred_nodemaintenance_signals_total",
+			Help: "Planned-maintenance lifecycle signals, separate from node health damage.",
 		}, []string{"node", "reason"}),
 		CooldownOverrides: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "alfred_cooldown_overrides_total",

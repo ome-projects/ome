@@ -67,7 +67,8 @@ func routeWorkloadPods(
 	pods []PodInfo,
 	isvcs []v1beta1.InferenceService,
 	irIndex inferenceReplicaIndex,
-) map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo {
+) (map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo,
+	map[types.NamespacedName][]inferenceReplicaKey) {
 	type workloadLayout struct {
 		modes            map[v1beta1.ComponentType]constants.DeploymentModeType
 		nativeComponents []v1beta1.ComponentType
@@ -91,11 +92,28 @@ func routeWorkloadPods(
 	}
 
 	routed := make(map[types.NamespacedName]map[v1beta1.ComponentType][]PodInfo)
+	ownerResolvedTargets := make(map[types.NamespacedName][]inferenceReplicaKey)
 	appendPod := func(key types.NamespacedName, component v1beta1.ComponentType, pod PodInfo) {
 		if routed[key] == nil {
 			routed[key] = make(map[v1beta1.ComponentType][]PodInfo)
 		}
 		routed[key][component] = append(routed[key][component], pod)
+	}
+	sortedTargets := func(targetSet map[inferenceReplicaKey]struct{}) []inferenceReplicaKey {
+		targets := make([]inferenceReplicaKey, 0, len(targetSet))
+		for target := range targetSet {
+			targets = append(targets, target)
+		}
+		sort.Slice(targets, func(i, j int) bool {
+			if targets[i].namespace != targets[j].namespace {
+				return targets[i].namespace < targets[j].namespace
+			}
+			if targets[i].parent != targets[j].parent {
+				return targets[i].parent < targets[j].parent
+			}
+			return targets[i].component < targets[j].component
+		})
+		return targets
 	}
 
 	sortedPods := append([]PodInfo(nil), pods...)
@@ -106,42 +124,43 @@ func routeWorkloadPods(
 		return sortedPods[i].Name < sortedPods[j].Name
 	})
 	for _, pod := range sortedPods {
-		ownerTargets := make(map[inferenceReplicaKey]struct{})
+		ownerRoutingTargets := make(map[inferenceReplicaKey]struct{})
+		ownerOccupancyTargets := make(map[inferenceReplicaKey]struct{})
 		ownerMatched := false
 		if pod.ControllerOwnerPresent && pod.ControllerOwnerValid {
 			ownerMatches := irIndex.byOwnerUID[inferenceReplicaOwnerKey{
 				namespace: pod.Namespace,
 				uid:       pod.ControllerOwnerUID,
 			}]
-			ownerMatched = len(ownerMatches) > 0
 			for _, owner := range ownerMatches {
+				if !controllerOwnerMatchesInferenceReplica(pod, owner) {
+					continue
+				}
+				ownerMatched = true
 				target := inferenceReplicaKey{
 					namespace: owner.Namespace,
 					parent:    owner.Spec.ParentRef.Name,
 					component: owner.Spec.Component,
 				}
+				// Even a stale or malformed IR remains positive OME ownership
+				// evidence. Its nonempty parent is the narrowest truthful workload
+				// identity available to keep node remediation fail closed.
+				if target.parent != "" {
+					ownerOccupancyTargets[target] = struct{}{}
+				}
 				layout, ok := layouts[types.NamespacedName{Namespace: target.namespace, Name: target.parent}]
 				if ok && layout.modes[target.component] == constants.OMENative &&
 					containsComponent(layout.nativeComponents, target.component) {
-					ownerTargets[target] = struct{}{}
+					ownerRoutingTargets[target] = struct{}{}
 				}
 			}
 		}
-		if len(ownerTargets) > 0 {
-			targets := make([]inferenceReplicaKey, 0, len(ownerTargets))
-			for target := range ownerTargets {
-				targets = append(targets, target)
-			}
-			sort.Slice(targets, func(i, j int) bool {
-				if targets[i].namespace != targets[j].namespace {
-					return targets[i].namespace < targets[j].namespace
-				}
-				if targets[i].parent != targets[j].parent {
-					return targets[i].parent < targets[j].parent
-				}
-				return targets[i].component < targets[j].component
-			})
-			for _, target := range targets {
+		if len(ownerOccupancyTargets) > 0 {
+			ownerResolvedTargets[types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}] =
+				sortedTargets(ownerOccupancyTargets)
+		}
+		if len(ownerRoutingTargets) > 0 {
+			for _, target := range sortedTargets(ownerRoutingTargets) {
 				appendPod(types.NamespacedName{Namespace: target.namespace, Name: target.parent}, target.component, pod)
 			}
 			continue
@@ -161,7 +180,53 @@ func routeWorkloadPods(
 			}
 		}
 	}
-	return routed
+	return routed, ownerResolvedTargets
+}
+
+// projectOwnerResolvedNodeOccupancy replaces a physical GPU Pod's raw node
+// classification with every OMENative workload/component target proven by
+// its controller owner. Workload validation continues to consume the raw
+// routed PodInfo above, so malformed label evidence is not repaired here.
+//
+// A Pod may project to multiple logical blockers when its owner UID is
+// ambiguous. AllocatedGPUs is deliberately not recomputed from OMEPods: the
+// physical Pod was accounted exactly once during ingestion.
+func projectOwnerResolvedNodeOccupancy(
+	nodes map[string]*Node,
+	ownerResolvedTargets map[types.NamespacedName][]inferenceReplicaKey,
+) {
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		omePods := make([]PodInfo, 0, len(node.OMEPods))
+		otherOccupants := make([]PodInfo, 0, len(node.OtherOccupants))
+		project := func(pod PodInfo, alreadyOME bool) {
+			targets := ownerResolvedTargets[types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}]
+			if len(targets) == 0 {
+				if alreadyOME {
+					omePods = append(omePods, pod)
+				} else {
+					otherOccupants = append(otherOccupants, pod)
+				}
+				return
+			}
+			for _, target := range targets {
+				canonical := pod
+				canonical.ISVC = types.NamespacedName{Namespace: target.namespace, Name: target.parent}
+				canonical.Component = target.component
+				omePods = append(omePods, canonical)
+			}
+		}
+		for _, pod := range node.OMEPods {
+			project(pod, true)
+		}
+		for _, pod := range node.OtherOccupants {
+			project(pod, false)
+		}
+		node.OMEPods = omePods
+		node.OtherOccupants = otherOccupants
+	}
 }
 
 func containsComponent(components []v1beta1.ComponentType, target v1beta1.ComponentType) bool {
@@ -252,7 +317,7 @@ func buildOMENativeComponent(
 
 	seen := make(map[int32]map[podMemberKey]struct{}, len(instancesByIndex))
 	for _, pod := range pods {
-		identityValid := validPodIdentity(pod, ir.UID, isvc, componentType)
+		identityValid := validPodIdentity(pod, ir, isvc, componentType)
 		if !identityValid && (!pod.InstanceIndexPresent || !pod.InstanceIndexValid) {
 			invalidateComponent(component, observationReasonPodIdentity)
 			continue
@@ -410,7 +475,7 @@ func validateRunnerLayout(runners []v1beta1.Runner) (runnerLayout, bool) {
 
 func validPodIdentity(
 	pod PodInfo,
-	ownerUID types.UID,
+	ir *v1beta1.InferenceReplica,
 	isvc *v1beta1.InferenceService,
 	component v1beta1.ComponentType,
 ) bool {
@@ -421,8 +486,15 @@ func validPodIdentity(
 		pod.IncarnationPresent && pod.IncarnationValid &&
 		pod.RunnerPresent && pod.RunnerValid &&
 		pod.PodOrdinalPresent && pod.PodOrdinalValid &&
+		controllerOwnerMatchesInferenceReplica(pod, ir)
+}
+
+func controllerOwnerMatchesInferenceReplica(pod PodInfo, ir *v1beta1.InferenceReplica) bool {
+	return ir != nil && pod.Namespace == ir.Namespace &&
 		pod.ControllerOwnerPresent && pod.ControllerOwnerValid &&
-		pod.ControllerOwnerUID == ownerUID
+		pod.ControllerOwnerAPIVersion == v1beta1.SchemeGroupVersion.String() &&
+		pod.ControllerOwnerKind == "InferenceReplica" &&
+		pod.ControllerOwnerName == ir.Name && pod.ControllerOwnerUID == ir.UID
 }
 
 type podMemberKey struct {

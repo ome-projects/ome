@@ -198,6 +198,33 @@ func TestCrossPolicyDecisionsKeyedSeparately(t *testing.T) {
 	}
 }
 
+func TestReporterChangedEvacuationCauseDoesNotInheritDispatch(t *testing.T) {
+	r, _, _, cl := newTestReporter(t, recommendationsCM(nil))
+	maintenance := health("prod/a", "node1")
+	maintenance.Reason = policy.ReasonNodeMaintenance
+	changed := maintenance
+	changed.Reason = policy.ReasonNodeUnhealthy
+	changed.Executable = false
+	changed.AdvisoryReason = "OMENativeStateIneligible"
+	r.ReportCycle(context.Background(), []policy.Candidate{maintenance, changed},
+		[]Decision{{Candidate: maintenance, Admitted: true, DispatchStatus: "submitted", RequestUUID: "maintenance-request", DispatchReason: "RequestSubmitted"}}, config.Default(), testNow)
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "ome", Name: "alfred-recommendations"}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	var got cycleRecord
+	if err := json.Unmarshal([]byte(cm.Data[recommendationsKey]), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Recommendations) != 2 {
+		t.Fatalf("lost candidate records: %+v", got)
+	}
+	if got.Recommendations[0].Outcome != "submitted" || got.Recommendations[0].RequestUUID != "maintenance-request" ||
+		got.Recommendations[1].Outcome != "advisory" || got.Recommendations[1].RequestUUID != "" {
+		t.Fatalf("changed cause inherited old dispatch: %+v", got.Recommendations)
+	}
+}
+
 func TestReportCycleAdmissionWithoutDispatchIsWithheld(t *testing.T) {
 	r, _, recorder, cl := newTestReporter(t, recommendationsCM(nil))
 	cfg := config.Default()

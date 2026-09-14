@@ -19,7 +19,7 @@ func TestDefaultIsSafeAndComplete(t *testing.T) {
 	if cfg.DecisionLoopInterval.Duration != 5*time.Minute || cfg.ObservationLoopInterval.Duration != 30*time.Second {
 		t.Fatalf("default intervals: %v / %v", cfg.DecisionLoopInterval, cfg.ObservationLoopInterval)
 	}
-	if len(cfg.EarlyTickOn) != 1 || cfg.EarlyTickOn[0] != EarlyTickNodeConditionChange {
+	if len(cfg.EarlyTickOn) != 2 || cfg.EarlyTickOn[0] != EarlyTickNodeConditionChange || cfg.EarlyTickOn[1] != EarlyTickNodeMaintenanceChange {
 		t.Fatalf("default earlyTickOn: %v", cfg.EarlyTickOn)
 	}
 

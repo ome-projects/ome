@@ -24,6 +24,7 @@ const (
 	RejectPlacementCooldown     = "PlacementCooldown"
 	RejectNodeCooldown          = "NodeCooldown"
 	RejectTargetUnderEvac       = "TargetUnderEvacuation"
+	RejectTargetUnavailable     = "TargetUnavailable"
 	RejectTargetNodeBusy        = "TargetNodeBusy"
 	RejectNoCapacity            = "NoCapacity"
 	RejectInFlightCap           = "InFlightCap"
@@ -55,8 +56,8 @@ type Decision struct {
 	// Reason is the rejection code; empty when admitted.
 	Reason string
 	// Target is the claimed placement for an admitted candidate: the
-	// first feasible hint net of claims, or empty for an eviction
-	// expected to reuse its source.
+	// first feasible hint net of claims, or empty for a future delegated
+	// free-before-place action.
 	Target string
 	// CooldownOverridden marks a health evacuation admitted under the
 	// health floor while the standard per-workload window was still
@@ -78,7 +79,7 @@ type Arbiter struct {
 }
 
 // Admit arbitrates the executable candidates and returns one Decision per
-// candidate, in arbitration order (health before defrag, then score).
+// candidate, in arbitration order (health, maintenance, defrag, then score).
 // Advisory candidates are not arbitrated — the engine routes them straight
 // to the Reporter — and produce no Decision. Admit reconciles the Ledger
 // against the snapshot (expired records are pruned, completed migrations
@@ -91,13 +92,13 @@ func (a *Arbiter) Admit(snap *snapshot.ClusterSnapshot, cands []policy.Candidate
 			ordered = append(ordered, c)
 		}
 	}
-	// Priority: health preempts defrag across the merged stream; within a
+	// Priority: health preempts maintenance, which preempts defrag; within a
 	// class the policies' own ranking (score, then smaller footprint)
 	// carries over deterministically.
 	sort.SliceStable(ordered, func(i, j int) bool {
-		hi, hj := ordered[i].Reason == policy.ReasonNodeUnhealthy, ordered[j].Reason == policy.ReasonNodeUnhealthy
-		if hi != hj {
-			return hi
+		pi, pj := candidatePriority(ordered[i]), candidatePriority(ordered[j])
+		if pi != pj {
+			return pi > pj
 		}
 		if ordered[i].Score != ordered[j].Score {
 			return ordered[i].Score > ordered[j].Score
@@ -113,6 +114,17 @@ func (a *Arbiter) Admit(snap *snapshot.ClusterSnapshot, cands []policy.Candidate
 	return decisions
 }
 
+func candidatePriority(c policy.Candidate) int {
+	switch c.Reason {
+	case policy.ReasonNodeUnhealthy:
+		return 2
+	case policy.ReasonNodeMaintenance:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // admitState is the per-pass arbitration bookkeeping.
 type admitState struct {
 	arbiter *Arbiter
@@ -121,7 +133,7 @@ type admitState struct {
 	now     time.Time
 
 	breakerOpen bool
-	// evacuating are the FromNodes of this cycle's health candidates —
+	// evacuating are the FromNodes of this cycle's evacuation candidates —
 	// nodes no admitted move may land on.
 	evacuating map[string]bool
 	// claims is per-node replacement GPUs: prior in-flight dispatches
@@ -155,7 +167,7 @@ func newAdmitState(a *Arbiter, snap *snapshot.ClusterSnapshot, cfg *config.Confi
 		st.claims = a.Ledger.ActiveClaims()
 	}
 	for _, c := range ordered {
-		if c.Reason == policy.ReasonNodeUnhealthy && c.FromNode != "" {
+		if (c.Reason == policy.ReasonNodeUnhealthy || c.Reason == policy.ReasonNodeMaintenance) && c.FromNode != "" {
 			st.evacuating[c.FromNode] = true
 		}
 	}
@@ -302,10 +314,9 @@ func (st *admitState) decide(c policy.Candidate) Decision {
 
 // selectTarget re-checks capacity mode-aware and net of claims, against the
 // candidate's exhaustive placement targets when supplied, or its reporting
-// hints for compatibility with other policies. Those targets are already
-// schedulable- and model-filtered by the policy on this same snapshot. Surge
-// shapes must fit while the source still holds its GPUs; eviction needs no
-// headroom and may reuse its source.
+// hints for compatibility with other policies. It independently rechecks node
+// availability even when a policy supplies untrusted hints. Surge shapes must
+// fit while the source still holds its GPUs; Alfred does not itself evict pods.
 // It returns the primary target, the per-node GPUs the admission will claim,
 // and — when nothing fits a surge — a reason distinguishing *why*: a hint
 // under evacuation, a hint already landed on this cycle, or plain capacity.
@@ -319,11 +330,15 @@ func (st *admitState) selectTarget(c policy.Candidate, inst *snapshot.Instance) 
 	// text), so they are reset per placement attempt: an early pod probing
 	// past a busy hint must not relabel a later pod's plain capacity
 	// failure.
-	var sawEvacuating, sawLanded, sawCooling bool
-	resetSaw := func() { sawEvacuating, sawLanded, sawCooling = false, false, false }
+	var sawEvacuating, sawUnavailable, sawLanded, sawCooling bool
+	resetSaw := func() { sawEvacuating, sawUnavailable, sawLanded, sawCooling = false, false, false, false }
 	fits := func(node string, gpus int64) bool {
 		n := st.snap.Nodes[node]
 		if n == nil {
+			return false
+		}
+		if n.UnavailableAsTarget() {
+			sawUnavailable = true
 			return false
 		}
 		if st.evacuating[node] {
@@ -390,6 +405,8 @@ func (st *admitState) selectTarget(c policy.Candidate, inst *snapshot.Instance) 
 		}
 		if !placed {
 			switch {
+			case sawUnavailable:
+				return "", nil, RejectTargetUnavailable
 			case sawEvacuating:
 				return "", nil, RejectTargetUnderEvac
 			case sawLanded:

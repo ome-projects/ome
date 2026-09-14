@@ -28,7 +28,7 @@ func TestSnapshotBuilder(t *testing.T) {
 		t.Fatalf("node1: allocated=%d free=%d, want 10/0 (floored)", node1.AllocatedGPUs, node1.FreeGPUs)
 	}
 	node2 := snap.Nodes["node2"]
-	if node2.AllocatedGPUs != 11 || node2.FreeGPUs != 0 || !node2.Unhealthy {
+	if node2.AllocatedGPUs != 11 || node2.FreeGPUs != 0 || node2.Health.State != snapshot.NodeHealthUnhealthy {
 		t.Fatalf("node2: %+v", node2)
 	}
 	if !snap.Nodes["node3"].Cordoned || !snap.Nodes["node3"].Preemptible {
@@ -64,6 +64,25 @@ func TestSnapshotBuilder(t *testing.T) {
 	}
 	if got := snap.PendingPods[0].PendingSince; !got.Equal(ReferenceTime.Add(-20 * time.Minute)) {
 		t.Fatalf("pending age: %v", got)
+	}
+}
+
+func TestNodeHealthOptionsRetainReconstructibleEvidence(t *testing.T) {
+	snap := NewSnapshot().
+		WithNode("unhealthy", "h100", 8, NodeSuspect(), NodeUnhealthy("ZFailure", "AFailure")).
+		WithNode("unknown", "h100", 8, NodeUnknown()).
+		WithNode("suspect", "h100", 8, NodeSuspect()).Build()
+	unhealthy := snap.Nodes["unhealthy"].Health
+	if unhealthy.SuspectUntil != nil || len(unhealthy.Conditions) != 2 || unhealthy.Conditions[0].Type != "AFailure" || !unhealthy.Conditions[0].LastTransitionTime.Equal(ReferenceTime) {
+		t.Fatalf("unhealthy evidence=%+v", unhealthy)
+	}
+	unknown := snap.Nodes["unknown"].Health
+	if len(unknown.Conditions) != 1 || unknown.Conditions[0].Status != "Unknown" || !unknown.Conditions[0].LastTransitionTime.Equal(ReferenceTime) {
+		t.Fatalf("unknown evidence=%+v", unknown)
+	}
+	suspect := snap.Nodes["suspect"].Health
+	if suspect.SuspectUntil == nil || !suspect.SuspectUntil.Equal(ReferenceTime.Add(30*time.Minute)) || len(suspect.Conditions) != 1 || suspect.Conditions[0].Status != "False" {
+		t.Fatalf("suspect evidence=%+v", suspect)
 	}
 }
 

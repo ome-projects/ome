@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -52,10 +53,44 @@ type OMENativeExecutorState struct {
 	Reason      string
 }
 
+// NodeHealthState is the placement-safety view of configured failure conditions.
+type NodeHealthState string
+
+const (
+	NodeHealthClear     NodeHealthState = "Clear"
+	NodeHealthUnhealthy NodeHealthState = "Unhealthy"
+	NodeHealthUnknown   NodeHealthState = "Unknown"
+	NodeHealthSuspect   NodeHealthState = "Suspect"
+)
+
+// NodeHealthObservation is reconstructed from the current Node conditions.
+type NodeHealthObservation struct {
+	State      NodeHealthState
+	Conditions []NodeConditionObservation
+	// SuspectUntil is non-nil only while State is NodeHealthSuspect.
+	SuspectUntil *time.Time
+}
+
+// NodeConditionObservation retains configured failure evidence.
+type NodeConditionObservation struct {
+	Type               corev1.NodeConditionType
+	Status             corev1.ConditionStatus
+	LastTransitionTime time.Time
+}
+
+// NodeMaintenanceObservation retains the names of matching planned-work rules.
+// It is independent of failure health and clears as soon as all rules stop matching.
+type NodeMaintenanceObservation struct {
+	Requested bool
+	Triggers  []string
+}
+
 // Node is one node's physical GPU state plus the placement-relevant flags
 // policies filter on.
 type Node struct {
 	Name string
+	// UID distinguishes a recreated Node from its previous same-name object.
+	UID types.UID
 
 	// Labels is the node's label set, retained because model readiness,
 	// spot detection, and PVC topology all resolve against it.
@@ -85,11 +120,10 @@ type Node struct {
 	// treated as free yet.
 	TerminatingGPUs int64
 
-	// Unhealthy is set when any configured trigger condition (default
-	// GpuUnhealthy) is True on the node.
-	Unhealthy bool
-	// UnhealthyConditions lists which trigger conditions were True.
-	UnhealthyConditions []string
+	// Health derives configured failure conditions and recovery quarantine.
+	Health NodeHealthObservation
+	// Maintenance observes independently configured planned-work signals.
+	Maintenance NodeMaintenanceObservation
 	// Cordoned mirrors spec.unschedulable.
 	Cordoned bool
 	// ScaleDownDisabled mirrors the cluster-autoscaler
@@ -101,17 +135,20 @@ type Node struct {
 	// Preemptible is set when the node matches a configured
 	// spot/preemptible label.
 	Preemptible bool
-	// Suspect is set by the engine for nodes inside their post-evacuation
-	// suspicion window; such nodes are excluded from every policy's
-	// target hints even after the health condition clears. The builder
-	// always leaves it false.
-	Suspect bool
 
-	// OMEPods are the OME-managed GPU pods bound to this node.
+	// OMEPods retain OME-managed GPU occupancy, including unresolved owner
+	// evidence. An ambiguous owner projects multiple logical blockers here;
+	// AllocatedGPUs still counts the physical Pod exactly once.
 	OMEPods []PodInfo
 	// OtherOccupants are non-OME GPU pods (notebooks, batch jobs, ...):
 	// they count against capacity but are never migration candidates.
 	OtherOccupants []PodInfo
+}
+
+// UnavailableAsTarget centralizes placement exclusions and fails closed for a
+// missing node observation.
+func (n *Node) UnavailableAsTarget() bool {
+	return n == nil || n.Health.Quarantined() || n.Maintenance.Requested || n.Cordoned || n.ScaleDownMarked
 }
 
 // PodInfo is the slice of pod state the snapshot keeps per GPU-consuming pod.
@@ -130,10 +167,10 @@ type PodInfo struct {
 	// StartTime is pod.status.startTime when set (drives the
 	// authorship-blind placement cooldown).
 	StartTime *time.Time
-	// ISVC is the owning InferenceService (zero for non-OME pods).
+	// ISVC retains the raw label during workload validation; node occupancy
+	// carries controller-owner-resolved identity when proven.
 	ISVC types.NamespacedName
-	// Component is the OME component label value (engine/decoder/router);
-	// empty for non-OME pods.
+	// Component follows the same raw-evidence/canonical-occupancy distinction.
 	Component v1beta1.ComponentType
 	// ManagedBy is the ome.io/managed-by label value.
 	ManagedBy string
@@ -154,11 +191,15 @@ type PodInfo struct {
 	PodOrdinalPresent    bool
 	PodOrdinalValid      bool
 
-	// ControllerOwnerUID is the sole controller OwnerReference UID when one
-	// structurally valid reference is present.
-	ControllerOwnerUID     types.UID
-	ControllerOwnerPresent bool
-	ControllerOwnerValid   bool
+	// ControllerOwner* retain the sole controller reference. Valid requires an
+	// ome/v1beta1 InferenceReplica with a nonempty name and UID; owner resolution
+	// additionally matches the complete identity to an observed IR.
+	ControllerOwnerUID        types.UID
+	ControllerOwnerAPIVersion string
+	ControllerOwnerKind       string
+	ControllerOwnerName       string
+	ControllerOwnerPresent    bool
+	ControllerOwnerValid      bool
 }
 
 // Workload is one InferenceService with everything policies need to reason
