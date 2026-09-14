@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -14,10 +13,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"knative.dev/pkg/apis"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/canaryevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
 	omevalidation "sigs.k8s.io/ome/pkg/validation"
@@ -34,8 +33,6 @@ var (
 	// an immutable InferenceService identity.
 	ErrSubjectUIDRequired = errors.New("inference service UID is required")
 )
-
-var revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
 
 // Project builds a safe, deterministic rollout report from one observed
 // InferenceService. It performs no cluster reads.
@@ -425,19 +422,16 @@ func (b *projector) applyCompletedCanaryStatus(
 	primary omev1beta1.ComponentType,
 	status *omev1beta1.CanaryStatus,
 ) {
-	validFinalStep := false
-	if len(group.Canary.Steps) > 0 {
-		finalStep := group.Canary.Steps[len(group.Canary.Steps)-1]
-		validFinalStep = finalStep.Traffic == 100 && validCompletedCanaryCapacity(finalStep.Capacity)
-	}
-	valid := validFinalStep &&
-		int(status.CurrentStep) == len(group.Canary.Steps) &&
-		status.ObservedTrafficWeight == 100 &&
-		status.StableRevisionHash == "" &&
-		status.RolledBackRevisionHash == "" &&
-		status.PromotedThrough == "" &&
+	component, found := b.isvc.Status.Components[primary]
+	valid := found &&
 		projected.TargetRevisionHash != "" &&
-		b.completedCanaryTrafficMatches(primary, projected.TargetRevisionHash)
+		canaryevidence.CompletedStatusMatches(
+			b.isvc.Name,
+			primary,
+			group.Canary.Steps,
+			status,
+			component.Traffic,
+		)
 	if !valid {
 		b.markMalformed(reportv1alpha1.RolloutIssueCanaryStepInvalid, ptrInt(projected.Index), "")
 	}
@@ -448,70 +442,11 @@ func (b *projector) activeCanaryTrafficMatches(
 	phase reportv1alpha1.RolloutPhase,
 	status *omev1beta1.CanaryStatus,
 ) bool {
-	if status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 ||
-		!safeRevisionHash(status.CanaryRevisionHash) ||
-		(status.StableRevisionHash != "" && !safeRevisionHash(status.StableRevisionHash)) ||
-		(status.StableRevisionHash != "" && status.StableRevisionHash == status.CanaryRevisionHash) {
-		return false
-	}
-
-	expected := make(map[string]int32, 2)
-	if phase == reportv1alpha1.RolloutPhaseRollingBack || phase == reportv1alpha1.RolloutPhaseRolledBack {
-		if status.RolledBackRevisionHash == "" ||
-			status.RolledBackRevisionHash != status.CanaryRevisionHash ||
-			status.StableRevisionHash == "" || status.ObservedTrafficWeight != 0 {
-			return false
-		}
-		expected[status.StableRevisionHash] = 100
-	} else {
-		if status.RolledBackRevisionHash != "" {
-			return false
-		}
-		if status.ObservedTrafficWeight > 0 {
-			expected[status.CanaryRevisionHash] = status.ObservedTrafficWeight
-		}
-		stableWeight := int32(100) - status.ObservedTrafficWeight
-		if stableWeight > 0 {
-			if status.StableRevisionHash == "" {
-				return false
-			}
-			expected[status.StableRevisionHash] = stableWeight
-		}
-	}
-
 	component, found := b.isvc.Status.Components[primary]
-	if !found || len(component.Traffic) != len(expected) {
+	if !found {
 		return false
 	}
-	seen := make(map[string]struct{}, len(component.Traffic))
-	for _, target := range component.Traffic {
-		hash := extractRevisionHash(b.isvc.Name, primary, target.RevisionName)
-		if hash == "" {
-			return false
-		}
-		if _, duplicate := seen[hash]; duplicate {
-			return false
-		}
-		seen[hash] = struct{}{}
-		expectedPercent, expectedHash := expected[hash]
-		if !expectedHash || expectedPercent != target.Percent {
-			return false
-		}
-	}
-	return true
-}
-
-func (b *projector) completedCanaryTrafficMatches(
-	primary omev1beta1.ComponentType,
-	targetHash string,
-) bool {
-	component, found := b.isvc.Status.Components[primary]
-	if !found || len(component.Traffic) != 1 {
-		return false
-	}
-	target := component.Traffic[0]
-	return target.Percent == 100 &&
-		extractRevisionHash(b.isvc.Name, primary, target.RevisionName) == targetHash
+	return canaryevidence.ActiveTrafficMatches(b.isvc.Name, primary, phase, status, component.Traffic)
 }
 
 func (b *projector) applyCoordinationStatus(
@@ -1152,16 +1087,8 @@ func (b *projector) canaryGroupPhase(
 }
 
 func canaryPrimary(components []omev1beta1.ComponentType) omev1beta1.ComponentType {
-	for _, candidate := range []omev1beta1.ComponentType{
-		omev1beta1.RouterComponent,
-		omev1beta1.EngineComponent,
-		omev1beta1.DecoderComponent,
-	} {
-		if slices.Contains(components, candidate) {
-			return candidate
-		}
-	}
-	return ""
+	primary, _ := canaryevidence.Primary(components)
+	return primary
 }
 
 func (b *projector) safeDirectHash(value string, group int) string {
@@ -1319,28 +1246,7 @@ func componentOrder(component omev1beta1.ComponentType) int {
 }
 
 func projectComponentPhase(phase omev1beta1.RolloutPhase) reportv1alpha1.RolloutPhase {
-	switch phase {
-	case omev1beta1.RolloutPhaseStable:
-		return reportv1alpha1.RolloutPhaseStable
-	case omev1beta1.RolloutPhaseCanarying:
-		return reportv1alpha1.RolloutPhaseCanarying
-	case omev1beta1.RolloutPhaseBlueGreenStandby:
-		return reportv1alpha1.RolloutPhaseBlueGreenStandby
-	case omev1beta1.RolloutPhasePending:
-		return reportv1alpha1.RolloutPhasePending
-	case omev1beta1.RolloutPhasePaused:
-		return reportv1alpha1.RolloutPhasePaused
-	case omev1beta1.RolloutPhasePromoting:
-		return reportv1alpha1.RolloutPhasePromoting
-	case omev1beta1.RolloutPhaseRollingBack:
-		return reportv1alpha1.RolloutPhaseRollingBack
-	case omev1beta1.RolloutPhaseRolledBack:
-		return reportv1alpha1.RolloutPhaseRolledBack
-	case omev1beta1.RolloutPhaseFailed:
-		return reportv1alpha1.RolloutPhaseFailed
-	default:
-		return reportv1alpha1.RolloutPhaseUnknown
-	}
+	return canaryevidence.ProjectPhase(phase)
 }
 
 func projectCoordinationPhase(phase omev1beta1.CoordinationPhase) reportv1alpha1.RolloutPhase {
@@ -1515,31 +1421,8 @@ func safeCapacity(value intstr.IntOrString) bool {
 	}
 }
 
-func validCompletedCanaryCapacity(value intstr.IntOrString) bool {
-	if !safeCapacity(value) {
-		return false
-	}
-	if value.Type == intstr.Int {
-		return value.IntVal > 0
-	}
-	percentage, err := strconv.Atoi(strings.TrimSuffix(value.StrVal, "%"))
-	return err == nil && percentage == 100
-}
-
 func extractRevisionHash(isvcName string, component omev1beta1.ComponentType, serviceName string) string {
-	if len(serviceName) < 8 {
-		return ""
-	}
-	hash := serviceName[len(serviceName)-8:]
-	if !safeRevisionHash(hash) {
-		return ""
-	}
-	rawName := fmt.Sprintf("%s-%s-rev-%s", isvcName, component, hash)
-	expected := constants.TruncateNameWithMaxLength(rawName, validation.DNS1035LabelMaxLength)
-	if serviceName != expected {
-		return ""
-	}
-	return hash
+	return canaryevidence.RevisionHash(isvcName, component, serviceName)
 }
 
 func extractControllerRevisionHash(
@@ -1561,7 +1444,7 @@ func extractControllerRevisionHash(
 }
 
 func safeRevisionHash(hash string) bool {
-	return revisionHashPattern.MatchString(hash)
+	return canaryevidence.SafeRevisionHash(hash)
 }
 
 func revisionRole(hash string, component *reportv1alpha1.RolloutComponentStatus) reportv1alpha1.RolloutRevisionRole {
@@ -1578,42 +1461,15 @@ func revisionRole(hash string, component *reportv1alpha1.RolloutComponentStatus)
 }
 
 func canaryPhaseNeedsStatus(phase reportv1alpha1.RolloutPhase) bool {
-	switch phase {
-	case reportv1alpha1.RolloutPhasePending,
-		reportv1alpha1.RolloutPhaseCanarying,
-		reportv1alpha1.RolloutPhasePaused,
-		reportv1alpha1.RolloutPhasePromoting,
-		reportv1alpha1.RolloutPhaseRollingBack,
-		reportv1alpha1.RolloutPhaseRolledBack,
-		reportv1alpha1.RolloutPhaseFailed:
-		return true
-	default:
-		return false
-	}
+	return canaryevidence.PhaseNeedsStatus(phase)
 }
 
 func canaryPhaseBindsTraffic(phase reportv1alpha1.RolloutPhase) bool {
-	switch phase {
-	case reportv1alpha1.RolloutPhaseCanarying,
-		reportv1alpha1.RolloutPhasePaused,
-		reportv1alpha1.RolloutPhasePromoting,
-		reportv1alpha1.RolloutPhaseRollingBack,
-		reportv1alpha1.RolloutPhaseRolledBack:
-		return true
-	default:
-		return false
-	}
+	return canaryevidence.PhaseBindsTraffic(phase)
 }
 
 func canaryPhaseBindsStepTraffic(phase reportv1alpha1.RolloutPhase) bool {
-	switch phase {
-	case reportv1alpha1.RolloutPhaseCanarying,
-		reportv1alpha1.RolloutPhasePaused,
-		reportv1alpha1.RolloutPhasePromoting:
-		return true
-	default:
-		return false
-	}
+	return canaryevidence.PhaseBindsStepTraffic(phase)
 }
 
 func canaryObservedTrafficMatchesStep(
@@ -1621,16 +1477,7 @@ func canaryObservedTrafficMatchesStep(
 	steps []omev1beta1.RolloutGroupStep,
 	status *omev1beta1.CanaryStatus,
 ) bool {
-	current := int(status.CurrentStep)
-	if current < 0 || current >= len(steps) {
-		return false
-	}
-	if status.ObservedTrafficWeight == steps[current].Traffic {
-		return true
-	}
-	return phase == reportv1alpha1.RolloutPhaseCanarying &&
-		current > 0 &&
-		status.ObservedTrafficWeight == steps[current-1].Traffic
+	return canaryevidence.ObservedTrafficMatchesStep(phase, steps, status)
 }
 
 func validCanaryPhaseStepResidue(
@@ -1638,43 +1485,7 @@ func validCanaryPhaseStepResidue(
 	steps []omev1beta1.RolloutGroupStep,
 	status *omev1beta1.CanaryStatus,
 ) bool {
-	current := int(status.CurrentStep)
-	if current < 0 || current >= len(steps) {
-		return false
-	}
-	last := len(steps) - 1
-	switch phase {
-	case reportv1alpha1.RolloutPhasePromoting:
-		if current != last {
-			return false
-		}
-	case reportv1alpha1.RolloutPhasePaused:
-		if current >= last {
-			return false
-		}
-	case reportv1alpha1.RolloutPhaseCanarying:
-		if current == last &&
-			(current == 0 || status.ObservedTrafficWeight != steps[current-1].Traffic) {
-			return false
-		}
-	}
-
-	rollbackPhase := phase == reportv1alpha1.RolloutPhaseRollingBack ||
-		phase == reportv1alpha1.RolloutPhaseRolledBack
-	if status.RolledBackRevisionHash != "" && !rollbackPhase {
-		return false
-	}
-	if status.PromotedThrough == "" {
-		return true
-	}
-	if current < 1 {
-		return false
-	}
-	previousStep := &steps[current-1]
-	if gateFor(previousStep) == reportv1alpha1.RolloutGateManual {
-		return status.PromotedThrough == status.CanaryRevisionHash
-	}
-	return true
+	return canaryevidence.ValidPhaseStepResidue(phase, steps, status)
 }
 
 func hasPhase(phases []reportv1alpha1.RolloutPhase, want reportv1alpha1.RolloutPhase) bool {

@@ -1,0 +1,341 @@
+// Package canaryevidence contains the pure invariants that bind canary status
+// to its rollout phase, configured step, and primary-component traffic epoch.
+package canaryevidence
+
+import (
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
+
+	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	"sigs.k8s.io/ome/pkg/constants"
+)
+
+var revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
+
+// Primary returns the component whose traffic is authoritative for a canary
+// group and whether every member is unique and supported. The selected value
+// still follows controller priority when the surrounding shape is invalid, so
+// diagnostic projections can preserve the shipped phase source.
+func Primary(components []omev1beta1.ComponentType) (omev1beta1.ComponentType, bool) {
+	valid := len(components) > 0
+	seen := make(map[omev1beta1.ComponentType]bool, len(components))
+	for _, component := range components {
+		if seen[component] || !supportedComponent(component) {
+			valid = false
+		}
+		seen[component] = true
+	}
+	for _, candidate := range []omev1beta1.ComponentType{
+		omev1beta1.RouterComponent,
+		omev1beta1.EngineComponent,
+		omev1beta1.DecoderComponent,
+	} {
+		if slices.Contains(components, candidate) {
+			return candidate, valid
+		}
+	}
+	return "", false
+}
+
+// ProjectPhase converts the API phase into the CLI's closed report contract.
+func ProjectPhase(phase omev1beta1.RolloutPhase) reportv1alpha1.RolloutPhase {
+	switch phase {
+	case omev1beta1.RolloutPhaseStable:
+		return reportv1alpha1.RolloutPhaseStable
+	case omev1beta1.RolloutPhaseCanarying:
+		return reportv1alpha1.RolloutPhaseCanarying
+	case omev1beta1.RolloutPhaseBlueGreenStandby:
+		return reportv1alpha1.RolloutPhaseBlueGreenStandby
+	case omev1beta1.RolloutPhasePending:
+		return reportv1alpha1.RolloutPhasePending
+	case omev1beta1.RolloutPhasePaused:
+		return reportv1alpha1.RolloutPhasePaused
+	case omev1beta1.RolloutPhasePromoting:
+		return reportv1alpha1.RolloutPhasePromoting
+	case omev1beta1.RolloutPhaseRollingBack:
+		return reportv1alpha1.RolloutPhaseRollingBack
+	case omev1beta1.RolloutPhaseRolledBack:
+		return reportv1alpha1.RolloutPhaseRolledBack
+	case omev1beta1.RolloutPhaseFailed:
+		return reportv1alpha1.RolloutPhaseFailed
+	default:
+		return reportv1alpha1.RolloutPhaseUnknown
+	}
+}
+
+// SafeRevisionHash reports whether a controller revision hash is canonical.
+func SafeRevisionHash(hash string) bool {
+	return revisionHashPattern.MatchString(hash)
+}
+
+// RevisionHash extracts a canonical hash from a per-revision Service name.
+func RevisionHash(isvcName string, component omev1beta1.ComponentType, serviceName string) string {
+	if len(serviceName) < 8 {
+		return ""
+	}
+	hash := serviceName[len(serviceName)-8:]
+	if !SafeRevisionHash(hash) {
+		return ""
+	}
+	rawName := isvcName + "-" + string(component) + "-rev-" + hash
+	expected := constants.TruncateNameWithMaxLength(rawName, validation.DNS1035LabelMaxLength)
+	if serviceName != expected {
+		return ""
+	}
+	return hash
+}
+
+// PhaseNeedsStatus reports whether a canary phase requires CanaryStatus.
+func PhaseNeedsStatus(phase reportv1alpha1.RolloutPhase) bool {
+	switch phase {
+	case reportv1alpha1.RolloutPhasePending,
+		reportv1alpha1.RolloutPhaseCanarying,
+		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhasePromoting,
+		reportv1alpha1.RolloutPhaseRollingBack,
+		reportv1alpha1.RolloutPhaseRolledBack,
+		reportv1alpha1.RolloutPhaseFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// PhaseBindsTraffic reports whether the phase promises that primary Traffic
+// and CanaryStatus describe the same applied epoch.
+func PhaseBindsTraffic(phase reportv1alpha1.RolloutPhase) bool {
+	switch phase {
+	case reportv1alpha1.RolloutPhaseCanarying,
+		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhasePromoting,
+		reportv1alpha1.RolloutPhaseRollingBack,
+		reportv1alpha1.RolloutPhaseRolledBack:
+		return true
+	default:
+		return false
+	}
+}
+
+// PhaseBindsStepTraffic reports whether observed traffic must match a
+// configured canary step in this phase.
+func PhaseBindsStepTraffic(phase reportv1alpha1.RolloutPhase) bool {
+	switch phase {
+	case reportv1alpha1.RolloutPhaseCanarying,
+		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhasePromoting:
+		return true
+	default:
+		return false
+	}
+}
+
+// ObservedTrafficMatchesStep accepts the current step, plus the controller's
+// documented one-write canary advance residue where the new index is visible
+// before its traffic is applied.
+func ObservedTrafficMatchesStep(
+	phase reportv1alpha1.RolloutPhase,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	if status == nil {
+		return false
+	}
+	current := int(status.CurrentStep)
+	if current < 0 || current >= len(steps) {
+		return false
+	}
+	if status.ObservedTrafficWeight == steps[current].Traffic {
+		return true
+	}
+	return phase == reportv1alpha1.RolloutPhaseCanarying &&
+		current > 0 &&
+		status.ObservedTrafficWeight == steps[current-1].Traffic
+}
+
+// ValidPhaseStepResidue validates phase-specific step and durable promotion /
+// rollback residue without requiring applied traffic during Pending or Failed.
+func ValidPhaseStepResidue(
+	phase reportv1alpha1.RolloutPhase,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	if status == nil {
+		return false
+	}
+	current := int(status.CurrentStep)
+	if current < 0 || current >= len(steps) {
+		return false
+	}
+	last := len(steps) - 1
+	switch phase {
+	case reportv1alpha1.RolloutPhasePromoting:
+		if current != last {
+			return false
+		}
+	case reportv1alpha1.RolloutPhasePaused:
+		if current >= last {
+			return false
+		}
+	case reportv1alpha1.RolloutPhaseCanarying:
+		if current == last &&
+			(current == 0 || status.ObservedTrafficWeight != steps[current-1].Traffic) {
+			return false
+		}
+	}
+
+	rollbackPhase := phase == reportv1alpha1.RolloutPhaseRollingBack ||
+		phase == reportv1alpha1.RolloutPhaseRolledBack
+	if status.RolledBackRevisionHash != "" && !rollbackPhase {
+		return false
+	}
+	if status.PromotedThrough == "" {
+		return true
+	}
+	if current < 1 {
+		return false
+	}
+	previousStep := steps[current-1]
+	if previousStep.Analysis == nil && previousStep.Pause != nil && previousStep.Pause.Duration == nil {
+		return status.PromotedThrough == status.CanaryRevisionHash
+	}
+	return true
+}
+
+// ActiveTrafficMatches validates that primary Traffic is the exact epoch
+// described by active CanaryStatus.
+func ActiveTrafficMatches(
+	isvcName string,
+	primary omev1beta1.ComponentType,
+	phase reportv1alpha1.RolloutPhase,
+	status *omev1beta1.CanaryStatus,
+	traffic []omev1beta1.ComponentTrafficTarget,
+) bool {
+	if status == nil || status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 ||
+		!SafeRevisionHash(status.CanaryRevisionHash) ||
+		(status.StableRevisionHash != "" && !SafeRevisionHash(status.StableRevisionHash)) ||
+		(status.StableRevisionHash != "" && status.StableRevisionHash == status.CanaryRevisionHash) {
+		return false
+	}
+
+	expected := make(map[string]int32, 2)
+	if phase == reportv1alpha1.RolloutPhaseRollingBack || phase == reportv1alpha1.RolloutPhaseRolledBack {
+		if status.RolledBackRevisionHash == "" ||
+			status.RolledBackRevisionHash != status.CanaryRevisionHash ||
+			status.StableRevisionHash == "" || status.ObservedTrafficWeight != 0 {
+			return false
+		}
+		expected[status.StableRevisionHash] = 100
+	} else {
+		if status.RolledBackRevisionHash != "" {
+			return false
+		}
+		if status.ObservedTrafficWeight > 0 {
+			expected[status.CanaryRevisionHash] = status.ObservedTrafficWeight
+		}
+		stableWeight := int32(100) - status.ObservedTrafficWeight
+		if stableWeight > 0 {
+			if status.StableRevisionHash == "" {
+				return false
+			}
+			expected[status.StableRevisionHash] = stableWeight
+		}
+	}
+
+	if len(traffic) != len(expected) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(traffic))
+	for _, target := range traffic {
+		hash := RevisionHash(isvcName, primary, target.RevisionName)
+		if hash == "" {
+			return false
+		}
+		if _, duplicate := seen[hash]; duplicate {
+			return false
+		}
+		seen[hash] = struct{}{}
+		expectedPercent, found := expected[hash]
+		if !found || expectedPercent != target.Percent {
+			return false
+		}
+	}
+	return true
+}
+
+// CompletedTrafficMatches validates the single 100% target promised by a
+// completed canary epoch.
+func CompletedTrafficMatches(
+	isvcName string,
+	primary omev1beta1.ComponentType,
+	targetHash string,
+	traffic []omev1beta1.ComponentTrafficTarget,
+) bool {
+	if len(traffic) != 1 {
+		return false
+	}
+	target := traffic[0]
+	return target.Percent == 100 && RevisionHash(isvcName, primary, target.RevisionName) == targetHash
+}
+
+// CompletedStatusMatches validates the completion sentinel and the primary
+// traffic epoch together, so an active CanaryStatus cannot be interpreted as
+// completed merely because the component phase changed first.
+func CompletedStatusMatches(
+	isvcName string,
+	primary omev1beta1.ComponentType,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+	traffic []omev1beta1.ComponentTrafficTarget,
+) bool {
+	return status != nil &&
+		len(steps) > 0 &&
+		ValidCompletedStep(steps[len(steps)-1]) &&
+		int(status.CurrentStep) == len(steps) &&
+		status.ObservedTrafficWeight == 100 &&
+		status.StableRevisionHash == "" &&
+		status.RolledBackRevisionHash == "" &&
+		status.PromotedThrough == "" &&
+		SafeRevisionHash(status.CanaryRevisionHash) &&
+		CompletedTrafficMatches(isvcName, primary, status.CanaryRevisionHash, traffic)
+}
+
+// ValidCompletedStep reports whether a canary plan may truthfully publish its
+// completion sentinel after the final step.
+func ValidCompletedStep(step omev1beta1.RolloutGroupStep) bool {
+	if step.Traffic != 100 || !safeCapacity(step.Capacity) {
+		return false
+	}
+	if step.Capacity.Type == intstr.Int {
+		return step.Capacity.IntVal > 0
+	}
+	percentage, err := strconv.Atoi(strings.TrimSuffix(step.Capacity.StrVal, "%"))
+	return err == nil && percentage == 100
+}
+
+func supportedComponent(component omev1beta1.ComponentType) bool {
+	return component == omev1beta1.EngineComponent ||
+		component == omev1beta1.DecoderComponent ||
+		component == omev1beta1.RouterComponent
+}
+
+func safeCapacity(value intstr.IntOrString) bool {
+	switch value.Type {
+	case intstr.Int:
+		return value.IntVal >= 0
+	case intstr.String:
+		raw := value.StrVal
+		if !strings.HasSuffix(raw, "%") {
+			return false
+		}
+		parsed, err := strconv.Atoi(strings.TrimSuffix(raw, "%"))
+		return err == nil && parsed >= 0 && parsed <= 100
+	default:
+		return false
+	}
+}

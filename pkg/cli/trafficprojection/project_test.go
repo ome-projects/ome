@@ -141,6 +141,99 @@ func TestProjectMarksTranslatorUnavailableWithoutARecognizedPolicy(t *testing.T)
 	}, got.Content.Summary.Source.Translator)
 }
 
+func TestProjectDoesNotInferNoopFromInvalidReadyCondition(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*metav1.Condition)
+	}{
+		{
+			name: "wrong status",
+			mutate: func(condition *metav1.Condition) {
+				condition.Status = metav1.ConditionUnknown
+			},
+		},
+		{
+			name: "missing transition time",
+			mutate: func(condition *metav1.Condition) {
+				condition.LastTransitionTime = metav1.Time{}
+			},
+		},
+		{
+			name: "negative observed generation",
+			mutate: func(condition *metav1.Condition) {
+				condition.ObservedGeneration = -1
+			},
+		},
+		{
+			name: "future observed generation",
+			mutate: func(condition *metav1.Condition) {
+				condition.ObservedGeneration = 8
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Status.Traffic.BackendPolicyResource = nil
+			isvc.Status.Traffic.TargetedHTTPRoutes = nil
+			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonNoTranslatorAvailable, 7)
+			tt.mutate(&isvc.Status.Traffic.Conditions[0])
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+			assert.Equal(t, reportv1alpha1.TrafficTranslatorUnavailable, got.Content.Summary.Translator)
+			assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Summary.Source.Algorithm.Freshness)
+			assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueConditionInvalid})
+		})
+	}
+}
+
+func TestProjectDoesNotInferNoopFromConflictingReadyConditions(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.BackendPolicyResource = nil
+	isvc.Status.Traffic.TargetedHTTPRoutes = nil
+	setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonNoTranslatorAvailable, 7)
+	isvc.Status.Traffic.Conditions = append(
+		isvc.Status.Traffic.Conditions,
+		trafficCondition(
+			omev1beta1.TrafficConditionBackendPolicyReady,
+			metav1.ConditionTrue,
+			omev1beta1.TrafficReasonAcceptedByGateway,
+			7,
+		),
+	)
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficTranslatorUnavailable, got.Content.Summary.Translator)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Summary.Source.Algorithm.Freshness)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueConditionConflict})
+}
+
+func TestProjectMarksPresentTrafficFieldsUnverifiableWithoutReadyCondition(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.Conditions = nil
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateUnavailable, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Summary.Source.Algorithm.Freshness)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Summary.Source.Translator.Freshness)
+	require.NotNil(t, got.Content.Policy)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Policy.Source.Freshness)
+	require.NotEmpty(t, got.Content.Routes)
+	for _, route := range got.Content.Routes {
+		assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, route.Source.Freshness)
+	}
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssuePolicyConditionMissing})
+}
+
 func TestProjectAllowsAValidStatusBeforeEndpointsArePublished(t *testing.T) {
 	isvc := currentTrafficISVC(t)
 	isvc.Status.Addresses = nil
@@ -203,6 +296,9 @@ func TestProjectCanaryPrimaryFollowsControllerPriority(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			isvc := currentTrafficISVC(t)
 			isvc.Spec.Rollout.Groups[0].Components = tt.components
+			isvc.Status.Components[omev1beta1.RouterComponent] = primaryCanaryComponent(
+				omev1beta1.RouterComponent,
+			)
 
 			got, err := trafficprojection.Project(isvc, projectionClock)
 
@@ -219,6 +315,9 @@ func TestProjectCanaryRolesAreScopedToThePrimaryComponent(t *testing.T) {
 		omev1beta1.EngineComponent,
 		omev1beta1.RouterComponent,
 	}
+	isvc.Status.Components[omev1beta1.RouterComponent] = primaryCanaryComponent(
+		omev1beta1.RouterComponent,
+	)
 	engine := isvc.Status.Components[omev1beta1.EngineComponent]
 	engine.Traffic = []omev1beta1.ComponentTrafficTarget{{
 		RevisionName:   "chat-engine-rev-e5f6a7b8",
@@ -232,9 +331,87 @@ func TestProjectCanaryRolesAreScopedToThePrimaryComponent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Content.Canary)
 	assert.Equal(t, reportv1alpha1.RuntimeComponentRouter, got.Content.Canary.Component)
-	require.Len(t, got.Content.Allocations, 1)
-	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Allocations[0].Component)
+	engineAllocations := allocationsForComponent(got.Content.Allocations, reportv1alpha1.RuntimeComponentEngine)
+	require.Len(t, engineAllocations, 1)
+	assert.Equal(t, reportv1alpha1.TrafficRoleStable, engineAllocations[0].Role)
+}
+
+func TestProjectRejectsContradictoryCanaryEpochEvidence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService)
+	}{
+		{
+			name: "traffic targets a different revision epoch",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				isvc.Status.Canary.CanaryRevisionHash = "cccccccc"
+			},
+		},
+		{
+			name: "paused phase reports a non-step weight",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				status := isvc.Status.Components[omev1beta1.EngineComponent]
+				status.RolloutPhase = omev1beta1.RolloutPhasePaused
+				isvc.Status.Components[omev1beta1.EngineComponent] = status
+				isvc.Status.Canary.ObservedTrafficWeight = 35
+			},
+		},
+		{
+			name: "canary status under a blue green phase",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				status := isvc.Status.Components[omev1beta1.EngineComponent]
+				status.RolloutPhase = omev1beta1.RolloutPhaseBlueGreenStandby
+				isvc.Status.Components[omev1beta1.EngineComponent] = status
+			},
+		},
+		{
+			name: "stable phase retains active canary status",
+			mutate: func(isvc *omev1beta1.InferenceService) {
+				status := isvc.Status.Components[omev1beta1.EngineComponent]
+				status.RolloutPhase = omev1beta1.RolloutPhaseStable
+				status.Traffic = []omev1beta1.ComponentTrafficTarget{{
+					RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 100, LatestRevision: true,
+				}}
+				isvc.Status.Components[omev1beta1.EngineComponent] = status
+				isvc.Status.Canary.ObservedTrafficWeight = 100
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			status := isvc.Status.Components[omev1beta1.EngineComponent]
+			status.RolloutPhase = omev1beta1.RolloutPhaseCanarying
+			isvc.Status.Components[omev1beta1.EngineComponent] = status
+			tt.mutate(isvc)
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+			assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
+		})
+	}
+}
+
+func TestProjectDoesNotPromoteAnUnmatchedPrimaryCanaryTargetToStable(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	status := isvc.Status.Components[omev1beta1.EngineComponent]
+	status.RolloutPhase = omev1beta1.RolloutPhasePending
+	isvc.Status.Components[omev1beta1.EngineComponent] = status
+	isvc.Status.Canary.CanaryRevisionHash = "cccccccc"
+	isvc.Status.Canary.ObservedTrafficWeight = 0
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStatePending, got.Content.Summary.State)
+	require.Len(t, got.Content.Allocations, 2)
 	assert.Equal(t, reportv1alpha1.TrafficRoleStable, got.Content.Allocations[0].Role)
+	assert.Equal(t, "a1b2c3d4", got.Content.Allocations[0].RevisionHash)
+	assert.Equal(t, reportv1alpha1.TrafficRoleOther, got.Content.Allocations[1].Role)
+	assert.Equal(t, "e5f6a7b8", got.Content.Allocations[1].RevisionHash)
 }
 
 func TestProjectRejectsEqualStableAndCanaryRevisionHashes(t *testing.T) {
@@ -255,6 +432,7 @@ func TestProjectAcceptsCompletedCanarySentinel(t *testing.T) {
 	isvc.Status.Canary.ObservedTrafficWeight = 100
 	isvc.Status.Canary.StableRevisionHash = ""
 	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.RolloutPhase = omev1beta1.RolloutPhaseStable
 	component.Traffic = []omev1beta1.ComponentTrafficTarget{{
 		RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 100, LatestRevision: true,
 	}}
@@ -528,11 +706,21 @@ func currentTrafficISVC(t *testing.T) *omev1beta1.InferenceService {
 			},
 			Canary: &omev1beta1.CanaryStatus{CurrentStep: 0, ObservedTrafficWeight: 20, StableRevisionHash: "a1b2c3d4", CanaryRevisionHash: "e5f6a7b8"},
 			Components: map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
-				omev1beta1.EngineComponent: {Traffic: []omev1beta1.ComponentTrafficTarget{
+				omev1beta1.EngineComponent: {RolloutPhase: omev1beta1.RolloutPhaseCanarying, Traffic: []omev1beta1.ComponentTrafficTarget{
 					{RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 20, Tag: "SECRET_TAG", LatestRevision: true},
 					{RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 80},
 				}},
 			},
+		},
+	}
+}
+
+func primaryCanaryComponent(component omev1beta1.ComponentType) omev1beta1.ComponentStatusSpec {
+	return omev1beta1.ComponentStatusSpec{
+		RolloutPhase: omev1beta1.RolloutPhaseCanarying,
+		Traffic: []omev1beta1.ComponentTrafficTarget{
+			{RevisionName: "chat-" + string(component) + "-rev-e5f6a7b8", Percent: 20, LatestRevision: true},
+			{RevisionName: "chat-" + string(component) + "-rev-a1b2c3d4", Percent: 80},
 		},
 	}
 }

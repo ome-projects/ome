@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net"
 	"net/url"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -19,8 +18,8 @@ import (
 	knapis "knative.dev/pkg/apis"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/canaryevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
-	"sigs.k8s.io/ome/pkg/constants"
 )
 
 const (
@@ -36,7 +35,6 @@ var (
 	ErrInferenceServiceNameRequired      = errors.New("inference service name is required")
 	ErrInferenceServiceNamespaceRequired = errors.New("inference service namespace is required")
 	ErrInferenceServiceUIDRequired       = errors.New("inference service UID is required")
-	revisionHashPattern                  = regexp.MustCompile(`^[0-9a-f]{8}$`)
 )
 
 // Project builds a bounded deterministic report from one observed parent.
@@ -87,15 +85,17 @@ func Project(isvc *omev1beta1.InferenceService, clock reportv1alpha1.Clock) (rep
 }
 
 type projector struct {
-	isvc        *omev1beta1.InferenceService
-	content     reportv1alpha1.TrafficStatusContent
-	ready       *reportv1alpha1.TrafficCondition
-	unsupported *reportv1alpha1.TrafficCondition
-	issueSet    map[string]struct{}
-	invalid     bool
-	partial     bool
-	stale       bool
-	truncated   bool
+	isvc             *omev1beta1.InferenceService
+	content          reportv1alpha1.TrafficStatusContent
+	ready            *reportv1alpha1.TrafficCondition
+	readyValid       bool
+	unsupported      *reportv1alpha1.TrafficCondition
+	unsupportedValid bool
+	issueSet         map[string]struct{}
+	invalid          bool
+	partial          bool
+	stale            bool
+	truncated        bool
 }
 
 func (b *projector) projectTrafficStatus() {
@@ -125,11 +125,13 @@ func (b *projector) projectTrafficStatus() {
 	}
 
 	b.projectConditions(status.Conditions)
-	conditionFreshness := reportv1alpha1.TrafficFreshnessUnavailable
+	conditionFreshness := reportv1alpha1.TrafficFreshnessUnverifiable
 	if b.ready != nil {
-		conditionFreshness = b.ready.Source.Freshness
 		b.content.Summary.PolicyReady = reportv1alpha1.TrafficConditionValue{Status: b.ready.Status, Reason: b.ready.Reason}
 		b.content.Summary.Source.PolicyReady = b.ready.Source
+		if b.readyValid {
+			conditionFreshness = b.ready.Source.Freshness
+		}
 	} else {
 		b.addIssue(reportv1alpha1.TrafficIssuePolicyConditionMissing, "", false)
 		b.partial = true
@@ -152,14 +154,17 @@ func (b *projector) projectTrafficStatus() {
 	}
 
 	switch {
-	case b.unsupported != nil && b.unsupported.Status == reportv1alpha1.TrafficConditionTrue:
+	case b.unsupported != nil && !b.unsupportedValid:
+		b.content.Summary.Unsupported = reportv1alpha1.TrafficUnsupportedUnknown
+		b.content.Summary.Source.Unsupported = b.unsupported.Source
+	case b.unsupportedValid && b.unsupported.Status == reportv1alpha1.TrafficConditionTrue:
 		b.content.Summary.Unsupported = reportv1alpha1.TrafficUnsupportedPresent
 		b.content.Summary.Source.Unsupported = b.unsupported.Source
 		b.partial = true
-	case b.unsupported != nil:
+	case b.unsupportedValid:
 		b.content.Summary.Unsupported = reportv1alpha1.TrafficUnsupportedUnknown
 		b.content.Summary.Source.Unsupported = b.unsupported.Source
-	case provesNoUnsupportedFields(b.ready):
+	case b.readyValid && provesNoUnsupportedFields(b.ready):
 		b.content.Summary.Unsupported = reportv1alpha1.TrafficUnsupportedNone
 		b.content.Summary.Source.Unsupported = b.ready.Source
 	default:
@@ -171,7 +176,7 @@ func (b *projector) projectTrafficStatus() {
 		}
 	}
 
-	if b.ready != nil && b.ready.Reason == reportv1alpha1.TrafficReasonNoTranslatorAvailable && status.BackendPolicyResource == nil {
+	if b.readyValid && b.ready.Reason == reportv1alpha1.TrafficReasonNoTranslatorAvailable && status.BackendPolicyResource == nil {
 		b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorNoop
 		b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, b.ready.Source.Freshness)
 	}
@@ -206,6 +211,11 @@ func (b *projector) projectConditions(conditions []metav1.Condition) {
 		conditionType, _ := projectConditionType(ordered[i].Type)
 		if seen[conditionType] {
 			b.addIssue(reportv1alpha1.TrafficIssueConditionConflict, "", true)
+			if conditionType == reportv1alpha1.TrafficConditionBackendPolicyReady {
+				b.readyValid = false
+			} else {
+				b.unsupportedValid = false
+			}
 			continue
 		}
 		seen[conditionType] = true
@@ -217,24 +227,32 @@ func (b *projector) projectConditions(conditions []metav1.Condition) {
 		if conditionType == reportv1alpha1.TrafficConditionBackendPolicyReady {
 			value := projected
 			b.ready = &value
+			b.readyValid = valid
 		} else {
 			value := projected
 			b.unsupported = &value
+			b.unsupportedValid = valid
 		}
 	}
 }
 
 func (b *projector) projectCondition(conditionType reportv1alpha1.TrafficConditionType, condition *metav1.Condition) (reportv1alpha1.TrafficCondition, bool) {
-	freshness := reportv1alpha1.TrafficFreshnessStale
-	if condition.ObservedGeneration == b.isvc.Generation {
+	generationValid := condition.ObservedGeneration >= 0 && condition.ObservedGeneration <= b.isvc.Generation
+	freshness := reportv1alpha1.TrafficFreshnessUnverifiable
+	if generationValid && condition.ObservedGeneration == b.isvc.Generation {
 		freshness = reportv1alpha1.TrafficFreshnessCurrent
-	} else {
+	} else if generationValid {
+		freshness = reportv1alpha1.TrafficFreshnessStale
 		b.stale = true
 		b.partial = true
 	}
 	status, statusOK := projectConditionStatus(condition.Status)
 	reason, reasonOK := projectConditionReason(condition.Reason)
-	valid := statusOK && reasonOK && validConditionCombination(conditionType, status, reason) && !condition.LastTransitionTime.IsZero()
+	valid := generationValid &&
+		statusOK &&
+		reasonOK &&
+		validConditionCombination(conditionType, status, reason) &&
+		!condition.LastTransitionTime.IsZero()
 	if !valid {
 		status = reportv1alpha1.TrafficConditionUnknown
 		if !reasonOK {
@@ -362,8 +380,10 @@ func (b *projector) projectCanary() {
 			group = &rollout.Groups[i]
 		}
 	}
-	component, componentOK := canaryPrimary(group)
-	if !componentOK || group == nil || group.Canary == nil || len(group.Canary.Steps) == 0 || len(group.Canary.Steps) > 20 || !validCanaryStatus(status, len(group.Canary.Steps)) {
+	component, primary, componentOK := canaryPrimary(group)
+	if !componentOK || group == nil || group.Canary == nil || len(group.Canary.Steps) == 0 || len(group.Canary.Steps) > 20 ||
+		!validCanaryStatus(status, len(group.Canary.Steps)) ||
+		!b.validCanaryEpoch(group.Canary.Steps, primary, status) {
 		b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)
 		return
 	}
@@ -373,6 +393,37 @@ func (b *projector) projectCanary() {
 		StableRevisionHash: status.StableRevisionHash, CanaryRevisionHash: status.CanaryRevisionHash,
 		Source: source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnverifiable),
 	}
+}
+
+func (b *projector) validCanaryEpoch(
+	steps []omev1beta1.RolloutGroupStep,
+	primary omev1beta1.ComponentType,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	component, found := b.isvc.Status.Components[primary]
+	if !found {
+		return false
+	}
+	phase := canaryevidence.ProjectPhase(component.RolloutPhase)
+	if phase == reportv1alpha1.RolloutPhaseStable {
+		return canaryevidence.CompletedStatusMatches(
+			b.isvc.Name,
+			primary,
+			steps,
+			status,
+			component.Traffic,
+		)
+	}
+	if !canaryevidence.PhaseNeedsStatus(phase) ||
+		!canaryevidence.ValidPhaseStepResidue(phase, steps, status) {
+		return false
+	}
+	if canaryevidence.PhaseBindsTraffic(phase) &&
+		!canaryevidence.ActiveTrafficMatches(b.isvc.Name, primary, phase, status, component.Traffic) {
+		return false
+	}
+	return !canaryevidence.PhaseBindsStepTraffic(phase) ||
+		canaryevidence.ObservedTrafficMatchesStep(phase, steps, status)
 }
 
 func (b *projector) projectAllocations() {
@@ -455,6 +506,7 @@ func (b *projector) allocationRole(component reportv1alpha1.RuntimeComponentType
 			}
 			return reportv1alpha1.TrafficRoleCanary
 		}
+		return reportv1alpha1.TrafficRoleOther
 	}
 	if latest || name == status.LatestRolledoutRevision {
 		return reportv1alpha1.TrafficRoleStable
@@ -612,51 +664,32 @@ func validConditionCombination(conditionType reportv1alpha1.TrafficConditionType
 	}
 }
 
-func canaryPrimary(group *omev1beta1.RolloutGroup) (reportv1alpha1.RuntimeComponentType, bool) {
+func canaryPrimary(group *omev1beta1.RolloutGroup) (reportv1alpha1.RuntimeComponentType, omev1beta1.ComponentType, bool) {
 	if group == nil {
-		return "", false
+		return "", "", false
 	}
-	seen := make(map[omev1beta1.ComponentType]bool, len(group.Components))
-	for _, component := range group.Components {
-		if seen[component] {
-			return "", false
-		}
-		seen[component] = true
-		if component != omev1beta1.EngineComponent && component != omev1beta1.DecoderComponent && component != omev1beta1.RouterComponent {
-			return "", false
-		}
+	primary, valid := canaryevidence.Primary(group.Components)
+	if !valid {
+		return "", "", false
 	}
-	for _, component := range []omev1beta1.ComponentType{omev1beta1.RouterComponent, omev1beta1.EngineComponent, omev1beta1.DecoderComponent} {
-		if seen[component] {
-			return projectComponent(component), true
-		}
-	}
-	return "", false
+	return projectComponent(primary), primary, true
 }
 
 func validCanaryStatus(status *omev1beta1.CanaryStatus, totalSteps int) bool {
-	if status == nil || totalSteps == 0 || status.CurrentStep < 0 || status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 || !revisionHashPattern.MatchString(status.CanaryRevisionHash) {
+	if status == nil || totalSteps == 0 || status.CurrentStep < 0 || status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 || !canaryevidence.SafeRevisionHash(status.CanaryRevisionHash) {
 		return false
 	}
 	if int(status.CurrentStep) == totalSteps {
 		return status.ObservedTrafficWeight == 100 && status.StableRevisionHash == ""
 	}
 	return int(status.CurrentStep) < totalSteps &&
-		revisionHashPattern.MatchString(status.StableRevisionHash) &&
+		canaryevidence.SafeRevisionHash(status.StableRevisionHash) &&
 		status.StableRevisionHash != status.CanaryRevisionHash
 }
 
 func revisionTargetHash(isvcName string, component omev1beta1.ComponentType, revisionName string) (string, bool) {
-	if len(revisionName) < 8 {
-		return "", false
-	}
-	hash := revisionName[len(revisionName)-8:]
-	if !revisionHashPattern.MatchString(hash) {
-		return "", false
-	}
-	rawName := isvcName + "-" + string(component) + "-rev-" + hash
-	expected := constants.TruncateNameWithMaxLength(rawName, utilvalidation.DNS1035LabelMaxLength)
-	return hash, revisionName == expected
+	hash := canaryevidence.RevisionHash(isvcName, component, revisionName)
+	return hash, hash != ""
 }
 
 func projectComponent(component omev1beta1.ComponentType) reportv1alpha1.RuntimeComponentType {
