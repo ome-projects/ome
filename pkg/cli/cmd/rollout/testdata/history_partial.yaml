@@ -1,0 +1,76 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-08-31T18:30:00Z"
+content:
+  issues: []
+  provenance:
+  - digestEvidence: Computed
+    group: 0
+    observedAt: "2026-08-31T18:30:00Z"
+    portableDigest: rp1:cca45ec1fb0f
+    source: Inline
+    view: ActiveRun
+  - digestEvidence: Reported
+    group: 0
+    observedAt: "2026-08-31T17:00:00Z"
+    portableDigest: rp1:cca45ec1fb0f
+    source: Inline
+    view: LastRun
+  - digestEvidence: Computed
+    group: 0
+    portableDigest: rp1:cca45ec1fb0f
+    source: Inline
+    view: Current
+  revisions:
+  - component: engine
+    phase: Unknown
+    revisionHash: aaaaaaaa
+    role: Current
+  - component: engine
+    phase: Unknown
+    revisionHash: bbbbbbbb
+    role: Ready
+  - component: engine
+    phase: Unknown
+    revisionHash: dddddddd
+    role: Previous
+  runs:
+  - groupCount: 1
+    openedAt: "2026-08-31T18:00:00Z"
+    outcome: Active
+    pinnedAt: "2026-08-31T18:30:00Z"
+    runID: chat-0123456789ab
+    slot: Active
+    targets:
+    - component: engine
+      evidence: Reported
+      revisionHash: cccccccc
+  - closedAt: "2026-08-31T17:00:00Z"
+    groupCount: 1
+    openedAt: "2026-08-31T16:00:00Z"
+    outcome: Completed
+    slot: Last
+    targets: []
+  statusIssues:
+  - code: EpochUnverifiable
+  summary:
+    activeRuns: 1
+    completeness: RetentionBounded
+    currentEpoch: Unverifiable
+    currentEvidence: Reported
+    currentState: Unknown
+    retainedRuns: 1
+    revisions: 3
+    state: Partial
+kind: RolloutHistoryReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-08-31T18:30:00Z"
+  evidence: Observed
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings:
+- code: PartialData

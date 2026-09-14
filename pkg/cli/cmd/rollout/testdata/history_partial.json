@@ -1,0 +1,112 @@
+{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "RolloutHistoryReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "2026-08-31T18:30:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "generation": 7,
+      "evidence": "Observed",
+      "collectedAt": "2026-08-31T18:30:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "state": "Partial",
+      "completeness": "RetentionBounded",
+      "currentState": "Unknown",
+      "currentEvidence": "Reported",
+      "currentEpoch": "Unverifiable",
+      "activeRuns": 1,
+      "retainedRuns": 1,
+      "revisions": 3
+    },
+    "runs": [
+      {
+        "slot": "Active",
+        "outcome": "Active",
+        "runID": "chat-0123456789ab",
+        "openedAt": "2026-08-31T18:00:00Z",
+        "pinnedAt": "2026-08-31T18:30:00Z",
+        "groupCount": 1,
+        "targets": [
+          {
+            "component": "engine",
+            "revisionHash": "cccccccc",
+            "evidence": "Reported"
+          }
+        ]
+      },
+      {
+        "slot": "Last",
+        "outcome": "Completed",
+        "openedAt": "2026-08-31T16:00:00Z",
+        "closedAt": "2026-08-31T17:00:00Z",
+        "groupCount": 1,
+        "targets": []
+      }
+    ],
+    "provenance": [
+      {
+        "view": "ActiveRun",
+        "group": 0,
+        "source": "Inline",
+        "portableDigest": "rp1:cca45ec1fb0f",
+        "digestEvidence": "Computed",
+        "observedAt": "2026-08-31T18:30:00Z"
+      },
+      {
+        "view": "LastRun",
+        "group": 0,
+        "source": "Inline",
+        "portableDigest": "rp1:cca45ec1fb0f",
+        "digestEvidence": "Reported",
+        "observedAt": "2026-08-31T17:00:00Z"
+      },
+      {
+        "view": "Current",
+        "group": 0,
+        "source": "Inline",
+        "portableDigest": "rp1:cca45ec1fb0f",
+        "digestEvidence": "Computed"
+      }
+    ],
+    "revisions": [
+      {
+        "component": "engine",
+        "role": "Current",
+        "revisionHash": "aaaaaaaa",
+        "phase": "Unknown"
+      },
+      {
+        "component": "engine",
+        "role": "Ready",
+        "revisionHash": "bbbbbbbb",
+        "phase": "Unknown"
+      },
+      {
+        "component": "engine",
+        "role": "Previous",
+        "revisionHash": "dddddddd",
+        "phase": "Unknown"
+      }
+    ],
+    "statusIssues": [
+      {
+        "code": "EpochUnverifiable"
+      }
+    ],
+    "issues": []
+  },
+  "warnings": [
+    {
+      "code": "PartialData"
+    }
+  ]
+}

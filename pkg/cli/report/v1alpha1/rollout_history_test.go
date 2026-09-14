@@ -40,12 +40,14 @@ func TestNewRolloutHistoryReportBuildsTypedEmptyContract(t *testing.T) {
 func TestRolloutHistoryCanonicalIsDeterministicDeepAndClosed(t *testing.T) {
 	opened := time.Date(2026, time.September, 14, 18, 0, 0, 0, time.FixedZone("fixture", 2*60*60))
 	closed := opened.Add(time.Hour)
+	lastOpened := opened.Add(-2 * time.Hour)
+	lastClosed := opened.Add(-time.Hour)
 	groupOne := 1
 	groupZero := 0
 	reportValue := v1alpha1.RolloutHistoryReport{
 		Metadata:    v1alpha1.Metadata{Namespace: "prod", Name: "chat"},
 		CollectedAt: opened,
-		Sources: []v1alpha1.RolloutSourceReference{
+		Sources: []v1alpha1.RolloutHistorySourceReference{
 			{Kind: v1alpha1.RolloutSourceInferenceService, Namespace: "prod", Name: "z", Evidence: v1alpha1.EvidenceObserved},
 			{Kind: v1alpha1.RolloutSourceInferenceService, Namespace: "prod", Name: "chat", Evidence: v1alpha1.EvidenceReported},
 		},
@@ -56,12 +58,12 @@ func TestRolloutHistoryCanonicalIsDeterministicDeepAndClosed(t *testing.T) {
 				CurrentEpoch: v1alpha1.RolloutEpochUnverifiable,
 			},
 			Runs: []v1alpha1.RolloutHistoryRun{
-				{Slot: v1alpha1.RolloutHistoryRunLast, Outcome: v1alpha1.RolloutHistoryRunCompleted, OpenedAt: &opened, ClosedAt: &closed},
+				{Slot: v1alpha1.RolloutHistoryRunLast, Outcome: v1alpha1.RolloutHistoryRunCompleted, OpenedAt: &lastOpened, ClosedAt: &lastClosed},
 				{Slot: v1alpha1.RolloutHistoryRunActive, Outcome: v1alpha1.RolloutHistoryRunActiveState,
 					RunID: "chat-0123456789ab", OpenedAt: &opened, PinnedAt: &closed,
 					Targets: []v1alpha1.RolloutHistoryTarget{
-						{Component: v1alpha1.RuntimeComponentRouter, RevisionHash: "bbbbbbbb"},
-						{Component: v1alpha1.RuntimeComponentEngine, RevisionHash: "aaaaaaaa"},
+						{Component: v1alpha1.RuntimeComponentRouter, RevisionHash: "bbbbbbbb", Evidence: v1alpha1.EvidenceReported},
+						{Component: v1alpha1.RuntimeComponentEngine, RevisionHash: "aaaaaaaa", Evidence: v1alpha1.EvidenceReported},
 					}},
 			},
 			Provenance: []v1alpha1.RolloutHistoryProvenance{
@@ -169,6 +171,37 @@ func TestRolloutHistoryCanonicalRetainsDigestlessCurrentResolution(t *testing.T)
 	assert.Equal(t, "-", reportValue.Table().Rows[0][3])
 }
 
+func TestRolloutHistoryCanonicalFailsClosedOnCrossSlotChronology(t *testing.T) {
+	activeOpened := time.Date(2026, 9, 14, 18, 0, 0, 0, time.UTC)
+	activePinned := activeOpened.Add(30 * time.Minute)
+	lastOpened := activeOpened.Add(-time.Hour)
+	lastClosed := activeOpened.Add(time.Hour)
+	reportValue := v1alpha1.NewRolloutHistoryReport(
+		v1alpha1.Metadata{Namespace: "prod", Name: "chat"},
+		v1alpha1.RolloutHistoryContent{Runs: []v1alpha1.RolloutHistoryRun{
+			{Slot: v1alpha1.RolloutHistoryRunActive, Outcome: v1alpha1.RolloutHistoryRunActiveState,
+				RunID: "chat-0123456789ab", OpenedAt: &activeOpened, PinnedAt: &activePinned,
+				GroupCount: 1, Targets: []v1alpha1.RolloutHistoryTarget{}},
+			{Slot: v1alpha1.RolloutHistoryRunLast, Outcome: v1alpha1.RolloutHistoryRunCompleted,
+				OpenedAt: &lastOpened, ClosedAt: &lastClosed, GroupCount: 1,
+				Targets: []v1alpha1.RolloutHistoryTarget{}},
+		}, Provenance: []v1alpha1.RolloutHistoryProvenance{{
+			View: v1alpha1.RolloutHistoryViewLast, Group: 0, Source: v1alpha1.RolloutPlanSourceInline,
+			PortableDigest: "rp1:aaaaaaaaaaaa",
+		}}}, v1alpha1.ClockFunc(func() time.Time { return activePinned }),
+	)
+
+	require.Len(t, reportValue.Content.Runs, 1)
+	assert.Equal(t, v1alpha1.RolloutHistoryRunActive, reportValue.Content.Runs[0].Slot)
+	assert.Empty(t, reportValue.Content.Provenance)
+	assert.Equal(t, v1alpha1.RolloutHistoryStatePartial, reportValue.Content.Summary.State)
+	assert.Contains(t, reportValue.Content.Issues, v1alpha1.RolloutHistoryIssue{
+		Code: v1alpha1.RolloutHistoryIssueRunChronologyMalformed,
+		View: v1alpha1.RolloutHistoryViewLast,
+	})
+	assert.Contains(t, reportValue.Warnings, v1alpha1.RolloutWarning{Code: v1alpha1.WarningPartialData})
+}
+
 func TestRolloutHistoryCompactTableIsCompleteAndAtMostEightyColumns(t *testing.T) {
 	reportValue := rolloutHistoryReportFixture()
 	var output bytes.Buffer
@@ -176,10 +209,11 @@ func TestRolloutHistoryCompactTableIsCompleteAndAtMostEightyColumns(t *testing.T
 
 	assert.Equal(t, "TYPE     STATE        COMP     IDENT          TIME          DETAIL       ISS\n"+
 		"WINDOW   Reported     -        -              -             bounded      0\n"+
+		"CURR     InProgress   -        Reported       -             Unverified   0\n"+
 		"ACTIVE   Active       -        0123456789ab   09-14T18:00   G:2 T:2      0\n"+
-		"TARGET   Active       engine   aaaaaaaa       -             run-target   0\n"+
-		"TARGET   Active       router   bbbbbbbb       -             run-target   0\n"+
-		"LAST     Completed    -        -              09-14T19:00   G:1          0\n"+
+		"TARGET   Reported     engine   aaaaaaaa       -             run-target   0\n"+
+		"TARGET   Reported     router   bbbbbbbb       -             run-target   0\n"+
+		"LAST     Completed    -        -              09-14T17:00   G:1          0\n"+
 		"PROV-A   Inline       g0       aaaaaaaaaaaa   09-14T18:30   -            0\n"+
 		"PROV-C   Policy       g1       bbbbbbbbbbbb   -             slow         0\n"+
 		"REV      Stable       engine   cccccccc       -             Current      0\n"+
@@ -191,6 +225,10 @@ func TestRolloutHistoryCompactTableIsCompleteAndAtMostEightyColumns(t *testing.T
 
 func TestRolloutHistoryCompactTableBoundsMaximumFieldDomains(t *testing.T) {
 	reportValue := rolloutHistoryReportFixture()
+	reportValue.Content.Summary.CurrentState = v1alpha1.RolloutStateNotConfigured
+	reportValue.Content.Summary.CurrentEvidence = v1alpha1.EvidenceUnavailable
+	reportValue.Content.Summary.CurrentEpoch = v1alpha1.RolloutEpochNotApplicable
+	reportValue.Content.Runs[0].Targets[0].RevisionHash = ""
 	reportValue.Content.Provenance[1].Policy.Name = strings.Repeat("a", 253)
 	for range 105 {
 		reportValue.Content.StatusIssues = append(reportValue.Content.StatusIssues, v1alpha1.RolloutIssue{
@@ -208,8 +246,9 @@ func TestRolloutHistoryCompactTableBoundsMaximumFieldDomains(t *testing.T) {
 }
 
 func TestRolloutHistoryWideTableShowsOnlyFullAllowlistedEvidence(t *testing.T) {
+	table := rolloutHistoryReportFixture().WideTable()
 	var output bytes.Buffer
-	require.NoError(t, rolloutHistoryReportFixture().WideTable().Write(&output))
+	require.NoError(t, table.Write(&output))
 
 	assert.Contains(t, output.String(), "chat-0123456789ab")
 	assert.Contains(t, output.String(), "rp1:aaaaaaaaaaaa")
@@ -217,25 +256,168 @@ func TestRolloutHistoryWideTableShowsOnlyFullAllowlistedEvidence(t *testing.T) {
 	assert.Contains(t, output.String(), "RetentionBounded")
 	assert.NotContains(t, output.String(), "serverAddress")
 	assert.NotContains(t, output.String(), "query")
+	assert.Equal(t, []string{
+		"ROW", "NAMESPACE", "NAME", "COLLECTED-AT", "COMPLETENESS", "WINDOW-STATE",
+		"CURRENT-STATE", "CURRENT-EVIDENCE", "CURRENT-EPOCH", "ACTIVE-RUNS",
+		"RETAINED-RUNS", "REVISIONS", "SOURCE-KIND", "SOURCE-NAMESPACE", "SOURCE-NAME",
+		"SOURCE-GENERATION", "SOURCE-EVIDENCE", "SOURCE-COLLECTED-AT", "RECORD", "OUTCOME",
+		"RUN-ID", "GROUP-COUNT", "COMPONENT", "REVISION", "REVISION-EVIDENCE", "ROLE",
+		"PHASE", "OPENED-AT", "PINNED-AT", "CLOSED-AT", "OBSERVED-AT", "VIEW", "GROUP",
+		"SOURCE", "POLICY", "POLICY-PROGRESSION", "POLICY-GENERATION", "POLICY-EVIDENCE",
+		"POLICY-DIGEST", "DIGEST", "DIGEST-EVIDENCE", "SHADOWED-POLICY", "SHADOWED-PROGRESSION",
+		"SHADOWED-GENERATION", "SHADOWED-EVIDENCE", "SHADOWED-DIGEST", "ISSUE-CODE", "ISSUE-VIEW",
+		"ISSUE-GROUP", "ISSUE-COMPONENT", "WARNING",
+	}, table.Headers)
+	assert.Equal(t, "Summary", table.Rows[0][0])
+	assert.Equal(t, "Reported", table.Rows[0][5])
+	assert.Equal(t, "InProgress", table.Rows[0][6])
+	assert.Equal(t, "Reported", table.Rows[0][7])
+	assert.Equal(t, "Unverifiable", table.Rows[0][8])
+	assert.Equal(t, "1", table.Rows[0][9])
+	assert.Equal(t, "1", table.Rows[0][10])
+	assert.Equal(t, "2", table.Rows[0][11])
 }
 
 func TestRolloutHistoryWideTableDoesNotInventUnavailablePolicyGeneration(t *testing.T) {
 	table := rolloutHistoryReportFixture().WideTable()
 	var current []string
+	viewColumn := historyWideColumn(t, table, "VIEW")
 	for _, row := range table.Rows {
-		if row[10] == string(v1alpha1.RolloutHistoryViewCurrent) {
+		if row[viewColumn] == string(v1alpha1.RolloutHistoryViewCurrent) {
 			current = row
 			break
 		}
 	}
 	require.Len(t, current, len(table.Headers))
-	assert.Equal(t, "-", current[14])
+	assert.Equal(t, "-", current[historyWideColumn(t, table, "POLICY-GENERATION")])
+}
+
+func TestRolloutHistoryWideTableUsesDistinctPinnedAndObservedTimes(t *testing.T) {
+	table := rolloutHistoryReportFixture().WideTable()
+	var active, provenance []string
+	recordColumn := historyWideColumn(t, table, "RECORD")
+	viewColumn := historyWideColumn(t, table, "VIEW")
+	for _, row := range table.Rows {
+		switch {
+		case row[0] == "Run" && row[recordColumn] == string(v1alpha1.RolloutHistoryRunActive):
+			active = row
+		case row[0] == "Provenance" && row[viewColumn] == string(v1alpha1.RolloutHistoryViewActive):
+			provenance = row
+		}
+	}
+	require.Len(t, active, len(table.Headers))
+	require.Len(t, provenance, len(table.Headers))
+	assert.Equal(t, "2026-09-14T18:30:00Z", active[historyWideColumn(t, table, "PINNED-AT")])
+	assert.Equal(t, "-", active[historyWideColumn(t, table, "OBSERVED-AT")])
+	assert.Equal(t, "-", provenance[historyWideColumn(t, table, "PINNED-AT")])
+	assert.Equal(t, "2026-09-14T18:30:00Z", provenance[historyWideColumn(t, table, "OBSERVED-AT")])
+}
+
+func TestRolloutHistoryWideTableExactGoldens(t *testing.T) {
+	group := 1
+	partial := rolloutHistoryReportFixture()
+	partial.Sources = []v1alpha1.RolloutHistorySourceReference{{
+		Kind: v1alpha1.RolloutSourceInferenceService, Namespace: "prod", Name: "chat",
+		Generation: 7, Evidence: v1alpha1.EvidenceObserved, CollectedAt: partial.CollectedAt,
+	}}
+	partial.Content.Summary.State = v1alpha1.RolloutHistoryStatePartial
+	partial.Content.Provenance[1].Policy.Generation = 4
+	partial.Content.Provenance[1].Policy.Digest = "rp1:bbbbbbbbbbbb"
+	partial.Content.Provenance = append(partial.Content.Provenance, v1alpha1.RolloutHistoryProvenance{
+		View: v1alpha1.RolloutHistoryViewCurrent, Group: 2,
+		Source: v1alpha1.RolloutPlanSourceInline, PortableDigest: "rp1:ffffffffffff",
+		DigestEvidence: v1alpha1.EvidenceComputed,
+		ShadowedPolicy: &v1alpha1.RolloutPolicyReference{
+			Kind: "RolloutPolicy", Name: "shadow", Progression: "blueGreen", Generation: 5,
+			Digest: "rp1:eeeeeeeeeeee", Evidence: v1alpha1.EvidenceReported,
+		},
+	})
+	partial.Content.StatusIssues = []v1alpha1.RolloutIssue{{
+		Code: v1alpha1.RolloutIssueTrafficInvalid, Group: &group,
+		Component: v1alpha1.RuntimeComponentRouter,
+	}}
+	partial.Content.Issues = []v1alpha1.RolloutHistoryIssue{{
+		Code: v1alpha1.RolloutHistoryIssueCurrentResolutionMalformed,
+		View: v1alpha1.RolloutHistoryViewCurrent, Group: &group,
+		Component: v1alpha1.RuntimeComponentRouter,
+	}}
+	partial.Warnings = []v1alpha1.RolloutWarning{{Code: v1alpha1.WarningPartialData}}
+
+	empty := v1alpha1.NewRolloutHistoryReport(
+		v1alpha1.Metadata{Namespace: "prod", Name: "chat"},
+		v1alpha1.RolloutHistoryContent{Summary: v1alpha1.RolloutHistorySummary{
+			State: v1alpha1.RolloutHistoryStateEmpty, CurrentState: v1alpha1.RolloutStateNotConfigured,
+			CurrentEvidence: v1alpha1.EvidenceDeclared, CurrentEpoch: v1alpha1.RolloutEpochNotApplicable,
+		}}, v1alpha1.ClockFunc(func() time.Time { return time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC) }),
+	)
+	unavailable := empty
+	unavailable.Content.Summary.State = v1alpha1.RolloutHistoryStateUnavailable
+	unavailable.Content.Issues = []v1alpha1.RolloutHistoryIssue{{Code: v1alpha1.RolloutHistoryIssueRunStatusUnavailable}}
+	unavailable.Warnings = []v1alpha1.RolloutWarning{{Code: v1alpha1.WarningSourceUnavailable}}
+
+	tests := []struct {
+		name  string
+		value v1alpha1.RolloutHistoryReport
+		want  string
+	}{
+		{name: "empty", value: empty, want: "Summary | NAMESPACE=prod | NAME=chat | COLLECTED-AT=2026-09-14T20:00:00Z | COMPLETENESS=RetentionBounded | WINDOW-STATE=Empty | CURRENT-STATE=NotConfigured | CURRENT-EVIDENCE=Declared | CURRENT-EPOCH=NotApplicable | ACTIVE-RUNS=0 | RETAINED-RUNS=0 | REVISIONS=0\n"},
+		{name: "unavailable", value: unavailable, want: "Summary | NAMESPACE=prod | NAME=chat | COLLECTED-AT=2026-09-14T20:00:00Z | COMPLETENESS=RetentionBounded | WINDOW-STATE=Unavailable | CURRENT-STATE=NotConfigured | CURRENT-EVIDENCE=Declared | CURRENT-EPOCH=NotApplicable | ACTIVE-RUNS=0 | RETAINED-RUNS=0 | REVISIONS=0\n" +
+			"HistoryIssue | ISSUE-CODE=RunStatusUnavailable\n" +
+			"Warning | WARNING=SourceUnavailable\n"},
+		{name: "partial", value: partial, want: "Summary | NAMESPACE=prod | NAME=chat | COLLECTED-AT=2026-09-14T19:00:00Z | COMPLETENESS=RetentionBounded | WINDOW-STATE=Partial | CURRENT-STATE=InProgress | CURRENT-EVIDENCE=Reported | CURRENT-EPOCH=Unverifiable | ACTIVE-RUNS=1 | RETAINED-RUNS=1 | REVISIONS=2\n" +
+			"Source | SOURCE-KIND=InferenceService | SOURCE-NAMESPACE=prod | SOURCE-NAME=chat | SOURCE-GENERATION=7 | SOURCE-EVIDENCE=Observed | SOURCE-COLLECTED-AT=2026-09-14T19:00:00Z\n" +
+			"Run | RECORD=Active | OUTCOME=Active | RUN-ID=chat-0123456789ab | GROUP-COUNT=2 | OPENED-AT=2026-09-14T18:00:00Z | PINNED-AT=2026-09-14T18:30:00Z\n" +
+			"Target | RECORD=Active | COMPONENT=engine | REVISION=aaaaaaaa | REVISION-EVIDENCE=Reported | ROLE=RunTarget\n" +
+			"Target | RECORD=Active | COMPONENT=router | REVISION=bbbbbbbb | REVISION-EVIDENCE=Reported | ROLE=RunTarget\n" +
+			"Run | RECORD=Last | OUTCOME=Completed | GROUP-COUNT=1 | OPENED-AT=2026-09-14T16:00:00Z | CLOSED-AT=2026-09-14T17:00:00Z\n" +
+			"Provenance | OBSERVED-AT=2026-09-14T18:30:00Z | VIEW=ActiveRun | GROUP=0 | SOURCE=Inline | DIGEST=rp1:aaaaaaaaaaaa | DIGEST-EVIDENCE=Computed\n" +
+			"Provenance | VIEW=Current | GROUP=1 | SOURCE=Policy | POLICY=RolloutPolicy/slow | POLICY-PROGRESSION=canary | POLICY-GENERATION=4 | POLICY-EVIDENCE=Reported | POLICY-DIGEST=rp1:bbbbbbbbbbbb | DIGEST=rp1:bbbbbbbbbbbb | DIGEST-EVIDENCE=Reported\n" +
+			"Provenance | VIEW=Current | GROUP=2 | SOURCE=Inline | DIGEST=rp1:ffffffffffff | DIGEST-EVIDENCE=Computed | SHADOWED-POLICY=RolloutPolicy/shadow | SHADOWED-PROGRESSION=blueGreen | SHADOWED-GENERATION=5 | SHADOWED-EVIDENCE=Reported | SHADOWED-DIGEST=rp1:eeeeeeeeeeee\n" +
+			"Revision | RECORD=CurrentStatus | COMPONENT=engine | REVISION=cccccccc | REVISION-EVIDENCE=Reported | ROLE=Current | PHASE=Stable\n" +
+			"Revision | RECORD=CurrentStatus | COMPONENT=router | REVISION=dddddddd | REVISION-EVIDENCE=Reported | ROLE=Previous | PHASE=RolledBack\n" +
+			"StatusIssue | ISSUE-CODE=TrafficInvalid | ISSUE-GROUP=1 | ISSUE-COMPONENT=router\n" +
+			"HistoryIssue | ISSUE-CODE=CurrentResolutionMalformed | ISSUE-VIEW=Current | ISSUE-GROUP=1 | ISSUE-COMPONENT=router\n" +
+			"Warning | WARNING=PartialData\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, rolloutHistoryWideSnapshot(tt.value.WideTable()))
+		})
+	}
+}
+
+func rolloutHistoryWideSnapshot(table report.Table) string {
+	var output strings.Builder
+	for _, row := range table.Rows {
+		values := []string{row[0]}
+		for column := 1; column < len(table.Headers); column++ {
+			if row[column] != "-" {
+				values = append(values, table.Headers[column]+"="+row[column])
+			}
+		}
+		output.WriteString(strings.Join(values, " | "))
+		output.WriteByte('\n')
+	}
+	return output.String()
+}
+
+func historyWideColumn(t *testing.T, table report.Table, name string) int {
+	t.Helper()
+	for index, header := range table.Headers {
+		if header == name {
+			return index
+		}
+	}
+	require.FailNow(t, "wide column missing", name)
+	return -1
 }
 
 func rolloutHistoryReportFixture() v1alpha1.RolloutHistoryReport {
 	opened := time.Date(2026, time.September, 14, 18, 0, 0, 0, time.UTC)
 	pinned := opened.Add(30 * time.Minute)
-	closed := opened.Add(time.Hour)
+	lastOpened := opened.Add(-2 * time.Hour)
+	lastClosed := opened.Add(-time.Hour)
+	collected := opened.Add(time.Hour)
 	return v1alpha1.NewRolloutHistoryReport(
 		v1alpha1.Metadata{Namespace: "prod", Name: "chat"},
 		v1alpha1.RolloutHistoryContent{
@@ -248,11 +430,11 @@ func rolloutHistoryReportFixture() v1alpha1.RolloutHistoryReport {
 				{Slot: v1alpha1.RolloutHistoryRunActive, Outcome: v1alpha1.RolloutHistoryRunActiveState,
 					RunID: "chat-0123456789ab", OpenedAt: &opened, PinnedAt: &pinned,
 					Targets: []v1alpha1.RolloutHistoryTarget{
-						{Component: v1alpha1.RuntimeComponentEngine, RevisionHash: "aaaaaaaa"},
-						{Component: v1alpha1.RuntimeComponentRouter, RevisionHash: "bbbbbbbb"},
+						{Component: v1alpha1.RuntimeComponentEngine, RevisionHash: "aaaaaaaa", Evidence: v1alpha1.EvidenceReported},
+						{Component: v1alpha1.RuntimeComponentRouter, RevisionHash: "bbbbbbbb", Evidence: v1alpha1.EvidenceReported},
 					}, GroupCount: 2},
 				{Slot: v1alpha1.RolloutHistoryRunLast, Outcome: v1alpha1.RolloutHistoryRunCompleted,
-					OpenedAt: &opened, ClosedAt: &closed, GroupCount: 1},
+					OpenedAt: &lastOpened, ClosedAt: &lastClosed, GroupCount: 1},
 			},
 			Provenance: []v1alpha1.RolloutHistoryProvenance{
 				{View: v1alpha1.RolloutHistoryViewActive, Group: 0, Source: v1alpha1.RolloutPlanSourceInline,
@@ -269,6 +451,6 @@ func rolloutHistoryReportFixture() v1alpha1.RolloutHistoryReport {
 					RevisionHash: "dddddddd", Phase: v1alpha1.RolloutPhaseRolledBack},
 			},
 		},
-		v1alpha1.ClockFunc(func() time.Time { return closed }),
+		v1alpha1.ClockFunc(func() time.Time { return collected }),
 	)
 }

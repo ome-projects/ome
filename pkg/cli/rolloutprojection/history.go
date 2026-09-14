@@ -74,26 +74,41 @@ func ProjectHistory(
 		},
 		fixedClock,
 	)
-	result.Sources = append([]reportv1alpha1.RolloutSourceReference{}, observed.Sources...)
+	result.Sources = make([]reportv1alpha1.RolloutHistorySourceReference, 0, len(observed.Sources))
+	for _, source := range observed.Sources {
+		result.Sources = append(result.Sources, reportv1alpha1.RolloutHistorySourceReference{
+			Kind: source.Kind, Namespace: source.Namespace, Name: source.Name,
+			Generation: source.Generation, Evidence: source.Evidence, CollectedAt: source.CollectedAt,
+		})
+	}
 
 	if isvc.Status.Rollout == nil {
 		result.Content.Summary.State = reportv1alpha1.RolloutHistoryStateUnavailable
+		if len(result.Content.Revisions) > 0 {
+			result.Content.Summary.State = reportv1alpha1.RolloutHistoryStatePartial
+			addHistoryWarning(&result, reportv1alpha1.WarningPartialData)
+		}
 		addHistoryIssue(&result, reportv1alpha1.RolloutHistoryIssue{
 			Code: reportv1alpha1.RolloutHistoryIssueRunStatusUnavailable,
 		})
 		addHistoryWarning(&result, reportv1alpha1.WarningSourceUnavailable)
-		if len(result.Content.StatusIssues) > 0 {
+		if len(result.Content.StatusIssues) > 0 && result.Content.Summary.State == reportv1alpha1.RolloutHistoryStatePartial {
 			addHistoryWarning(&result, reportv1alpha1.WarningPartialData)
 		}
 		return result.Canonical(), nil
 	}
 
 	status := isvc.Status.Rollout
+	var activeRun *reportv1alpha1.RolloutHistoryRun
+	var activeProvenance []reportv1alpha1.RolloutHistoryProvenance
 	if status.ActiveRun != nil {
-		run, provenance, ok := projectActiveHistory(isvc, status.ActiveRun)
+		run, provenance, targetIssues, ok := projectActiveHistory(isvc, status.ActiveRun)
 		if ok {
-			result.Content.Runs = append(result.Content.Runs, run)
-			result.Content.Provenance = append(result.Content.Provenance, provenance...)
+			activeRun = &run
+			activeProvenance = provenance
+			for _, issue := range targetIssues {
+				addHistoryIssue(&result, issue)
+			}
 		} else {
 			addHistoryIssue(&result, reportv1alpha1.RolloutHistoryIssue{
 				Code: reportv1alpha1.RolloutHistoryIssueActiveRunMalformed,
@@ -101,17 +116,36 @@ func ProjectHistory(
 			})
 		}
 	}
+	var lastRun *reportv1alpha1.RolloutHistoryRun
+	var lastProvenance []reportv1alpha1.RolloutHistoryProvenance
 	if status.LastRun != nil {
 		run, provenance, ok := projectLastHistory(status.LastRun)
 		if ok {
-			result.Content.Runs = append(result.Content.Runs, run)
-			result.Content.Provenance = append(result.Content.Provenance, provenance...)
+			lastRun = &run
+			lastProvenance = provenance
 		} else {
 			addHistoryIssue(&result, reportv1alpha1.RolloutHistoryIssue{
 				Code: reportv1alpha1.RolloutHistoryIssueLastRunMalformed,
 				View: reportv1alpha1.RolloutHistoryViewLast,
 			})
 		}
+	}
+	if activeRun != nil && lastRun != nil && lastRun.ClosedAt != nil &&
+		activeRun.OpenedAt != nil && lastRun.ClosedAt.After(*activeRun.OpenedAt) {
+		lastRun = nil
+		lastProvenance = nil
+		addHistoryIssue(&result, reportv1alpha1.RolloutHistoryIssue{
+			Code: reportv1alpha1.RolloutHistoryIssueRunChronologyMalformed,
+			View: reportv1alpha1.RolloutHistoryViewLast,
+		})
+	}
+	if activeRun != nil {
+		result.Content.Runs = append(result.Content.Runs, *activeRun)
+		result.Content.Provenance = append(result.Content.Provenance, activeProvenance...)
+	}
+	if lastRun != nil {
+		result.Content.Runs = append(result.Content.Runs, *lastRun)
+		result.Content.Provenance = append(result.Content.Provenance, lastProvenance...)
 	}
 	current, currentIssues := projectCurrentHistory(isvc)
 	result.Content.Provenance = append(result.Content.Provenance, current...)
@@ -138,18 +172,17 @@ func ProjectHistory(
 func projectActiveHistory(
 	isvc *omev1beta1.InferenceService,
 	active *omev1beta1.RolloutRun,
-) (reportv1alpha1.RolloutHistoryRun, []reportv1alpha1.RolloutHistoryProvenance, bool) {
+) (reportv1alpha1.RolloutHistoryRun, []reportv1alpha1.RolloutHistoryProvenance, []reportv1alpha1.RolloutHistoryIssue, bool) {
 	if active == nil || !validHistoryRunID(isvc.Name, active.RunID) ||
 		active.OpenedAt.IsZero() || active.PinnedAt.IsZero() ||
 		active.PinnedAt.Before(&active.OpenedAt) ||
-		len(active.Plan.Groups) < 1 || len(active.Plan.Groups) > maxExplainGroups ||
-		len(active.TargetRevisions) < 1 || len(active.TargetRevisions) > 3 {
-		return reportv1alpha1.RolloutHistoryRun{}, nil, false
+		len(active.Plan.Groups) < 1 || len(active.Plan.Groups) > maxExplainGroups {
+		return reportv1alpha1.RolloutHistoryRun{}, nil, nil, false
 	}
 	effective := isvc.Spec
 	effective.Rollout = active.Plan.AsRolloutSpec(isvc.Spec.Rollout)
 	if !validStoredRolloutSpec(&effective) || len(invalidPinnedPlanGroups(active.Plan.Groups)) > 0 {
-		return reportv1alpha1.RolloutHistoryRun{}, nil, false
+		return reportv1alpha1.RolloutHistoryRun{}, nil, nil, false
 	}
 
 	components := make(map[omev1beta1.ComponentType]struct{}, 3)
@@ -163,38 +196,18 @@ func projectActiveHistory(
 			&group.Group, &observedAt,
 		)
 		if !ok {
-			return reportv1alpha1.RolloutHistoryRun{}, nil, false
+			return reportv1alpha1.RolloutHistoryRun{}, nil, nil, false
 		}
 		for _, component := range group.Group.Components {
 			if _, duplicate := components[component]; duplicate {
-				return reportv1alpha1.RolloutHistoryRun{}, nil, false
+				return reportv1alpha1.RolloutHistoryRun{}, nil, nil, false
 			}
 			components[component] = struct{}{}
 		}
 		provenance = append(provenance, projected)
 	}
 
-	targets := make([]reportv1alpha1.RolloutHistoryTarget, 0, len(active.TargetRevisions))
-	seen := make(map[omev1beta1.ComponentType]struct{}, len(active.TargetRevisions))
-	for _, target := range active.TargetRevisions {
-		component := projectComponent(target.Component)
-		if component == "" || !safeRevisionHash(target.Revision) {
-			return reportv1alpha1.RolloutHistoryRun{}, nil, false
-		}
-		if _, duplicate := seen[target.Component]; duplicate {
-			return reportv1alpha1.RolloutHistoryRun{}, nil, false
-		}
-		if _, expected := components[target.Component]; !expected {
-			return reportv1alpha1.RolloutHistoryRun{}, nil, false
-		}
-		seen[target.Component] = struct{}{}
-		targets = append(targets, reportv1alpha1.RolloutHistoryTarget{
-			Component: component, RevisionHash: target.Revision,
-		})
-	}
-	if len(seen) != len(components) {
-		return reportv1alpha1.RolloutHistoryRun{}, nil, false
-	}
+	targets, targetIssues := projectActiveHistoryTargets(active.TargetRevisions)
 	openedAt := active.OpenedAt.Time.UTC()
 	pinnedAt := active.PinnedAt.Time.UTC()
 	return reportv1alpha1.RolloutHistoryRun{
@@ -202,7 +215,60 @@ func projectActiveHistory(
 		Outcome: reportv1alpha1.RolloutHistoryRunActiveState,
 		RunID:   active.RunID, OpenedAt: &openedAt, PinnedAt: &pinnedAt,
 		GroupCount: len(active.Plan.Groups), Targets: targets,
-	}, provenance, true
+	}, provenance, targetIssues, true
+}
+
+func projectActiveHistoryTargets(
+	values []omev1beta1.RolloutRunTarget,
+) ([]reportv1alpha1.RolloutHistoryTarget, []reportv1alpha1.RolloutHistoryIssue) {
+	if len(values) == 0 {
+		return []reportv1alpha1.RolloutHistoryTarget{}, []reportv1alpha1.RolloutHistoryIssue{{
+			Code: reportv1alpha1.RolloutHistoryIssueActiveTargetMalformed,
+			View: reportv1alpha1.RolloutHistoryViewActive,
+		}}
+	}
+	counts := make(map[omev1beta1.ComponentType]int, len(values))
+	for _, value := range values {
+		counts[value.Component]++
+	}
+	targets := make([]reportv1alpha1.RolloutHistoryTarget, 0, min(len(values), 3))
+	issues := []reportv1alpha1.RolloutHistoryIssue{}
+	malformedUnscoped := false
+	for _, value := range values {
+		component := projectComponent(value.Component)
+		if component == "" || counts[value.Component] != 1 {
+			malformedUnscoped = true
+			continue
+		}
+		if value.Revision == "" {
+			targets = append(targets, reportv1alpha1.RolloutHistoryTarget{
+				Component: component, Evidence: reportv1alpha1.EvidenceUnavailable,
+			})
+			issues = append(issues, reportv1alpha1.RolloutHistoryIssue{
+				Code: reportv1alpha1.RolloutHistoryIssueActiveTargetUnavailable,
+				View: reportv1alpha1.RolloutHistoryViewActive, Component: component,
+			})
+			continue
+		}
+		if !safeRevisionHash(value.Revision) {
+			issues = append(issues, reportv1alpha1.RolloutHistoryIssue{
+				Code: reportv1alpha1.RolloutHistoryIssueActiveTargetMalformed,
+				View: reportv1alpha1.RolloutHistoryViewActive, Component: component,
+			})
+			continue
+		}
+		targets = append(targets, reportv1alpha1.RolloutHistoryTarget{
+			Component: component, RevisionHash: value.Revision,
+			Evidence: reportv1alpha1.EvidenceReported,
+		})
+	}
+	if malformedUnscoped || len(values) > 3 {
+		issues = append(issues, reportv1alpha1.RolloutHistoryIssue{
+			Code: reportv1alpha1.RolloutHistoryIssueActiveTargetMalformed,
+			View: reportv1alpha1.RolloutHistoryViewActive,
+		})
+	}
+	return targets, issues
 }
 
 func projectPinnedHistoryProvenance(
@@ -494,7 +560,7 @@ func projectHistoryRevisions(
 			hash string
 		}{
 			{role: reportv1alpha1.RolloutRevisionCurrent, hash: component.RolledOutRevisionHash},
-			{role: reportv1alpha1.RolloutRevisionTarget, hash: component.ReadyRevisionHash},
+			{role: reportv1alpha1.RolloutHistoryRevisionReady, hash: component.ReadyRevisionHash},
 			{role: reportv1alpha1.RolloutRevisionPrevious, hash: component.PreviousRevisionHash},
 		} {
 			if value.hash == "" {

@@ -43,7 +43,8 @@ func TestProjectHistoryReportsOnlyRetainedRunAndRevisionEvidence(t *testing.T) {
 		RunID: "chat-0123456789ab", OpenedAt: historyTime(18, 0), PinnedAt: historyTime(18, 30),
 		GroupCount: 1,
 		Targets: []reportv1alpha1.RolloutHistoryTarget{{
-			Component: reportv1alpha1.RuntimeComponentEngine, RevisionHash: "bbbbbbbb",
+			Component: reportv1alpha1.RuntimeComponentEngine, RevisionHash: "cccccccc",
+			Evidence: reportv1alpha1.EvidenceReported,
 		}},
 	}, got.Content.Runs[0])
 	assert.Equal(t, reportv1alpha1.RolloutHistoryRun{
@@ -71,18 +72,18 @@ func TestProjectHistoryReportsOnlyRetainedRunAndRevisionEvidence(t *testing.T) {
 	assert.Equal(t, []reportv1alpha1.RolloutHistoryRevision{
 		{Component: reportv1alpha1.RuntimeComponentEngine, Role: reportv1alpha1.RolloutRevisionCurrent,
 			RevisionHash: "aaaaaaaa", Phase: reportv1alpha1.RolloutPhaseUnknown},
-		{Component: reportv1alpha1.RuntimeComponentEngine, Role: reportv1alpha1.RolloutRevisionTarget,
+		{Component: reportv1alpha1.RuntimeComponentEngine, Role: reportv1alpha1.RolloutHistoryRevisionReady,
 			RevisionHash: "bbbbbbbb", Phase: reportv1alpha1.RolloutPhaseUnknown},
 		{Component: reportv1alpha1.RuntimeComponentEngine, Role: reportv1alpha1.RolloutRevisionPrevious,
-			RevisionHash: "cccccccc", Phase: reportv1alpha1.RolloutPhaseUnknown},
+			RevisionHash: "dddddddd", Phase: reportv1alpha1.RolloutPhaseUnknown},
 	}, got.Content.Revisions)
 	assert.Equal(t, []reportv1alpha1.RolloutIssue{{Code: reportv1alpha1.RolloutIssueEpochUnverifiable}}, got.Content.StatusIssues)
 	assert.Empty(t, got.Content.Issues)
 	assert.Equal(t, []reportv1alpha1.RolloutWarning{{Code: reportv1alpha1.WarningPartialData}}, got.Warnings)
 	require.Len(t, got.Sources, 1)
-	assert.Equal(t, reportv1alpha1.RolloutSourceReference{
+	assert.Equal(t, reportv1alpha1.RolloutHistorySourceReference{
 		Kind: reportv1alpha1.RolloutSourceInferenceService, Namespace: "prod", Name: "chat",
-		UID: "isvc-uid", Generation: 7, Evidence: reportv1alpha1.EvidenceObserved,
+		Generation: 7, Evidence: reportv1alpha1.EvidenceObserved,
 		CollectedAt: fixedClock().Now(),
 	}, got.Sources[0])
 }
@@ -97,6 +98,21 @@ func TestProjectHistoryDistinguishesUnavailableAndEmptyRunWindows(t *testing.T) 
 			Code: reportv1alpha1.RolloutHistoryIssueRunStatusUnavailable,
 		})
 		assert.Contains(t, got.Warnings, reportv1alpha1.RolloutWarning{Code: reportv1alpha1.WarningSourceUnavailable})
+	})
+
+	t.Run("run status absent but revision evidence survives", func(t *testing.T) {
+		isvc := validHistoryInferenceService(t)
+		isvc.Status.Rollout = nil
+
+		got, err := rolloutprojection.ProjectHistory(isvc, fixedClock())
+		require.NoError(t, err)
+		assert.Equal(t, reportv1alpha1.RolloutHistoryStatePartial, got.Content.Summary.State)
+		assert.Len(t, got.Content.Revisions, 3)
+		assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutHistoryIssue{
+			Code: reportv1alpha1.RolloutHistoryIssueRunStatusUnavailable,
+		})
+		assert.Contains(t, got.Warnings, reportv1alpha1.RolloutWarning{Code: reportv1alpha1.WarningSourceUnavailable})
+		assert.Contains(t, got.Warnings, reportv1alpha1.RolloutWarning{Code: reportv1alpha1.WarningPartialData})
 	})
 
 	t.Run("run status present and empty", func(t *testing.T) {
@@ -115,6 +131,7 @@ func TestProjectHistoryDistinguishesUnavailableAndEmptyRunWindows(t *testing.T) 
 
 func TestProjectHistoryNeverSerializesPinnedPlansOrArbitraryFields(t *testing.T) {
 	isvc := validHistoryInferenceService(t)
+	isvc.UID = types.UID("SECRET_HOSTILE_UID")
 	isvc.ResourceVersion = "SECRET_RESOURCE_VERSION"
 	isvc.Annotations = map[string]string{"ome.io/rollout-promote": "SECRET_TOKEN"}
 	isvc.Status.RolloutCoordination.Groups[0].Message = "SECRET_STATUS_MESSAGE"
@@ -144,7 +161,7 @@ func TestProjectHistoryNeverSerializesPinnedPlansOrArbitraryFields(t *testing.T)
 		for _, secret := range []string{
 			"SECRET_RESOURCE_VERSION", "SECRET_TOKEN", "SECRET_STATUS_MESSAGE",
 			"SECRET_SERVER", "SECRET_QUERY", "SECRET_HEADER", "SECRET_AUTH",
-			"SECRET_METRIC", "SECRET_TOKEN_KEY",
+			"SECRET_METRIC", "SECRET_TOKEN_KEY", "SECRET_HOSTILE_UID",
 		} {
 			assert.NotContains(t, output, secret)
 		}
@@ -186,16 +203,6 @@ func TestProjectHistoryRejectsMalformedActiveRunEvidence(t *testing.T) {
 			group := run.Plan.Groups[0]
 			run.Plan.Groups = []omev1beta1.RolloutRunGroup{group, group, group, group}
 		}},
-		{name: "targets absent", mutate: func(run *omev1beta1.RolloutRun) { run.TargetRevisions = nil }},
-		{name: "target duplicated", mutate: func(run *omev1beta1.RolloutRun) {
-			run.TargetRevisions = append(run.TargetRevisions, run.TargetRevisions[0])
-		}},
-		{name: "target component outside plan", mutate: func(run *omev1beta1.RolloutRun) {
-			run.TargetRevisions[0].Component = omev1beta1.DecoderComponent
-		}},
-		{name: "target revision malformed", mutate: func(run *omev1beta1.RolloutRun) {
-			run.TargetRevisions[0].Revision = "BBBBBBBB"
-		}},
 		{name: "digest does not prove pinned body", mutate: func(run *omev1beta1.RolloutRun) {
 			run.Plan.Groups[0].PortableDigest = "rp1:aaaaaaaaaaaa"
 		}},
@@ -235,6 +242,124 @@ func TestProjectHistoryRejectsMalformedActiveRunEvidence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProjectHistoryRetainsRunWhenOptionalTargetIsUnavailable(t *testing.T) {
+	isvc := validHistoryInferenceService(t)
+	isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = ""
+
+	got, err := rolloutprojection.ProjectHistory(isvc, fixedClock())
+	require.NoError(t, err)
+	require.Len(t, got.Content.Runs, 2)
+	assert.Equal(t, reportv1alpha1.RolloutHistoryRunActive, got.Content.Runs[0].Slot)
+	require.Len(t, got.Content.Runs[0].Targets, 1)
+	assert.Equal(t, reportv1alpha1.RolloutHistoryTarget{
+		Component: reportv1alpha1.RuntimeComponentEngine,
+		Evidence:  reportv1alpha1.EvidenceUnavailable,
+	}, got.Content.Runs[0].Targets[0])
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutHistoryIssue{
+		Code: reportv1alpha1.RolloutHistoryIssueActiveTargetUnavailable,
+		View: reportv1alpha1.RolloutHistoryViewActive, Component: reportv1alpha1.RuntimeComponentEngine,
+	})
+	assert.Equal(t, reportv1alpha1.RolloutHistoryStatePartial, got.Content.Summary.State)
+	assert.True(t, slices.ContainsFunc(got.Content.Provenance, func(value reportv1alpha1.RolloutHistoryProvenance) bool {
+		return value.View == reportv1alpha1.RolloutHistoryViewActive
+	}))
+}
+
+func TestProjectHistoryRetainsRepinnedRunWithOriginalTargets(t *testing.T) {
+	isvc := validHistoryInferenceService(t)
+	isvc.Spec.Decoder = &omev1beta1.DecoderSpec{}
+	repinned := omev1beta1.RolloutGroup{
+		Components: []omev1beta1.ComponentType{omev1beta1.DecoderComponent},
+		BlueGreen:  &omev1beta1.GroupBlueGreen{},
+	}
+	digest, err := rolloutpolicy.ProgressionDigest(&repinned)
+	require.NoError(t, err)
+	isvc.Status.Rollout.ActiveRun.Plan.Groups = []omev1beta1.RolloutRunGroup{{
+		Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: digest, Group: repinned,
+	}}
+	isvc.Status.Rollout.ActiveRun.PinnedAt = metav1.NewTime(*historyTime(18, 45))
+
+	got, err := rolloutprojection.ProjectHistory(isvc, fixedClock())
+	require.NoError(t, err)
+	require.Len(t, got.Content.Runs, 2)
+	assert.Equal(t, reportv1alpha1.RolloutHistoryRunActive, got.Content.Runs[0].Slot)
+	assert.Equal(t, []reportv1alpha1.RolloutHistoryTarget{{
+		Component:    reportv1alpha1.RuntimeComponentEngine,
+		RevisionHash: "cccccccc", Evidence: reportv1alpha1.EvidenceReported,
+	}}, got.Content.Runs[0].Targets)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutHistoryIssue{
+		Code: reportv1alpha1.RolloutHistoryIssueActiveRunMalformed,
+		View: reportv1alpha1.RolloutHistoryViewActive,
+	})
+	require.True(t, slices.ContainsFunc(got.Content.Provenance, func(value reportv1alpha1.RolloutHistoryProvenance) bool {
+		return value.View == reportv1alpha1.RolloutHistoryViewActive
+	}))
+}
+
+func TestProjectHistoryValidatesTargetsIndependently(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.RolloutRun)
+	}{
+		{name: "targets absent", mutate: func(run *omev1beta1.RolloutRun) { run.TargetRevisions = nil }},
+		{name: "target duplicated", mutate: func(run *omev1beta1.RolloutRun) {
+			run.TargetRevisions = append(run.TargetRevisions, run.TargetRevisions[0])
+		}},
+		{name: "target component malformed", mutate: func(run *omev1beta1.RolloutRun) {
+			run.TargetRevisions[0].Component = "SECRET"
+		}},
+		{name: "target revision malformed", mutate: func(run *omev1beta1.RolloutRun) {
+			run.TargetRevisions[0].Revision = "BBBBBBBB"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := validHistoryInferenceService(t)
+			tt.mutate(isvc.Status.Rollout.ActiveRun)
+
+			got, err := rolloutprojection.ProjectHistory(isvc, fixedClock())
+			require.NoError(t, err)
+			assert.True(t, slices.ContainsFunc(got.Content.Runs, func(run reportv1alpha1.RolloutHistoryRun) bool {
+				return run.Slot == reportv1alpha1.RolloutHistoryRunActive
+			}))
+			assert.True(t, slices.ContainsFunc(got.Content.Provenance, func(value reportv1alpha1.RolloutHistoryProvenance) bool {
+				return value.View == reportv1alpha1.RolloutHistoryViewActive
+			}))
+			assert.True(t, slices.ContainsFunc(got.Content.Issues, func(issue reportv1alpha1.RolloutHistoryIssue) bool {
+				return issue.Code == reportv1alpha1.RolloutHistoryIssueActiveTargetMalformed &&
+					issue.View == reportv1alpha1.RolloutHistoryViewActive
+			}), got.Content.Issues)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutHistoryIssue{
+				Code: reportv1alpha1.RolloutHistoryIssueActiveRunMalformed,
+				View: reportv1alpha1.RolloutHistoryViewActive,
+			})
+		})
+	}
+}
+
+func TestProjectHistoryRejectsCrossSlotChronology(t *testing.T) {
+	isvc := validHistoryInferenceService(t)
+	reversed := metav1.NewTime(*historyTime(19, 0))
+	isvc.Status.Rollout.LastRun.ClosedAt = &reversed
+
+	got, err := rolloutprojection.ProjectHistory(isvc, fixedClock())
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.RolloutHistoryStatePartial, got.Content.Summary.State)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutHistoryIssue{
+		Code: reportv1alpha1.RolloutHistoryIssueRunChronologyMalformed,
+		View: reportv1alpha1.RolloutHistoryViewLast,
+	})
+	assert.True(t, slices.ContainsFunc(got.Content.Runs, func(run reportv1alpha1.RolloutHistoryRun) bool {
+		return run.Slot == reportv1alpha1.RolloutHistoryRunActive
+	}))
+	assert.False(t, slices.ContainsFunc(got.Content.Runs, func(run reportv1alpha1.RolloutHistoryRun) bool {
+		return run.Slot == reportv1alpha1.RolloutHistoryRunLast
+	}))
+	assert.False(t, slices.ContainsFunc(got.Content.Provenance, func(value reportv1alpha1.RolloutHistoryProvenance) bool {
+		return value.View == reportv1alpha1.RolloutHistoryViewLast
+	}))
 }
 
 func TestProjectHistoryRejectsMalformedLastRunEvidence(t *testing.T) {
@@ -507,7 +632,7 @@ func validHistoryInferenceService(t *testing.T) *omev1beta1.InferenceService {
 		omev1beta1.EngineComponent: {
 			LatestRolledoutRevision:   "chat-engine-rev-aaaaaaaa",
 			LatestReadyRevision:       "chat-engine-rev-bbbbbbbb",
-			PreviousRolledoutRevision: "chat-engine-rev-cccccccc",
+			PreviousRolledoutRevision: "chat-engine-rev-dddddddd",
 		},
 	}
 	isvc.Status.RolloutCoordination = &omev1beta1.RolloutCoordinationStatus{
@@ -527,7 +652,7 @@ func validHistoryInferenceService(t *testing.T) *omev1beta1.InferenceService {
 		ActiveRun: &omev1beta1.RolloutRun{
 			RunID: "chat-0123456789ab", OpenedAt: opened, PinnedAt: pinned,
 			TargetRevisions: []omev1beta1.RolloutRunTarget{{
-				Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb",
+				Component: omev1beta1.EngineComponent, Revision: "cccccccc",
 			}},
 			Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{
 				Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: digest, Group: group,

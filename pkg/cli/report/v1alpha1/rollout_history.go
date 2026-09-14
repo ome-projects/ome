@@ -79,10 +79,17 @@ type RolloutHistoryIssueCode string
 const (
 	RolloutHistoryIssueRunStatusUnavailable       RolloutHistoryIssueCode = "RunStatusUnavailable"
 	RolloutHistoryIssueActiveRunMalformed         RolloutHistoryIssueCode = "ActiveRunMalformed"
+	RolloutHistoryIssueActiveTargetUnavailable    RolloutHistoryIssueCode = "ActiveTargetUnavailable"
+	RolloutHistoryIssueActiveTargetMalformed      RolloutHistoryIssueCode = "ActiveTargetMalformed"
 	RolloutHistoryIssueLastRunMalformed           RolloutHistoryIssueCode = "LastRunMalformed"
+	RolloutHistoryIssueRunChronologyMalformed     RolloutHistoryIssueCode = "RunChronologyMalformed"
 	RolloutHistoryIssueCurrentResolutionMissing   RolloutHistoryIssueCode = "CurrentResolutionMissing"
 	RolloutHistoryIssueCurrentResolutionMalformed RolloutHistoryIssueCode = "CurrentResolutionMalformed"
 )
+
+// RolloutHistoryRevisionReady identifies the newest revision whose pods
+// reached Ready. It is intentionally distinct from a run's pinned target.
+const RolloutHistoryRevisionReady RolloutRevisionRole = "Ready"
 
 // RolloutHistorySummary describes the bounded window and qualifies the
 // current status-derived revision rows.
@@ -100,7 +107,8 @@ type RolloutHistorySummary struct {
 // RolloutHistoryTarget is one controller-pinned component target hash.
 type RolloutHistoryTarget struct {
 	Component    RuntimeComponentType `json:"component"`
-	RevisionHash string               `json:"revisionHash"`
+	RevisionHash string               `json:"revisionHash,omitempty"`
+	Evidence     EvidenceLevel        `json:"evidence"`
 }
 
 // RolloutHistoryRun is one active or retained run slot. It deliberately has
@@ -155,15 +163,27 @@ type RolloutHistoryContent struct {
 	Issues       []RolloutHistoryIssue      `json:"issues"`
 }
 
+// RolloutHistorySourceReference is the minimal source identity needed to
+// qualify this bounded report. Object UIDs are deliberately not part of the
+// rollout-history contract.
+type RolloutHistorySourceReference struct {
+	Kind        RolloutSourceKind `json:"kind"`
+	Namespace   string            `json:"namespace,omitempty"`
+	Name        string            `json:"name"`
+	Generation  int64             `json:"generation,omitempty"`
+	Evidence    EvidenceLevel     `json:"evidence"`
+	CollectedAt time.Time         `json:"collectedAt"`
+}
+
 // RolloutHistoryReport is the stable CLI-owned v1alpha1 report.
 type RolloutHistoryReport struct {
-	APIVersion  string                   `json:"apiVersion"`
-	Kind        string                   `json:"kind"`
-	Metadata    Metadata                 `json:"metadata"`
-	CollectedAt time.Time                `json:"collectedAt"`
-	Sources     []RolloutSourceReference `json:"sources"`
-	Content     RolloutHistoryContent    `json:"content"`
-	Warnings    []RolloutWarning         `json:"warnings"`
+	APIVersion  string                          `json:"apiVersion"`
+	Kind        string                          `json:"kind"`
+	Metadata    Metadata                        `json:"metadata"`
+	CollectedAt time.Time                       `json:"collectedAt"`
+	Sources     []RolloutHistorySourceReference `json:"sources"`
+	Content     RolloutHistoryContent           `json:"content"`
+	Warnings    []RolloutWarning                `json:"warnings"`
 }
 
 // NewRolloutHistoryReport creates a canonical rollout-history report.
@@ -177,7 +197,7 @@ func NewRolloutHistoryReport(
 	}
 	return (RolloutHistoryReport{
 		APIVersion: APIVersion, Kind: RolloutHistoryReportKind, Metadata: metadata,
-		CollectedAt: clock.Now().UTC(), Sources: []RolloutSourceReference{},
+		CollectedAt: clock.Now().UTC(), Sources: []RolloutHistorySourceReference{},
 		Content: content, Warnings: []RolloutWarning{},
 	}).Canonical()
 }
@@ -188,15 +208,20 @@ func (r RolloutHistoryReport) Canonical() RolloutHistoryReport {
 	out.APIVersion = APIVersion
 	out.Kind = RolloutHistoryReportKind
 	out.CollectedAt = r.CollectedAt.UTC()
-	out.Sources = append([]RolloutSourceReference{}, r.Sources...)
-	for i := range out.Sources {
-		out.Sources[i].Kind = canonicalRolloutSourceKind(out.Sources[i].Kind)
-		out.Sources[i].Evidence = canonicalRolloutEvidenceLevel(out.Sources[i].Evidence)
-		if out.Sources[i].CollectedAt.IsZero() {
-			out.Sources[i].CollectedAt = out.CollectedAt
-		} else {
-			out.Sources[i].CollectedAt = out.Sources[i].CollectedAt.UTC()
+	out.Sources = make([]RolloutHistorySourceReference, 0, len(r.Sources))
+	for _, value := range r.Sources {
+		if value.Kind != RolloutSourceInferenceService || value.Generation < 0 ||
+			len(utilvalidation.IsDNS1123Label(value.Namespace)) != 0 ||
+			len(utilvalidation.IsDNS1123Subdomain(value.Name)) != 0 {
+			continue
 		}
+		value.Evidence = canonicalRolloutEvidenceLevel(value.Evidence)
+		if value.CollectedAt.IsZero() {
+			value.CollectedAt = out.CollectedAt
+		} else {
+			value.CollectedAt = value.CollectedAt.UTC()
+		}
+		out.Sources = append(out.Sources, value)
 	}
 	sort.SliceStable(out.Sources, func(i, j int) bool {
 		return compareRolloutHistorySources(out.Sources[i], out.Sources[j]) < 0
@@ -207,6 +232,12 @@ func (r RolloutHistoryReport) Canonical() RolloutHistoryReport {
 	}
 	sort.Slice(out.Warnings, func(i, j int) bool { return out.Warnings[i].Code < out.Warnings[j].Code })
 	out.Content = r.Content.canonical(r.Metadata.Name)
+	if slices.ContainsFunc(out.Content.Issues, func(issue RolloutHistoryIssue) bool {
+		return issue.Code == RolloutHistoryIssueRunChronologyMalformed
+	}) && !slices.Contains(out.Warnings, RolloutWarning{Code: WarningPartialData}) {
+		out.Warnings = append(out.Warnings, RolloutWarning{Code: WarningPartialData})
+		sort.Slice(out.Warnings, func(i, j int) bool { return out.Warnings[i].Code < out.Warnings[j].Code })
+	}
 	return out
 }
 
@@ -266,6 +297,24 @@ func (c RolloutHistoryContent) canonical(subjectName string) RolloutHistoryConte
 	sort.Slice(out.Issues, func(i, j int) bool {
 		return compareRolloutHistoryIssues(out.Issues[i], out.Issues[j]) < 0
 	})
+	if rolloutHistoryChronologyConflicts(out.Runs) {
+		out.Runs = slices.DeleteFunc(out.Runs, func(run RolloutHistoryRun) bool {
+			return run.Slot == RolloutHistoryRunLast
+		})
+		out.Provenance = slices.DeleteFunc(out.Provenance, func(value RolloutHistoryProvenance) bool {
+			return value.View == RolloutHistoryViewLast
+		})
+		chronology := RolloutHistoryIssue{
+			Code: RolloutHistoryIssueRunChronologyMalformed, View: RolloutHistoryViewLast,
+		}
+		if !slices.Contains(out.Issues, chronology) {
+			out.Issues = append(out.Issues, chronology)
+			sort.Slice(out.Issues, func(i, j int) bool {
+				return compareRolloutHistoryIssues(out.Issues[i], out.Issues[j]) < 0
+			})
+		}
+		out.Summary.State = RolloutHistoryStatePartial
+	}
 	out.Summary.ActiveRuns = 0
 	out.Summary.RetainedRuns = 0
 	for _, run := range out.Runs {
@@ -277,6 +326,19 @@ func (c RolloutHistoryContent) canonical(subjectName string) RolloutHistoryConte
 	}
 	out.Summary.Revisions = len(out.Revisions)
 	return out
+}
+
+func rolloutHistoryChronologyConflicts(runs []RolloutHistoryRun) bool {
+	var activeOpened, lastClosed *time.Time
+	for index := range runs {
+		switch runs[index].Slot {
+		case RolloutHistoryRunActive:
+			activeOpened = runs[index].OpenedAt
+		case RolloutHistoryRunLast:
+			lastClosed = runs[index].ClosedAt
+		}
+	}
+	return activeOpened != nil && lastClosed != nil && lastClosed.After(*activeOpened)
 }
 
 func canonicalRolloutHistoryRun(
@@ -305,14 +367,25 @@ func canonicalRolloutHistoryRun(
 	if out.GroupCount < 0 || out.GroupCount > 3 {
 		out.GroupCount = 0
 	}
+	componentCounts := make(map[RuntimeComponentType]int, len(value.Targets))
+	for _, target := range value.Targets {
+		if component := canonicalRolloutComponentType(target.Component); component != "" {
+			componentCounts[component]++
+		}
+	}
 	out.Targets = make([]RolloutHistoryTarget, 0, len(value.Targets))
 	for _, target := range value.Targets {
 		component := canonicalRolloutComponentType(target.Component)
-		if component == "" || !rolloutHistoryRevisionPattern.MatchString(target.RevisionHash) {
+		if component == "" || componentCounts[component] != 1 || (target.RevisionHash != "" &&
+			!rolloutHistoryRevisionPattern.MatchString(target.RevisionHash)) {
 			continue
 		}
+		evidence := EvidenceUnavailable
+		if target.RevisionHash != "" {
+			evidence = EvidenceReported
+		}
 		out.Targets = append(out.Targets, RolloutHistoryTarget{
-			Component: component, RevisionHash: target.RevisionHash,
+			Component: component, RevisionHash: target.RevisionHash, Evidence: evidence,
 		})
 	}
 	sort.Slice(out.Targets, func(i, j int) bool {
@@ -377,7 +450,7 @@ func canonicalRolloutHistoryRevision(
 	if component == "" || !rolloutHistoryRevisionPattern.MatchString(value.RevisionHash) {
 		return RolloutHistoryRevision{}, false
 	}
-	role := canonicalRolloutRevisionRole(value.Role)
+	role := canonicalRolloutHistoryRevisionRole(value.Role)
 	if role == RolloutRevisionOther {
 		return RolloutHistoryRevision{}, false
 	}
@@ -387,13 +460,25 @@ func canonicalRolloutHistoryRevision(
 	}, true
 }
 
+func canonicalRolloutHistoryRevisionRole(role RolloutRevisionRole) RolloutRevisionRole {
+	switch role {
+	case RolloutRevisionCurrent, RolloutHistoryRevisionReady, RolloutRevisionPrevious:
+		return role
+	default:
+		return RolloutRevisionOther
+	}
+}
+
 func canonicalRolloutHistoryIssue(
 	value RolloutHistoryIssue,
 ) (RolloutHistoryIssue, bool) {
 	switch value.Code {
 	case RolloutHistoryIssueRunStatusUnavailable,
 		RolloutHistoryIssueActiveRunMalformed,
+		RolloutHistoryIssueActiveTargetUnavailable,
+		RolloutHistoryIssueActiveTargetMalformed,
 		RolloutHistoryIssueLastRunMalformed,
+		RolloutHistoryIssueRunChronologyMalformed,
 		RolloutHistoryIssueCurrentResolutionMissing,
 		RolloutHistoryIssueCurrentResolutionMalformed:
 	default:
@@ -447,6 +532,12 @@ func (r RolloutHistoryReport) Table() report.Table {
 		"WINDOW", compactRolloutHistoryState(string(canonical.Content.Summary.State)), "-", "-", "-",
 		"bounded", compactRolloutHistoryIssueCount(issueCount),
 	})
+	table.Rows = append(table.Rows, []string{
+		"CURR", compactRolloutHistoryState(string(canonical.Content.Summary.CurrentState)), "-",
+		printers.BoundedCell(string(canonical.Content.Summary.CurrentEvidence), 12), "-",
+		compactRolloutHistoryEpoch(canonical.Content.Summary.CurrentEpoch),
+		compactRolloutHistoryIssueCount(issueCount),
+	})
 	for _, run := range canonical.Content.Runs {
 		detail := fmt.Sprintf("G:%d", run.GroupCount)
 		if run.Slot == RolloutHistoryRunActive {
@@ -463,7 +554,8 @@ func (r RolloutHistoryReport) Table() report.Table {
 		if run.Slot == RolloutHistoryRunActive {
 			for _, target := range run.Targets {
 				table.Rows = append(table.Rows, []string{
-					"TARGET", "Active", printers.BoundedCell(string(target.Component), 7), target.RevisionHash,
+					"TARGET", compactRolloutHistoryState(string(target.Evidence)),
+					printers.BoundedCell(string(target.Component), 7), orDash(target.RevisionHash),
 					"-", "run-target", compactRolloutHistoryIssueCount(issueCount),
 				})
 			}
@@ -496,62 +588,182 @@ func (r RolloutHistoryReport) Table() report.Table {
 func (r RolloutHistoryReport) WideTable() report.Table {
 	canonical := r.Canonical()
 	table := report.Table{Headers: []string{
-		"WINDOW", "RECORD", "STATE", "RUN-ID", "COMPONENT", "REVISION", "ROLE",
-		"OPENED", "PINNED", "CLOSED", "VIEW", "GROUP", "SOURCE", "POLICY",
-		"POLICY-GENERATION", "DIGEST", "SHADOWED-POLICY", "SHADOWED-DIGEST", "PHASE",
-		"DIGEST-EVIDENCE", "ISSUES",
+		"ROW", "NAMESPACE", "NAME", "COLLECTED-AT", "COMPLETENESS", "WINDOW-STATE",
+		"CURRENT-STATE", "CURRENT-EVIDENCE", "CURRENT-EPOCH", "ACTIVE-RUNS",
+		"RETAINED-RUNS", "REVISIONS", "SOURCE-KIND", "SOURCE-NAMESPACE", "SOURCE-NAME",
+		"SOURCE-GENERATION", "SOURCE-EVIDENCE", "SOURCE-COLLECTED-AT", "RECORD", "OUTCOME",
+		"RUN-ID", "GROUP-COUNT", "COMPONENT", "REVISION", "REVISION-EVIDENCE", "ROLE",
+		"PHASE", "OPENED-AT", "PINNED-AT", "CLOSED-AT", "OBSERVED-AT", "VIEW", "GROUP",
+		"SOURCE", "POLICY", "POLICY-PROGRESSION", "POLICY-GENERATION", "POLICY-EVIDENCE",
+		"POLICY-DIGEST", "DIGEST", "DIGEST-EVIDENCE", "SHADOWED-POLICY", "SHADOWED-PROGRESSION",
+		"SHADOWED-GENERATION", "SHADOWED-EVIDENCE", "SHADOWED-DIGEST", "ISSUE-CODE", "ISSUE-VIEW",
+		"ISSUE-GROUP", "ISSUE-COMPONENT", "WARNING",
 	}}
-	issues := wideRolloutHistoryIssues(canonical.Content)
+	summary := emptyRolloutHistoryWideRow()
+	summary[historyWideRow] = "Summary"
+	summary[historyWideNamespace], summary[historyWideName] = orDash(canonical.Metadata.Namespace), canonical.Metadata.Name
+	summary[historyWideCollectedAt] = canonical.CollectedAt.Format(time.RFC3339)
+	summary[historyWideCompleteness] = string(canonical.Content.Summary.Completeness)
+	summary[historyWideWindowState] = string(canonical.Content.Summary.State)
+	summary[historyWideCurrentState] = string(canonical.Content.Summary.CurrentState)
+	summary[historyWideCurrentEvidence] = string(canonical.Content.Summary.CurrentEvidence)
+	summary[historyWideCurrentEpoch] = string(canonical.Content.Summary.CurrentEpoch)
+	summary[historyWideActiveRuns] = fmt.Sprintf("%d", canonical.Content.Summary.ActiveRuns)
+	summary[historyWideRetainedRuns] = fmt.Sprintf("%d", canonical.Content.Summary.RetainedRuns)
+	summary[historyWideRevisionCount] = fmt.Sprintf("%d", canonical.Content.Summary.Revisions)
+	table.Rows = append(table.Rows, summary)
+	for _, source := range canonical.Sources {
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow] = "Source"
+		row[historyWideSourceKind], row[historyWideSourceNamespace], row[historyWideSourceName] =
+			string(source.Kind), orDash(source.Namespace), source.Name
+		if source.Generation > 0 {
+			row[historyWideSourceGeneration] = fmt.Sprintf("%d", source.Generation)
+		}
+		row[historyWideSourceEvidence] = string(source.Evidence)
+		row[historyWideSourceCollectedAt] = source.CollectedAt.Format(time.RFC3339)
+		table.Rows = append(table.Rows, row)
+	}
 	for _, run := range canonical.Content.Runs {
-		row := emptyRolloutHistoryWideRow(canonical.Content.Summary.Completeness, issues)
-		row[1], row[2], row[3] = string(run.Slot), string(run.Outcome), orDash(run.RunID)
-		row[7], row[8], row[9] = formatRolloutHistoryTime(run.OpenedAt), formatRolloutHistoryTime(run.PinnedAt), formatRolloutHistoryTime(run.ClosedAt)
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow], row[historyWideRecord], row[historyWideOutcome] = "Run", string(run.Slot), string(run.Outcome)
+		row[historyWideRunID], row[historyWideGroupCount] = orDash(run.RunID), fmt.Sprintf("%d", run.GroupCount)
+		row[historyWideOpenedAt], row[historyWidePinnedAt], row[historyWideClosedAt] =
+			formatRolloutHistoryTime(run.OpenedAt), formatRolloutHistoryTime(run.PinnedAt), formatRolloutHistoryTime(run.ClosedAt)
 		table.Rows = append(table.Rows, row)
 		for _, target := range run.Targets {
-			targetRow := emptyRolloutHistoryWideRow(canonical.Content.Summary.Completeness, issues)
-			targetRow[1], targetRow[2] = string(run.Slot), string(run.Outcome)
-			targetRow[4], targetRow[5], targetRow[6] = string(target.Component), target.RevisionHash, "RunTarget"
+			targetRow := emptyRolloutHistoryWideRow()
+			targetRow[historyWideRow], targetRow[historyWideRecord] = "Target", string(run.Slot)
+			targetRow[historyWideComponent], targetRow[historyWideRevision] = string(target.Component), orDash(target.RevisionHash)
+			targetRow[historyWideRevisionEvidence], targetRow[historyWideRole] = string(target.Evidence), "RunTarget"
 			table.Rows = append(table.Rows, targetRow)
 		}
 	}
 	for _, provenance := range canonical.Content.Provenance {
-		row := emptyRolloutHistoryWideRow(canonical.Content.Summary.Completeness, issues)
-		row[10], row[11], row[12], row[15] = string(provenance.View), fmt.Sprintf("%d", provenance.Group), string(provenance.Source), provenance.PortableDigest
-		row[19] = string(provenance.DigestEvidence)
-		row[8] = formatRolloutHistoryTime(provenance.ObservedAt)
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow], row[historyWideView] = "Provenance", string(provenance.View)
+		row[historyWideGroup], row[historyWidePlanSource] = fmt.Sprintf("%d", provenance.Group), string(provenance.Source)
+		row[historyWideDigest], row[historyWideDigestEvidence] = orDash(provenance.PortableDigest), string(provenance.DigestEvidence)
+		row[historyWideObservedAt] = formatRolloutHistoryTime(provenance.ObservedAt)
 		if provenance.Policy != nil {
-			row[13] = rolloutHistoryPolicyDisplay(provenance.Policy)
+			row[historyWidePolicy] = rolloutHistoryPolicyDisplay(provenance.Policy)
+			row[historyWidePolicyProgression] = orDash(provenance.Policy.Progression)
 			if provenance.Policy.Generation > 0 {
-				row[14] = fmt.Sprintf("%d", provenance.Policy.Generation)
+				row[historyWidePolicyGeneration] = fmt.Sprintf("%d", provenance.Policy.Generation)
 			}
+			row[historyWidePolicyEvidence] = string(provenance.Policy.Evidence)
+			row[historyWidePolicyDigest] = orDash(provenance.Policy.Digest)
 		}
 		if provenance.ShadowedPolicy != nil {
-			row[16] = rolloutHistoryPolicyDisplay(provenance.ShadowedPolicy)
-			row[17] = orDash(provenance.ShadowedPolicy.Digest)
+			row[historyWideShadowedPolicy] = rolloutHistoryPolicyDisplay(provenance.ShadowedPolicy)
+			row[historyWideShadowedProgression] = orDash(provenance.ShadowedPolicy.Progression)
+			if provenance.ShadowedPolicy.Generation > 0 {
+				row[historyWideShadowedGeneration] = fmt.Sprintf("%d", provenance.ShadowedPolicy.Generation)
+			}
+			row[historyWideShadowedEvidence] = string(provenance.ShadowedPolicy.Evidence)
+			row[historyWideShadowedDigest] = orDash(provenance.ShadowedPolicy.Digest)
 		}
 		table.Rows = append(table.Rows, row)
 	}
 	for _, revision := range canonical.Content.Revisions {
-		row := emptyRolloutHistoryWideRow(canonical.Content.Summary.Completeness, issues)
-		row[1], row[2] = "CurrentStatus", string(canonical.Content.Summary.CurrentState)
-		row[4], row[5], row[6], row[18] = string(revision.Component), revision.RevisionHash, string(revision.Role), string(revision.Phase)
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow], row[historyWideRecord] = "Revision", "CurrentStatus"
+		row[historyWideComponent], row[historyWideRevision] = string(revision.Component), revision.RevisionHash
+		row[historyWideRevisionEvidence] = string(canonical.Content.Summary.CurrentEvidence)
+		row[historyWideRole], row[historyWidePhase] = string(revision.Role), string(revision.Phase)
 		table.Rows = append(table.Rows, row)
 	}
-	if len(table.Rows) == 0 {
-		row := emptyRolloutHistoryWideRow(canonical.Content.Summary.Completeness, issues)
-		row[1], row[2] = "Window", string(canonical.Content.Summary.State)
+	for _, issue := range canonical.Content.StatusIssues {
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow], row[historyWideIssueCode] = "StatusIssue", string(issue.Code)
+		row[historyWideIssueGroup] = formatRolloutHistoryGroup(issue.Group)
+		row[historyWideIssueComponent] = orDash(string(issue.Component))
+		table.Rows = append(table.Rows, row)
+	}
+	for _, issue := range canonical.Content.Issues {
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow], row[historyWideIssueCode] = "HistoryIssue", string(issue.Code)
+		row[historyWideIssueView] = orDash(string(issue.View))
+		row[historyWideIssueGroup] = formatRolloutHistoryGroup(issue.Group)
+		row[historyWideIssueComponent] = orDash(string(issue.Component))
+		table.Rows = append(table.Rows, row)
+	}
+	for _, warning := range canonical.Warnings {
+		row := emptyRolloutHistoryWideRow()
+		row[historyWideRow], row[historyWideWarning] = "Warning", string(warning.Code)
 		table.Rows = append(table.Rows, row)
 	}
 	return table
 }
 
-func emptyRolloutHistoryWideRow(completeness RolloutHistoryCompleteness, issues string) []string {
-	row := make([]string, 21)
+const (
+	historyWideRow = iota
+	historyWideNamespace
+	historyWideName
+	historyWideCollectedAt
+	historyWideCompleteness
+	historyWideWindowState
+	historyWideCurrentState
+	historyWideCurrentEvidence
+	historyWideCurrentEpoch
+	historyWideActiveRuns
+	historyWideRetainedRuns
+	historyWideRevisionCount
+	historyWideSourceKind
+	historyWideSourceNamespace
+	historyWideSourceName
+	historyWideSourceGeneration
+	historyWideSourceEvidence
+	historyWideSourceCollectedAt
+	historyWideRecord
+	historyWideOutcome
+	historyWideRunID
+	historyWideGroupCount
+	historyWideComponent
+	historyWideRevision
+	historyWideRevisionEvidence
+	historyWideRole
+	historyWidePhase
+	historyWideOpenedAt
+	historyWidePinnedAt
+	historyWideClosedAt
+	historyWideObservedAt
+	historyWideView
+	historyWideGroup
+	historyWidePlanSource
+	historyWidePolicy
+	historyWidePolicyProgression
+	historyWidePolicyGeneration
+	historyWidePolicyEvidence
+	historyWidePolicyDigest
+	historyWideDigest
+	historyWideDigestEvidence
+	historyWideShadowedPolicy
+	historyWideShadowedProgression
+	historyWideShadowedGeneration
+	historyWideShadowedEvidence
+	historyWideShadowedDigest
+	historyWideIssueCode
+	historyWideIssueView
+	historyWideIssueGroup
+	historyWideIssueComponent
+	historyWideWarning
+	historyWideColumnCount
+)
+
+func emptyRolloutHistoryWideRow() []string {
+	row := make([]string, historyWideColumnCount)
 	for i := range row {
 		row[i] = "-"
 	}
-	row[0], row[20] = string(completeness), issues
 	return row
+}
+
+func formatRolloutHistoryGroup(value *int) string {
+	if value == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", *value)
 }
 
 func runTime(run RolloutHistoryRun) *time.Time {
@@ -567,6 +779,17 @@ func compactRolloutHistoryType(value string) string {
 
 func compactRolloutHistoryState(value string) string {
 	return printers.BoundedCell(value, 10)
+}
+
+func compactRolloutHistoryEpoch(value RolloutEpochState) string {
+	switch value {
+	case RolloutEpochNotApplicable:
+		return "N/A"
+	case RolloutEpochUnverifiable:
+		return "Unverified"
+	default:
+		return "Unknown"
+	}
 }
 
 func compactRolloutHistoryPhase(value RolloutPhase) string {
@@ -664,25 +887,11 @@ func rolloutHistoryPolicyDisplay(value *RolloutPolicyReference) string {
 	return value.Kind + "/" + value.Name
 }
 
-func wideRolloutHistoryIssues(content RolloutHistoryContent) string {
-	values := make([]string, 0, len(content.Issues)+len(content.StatusIssues))
-	for _, issue := range content.Issues {
-		values = append(values, string(issue.Code))
-	}
-	for _, issue := range content.StatusIssues {
-		values = append(values, "Status:"+string(issue.Code))
-	}
-	if len(values) == 0 {
-		return "-"
-	}
-	return strings.Join(values, ",")
-}
-
-func compareRolloutHistorySources(a, b RolloutSourceReference) int {
+func compareRolloutHistorySources(a, b RolloutHistorySourceReference) int {
 	for _, result := range []int{
 		cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Namespace, b.Namespace),
-		cmp.Compare(a.Name, b.Name), cmp.Compare(a.UID, b.UID),
-		cmp.Compare(a.Generation, b.Generation), cmp.Compare(a.Evidence, b.Evidence),
+		cmp.Compare(a.Name, b.Name), cmp.Compare(a.Generation, b.Generation),
+		cmp.Compare(a.Evidence, b.Evidence),
 		a.CollectedAt.Compare(b.CollectedAt),
 	} {
 		if result != 0 {
@@ -727,6 +936,7 @@ func compareRolloutHistoryTargets(a, b RolloutHistoryTarget) int {
 	for _, result := range []int{
 		cmp.Compare(rolloutComponentOrder(a.Component), rolloutComponentOrder(b.Component)),
 		cmp.Compare(a.Component, b.Component), cmp.Compare(a.RevisionHash, b.RevisionHash),
+		cmp.Compare(a.Evidence, b.Evidence),
 	} {
 		if result != 0 {
 			return result
@@ -776,7 +986,7 @@ func compareRolloutHistoryRevisions(a, b RolloutHistoryRevision) int {
 	for _, result := range []int{
 		cmp.Compare(rolloutComponentOrder(a.Component), rolloutComponentOrder(b.Component)),
 		cmp.Compare(a.Component, b.Component),
-		cmp.Compare(rolloutRevisionRoleOrder(a.Role), rolloutRevisionRoleOrder(b.Role)),
+		cmp.Compare(rolloutHistoryRevisionRoleOrder(a.Role), rolloutHistoryRevisionRoleOrder(b.Role)),
 		cmp.Compare(a.Role, b.Role), cmp.Compare(a.RevisionHash, b.RevisionHash),
 		cmp.Compare(a.Phase, b.Phase),
 	} {
@@ -785,6 +995,19 @@ func compareRolloutHistoryRevisions(a, b RolloutHistoryRevision) int {
 		}
 	}
 	return 0
+}
+
+func rolloutHistoryRevisionRoleOrder(role RolloutRevisionRole) int {
+	switch role {
+	case RolloutRevisionCurrent:
+		return 0
+	case RolloutHistoryRevisionReady:
+		return 1
+	case RolloutRevisionPrevious:
+		return 2
+	default:
+		return 3
+	}
 }
 
 func compareRolloutHistoryIssues(a, b RolloutHistoryIssue) int {

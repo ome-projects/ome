@@ -1,0 +1,37 @@
+{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "RolloutHistoryReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "2026-08-31T18:30:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "generation": 7,
+      "evidence": "Observed",
+      "collectedAt": "2026-08-31T18:30:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "state": "Empty",
+      "completeness": "RetentionBounded",
+      "currentState": "NotConfigured",
+      "currentEvidence": "Declared",
+      "currentEpoch": "NotApplicable",
+      "activeRuns": 0,
+      "retainedRuns": 0,
+      "revisions": 0
+    },
+    "runs": [],
+    "provenance": [],
+    "revisions": [],
+    "statusIssues": [],
+    "issues": []
+  },
+  "warnings": []
+}

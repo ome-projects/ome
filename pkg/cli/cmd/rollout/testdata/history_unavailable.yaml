@@ -1,0 +1,31 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-08-31T18:30:00Z"
+content:
+  issues:
+  - code: RunStatusUnavailable
+  provenance: []
+  revisions: []
+  runs: []
+  statusIssues: []
+  summary:
+    activeRuns: 0
+    completeness: RetentionBounded
+    currentEpoch: NotApplicable
+    currentEvidence: Declared
+    currentState: NotConfigured
+    retainedRuns: 0
+    revisions: 0
+    state: Unavailable
+kind: RolloutHistoryReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-08-31T18:30:00Z"
+  evidence: Observed
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings:
+- code: SourceUnavailable

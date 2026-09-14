@@ -3,6 +3,8 @@ package rollout
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -60,8 +62,9 @@ func TestHistoryPerformsOneBoundNamespacedGet(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t,
-		"TYPE     STATE   COMP   IDENT   TIME   DETAIL    ISS\n"+
-			"WINDOW   Empty   -      -       -      bounded   0\n",
+		"TYPE     STATE        COMP   IDENT      TIME   DETAIL    ISS\n"+
+			"WINDOW   Empty        -      -          -      bounded   0\n"+
+			"CURR     NotConf...   -      Declared   -      N/A       0\n",
 		output,
 	)
 	require.Len(t, client.Actions(), 1)
@@ -81,22 +84,25 @@ func TestHistoryPrintsRetainedEvidenceEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "TYPE     STATE       COMP     IDENT          TIME          DETAIL       ISS\n"+
 		"WINDOW   Partial     -        -              -             bounded      1\n"+
+		"CURR     Unknown     -        Reported       -             Unverified   1\n"+
 		"ACTIVE   Active      -        0123456789ab   08-31T18:00   G:1 T:1      1\n"+
-		"TARGET   Active      engine   bbbbbbbb       -             run-target   1\n"+
+		"TARGET   Reported    engine   cccccccc       -             run-target   1\n"+
 		"LAST     Completed   -        -              08-31T17:00   G:1          1\n"+
 		"PROV-A   Inline      g0       cca45ec1fb0f   08-31T18:30   -            1\n"+
 		"PROV-L   Inline      g0       cca45ec1fb0f   08-31T17:00   -            1\n"+
 		"PROV-C   Inline      g0       cca45ec1fb0f   -             -            1\n"+
 		"REV      Unknown     engine   aaaaaaaa       -             Current      1\n"+
-		"REV      Unknown     engine   bbbbbbbb       -             Target       1\n"+
-		"REV      Unknown     engine   cccccccc       -             Previous     1\n", output)
+		"REV      Unknown     engine   bbbbbbbb       -             Ready        1\n"+
+		"REV      Unknown     engine   dddddddd       -             Previous     1\n", output)
 	require.Len(t, client.Actions(), 1)
 }
 
 func TestHistoryWritesTypedJSONAndYAMLWithoutRawObjectFields(t *testing.T) {
 	for _, format := range []string{"json", "yaml"} {
 		t.Run(format, func(t *testing.T) {
-			client := omefake.NewSimpleClientset(minimalInferenceService())
+			isvc := minimalInferenceService()
+			isvc.UID = "SECRET_HOSTILE_UID"
+			client := omefake.NewSimpleClientset(isvc)
 			output, err := execute(
 				t, factory.Static{OME: client, NS: "prod"}, fixedClock(),
 				"history", "chat", "-o", format,
@@ -109,6 +115,7 @@ func TestHistoryWritesTypedJSONAndYAMLWithoutRawObjectFields(t *testing.T) {
 			for _, secret := range []string{
 				"SECRET_RESOURCE_VERSION", "SECRET_MAILBOX",
 				"SECRET_STATUS_ANNOTATION", "SECRET_SYNC_TOKEN",
+				"SECRET_HOSTILE_UID",
 			} {
 				assert.NotContains(t, output, secret)
 			}
@@ -199,6 +206,33 @@ func TestHistoryHelpStatesRetentionBoundary(t *testing.T) {
 	assert.Contains(t, output.String(), "history INFERENCESERVICE")
 }
 
+func TestHistoryWritesExactMachineGoldens(t *testing.T) {
+	healthy := minimalInferenceService()
+	healthy.Status.Rollout = &omev1beta1.RolloutStatus{}
+	fixtures := map[string]*omev1beta1.InferenceService{
+		"healthy": healthy, "partial": historyInferenceService(t),
+		"unavailable": minimalInferenceService(),
+	}
+	for state, isvc := range fixtures {
+		isvc.UID = "SECRET_HOSTILE_UID"
+		for _, format := range []string{"json", "yaml"} {
+			t.Run(state+"/"+format, func(t *testing.T) {
+				want, err := os.ReadFile(filepath.Join("testdata", "history_"+state+"."+format))
+				require.NoError(t, err)
+				output, err := execute(
+					t, factory.Static{OME: omefake.NewSimpleClientset(isvc.DeepCopy()), NS: "prod"},
+					fixedClock(), "history", "chat", "-o", format,
+				)
+				require.NoError(t, err)
+				assert.Equal(t, string(want), output)
+				assert.NotContains(t, output, "SECRET_HOSTILE_UID")
+				assert.NotContains(t, output, "uid:")
+				assert.NotContains(t, output, `"uid"`)
+			})
+		}
+	}
+}
+
 func historyInferenceService(t *testing.T) *omev1beta1.InferenceService {
 	t.Helper()
 	isvc := minimalInferenceService()
@@ -221,7 +255,7 @@ func historyInferenceService(t *testing.T) *omev1beta1.InferenceService {
 		omev1beta1.EngineComponent: {
 			LatestRolledoutRevision:   "chat-engine-rev-aaaaaaaa",
 			LatestReadyRevision:       "chat-engine-rev-bbbbbbbb",
-			PreviousRolledoutRevision: "chat-engine-rev-cccccccc",
+			PreviousRolledoutRevision: "chat-engine-rev-dddddddd",
 		},
 	}
 	isvc.Status.RolloutCoordination = &omev1beta1.RolloutCoordinationStatus{
@@ -234,7 +268,7 @@ func historyInferenceService(t *testing.T) *omev1beta1.InferenceService {
 		ActiveRun: &omev1beta1.RolloutRun{
 			RunID: "chat-0123456789ab", OpenedAt: opened, PinnedAt: pinned,
 			TargetRevisions: []omev1beta1.RolloutRunTarget{{
-				Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb",
+				Component: omev1beta1.EngineComponent, Revision: "cccccccc",
 			}},
 			Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{
 				Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: digest, Group: group,
