@@ -14,7 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -161,78 +160,54 @@ func (r *InheritanceReconciler) namespacedFetcher(namespace string) runtimeinher
 	}
 }
 
-// dependentsOfCluster enqueues self + every CSR/SR that inherits from
-// the changed CSR. Drives cluster→cluster and cluster→namespaced
+// dependentsOfCluster enqueues self + every CSR/SR below the changed CSR
+// in the inheritance graph. Drives cluster→cluster and cluster→namespaced
 // cascade on parent profile updates.
 func (r *InheritanceReconciler) dependentsOfCluster(ctx context.Context, obj client.Object) []reconcile.Request {
-	name := obj.GetName()
-	reqs := []reconcile.Request{{NamespacedName: types.NamespacedName{Name: name}}}
-
-	var csrs v1beta1.ClusterServingRuntimeList
-	if err := r.List(ctx, &csrs); err == nil {
-		for _, item := range csrs.Items {
-			if item.Name == name {
-				continue
-			}
-			if item.Annotations[constants.RuntimeInheritFromAnnotationKey] == name {
-				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: item.Name}})
-			}
-		}
-	} else {
-		r.Log.Error(err, "dependentsOfCluster: list ClusterServingRuntimes failed")
-	}
-	var srs v1beta1.ServingRuntimeList
-	if err := r.List(ctx, &srs); err == nil {
-		for _, item := range srs.Items {
-			if item.Annotations[constants.RuntimeInheritFromAnnotationKey] == name {
-				reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: item.Namespace, Name: item.Name}})
-			}
-		}
-	} else {
-		r.Log.Error(err, "dependentsOfCluster: list ServingRuntimes failed")
-	}
-	return reqs
+	return r.selfAndDependents(ctx, types.NamespacedName{Name: obj.GetName()})
 }
 
-// dependentsOfNamespaced enqueues self + same-namespace SRs that
-// inherit from the changed SR. Drives namespaced→namespaced cascade.
-// SRs cannot be inherited from outside their namespace.
+// dependentsOfNamespaced enqueues self + the same-namespace SRs below the
+// changed SR. Drives namespaced→namespaced cascade. SRs cannot be
+// inherited from outside their namespace.
 func (r *InheritanceReconciler) dependentsOfNamespaced(ctx context.Context, obj client.Object) []reconcile.Request {
-	name := obj.GetName()
-	namespace := obj.GetNamespace()
-	reqs := []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}}
+	return r.selfAndDependents(ctx, types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()})
+}
 
-	var srs v1beta1.ServingRuntimeList
-	if err := r.List(ctx, &srs, client.InNamespace(namespace)); err != nil {
-		r.Log.Error(err, "dependentsOfNamespaced: list ServingRuntimes failed", "namespace", namespace)
+// selfAndDependents enqueues root plus its whole subtree. The walk is
+// transitive because a chain edit reaches past direct children: repointing
+// a runtime at a different parent rewrites the resolved chain of everything
+// below it, and only the runtime's own reconcile can record that.
+func (r *InheritanceReconciler) selfAndDependents(ctx context.Context, root types.NamespacedName) []reconcile.Request {
+	reqs := []reconcile.Request{{NamespacedName: root}}
+
+	dependents, err := runtimeinheritance.Descendants(ctx, r.Client, root)
+	if err != nil {
+		r.Log.Error(err, "inheritance cascade: resolve dependents failed",
+			"namespace", root.Namespace, "name", root.Name)
 		return reqs
 	}
-	for _, item := range srs.Items {
-		if item.Name == name {
-			continue
-		}
-		if item.Annotations[constants.RuntimeInheritFromAnnotationKey] == name {
-			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: item.Namespace, Name: item.Name}})
-		}
+	for _, dependent := range dependents {
+		reqs = append(reqs, reconcile.Request{NamespacedName: dependent})
 	}
 	return reqs
 }
 
 // SetupWithManager registers a single controller watching both CSR and
 // SR via Watches() with fan-out map functions. A cluster-scoped parent
-// update cascades into all cluster- and namespace-scoped children;
+// update cascades into all cluster- and namespace-scoped dependents;
 // a namespace-scoped parent update cascades into same-namespace
-// children only. Reconcile branches on req.Namespace.
+// dependents only. Reconcile branches on req.Namespace.
 func (r *InheritanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("servingruntime-inheritance").
 		For(&v1beta1.ClusterServingRuntime{},
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			builder.WithPredicates(inheritanceTriggerPredicate())).
 		Watches(&v1beta1.ClusterServingRuntime{},
 			handler.EnqueueRequestsFromMapFunc(r.dependentsOfCluster),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			builder.WithPredicates(inheritanceTriggerPredicate())).
 		Watches(&v1beta1.ServingRuntime{},
 			handler.EnqueueRequestsFromMapFunc(r.dependentsOfNamespaced),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			builder.WithPredicates(inheritanceTriggerPredicate())).
 		Complete(r)
 }

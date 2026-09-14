@@ -2,9 +2,12 @@ package servingruntime
 
 import (
 	"context"
+	"sort"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -240,37 +244,96 @@ func TestReconcile_Namespaced_NamespacedShadowsCluster(t *testing.T) {
 
 // Cascade fan-out (handler-level)
 
-func TestOnClusterEvent_FanoutToBothScopes(t *testing.T) {
-	g := gomega.NewWithT(t)
-	root := mkCSR("root", "", v1beta1.ServingRuntimeSpec{})
-	clusterChild := mkCSR("c1", "root", v1beta1.ServingRuntimeSpec{})
-	nsChild1 := mkSR("n1", "team-a", "root", v1beta1.ServingRuntimeSpec{})
-	nsChild2 := mkSR("n2", "team-b", "root", v1beta1.ServingRuntimeSpec{})
-	unrelated := mkCSR("other", "", v1beta1.ServingRuntimeSpec{})
-	r, _ := newReconciler(t, root, clusterChild, nsChild1, nsChild2, unrelated)
-
-	reqs := r.dependentsOfCluster(context.Background(), root)
-	keys := []string{}
+// reqKeys flattens requests to sorted "namespace/name", so a cluster-scoped
+// dependent reads as "/name". Descendants derives its result from a map, so
+// the mapper's order is unspecified and has to be normalised before diffing.
+func reqKeys(reqs []reconcile.Request) []string {
+	out := make([]string, 0, len(reqs))
 	for _, req := range reqs {
-		keys = append(keys, req.Namespace+"/"+req.Name)
+		out = append(out, req.Namespace+"/"+req.Name)
 	}
-	g.Expect(keys).To(gomega.ConsistOf("/root", "/c1", "team-a/n1", "team-b/n2"),
-		"CSR event should enqueue self + cluster dependents + ns dependents across all namespaces")
+	sort.Strings(out)
+	return out
 }
 
-func TestOnNamespacedEvent_FanoutWithinNamespace(t *testing.T) {
-	g := gomega.NewWithT(t)
-	parent := mkSR("parent", "team-a", "", v1beta1.ServingRuntimeSpec{})
-	sibling := mkSR("sibling", "team-a", "parent", v1beta1.ServingRuntimeSpec{})
-	otherNS := mkSR("other-ns-child", "team-b", "parent", v1beta1.ServingRuntimeSpec{})
-	unrelated := mkSR("unrelated", "team-a", "", v1beta1.ServingRuntimeSpec{})
-	r, _ := newReconciler(t, parent, sibling, otherNS, unrelated)
-
-	reqs := r.dependentsOfNamespaced(context.Background(), parent)
-	keys := []string{}
-	for _, req := range reqs {
-		keys = append(keys, req.Namespace+"/"+req.Name)
+func TestDependentsFanout(t *testing.T) {
+	tests := []struct {
+		name     string
+		runtimes []client.Object
+		event    client.Object
+		want     []string
+	}{
+		{
+			name: "a cluster event reaches both scopes, in every namespace",
+			runtimes: []client.Object{
+				mkCSR("root", "", v1beta1.ServingRuntimeSpec{}),
+				mkCSR("c1", "root", v1beta1.ServingRuntimeSpec{}),
+				mkSR("n1", "team-a", "root", v1beta1.ServingRuntimeSpec{}),
+				mkSR("n2", "team-b", "root", v1beta1.ServingRuntimeSpec{}),
+				mkCSR("other", "", v1beta1.ServingRuntimeSpec{}),
+			},
+			event: mkCSR("root", "", v1beta1.ServingRuntimeSpec{}),
+			want:  []string{"/c1", "/root", "team-a/n1", "team-b/n2"},
+		},
+		{
+			// Cross-namespace inheritance is disallowed, so team-b's runtime
+			// resolves some other parent named "parent".
+			name: "a namespaced event stays inside its namespace",
+			runtimes: []client.Object{
+				mkSR("parent", "team-a", "", v1beta1.ServingRuntimeSpec{}),
+				mkSR("sibling", "team-a", "parent", v1beta1.ServingRuntimeSpec{}),
+				mkSR("other-ns-child", "team-b", "parent", v1beta1.ServingRuntimeSpec{}),
+				mkSR("unrelated", "team-a", "", v1beta1.ServingRuntimeSpec{}),
+			},
+			event: mkSR("parent", "team-a", "", v1beta1.ServingRuntimeSpec{}),
+			want:  []string{"team-a/parent", "team-a/sibling"},
+		},
+		{
+			// Repointing root rewrites the resolved chain of everything below
+			// it, and only each runtime's own reconcile can record that.
+			name: "a cluster event reaches the whole subtree, however deep",
+			runtimes: []client.Object{
+				mkCSR("root", "", v1beta1.ServingRuntimeSpec{}),
+				mkCSR("child", "root", v1beta1.ServingRuntimeSpec{}),
+				mkCSR("grandchild", "child", v1beta1.ServingRuntimeSpec{}),
+				mkSR("ns-grandchild", "team-a", "child", v1beta1.ServingRuntimeSpec{}),
+			},
+			event: mkCSR("root", "", v1beta1.ServingRuntimeSpec{}),
+			want:  []string{"/child", "/grandchild", "/root", "team-a/ns-grandchild"},
+		},
+		{
+			name: "a namespaced event reaches its whole same-namespace subtree",
+			runtimes: []client.Object{
+				mkSR("parent", "team-a", "", v1beta1.ServingRuntimeSpec{}),
+				mkSR("child", "team-a", "parent", v1beta1.ServingRuntimeSpec{}),
+				mkSR("grandchild", "team-a", "child", v1beta1.ServingRuntimeSpec{}),
+				mkSR("outsider", "team-b", "parent", v1beta1.ServingRuntimeSpec{}),
+			},
+			event: mkSR("parent", "team-a", "", v1beta1.ServingRuntimeSpec{}),
+			want:  []string{"team-a/child", "team-a/grandchild", "team-a/parent"},
+		},
 	}
-	g.Expect(keys).To(gomega.ConsistOf("team-a/parent", "team-a/sibling"),
-		"SR event should enqueue self + same-ns dependents only (cross-ns inheritance is disallowed)")
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := newReconciler(t, tc.runtimes...)
+
+			// Dispatch on kind the way SetupWithManager wires the two
+			// Watches: the CSR source feeds dependentsOfCluster, the SR
+			// source feeds dependentsOfNamespaced.
+			var got []string
+			switch tc.event.(type) {
+			case *v1beta1.ClusterServingRuntime:
+				got = reqKeys(r.dependentsOfCluster(context.Background(), tc.event))
+			case *v1beta1.ServingRuntime:
+				got = reqKeys(r.dependentsOfNamespaced(context.Background(), tc.event))
+			default:
+				t.Fatalf("event is neither runtime kind: %T", tc.event)
+			}
+
+			if diff := cmp.Diff(tc.want, got, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("dependents mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

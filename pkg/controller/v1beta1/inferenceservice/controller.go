@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
@@ -62,6 +63,7 @@ import (
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
+	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils"
@@ -1611,9 +1613,9 @@ func registerISVCRuntimeNameIndex(ctx context.Context, indexer client.FieldIndex
 }
 
 // isvcsReferencingRuntime returns reconcile requests for EVERY ISVC whose
-// spec.runtime.name matches obj (respecting namespaced-SR scope), regardless
-// of autoSync. Both float and pinned consumers must be re-reconciled on a
-// runtime change:
+// spec.runtime.name matches obj or any runtime inheriting from it
+// (respecting namespaced-SR scope), regardless of autoSync. Both float and
+// pinned consumers must be re-reconciled on a runtime change:
 //
 //   - autoSync=true (default, "float"): the reconcile re-renders the pod
 //     spec from the LIVE runtime, so a runtime edit rolls the ISVC forward.
@@ -1627,36 +1629,59 @@ func registerISVCRuntimeNameIndex(ctx context.Context, indexer client.FieldIndex
 //   - autoSync=false ("pinned"): the reconcile runs drift detection and
 //     warns the operator that the runtime edit was rejected; it does not roll.
 //
+// The fan-out follows inherit-from downwards, not just direct references.
+// A consuming ISVC renders the runtime's chain resolved end to end on every
+// reconcile, so editing a shared profile changes what every ISVC behind a
+// child runtime produces; matching only the edited runtime's own name leaves
+// those ISVCs on the pre-edit spec with no event left to correct them.
+//
 // NOTE: fanning out float ISVCs means a runtime edit rolls them. For
 // RawDeployment that is a safe native rolling update; for OMENative it
 // rolls per the Component's updateStrategy — an OMENative ISVC on
 // RecreatePod with no rollout budget is recreated wholesale.
 func (r *InferenceServiceReconciler) isvcsReferencingRuntime(ctx context.Context, obj client.Object) []reconcile.Request {
-	runtimeName := obj.GetName()
-	runtimeNamespace := obj.GetNamespace() // empty for cluster-scoped
+	// Empty namespace means cluster-scoped.
+	root := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
 
-	// Narrow to ISVCs whose spec.runtime.name matches via the field index;
-	// the in-memory kind/namespace-scope filter below still applies.
-	var isvcs v1beta1.InferenceServiceList
-	if err := r.List(ctx, &isvcs, client.MatchingFields{isvcRuntimeNameIndexField: runtimeName}); err != nil {
-		r.Log.Error(err, "fan-out runtime event: list InferenceServices failed")
-		return nil
+	sources := []types.NamespacedName{root}
+	descendants, err := runtimeinheritance.Descendants(ctx, r.Client, root)
+	if err != nil {
+		// Degrade to the direct consumers rather than dropping the event.
+		r.Log.Error(err, "fan-out runtime event: resolve inheriting runtimes failed", "runtime", root.Name)
+	}
+	sources = append(sources, descendants...)
+
+	seen := sets.New[types.NamespacedName]()
+	var reqs []reconcile.Request
+	enqueue := func(namespace, name string) {
+		key := types.NamespacedName{Namespace: namespace, Name: name}
+		if seen.Has(key) {
+			return
+		}
+		seen.Insert(key)
+		reqs = append(reqs, reconcile.Request{NamespacedName: key})
 	}
 
-	var reqs []reconcile.Request
-	for i := range isvcs.Items {
-		isvc := &isvcs.Items[i]
-		if isvc.Spec.Runtime == nil || isvc.Spec.Runtime.Name != runtimeName {
+	for _, source := range sources {
+		// Narrow to ISVCs whose spec.runtime.name matches via the field index;
+		// the in-memory kind/namespace-scope filter below still applies.
+		var isvcs v1beta1.InferenceServiceList
+		if err := r.List(ctx, &isvcs, client.MatchingFields{isvcRuntimeNameIndexField: source.Name}); err != nil {
+			r.Log.Error(err, "fan-out runtime event: list InferenceServices failed", "runtime", source.Name)
 			continue
 		}
-		// Namespaced SR only matches same-namespace ISVCs; a cluster-scoped
-		// runtime (empty namespace) matches ISVCs in any namespace.
-		if runtimeNamespace != "" && isvc.Namespace != runtimeNamespace {
-			continue
+		for i := range isvcs.Items {
+			isvc := &isvcs.Items[i]
+			if isvc.Spec.Runtime == nil || isvc.Spec.Runtime.Name != source.Name {
+				continue
+			}
+			// Namespaced SR only matches same-namespace ISVCs; a cluster-scoped
+			// runtime (empty namespace) matches ISVCs in any namespace.
+			if source.Namespace != "" && isvc.Namespace != source.Namespace {
+				continue
+			}
+			enqueue(isvc.Namespace, isvc.Name)
 		}
-		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-			Namespace: isvc.Namespace, Name: isvc.Name,
-		}})
 	}
 
 	// Also wake auto-select ISVCs parked on RuntimeReady=False: the new or
@@ -1669,12 +1694,10 @@ func (r *InferenceServiceReconciler) isvcsReferencingRuntime(ctx context.Context
 	}
 	for i := range unresolved.Items {
 		isvc := &unresolved.Items[i]
-		if runtimeNamespace != "" && isvc.Namespace != runtimeNamespace {
+		if root.Namespace != "" && isvc.Namespace != root.Namespace {
 			continue
 		}
-		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-			Namespace: isvc.Namespace, Name: isvc.Name,
-		}})
+		enqueue(isvc.Namespace, isvc.Name)
 	}
 	return reqs
 }
