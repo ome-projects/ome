@@ -24,11 +24,12 @@
     - [Story 7: Coexistence with cluster-autoscaler](#story-7-coexistence-with-cluster-autoscaler)
   - [Risks and mitigations](#risks-and-mitigations)
 - [Design details](#design-details)
-  - [Policy #1: Defragmentation](#policy-1-defragmentation)
+  - [Policy #1: Capacity descheduling (defragmentation)](#policy-1-capacity-descheduling-defragmentation)
     - [Observation layer](#observation-layer)
     - [Fragmentation scoring](#fragmentation-scoring)
     - [Candidate selection](#candidate-selection)
     - [Placement-hint computation](#placement-hint-computation)
+    - [Matching-scheduler simulation](#matching-scheduler-simulation)
     - [Execution](#execution)
   - [Policy #2: Node-health evacuation](#policy-2-node-health-evacuation)
     - [Goal and context](#goal-and-context)
@@ -36,7 +37,6 @@
     - [Approach (how)](#approach-how)
     - [The narrow-contracts property (no new RBAC, no cloud credentials)](#the-narrow-contracts-property-no-new-rbac-no-cloud-credentials)
     - [Anticipated objection](#anticipated-objection)
-  - [Policy #3: Descheduling (future)](#policy-3-descheduling-future)
   - [The arbiter (arbitration-lite)](#the-arbiter-arbitration-lite)
     - [Why an arbiter at all](#why-an-arbiter-at-all)
     - [The four rules](#the-four-rules)
@@ -72,7 +72,7 @@
   - [Alternative 3: Alfred as a CRD-driven system](#alternative-3-alfred-as-a-crd-driven-system)
   - [Alternative 4: Don't build Alfred; manual operator intervention](#alternative-4-dont-build-alfred-manual-operator-intervention)
   - [Alternative 5: Extend cluster-autoscaler](#alternative-5-extend-cluster-autoscaler)
-  - [Alternative 6: Keep Alfred a single-purpose defragmenter; put node-health and descheduling in separate controllers](#alternative-6-keep-alfred-a-single-purpose-defragmenter-put-node-health-and-descheduling-in-separate-controllers)
+  - [Alternative 6: Put node-health in a separate controller](#alternative-6-put-node-health-in-a-separate-controller)
 - [Open questions](#open-questions)
 <!-- /toc -->
 
@@ -80,9 +80,26 @@
 
 **Tl;dr:** Alfred is designed as the GPU **Cluster Caretaker** — a cluster-level control loop that watches the *physical* GPU layer (nodes, accelerators, workload placement) and, when it drifts into a bad state, arbitrates a safe corrective action and actuates it through narrow write contracts. The current implementation stops after arbitration and reporting. Alfred does not schedule pods, scale replicas, or touch node lifecycle.
 
-The target caretaker is a single observe → arbitrate → actuate engine, not a grab-bag of one-off scripts. One shared, read-only **ClusterSnapshot** (the physical GPU state for a reconcile pass) is fed to a set of **Policies**; each Policy is a pure function `Evaluate(snapshot) → []Candidate`, where a *Candidate* is a proposed action plus its justification. An **Arbiter** selects and sequences across all Policies' candidates under global safety bounds (rate limits, cooldowns, concurrency caps), a **Dispatcher** actuates the winners through one narrow contract — the OEP-0007 migration-request annotation — and the controller that owns each workload executes the request. OMENative is the only implemented consumer of that contract today. `RawDeployment` and legacy LWS candidates remain advisory-only until their lifecycle owner implements and validates an equivalent consumer. A **Reporter** is the only component that emits observability output (K8s Events, decision metrics, the optional recommendations `ConfigMap`), so a Policy holds no client and writes nothing at all.
+The target caretaker is a single observe → arbitrate → actuate engine, not a
+grab-bag of one-off scripts. One shared, read-only **ClusterSnapshot** feeds two
+pure **Policies** (`Evaluate(snapshot) → []Candidate`). Cheap arithmetic bounds
+their output; an isolated matching-scheduler worker must then predict placement
+for every potentially executable Candidate. An **Arbiter** revalidates and
+selects under global safety bounds, and a **Dispatcher** actuates winners only
+through the OEP-0007 migration-request annotation. The workload owner performs
+the move; Alfred never binds or evicts Pods. OMENative is the only implemented
+consumer today. `RawDeployment` and legacy LWS remain advisory-only. A
+**Reporter** alone emits Events, decision metrics, and the optional
+recommendations `ConfigMap`.
 
-Three policies, staged: **Policy #1 — Defragmentation** is implemented as observation, scoring, arbitration, and reporting; execution is not yet wired. **Policy #2 — Node-Health Evacuation** is the next policy: on a bad node condition, evacuate eligible OME workloads off the node *and emit a remediation signal* — it does **not** cordon, drain, terminate, or reboot the node. **Policy #3 — Descheduling** (rebalance against drifted constraints) is future, and named here only to show the engine generalizes. Alfred introduces **no new CRDs**: configuration lives in a `ConfigMap`, per-workload gating in annotations, and output in Prometheus metrics, K8s Events, and an optional recommendations `ConfigMap`.
+Exactly two policies are in scope: **Policy #1 — Capacity Descheduling
+(Defragmentation)** is implemented as observation, scoring, arbitration, and
+reporting; execution is not yet wired. **Policy #2 — Node-Health Evacuation**
+is planned: on a bad node condition, evacuate eligible OME workloads off the
+node *and emit a remediation signal* — it does **not** cordon, drain, terminate,
+or reboot the node. Alfred introduces **no new CRDs**: configuration lives in a
+`ConfigMap`, per-workload gating in annotations, and output in Prometheus
+metrics, K8s Events, and an optional recommendations `ConfigMap`.
 
 ## Motivation
 
@@ -110,29 +127,45 @@ The answer is **not** "smarter eviction." The answer is to narrow the action sur
 
 ### Why one caretaker, not N controllers
 
-Tl;dr: defragmentation, node-health evacuation, and descheduling are *different policies over the same physical state*, and the hard parts they share — building a consistent snapshot, enforcing safety bounds, and actuating without corrupting workloads — should be written once, not three times.
+Tl;dr: capacity descheduling/defragmentation and node-health evacuation are
+*different policies over the same physical state*, and the hard parts they share
+— building a consistent snapshot, enforcing safety bounds, and actuating
+without corrupting workloads — should be written once, not twice.
 
-The reader's reasonable objection: "These are three unrelated jobs. Why not three small controllers?" Because the genuinely difficult, genuinely dangerous machinery is identical across all three:
+The reader's reasonable objection: "These are unrelated jobs. Why not two small
+controllers?" Because the genuinely difficult, genuinely dangerous machinery
+is identical across both:
 
-1. **One ClusterSnapshot.** Every policy reasons about the same physical GPU layer — node GPU inventory, per-pod GPU consumption, accelerator health, pending-pod pressure. Building that view *consistently* (so two policies don't act on disagreeing state in the same pass) is the same work whether the trigger is fragmentation or a `GpuUnhealthy` condition. Three controllers means three snapshots that can disagree, and three reconcile loops racing each other on the same pods.
+1. **One ClusterSnapshot.** Every policy reasons about the same physical GPU layer — node GPU inventory, per-pod GPU consumption, accelerator health, pending-pod pressure. Building that view *consistently* (so two policies don't act on disagreeing state in the same pass) is the same work whether the trigger is fragmentation or a `GpuUnhealthy` condition. Two controllers means two snapshots that can disagree, and two reconcile loops racing each other on the same pods.
 2. **One safety layer.** Rate limits, per-workload cooldowns, concurrency caps, and "reject high-uncertainty actions" (*primum non nocere*) are not policy-specific — they bound *actuation*, regardless of which policy proposed it. Centralizing them in the Arbiter means a defrag migration and a health evacuation can't both move the same workload, or together exceed the cluster's churn budget. N independent controllers cannot enforce a shared budget without inventing a coordination protocol between them — i.e., reinventing the Arbiter, badly.
 3. **One narrow actuation contract.** Both moving a fragmented workload and evacuating a workload off a bad node reduce to the *same* primitive: write the migration-request annotation and let the controller that owns the workload's lifecycle move it safely. The planned Dispatcher centralizes "how to request a move without breaking the workload." A second actuator would either duplicate that contract or, worse, take a wider, more dangerous surface.
 
 **Policy #1 (Defragmentation)** now implements the observation and recommendation part of the original vision. **Policy #2 (Node-Health Evacuation)** remains target design. On a bad node condition, Policy #2 will evacuate eligible OME workloads through the same narrow Dispatcher contract and emit a remediation signal (a Prometheus metric, plus K8s Events at detection and at drain completion) for whatever system actually owns hardware remediation. It explicitly does **not** cordon, drain, terminate, or reboot the node, and it does **not** call any cloud Compute API. That is the line between the archived design and this one: we keep "react to a `GpuUnhealthy` node," we drop "patch/repair the hardware." (Refined non-goal below.)
 
-Generalizing to a caretaker engine has a cost, and it is worth naming: a single process now carries three policies' blast radius, and a snapshot bug or a Dispatcher bug is a bug for *all* policies at once. The mitigation is the same property that makes the engine tractable — every policy actuates only through the narrow contract and only under the Arbiter's bounds — so a misbehaving policy is bounded to "proposes a bad Candidate," which the Arbiter can reject, not "directly does damage." This is a mitigation, not a full fix: a wrong *snapshot* fools the Arbiter too. TBD: the snapshot-consistency guarantees and how a policy declares a Candidate's confidence are Design Details, not settled here.
+Generalizing to a caretaker engine has a cost, and it is worth naming: a single
+process carries both policies' blast radius, and a snapshot bug or a Dispatcher
+bug is a bug for *both* policies at once. The mitigation is the same property
+that makes the engine tractable — every policy actuates only through the narrow
+contract and only under the Arbiter's bounds — so a misbehaving policy is
+bounded to "proposes a bad Candidate," which the Arbiter can reject, not
+"directly does damage." This is a mitigation, not a full fix: a wrong *snapshot*
+fools the Arbiter too.
 
 ### Goals
 
 1. **Run one observe → arbitrate → actuate engine** over the physical GPU layer: a shared read-only ClusterSnapshot, a set of Policies (`Evaluate(snapshot) → []Candidate`), an Arbiter that selects and sequences under global safety bounds, a Dispatcher that actuates through the existing narrow contracts, and a Reporter that is the sole emitter of observability output (Events, decision metrics, the optional recommendations ConfigMap). The engine is the deliverable; policies are pluggable on top of it.
-2. **Ship Policy #1 — Defragmentation.** Continuously observe GPU utilization, workload placement, and pending-pod pressure; compute a fragmentation metric; produce candidates identifying which workloads, if relocated, would reduce fragmentation most; and execute only those candidates for which a lifecycle owner exposes the migration-request contract.
+2. **Ship Policy #1 — Capacity Descheduling (Defragmentation).** Continuously observe GPU utilization, workload placement, and pending-pod pressure; compute a fragmentation metric; produce candidates identifying which workloads, if relocated, would reduce fragmentation most; and execute only those candidates for which a lifecycle owner exposes the migration-request contract.
 3. **Ship Policy #2 — Node-Health Evacuation.** On a bad node condition (consumed from existing signals — node conditions — not newly detected by Alfred), produce candidates that evacuate eligible OME workloads off the affected node through the narrow contract, **and** emit a remediation signal (metric + two Events: `NodeRepairNeeded` at detection, `NodeDrainedForRepair` at drain completion) for the system that owns remediation. Evacuate and signal; never cordon, drain, terminate, or reboot.
-4. **Reserve Policy #3 — Descheduling** as a future policy on the same engine (rebalancing workloads whose placement has drifted from current constraints). Named here only to validate that the engine generalizes; **no** behavior is promised in this OEP.
-5. **Actuate only through one narrow contract.** The migration-request annotation (the published OEP-0007 contract) is the single verb for every executable path. OMENative consumes it for OMENative Instances. A deployment mode without a consumer is advisory-only; adding a `RawDeployment` consumer is separate implementation work and must preserve the same validation, idempotency, and status contract. Alfred itself never evicts or deletes a pod. Never modify OME-owned reconciliation state by any other path.
+4. **Actuate only through one narrow contract.** The migration-request annotation (the published OEP-0007 contract) is the single verb for every executable path. OMENative consumes it for OMENative Instances. A deployment mode without a consumer is advisory-only; adding a `RawDeployment` consumer is separate implementation work and must preserve the same validation, idempotency, and status contract. Alfred itself never evicts or deletes a pod. Never modify OME-owned reconciliation state by any other path.
+5. **Require matching-scheduler simulation before execution.** Cheap GPU
+   arithmetic may shortlist a Candidate, but only an isolated worker that
+   reproduces the replacement Pods' effective scheduler may prove predicted
+   placement feasible. Missing, incompatible, stale, or unsupported simulation
+   fails closed.
 6. **Operate safely by default.** Conservative rate limits, per-workload cooldowns, concurrency caps, and explicit rejection of high-uncertainty actions, enforced centrally in the Arbiter across all policies. First principle: *primum non nocere.*
 7. **Introduce no new CRDs.** Configuration via `ConfigMap`; per-workload gating via annotations on `InferenceService`; output via Prometheus metrics, K8s Events, and an optional recommendations `ConfigMap`.
 8. **Be useful without OMENative** as an observer and recommender for `RawDeployment` workloads. Automatic Raw migration is not an Alpha dependency; it becomes executable only after the InferenceService controller implements the same migration-request consumer contract.
-9. **Scale to large clusters** (tested design target: 1000 nodes, 10k pods, 100+ InferenceServices).
+9. **Scale to large clusters** (tested design target: 1000 nodes, 10k pods, 100+ InferenceServices), using bounded per-cycle shortlists and top-K simulation rather than simulating every theoretical move.
 
 ### Non-Goals
 
@@ -150,9 +183,10 @@ Generalizing to a caretaker engine has a cost, and it is worth naming: a single 
 ## Proposal
 
 Tl;dr: Alfred is a GPU **Cluster Caretaker** — a leader-elected controller that
-runs one loop, observe → arbitrate → actuate, on top of a shared read-only
+runs one loop, observe → shortlist → simulate → arbitrate → actuate, on top of a shared read-only
 **ClusterSnapshot**. Independent **Policies** each propose work against that
-snapshot; a single **Arbiter** selects and sequences across them; a
+snapshot; a matching scheduler worker predicts placement; a single **Arbiter**
+revalidates, selects, and sequences across them; a
 **Dispatcher** actuates only through the narrow write contracts OEP-0008 already
 owns; a single **Reporter** emits every Event, decision metric, and
 recommendation. The caretaker never orchestrates pod lifecycle itself, so its blast radius
@@ -176,10 +210,11 @@ Alfred runs two loops:
   informers, compute fragmentation and health signals, update Prometheus gauges.
   This loop only reads and only emits metrics — it never actuates.
 - **Decision loop** (default 5m): hand the latest snapshot to every Policy,
-  collect their Candidates, run the Arbiter to pick and order a set of
-  Recommendations, publish every outcome through the Reporter (Events, decision
-  metrics, the optional recommendations ConfigMap), then let the Dispatcher
-  actuate the executable ones (subject to mode, cooldowns, and rate limits).
+  collect and cheaply bound their Candidates, simulate potentially executable
+  replacements with the matching scheduler, run the Arbiter to revalidate and
+  order Recommendations, publish every outcome through the Reporter, then let
+  the Dispatcher request the admitted migrations (subject to mode, disruption,
+  cooldown, and rate-limit gates).
 
 The split matters for a concrete failure mode: if the decision loop is wedged,
 the observation loop keeps the snapshot gauges flowing, so an operator still
@@ -226,18 +261,20 @@ Everything else is read-only.
 ### Implementation status and compatibility baseline
 
 This OEP is the target design, not a claim that every stage is implemented.
-At the 2026-08-31 baseline, the source tree has the following status:
+At the 2026-09-14 baseline, the source tree has the following status:
 
 | Area | Status | Current boundary |
 |------|--------|------------------|
 | Observation and configuration | Implemented | Every replica builds snapshots and publishes gauges; configuration hot-reloads with last-known-good fallback. |
-| Defragmentation Policy #1 | Partially implemented | Scoring, candidate generation, arbitration, and reporting run; placement feasibility is not yet scheduler-complete. |
+| Capacity-descheduling Policy #1 | Partially implemented | Fragmentation scoring, cheap candidate generation, arbitration, and reporting run; GPU arithmetic is not scheduler feasibility. |
 | Arbiter and Reporter | Partially implemented | Core admission gates and outputs exist; positive-benefit/regression admission and dispatch/outcome-fed ledger state are not connected. |
 | Node-Health Policy #2 | Not implemented | Node conditions only exclude unhealthy nodes as defrag targets and enqueue a coalesced early decision request. That request currently reads the latest cached snapshot without first refreshing it; no evacuation candidates or remediation signals are produced. |
+| Scheduler profile selection and simulation protocol | Initial gate implemented | New code selects a configured profile from the checked runner templates' effective `schedulerName`, defines a versioned request/result contract, validates whole-placement results, and always withholds execution because simulation is unavailable. It uses public API types and does not import controller or scheduler internals. This is preliminary routing only: no renderer/admission integration or simulation worker exists. Pre-existing Alfred snapshot imports of controller internals remain technical debt. |
+| Scheduler simulation worker | Not implemented | Neither worker integration nor a worker is shipped. Therefore every otherwise executable Candidate stops at the mandatory simulation gate with an unavailable/unsupported diagnostic; no profile in configuration can make execution ready by itself. |
 | Dispatcher | Not implemented | Alfred does not patch migration-request annotations. Current `mode: execute` reporting says "will dispatch" despite performing no write; that mode is unsupported and must fail closed to recommend-only until the Dispatcher and its guards land. |
-| OMENative state | Requires refresh | Current code collapses every non-Raw Component into synthetic Instance 0 and reads legacy ISVC migration history. Alfred must normalize `InferenceReplica.Status` for stable Instance identity, lifecycle state, and migrations, then join live Pods by Instance index and incarnation for physical placement and readiness. |
+| OMENative state | Implemented | Alfred normalizes checked `InferenceReplica.Status`, joins live Pods by Instance index and incarnation for physical placement/readiness, and reads `InferenceReplica.Status.Migrations`. |
 | OMENative executor readiness | Not implemented | CRD discovery and current status do not prove the controller is still running. Alpha execution requires a fresh OMENative capability Lease; until that signal exists and Alfred consumes it, OMENative candidates remain advisory. |
-| RawDeployment execution | Deferred | Current policy classifies Raw candidates as executable, but neither an Alfred Dispatcher nor a Raw request consumer exists. The revised design requires Raw candidates to be advisory-only until both are implemented and tested. |
+| RawDeployment and LWS execution | Deferred | Both are advisory-only. Neither has a validated migration-request consumer, so neither can reach execution. |
 
 The remaining sections describe the target architecture unless they explicitly
 say "current implementation." The compatibility baseline for new work is the
@@ -296,29 +333,35 @@ bearing safety property of the whole design.
 
 ### The engine: snapshot → policies → arbiter → dispatcher + reporter
 
-Tl;dr: One read-only snapshot feeds many independent policies; one arbiter is the
+Tl;dr: One read-only snapshot feeds two independent policies; one arbiter is the
 *only* component that reasons across policies; one dispatcher is the *only*
 component that actuates; one reporter is the *only* component that emits
 observability output. Policies never write at all.
 
-The engine is a five-component pipeline — the Dispatcher and the Reporter sit
-side by side at its end — and the separation between stages is the design, not
-an implementation detail:
+The engine is a staged pipeline; the Reporter consumes advisory findings and
+every later outcome alongside the actuation path. The separation between stages
+is the design, not an implementation detail:
 
 ```
-ClusterSnapshot ──▶ [ Policy₁ Defragmentation ]──┐
-   (read-only)      [ Policy₂ Node-Health Evac ]──┼──▶ Arbiter ──▶ Dispatcher ──▶ actuation
-                    [ Policy₃ Descheduling (fut)]──┘  (select+    (the only       contracts
-                                                  │    sequence)   actuator)    (migration request)
-                                                  │       │
-                        advisory candidates ──────┤       │ outcomes (admitted /
-                        (Executable=false)        │       │ withheld / rejected + reason)
-                                                  │◀──────┘
-                                                  ▼
-                                                 Reporter ──▶ observability contracts
-                                                 (the only      (Events, decision metrics,
-                                                  observability   recommendations ConfigMap)
-                                                  writer)
+ClusterSnapshot ──▶ [ Policy₁ Capacity Descheduling ]──┐
+   (read-only)      [ Policy₂ Node-Health Evacuation ]──┴──▶ cheap shortlist
+                                                               │
+                                                               ▼
+                                                   matching-scheduler simulation
+                                                     (isolated worker; mandatory)
+                                                               │
+                                                               ▼
+                                                            Arbiter
+                                                        (revalidate + select)
+                                                               │
+                                                               ▼
+                                                          Dispatcher ──▶ OME migration API
+                                                        (the only actuator)
+                                                               │
+                          advisory and terminal outcomes ───────┤
+                                                               ▼
+                                                            Reporter
+                                                    (the only observability writer)
 ```
 
 **The Policy interface.** Every policy implements exactly one method:
@@ -350,13 +393,12 @@ The contract is deliberately tiny, and the consequence is the point:
   literal — a policy holds no client of any kind — so the table-driven tests
   exercise exactly the code production runs.
 - Adding a policy is additive: register a new `Evaluate` implementation. The
-  Arbiter, Reporter, and Dispatcher are unchanged. **Descheduling (Policy #3)** is named
-  here precisely to show the seam — it is future work, not in this OEP's scope,
-  and it slots in as one more `Evaluate` with zero change to the actuation path.
+  mandatory simulation, Arbiter, Reporter, and Dispatcher contracts remain
+  unchanged.
 
-**The three policies.**
+**The two policies.**
 
-1. **Defragmentation (Policy #1).** Detects GPU fragmentation (free GPUs
+1. **Capacity Descheduling / Defragmentation (Policy #1).** Detects GPU fragmentation (free GPUs
    scattered across nodes so that a large contiguous request cannot schedule) and
    proposes consolidating migrations. This is the original OEP-0008 workload.
 2. **Node-Health Evacuation (Policy #2).** Detects a node that has gone
@@ -369,9 +411,6 @@ The contract is deliberately tiny, and the consequence is the point:
    reframing of the old `ome-operator` auto-repair: the evacuation reuses the
    exact same delegated migration path as defragmentation, so Policy #2
    needs **no new node-write RBAC and no cloud credentials.**
-3. **Descheduling (Policy #3, future).** Reserved seam for policy-driven eviction
-   of workloads that violate placement rules over time. Out of scope here; named
-   only to validate the interface.
 
 **The Arbiter** is the *only* cross-policy reasoner. Each policy is myopic by
 design — it sees the whole snapshot but only its own concern. The Arbiter takes
@@ -431,12 +470,13 @@ the entire surface read-only-plus-four-narrow-writes — the same surface OEP-00
 already justified for defragmentation alone.
 
 **One pass at a time.** A decision pass — snapshot build, policy evaluation,
-one Arbiter admission run, dispatch — is non-overlapping by construction: the
+bounded scheduler simulation, one Arbiter admission run, dispatch — is
+non-overlapping by construction: the
 loop is non-reentrant, so if a pass overruns `decisionLoopInterval`, the next
 tick is delayed until it completes, never started concurrently (cadence
 degrades under load; correctness does not). A coalesced early request adds one
 serialized pass without resetting the periodic timer. *Rationale:* every safety
-bound — the shared budget, the capacity check net of in-flight claims, the
+bound — the shared budget, matching-scheduler gate, and in-flight claims, the
 cooldown bookkeeping — assumes admissions are totally ordered. Two concurrent
 Arbiter passes are two admitting authorities racing one ledger: both read "2
 of 3 in flight," both admit, the cap is silently broken — the
@@ -505,8 +545,9 @@ Each term defined before use, with the consequence baked in.
   dispatch; the engine routes it directly to the Reporter, so it never enters
   arbitration and never consumes budget.
 - **Recommendation.** A Candidate that has survived the Arbiter — passed
-  opt-in/eligibility, cooldown, rate-limit, capacity, and regression checks — and
-  is ready to emit or dispatch. *Consequence:* a Recommendation is the only thing
+  matching-scheduler simulation plus the separate opt-in/eligibility, cooldown,
+  rate-limit, disruption, freshness, and regression checks — and is ready to
+  emit or dispatch. *Consequence:* a Recommendation is the only thing
   the Dispatcher will act on; an un-arbitrated Candidate never reaches an
   actuation write — the only surface an advisory Candidate can reach is the
   Reporter's observability output.
@@ -643,8 +684,9 @@ where true.
 
 **Risk: a policy proposes a counterproductive move (scorer bug).** A
 Defragmentation Candidate that, if executed, would *increase* fragmentation.
-*Mitigation:* the Arbiter runs a regression check — the post-move
-snapshot and reject any Recommendation that worsens the Fragmentation Score.
+*Mitigation:* the Arbiter runs a regression check against the predicted
+post-move snapshot and rejects any Recommendation that worsens the
+Fragmentation Score.
 Because policies are pure functions of the snapshot, the same scorer is exercised
 in table-driven unit tests over adversarial synthetic snapshots before it ever
 ships. `recommend-only` is the default for early deployments, so a bad scorer
@@ -705,6 +747,8 @@ their replacement footprint free on a healthy node *before* the source frees.
 On a fragmented cluster that footprint may exist only in scatter — 12 free
 GPUs as 2+3+2+3+2 cannot surge an 8-GPU Instance — so the candidate downgrades
 to advisory with `NoSurgeHeadroom`, correctly but unhelpfully: the
+cheap bound has proved it cannot fit, before any worker call. Passing that bound
+would still require matching-scheduler simulation; it would not prove fit. The
 consolidation that would create the slot is defrag's job, and nothing steers
 defrag toward that specific hole. The emergency boost keys on Pending pods,
 and the stranded Instance is not Pending — it is running-degraded on failing
@@ -728,7 +772,9 @@ state reconstructs from InferenceReplica status and the workload audit ledger.
 **Risk: broken GPU discovered only after migration.** Alfred migrates onto Node5,
 which has a broken NVLink; NCCL fails.
 *Mitigation:* the snapshot carries node health (including `GpuUnhealthy`), so
-unhealthy nodes are excluded from placement hints during Candidate generation.
+unhealthy nodes are removed from the cheap hint set and included in the
+simulation request's explicit exclusions. A worker result placing a replacement
+on one is rejected; hints alone are never the safety boundary.
 This is also exactly why **Node-Health Evacuation is a first-class policy** rather
 than an afterthought — the same health signal that excludes a node as a *target*
 also makes it a *source* to evacuate. Post-migration, if a migrated workload fails
@@ -770,14 +816,15 @@ offline.
 **Risk: snapshot staleness produces a bad decision.** The snapshot is a point-in-
 time view; the cluster can change between snapshot and dispatch.
 *Mitigation:* the snapshot is rebuilt every observation-loop period (default
-30s), bounding staleness to the loop frequency, and the Dispatcher does a
-pre-flight re-check against the latest snapshot before each actuation. Mitigation,
-not full fix: a change inside the pre-flight window is still possible — caught
-downstream by OMENative's own lock and by the bounded blast radius of the narrow
-posture.
+30s), scheduler results carry a snapshot identity and freshness bound, relevant
+cache changes invalidate them, and the Arbiter revalidates immediately before
+dispatch. This is mitigation, not a guarantee: the snapshot omits transient
+in-memory scheduler reservations and the cluster may change inside the
+pre-flight window. OMENative's own lock and the narrow migration-request surface
+bound the remaining race.
 
-**Risk: a third-party or future policy misbehaves.** Policy #3 (Descheduling), or
-any later addition, has a bug.
+**Risk: a policy misbehaves.** Either current Policy, or a later addition, has a
+bug.
 *Mitigation:* the Policy interface gives a policy **no** write path — the worst it
 can do is return bad Candidates, which the Arbiter filters and which, even if
 dispatched, hit only the bounded narrow-write surface. The structural guarantee
@@ -787,7 +834,7 @@ of the engine is that *blast radius is independent of how many policies exist.*
 
 The engine — shared `ClusterSnapshot` → `Policies` → `Arbiter` → `Dispatcher` + `Reporter` — is fixed; what varies is the set of policies plugged into it. This section specifies each policy as a self-contained implementation of the `Policy` interface, then the cross-cutting concerns (safety, RBAC, tests) that the engine enforces around all of them.
 
-### Policy #1: Defragmentation
+### Policy #1: Capacity descheduling (defragmentation)
 
 Tl;dr: Policy #1 implements `Evaluate(snapshot) → []Candidate`. It reads the
 shared `ClusterSnapshot`, scores fixable GPU fragmentation plus eligible pending
@@ -939,13 +986,15 @@ The following properties of the read surface are load-bearing for later sections
   dispatch; an absent, stale, or incompatible Lease makes every Candidate
   advisory. This Lease is a target Alpha dependency and is not implemented in
   the current baseline.
-- **Placement feasibility fails closed.** GPU room, model locality, and storage
-  topology are necessary but not sufficient. Before a Candidate becomes
-  executable, Alfred evaluates the complete OMENative runner template: scalar
-  resources, node selectors, required affinity, taints and tolerations, PVC/PV
-  topology, evaluable required pod affinity/anti-affinity, and the atomic
-  multi-pod footprint. A required constraint Alfred cannot evaluate downgrades
-  the Candidate to advisory rather than producing a speculative target.
+- **Placement feasibility fails closed.** GPU room, model locality, storage
+  topology, and Alfred's target hints are only cheap shortlist inputs. Before a
+  Candidate becomes executable, a matching scheduler worker must simulate the
+  complete replacement Pods against the relevant cluster objects. It must
+  reproduce the configured scheduler version, profile, enabled plugins, plugin
+  arguments, and feature gates. For an OME gang, that includes the complete
+  scheduling cycle through OME reservation and `Permit`; default-scheduler
+  filtering alone is not a gang-admission proof. Missing or unsupported inputs
+  make the Candidate non-executable.
 - **`ModelAvailability` is storage-aware, because PVC-backed models have no per-node readiness.** Per-node models (model-agent downloads) report readiness through `Status.NodesReady` and the `models.ome.io/...=Ready` node label — and the ISVC controller stamps that label as a hard `nodeSelector` on the pods, so the scheduler enforces it independently of Alfred. PVC-backed models intentionally never populate `NodesReady` (there is no per-node copy to report, and the ISVC controller likewise skips the readiness selector for them). *Failure mode if we got this wrong:* filtering PVC-backed workloads' targets by `NodesReady` would yield zero feasible targets and silently mark every PVC-backed workload `NoFeasibleTarget` forever. So the snapshot records the storage backend and, for PVC, the access modes and CSI topology — and the target filter switches on it (mechanism in Placement-hint computation).
 
 #### Fragmentation scoring
@@ -982,9 +1031,9 @@ OMENative, `Movable=true`, a checked InferenceReplica-plus-Pod view, a fresh
 compatible executor Lease, steady lifecycle state, and a supported placement
 proof. Hold everything else fixed in
 place: non-OME occupants, `Movable=false` workloads, RawDeployment, and
-LWS-backed Instances. FFD is the same heuristic family candidate simulation
-already uses, and global optimality is explicitly not promised (see Non-Goals:
-not an optimization engine). Recompute Steps 1–2 on the repacked free
+LWS-backed Instances. FFD is a cheap upper-bound/shortlist heuristic, not
+scheduler simulation, and global optimality is explicitly not promised (see
+Non-Goals: not an optimization engine). Recompute Steps 1–2 on the repacked free
 distribution:
 
 ```text
@@ -1018,12 +1067,14 @@ Noisy-OR across the two terms: fixable shape damage or a starving fixable pod ea
 
 When the score is above threshold, the policy turns the snapshot into a ranked `[]Candidate`. The steps below run on each evaluation tick:
 
-1. **Enumerate.** For every movable workload (`Movable=true`), enumerate each
+1. **Enumerate and bound.** For every movable workload (`Movable=true`), enumerate each
    Component Instance as one prospective Candidate and carry its migration,
    placement, and termination state forward. The Arbiter applies the shared
    busy/cooldown/terminating gates to every policy's Candidates; see
    [Safety bounds](#safety-bounds). Keeping these Candidates visible lets the
-   Reporter explain a skip instead of turning it into silence.
+   Reporter explain a skip instead of turning it into silence. Cheap GPU
+   arithmetic, model/storage reachability, and FFD reduce this set to a bounded
+   top-K shortlist per cycle. They are necessary bounds, never placement proof.
 2. **Classify by deployment mode** — this sets the `Executable` flag, it does not drop the candidate:
    - **OMENative**: potentially executable via the OMENative migration verb,
      subject to the checked InferenceReplica-plus-Pod view, a fresh compatible
@@ -1033,9 +1084,14 @@ When the score is above threshold, the policy turns the snapshot into a ranked `
      see the opportunity.
    - **LWS-backed multi-pod**: `Executable=false`, but *still emitted* as a Candidate so the recommendation surfaces to operators. *Why include something we won't execute:* LWS's `RecreateGroupOnPodRestart` tears down the whole group on eviction with no surge protection — migrating it automatically is unsafe — but an operator still needs to see that this workload is a defrag opportunity and that the safe fix is to move it to OMENative.
    - **Knative**: not managed by Alfred; not enumerated.
-3. **Simulate.** For each candidate, predict the post-migration cluster state and recompute `F_observed` on that hypothetical snapshot; this gives `F_observed_after`. (Per-candidate benefit deliberately uses the *observed* score, never the reclaimable one — `F_best` stays out of per-candidate math, so the repack heuristic cannot jitter rankings.) An executable OMENative migration is **place-then-free**: every replacement member must fit on valid targets while the source still holds its GPUs, and only then does simulation free the source and re-score. A candidate with no surge-feasible placement is downgraded to advisory with reason `NoSurgeHeadroom`. RawDeployment and LWS simulations may estimate operator-visible benefit, but they never create capacity claims or executable Recommendations.
-
-   Getting this order wrong is a real failure mode: free-then-place simulation of a surge move overestimates feasibility exactly when defragmentation matters most — on a highly utilized cluster.
+3. **Estimate shortlist benefit.** Use cheap place-then-free GPU arithmetic to
+   predict a hypothetical post-migration distribution and recompute
+   `F_observed_after`. Keep every source footprint occupied until the complete
+   replacement footprint passes the arithmetic bound. Per-candidate benefit
+   deliberately uses the *observed* score, never the reclaimable one, so the
+   FFD repack heuristic cannot jitter rankings. This is ranking input, not a
+   scheduler-feasibility result. RawDeployment and LWS estimates remain
+   advisory and never create executable Recommendations.
 4. **Score** each candidate with a benefit-minus-cost rule:
 
    ```
@@ -1046,7 +1102,7 @@ When the score is above threshold, the policy turns the snapshot into a ranked `
 
    Alpha has one executable mechanism: **OMENative surge**, for either a
    single-pod or multi-pod Instance. It needs the complete replacement footprint
-   as headroom while the source still runs; step 3 enforces that as feasibility,
+   as headroom while the source still runs; step 3 applies only a cheap bound,
    while the cost term prices the affected serving footprint. RawDeployment and
    LWS are not cost-scored for admission — they are advisory
    (`Executable=false`) and route straight to the Reporter, outside arbitration
@@ -1057,31 +1113,120 @@ When the score is above threshold, the policy turns the snapshot into a ranked `
 5. **Boost emergencies.** If a candidate's migration would unblock a pod — real, or a virtual pending from a blocked evacuation (see the risks section) — that has been Pending longer than `emergencyPendingAgeMinutes`, multiply its `FinalScore` by a boost factor. This is what lets Story 2 — a Llama4 stuck Pending despite 70 free GPUs — jump the queue ahead of routine consolidation. (Complementary to the scoring gate's pending-pressure term `P`: `P` decides whether the policy wakes at all; the boost decides what the woken policy does first.)
 6. **Rank** by `FinalScore` descending, breaking ties toward the smaller surge footprint — smaller moves fit more often, disrupt less, and each completion frees GPUs that make larger moves feasible later. High-utilization defragmentation is designed to converge across decision cycles, smallest-first, not in one pass.
 7. **Apply policy-local eligibility** before returning: deployment support,
-   steady lifecycle state, model/storage reachability, and placement certainty.
-   Shared cooldown, maintenance-window, tenant-boundary, and rate-limit gates
-   remain in the Arbiter so they are enforced once across policies and their
-   rejection reasons reach the Reporter.
-8. **Return** the surviving ranked slice as `[]Candidate`. That return value is the policy's entire output — Policy #1 itself emits no Event, no metric, and no ConfigMap entry (it holds no client; see the engine's purity contract). The engine then routes the slice: executable Candidates enter the Arbiter; advisory ones (`Executable=false`) go straight to the Reporter. The Reporter emits a `FragmentationRecommendationProduced` K8s Event on each target InferenceService, increments `alfred_recommendations_produced_total`, and (if enabled) writes the `alfred-recommendations` ConfigMap entry — for every Candidate outcome it sees: produced, admitted, withheld, or rejected, each with its reason. Whether a returned Candidate is acted on remains the Arbiter's call, and dispatch the Dispatcher's.
+   steady lifecycle state, and obvious model/storage bounds. Shared disruption,
+   cooldown, maintenance-window, tenant-boundary, and rate-limit gates remain in
+   the Arbiter so they are enforced once across policies and their rejection
+   reasons reach the Reporter.
+8. **Return** the surviving ranked slice as `[]Candidate`. That return value is
+   the policy's entire output — Policy #1 itself emits no Event, metric, ConfigMap
+   entry, or worker call. The engine routes every potentially executable
+   Candidate through mandatory matching-scheduler simulation before the Arbiter;
+   advisory Candidates (`Executable=false`) go straight to the Reporter. The
+   Reporter emits a `FragmentationRecommendationProduced` Event, decision
+   metrics, and the optional recommendations record for each outcome. Whether a
+   simulated Candidate is acted on remains the Arbiter's call, and dispatch the
+   Dispatcher's.
 
 #### Placement-hint computation
 
 Each Candidate carries `HintTargetNodes`: a ranked, *advisory* list of nodes the migration should prefer. Advisory is the key word — Alfred computes a good target, but the K8s scheduler makes the final placement, and Alfred re-evaluates from the observed outcome rather than insisting. Computing a hint:
 
-1. **Enumerate** nodes that can physically accommodate the Instance's footprint (GPU count and hardware pool).
+1. **Enumerate** nodes that pass cheap physical bounds for the Instance's footprint (GPU count and hardware pool).
 2. **Filter** out nodes that would make the migration pointless or unsafe:
-   - **Required scheduling constraints fail closed** — evaluate CPU, memory and
-     scalar requests; node selectors; required node affinity; taints and
-     tolerations; PVC/PV topology; evaluable required pod affinity and
-     anti-affinity; and the complete multi-pod/gang footprint from the
-     InferenceReplica runner templates. If a required constraint cannot be
-     evaluated soundly, the Candidate becomes advisory instead of receiving a
-     speculative target hint.
+   - **Obvious required constraints fail closed** — cheap filtering may remove
+     nodes that plainly violate resources, selectors, taints/tolerations, or
+     storage reachability. This is an optimization only. The matching scheduler
+     worker is authoritative for predicted feasibility and must evaluate the
+     fully rendered/admitted Pods through its complete configured scheduling
+     cycle.
    - **Model not available** — storage-aware, switching on `ModelAvailability.Backend`. *Per-node models*: the target must have the model ready, per `BaseModel.Status.NodesReady` or the node label `models.ome.io/{ns}.basemodel.{name}=Ready` (OEP-0007 Q-017) — migrating to a node that must first pull a multi-hundred-GB model defeats the purpose, and the pod's own readiness `nodeSelector` would block the placement anyway. *PVC-backed models*: `NodesReady` is intentionally empty and must **not** be used as a filter; the target set is the nodes that can mount the volume — for RWX/ROX storage, any node satisfying the PVC's CSI topology, with no model pull ever needed. *RWO (and RWOP) PVCs pin the workload*: the volume attaches to one node at a time and the source pod still holds it while a surge replacement starts, so no surge-shaped mechanism can run — the candidate is downgraded to advisory with reason `VolumePinned`.
    - **Unhealthy or cordoned**: excluded. Excluding unhealthy nodes from placement is existing defragmentation behavior — and it is the seam Policy #2 builds on: a node Policy #1 already refuses as a *target* is exactly the kind of node Policy #2 will reason about as a *source* to drain. Nodes inside their post-evacuation **suspicion window** are excluded too, even after the condition clears (see Policy #2's "stay suspicious" rule). (Mechanism for Policy #2 in its own section.)
    - **CA scale-down in progress**: a node with `scale-down-disabled` being processed is excluded, so Alfred and the cluster-autoscaler do not fight over it.
    - **Spot / preemptible**: excluded from targets by default (see the spot/preemptible section) — moving a workload onto a node that can vanish is a poor trade.
 3. **Rank** by a bin-packing heuristic whose direction depends on the goal: prefer partially-filled nodes when the goal is to consolidate, or prefer empty nodes when the goal is to free contiguous capacity elsewhere.
-4. **Return** the top N (default `3`).
+4. **Return** the top N (default `3`) as soft hints and as a bounded simulation
+   shortlist. The scheduler may choose another eligible node; Alfred never
+   treats a hint as binding.
+
+#### Matching-scheduler simulation
+
+The executable pipeline is mandatory and ordered:
+
+```text
+cheap bounded shortlist
+  -> matching-scheduler simulation
+  -> Arbiter revalidation and disruption gates
+  -> OEP-0007 migration request
+  -> terminal outcome observed from the workload owner
+```
+
+There is no shortcut from GPU fit to dispatch. Placement prediction and
+disruption authorization answer different questions, and both must pass.
+Alfred never calls the eviction API; actual movement remains in the OMENative
+workload package behind the public migration-request contract.
+
+**Scheduler routing.** The effective `schedulerName` of every replacement Pod
+selects `scheduling.profiles[<schedulerName>]`; an omitted name means
+`default-scheduler`. A default-scheduler Pod requires an explicit
+`default-scheduler` profile, an OME-scheduled Pod requires the matching OME
+profile, and any custom name requires its own mapping. Alfred never silently
+falls back from one scheduler to another. A multi-pod replacement whose members
+select different schedulers is unsupported.
+
+Initial routing may inspect the checked current public InferenceReplica runner
+templates. That is sufficient only to choose a prospective profile: later
+rendering and admission add instance labels, gang identity, topology, source
+exclusions, migration hints, and defaults. The real worker request must contain
+the actual fully rendered and admitted replacement Pods. Alfred repeats profile
+routing after that step and rejects the Candidate if the effective scheduler or
+profile changed.
+
+**Immutable profile identity.** A configured profile contains the opaque worker
+identity `backend`, the exact `schedulerVersion`, an immutable
+`configurationID` covering the scheduler configuration, plugins, plugin
+arguments, and feature gates, and `gangScheduling`. A result is accepted only
+if it echoes that complete identity. Matching Kubernetes versions while using
+different profiles or plugin arguments is not equivalent. For OME gangs,
+`gangScheduling: true` also asserts that the worker runs the complete OME
+scheduling sequence—queue/pre-filter, filter, scoring, Reserve and `Permit`,
+then pre-bind validation—using isolated reservation state. It records predicted
+placements but never invokes the production Bind action. A plain
+default-scheduler filter pass is insufficient.
+
+**Isolation and protocol.** The worker runs out of process with scheduler state
+created solely for the request. It receives a versioned request containing a
+request ID, snapshot ID/time, immutable profile identity, actual replacement
+Pods, immutable source-Pod identities, explicit source-node exclusions, the
+gang requirement, and all relevant snapshot objects (including Nodes, other
+Pods, storage and scheduling objects). It performs no production bind, evict,
+delete, patch, or reservation write. Its result is only `Feasible`,
+`Infeasible`, or `Unsupported`, a reason, and—when feasible—exactly one known,
+non-excluded node placement for every replacement Pod. Alfred rejects a stale,
+partial, foreign, or identity-mismatched result.
+
+Simulation must preserve source occupancy for the whole attempt. It also models
+the matching scheduler's current scheduling state as far as the request
+provides it, including OME gang Reserve/Permit behavior. The snapshot does not
+contain the scheduler's transient in-memory reservations, so even a valid
+feasible result is a prediction rather than a capacity guarantee. Alfred bounds
+that uncertainty with freshness limits, cache invalidation on relevant object or
+profile changes, and Arbiter revalidation immediately before dispatch. The live
+scheduler and other actors can still consume capacity after simulation.
+
+**Current gate.** The first scheduler-safety change implements public profile
+selection, the request/result protocol and validation, and a mandatory gate that
+returns structured `scheduling` diagnostics. Diagnostics record
+`schedulerName`, `backend`, `schedulerVersion`, `configurationID`, `status`, and
+`reason`; status is `Unavailable` or `Unsupported` at the current gate. Current
+reasons include `ProfileNotConfigured`, `NoTemplates`, `TemplateBound`,
+`ProfileInvalid`, `GangUnsupported`, `MixedSchedulers`, `SimulationUnavailable`, and
+`OMENativeObservationInvalid`. The original advisory reason remains alongside
+these diagnostics. There is no renderer/admission integration, worker registry,
+worker, or Dispatcher in this change. Consequently every Candidate remains
+non-executable in practice, and every concrete OMENative Candidate is withheld
+at this gate; adding a profile to configuration cannot activate execution.
+The new package depends on public contracts rather than controller/scheduler
+internals, but pre-existing Alfred snapshot imports remain separate debt.
 
 #### Execution
 
@@ -1224,8 +1369,9 @@ contracts:
 
 a) **Evacuate.** Produce evacuation Candidates for every OME workload occupying
    N, scored and dispatched through the same Candidate pipeline Policy #1
-   uses (eligibility check, simulation against the *healthy* remainder of the
-   cluster, capacity check, dispatch via the migration-request annotation).
+   uses (cheap shortlist, matching-scheduler simulation against the *healthy*
+   remainder while preserving source occupancy, Arbiter revalidation and
+   disruption gates, then the migration-request annotation).
    Ineligible Instances and deployment modes without a consumer remain visible
    as advisory Candidates; they are never silently dropped or speculatively
    dispatched. Source enumeration starts from the OME occupants physically on
@@ -1310,26 +1456,6 @@ blockers visible. Policy #2 reduces exposure where a validated migration path
 exists. It does not guarantee that every workload is safe or that the hardware
 gets fixed; those residual actions belong to the operator and node owner.
 
-### Policy #3: Descheduling (future)
-
-Tl;dr: a reserved interface slot, not a design. Listed now only so the Policy
-abstraction is shaped to hold more than two triggers.
-
-*Policy #3* is generic descheduling: "this placement now violates a constraint it
-satisfied when the pod was scheduled" — anti-affinity drift (two pods that should
-be spread ended up co-located after unrelated churn), priority inversion (a
-low-priority workload squatting on capacity a high-priority one now needs), or a
-topology constraint that newer labels invalidated. The trigger is a *constraint
-violation discovered after scheduling*, distinct from fragmentation (Policy #1)
-and node health (Policy #2). The actuation depth would again be evacuate-style
-relocation through the same Candidate pipeline — but the *detection* (which
-constraints to evaluate, how to score a violation's severity, how to avoid
-fighting the scheduler that placed the pod) is not designed here. Policy #3 is
-**Phase 2** and is named only to confirm that the Policy interface — trigger →
-Candidates → Arbiter → dispatch — generalizes cleanly past defrag, so we don't
-have to reshape it later. Anything beyond this paragraph about Policy #3 is out
-of scope for this OEP.
-
 ### The arbiter (arbitration-lite)
 
 Tl;dr: with more than one policy producing Candidates, something has to decide
@@ -1383,7 +1509,7 @@ b) **Mutual exclusion — at most one in-flight action per workload, and per
 c) **Global safety bounds — the existing cooldown, rate-limit, and capacity-check
    apply across all policies, not per policy.** The cluster-wide caps
    (`maxInFlightMigrations`, `maxMigrationsPerHour`), the per-workload and
-   per-node cooldowns, and the pre-flight capacity check are evaluated on the
+   per-node cooldowns, and placement/disruption revalidation are evaluated on the
    *combined* stream of surviving Candidates after priority and exclusion — never
    reset or duplicated per policy. *Rationale:* if each policy got its own budget,
    adding Policy #2 would silently double the migration rate the cluster
@@ -1491,6 +1617,21 @@ config.yaml: |
   observationLoopInterval: 30s
   earlyTickOn: [NodeConditionChange]  # adds a serialized early pass; periodic cadence is unchanged ([] disables)
 
+  # Illustrative only: current Alfred has no worker integration, so profiles
+  # cannot enable execution. Shipped defaults use `profiles: {}`.
+  scheduling:
+    profiles:                       # keyed by effective replacement schedulerName
+      default-scheduler:
+        backend: kube-v135          # opaque identity of the matching worker
+        schedulerVersion: v1.35.4
+        configurationID: sha256:<immutable-default-profile-digest>
+        gangScheduling: false
+      ome-scheduler:
+        backend: ome-v135
+        schedulerVersion: v1.35.4
+        configurationID: sha256:<immutable-ome-profile-digest>
+        gangScheduling: true
+
   # Per-policy enable + tuning
   policies:
     defragmentation:
@@ -1542,10 +1683,19 @@ unchanged and documented in their own sections below; they are deliberately
 *not* nested under `policies` because they are applied once, by the Arbiter,
 across every Policy's output.
 
+`scheduling.profiles` is keyed by `schedulerName`, not by workload type. Each
+entry is an exact compatibility assertion: `backend` is an opaque worker
+identity, `schedulerVersion` pins the scheduler build, `configurationID`
+immutably identifies its profile/plugins/arguments/feature gates, and
+`gangScheduling` declares whether the worker implements complete atomic gang
+admission. Configuration never supplies fallback semantics. Empty profiles are
+valid and are the shipped default; because worker integration is not yet
+implemented, even the illustrative entries above cannot activate execution.
+
 **Aggressiveness is a scoring knob, not a kill switch.** `conservative` raises
 the benefit/cost threshold a candidate must clear before the Arbiter will admit
 it; `aggressive` lowers it. It does not bypass cooldowns, rate limits, or the
-capacity check — those are global and non-negotiable (see
+  matching-scheduler and disruption gates — those are global and non-negotiable (see
 [Safety bounds](#safety-bounds)). Naming the failure mode: if aggressiveness
 *could* relax safety bounds, an operator chasing utilization would set
 `aggressive` and silently disable the very gates that keep the caretaker from
@@ -1675,15 +1825,17 @@ The gates, applied by the Arbiter to the merged candidate stream:
   pod carrying a `DeletionTimestamp`; past
   `max(2 × terminationGracePeriodSeconds, 5m)` of deletion age the Reporter
   emits a `StuckTerminating` advisory instead. Action never; silence never.
-- **Capacity check**: before admitting a candidate, the Arbiter re-checks the
-  `ClusterSnapshot` for a feasible target with enough contiguous free GPUs and a
-  ready model copy. Every executable Alpha path is OMENative surge and therefore
-  **place-then-free**: the complete replacement must fit while the source still
-  holds its GPUs. The check is **net of in-flight claims**: GPUs that a
-  still-running migration's replacement will occupy count as allocated, so two
-  admitted candidates can never both "fit" into the same free block. A candidate
-  scored against a stale snapshot whose target has since filled is rejected
-  here, not dispatched into a guaranteed stall.
+- **Placement revalidation**: before admitting a candidate, the Arbiter requires
+  a fresh, whole-set feasible result from the matching scheduler worker and
+  verifies its request, snapshot, and immutable profile identities. Every
+  executable path is OMENative surge and therefore **place-then-free**: the
+  complete replacement is simulated while every source Pod remains occupied.
+  Alfred's durable in-flight claims are included, but the snapshot cannot see
+  all live scheduler reservations; simulation is a prediction, not a capacity
+  reservation. Relevant Pod, Node, storage, scheduling-object, profile, or
+  candidate changes invalidate the result. The Arbiter reruns cheap bounds and
+  separate disruption gates immediately before dispatch and rejects stale or
+  incompatible input rather than treating a hint or old result as authority.
 - **Circuit breaker**: if the recent-10-actions failure rate exceeds 50%, the
   Arbiter pauses *all* execution for 60 minutes and emits a critical event.
   Failure mode: a systematically bad target (a node that looks free but rejects
@@ -2269,9 +2421,9 @@ data:
 ## Test plan
 
 Tl;dr: the old suite covered one policy (Defrag) end-to-end; the engine
-refactor adds three things that can break independently — the **Arbiter**
+refactor adds four things that can break independently — the **Arbiter**
 (cross-policy conflict resolution), **Node-Health Evacuation** (a second
-policy that actuates), and the **OEP-0013 read-only seam** (Alfred must not
+policy that actuates), **matching-scheduler simulation**, and the **OEP-0013 read-only seam** (Alfred must not
 fight Component-Scoped Autoscaling). Each gets its own coverage below, on top
 of the existing Defrag tests, which are preserved verbatim because Defrag is
 now Policy #1, not a special case.
@@ -2280,7 +2432,7 @@ Terminology used throughout this section:
 
 - **Policy** : a pluggable unit implementing the `Policy` interface
   (`Evaluate(snapshot) -> []Candidate`). Defrag is Policy #1, Node-Health
-  Evacuation is Policy #2, Descheduling is Policy #3.
+  Evacuation is Policy #2.
 - **Candidate** : a policy's request to act on a (workload, target) — the
   rename of the old single-policy "Recommendation", generalized so the
   Arbiter can compare candidates from different policies.
@@ -2301,7 +2453,7 @@ new packages carry their own thresholds):
 - `engine/reporter`: ≥ 85% — new; every candidate outcome must surface exactly once, and only through this stage.
 - `policy/defrag`: ≥ 90% — the old `scorer`/`recommender` logic, ported behind the `Policy` interface.
 - `policy/nodehealth`: ≥ 90% — new.
-- `policy/descheduling`: ≥ 90% — new, lands in Phase 2.
+- `scheduling`: ≥ 90% — profile selection, protocol validation, and worker gate.
 - `observer`: ≥ 90%
 - `executor`: ≥ 85%
 - `metrics`: ≥ 80%
@@ -2316,7 +2468,7 @@ New unit coverage for the engine refactor:
 
 1. **Arbiter priority ordering.** Two policies propose actions on disjoint
    workloads; verify the Arbiter emits both, ordered by the configured policy
-   priority (Node-Health > Defrag > Descheduling). *Failure mode if absent:* a
+   priority (Node-Health > Defrag). *Failure mode if absent:* a
    low-priority cosmetic defrag could be scheduled ahead of an urgent
    node-health evacuation, delaying evacuation off a failing GPU.
 2. **Arbiter mutual exclusion on a workload.** Defrag and Node-Health both
@@ -2351,15 +2503,13 @@ New unit coverage for the engine refactor:
    emits its Event and metric. *Failure mode if absent:* benefit-cost admission
    silently drops the advisory before an operator ever sees it, or an inert
    recommendation debits the migration budget real actions need.
-8. **Surge feasibility is place-then-free.** Given a snapshot where the target
-   fits the Instance only if the source is freed first, verify a surge-shaped
-   OMENative candidate is downgraded
-   to advisory with `NoSurgeHeadroom` and never dispatched; given genuine
-   headroom, verify it is executable. Verify Raw and LWS candidates remain
-   advisory regardless of apparent headroom, and that in-flight OMENative surge
-   claims are subtracted from available capacity. *Failure mode if absent:* Alfred
-   dispatches migrations that stall in `SurgePending` on exactly the clusters
-   that most need defragmentation.
+8. **Surge simulation is place-then-free.** Given a request where replacements
+   fit only after their sources are removed, verify the matching worker reports
+   infeasible and Alfred never dispatches. Given genuine headroom, verify every
+   replacement receives one known, non-source node placement. Raw and LWS stay
+   advisory regardless, and durable in-flight claims remain occupied. *Failure
+   mode if absent:* Alfred dispatches migrations that stall in `SurgePending` on
+   exactly the clusters that most need defragmentation.
 9. **Health cooldown floor.** A workload defrag-moved at T+0 receives a
    health-evacuation candidate: verify rejection at T+4 (inside the floor),
    admission at T+6 with `CooldownOverriddenForEvacuation` emitted — and that
@@ -2391,6 +2541,23 @@ New unit coverage for the engine refactor:
     InferenceReplica status, verify an absent, stale, or wire-incompatible
     OMENative capability Lease still produces advisory Candidates only; a fresh
     compatible Lease enables otherwise eligible Candidates.
+14. **Scheduler selection and mandatory-worker gate.** Verify omitted
+    `schedulerName` selects only an explicitly configured `default-scheduler`
+    profile; `ome-scheduler` and custom names select only their exact mappings;
+    mixed names, missing templates, invalid profile identities, and a gang on a
+    non-gang profile fail closed. With no worker registered, verify the preserved
+    advisory reason plus structured `SimulationUnavailable` diagnostics and no
+    dispatch path.
+15. **Protocol result validation and no live writes.** Reject mismatched request,
+    snapshot, or profile identities; partial/duplicate/foreign Pod placements;
+    unknown or source nodes; and unsupported decisions. Worker tests must assert
+    that simulation never binds, evicts, patches, deletes, or mutates production
+    scheduler state.
+16. **Bounded work and invalidation.** Verify cheap filters cap scheduler calls
+    at the configured top-K/per-cycle budget; relevant Pod, Node, storage,
+    scheduling-object, rendered-spec, and profile changes invalidate cached
+    results; expired results are never admitted. Record benchmark evidence before
+    claiming any throughput or latency improvement.
 
 The existing single-policy unit expectations (fragmentation scoring, threshold
 gating, placement-hint computation, cooldown, rate limiting) remain under
@@ -2477,10 +2644,14 @@ New integration coverage for the multi-policy engine:
     (replica count changing); verify no Alfred policy actuates against its
     workload until scaling settles. This is the integration-level twin of unit
     test 4.
-27. **Descheduling (Phase 2).** A workload violating its placement
-    preference (e.g., a soft anti-affinity that drifted) is selected by the
-    Descheduling policy and migrated; verify it does not fire on workloads that
-    still satisfy their constraints.
+27. **Matching-scheduler differential suite.** Feed the isolated worker actual
+    fully rendered/admitted replacements and the same snapshot objects as a real
+    matching scheduler. Compare feasible/infeasible and whole-gang outcomes for
+    tolerations, selectors, required affinity/anti-affinity, storage topology,
+    topology spread, source exclusions, and atomic OME gangs through
+    Reserve/Permit. Verify admission/defaulting changes trigger profile
+    re-selection, stale results are rejected, source occupancy is retained, and
+    neither path performs a live bind, eviction, patch, or delete.
 28. **PVC-backed model migration.** An ISVC backed by an RWX (or ROX) PVC model
     migrates with no model-ready filtering — verify the target set is the
     CSI-topology-reachable nodes and the migration completes with no model
@@ -2533,9 +2704,9 @@ New, targeting the multi-policy failure surface:
 
 ## Graduation criteria
 
-The maturity ladder maps onto the phasing: Alpha ships the engine refactor
-plus the first two policies; Beta adds Descheduling and production soak; GA
-optionally adds the predictive planner and a cloud remediation provider. The
+The maturity ladder maps onto the phasing: Alpha completes the two-policy engine
+and mandatory matching-scheduler safety path; Beta adds production soak; GA may
+optionally add the predictive planner and a cloud remediation provider. The
 phasing is deliberate — each phase is independently useful, and a phase can
 slip without blocking the one below it.
 
@@ -2545,7 +2716,7 @@ Scope: the engine refactor (`Policy` interface + `Arbiter` + `Reporter`), Defrag
 **Policy #1**, **Policy #2 Node-Health Evacuation** (evacuate + remediation
 signal), the checked InferenceReplica-plus-Pod snapshot, OMENative executor
 capability Lease, Dispatcher, **arbitration-lite** (priority ordering + mutual
-exclusion, no forecasting), and
+exclusion, no forecasting), the isolated matching-scheduler worker, and
 the **OEP-0013 read-only seam**.
 
 - Unit tests ≥ 80% coverage, including the new `engine/arbiter`,
@@ -2557,6 +2728,11 @@ the **OEP-0013 read-only seam**.
   leader failover.
 - A fresh, wire-compatible OMENative capability Lease gates every executable
   Candidate; CRD and status presence alone fail the execution-readiness test.
+- Every executable Candidate is simulated using actual fully rendered/admitted
+  replacement Pods by a worker that matches the effective scheduler's immutable
+  version/profile/plugins/arguments/feature gates. Whole OME gangs complete
+  reservation and Permit simulation while sources remain occupied; no worker,
+  unsupported input, stale state, or profile mismatch fails open.
 - `RawDeployment` and LWS are advisory-only. A future Raw executor is additive
   and is not an Alpha graduation dependency.
 - Integration tests 1–10 passing, plus the node-health end-to-end test (24),
@@ -2564,18 +2740,17 @@ the **OEP-0013 read-only seam**.
 - The two new chaos tests passing: flapping-node cooldown, and the
   no-same-cycle-collision invariant.
 - Deployment via Helm documented.
-- Feature gate `AlfredGPUDefragmenter` disabled by default in the OME Helm chart.
-- Policy schema documented, including how to enable/disable each policy and set
-  the Arbiter priority order.
+- Policy schema documented, including how to enable/disable each policy, the
+  fixed health-before-defrag ordering, and exact scheduler profile identities.
 - `recommend-only` is the default mode; `execute` is opt-in. This applies to
   **every** policy, Node-Health included: an alpha operator can run Node-Health
   in recommend-only and watch the Events before enabling the Dispatcher.
 
 ### Beta
 
-Scope adds **Policy #3 Descheduling**.
+Scope adds production soak and hardening of the same two policies.
 
-- Integration tests 1–28 (Descheduling and PVC-backed migration included) +
+- Integration tests 1–28 (matching-scheduler differential and PVC-backed migration included) +
   chaos + simulation passing.
 - 2+ production users running Alfred for ≥ 60 days without Sev1/Sev2 incidents
   attributed to Alfred — across **at least Defrag and Node-Health enabled
@@ -2598,7 +2773,7 @@ engine must not preclude them.
 - 6 months of Beta.
 - Test coverage ≥ 85%.
 - Policy schema and the `Policy`/`Arbiter`/`Reporter` interfaces stabilized —
-  adding a fourth policy must not require an interface change.
+  adding another policy must not require an interface change.
 - OMENative at GA.
 - Deprecation story documented (if Alfred is ever replaced).
 - If the predictive planner ships: its forecasts feed the Arbiter as
@@ -2614,9 +2789,8 @@ engine must not preclude them.
 - 2026-06-04: Reframed from "Alfred GPU Defragmenter" to "Alfred GPU Cluster
   Caretaker": Defrag becomes one policy behind a `Policy` interface, an
   `Arbiter` resolves cross-policy conflicts, Node-Health Evacuation added as
-  Policy #2, Descheduling reserved as Policy #3, and the predictive planner and
-  cloud remediation provider deferred to Phase 3. Phasing mapped onto
-  Alpha/Beta/GA.
+  Policy #2, and the predictive planner and cloud remediation provider deferred
+  beyond the reactive two-policy engine. Phasing mapped onto Alpha/Beta/GA.
 - 2026-08-14: Engine gains an explicit **Reporter** stage: all observability
   emission (Events, decision metrics, the recommendations ConfigMap) moves out
   of `Evaluate` into the engine, making the policies-are-pure-functions
@@ -2625,8 +2799,7 @@ engine must not preclude them.
   directly to the Reporter.
 - 2026-08-15: Actuation design unified on the single migration-request
   annotation. A RawDeployment consumer was proposed but not implemented;
-  `pods/eviction` remains outside Alfred's RBAC. Candidate simulation plus the
-  Arbiter capacity check become surge-aware
+  `pods/eviction` remains outside Alfred's RBAC. Cheap candidate bounds become surge-aware
   (place-then-free ordering, in-flight claims, `NoSurgeHeadroom` downgrades,
   smallest-footprint tie-breaking).
 - 2026-08-15: Model-readiness target filtering made storage-aware: per-node
@@ -2665,11 +2838,16 @@ engine must not preclude them.
   proves executor availability. RawDeployment and LWS are advisory-only until
   their lifecycle owner implements the request contract. Current implementation
   gaps (Node-Health and Dispatcher) are recorded explicitly.
-- TBD: Complete Alpha implementation (checked InferenceReplica-plus-Pod
-  snapshot, capability Lease, Policy #2, Dispatcher, and outcome-fed safety
-  ledger).
+- 2026-09-14: Policy scope fixed at exactly two policies. Matching-scheduler
+  simulation became a mandatory gate between the cheap shortlist and Arbiter
+  admission. Public profile selection, a versioned request/result contract, and
+  fail-closed unavailable-worker diagnostics landed; the renderer/admission
+  bridge, isolated worker, and Dispatcher remain unimplemented.
+- TBD: Complete Alpha implementation (replacement rendering/admission bridge,
+  isolated matching-scheduler worker, capability Lease, Policy #2, Dispatcher,
+  and outcome-fed safety ledger).
 - TBD: First Beta user.
-- TBD: Beta (Policy #3 Descheduling).
+- TBD: First Beta release.
 - TBD: GA.
 
 ## Drawbacks
@@ -2687,12 +2865,13 @@ engine must not preclude them.
    consolidations. Trade: simplicity and speed over global optimality. The
    predictive planner (Phase 3) is the proposed answer, but it is not yet
    justified — see Open Questions.
-4. **Operational overhead.** Operators learn Alfred's metrics, policy schema,
-   and failure modes — now multiplied across three policies and an Arbiter
-   priority order they must configure.
+4. **Operational overhead.** Operators learn Alfred's metrics, two-policy
+   schema, scheduler-profile identities, and Arbiter failure modes. Each
+   executable scheduler profile also needs a matching isolated worker whose
+   build and immutable configuration stay aligned with the live scheduler.
 5. **Policy complexity.** The ConfigMap schema has many knobs, and the
-   multi-policy engine adds per-policy enablement plus the Arbiter priority
-   list. Good defaults mitigate, but the failure surface is larger than the
+   multi-policy engine adds per-policy enablement plus scheduler-profile
+   mappings. Good defaults mitigate, but the failure surface is larger than the
    single-policy design.
 6. **Cross-controller interaction space.** Alfred, OMENative, HPA, CA,
    OEP-0013 Component-Scoped Autoscaling, and the scheduler form a complex
@@ -2717,8 +2896,8 @@ apply bin-packing at placement time.
   workloads already running. Would need combination with a separate actor for
   migration anyway.
 
-Rejected — the core problem is runtime caretaking (defrag, evacuation,
-descheduling), not initial placement.
+Rejected — the core problem is runtime caretaking (capacity descheduling and
+health evacuation), not initial placement.
 
 ### Alternative 2: Embed Alfred in the OME manager
 
@@ -2764,28 +2943,28 @@ Fork / contribute to CA to add GPU-aware defragmentation.
 
 Rejected — architectural mismatch.
 
-### Alternative 6: Keep Alfred a single-purpose defragmenter; put node-health and descheduling in separate controllers
+### Alternative 6: Put node-health in a separate controller
 
-Leave Alfred as the defragmenter it was, and ship Node-Health Evacuation and
-Descheduling as their own standalone controllers, each with its own
-deployment, snapshot, and actuation path.
+Leave Alfred as the defragmenter it was, and ship Node-Health Evacuation as its
+own standalone controller with its own deployment, snapshot, and actuation
+path.
 
 - **Pros:** Smaller blast radius per controller; each can fail or be disabled
   in isolation; no Arbiter to build.
-- **Cons:** All three policies need the **same** machinery — the cluster
+- **Cons:** Both policies need the **same** machinery — the cluster
   snapshot (observe nodes/GPUs/workloads), the safety bounds (cooldown, rate
   limiting, circuit breaker, maintenance windows, opt-out), and the **same
   narrow actuation surface** (the migration-request annotation executed by the
   owning controllers).
-  N controllers means N copies of that machinery to build, test, and keep in
+  Two controllers means two copies of that machinery to build, test, and keep in
   sync. Worse: with no shared engine, there is **no place to do cross-policy
   arbitration** — two independent controllers can evacuate and consolidate the
   same workload in the same instant, exactly the double-move the Arbiter
   exists to prevent. The coordination problem doesn't disappear; it just moves
-  out of one process and into an unowned gap between three.
+  out of one process and into an unowned gap between two.
 
 Rejected — the policies share the snapshot, the safety machinery, and the
-narrow actuation, so splitting them duplicates the engine three ways and
+narrow actuation, so splitting them duplicates the engine and
 forfeits the one thing only a shared engine can provide: arbitration across
 policies.
 
@@ -2861,14 +3040,15 @@ Carried from the single-policy design (research-level, not blocking):
     ConfigMap. Dashboards operator-owned. No dedicated UI.
 
 11. **Unified "OME Ops" controller** (Q-045). The Caretaker reframing is a step
-    toward this: Defrag, Node-Health, and Descheduling now share one engine.
+    toward this: capacity defragmentation and Node-Health share one engine.
     The open question becomes whether auto-patch / auto-repair / maintenance
     tooling also fold in as further policies, or stay separate. Current design
     is compatible — the `Policy` interface is the obvious extension point.
 
 12. **Auto-patch / auto-repair re-introduction** (Q-046, Q-022 on plugin
-    architecture). Could become Policy #4/#5 under the new engine rather than
-    separate OEPs. Alfred is designed not to preclude this.
+    architecture). This would require a separate OEP because the current
+    two-policy design intentionally has no node-write or cloud credential
+    surface. Alfred does not promise this extension.
 
 13. **Model pre-download coordination** (Q-032 extension). v2 may add
     auto-triggered pre-download to target nodes before retrying migrations

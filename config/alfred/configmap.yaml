@@ -22,6 +22,12 @@ data:
     # Advances the next decision tick; never interrupts a pass ([] disables).
     earlyTickOn: [NodeConditionChange]
 
+    # Scheduler simulation is mandatory before execution. Profiles are keyed by
+    # the effective replacement Pod schedulerName. No simulation workers ship
+    # with Alfred yet, so defaults remain empty and every candidate fails closed.
+    scheduling:
+      profiles: {}
+
     policies:
       defragmentation:
         enabled: true
