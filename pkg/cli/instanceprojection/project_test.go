@@ -932,6 +932,29 @@ func TestProjectRejectsUnknownCollectionEvidence(t *testing.T) {
 	}
 }
 
+func TestProjectAcceptsExactOwnerEvidenceForLongParentName(t *testing.T) {
+	t.Parallel()
+
+	isvc := instanceISVC()
+	isvc.Name = strings.Repeat("a", 64)
+	ir := instanceReplica(isvc, "engine", omev1beta1.EngineComponent, 2, 2)
+	delete(ir.Labels, constants.InferenceServiceLabel)
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{
+		Index: 0, Incarnation: 1, Phase: omev1beta1.OMENativeInstanceReady,
+	}}
+
+	got, err := instanceprojection.Project(instanceprojection.Input{
+		InferenceService: isvc,
+		Collection:       instancecollection.Result{Items: []omev1beta1.InferenceReplica{ir}},
+		MaxInstances:     10,
+	}, reportv1alpha1.ClockFunc(func() time.Time { return time.Unix(1, 0) }))
+
+	require.NoError(t, err)
+	require.Len(t, got.Content.Components, 1)
+	assert.Equal(t, "engine", got.Content.Components[0].InferenceReplica)
+	require.Len(t, got.Content.Instances, 1)
+}
+
 func instanceISVC() *omev1beta1.InferenceService {
 	return &omev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
 		Name: "chat", Namespace: "prod", UID: types.UID("isvc-uid"), Generation: 7,

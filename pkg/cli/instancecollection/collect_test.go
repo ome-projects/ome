@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,6 +71,116 @@ func TestCollectRelatedPagesWithExactSelectorAndRejectsUnboundObjects(t *testing
 	assert.False(t, got.Truncated)
 }
 
+func TestCollectRelatedLongParentNameUsesBoundedExactRelationshipScan(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	isvc.Name = strings.Repeat("a", 64)
+	related := relatedReplica(isvc, "engine", omev1beta1.EngineComponent)
+	delete(related.Labels, constants.InferenceServiceLabel)
+	wrongParent := *related.DeepCopy()
+	wrongParent.Name = "wrong-parent"
+	wrongParent.UID = "wrong-parent-uid"
+	wrongParent.Spec.ParentRef.Name = "other"
+	wrongOwner := *related.DeepCopy()
+	wrongOwner.Name = "wrong-owner"
+	wrongOwner.UID = "wrong-owner-uid"
+	wrongOwner.OwnerReferences[0].UID = "other"
+	lister := &pagedLister{pages: map[string]*omev1beta1.InferenceReplicaList{
+		"": {
+			ListMeta: metav1.ListMeta{Continue: "next"},
+			Items:    []omev1beta1.InferenceReplica{wrongParent, related},
+		},
+		"next": {Items: []omev1beta1.InferenceReplica{wrongOwner}},
+	}}
+	limits := collectionLimits()
+	limits.Paging.PageSize = 2
+
+	got, err := instancecollection.CollectRelated(context.Background(), lister, isvc, limits)
+
+	require.NoError(t, err)
+	require.Len(t, lister.options, 2)
+	assert.Empty(t, lister.options[0].LabelSelector)
+	assert.Empty(t, lister.options[1].LabelSelector)
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, "engine", got.Items[0].Name)
+	assert.Empty(t, got.Items[0].Labels[constants.InferenceServiceLabel])
+	assert.Equal(t, []instancecollection.Rejection{
+		{Name: "wrong-parent", Reason: instancecollection.RejectionParentReference},
+		{Name: "wrong-owner", Reason: instancecollection.RejectionOwnerReference},
+	}, got.Rejected)
+}
+
+func TestCollectRelatedLongParentScanSkipsUnrelatedButRejectsTargetClaim(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	isvc.Name = strings.Repeat("a", 64)
+	related := relatedReplica(isvc, "engine", omev1beta1.EngineComponent)
+	delete(related.Labels, constants.InferenceServiceLabel)
+	badOwner := *related.DeepCopy()
+	badOwner.Name = "bad-owner"
+	badOwner.UID = "bad-owner-uid"
+	badOwner.OwnerReferences[0].UID = "wrong-uid"
+	otherISVC := &omev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+		Name: "other", Namespace: isvc.Namespace, UID: "other-uid",
+	}}
+	unrelated := relatedReplica(otherISVC, "other-engine", omev1beta1.EngineComponent)
+
+	got, err := instancecollection.CollectRelated(
+		context.Background(),
+		listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{
+				unrelated, badOwner, related,
+			}}, nil
+		}),
+		isvc,
+		collectionLimits(),
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, "engine", got.Items[0].Name)
+	assert.Equal(t, []instancecollection.Rejection{{
+		Name: "bad-owner", Reason: instancecollection.RejectionOwnerReference,
+	}}, got.Rejected)
+}
+
+func TestCollectRelatedLongParentScanTreatsExactOwnerUIDAsTargetClaim(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	isvc.Name = strings.Repeat("a", 64)
+	related := relatedReplica(isvc, "engine", omev1beta1.EngineComponent)
+	delete(related.Labels, constants.InferenceServiceLabel)
+	otherISVC := &omev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+		Name: "other", Namespace: isvc.Namespace, UID: "other-uid",
+	}}
+	suspicious := relatedReplica(otherISVC, "suspicious-engine", omev1beta1.EngineComponent)
+	suspicious.OwnerReferences[0].APIVersion = "malformed/v1"
+	suspicious.OwnerReferences[0].Kind = "Other"
+	suspicious.OwnerReferences[0].Name = "other"
+	suspicious.OwnerReferences[0].UID = isvc.UID
+
+	got, err := instancecollection.CollectRelated(
+		context.Background(),
+		listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{
+				suspicious, related,
+			}}, nil
+		}),
+		isvc,
+		collectionLimits(),
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, "engine", got.Items[0].Name)
+	assert.Equal(t, []instancecollection.Rejection{{
+		Name: "suspicious-engine", Reason: instancecollection.RejectionParentReference,
+	}}, got.Rejected)
+}
+
 func TestCollectRelatedRejectsSuccessfulResponseAfterRequestCancellation(t *testing.T) {
 	t.Parallel()
 
@@ -117,6 +229,31 @@ func TestCollectRelatedReturnsDefensiveCopies(t *testing.T) {
 	assert.Equal(t, int32(9), got.Items[0].Status.InstanceStatuses[0].Index)
 }
 
+func TestCollectRelatedPreservesDefensiveDeletionTimestamp(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	source := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	deletingAt := metav1.NewTime(time.Date(2026, 9, 14, 22, 30, 0, 0, time.UTC))
+	source.DeletionTimestamp = &deletingAt
+
+	got, err := instancecollection.CollectRelated(
+		context.Background(),
+		listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+		}),
+		isvc,
+		collectionLimits(),
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	require.NotNil(t, got.Items[0].DeletionTimestamp)
+	assert.Equal(t, deletingAt.Time, got.Items[0].DeletionTimestamp.Time)
+	got.Items[0].DeletionTimestamp.Time = time.Time{}
+	assert.Equal(t, deletingAt.Time, source.DeletionTimestamp.Time)
+}
+
 func TestCollectRelatedBoundsNestedStatusCopies(t *testing.T) {
 	t.Parallel()
 
@@ -162,6 +299,115 @@ func TestCollectRelatedBoundsNestedStatusCopies(t *testing.T) {
 	encoded, marshalErr := json.Marshal(got.Items[0])
 	require.NoError(t, marshalErr)
 	assert.NotContains(t, string(encoded), "SECRET-NESTED-OPAQUE-VALUE")
+}
+
+func TestCollectRelatedBoundsAndDefensivelyCopiesRetryBlocks(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	large := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	large.Status.RetryBlocks = make([]omev1beta1.RetryBlock, 10_000)
+	for index := range large.Status.RetryBlocks {
+		large.Status.RetryBlocks[index] = omev1beta1.RetryBlock{
+			TargetRevision: "chat-engine-oversized",
+			State:          omev1beta1.RetryBlockHeld,
+			Reason:         "SECRET-OVERSIZED-REASON",
+		}
+	}
+	small := relatedReplica(isvc, "chat-decoder", omev1beta1.DecoderComponent)
+	nextRetry := metav1.NewTime(time.Date(2026, 9, 14, 22, 0, 0, 0, time.UTC))
+	small.Status.RetryBlocks = []omev1beta1.RetryBlock{{
+		TargetRevision:  "chat-decoder-aaaaaaaa",
+		State:           omev1beta1.RetryBlockBackoff,
+		AttemptsStarted: 2,
+		NextRetryAt:     &nextRetry,
+		Reason:          "pull failed",
+	}}
+	limits := collectionLimits()
+	limits.MaxRetryBlocks = 1
+	collect := func(items []omev1beta1.InferenceReplica) instancecollection.Result {
+		lister := listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: items}, nil
+		})
+		got, err := instancecollection.CollectRelated(context.Background(), lister, isvc, limits)
+		require.NoError(t, err)
+		return got
+	}
+
+	got := collect([]omev1beta1.InferenceReplica{small, large})
+	assert.Equal(t, got, collect([]omev1beta1.InferenceReplica{large, small}),
+		"retry-block budget selection must not inherit API response order")
+	require.Len(t, got.Items, 2)
+	assert.Empty(t, got.Items[0].Status.RetryBlocks)
+	require.Len(t, got.Items[1].Status.RetryBlocks, 1)
+	assert.Equal(t, []instancecollection.RetryBlocksTruncation{{
+		Name: "chat-engine", Component: omev1beta1.EngineComponent,
+	}}, got.RetryBlocksTruncated)
+
+	got.Items[1].Status.RetryBlocks[0].Reason = "changed"
+	got.Items[1].Status.RetryBlocks[0].NextRetryAt.Time = time.Time{}
+	assert.Equal(t, "pull failed", small.Status.RetryBlocks[0].Reason)
+	assert.Equal(t, nextRetry.Time, small.Status.RetryBlocks[0].NextRetryAt.Time)
+	encoded, marshalErr := json.Marshal(got.Items[0])
+	require.NoError(t, marshalErr)
+	assert.NotContains(t, string(encoded), "SECRET-OVERSIZED-REASON")
+}
+
+func TestCollectRelatedBoundsRetryBlockStringsByBytesAndUTF8(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.RetryBlocks = []omev1beta1.RetryBlock{{
+		TargetRevision:  strings.Repeat("界", 400),
+		State:           omev1beta1.RetryBlockHeld,
+		AttemptsStarted: 1,
+		Reason:          strings.Repeat("\xffa", 3_000),
+	}}
+	limits := collectionLimits()
+	limits.MaxRetryBlocks = 1
+
+	got, err := instancecollection.CollectRelated(
+		context.Background(),
+		listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+		}),
+		isvc,
+		limits,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	require.Len(t, got.Items[0].Status.RetryBlocks, 1)
+	block := got.Items[0].Status.RetryBlocks[0]
+	assert.LessOrEqual(t, len(block.TargetRevision), 1_024)
+	assert.LessOrEqual(t, len(block.Reason), 4_096)
+	assert.True(t, utf8.ValidString(block.TargetRevision))
+	assert.True(t, utf8.ValidString(block.Reason))
+}
+
+func TestCollectRelatedOmitsRetryBlocksWhenBudgetIsDisabled(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.RetryBlocks = []omev1beta1.RetryBlock{{
+		TargetRevision: "chat-engine-aaaaaaaa", State: omev1beta1.RetryBlockHeld,
+	}}
+
+	got, err := instancecollection.CollectRelated(
+		context.Background(),
+		listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+		}),
+		isvc,
+		collectionLimits(),
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Empty(t, got.Items[0].Status.RetryBlocks)
+	assert.Empty(t, got.RetryBlocksTruncated)
 }
 
 func TestCollectRelatedRequiresExactNonemptyControllerUID(t *testing.T) {
@@ -307,6 +553,7 @@ func TestCollectRelatedRejectsInvalidInputsWithoutListing(t *testing.T) {
 		{name: "unsafe uid", lister: panicLister{}, isvc: &omev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "prod", UID: "uid\u202e\nSECRET"}}, limits: collectionLimits(), want: instancecollection.ErrInferenceServiceIdentityInvalid},
 		{name: "nil lister", isvc: isvc, limits: collectionLimits(), want: instancecollection.ErrListerRequired},
 		{name: "invalid status row limit", lister: panicLister{}, isvc: isvc, limits: instancecollection.Limits{Paging: collectionLimits().Paging}, want: instancecollection.ErrMaxStatusRowsInvalid},
+		{name: "invalid retry block limit", lister: panicLister{}, isvc: isvc, limits: instancecollection.Limits{Paging: collectionLimits().Paging, MaxStatusRows: 1, MaxRetryBlocks: -1}, want: instancecollection.ErrMaxRetryBlocksInvalid},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

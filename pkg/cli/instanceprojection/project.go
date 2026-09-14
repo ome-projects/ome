@@ -530,8 +530,9 @@ func validSourceIdentity(namespace, name string, uid types.UID) bool {
 }
 
 func validCollectedReplicaIdentity(ir *omev1beta1.InferenceReplica, isvc *omev1beta1.InferenceService) bool {
+	requireRelationshipLabel := len(validation.IsValidLabelValue(isvc.Name)) == 0
 	if ir == nil || ir.Namespace != isvc.Namespace || !validSourceIdentity(ir.Namespace, ir.Name, ir.UID) ||
-		ir.Labels[constants.InferenceServiceLabel] != isvc.Name ||
+		(requireRelationshipLabel && ir.Labels[constants.InferenceServiceLabel] != isvc.Name) ||
 		ir.Labels[constants.OMEComponentLabel] != string(ir.Spec.Component) ||
 		ir.Spec.ParentRef.Name != isvc.Name || !validComponent(ir.Spec.Component) {
 		return false

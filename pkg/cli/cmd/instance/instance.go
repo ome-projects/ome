@@ -15,6 +15,8 @@ import (
 
 const defaultMaxInstances = 1000
 
+const defaultMaxRetryBlocks = 1000
+
 // NewCmd builds the instance command family.
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
@@ -28,6 +30,13 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 		},
 		maxInstances: defaultMaxInstances,
 		project:      instanceprojection.Project,
+	}))
+	cmd.AddCommand(newRetryBlocksCmd(f, streams, retryBlocksDependencies{
+		clock: reportv1alpha1.SystemClock{},
+		limits: paging.Limits{
+			PageSize: 50, MaxItems: 100, MaxPages: 10, RequestTimeout: 10 * time.Second,
+		},
+		maxRetryBlocks: defaultMaxRetryBlocks,
 	}))
 	return cmd
 }

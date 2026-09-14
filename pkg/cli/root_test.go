@@ -31,6 +31,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome get",
 		"ome instance",
 		"ome instance list",
+		"ome instance retry-blocks",
 		"ome logs",
 		"ome migration",
 		"ome migration status",
@@ -72,6 +73,14 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if validate.Use != "validate INFERENCESERVICE" || validate.Short != "Validate rollout, traffic, and autoscaling configuration" {
 		t.Fatalf("rollout validate contract changed: Use=%q Short=%q", validate.Use, validate.Short)
+	}
+	retryBlocks, _, err := root.Find([]string{"instance", "retry-blocks"})
+	if err != nil {
+		t.Fatalf("find instance retry-blocks: %v", err)
+	}
+	if retryBlocks.Use != "retry-blocks INFERENCESERVICE --component COMPONENT" ||
+		retryBlocks.Short != "Show controller-reported retry authority" {
+		t.Fatalf("instance retry-blocks contract changed: Use=%q Short=%q", retryBlocks.Use, retryBlocks.Short)
 	}
 }
 

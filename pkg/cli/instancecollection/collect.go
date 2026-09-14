@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -24,11 +25,14 @@ var (
 	ErrInferenceServiceIdentityInvalid   = errors.New("instance collection requires a safe InferenceService identity")
 	ErrListerRequired                    = errors.New("instance collection requires an InferenceReplica lister")
 	ErrMaxStatusRowsInvalid              = errors.New("instance collection requires a positive status-row limit")
+	ErrMaxRetryBlocksInvalid             = errors.New("instance collection requires a non-negative retry-block limit")
 )
 
 const (
-	invalidIdentityName = "INVALID"
-	maxUIDLength        = 128
+	invalidIdentityName   = "INVALID"
+	maxUIDLength          = 128
+	maxRetryRevisionBytes = 1024
+	maxRetryReasonBytes   = 4096
 )
 
 type RejectionReason string
@@ -51,6 +55,9 @@ type Rejection struct {
 type Limits struct {
 	Paging        paging.Limits
 	MaxStatusRows int
+	// MaxRetryBlocks bounds retry-block copies across every accepted source.
+	// Zero disables collection for callers that do not consume these records.
+	MaxRetryBlocks int
 }
 
 // StatusRowsTruncation identifies a related InferenceReplica whose nested
@@ -61,21 +68,32 @@ type StatusRowsTruncation struct {
 	Component omev1beta1.ComponentType
 }
 
+// RetryBlocksTruncation identifies a related InferenceReplica whose nested
+// retry-block list exceeded the collection work budget. No block from that
+// source is copied or scanned.
+type RetryBlocksTruncation struct {
+	Name      string
+	Component omev1beta1.ComponentType
+}
+
 type Result struct {
-	Items               []omev1beta1.InferenceReplica
-	Rejected            []Rejection
-	StatusRowsTruncated []StatusRowsTruncation
-	Pages               int
-	Truncated           bool
+	Items                []omev1beta1.InferenceReplica
+	Rejected             []Rejection
+	StatusRowsTruncated  []StatusRowsTruncation
+	RetryBlocksTruncated []RetryBlocksTruncation
+	Pages                int
+	Truncated            bool
 }
 
 type Lister interface {
 	List(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error)
 }
 
-// CollectRelated lists with the canonical parent label and then validates the
-// immutable parent reference and controller owner identity before returning an
-// object. A matching label alone is never treated as ownership evidence.
+// CollectRelated uses the canonical parent label when the parent name is a
+// valid label value, then validates the immutable parent reference and exact
+// controller owner identity before returning an object. Longer valid parent
+// names use the same bounded namespace scan without a relationship selector.
+// A matching label alone is never treated as ownership evidence.
 func CollectRelated(
 	ctx context.Context,
 	lister Lister,
@@ -101,10 +119,17 @@ func CollectRelated(
 	if limits.MaxStatusRows <= 0 {
 		return Result{}, ErrMaxStatusRowsInvalid
 	}
-	selector := labels.Set{constants.InferenceServiceLabel: isvc.Name}.AsSelector().String()
+	if limits.MaxRetryBlocks < 0 {
+		return Result{}, ErrMaxRetryBlocksInvalid
+	}
+	requireRelationshipLabel := len(validation.IsValidLabelValue(isvc.Name)) == 0
+	listOptions := metav1.ListOptions{}
+	if requireRelationshipLabel {
+		listOptions.LabelSelector = labels.Set{constants.InferenceServiceLabel: isvc.Name}.AsSelector().String()
+	}
 	listed, err := paging.ListBounded(
 		ctx,
-		metav1.ListOptions{LabelSelector: selector},
+		listOptions,
 		limits.Paging,
 		func(requestCtx context.Context, options metav1.ListOptions) (paging.Page[omev1beta1.InferenceReplica], error) {
 			page, listErr := lister.List(requestCtx, options)
@@ -122,15 +147,19 @@ func CollectRelated(
 	)
 
 	result := Result{
-		Items:               make([]omev1beta1.InferenceReplica, 0, len(listed.Items)),
-		Rejected:            make([]Rejection, 0),
-		StatusRowsTruncated: make([]StatusRowsTruncation, 0),
-		Pages:               listed.Pages, Truncated: listed.Truncated,
+		Items:                make([]omev1beta1.InferenceReplica, 0, len(listed.Items)),
+		Rejected:             make([]Rejection, 0),
+		StatusRowsTruncated:  make([]StatusRowsTruncation, 0),
+		RetryBlocksTruncated: make([]RetryBlocksTruncation, 0),
+		Pages:                listed.Pages, Truncated: listed.Truncated,
 	}
 	accepted := make([]*omev1beta1.InferenceReplica, 0, len(listed.Items))
 	for i := range listed.Items {
 		item := listed.Items[i]
-		if reason := rejectionReason(&item, isvc); reason != "" {
+		if !requireRelationshipLabel && !claimsTargetParent(&item, isvc) {
+			continue
+		}
+		if reason := rejectionReason(&item, isvc, requireRelationshipLabel); reason != "" {
 			result.Rejected = append(result.Rejected, Rejection{Name: safeName(item.Name), Reason: reason})
 			continue
 		}
@@ -150,6 +179,7 @@ func CollectRelated(
 		return left.UID < right.UID
 	})
 	remainingRows := limits.MaxStatusRows
+	remainingRetryBlocks := limits.MaxRetryBlocks
 	for _, item := range accepted {
 		copyRows := len(item.Status.InstanceStatuses) <= remainingRows
 		if !copyRows {
@@ -157,9 +187,18 @@ func CollectRelated(
 				Name: item.Name, Component: item.Spec.Component,
 			})
 		}
-		result.Items = append(result.Items, boundedReplicaCopy(item, isvc, copyRows))
+		copyRetryBlocks := limits.MaxRetryBlocks > 0 && len(item.Status.RetryBlocks) <= remainingRetryBlocks
+		if limits.MaxRetryBlocks > 0 && !copyRetryBlocks {
+			result.RetryBlocksTruncated = append(result.RetryBlocksTruncated, RetryBlocksTruncation{
+				Name: item.Name, Component: item.Spec.Component,
+			})
+		}
+		result.Items = append(result.Items, boundedReplicaCopy(item, isvc, copyRows, copyRetryBlocks))
 		if copyRows {
 			remainingRows -= len(item.Status.InstanceStatuses)
+		}
+		if copyRetryBlocks {
+			remainingRetryBlocks -= len(item.Status.RetryBlocks)
 		}
 	}
 	return result, err
@@ -172,11 +211,13 @@ func boundedReplicaCopy(
 	ir *omev1beta1.InferenceReplica,
 	isvc *omev1beta1.InferenceService,
 	copyRows bool,
+	copyRetryBlocks bool,
 ) omev1beta1.InferenceReplica {
 	controller := true
 	result := omev1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: ir.Name, Namespace: ir.Namespace, UID: ir.UID, Generation: ir.Generation,
+			DeletionTimestamp: copyTime(ir.DeletionTimestamp),
 			Labels: map[string]string{
 				constants.InferenceServiceLabel: ir.Labels[constants.InferenceServiceLabel],
 				constants.OMEComponentLabel:     ir.Labels[constants.OMEComponentLabel],
@@ -204,7 +245,7 @@ func boundedReplicaCopy(
 		}
 	}
 	if !copyRows {
-		return result
+		return copyBoundedRetryBlocks(result, ir, copyRetryBlocks)
 	}
 	result.Status.InstanceStatuses = make([]omev1beta1.OMENativeInstanceStatus, len(ir.Status.InstanceStatuses))
 	for i := range ir.Status.InstanceStatuses {
@@ -224,14 +265,75 @@ func boundedReplicaCopy(
 		}
 		result.Status.InstanceStatuses[i] = row
 	}
+	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks)
+}
+
+func copyBoundedRetryBlocks(
+	result omev1beta1.InferenceReplica,
+	ir *omev1beta1.InferenceReplica,
+	copyRetryBlocks bool,
+) omev1beta1.InferenceReplica {
+	if !copyRetryBlocks {
+		return result
+	}
+	result.Status.RetryBlocks = make([]omev1beta1.RetryBlock, len(ir.Status.RetryBlocks))
+	for i := range ir.Status.RetryBlocks {
+		source := &ir.Status.RetryBlocks[i]
+		result.Status.RetryBlocks[i] = omev1beta1.RetryBlock{
+			TargetRevision: boundedClone(source.TargetRevision, maxRetryRevisionBytes),
+			State:          source.State, AttemptsStarted: source.AttemptsStarted,
+			NextRetryAt: copyTime(source.NextRetryAt), FirstFailureAt: copyTime(source.FirstFailureAt),
+			LastFailureAt: copyTime(source.LastFailureAt),
+			Reason:        boundedClone(source.Reason, maxRetryReasonBytes),
+		}
+	}
 	return result
 }
 
-func rejectionReason(ir *omev1beta1.InferenceReplica, isvc *omev1beta1.InferenceService) RejectionReason {
+func copyTime(value *metav1.Time) *metav1.Time {
+	if value == nil {
+		return nil
+	}
+	return value.DeepCopy()
+}
+
+func boundedClone(value string, maxBytes int) string {
+	if len(value) > maxBytes {
+		value = value[:maxBytes]
+	}
+	// A single-byte replacement keeps the sanitized copy within the byte
+	// budget even when the cut lands inside a multi-byte rune or the source
+	// contains many invalid byte sequences.
+	return strings.Clone(strings.ToValidUTF8(value, "?"))
+}
+
+func claimsTargetParent(
+	ir *omev1beta1.InferenceReplica,
+	isvc *omev1beta1.InferenceService,
+) bool {
+	if ir.Spec.ParentRef.Name == isvc.Name ||
+		ir.Labels[constants.InferenceServiceLabel] == isvc.Name {
+		return true
+	}
+	for i := range ir.OwnerReferences {
+		owner := &ir.OwnerReferences[i]
+		if owner.UID == isvc.UID ||
+			(owner.Kind == "InferenceService" && owner.Name == isvc.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func rejectionReason(
+	ir *omev1beta1.InferenceReplica,
+	isvc *omev1beta1.InferenceService,
+	requireRelationshipLabel bool,
+) RejectionReason {
 	if len(validation.IsDNS1123Subdomain(ir.Name)) != 0 || ir.Namespace != isvc.Namespace || !validUID(ir.UID) {
 		return RejectionMetadata
 	}
-	if ir.Labels[constants.InferenceServiceLabel] != isvc.Name {
+	if requireRelationshipLabel && ir.Labels[constants.InferenceServiceLabel] != isvc.Name {
 		return RejectionLabel
 	}
 	if ir.Spec.ParentRef.Name != isvc.Name {
