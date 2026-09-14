@@ -1,8 +1,8 @@
 // Package policy defines the contract every Alfred policy implements: a
 // pure, side-effect-free function of the ClusterSnapshot that returns ranked
 // Candidates (OEP-0008 §The engine). A policy holds no client and emits no
-// Event, metric, or ConfigMap entry — the engine routes its output: executable
-// Candidates enter the Arbiter, advisory ones go straight to the Reporter.
+// Event, metric, or ConfigMap entry — the engine gates scheduling before
+// routing executable Candidates to the Arbiter and advisories to the Reporter.
 package policy
 
 import (
@@ -101,6 +101,9 @@ type Candidate struct {
 	// Executable=false marks an advisory finding; AdvisoryReason says why.
 	Executable     bool
 	AdvisoryReason string
+	// Scheduling is added by the engine after policy evaluation. Profile
+	// selection is preliminary routing, not a placement feasibility result.
+	Scheduling *SchedulingDiagnostics
 
 	// SurgeShaped records the simulated execution shape. Defragmentation
 	// has one executable Alpha shape: OMENative place-then-free surge.
@@ -121,6 +124,17 @@ type Candidate struct {
 	// Emergency marks a candidate whose move unblocks a pending pod older
 	// than emergencyPendingAgeMinutes.
 	Emergency bool
+}
+
+// SchedulingDiagnostics records bounded scheduling outcomes separately from
+// an advisory's original cause. The engine never reports backend payloads.
+type SchedulingDiagnostics struct {
+	SchedulerName    string `json:"schedulerName,omitempty"`
+	Backend          string `json:"backend,omitempty"`
+	SchedulerVersion string `json:"schedulerVersion,omitempty"`
+	ConfigurationID  string `json:"configurationID,omitempty"`
+	Status           string `json:"status"`
+	Reason           string `json:"reason"`
 }
 
 // Policy is a pluggable decision module: a pure function of the snapshot.

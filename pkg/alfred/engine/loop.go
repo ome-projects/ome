@@ -85,6 +85,9 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 	for _, p := range l.Policies {
 		candidates = append(candidates, p.Evaluate(snap, cfg)...)
 	}
+	for i, candidate := range candidates {
+		candidates[i] = gateSchedulingCandidate(snap, cfg, candidate)
+	}
 	decisions := l.Arbiter.Admit(snap, candidates, cfg, l.now())
 
 	if l.Arbiter.Ledger != nil && l.Arbiter.Ledger.BreakerOpen(l.now()) {

@@ -94,6 +94,8 @@ type recommendationView struct {
 	Score          float64  `json:"score"`
 	Emergency      bool     `json:"emergency,omitempty"`
 	CooldownOver   bool     `json:"cooldownOverridden,omitempty"`
+
+	Scheduling *policy.SchedulingDiagnostics `json:"scheduling,omitempty"`
 }
 
 // ReportCycle publishes one decision pass: produced/accepted/rejected
@@ -127,6 +129,7 @@ func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidat
 			HintTargets:    c.HintTargetNodes,
 			Score:          c.Score,
 			Emergency:      c.Emergency,
+			Scheduling:     c.Scheduling,
 		}
 
 		if !c.Executable {
