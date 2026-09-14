@@ -109,12 +109,12 @@ func Project(
 	)
 	reportValue.Sources = append(reportValue.Sources, reportv1alpha1.AcceleratorSourceReference{
 		Kind: "InferenceService", Namespace: isvc.Namespace, Name: isvc.Name,
-		UID: string(isvc.UID), Generation: isvc.Generation, Evidence: reportv1alpha1.EvidenceObserved,
+		Generation: isvc.Generation, Evidence: reportv1alpha1.EvidenceObserved,
 	})
 	if base.ActiveSourceName != "" {
 		reportValue.Sources = append(reportValue.Sources, reportv1alpha1.AcceleratorSourceReference{
 			Kind: base.ActiveSourceKind, Namespace: base.ActiveSourceNamespace,
-			Name: base.ActiveSourceName, UID: base.ActiveSourceUID,
+			Name:       base.ActiveSourceName,
 			Generation: base.ActiveSourceGeneration, Evidence: reportv1alpha1.EvidenceObserved,
 		})
 	}
@@ -164,25 +164,27 @@ func projectComponent(
 		},
 		Class: reportv1alpha1.AcceleratorClassObservation{State: reportv1alpha1.AcceleratorClassNotRequested},
 		Requests: reportv1alpha1.AcceleratorRequestObservation{
-			State: reportv1alpha1.AcceleratorRequestsUnavailable,
-			Base:  mapBaseRequests(baseComponent.Requests), Effective: []reportv1alpha1.AcceleratorResourceRequest{},
+			BaseState:      mapBaseRequestState(baseComponent.State),
+			Base:           mapBaseRequests(baseComponent.Requests),
+			EffectiveState: reportv1alpha1.AcceleratorRequestsUnavailable,
+			Effective:      []reportv1alpha1.AcceleratorResourceRequest{},
 		},
 		Issues: append([]reportv1alpha1.AcceleratorExplainIssueCode{}, intentIssues...),
 	}
 	configured := intent.State != reportv1alpha1.AcceleratorIntentNotConfigured
 	status := isvc.Status.Components[baseComponent.Type].SelectedAccelerator
-	if baseComponent.State == effective.AcceleratorBaseInvalid {
+	switch baseComponent.State {
+	case effective.AcceleratorBaseUnavailable:
 		component.Requests.Base = []reportv1alpha1.AcceleratorResourceRequest{}
-		component.Requests.State = reportv1alpha1.AcceleratorRequestsInvalid
-		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueRequestsInvalid)
-	}
-	if !configured && status == nil {
-		component.Selection.State = reportv1alpha1.AcceleratorSelectionNotConfigured
-		component.Selection.Reason.State = reportv1alpha1.AcceleratorReasonNotReported
-		if baseComponent.State != effective.AcceleratorBaseInvalid {
-			component.Requests.State = reportv1alpha1.AcceleratorRequestsNotConfigured
+		if base.ActiveState != effective.AcceleratorActiveUnavailable {
+			component.Issues = append(
+				component.Issues,
+				reportv1alpha1.AcceleratorIssueBaseRequestsUnavailable,
+			)
 		}
-		return canonicalComponent(component), ""
+	case effective.AcceleratorBaseInvalid:
+		component.Requests.Base = []reportv1alpha1.AcceleratorResourceRequest{}
+		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueRequestsInvalid)
 	}
 	if base.ActiveState == effective.AcceleratorActiveInconsistent {
 		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueActiveRevisionInconsistent)
@@ -190,6 +192,14 @@ func projectComponent(
 	if base.ActiveState == effective.AcceleratorActiveUnavailable {
 		component.Issues = append(component.Issues,
 			reportv1alpha1.AcceleratorIssueActiveConfigurationUnavailable)
+	}
+	if !configured && status == nil {
+		component.Selection.State = reportv1alpha1.AcceleratorSelectionNotConfigured
+		component.Selection.Reason.State = reportv1alpha1.AcceleratorReasonNotReported
+		component.Requests.EffectiveState = reportv1alpha1.AcceleratorRequestsNotConfigured
+		return canonicalComponent(component), ""
+	}
+	if base.ActiveState == effective.AcceleratorActiveUnavailable {
 		if !configured && status != nil {
 			component.Issues = append(component.Issues,
 				reportv1alpha1.AcceleratorIssueSelectionUnexpected)
@@ -206,7 +216,7 @@ func projectComponent(
 	case effective.StatusFreshnessInconsistent:
 		component.Selection.State = reportv1alpha1.AcceleratorSelectionInvalid
 		component.Selection.Reason.State = reportv1alpha1.AcceleratorReasonInvalid
-		component.Requests.State = reportv1alpha1.AcceleratorRequestsInvalid
+		component.Requests.EffectiveState = reportv1alpha1.AcceleratorRequestsInvalid
 		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueStatusInvalid)
 		return canonicalComponent(component), ""
 	case effective.StatusFreshnessCurrent:
@@ -219,7 +229,7 @@ func projectComponent(
 		if !configured {
 			component.Selection.State = reportv1alpha1.AcceleratorSelectionNotConfigured
 			component.Selection.Reason.State = reportv1alpha1.AcceleratorReasonNotReported
-			component.Requests.State = reportv1alpha1.AcceleratorRequestsNotConfigured
+			component.Requests.EffectiveState = reportv1alpha1.AcceleratorRequestsNotConfigured
 			return canonicalComponent(component), ""
 		}
 		component.Selection.State = reportv1alpha1.AcceleratorSelectionNotReported
@@ -233,7 +243,7 @@ func projectComponent(
 	if !classValid || !nodeSelectorValid || !requestsValid {
 		component.Selection.State = reportv1alpha1.AcceleratorSelectionInvalid
 		component.Selection.Reason.State = reportv1alpha1.AcceleratorReasonInvalid
-		component.Requests.State = reportv1alpha1.AcceleratorRequestsInvalid
+		component.Requests.EffectiveState = reportv1alpha1.AcceleratorRequestsInvalid
 		if !requestsValid {
 			component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueRequestsInvalid)
 		}
@@ -249,12 +259,12 @@ func projectComponent(
 	component.Selection.Class = status.AcceleratorClass
 	component.Selection.Reason = projectReason(status.Reason)
 	if status.ResourceRequests == nil {
-		component.Requests.State = reportv1alpha1.AcceleratorRequestsNotReported
+		component.Requests.EffectiveState = reportv1alpha1.AcceleratorRequestsNotReported
 		component.Issues = append(
 			component.Issues, reportv1alpha1.AcceleratorIssueRequestsNotReported,
 		)
 	} else {
-		component.Requests.State = reportv1alpha1.AcceleratorRequestsReported
+		component.Requests.EffectiveState = reportv1alpha1.AcceleratorRequestsReported
 		component.Requests.Effective = requests
 	}
 	if !configured {
@@ -611,9 +621,24 @@ func classSource(evidence AcceleratorClassEvidence) reportv1alpha1.AcceleratorSo
 		level = reportv1alpha1.EvidenceUnavailable
 	}
 	return reportv1alpha1.AcceleratorSourceReference{
-		Kind: "AcceleratorClass", Name: evidence.name, UID: evidence.uid,
+		Kind: "AcceleratorClass", Name: evidence.name,
 		Generation: evidence.generation, Evidence: level,
 		UnavailableReason: evidence.unavailableReason,
+	}
+}
+
+func mapBaseRequestState(
+	state effective.AcceleratorBaseState,
+) reportv1alpha1.AcceleratorBaseRequestState {
+	switch state {
+	case effective.AcceleratorBaseAvailable:
+		return reportv1alpha1.AcceleratorBaseRequestsAvailable
+	case effective.AcceleratorBaseUnavailable:
+		return reportv1alpha1.AcceleratorBaseRequestsUnavailable
+	case effective.AcceleratorBaseInvalid:
+		return reportv1alpha1.AcceleratorBaseRequestsInvalid
+	default:
+		return reportv1alpha1.AcceleratorBaseRequestsInvalid
 	}
 }
 
@@ -728,14 +753,20 @@ func summarize(content reportv1alpha1.AcceleratorExplainContent) reportv1alpha1.
 	hasIssue := len(content.Issues) > 0
 	for _, component := range content.Components {
 		if component.Intent.State != reportv1alpha1.AcceleratorIntentNotConfigured ||
-			component.Selection.State != reportv1alpha1.AcceleratorSelectionNotConfigured {
+			component.Selection.State != reportv1alpha1.AcceleratorSelectionNotConfigured ||
+			component.Requests.BaseState != reportv1alpha1.AcceleratorBaseRequestsAvailable ||
+			component.Requests.EffectiveState != reportv1alpha1.AcceleratorRequestsNotConfigured {
 			allNotConfigured = false
 		}
 		if component.Intent.State == reportv1alpha1.AcceleratorIntentInvalid ||
 			component.Selection.State == reportv1alpha1.AcceleratorSelectionInvalid ||
-			component.Requests.State == reportv1alpha1.AcceleratorRequestsInvalid ||
+			component.Requests.BaseState == reportv1alpha1.AcceleratorBaseRequestsInvalid ||
+			component.Requests.EffectiveState == reportv1alpha1.AcceleratorRequestsInvalid ||
 			component.Class.State == reportv1alpha1.AcceleratorClassInvalid {
 			hasInvalid = true
+		}
+		if component.Requests.BaseState == reportv1alpha1.AcceleratorBaseRequestsUnavailable {
+			hasIssue = true
 		}
 		if len(component.Issues) > 0 {
 			hasIssue = true
@@ -763,7 +794,9 @@ func warningsFor(content reportv1alpha1.AcceleratorExplainContent) []reportv1alp
 		switch issue.Code {
 		case reportv1alpha1.AcceleratorIssueStatusStale:
 			warnings = append(warnings, reportv1alpha1.AcceleratorWarning{Code: reportv1alpha1.AcceleratorWarningStaleEvidence})
-		case reportv1alpha1.AcceleratorIssueClassForbidden,
+		case reportv1alpha1.AcceleratorIssueActiveConfigurationUnavailable,
+			reportv1alpha1.AcceleratorIssueBaseRequestsUnavailable,
+			reportv1alpha1.AcceleratorIssueClassForbidden,
 			reportv1alpha1.AcceleratorIssueClassNotFound,
 			reportv1alpha1.AcceleratorIssueClassUnreadable,
 			reportv1alpha1.AcceleratorIssueClassUnsupportedAPI:

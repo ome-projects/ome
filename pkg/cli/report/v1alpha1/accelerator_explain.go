@@ -87,11 +87,20 @@ const (
 	AcceleratorRequestsInvalid       AcceleratorRequestState = "Invalid"
 )
 
+type AcceleratorBaseRequestState string
+
+const (
+	AcceleratorBaseRequestsAvailable   AcceleratorBaseRequestState = "Available"
+	AcceleratorBaseRequestsUnavailable AcceleratorBaseRequestState = "Unavailable"
+	AcceleratorBaseRequestsInvalid     AcceleratorBaseRequestState = "Invalid"
+)
+
 type AcceleratorExplainIssueCode string
 
 const (
 	AcceleratorIssueActiveConfigurationUnavailable AcceleratorExplainIssueCode = "ActiveConfigurationUnavailable"
 	AcceleratorIssueActiveRevisionInconsistent     AcceleratorExplainIssueCode = "ActiveRevisionInconsistent"
+	AcceleratorIssueBaseRequestsUnavailable        AcceleratorExplainIssueCode = "BaseRequestsUnavailable"
 	AcceleratorIssueClassForbidden                 AcceleratorExplainIssueCode = "ClassForbidden"
 	AcceleratorIssueClassInvalid                   AcceleratorExplainIssueCode = "ClassInvalid"
 	AcceleratorIssueClassNotFound                  AcceleratorExplainIssueCode = "ClassNotFound"
@@ -127,7 +136,6 @@ type AcceleratorSourceReference struct {
 	Kind              string            `json:"kind"`
 	Namespace         string            `json:"namespace,omitempty"`
 	Name              string            `json:"name"`
-	UID               string            `json:"uid,omitempty"`
 	Generation        int64             `json:"generation,omitempty"`
 	Evidence          EvidenceLevel     `json:"evidence"`
 	CollectedAt       time.Time         `json:"collectedAt"`
@@ -169,9 +177,10 @@ type AcceleratorResourceRequest struct {
 }
 
 type AcceleratorRequestObservation struct {
-	State     AcceleratorRequestState      `json:"state"`
-	Base      []AcceleratorResourceRequest `json:"base"`
-	Effective []AcceleratorResourceRequest `json:"effective"`
+	BaseState      AcceleratorBaseRequestState  `json:"baseState"`
+	Base           []AcceleratorResourceRequest `json:"base"`
+	EffectiveState AcceleratorRequestState      `json:"effectiveState"`
+	Effective      []AcceleratorResourceRequest `json:"effective"`
 }
 
 type AcceleratorExplainComponent struct {
@@ -256,7 +265,6 @@ func (r AcceleratorExplainReport) WideTable() report.Table {
 		}
 		table.Rows = append(table.Rows,
 			[]string{"SOURCE", source.Kind, "NAME", name, evidence},
-			[]string{"SOURCE", source.Kind, "UID", printers.OrDash(source.UID), evidence},
 			[]string{
 				"SOURCE", source.Kind, "GENERATION",
 				optionalAcceleratorGeneration(source.Generation), evidence,
@@ -378,15 +386,19 @@ func (c AcceleratorExplainContent) WideTable() report.Table {
 			})
 		}
 		table.Rows = append(table.Rows, []string{
-			"REQUEST", comp, "STATE", string(component.Requests.State),
-			requestEvidence(component.Requests.State),
+			"REQUEST", comp, "BASE_STATE", string(component.Requests.BaseState),
+			baseRequestEvidence(component.Requests.BaseState),
 		})
-		if len(component.Requests.Base) > 0 {
+		if component.Requests.BaseState == AcceleratorBaseRequestsAvailable {
 			table.Rows = append(table.Rows, []string{
 				"REQUEST", comp, "BASE", joinAcceleratorRequests(component.Requests.Base), "Computed",
 			})
 		}
-		if component.Requests.State == AcceleratorRequestsReported {
+		table.Rows = append(table.Rows, []string{
+			"REQUEST", comp, "EFFECTIVE_STATE", string(component.Requests.EffectiveState),
+			requestEvidence(component.Requests.EffectiveState),
+		})
+		if component.Requests.EffectiveState == AcceleratorRequestsReported {
 			table.Rows = append(table.Rows, []string{
 				"REQUEST", comp, "EFFECTIVE", joinAcceleratorRequests(component.Requests.Effective), "Reported",
 			})
@@ -424,19 +436,25 @@ func compactAcceleratorSelection(state AcceleratorSelectionState) string {
 }
 
 func compactAcceleratorRequests(requests AcceleratorRequestObservation) string {
+	switch requests.BaseState {
+	case AcceleratorBaseRequestsUnavailable:
+		return "base:Unknown"
+	case AcceleratorBaseRequestsInvalid:
+		return "base:Invalid"
+	}
 	if len(requests.Effective) > 0 {
 		return compactAcceleratorRequestList(requests.Effective)
 	}
 	if len(requests.Base) > 0 {
 		return printers.BoundedCell("base:"+compactAcceleratorRequestList(requests.Base), 18)
 	}
-	switch requests.State {
+	switch requests.EffectiveState {
 	case AcceleratorRequestsNotConfigured:
 		return "None"
 	case AcceleratorRequestsNotReported, AcceleratorRequestsUnavailable:
 		return "Unknown"
 	default:
-		return printers.OrDash(string(requests.State))
+		return printers.OrDash(string(requests.EffectiveState))
 	}
 }
 
@@ -527,6 +545,13 @@ func requestEvidence(state AcceleratorRequestState) string {
 	}
 }
 
+func baseRequestEvidence(state AcceleratorBaseRequestState) string {
+	if state == AcceleratorBaseRequestsAvailable {
+		return "Computed"
+	}
+	return "Unavailable"
+}
+
 func optionalAcceleratorGeneration(generation int64) string {
 	if generation == 0 {
 		return "-"
@@ -580,7 +605,7 @@ func allAcceleratorIssues(content AcceleratorExplainContent) []AcceleratorExplai
 
 func acceleratorSourceKey(source AcceleratorSourceReference) string {
 	return strings.Join([]string{
-		source.Kind, source.Namespace, source.Name, source.UID,
+		source.Kind, source.Namespace, source.Name,
 		strconv.FormatInt(source.Generation, 10), string(source.Evidence),
 		source.CollectedAt.Format(time.RFC3339Nano), string(source.UnavailableReason),
 	}, "\x00")

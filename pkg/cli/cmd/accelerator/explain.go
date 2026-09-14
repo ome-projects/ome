@@ -309,7 +309,7 @@ func safePrimaryReadError(
 	switch {
 	case apierrors.IsForbidden(cause), apierrors.IsUnauthorized(cause):
 		classification = primaryReadForbidden
-	case unsupportedPrimaryAPI(cause):
+	case unsupportedAPIRead(cause):
 		classification = primaryReadUnsupportedAPI
 	case apierrors.IsNotFound(cause):
 		classification = primaryReadNotFound
@@ -322,7 +322,7 @@ func safePrimaryReadError(
 	}
 }
 
-func unsupportedPrimaryAPI(err error) bool {
+func unsupportedAPIRead(err error) bool {
 	if !apierrors.IsNotFound(err) {
 		return false
 	}
@@ -432,7 +432,7 @@ func unavailableClassEvidence(
 	switch {
 	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
 		state = reportv1alpha1.AcceleratorClassForbidden
-	case apierrors.IsNotFound(err) && strings.Contains(err.Error(), "server could not find the requested resource"):
+	case unsupportedAPIRead(err):
 		state = reportv1alpha1.AcceleratorClassUnsupportedAPI
 	case apierrors.IsNotFound(err):
 		state = reportv1alpha1.AcceleratorClassNotFound

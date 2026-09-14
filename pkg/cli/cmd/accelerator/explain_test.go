@@ -247,7 +247,7 @@ func TestExplainUsesBoundControllerRevisionForPinAwareBaseRequests(t *testing.T)
 	}}, got.Content.Components[0].Requests.Base)
 	assert.Contains(t, got.Sources, reportv1alpha1.AcceleratorSourceReference{
 		Kind: "ControllerRevision", Namespace: "control-plane", Name: revisionName,
-		UID: "revision-uid", Evidence: reportv1alpha1.EvidenceObserved,
+		Evidence:    reportv1alpha1.EvidenceObserved,
 		CollectedAt: fixedCommandClock().Now(),
 	})
 }
@@ -285,6 +285,7 @@ func TestExplainNeverEmitsArbitraryServiceRuntimeOrClassPayloads(t *testing.T) {
 	assert.NotContains(t, output.String(), secret)
 	assert.NotContains(t, output.String(), "private.example/token")
 	assert.NotContains(t, output.String(), "resourceVersion")
+	assert.NotContains(t, strings.ToLower(output.String()), "uid")
 	assert.Contains(t, output.String(), `"digest": "rs1:`)
 }
 
@@ -345,8 +346,10 @@ func TestExplainProductionProjectionPreservesBaseRequestsWithoutSelector(t *test
 			component := got.Content.Components[0]
 			assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotConfigured,
 				component.Selection.State)
+			assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsAvailable,
+				component.Requests.BaseState)
 			assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured,
-				component.Requests.State)
+				component.Requests.EffectiveState)
 			assert.Equal(t, tt.want, component.Requests.Base)
 		})
 	}
@@ -370,12 +373,15 @@ func TestExplainProductionWideShowsAbsentRequestEvidenceAndProvenance(t *testing
 	require.NoError(t, cmd.Execute())
 	assert.Contains(t, output.String(), "STATUS_FRESHNESS")
 	assert.Contains(t, output.String(), "REASON_STATE")
+	assert.Contains(t, output.String(), "BASE_STATE")
+	assert.Contains(t, output.String(), "EFFECTIVE_STATE")
 	assert.Contains(t, output.String(), "NotReported")
 	assert.Contains(t, output.String(), "RequestsNotReported")
 	assert.Contains(t, output.String(), "SOURCE")
 	assert.Contains(t, output.String(), "InferenceService")
 	assert.Contains(t, output.String(), "WARNING")
-	assert.NotContains(t, output.String(), "EFFECTIVE")
+	assert.NotContains(t, output.String(), "UID")
+	assert.NotContains(t, output.String(), "example.com/gpu=1")
 }
 
 func TestExplainStaleStatusSkipsAcceleratorClassRead(t *testing.T) {
@@ -454,8 +460,14 @@ func TestExplainMissingRuntimeRemainsUnavailableInsteadOfFailing(t *testing.T) {
 	require.NoError(t, err)
 	var got reportv1alpha1.AcceleratorExplainReport
 	require.NoError(t, json.Unmarshal(output.Bytes(), &got))
-	assert.Equal(t, reportv1alpha1.AcceleratorExplainNotConfigured, got.Content.Summary.State)
-	assert.Empty(t, got.Content.Components[0].Issues)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainPartial, got.Content.Summary.State)
+	component := got.Content.Components[0]
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsUnavailable,
+		component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured,
+		component.Requests.EffectiveState)
+	assert.Contains(t, component.Issues,
+		reportv1alpha1.AcceleratorIssueActiveConfigurationUnavailable)
 }
 
 func TestExplainUnverifiableRuntimeSkipsReportedClassJoin(t *testing.T) {
@@ -482,6 +494,8 @@ func TestExplainUnverifiableRuntimeSkipsReportedClassJoin(t *testing.T) {
 	require.NoError(t, json.Unmarshal(output.Bytes(), &got))
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionUnavailable,
 		got.Content.Components[0].Selection.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsUnavailable,
+		got.Content.Components[0].Requests.BaseState)
 	assert.Empty(t, got.Content.Components[0].Selection.Class)
 }
 
@@ -492,10 +506,20 @@ func TestExplainClassReadFailuresAreTypedAndDoNotEchoServerMessages(t *testing.T
 		err  error
 		want reportv1alpha1.AcceleratorClassState
 	}{
-		{name: "not found", err: apierrors.NewNotFound(schema.GroupResource{Group: "ome.io", Resource: "acceleratorclasses"}, "gpu-a"), want: reportv1alpha1.AcceleratorClassNotFound},
-		{name: "unsupported API", err: &apierrors.StatusError{ErrStatus: metav1.Status{
-			Reason: metav1.StatusReasonNotFound, Message: "the server could not find the requested resource",
-		}}, want: reportv1alpha1.AcceleratorClassUnsupportedAPI},
+		{name: "object not found despite hostile unsupported phrase", err: &apierrors.StatusError{
+			ErrStatus: metav1.Status{
+				Reason:  metav1.StatusReasonNotFound,
+				Message: "the server could not find the requested resource: " + secret,
+				Details: &metav1.StatusDetails{
+					Name: "gpu-a", Group: "ome.io", Kind: "acceleratorclasses",
+				},
+			},
+		}, want: reportv1alpha1.AcceleratorClassNotFound},
+		{name: "unsupported API", err: apierrors.NewGenericServerResponse(
+			404, "get",
+			schema.GroupResource{Group: "ome.io", Resource: "acceleratorclasses"},
+			"", secret, 0, true,
+		), want: reportv1alpha1.AcceleratorClassUnsupportedAPI},
 		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Group: "ome.io", Resource: "acceleratorclasses"}, "gpu-a", errors.New(secret)), want: reportv1alpha1.AcceleratorClassForbidden},
 		{name: "unreadable", err: errors.New(secret), want: reportv1alpha1.AcceleratorClassUnreadable},
 	}
@@ -640,6 +664,7 @@ func TestExplainFormatsShareOneTypedProjection(t *testing.T) {
 			require.NoError(t, cmd.Execute())
 			assert.NotEmpty(t, output.String())
 			assert.NotContains(t, output.String(), "resourceVersion")
+			assert.NotContains(t, strings.ToLower(output.String()), "uid")
 			switch format {
 			case "table":
 				assert.Contains(t, output.String(), "COMP")

@@ -46,7 +46,8 @@ func TestProjectReportsCurrentSelectionAndRedactedReason(t *testing.T) {
 	assert.Equal(t, reportv1alpha1.AcceleratorReasonReported, component.Selection.Reason.State)
 	assert.Equal(t, "rs1:09963eb2e26c", component.Selection.Reason.Digest)
 	assert.Equal(t, reportv1alpha1.AcceleratorClassObserved, component.Class.State)
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsReported, component.Requests.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsAvailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsReported, component.Requests.EffectiveState)
 	assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{
 		{Name: "example.com/gpu", Quantity: "1"}, {Name: "memory", Quantity: "8Gi"},
 	}, component.Requests.Effective)
@@ -55,11 +56,12 @@ func TestProjectReportsCurrentSelectionAndRedactedReason(t *testing.T) {
 	assert.Equal(t, "AcceleratorClass", got.Sources[0].Kind)
 	assert.Equal(t, "InferenceService", got.Sources[1].Kind)
 	assert.Equal(t, "ServingRuntime", got.Sources[2].Kind)
-	assert.Equal(t, "runtime-uid", got.Sources[2].UID)
+	assert.Equal(t, int64(2), got.Sources[2].Generation)
 	data, err := json.Marshal(got)
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "selected by policy")
 	assert.NotContains(t, string(data), "resourceVersion")
+	assert.NotContains(t, string(data), "uid")
 }
 
 func TestProjectSelectionWithoutRequestsPreservesClassAndReportsAbsence(t *testing.T) {
@@ -95,7 +97,8 @@ func TestProjectSelectionWithoutRequestsPreservesClassAndReportsAbsence(t *testi
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionReported, component.Selection.State)
 	assert.Equal(t, "gpu-a", component.Selection.Class)
 	assert.Equal(t, reportv1alpha1.AcceleratorClassObserved, component.Class.State)
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotReported, component.Requests.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsAvailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotReported, component.Requests.EffectiveState)
 	assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
 		component.Requests.Base)
 	assert.Empty(t, component.Requests.Effective)
@@ -131,7 +134,8 @@ func TestProjectExplicitEmptyRequestsRemainReported(t *testing.T) {
 
 	require.NoError(t, err)
 	component := got.Content.Components[0]
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsReported, component.Requests.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsAvailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsReported, component.Requests.EffectiveState)
 	assert.Empty(t, component.Requests.Effective)
 	assert.NotContains(t, component.Issues, reportv1alpha1.AcceleratorIssueRequestsNotReported)
 	assert.Equal(t, reportv1alpha1.AcceleratorExplainReported, got.Content.Summary.State)
@@ -228,7 +232,8 @@ func TestProjectConfiguredButUnreportedSelectionRemainsUnknown(t *testing.T) {
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectorSourceComponent, component.Intent.ClassSource)
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotReported, component.Selection.State)
 	assert.Empty(t, component.Selection.Class)
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsUnavailable, component.Requests.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsAvailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsUnavailable, component.Requests.EffectiveState)
 	assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}}, component.Requests.Base)
 	assert.Contains(t, component.Issues, reportv1alpha1.AcceleratorIssueSelectionNotReported)
 }
@@ -321,7 +326,7 @@ func TestProjectAcceptsBoundControllerRevisionBase(t *testing.T) {
 		got.Content.Summary.State)
 	assert.Contains(t, got.Sources, reportv1alpha1.AcceleratorSourceReference{
 		Kind: "ControllerRevision", Namespace: "ome", Name: "revision-a",
-		UID: "revision-uid", Evidence: reportv1alpha1.EvidenceObserved,
+		Evidence:    reportv1alpha1.EvidenceObserved,
 		CollectedAt: fixedClock().Now(),
 	})
 }
@@ -430,13 +435,14 @@ func TestProjectNoIntentAndNoStatusIsNotConfigured(t *testing.T) {
 	component := got.Content.Components[0]
 	assert.Equal(t, reportv1alpha1.AcceleratorIntentNotConfigured, component.Intent.State)
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotConfigured, component.Selection.State)
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsAvailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.EffectiveState)
 	assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
 		component.Requests.Base)
 	assert.Empty(t, component.Issues)
 }
 
-func TestProjectNoIntentIgnoresUnavailableRuntimeThatCannotAffectSelection(t *testing.T) {
+func TestProjectNoIntentPreservesUnavailableRuntimeEvidence(t *testing.T) {
 	isvc := acceleratorProjectionISVC()
 	base := effective.AcceleratorBaseResolution{
 		StatusFreshness: effective.StatusFreshnessCurrent,
@@ -450,8 +456,28 @@ func TestProjectNoIntentIgnoresUnavailableRuntimeThatCannotAffectSelection(t *te
 	got, err := Project(isvc, base, nil, fixedClock())
 
 	require.NoError(t, err)
-	assert.Equal(t, reportv1alpha1.AcceleratorExplainNotConfigured, got.Content.Summary.State)
-	assert.Empty(t, got.Content.Components[0].Issues)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainPartial, got.Content.Summary.State)
+	component := got.Content.Components[0]
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsUnavailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.EffectiveState)
+	assert.Contains(t, component.Issues,
+		reportv1alpha1.AcceleratorIssueActiveConfigurationUnavailable)
+}
+
+func TestProjectNoIntentPreservesUnavailableComponentEvidence(t *testing.T) {
+	isvc := acceleratorProjectionISVC()
+	base := acceleratorBaseFixture(effective.AcceleratorActiveAvailable, false)
+	base.Components[0].State = effective.AcceleratorBaseUnavailable
+	base.Components[0].Requests = []effective.AcceleratorBaseRequest{}
+
+	got, err := Project(isvc, base, nil, fixedClock())
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainPartial, got.Content.Summary.State)
+	component := got.Content.Components[0]
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsUnavailable, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.EffectiveState)
+	assert.Contains(t, component.Issues, reportv1alpha1.AcceleratorIssueBaseRequestsUnavailable)
 }
 
 func TestProjectNoIntentKeepsIndependentBaseDiagnostics(t *testing.T) {
@@ -468,10 +494,72 @@ func TestProjectNoIntentKeepsIndependentBaseDiagnostics(t *testing.T) {
 	assert.Equal(t, reportv1alpha1.AcceleratorExplainInvalid, got.Content.Summary.State)
 	component := got.Content.Components[0]
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotConfigured, component.Selection.State)
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsInvalid, component.Requests.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorBaseRequestsInvalid, component.Requests.BaseState)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.EffectiveState)
 	assert.Equal(t, []reportv1alpha1.AcceleratorExplainIssueCode{
 		reportv1alpha1.AcceleratorIssueRequestsInvalid,
 	}, component.Issues)
+}
+
+func TestProjectCurrentSelectionPreservesBaseRequestEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		baseState   effective.AcceleratorBaseState
+		wantBase    reportv1alpha1.AcceleratorBaseRequestState
+		wantSummary reportv1alpha1.AcceleratorExplainState
+		wantIssue   reportv1alpha1.AcceleratorExplainIssueCode
+	}{
+		{
+			name: "unavailable", baseState: effective.AcceleratorBaseUnavailable,
+			wantBase:    reportv1alpha1.AcceleratorBaseRequestsUnavailable,
+			wantSummary: reportv1alpha1.AcceleratorExplainPartial,
+			wantIssue:   reportv1alpha1.AcceleratorIssueBaseRequestsUnavailable,
+		},
+		{
+			name: "invalid", baseState: effective.AcceleratorBaseInvalid,
+			wantBase:    reportv1alpha1.AcceleratorBaseRequestsInvalid,
+			wantSummary: reportv1alpha1.AcceleratorExplainInvalid,
+			wantIssue:   reportv1alpha1.AcceleratorIssueRequestsInvalid,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isvc := acceleratorProjectionISVC()
+			isvc.Spec.AcceleratorSelector = &omev1beta1.AcceleratorSelector{
+				Policy: omev1beta1.CheapestPolicy,
+			}
+			isvc.Status.Components = map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
+				omev1beta1.EngineComponent: {
+					SelectedAccelerator: &omev1beta1.AcceleratorSelection{
+						AcceleratorClass: "gpu-a",
+						ResourceRequests: map[string]string{"example.com/gpu": "1"},
+					},
+				},
+			}
+			base := acceleratorBaseFixture(effective.AcceleratorActiveAvailable, true)
+			base.Components[0].State = test.baseState
+			base.Components[0].Requests = []effective.AcceleratorBaseRequest{}
+			class, classErr := ObserveAcceleratorClass(&omev1beta1.AcceleratorClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "gpu-a", UID: "class-uid", ResourceVersion: "9", Generation: 2,
+				},
+			})
+			require.NoError(t, classErr)
+
+			got, err := Project(isvc, base,
+				map[string]AcceleratorClassEvidence{"gpu-a": class}, fixedClock())
+
+			require.NoError(t, err)
+			component := got.Content.Components[0]
+			assert.Equal(t, test.wantBase, component.Requests.BaseState)
+			assert.Equal(t, reportv1alpha1.AcceleratorRequestsReported,
+				component.Requests.EffectiveState)
+			assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{{
+				Name: "example.com/gpu", Quantity: "1",
+			}}, component.Requests.Effective)
+			assert.Contains(t, component.Issues, test.wantIssue)
+			assert.Equal(t, test.wantSummary, got.Content.Summary.State)
+		})
+	}
 }
 
 func TestProjectUnavailableRuntimeSuppressesApparentlyCurrentStatus(t *testing.T) {

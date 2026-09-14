@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
@@ -33,9 +34,10 @@ func TestAcceleratorExplainCanonicalAndCompactTable(t *testing.T) {
 					State: AcceleratorClassObserved, Name: "nvidia-h100-80gb",
 				},
 				Requests: AcceleratorRequestObservation{
-					State:     AcceleratorRequestsReported,
-					Base:      []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
-					Effective: []AcceleratorResourceRequest{{Name: "nvidia.com/gpu", Quantity: "1"}},
+					BaseState:      AcceleratorBaseRequestsAvailable,
+					Base:           []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+					EffectiveState: AcceleratorRequestsReported,
+					Effective:      []AcceleratorResourceRequest{{Name: "nvidia.com/gpu", Quantity: "1"}},
 				},
 				Issues: []AcceleratorExplainIssueCode{},
 			},
@@ -53,11 +55,12 @@ func TestAcceleratorExplainCanonicalAndCompactTable(t *testing.T) {
 					State: AcceleratorClassObserved, Name: "nvidia-a100-80gb",
 				},
 				Requests: AcceleratorRequestObservation{
-					State: AcceleratorRequestsReported,
+					BaseState: AcceleratorBaseRequestsAvailable,
 					Base: []AcceleratorResourceRequest{
 						{Name: "memory", Quantity: "8Gi"}, {Name: "cpu", Quantity: "1"},
 					},
-					Effective: []AcceleratorResourceRequest{{Name: "nvidia.com/gpu", Quantity: "1"}},
+					EffectiveState: AcceleratorRequestsReported,
+					Effective:      []AcceleratorResourceRequest{{Name: "nvidia.com/gpu", Quantity: "1"}},
 				},
 				Issues: []AcceleratorExplainIssueCode{},
 			},
@@ -102,9 +105,12 @@ func TestAcceleratorExplainMachineSchemaNeverCarriesRawReason(t *testing.T) {
 				PolicySource: AcceleratorSelectorSourceService},
 			Selection: AcceleratorSelectionObservation{State: AcceleratorSelectionUnavailable,
 				Reason: AcceleratorReason{State: AcceleratorReasonUnavailable}},
-			Class:    AcceleratorClassObservation{State: AcceleratorClassNotRequested},
-			Requests: AcceleratorRequestObservation{State: AcceleratorRequestsUnavailable},
-			Issues:   []AcceleratorExplainIssueCode{AcceleratorIssueStatusStale},
+			Class: AcceleratorClassObservation{State: AcceleratorClassNotRequested},
+			Requests: AcceleratorRequestObservation{
+				BaseState:      AcceleratorBaseRequestsUnavailable,
+				EffectiveState: AcceleratorRequestsUnavailable,
+			},
+			Issues: []AcceleratorExplainIssueCode{AcceleratorIssueStatusStale},
 		}},
 		Issues: []AcceleratorExplainIssue{{Code: AcceleratorIssueStatusStale, Component: RuntimeComponentEngine}},
 	}, ClockFunc(func() time.Time { return time.Unix(0, 0) }))
@@ -130,9 +136,10 @@ func TestAcceleratorExplainWideTableIsCompleteAndDeterministic(t *testing.T) {
 		},
 		Class: AcceleratorClassObservation{State: AcceleratorClassForbidden, Name: "gpu-a"},
 		Requests: AcceleratorRequestObservation{
-			State:     AcceleratorRequestsReported,
-			Base:      []AcceleratorResourceRequest{{Name: "cpu", Quantity: "1"}},
-			Effective: []AcceleratorResourceRequest{{Name: "example.com/gpu", Quantity: "2"}},
+			BaseState:      AcceleratorBaseRequestsAvailable,
+			Base:           []AcceleratorResourceRequest{{Name: "cpu", Quantity: "1"}},
+			EffectiveState: AcceleratorRequestsReported,
+			Effective:      []AcceleratorResourceRequest{{Name: "example.com/gpu", Quantity: "2"}},
 		},
 		Issues: []AcceleratorExplainIssueCode{AcceleratorIssueClassForbidden},
 	}
@@ -152,7 +159,7 @@ func TestAcceleratorExplainWideTableIsCompleteAndDeterministic(t *testing.T) {
 		ClockFunc(func() time.Time { return collectedAt }),
 	)
 	reportValue.Sources = []AcceleratorSourceReference{
-		{Kind: "InferenceService", Namespace: "prod", Name: "chat", UID: "isvc-uid",
+		{Kind: "InferenceService", Namespace: "prod", Name: "chat",
 			Generation: 4, Evidence: EvidenceObserved},
 		{Kind: "AcceleratorClass", Name: "gpu-a", Evidence: EvidenceUnavailable,
 			UnavailableReason: UnavailableForbidden},
@@ -185,19 +192,18 @@ func TestAcceleratorExplainWideTableIsCompleteAndDeterministic(t *testing.T) {
 		{"SELECTION", "engine", "REASON_DIGEST", "rs1:0123456789ab", "Reported/Redacted"},
 		{"CLASS", "engine", "STATE", "Forbidden", "Unavailable"},
 		{"CLASS", "engine", "NAME", "gpu-a", "Unavailable"},
-		{"REQUEST", "engine", "STATE", "Reported", "Reported"},
+		{"REQUEST", "engine", "BASE_STATE", "Available", "Computed"},
 		{"REQUEST", "engine", "BASE", "cpu=1", "Computed"},
+		{"REQUEST", "engine", "EFFECTIVE_STATE", "Reported", "Reported"},
 		{"REQUEST", "engine", "EFFECTIVE", "example.com/gpu=2", "Reported"},
 		{"ISSUE", "engine", "ClassForbidden", "-", "Computed"},
 		{"ISSUE", "router", "UnexpectedComponentEvidence", "-", "Computed"},
 		{"ISSUE", "-", "StatusStale", "-", "Computed"},
 		{"SOURCE", "AcceleratorClass", "NAME", "gpu-a", "Unavailable"},
-		{"SOURCE", "AcceleratorClass", "UID", "-", "Unavailable"},
 		{"SOURCE", "AcceleratorClass", "GENERATION", "-", "Unavailable"},
 		{"SOURCE", "AcceleratorClass", "COLLECTED_AT", "2026-09-14T20:30:00Z", "Unavailable"},
 		{"SOURCE", "AcceleratorClass", "UNAVAILABLE_REASON", "Forbidden", "Unavailable"},
 		{"SOURCE", "InferenceService", "NAME", "prod/chat", "Observed"},
-		{"SOURCE", "InferenceService", "UID", "isvc-uid", "Observed"},
 		{"SOURCE", "InferenceService", "GENERATION", "4", "Observed"},
 		{"SOURCE", "InferenceService", "COLLECTED_AT", "2026-09-14T20:30:00Z", "Observed"},
 		{"WARNING", "-", "CODE", "PartialData", "Computed"},
@@ -223,8 +229,9 @@ func TestAcceleratorExplainWideTableAlwaysShowsReasonAndRequestStates(t *testing
 			},
 			Class: AcceleratorClassObservation{State: AcceleratorClassObserved, Name: "gpu-a"},
 			Requests: AcceleratorRequestObservation{
-				State: AcceleratorRequestsNotReported,
-				Base:  []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+				BaseState:      AcceleratorBaseRequestsAvailable,
+				Base:           []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+				EffectiveState: AcceleratorRequestsNotReported,
 			},
 			Issues: []AcceleratorExplainIssueCode{AcceleratorIssueRequestsNotReported},
 		}},
@@ -238,7 +245,10 @@ func TestAcceleratorExplainWideTableAlwaysShowsReasonAndRequestStates(t *testing
 		"SELECTION", "engine", "REASON_STATE", "NotReported", "Unavailable",
 	})
 	assert.Contains(t, rows, []string{
-		"REQUEST", "engine", "STATE", "NotReported", "Unavailable",
+		"REQUEST", "engine", "BASE_STATE", "Available", "Computed",
+	})
+	assert.Contains(t, rows, []string{
+		"REQUEST", "engine", "EFFECTIVE_STATE", "NotReported", "Unavailable",
 	})
 	assert.NotContains(t, rows, []string{
 		"REQUEST", "engine", "EFFECTIVE", "None", "Reported",
@@ -263,8 +273,9 @@ func TestAcceleratorExplainNotReportedRequestsMachineOutputIsExact(t *testing.T)
 				},
 				Class: AcceleratorClassObservation{State: AcceleratorClassObserved, Name: "gpu-a"},
 				Requests: AcceleratorRequestObservation{
-					State: AcceleratorRequestsNotReported,
-					Base:  []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+					BaseState:      AcceleratorBaseRequestsAvailable,
+					Base:           []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+					EffectiveState: AcceleratorRequestsNotReported,
 				},
 				Issues: []AcceleratorExplainIssueCode{AcceleratorIssueRequestsNotReported},
 			}},
@@ -274,7 +285,7 @@ func TestAcceleratorExplainNotReportedRequestsMachineOutputIsExact(t *testing.T)
 		}, ClockFunc(func() time.Time { return time.Unix(0, 0) }))
 	reportValue.Sources = []AcceleratorSourceReference{{
 		Kind: "InferenceService", Namespace: "prod", Name: "chat",
-		UID: "isvc-uid", Generation: 4, Evidence: EvidenceObserved,
+		Generation: 4, Evidence: EvidenceObserved,
 	}}
 	reportValue.Warnings = []AcceleratorWarning{{Code: AcceleratorWarningPartialData}}
 
@@ -296,7 +307,6 @@ func TestAcceleratorExplainNotReportedRequestsMachineOutputIsExact(t *testing.T)
       "kind": "InferenceService",
       "namespace": "prod",
       "name": "chat",
-      "uid": "isvc-uid",
       "generation": 4,
       "evidence": "Observed",
       "collectedAt": "1970-01-01T00:00:00Z"
@@ -327,13 +337,14 @@ func TestAcceleratorExplainNotReportedRequestsMachineOutputIsExact(t *testing.T)
           "name": "gpu-a"
         },
         "requests": {
-          "state": "NotReported",
+          "baseState": "Available",
           "base": [
             {
               "name": "cpu",
               "quantity": "2"
             }
           ],
+          "effectiveState": "NotReported",
           "effective": []
         },
         "issues": [
@@ -372,8 +383,9 @@ content:
       base:
       - name: cpu
         quantity: "2"
+      baseState: Available
       effective: []
-      state: NotReported
+      effectiveState: NotReported
     selection:
       class: gpu-a
       reason:
@@ -397,7 +409,6 @@ sources:
   kind: InferenceService
   name: chat
   namespace: prod
-  uid: isvc-uid
 warnings:
 - code: PartialData
 `},
@@ -408,6 +419,7 @@ warnings:
 			require.NoError(t, report.Write(&output, test.format, reportValue))
 			assert.Equal(t, test.want, output.String())
 			assert.NotContains(t, output.String(), "resourceVersion")
+			assert.NotContains(t, strings.ToLower(output.String()), "uid")
 		})
 	}
 }
@@ -445,11 +457,12 @@ func TestAcceleratorExplainCompactTableNeverExceedsEightyColumns(t *testing.T) {
 			},
 			Class: AcceleratorClassObservation{State: AcceleratorClassObserved},
 			Requests: AcceleratorRequestObservation{
-				State: AcceleratorRequestsUnavailable,
+				BaseState: AcceleratorBaseRequestsAvailable,
 				Base: []AcceleratorResourceRequest{
 					{Name: "an.example.com/extremely-long-accelerator-resource-name", Quantity: "999999999999m"},
 					{Name: "memory", Quantity: "256Gi"},
 				},
+				EffectiveState: AcceleratorRequestsUnavailable,
 			},
 			Issues: []AcceleratorExplainIssueCode{
 				AcceleratorIssueClassUnreadable, AcceleratorIssueReportedClassMismatch,
@@ -462,4 +475,61 @@ func TestAcceleratorExplainCompactTableNeverExceedsEightyColumns(t *testing.T) {
 	for _, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
 		assert.Equal(t, line, printers.BoundedCell(line, 80), "line exceeds 80 terminal columns")
 	}
+}
+
+func TestAcceleratorExplainCompactTablePreservesBaseEvidenceFailure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		baseState AcceleratorBaseRequestState
+		want      string
+	}{
+		{name: "unavailable", baseState: AcceleratorBaseRequestsUnavailable, want: "base:Unknown"},
+		{name: "invalid", baseState: AcceleratorBaseRequestsInvalid, want: "base:Invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			content := AcceleratorExplainContent{Components: []AcceleratorExplainComponent{{
+				Type: RuntimeComponentEngine,
+				Requests: AcceleratorRequestObservation{
+					BaseState: test.baseState, EffectiveState: AcceleratorRequestsReported,
+					Effective: []AcceleratorResourceRequest{{Name: "example.com/gpu", Quantity: "1"}},
+				},
+			}}}
+
+			require.Len(t, content.Table().Rows, 1)
+			assert.Equal(t, test.want, content.Table().Rows[0][4])
+			rows := content.WideTable().Rows
+			assert.Contains(t, rows, []string{
+				"REQUEST", "engine", "BASE_STATE", string(test.baseState), "Unavailable",
+			})
+			assert.Contains(t, rows, []string{
+				"REQUEST", "engine", "EFFECTIVE_STATE", "Reported", "Reported",
+			})
+		})
+	}
+}
+
+func TestAcceleratorRequestObservationMachineSchemaIsLossless(t *testing.T) {
+	requests := AcceleratorRequestObservation{
+		BaseState:      AcceleratorBaseRequestsUnavailable,
+		Base:           []AcceleratorResourceRequest{},
+		EffectiveState: AcceleratorRequestsReported,
+		Effective:      []AcceleratorResourceRequest{{Name: "example.com/gpu", Quantity: "1"}},
+	}
+
+	encodedJSON, err := json.Marshal(requests)
+	require.NoError(t, err)
+	assert.Equal(t,
+		`{"baseState":"Unavailable","base":[],"effectiveState":"Reported",`+
+			`"effective":[{"name":"example.com/gpu","quantity":"1"}]}`,
+		string(encodedJSON),
+	)
+	encodedYAML, err := yaml.Marshal(requests)
+	require.NoError(t, err)
+	assert.Equal(t, `base: []
+baseState: Unavailable
+effective:
+- name: example.com/gpu
+  quantity: "1"
+effectiveState: Reported
+`, string(encodedYAML))
 }
