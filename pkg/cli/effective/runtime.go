@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -257,11 +258,15 @@ type RuntimeResolution struct {
 	Name                string
 	Kind                string
 	Namespace           string
+	UID                 string
+	Generation          int64
+	IdentityObserved    bool
 	SelectionSource     RuntimeSelectionSource
 	RequestedKind       string
 	RequestedKindSet    bool
 	PinSource           RuntimePinSource
 	DeclaredInheritance InheritanceObservation
+	resourceVersion     string
 	spec                *v1beta1.ServingRuntimeSpec
 	AutoSync            bool
 	RequestedRevision   string
@@ -341,12 +346,17 @@ func (LiveConfiguration) MarshalYAML() (any, error) {
 // used by the operator and observes declared inheritance as separate
 // provenance.
 type RuntimeResolver struct {
-	client   ctrlclient.Client
-	selector runtimeSelector
+	client    ctrlclient.Client
+	selector  runtimeSelector
+	resolveMu sync.Mutex
 }
 
 func NewRuntimeResolver(client ctrlclient.Client) *RuntimeResolver {
-	return newRuntimeResolver(client, runtimeselector.New(client))
+	if client == nil {
+		return &RuntimeResolver{}
+	}
+	tracked := newRuntimeSnapshotClient(client)
+	return newRuntimeResolver(tracked, runtimeselector.New(tracked))
 }
 
 func newRuntimeResolver(client ctrlclient.Client, selector runtimeSelector) *RuntimeResolver {
@@ -366,6 +376,11 @@ func (r *RuntimeResolver) ResolveLive(ctx context.Context, isvc *v1beta1.Inferen
 	if isvc.Namespace == "" {
 		return nil, errors.New("InferenceService namespace must not be empty")
 	}
+	r.resolveMu.Lock()
+	defer r.resolveMu.Unlock()
+	if resetter, ok := r.client.(runtimeSnapshotResetter); ok {
+		resetter.resetRuntimeSnapshots()
+	}
 
 	model, err := resolveModel(ctx, r.client, isvc)
 	if err != nil {
@@ -384,6 +399,14 @@ func (r *RuntimeResolver) ResolveLive(ctx context.Context, isvc *v1beta1.Inferen
 		return nil, &runtimeselector.RuntimeDisabledError{RuntimeName: reference.name, IsCluster: reference.cluster}
 	}
 
+	kind := runtimeselector.KindServingRuntime
+	namespace := isvc.Namespace
+	if reference.cluster {
+		kind = runtimeselector.KindClusterServingRuntime
+		namespace = ""
+	}
+	snapshot, snapshotFound := runtimeSnapshotFor(r.client, kind, namespace, reference.name)
+
 	components, err := MergeEffectiveComponents(isvc, reference.spec)
 	if err != nil {
 		return nil, err
@@ -397,23 +420,21 @@ func (r *RuntimeResolver) ResolveLive(ctx context.Context, isvc *v1beta1.Inferen
 
 	autoSync, requestedKind, requestedKindSet, requestedRevision, pinSource := runtimeReferenceIntent(isvc, reference.source)
 
-	kind := runtimeselector.KindServingRuntime
-	namespace := isvc.Namespace
-	if reference.cluster {
-		kind = runtimeselector.KindClusterServingRuntime
-		namespace = ""
-	}
 	return &LiveConfiguration{
 		Model: model,
 		Runtime: RuntimeResolution{
 			Name:                reference.name,
 			Kind:                kind,
 			Namespace:           namespace,
+			UID:                 snapshot.uid,
+			Generation:          snapshot.generation,
+			IdentityObserved:    snapshotFound && snapshot.identityObserved(),
 			SelectionSource:     reference.source,
 			RequestedKind:       requestedKind,
 			RequestedKindSet:    requestedKindSet,
 			PinSource:           pinSource,
 			DeclaredInheritance: declaredInheritance,
+			resourceVersion:     snapshot.resourceVersion,
 			spec:                reference.spec.DeepCopy(),
 			AutoSync:            autoSync,
 			RequestedRevision:   requestedRevision,
@@ -421,6 +442,17 @@ func (r *RuntimeResolver) ResolveLive(ctx context.Context, isvc *v1beta1.Inferen
 		Components: components,
 		Advisories: append([]RuntimeAdvisory{}, reference.advisories...),
 	}, nil
+}
+
+func runtimeSnapshotFor(
+	client ctrlclient.Client,
+	kind, namespace, name string,
+) (runtimeObjectSnapshot, bool) {
+	provider, ok := client.(runtimeSnapshotProvider)
+	if !ok {
+		return runtimeObjectSnapshot{}, false
+	}
+	return provider.runtimeSnapshot(kind, namespace, name)
 }
 
 type resolvedRuntimeReference struct {
@@ -584,6 +616,15 @@ func observeDeclaredInheritance(
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return InheritanceObservation{}, fmt.Errorf("observe declared runtime inheritance: %w", ctxErr)
+	}
+	for _, safetyError := range []error{
+		ErrRuntimeObjectIdentityMismatch,
+		ErrRuntimeSnapshotChanged,
+		ErrRuntimeSnapshotUnbindable,
+	} {
+		if errors.Is(err, safetyError) {
+			return InheritanceObservation{}, safetyError
+		}
 	}
 	return unavailableInheritance(classifyInheritanceUnavailable(err)), nil
 }
