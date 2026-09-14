@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 )
 
-func TestNewCmdRegistersStatusSubcommand(t *testing.T) {
+func TestNewCmdRegistersAutoscaleSubcommands(t *testing.T) {
 	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{
 		In: &bytes.Buffer{}, Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{},
 	})
@@ -22,9 +22,15 @@ func TestNewCmdRegistersStatusSubcommand(t *testing.T) {
 	assert.Empty(t, args)
 	assert.Equal(t, "autoscale status", found.CommandPath())
 	assert.Equal(t, "status INFERENCESERVICE", found.Use)
+
+	found, args, err = cmd.Find([]string{"explain"})
+	require.NoError(t, err)
+	assert.Empty(t, args)
+	assert.Equal(t, "autoscale explain", found.CommandPath())
+	assert.Equal(t, "explain INFERENCESERVICE", found.Use)
 }
 
-func TestAutoscaleHelpExplainsReportedEvidence(t *testing.T) {
+func TestAutoscaleHelpExplainsConfigurationAndEvidence(t *testing.T) {
 	var output bytes.Buffer
 	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{
 		In: &bytes.Buffer{}, Out: &output, ErrOut: &output,
@@ -34,13 +40,14 @@ func TestAutoscaleHelpExplainsReportedEvidence(t *testing.T) {
 	cmd.SetArgs([]string{"--help"})
 
 	require.NoError(t, cmd.Execute())
-	assert.Equal(t, `Inspect controller-reported autoscaling evidence
+	assert.Equal(t, `Inspect autoscaling configuration and evidence
 
 Usage:
   autoscale [command]
 
 Available Commands:
   completion  Generate the autocompletion script for the specified shell
+  explain     Explain effective and reported autoscaling
   help        Help about any command
   status      Show controller-reported autoscaling status
 
@@ -48,6 +55,34 @@ Flags:
   -h, --help   help for autoscale
 
 Use "autoscale [command] --help" for more information about a command.
+`, output.String())
+}
+
+func TestExplainHelpDefinesItsEvidenceBoundary(t *testing.T) {
+	var output bytes.Buffer
+	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: &output, ErrOut: &output,
+	})
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+	cmd.SetArgs([]string{"explain", "--help"})
+
+	require.NoError(t, cmd.Execute())
+	assert.Equal(t, `Explains declared autoscaling from the controller-selected active runtime configuration
+and compares it with evidence reported on the InferenceService parent.
+
+The command does not query child autoscaler or workload objects. A matching
+report describes one bound API snapshot; it does not prove rollout convergence
+or wall-clock freshness. Raw runtime specifications, autoscaler payloads,
+resource versions, status messages, and synchronization tokens are never printed.
+
+Usage:
+  autoscale explain INFERENCESERVICE [flags]
+
+Flags:
+  -h, --help                   help for explain
+      --ome-namespace string   Namespace where the OME control plane is installed (default "ome")
+  -o, --output string          Output format: table, json or yaml (default "table")
 `, output.String())
 }
 

@@ -14,8 +14,9 @@ import (
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "autoscale",
-		Short: "Inspect controller-reported autoscaling evidence",
+		Short: "Inspect autoscaling configuration and evidence",
 	}
+	cmd.AddCommand(newExplainCmd(f, streams))
 	cmd.AddCommand(newStatusCmd(f, streams, statusDependencies{
 		clock:   reportv1alpha1.SystemClock{},
 		project: autoscaleprojection.Project,

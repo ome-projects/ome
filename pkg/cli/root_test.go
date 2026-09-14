@@ -26,6 +26,7 @@ func TestRootCommandTree(t *testing.T) {
 	got := commandPaths(root)
 	want := []string{
 		"ome autoscale",
+		"ome autoscale explain",
 		"ome autoscale status",
 		"ome get",
 		"ome logs",
@@ -74,7 +75,7 @@ func TestRootHelpListsAutoscaleEvidenceCommand(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !bytes.Contains(output.Bytes(), []byte("  autoscale   Inspect controller-reported autoscaling evidence\n")) {
+	if !bytes.Contains(output.Bytes(), []byte("  autoscale   Inspect autoscaling configuration and evidence\n")) {
 		t.Fatalf("root help does not list autoscale command:\n%s", output.String())
 	}
 }
