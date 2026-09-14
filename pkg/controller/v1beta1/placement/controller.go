@@ -525,58 +525,68 @@ func placementTargetExists(pl *v1beta1.PlacementStatus, clusters []v1beta1.Workl
 }
 
 func (r *Reconciler) reconcileAll(ctx context.Context, isvc *v1beta1.InferenceService, candidates []string) (ctrl.Result, error) {
-	placed, err := r.fanOut(ctx, isvc, candidates)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if len(placed) == 0 {
-		return r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
-	}
-
-	// A home that cannot be read this pass keeps whatever it published last:
-	// dropping it from candidates would tell the endpoint publisher to delete
-	// that backend, so a transient read error would deroute live traffic.
-	prev := make(map[string]v1beta1.CandidatePlacement, len(placed))
+	// A candidate that cannot be observed this pass keeps its last-published
+	// state. The WorkloadCluster API can remain Ready while a newly elected
+	// process is still rebuilding its local remote-client registry.
+	prev := make(map[string]v1beta1.CandidatePlacement, len(candidates))
 	if isvc.Status.Placement != nil {
 		for _, c := range isvc.Status.Placement.Candidates {
 			prev[c.Cluster] = c
 		}
 	}
-	carryForward := func(c string) (v1beta1.CandidatePlacement, bool) {
-		p, ok := prev[c]
-		return p, ok
+
+	placed, err := r.fanOut(ctx, isvc, candidates)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	placedNow := make(map[string]bool, len(placed))
+	for _, c := range placed {
+		placedNow[c] = true
 	}
 
-	cands := make([]v1beta1.CandidatePlacement, 0, len(placed))
+	cands := make([]v1beta1.CandidatePlacement, 0, len(candidates))
 	admitted := 0
-	for _, c := range placed {
+	carryForward := func(c string) {
+		if p, ok := prev[c]; ok {
+			cands = append(cands, p)
+			if p.Phase == v1beta1.CandidatePhaseAdmitted {
+				admitted++
+			}
+		}
+	}
+	unobserved := false
+	for _, c := range candidates {
+		if !placedNow[c] {
+			unobserved = true
+			if _, had := prev[c]; had {
+				r.Log.Info("all: candidate unavailable; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
+			}
+			carryForward(c)
+			continue
+		}
 		derived, ok, err := r.getDerived(ctx, c, isvc)
 		if err != nil {
 			r.Log.Error(err, "all: reading derived failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			if p, had := carryForward(c); had {
-				cands = append(cands, p)
-				if p.Phase == v1beta1.CandidatePhaseAdmitted {
-					admitted++
-				}
-			}
+			unobserved = true
+			carryForward(c)
 			continue
 		}
 		if !ok {
+			unobserved = true
+			carryForward(c)
 			continue
 		}
 		cl, ok := r.Clusters.ClientFor(c)
 		if !ok {
+			unobserved = true
+			carryForward(c)
 			continue
 		}
 		statuses, err := componentIRStatuses(ctx, cl, derived)
 		if err != nil {
 			r.Log.Error(err, "all: reading IR statuses failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			if p, had := carryForward(c); had {
-				cands = append(cands, p)
-				if p.Phase == v1beta1.CandidatePhaseAdmitted {
-					admitted++
-				}
-			}
+			unobserved = true
+			carryForward(c)
 			continue
 		}
 		if AllComponentsAdmitted(derived, statuses) {
@@ -587,6 +597,13 @@ func (r *Reconciler) reconcileAll(ctx context.Context, isvc *v1beta1.InferenceSe
 			continue
 		}
 		cands = append(cands, v1beta1.CandidatePlacement{Cluster: c, Phase: v1beta1.CandidatePhasePlaced})
+	}
+	if len(placed) == 0 && len(cands) == 0 {
+		res, err := r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
+		if err == nil {
+			res.RequeueAfter = r.requeue()
+		}
+		return res, err
 	}
 
 	phase := v1beta1.PlacementPhaseRacing
@@ -601,7 +618,7 @@ func (r *Reconciler) reconcileAll(ctx context.Context, isvc *v1beta1.InferenceSe
 	// first must be observed without waiting for the long steady-state backstop —
 	// even once the placement is Placed on the earlier home(s). Once every home is
 	// admitted, writePlacement's backstop requeue stands.
-	if err == nil && admitted < len(cands) {
+	if err == nil && (admitted < len(cands) || unobserved) {
 		res.RequeueAfter = r.requeue()
 	}
 	return res, err

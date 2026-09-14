@@ -1289,6 +1289,19 @@ func srcISVCMode(mode v1beta1.PlacementMode, requirements string) *v1beta1.Infer
 	return i
 }
 
+func placedAllISVC() *v1beta1.InferenceService {
+	i := srcISVCMode(v1beta1.PlacementModeAll, "gpu=gb300")
+	i.Finalizers = []string{PlacementFinalizer}
+	i.Status.Placement = &v1beta1.PlacementStatus{
+		Phase: v1beta1.PlacementPhasePlaced,
+		Candidates: []v1beta1.CandidatePlacement{
+			{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("svc.a.example")},
+			{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("svc.b.example")},
+		},
+	}
+	return i
+}
+
 // workerWithGatedDerived returns a worker whose derived ISVC exists but whose
 // engine IR reports no admitted instance — a home that fanned out but is still
 // gated behind Kueue admission.
@@ -1344,6 +1357,94 @@ func TestReconcile_AllModeKeepsEveryAdmittedHome(t *testing.T) {
 	assert.Equal(t, v1beta1.CandidatePhaseAdmitted, by["b"].Phase)
 	require.NotNil(t, by["b"].Endpoint)
 	assert.Equal(t, "svc.b.example", by["b"].Endpoint.Host)
+}
+
+// All mode keeps its published homes while the remote-client registry is
+// rebuilding. WorkloadCluster readiness survives a controller restart, but the
+// process-local clients do not, so an empty registry is not evidence that the
+// serving homes disappeared.
+func TestReconcile_AllModeDisconnectedStartupPreservesLastKnownHomes(t *testing.T) {
+	s := testScheme(t)
+	isvc := placedAllISVC()
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}, isvc,
+		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
+
+	res, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, res.RequeueAfter)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
+	require.Len(t, p.Candidates, 2)
+	by := candidatesByCluster(p.Candidates)
+	require.Contains(t, by, "a")
+	require.Contains(t, by, "b")
+	assert.Equal(t, "svc.a.example", by["a"].Endpoint.Host)
+	assert.Equal(t, "svc.b.example", by["b"].Endpoint.Host)
+}
+
+func TestReconcile_AllModeDisconnectedNewSourceRetriesFast(t *testing.T) {
+	s := testScheme(t)
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}},
+		srcISVCMode(v1beta1.PlacementModeAll, "gpu=gb300"),
+		readyWC("a", map[string]string{"gpu": "gb300"}))
+
+	res, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, res.RequeueAfter)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	assert.Equal(t, v1beta1.PlacementPhasePending, p.Phase)
+	assert.Empty(t, p.Candidates)
+}
+
+// A disconnected home remains published while connected homes continue to be
+// observed normally. One transport gap must not remove only that backend from
+// an otherwise healthy All placement.
+func TestReconcile_AllModePartialDisconnectPreservesLastKnownHome(t *testing.T) {
+	s := testScheme(t)
+	wa := workerWithAdmittedURL(t, s, "svc.a.example")
+	isvc := placedAllISVC()
+	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
+		"a": workloadcluster.NewNeverCachingClient(wa),
+	}}
+	r, cp := newPlacer(s, clusters, isvc,
+		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
+
+	res, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, res.RequeueAfter)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
+	require.Len(t, p.Candidates, 2)
+	by := candidatesByCluster(p.Candidates)
+	require.Contains(t, by, "a")
+	require.Contains(t, by, "b")
+	assert.Equal(t, v1beta1.CandidatePhaseAdmitted, by["a"].Phase)
+	assert.Equal(t, v1beta1.CandidatePhaseAdmitted, by["b"].Phase)
+	assert.Equal(t, "svc.b.example", by["b"].Endpoint.Host)
+}
+
+func TestReconcile_AllModeDisconnectDoesNotRetainNonCandidateHome(t *testing.T) {
+	s := testScheme(t)
+	isvc := placedAllISVC()
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}, isvc,
+		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "h100"}))
+
+	res, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, res.RequeueAfter)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
+	require.Len(t, p.Candidates, 1)
+	assert.Equal(t, "a", p.Candidates[0].Cluster)
+	assert.Equal(t, "svc.a.example", p.Candidates[0].Endpoint.Host)
 }
 
 // TestReconcile_AllModePartialAdmitStaysPlaced: one home admitted, one still
