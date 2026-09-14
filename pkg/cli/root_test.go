@@ -45,6 +45,8 @@ func TestRootCommandTree(t *testing.T) {
 		"ome runtime history",
 		"ome runtime tree",
 		"ome status",
+		"ome traffic",
+		"ome traffic status",
 		"ome version",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -115,6 +117,23 @@ func TestRootHelpListsMigrationStatus(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "migration") || !strings.Contains(output.String(), "Inspect OMENative migrations") {
 		t.Fatalf("root help does not list migration status:\n%s", output.String())
+	}
+}
+
+func TestRootHelpListsTrafficEvidenceCommand(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	root := NewRootCmdWithFactory(factory.Static{NS: "default"}, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: &output, ErrOut: &output,
+	})
+	root.SetArgs([]string{"--help"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !bytes.Contains(output.Bytes(), []byte("  traffic     Inspect controller-reported traffic evidence\n")) {
+		t.Fatalf("root help does not list traffic command:\n%s", output.String())
 	}
 }
 

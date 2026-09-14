@@ -1,0 +1,562 @@
+package trafficprojection_test
+
+import (
+	"bytes"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
+	knapis "knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
+
+	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/report"
+	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	"sigs.k8s.io/ome/pkg/cli/trafficprojection"
+	"sigs.k8s.io/ome/pkg/constants"
+)
+
+var projectionClock = reportv1alpha1.ClockFunc(func() time.Time {
+	return time.Date(2026, 9, 14, 17, 0, 0, 0, time.UTC)
+})
+
+func TestProjectCurrentTrafficEvidence(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	before := isvc.DeepCopy()
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, before, isvc, "projection must not mutate API evidence")
+	assert.Equal(t, reportv1alpha1.TrafficStatePending, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficTranslatorEnvoyGateway, got.Content.Summary.Translator)
+	assert.Equal(t, reportv1alpha1.TrafficAlgorithmRoundRobin, got.Content.Summary.Algorithm)
+	assert.Equal(t, reportv1alpha1.TrafficConditionValue{Status: reportv1alpha1.TrafficConditionUnknown, Reason: reportv1alpha1.TrafficReasonPending}, got.Content.Summary.PolicyReady)
+	assert.Equal(t, reportv1alpha1.TrafficUnsupportedNone, got.Content.Summary.Unsupported)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessCurrent, got.Content.Summary.Source.PolicyReady.Freshness)
+	require.NotNil(t, got.Content.Policy)
+	assert.Equal(t, reportv1alpha1.TrafficPolicyBackendTrafficPolicy, got.Content.Policy.Kind)
+	assert.Equal(t, []string{"chat", "chat-router"}, trafficRouteNames(got.Content.Routes))
+	assert.Equal(t, []string{"http://chat-engine.prod.svc.cluster.local", "https://chat.prod.example/"}, trafficEndpointURLs(got.Content.Endpoints))
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, int32(0), got.Content.Canary.CurrentStep)
+	assert.Equal(t, int32(2), got.Content.Canary.TotalSteps)
+	assert.Equal(t, int32(20), got.Content.Canary.ObservedTraffic)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canary.Component)
+	assert.Equal(t, []reportv1alpha1.TrafficAllocationRole{reportv1alpha1.TrafficRoleStable, reportv1alpha1.TrafficRoleCanary}, trafficAllocationRoles(got.Content.Allocations))
+	assert.Empty(t, got.Content.Issues)
+	assert.Empty(t, got.Warnings)
+	require.Len(t, got.Sources, 1)
+	assert.Equal(t, "uid-chat", got.Sources[0].UID)
+	assert.Equal(t, int64(7), got.Sources[0].Generation)
+}
+
+func TestProjectMapsControllerConditionsHonestly(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*omev1beta1.InferenceService)
+		wantState   reportv1alpha1.TrafficState
+		translator  reportv1alpha1.TrafficTranslator
+		unsupported reportv1alpha1.TrafficUnsupportedState
+		freshness   reportv1alpha1.TrafficFreshness
+	}{
+		{name: "accepted", mutate: func(isvc *omev1beta1.InferenceService) {
+			setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
+		}, wantState: reportv1alpha1.TrafficStateReported, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedNone, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "pending", mutate: func(*omev1beta1.InferenceService) {}, wantState: reportv1alpha1.TrafficStatePending, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedNone, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "gateway rejected", mutate: func(isvc *omev1beta1.InferenceService) {
+			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonGatewayRejected, 7)
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedNone, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "conflicting policy", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Traffic.BackendPolicyResource = nil
+			isvc.Status.Traffic.TargetedHTTPRoutes = nil
+			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonConflictingPolicy, 7)
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnknown, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "unsupported fields", mutate: func(isvc *omev1beta1.InferenceService) {
+			setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
+			isvc.Status.Traffic.Conditions = append(isvc.Status.Traffic.Conditions, trafficCondition(omev1beta1.TrafficConditionBackendPolicyUnsupportedFields, metav1.ConditionTrue, omev1beta1.TrafficReasonUnsupportedField, 7))
+		}, wantState: reportv1alpha1.TrafficStatePartial, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedPresent, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "noop", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Traffic.BackendPolicyResource = nil
+			isvc.Status.Traffic.TargetedHTTPRoutes = nil
+			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonNoTranslatorAvailable, 7)
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorNoop, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "translation failed", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Traffic.BackendPolicyResource = nil
+			isvc.Status.Traffic.TargetedHTTPRoutes = nil
+			setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonTranslationFailed, 7)
+		}, wantState: reportv1alpha1.TrafficStateDegraded, translator: reportv1alpha1.TrafficTranslatorUnknown, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessCurrent},
+		{name: "stale", mutate: func(isvc *omev1beta1.InferenceService) {
+			setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 6)
+		}, wantState: reportv1alpha1.TrafficStatePartial, translator: reportv1alpha1.TrafficTranslatorEnvoyGateway, unsupported: reportv1alpha1.TrafficUnsupportedUnknown, freshness: reportv1alpha1.TrafficFreshnessStale},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			tt.mutate(isvc)
+			got, err := trafficprojection.Project(isvc, projectionClock)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantState, got.Content.Summary.State)
+			assert.Equal(t, tt.translator, got.Content.Summary.Translator)
+			assert.Equal(t, tt.unsupported, got.Content.Summary.Unsupported)
+			assert.Equal(t, tt.freshness, got.Content.Summary.Source.PolicyReady.Freshness)
+		})
+	}
+}
+
+func TestProjectMissingTrafficStatusIsUnavailable(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic = nil
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateUnavailable, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficUnsupportedUnknown, got.Content.Summary.Unsupported)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueTrafficStatusMissing})
+}
+
+func TestProjectAllowsAValidStatusBeforeEndpointsArePublished(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Addresses = nil
+	isvc.Status.URL = nil
+	isvc.Status.Address = nil
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStatePending, got.Content.Summary.State)
+	assert.Empty(t, got.Content.Endpoints)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueEndpointInvalid})
+}
+
+func TestProjectCanaryUsesPinnedActiveRunPlan(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	pinnedGroup := isvc.Spec.Rollout.Groups[0]
+	isvc.Status.Rollout = &omev1beta1.RolloutStatus{ActiveRun: &omev1beta1.RolloutRun{
+		Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{Group: pinnedGroup}}},
+	}}
+	isvc.Spec.Rollout = &omev1beta1.RolloutSpec{Groups: []omev1beta1.RolloutGroup{{
+		Components: []omev1beta1.ComponentType{omev1beta1.RouterComponent},
+		Canary: &omev1beta1.GroupCanary{Steps: []omev1beta1.RolloutGroupStep{{
+			Capacity: intstr.FromString("100%"), Traffic: 100,
+		}}},
+	}}}
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canary.Component)
+	assert.Equal(t, int32(2), got.Content.Canary.TotalSteps)
+}
+
+func TestProjectCanaryPrimaryFollowsControllerPriority(t *testing.T) {
+	tests := []struct {
+		name       string
+		components []omev1beta1.ComponentType
+	}{
+		{
+			name:       "router before engine",
+			components: []omev1beta1.ComponentType{omev1beta1.EngineComponent, omev1beta1.RouterComponent},
+		},
+		{
+			name:       "router before decoder",
+			components: []omev1beta1.ComponentType{omev1beta1.DecoderComponent, omev1beta1.RouterComponent},
+		},
+		{
+			name: "router before engine and decoder",
+			components: []omev1beta1.ComponentType{
+				omev1beta1.DecoderComponent,
+				omev1beta1.EngineComponent,
+				omev1beta1.RouterComponent,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Spec.Rollout.Groups[0].Components = tt.components
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			require.NotNil(t, got.Content.Canary)
+			assert.Equal(t, reportv1alpha1.RuntimeComponentRouter, got.Content.Canary.Component)
+		})
+	}
+}
+
+func TestProjectRejectsEqualStableAndCanaryRevisionHashes(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Canary.CanaryRevisionHash = isvc.Status.Canary.StableRevisionHash
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+	assert.Nil(t, got.Content.Canary)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
+}
+
+func TestProjectAcceptsCompletedCanarySentinel(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Canary.CurrentStep = int32(len(isvc.Spec.Rollout.Groups[0].Canary.Steps))
+	isvc.Status.Canary.ObservedTrafficWeight = 100
+	isvc.Status.Canary.StableRevisionHash = ""
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+		RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 100, LatestRevision: true,
+	}}
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, int32(2), got.Content.Canary.CurrentStep)
+	assert.Equal(t, int32(2), got.Content.Canary.TotalSteps)
+	assert.Equal(t, int32(100), got.Content.Canary.ObservedTraffic)
+	require.Len(t, got.Content.Allocations, 1)
+	assert.Equal(t, reportv1alpha1.TrafficRoleStable, got.Content.Allocations[0].Role)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
+	assert.Contains(t, flattenRows(got.Table().Rows), "CANARY|engine|2/2 @ 100%|Reported/Unverifiable")
+}
+
+func TestProjectAcceptsControllerBoundedRevisionServiceNames(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Name = strings.Repeat("long-", 10) + "chat"
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	for i := range component.Traffic {
+		hash := component.Traffic[i].RevisionName[len(component.Traffic[i].RevisionName)-8:]
+		raw := fmt.Sprintf("%s-%s-rev-%s", isvc.Name, omev1beta1.EngineComponent, hash)
+		component.Traffic[i].RevisionName = constants.TruncateNameWithMaxLength(raw, utilvalidation.DNS1035LabelMaxLength)
+		require.Len(t, component.Traffic[i].RevisionName, utilvalidation.DNS1035LabelMaxLength)
+	}
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Len(t, got.Content.Allocations, 2)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code: reportv1alpha1.TrafficIssueAllocationInvalid, Component: reportv1alpha1.RuntimeComponentEngine,
+	})
+	for _, allocation := range got.Content.Allocations {
+		assert.Len(t, allocation.RevisionName, utilvalidation.DNS1035LabelMaxLength)
+	}
+}
+
+func TestProjectNeverReportsUnsupportedNoneForMalformedEvidence(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.Conditions = append(isvc.Status.Traffic.Conditions,
+		trafficCondition(omev1beta1.TrafficConditionBackendPolicyUnsupportedFields, metav1.ConditionFalse, omev1beta1.TrafficReasonUnsupportedField, 7),
+	)
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficUnsupportedUnknown, got.Content.Summary.Unsupported)
+}
+
+func TestProjectRejectsMalformedStatusWithoutEchoingHostileValues(t *testing.T) {
+	secretValues := []string{
+		"SECRET_ALGORITHM", "secret.policy.invalid", "SECRET_KIND", "Bad_Route_SECRET",
+		"user:password", "SECRET_TAG", "SECRET_MESSAGE", "SECRET_ANNOTATION",
+		"bad-revision-SECRET",
+	}
+	isvc := currentTrafficISVC(t)
+	isvc.Annotations = map[string]string{"secret": "SECRET_ANNOTATION"}
+	isvc.Status.Traffic.Algorithm = secretValues[0]
+	isvc.Status.Traffic.BackendPolicyResource = &omev1beta1.BackendPolicyRef{APIVersion: secretValues[1], Kind: secretValues[2], Name: "SECRET_POLICY_NAME"}
+	isvc.Status.Traffic.TargetedHTTPRoutes = append(isvc.Status.Traffic.TargetedHTTPRoutes, secretValues[3])
+	isvc.Status.Traffic.Conditions[0].Message = secretValues[6]
+	isvc.Status.Traffic.Conditions = append(isvc.Status.Traffic.Conditions, isvc.Status.Traffic.Conditions[0])
+	isvc.Status.Addresses = append(isvc.Status.Addresses, duckv1.Addressable{URL: mustURL(t, "https://user:password@secret.invalid/path?token=SECRET#fragment")})
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.Traffic = append(component.Traffic, omev1beta1.ComponentTrafficTarget{RevisionName: secretValues[8], Percent: 1, Tag: secretValues[5]})
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+	require.NotEmpty(t, got.Content.Issues)
+	var rendered bytes.Buffer
+	require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+	for _, secret := range secretValues {
+		assert.NotContains(t, rendered.String(), secret)
+	}
+	assert.NotContains(t, rendered.String(), "SECRET_POLICY_NAME")
+}
+
+func TestProjectBoundsAndSortsAllRepeatedEvidence(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.TargetedHTTPRoutes = nil
+	for i := 5; i >= 0; i-- {
+		isvc.Status.Traffic.TargetedHTTPRoutes = append(isvc.Status.Traffic.TargetedHTTPRoutes, fmt.Sprintf("chat-route-%d", i))
+	}
+	isvc.Status.Addresses = nil
+	for i := 17; i >= 0; i-- {
+		isvc.Status.Addresses = append(isvc.Status.Addresses, duckv1.Addressable{URL: mustURL(t, fmt.Sprintf("https://chat-%02d.prod.example/", i))})
+	}
+	for _, componentType := range []omev1beta1.ComponentType{
+		omev1beta1.EngineComponent, omev1beta1.DecoderComponent, omev1beta1.RouterComponent,
+	} {
+		component := isvc.Status.Components[componentType]
+		component.Traffic = nil
+		for i := 9; i >= 0; i-- {
+			component.Traffic = append(component.Traffic, omev1beta1.ComponentTrafficTarget{
+				RevisionName: fmt.Sprintf("chat-%s-rev-%08x", componentType, i), Percent: 10,
+			})
+		}
+		isvc.Status.Components[componentType] = component
+	}
+	for i := 0; i < 100; i++ {
+		isvc.Status.Traffic.Conditions = append(isvc.Status.Traffic.Conditions, trafficCondition(fmt.Sprintf("Unknown-%03d", i), metav1.ConditionTrue, "SECRET_REASON", 7))
+	}
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Len(t, got.Content.Routes, 4)
+	assert.Equal(t, []string{"chat-route-0", "chat-route-1", "chat-route-2", "chat-route-3"}, trafficRouteNames(got.Content.Routes))
+	assert.Len(t, got.Content.Endpoints, 16)
+	assert.Equal(t, "https://chat-00.prod.example/", got.Content.Endpoints[0].URL)
+	assert.Equal(t, "https://chat-15.prod.example/", got.Content.Endpoints[15].URL)
+	assert.Len(t, got.Content.Allocations, 24)
+	for _, component := range []reportv1alpha1.RuntimeComponentType{
+		reportv1alpha1.RuntimeComponentEngine,
+		reportv1alpha1.RuntimeComponentDecoder,
+		reportv1alpha1.RuntimeComponentRouter,
+	} {
+		assert.Len(t, allocationsForComponent(got.Content.Allocations, component), 8)
+		assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+			Code: reportv1alpha1.TrafficIssueAllocationsTruncated, Component: component,
+		})
+	}
+	assert.Len(t, got.Content.Conditions, 1, "unrecognized condition types must not expand output")
+	for _, code := range []reportv1alpha1.TrafficIssueCode{reportv1alpha1.TrafficIssueRoutesTruncated, reportv1alpha1.TrafficIssueEndpointsTruncated} {
+		assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: code, Component: issueComponent(code)})
+	}
+	assert.Contains(t, got.Warnings, reportv1alpha1.TrafficWarning{Code: reportv1alpha1.WarningTruncated})
+}
+
+func TestProjectIsDeterministicAcrossSourceOrder(t *testing.T) {
+	left := currentTrafficISVC(t)
+	right := left.DeepCopy()
+	slices.Reverse(right.Status.Traffic.TargetedHTTPRoutes)
+	slices.Reverse(right.Status.Addresses)
+	rightComponent := right.Status.Components[omev1beta1.EngineComponent]
+	slices.Reverse(rightComponent.Traffic)
+	right.Status.Components[omev1beta1.EngineComponent] = rightComponent
+	slices.Reverse(right.Status.Traffic.Conditions)
+
+	leftReport, err := trafficprojection.Project(left, projectionClock)
+	require.NoError(t, err)
+	rightReport, err := trafficprojection.Project(right, projectionClock)
+	require.NoError(t, err)
+
+	assert.Equal(t, leftReport, rightReport)
+}
+
+func TestProjectConditionConflictIsDeterministicAcrossSourceOrder(t *testing.T) {
+	left := currentTrafficISVC(t)
+	left.Status.Traffic.Conditions = append(left.Status.Traffic.Conditions,
+		trafficCondition(omev1beta1.TrafficConditionBackendPolicyReady, metav1.ConditionFalse, omev1beta1.TrafficReasonGatewayRejected, 7),
+	)
+	right := left.DeepCopy()
+	slices.Reverse(right.Status.Traffic.Conditions)
+
+	leftReport, err := trafficprojection.Project(left, projectionClock)
+	require.NoError(t, err)
+	rightReport, err := trafficprojection.Project(right, projectionClock)
+	require.NoError(t, err)
+
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, leftReport.Content.Summary.State)
+	assert.Equal(t, leftReport, rightReport)
+}
+
+func TestProjectAllocationConflictIsDeterministicAcrossSourceOrder(t *testing.T) {
+	left := currentTrafficISVC(t)
+	left.Status.Canary = nil
+	component := left.Status.Components[omev1beta1.EngineComponent]
+	component.Traffic = []omev1beta1.ComponentTrafficTarget{
+		{RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 50},
+		{RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 50, LatestRevision: true},
+	}
+	left.Status.Components[omev1beta1.EngineComponent] = component
+	right := left.DeepCopy()
+	rightComponent := right.Status.Components[omev1beta1.EngineComponent]
+	slices.Reverse(rightComponent.Traffic)
+	right.Status.Components[omev1beta1.EngineComponent] = rightComponent
+
+	leftReport, err := trafficprojection.Project(left, projectionClock)
+	require.NoError(t, err)
+	rightReport, err := trafficprojection.Project(right, projectionClock)
+	require.NoError(t, err)
+
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, leftReport.Content.Summary.State)
+	assert.Equal(t, leftReport, rightReport)
+}
+
+func TestProjectRecognizesOnlyExactPolicyGVKs(t *testing.T) {
+	tests := []struct {
+		apiVersion string
+		kind       string
+		want       reportv1alpha1.TrafficTranslator
+		invalid    bool
+	}{
+		{apiVersion: "gateway.envoyproxy.io/v1alpha1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorEnvoyGateway},
+		{apiVersion: "networking.istio.io/v1", kind: "DestinationRule", want: reportv1alpha1.TrafficTranslatorIstio},
+		{apiVersion: "gateway.envoyproxy.io/v1beta1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorUnknown, invalid: true},
+		{apiVersion: "networking.istio.io/v1", kind: "BackendTrafficPolicy", want: reportv1alpha1.TrafficTranslatorUnknown, invalid: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.apiVersion+"/"+tt.kind, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Status.Traffic.BackendPolicyResource.APIVersion = tt.apiVersion
+			isvc.Status.Traffic.BackendPolicyResource.Kind = tt.kind
+			got, err := trafficprojection.Project(isvc, projectionClock)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.Content.Summary.Translator)
+			assert.Equal(t, tt.invalid, got.Content.Summary.State == reportv1alpha1.TrafficStateInvalid)
+		})
+	}
+}
+
+func TestProjectValidatesSubjectIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService)
+		want   error
+	}{
+		{name: "nil", want: trafficprojection.ErrInferenceServiceRequired},
+		{name: "name", mutate: func(isvc *omev1beta1.InferenceService) { isvc.Name = "" }, want: trafficprojection.ErrInferenceServiceNameRequired},
+		{name: "namespace", mutate: func(isvc *omev1beta1.InferenceService) { isvc.Namespace = "" }, want: trafficprojection.ErrInferenceServiceNamespaceRequired},
+		{name: "uid", mutate: func(isvc *omev1beta1.InferenceService) { isvc.UID = "" }, want: trafficprojection.ErrInferenceServiceUIDRequired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var isvc *omev1beta1.InferenceService
+			if tt.mutate != nil {
+				isvc = currentTrafficISVC(t)
+				tt.mutate(isvc)
+			}
+			_, err := trafficprojection.Project(isvc, projectionClock)
+			assert.ErrorIs(t, err, tt.want)
+		})
+	}
+}
+
+func currentTrafficISVC(t *testing.T) *omev1beta1.InferenceService {
+	t.Helper()
+	class := "SECRET_CLASS_MUST_NOT_LEAK"
+	return &omev1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "prod", UID: types.UID("uid-chat"), Generation: 7},
+		Spec: omev1beta1.InferenceServiceSpec{
+			Traffic: &omev1beta1.TrafficSpec{},
+			Rollout: &omev1beta1.RolloutSpec{Groups: []omev1beta1.RolloutGroup{{
+				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+				Canary: &omev1beta1.GroupCanary{Steps: []omev1beta1.RolloutGroupStep{
+					{Capacity: intstr.FromString("50%"), Traffic: 20},
+					{Capacity: intstr.FromString("100%"), Traffic: 100},
+				}},
+			}}},
+		},
+		Status: omev1beta1.InferenceServiceStatus{
+			Addresses: []duckv1.Addressable{
+				{Name: &class, URL: mustURL(t, "https://chat.prod.example/")},
+				{URL: mustURL(t, "http://chat-engine.prod.svc.cluster.local")},
+			},
+			Traffic: &omev1beta1.TrafficStatus{
+				Algorithm:             "RoundRobin",
+				BackendPolicyResource: &omev1beta1.BackendPolicyRef{APIVersion: "gateway.envoyproxy.io/v1alpha1", Kind: "BackendTrafficPolicy", Name: "chat"},
+				TargetedHTTPRoutes:    []string{"chat-router", "chat"},
+				Conditions:            []metav1.Condition{trafficCondition(omev1beta1.TrafficConditionBackendPolicyReady, metav1.ConditionUnknown, omev1beta1.TrafficReasonPending, 7)},
+			},
+			Canary: &omev1beta1.CanaryStatus{CurrentStep: 0, ObservedTrafficWeight: 20, StableRevisionHash: "a1b2c3d4", CanaryRevisionHash: "e5f6a7b8"},
+			Components: map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
+				omev1beta1.EngineComponent: {Traffic: []omev1beta1.ComponentTrafficTarget{
+					{RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 20, Tag: "SECRET_TAG", LatestRevision: true},
+					{RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 80},
+				}},
+			},
+		},
+	}
+}
+
+func trafficCondition(conditionType string, status metav1.ConditionStatus, reason string, generation int64) metav1.Condition {
+	return metav1.Condition{Type: conditionType, Status: status, Reason: reason, Message: "SECRET_MESSAGE", ObservedGeneration: generation, LastTransitionTime: metav1.NewTime(time.Date(2026, 9, 14, 16, 59, 0, 0, time.UTC))}
+}
+
+func setReadyCondition(isvc *omev1beta1.InferenceService, status metav1.ConditionStatus, reason string, generation int64) {
+	isvc.Status.Traffic.Conditions[0] = trafficCondition(omev1beta1.TrafficConditionBackendPolicyReady, status, reason, generation)
+}
+
+func mustURL(t *testing.T, value string) *knapis.URL {
+	t.Helper()
+	result, err := knapis.ParseURL(value)
+	require.NoError(t, err)
+	return result
+}
+
+func trafficRouteNames(values []reportv1alpha1.TrafficRoute) []string {
+	result := make([]string, len(values))
+	for i := range values {
+		result[i] = values[i].Name
+	}
+	return result
+}
+
+func trafficEndpointURLs(values []reportv1alpha1.TrafficEndpoint) []string {
+	result := make([]string, len(values))
+	for i := range values {
+		result[i] = values[i].URL
+	}
+	return result
+}
+
+func trafficAllocationRoles(values []reportv1alpha1.TrafficAllocation) []reportv1alpha1.TrafficAllocationRole {
+	result := make([]reportv1alpha1.TrafficAllocationRole, len(values))
+	for i := range values {
+		result[i] = values[i].Role
+	}
+	return result
+}
+
+func allocationsForComponent(values []reportv1alpha1.TrafficAllocation, component reportv1alpha1.RuntimeComponentType) []reportv1alpha1.TrafficAllocation {
+	result := make([]reportv1alpha1.TrafficAllocation, 0, len(values))
+	for _, value := range values {
+		if value.Component == component {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func flattenRows(rows [][]string) string {
+	values := make([]string, len(rows))
+	for i := range rows {
+		values[i] = strings.Join(rows[i], "|")
+	}
+	return strings.Join(values, "\n")
+}
+
+func issueComponent(code reportv1alpha1.TrafficIssueCode) reportv1alpha1.RuntimeComponentType {
+	if code == reportv1alpha1.TrafficIssueAllocationsTruncated {
+		return reportv1alpha1.RuntimeComponentEngine
+	}
+	return ""
+}
