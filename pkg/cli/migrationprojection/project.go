@@ -96,13 +96,14 @@ func Project(
 
 	sources := make([]sourceSnapshot, 0, len(snapshot.InferenceReplicas))
 	componentCounts := map[reportv1alpha1.RuntimeComponentType]int{}
+	requireRelationshipLabel := len(utilvalidation.IsValidLabelValue(parent.Name)) == 0
 	for index := range snapshot.InferenceReplicas {
 		ir := &snapshot.InferenceReplicas[index]
 		component, componentValid := canonicalComponent(ir.Spec.Component)
 		if filterSet && (!componentValid || component != filter) {
 			continue
 		}
-		source := validateSource(parent, ir, now, &report)
+		source := validateSource(parent, ir, requireRelationshipLabel, now, &report)
 		if source.bound {
 			componentCounts[source.component]++
 		}
@@ -236,6 +237,7 @@ func validParentIdentity(parent *omev1beta1.InferenceService) bool {
 func validateSource(
 	parent *omev1beta1.InferenceService,
 	ir *omev1beta1.InferenceReplica,
+	requireRelationshipLabel bool,
 	now time.Time,
 	report *reportv1alpha1.MigrationStatusReport,
 ) sourceSnapshot {
@@ -248,7 +250,7 @@ func validateSource(
 	labelValid := ir.Labels[constants.InferenceServicePodLabelKey] == parent.Name
 	parentValid := ir.Spec.ParentRef.Name == parent.Name
 	ownerValid := hasExactControllerOwner(ir.OwnerReferences, parent)
-	bound := identityValid && componentValid && labelValid && parentValid && ownerValid
+	bound := identityValid && componentValid && (!requireRelationshipLabel || labelValid) && parentValid && ownerValid
 	freshness := reportv1alpha1.StatusFreshnessInvalid
 	observedGeneration := int64(0)
 	statusUsable := false
@@ -281,7 +283,7 @@ func validateSource(
 	if !identityValid {
 		addReportIssue(report, reportv1alpha1.MigrationIssue{Code: reportv1alpha1.MigrationIssueSourceIdentityInvalid, SourceName: name})
 	}
-	if !labelValid {
+	if requireRelationshipLabel && !labelValid {
 		addReportIssue(report, reportv1alpha1.MigrationIssue{Code: reportv1alpha1.MigrationIssueSourceLabelMismatch, SourceName: name, Component: component})
 	}
 	if !parentValid {

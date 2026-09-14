@@ -2,6 +2,8 @@ package v1alpha1
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/base64"
 	"slices"
 	"sort"
 	"time"
@@ -358,10 +360,21 @@ func compactMigrationIssueSubject(issue MigrationIssue) string {
 }
 
 func compactSourceName(value string) string {
-	if !safeResourceName(value) {
-		return "INVALID"
+	const cellWidth = 8
+
+	valid := safeResourceName(value)
+	if valid && len(value) <= cellWidth {
+		return value
 	}
-	return printers.BoundedMiddleCell(value, 8)
+	// The sentinel cannot occur at the start of a valid resource name, so a
+	// digest token cannot collide with an unabridged short name. Seven base64url
+	// characters retain 42 bits of SHA-256 while keeping the cell at 8 columns.
+	digest := sha256.Sum256([]byte(value))
+	token := base64.RawURLEncoding.EncodeToString(digest[:])[:cellWidth-1]
+	if valid {
+		return "~" + token
+	}
+	return "!" + token
 }
 
 func reportFreshness(report MigrationStatusReport) string {

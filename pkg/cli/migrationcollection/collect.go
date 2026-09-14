@@ -43,8 +43,10 @@ type Result struct {
 	Completeness      Completeness
 }
 
-// Collect performs one exact namespaced parent GET followed by bounded,
-// selector-preserving InferenceReplica pagination.
+// Collect performs one exact namespaced parent GET followed by bounded
+// InferenceReplica pagination. Parent names that fit a Kubernetes label value
+// use the relationship label selector; longer names use a bounded namespace
+// scan and retain only exact typed parent and controller-owner matches.
 func Collect(
 	ctx context.Context,
 	client omeclient.OmeV1beta1Interface,
@@ -94,10 +96,14 @@ func Collect(
 		return Result{}, ErrInferenceServiceUIDInvalid
 	}
 
-	selector := labels.Set{constants.InferenceServicePodLabelKey: name}.AsSelector().String()
+	listOptions := metav1.ListOptions{}
+	useRelationshipSelector := len(utilvalidation.IsValidLabelValue(name)) == 0
+	if useRelationshipSelector {
+		listOptions.LabelSelector = labels.Set{constants.InferenceServicePodLabelKey: name}.AsSelector().String()
+	}
 	listed, err := paging.ListBounded(
 		ctx,
-		metav1.ListOptions{LabelSelector: selector},
+		listOptions,
 		limits,
 		func(requestCtx context.Context, options metav1.ListOptions) (paging.Page[omev1beta1.InferenceReplica], error) {
 			list, listErr := client.InferenceReplicas(namespace).List(requestCtx, options)
@@ -116,10 +122,14 @@ func Collect(
 	if err != nil {
 		return Result{}, fmt.Errorf("list related InferenceReplicas: %w", err)
 	}
+	replicas := listed.Items
+	if !useRelationshipSelector {
+		replicas = exactlyRelatedInferenceReplicas(listed.Items, isvc)
+	}
 
 	result := Result{
 		InferenceService:  isvc.DeepCopy(),
-		InferenceReplicas: copyInferenceReplicas(listed.Items),
+		InferenceReplicas: copyInferenceReplicas(replicas),
 		Completeness: Completeness{
 			ObservedPages: listed.Pages,
 			ObservedItems: len(listed.Items),
@@ -127,6 +137,36 @@ func Collect(
 		},
 	}
 	return result, nil
+}
+
+func exactlyRelatedInferenceReplicas(
+	items []omev1beta1.InferenceReplica,
+	parent *omev1beta1.InferenceService,
+) []omev1beta1.InferenceReplica {
+	result := make([]omev1beta1.InferenceReplica, 0, len(items))
+	for i := range items {
+		item := &items[i]
+		if item.Namespace != parent.Namespace || item.Spec.ParentRef.Name != parent.Name ||
+			!hasExactControllerOwner(item.OwnerReferences, parent) {
+			continue
+		}
+		result = append(result, *item)
+	}
+	return result
+}
+
+func hasExactControllerOwner(references []metav1.OwnerReference, parent *omev1beta1.InferenceService) bool {
+	controllers := 0
+	matched := false
+	for _, reference := range references {
+		if reference.Controller == nil || !*reference.Controller {
+			continue
+		}
+		controllers++
+		matched = reference.APIVersion == omev1beta1.SchemeGroupVersion.String() &&
+			reference.Kind == "InferenceService" && reference.Name == parent.Name && reference.UID == parent.UID
+	}
+	return controllers == 1 && matched
 }
 
 func validateLimits(limits paging.Limits) error {

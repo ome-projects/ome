@@ -393,9 +393,28 @@ func TestMigrationStatusTableDeduplicatesOnlyExactScopedIssues(t *testing.T) {
 	table := document.Table()
 
 	assert.Equal(t, [][]string{
-		{"cha...ne/engine", "Partial/Current", "SourceOwnerMismatch"},
-		{"cha...ow/engine", "Partial/Current", "SourceOwnerMismatch"},
-		{"cha...er/router", "Partial/Current", "SourceOwnerMismatch"},
+		{"~meItRK7/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"~VXYQlcT/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"~-wSO5qU/router", "Partial/Current", "SourceOwnerMismatch"},
+	}, table.Rows)
+}
+
+func TestMigrationStatusTableDisambiguatesCollidingSourceNames(t *testing.T) {
+	t.Parallel()
+
+	document := MigrationStatusReport{Content: MigrationStatusContent{
+		Summary: MigrationSummary{State: MigrationReportStatePartial},
+		Issues: []MigrationIssue{
+			{Code: MigrationIssueSourceOwnerMismatch, SourceName: "abc-one-xy", Component: RuntimeComponentEngine},
+			{Code: MigrationIssueSourceOwnerMismatch, SourceName: "abc-two-xy", Component: RuntimeComponentEngine},
+		},
+	}}
+
+	table := document.Table()
+
+	assert.Equal(t, [][]string{
+		{"~AJ0Yn9C/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"~jbSpLH_/engine", "Partial/Current", "SourceOwnerMismatch"},
 	}, table.Rows)
 }
 
@@ -412,7 +431,7 @@ func TestMigrationStatusTableRejectsUntrustedSourceSubject(t *testing.T) {
 	table := document.Table()
 
 	assert.Equal(t, [][]string{{
-		"INVALID/engine", "Partial/Current", "SourceIdentityInvalid",
+		"!6H30TC5/engine", "Partial/Current", "SourceIdentityInvalid",
 	}}, table.Rows)
 }
 

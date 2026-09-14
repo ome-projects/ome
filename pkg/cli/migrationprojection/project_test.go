@@ -212,6 +212,51 @@ func TestProjectValidatesReplicaIdentityBeforeUsingStatus(t *testing.T) {
 	}
 }
 
+func TestProjectUsesExactOwnerEvidenceWhenParentNameCannotBeALabelValue(t *testing.T) {
+	t.Parallel()
+
+	parent := projectionISVC()
+	parent.Name = strings.Repeat("a", 64)
+	ir := projectionIR(parent, "engine", omev1beta1.EngineComponent)
+	ir.Labels = nil
+	ir.Status.Migrations = []omev1beta1.MigrationStatus{
+		validManualRecord("safe-record", omev1beta1.MigrationPhaseAccepted),
+	}
+
+	got, err := Project(
+		migrationcollection.Result{InferenceService: parent, InferenceReplicas: []omev1beta1.InferenceReplica{ir}},
+		"", Limits{MaxRecords: 20, MaxScannedRecords: 80, MaxNodeHints: 4, MaxScannedNodeHints: 32}, fixedClock{projectionNow},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.MigrationReportStateReported, got.Content.Summary.State)
+	require.Len(t, got.Content.Migrations, 1)
+	assert.Equal(t, "safe-record", got.Content.Migrations[0].RequestID)
+	assert.Empty(t, got.Content.Issues)
+}
+
+func TestProjectLongNameStillRejectsAnInexactOwner(t *testing.T) {
+	t.Parallel()
+
+	parent := projectionISVC()
+	parent.Name = strings.Repeat("a", 64)
+	ir := projectionIR(parent, "engine", omev1beta1.EngineComponent)
+	ir.Labels = nil
+	ir.OwnerReferences[0].UID = "unrelated"
+	ir.Status.Migrations = []omev1beta1.MigrationStatus{
+		validManualRecord("must-not-project", omev1beta1.MigrationPhaseAccepted),
+	}
+
+	got, err := Project(
+		migrationcollection.Result{InferenceService: parent, InferenceReplicas: []omev1beta1.InferenceReplica{ir}},
+		"", Limits{MaxRecords: 20, MaxScannedRecords: 80, MaxNodeHints: 4, MaxScannedNodeHints: 32}, fixedClock{projectionNow},
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, got.Content.Migrations)
+	assertIssueCode(t, got.Content.Issues, reportv1alpha1.MigrationIssueSourceOwnerMismatch)
+}
+
 func TestProjectReportsStalenessAndDuplicateSources(t *testing.T) {
 	t.Parallel()
 

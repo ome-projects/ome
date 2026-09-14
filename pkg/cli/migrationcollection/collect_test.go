@@ -3,6 +3,7 @@ package migrationcollection
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,6 +76,122 @@ func TestCollectGetsExactParentAndPagesExactLabeledReplicas(t *testing.T) {
 	got.InferenceService.Name = "changed"
 	got.InferenceReplicas[0].Name = "changed"
 	assert.Equal(t, "chat", parent.Name)
+}
+
+func TestCollectNeverBuildsAnInvalidRelationshipLabelSelector(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		length       int
+		wantSelector bool
+	}{
+		{name: "maximum label value", length: 63, wantSelector: true},
+		{name: "over label value limit", length: 64},
+		{name: "maximum inference service name", length: 253},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			name := strings.Repeat("a", test.length)
+			client := omefake.NewSimpleClientset(collectionISVC(name, "prod", "uid-parent"))
+			client.PrependReactor("list", "inferencereplicas", func(action ktesting.Action) (bool, runtime.Object, error) {
+				options := action.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
+				if test.wantSelector {
+					assert.Equal(t, constants.InferenceServicePodLabelKey+"="+name, options.LabelSelector)
+				} else {
+					assert.Empty(t, options.LabelSelector)
+				}
+				return true, &omev1beta1.InferenceReplicaList{}, nil
+			})
+
+			got, err := Collect(context.Background(), client.OmeV1beta1(), "prod", name, collectionTestLimits)
+
+			require.NoError(t, err)
+			assert.Empty(t, got.InferenceReplicas)
+			require.Len(t, client.Actions(), 2)
+		})
+	}
+}
+
+func TestCollectLongNameScansBoundedlyAndKeepsOnlyExactRelationships(t *testing.T) {
+	t.Parallel()
+
+	parent := collectionISVC(strings.Repeat("a", 64), "prod", "uid-parent")
+	relatedEngine := collectionRelatedIR(parent, "engine", "uid-engine")
+	relatedEngine.Annotations = map[string]string{"source": "original"}
+	relatedRouter := collectionRelatedIR(parent, "router", "uid-router")
+	relatedRouter.Spec.Component = omev1beta1.RouterComponent
+
+	hostileUnrelated := collectionIR("bad\n\x1b\u202esource", "prod", "uid-hostile")
+	hostileUnrelated.Spec.ParentRef.Name = parent.Name
+	wrongParent := collectionRelatedIR(parent, "wrong-parent", "uid-wrong-parent")
+	wrongParent.Spec.ParentRef.Name = "someone-else"
+	wrongOwner := collectionRelatedIR(parent, "wrong-owner", "uid-wrong-owner")
+	wrongOwner.OwnerReferences[0].UID = "someone-else"
+	wrongNamespace := collectionRelatedIR(parent, "wrong-namespace", "uid-wrong-namespace")
+	wrongNamespace.Namespace = "other"
+
+	client := omefake.NewSimpleClientset(parent)
+	client.PrependReactor("list", "inferencereplicas", func(action ktesting.Action) (bool, runtime.Object, error) {
+		options := action.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
+		assert.Empty(t, options.LabelSelector)
+		switch options.Continue {
+		case "":
+			return true, &omev1beta1.InferenceReplicaList{
+				ListMeta: metav1.ListMeta{Continue: "next"},
+				Items:    []omev1beta1.InferenceReplica{hostileUnrelated, wrongParent, relatedEngine},
+			}, nil
+		case "next":
+			return true, &omev1beta1.InferenceReplicaList{
+				Items: []omev1beta1.InferenceReplica{relatedRouter, wrongOwner, wrongNamespace},
+			}, nil
+		default:
+			return true, nil, errors.New("unexpected continue token")
+		}
+	})
+	limits := collectionTestLimits
+	limits.PageSize = 3
+	limits.MaxItems = 6
+
+	got, err := Collect(context.Background(), client.OmeV1beta1(), "prod", parent.Name, limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, Completeness{ObservedPages: 2, ObservedItems: 6}, got.Completeness)
+	require.Len(t, got.InferenceReplicas, 2)
+	assert.Equal(t, []string{"engine", "router"}, []string{got.InferenceReplicas[0].Name, got.InferenceReplicas[1].Name})
+	assert.NotContains(t, got.InferenceReplicas, hostileUnrelated)
+	got.InferenceReplicas[0].Annotations["source"] = "changed"
+	got.InferenceReplicas[0].OwnerReferences[0].UID = "changed"
+	assert.Equal(t, "original", relatedEngine.Annotations["source"])
+	assert.Equal(t, types.UID("uid-parent"), relatedEngine.OwnerReferences[0].UID)
+}
+
+func TestCollectLongNameMarksBoundedNamespaceScanTruncated(t *testing.T) {
+	t.Parallel()
+
+	parent := collectionISVC(strings.Repeat("a", 64), "prod", "uid-parent")
+	related := collectionRelatedIR(parent, "engine", "uid-engine")
+	unrelated := collectionRelatedIR(parent, "other", "uid-other")
+	unrelated.OwnerReferences[0].Name = "someone-else"
+	client := omefake.NewSimpleClientset(parent)
+	client.PrependReactor("list", "inferencereplicas", func(action ktesting.Action) (bool, runtime.Object, error) {
+		options := action.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
+		assert.Empty(t, options.LabelSelector)
+		return true, &omev1beta1.InferenceReplicaList{
+			ListMeta: metav1.ListMeta{Continue: "more"},
+			Items:    []omev1beta1.InferenceReplica{related, unrelated},
+		}, nil
+	})
+	limits := collectionTestLimits
+	limits.MaxItems = 2
+
+	got, err := Collect(context.Background(), client.OmeV1beta1(), "prod", parent.Name, limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, Completeness{ObservedPages: 1, ObservedItems: 2, Truncated: true}, got.Completeness)
+	require.Len(t, got.InferenceReplicas, 1)
+	assert.Equal(t, "engine", got.InferenceReplicas[0].Name)
 }
 
 func TestCollectMarksBoundedReplicaPrefixTruncated(t *testing.T) {
@@ -167,6 +284,47 @@ func TestCollectPropagatesCancellationAndListErrorsWithoutPartialSnapshot(t *tes
 	})
 }
 
+func TestCollectLongNamePropagatesCancellationAndListErrorsWithoutPartialSnapshot(t *testing.T) {
+	t.Parallel()
+
+	name := strings.Repeat("a", 64)
+	t.Run("canceled namespace scan", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		fake := omefake.NewSimpleClientset(collectionISVC(name, "prod", "uid-parent"))
+		client := collectionListClient{
+			OmeV1beta1Interface: fake.OmeV1beta1(),
+			list: func(requestCtx context.Context, options metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+				assert.Empty(t, options.LabelSelector)
+				cancel()
+				return nil, requestCtx.Err()
+			},
+		}
+
+		got, err := Collect(ctx, client, "prod", name, collectionTestLimits)
+
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Nil(t, got.InferenceService)
+		assert.Empty(t, got.InferenceReplicas)
+	})
+
+	t.Run("namespace scan client error", func(t *testing.T) {
+		boom := errors.New("namespace scan failed")
+		fake := omefake.NewSimpleClientset(collectionISVC(name, "prod", "uid-parent"))
+		client := collectionListClient{
+			OmeV1beta1Interface: fake.OmeV1beta1(),
+			list: func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+				return nil, boom
+			},
+		}
+
+		got, err := Collect(context.Background(), client, "prod", name, collectionTestLimits)
+
+		require.ErrorIs(t, err, boom)
+		assert.Nil(t, got.InferenceService)
+		assert.Empty(t, got.InferenceReplicas)
+	})
+}
+
 func TestCollectRejectsMissingClientWithoutAttemptingARead(t *testing.T) {
 	t.Parallel()
 
@@ -249,6 +407,7 @@ func TestCollectRejectsInvalidRequestIdentityBeforeAnyRead(t *testing.T) {
 		{name: "invalid namespace", namespace: "Bad_Namespace", isvc: "chat", want: ErrInferenceServiceNamespaceInvalid},
 		{name: "empty name", namespace: "prod", want: ErrInferenceServiceNameInvalid},
 		{name: "invalid name", namespace: "prod", isvc: "Bad_Name", want: ErrInferenceServiceNameInvalid},
+		{name: "name too long", namespace: "prod", isvc: strings.Repeat("a", 254), want: ErrInferenceServiceNameInvalid},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -276,6 +435,22 @@ func collectionIR(name, namespace, uid string) omev1beta1.InferenceReplica {
 	}}
 }
 
+func collectionRelatedIR(parent *omev1beta1.InferenceService, name, uid string) omev1beta1.InferenceReplica {
+	controller := true
+	return omev1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: parent.Namespace, UID: types.UID(uid), Generation: 2,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: omev1beta1.SchemeGroupVersion.String(), Kind: "InferenceService",
+				Name: parent.Name, UID: parent.UID, Controller: &controller,
+			}},
+		},
+		Spec: omev1beta1.InferenceReplicaSpec{
+			ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: omev1beta1.EngineComponent,
+		},
+	}
+}
+
 type collectionMissingListClient struct {
 	omeclient.OmeV1beta1Interface
 }
@@ -290,4 +465,25 @@ type collectionMissingInferenceReplicas struct {
 
 func (collectionMissingInferenceReplicas) List(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
 	return nil, nil
+}
+
+type collectionListClient struct {
+	omeclient.OmeV1beta1Interface
+	list func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error)
+}
+
+func (c collectionListClient) InferenceReplicas(namespace string) omeclient.InferenceReplicaInterface {
+	return collectionListInferenceReplicas{
+		InferenceReplicaInterface: c.OmeV1beta1Interface.InferenceReplicas(namespace),
+		list:                      c.list,
+	}
+}
+
+type collectionListInferenceReplicas struct {
+	omeclient.InferenceReplicaInterface
+	list func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error)
+}
+
+func (c collectionListInferenceReplicas) List(ctx context.Context, options metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+	return c.list(ctx, options)
 }

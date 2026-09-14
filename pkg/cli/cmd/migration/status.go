@@ -100,8 +100,10 @@ func newStatusCmdWithDependencies(
 		Short: "Show live InferenceReplica migration status",
 		Long: `Show the bounded, authoritative migration records reported by the
 InferenceReplicas owned by one InferenceService. The command reads exactly that
-InferenceService and a label-selected, identity-validated InferenceReplica
-collection. It never reads migration audit ConfigMaps, pods, or Events.
+InferenceService and an identity-validated InferenceReplica collection. It uses
+the relationship label when representable; longer names use a bounded namespace
+scan with exact parent and controller-owner checks. It never reads migration
+audit ConfigMaps, pods, or Events.
 
 Controller blocker and terminal-outcome messages are sanitized and capped at
 256 display columns in machine output. Table details are clipped further so
