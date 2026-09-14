@@ -98,6 +98,13 @@ type projector struct {
 	truncated        bool
 }
 
+type allocationCandidate struct {
+	name    string
+	hash    string
+	percent int32
+	latest  bool
+}
+
 func (b *projector) projectTrafficStatus() {
 	unavailable := source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnavailable)
 	b.content.Summary = reportv1alpha1.TrafficSummary{
@@ -176,9 +183,16 @@ func (b *projector) projectTrafficStatus() {
 		}
 	}
 
-	if b.readyValid && b.ready.Reason == reportv1alpha1.TrafficReasonNoTranslatorAvailable && status.BackendPolicyResource == nil {
-		b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorNoop
-		b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, b.ready.Source.Freshness)
+	if b.readyValid && b.ready.Reason == reportv1alpha1.TrafficReasonNoTranslatorAvailable {
+		switch {
+		case b.content.Policy != nil:
+			b.addIssue(reportv1alpha1.TrafficIssueStatusCombinationInvalid, "", true)
+			b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorUnavailable
+			b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, reportv1alpha1.TrafficFreshnessUnverifiable)
+		case status.BackendPolicyResource == nil:
+			b.content.Summary.Translator = reportv1alpha1.TrafficTranslatorNoop
+			b.content.Summary.Source.Translator = source(reportv1alpha1.EvidenceComputed, b.ready.Source.Freshness)
+		}
 	}
 }
 
@@ -237,7 +251,7 @@ func (b *projector) projectConditions(conditions []metav1.Condition) {
 }
 
 func (b *projector) projectCondition(conditionType reportv1alpha1.TrafficConditionType, condition *metav1.Condition) (reportv1alpha1.TrafficCondition, bool) {
-	generationValid := condition.ObservedGeneration >= 0 && condition.ObservedGeneration <= b.isvc.Generation
+	generationValid := condition.ObservedGeneration > 0 && condition.ObservedGeneration <= b.isvc.Generation
 	freshness := reportv1alpha1.TrafficFreshnessUnverifiable
 	if generationValid && condition.ObservedGeneration == b.isvc.Generation {
 		freshness = reportv1alpha1.TrafficFreshnessCurrent
@@ -362,10 +376,6 @@ func (b *projector) projectEndpoints() {
 }
 
 func (b *projector) projectCanary() {
-	status := b.isvc.Status.Canary
-	if status == nil {
-		return
-	}
 	rollout := omev1beta1.EffectiveRollout(b.isvc)
 	var group *omev1beta1.RolloutGroup
 	if rollout != nil {
@@ -379,6 +389,15 @@ func (b *projector) projectCanary() {
 			}
 			group = &rollout.Groups[i]
 		}
+	}
+	status := b.isvc.Status.Canary
+	if status == nil {
+		_, primary, primaryOK := canaryPrimary(group)
+		component, componentOK := b.isvc.Status.Components[primary]
+		if primaryOK && componentOK && canaryevidence.PhaseNeedsStatus(canaryevidence.ProjectPhase(component.RolloutPhase)) {
+			b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)
+		}
+		return
 	}
 	component, primary, componentOK := canaryPrimary(group)
 	if !componentOK || group == nil || group.Canary == nil || len(group.Canary.Steps) == 0 || len(group.Canary.Steps) > 20 ||
@@ -444,13 +463,7 @@ func (b *projector) projectAllocations() {
 
 func (b *projector) projectComponentAllocations(component omev1beta1.ComponentType, status omev1beta1.ComponentStatusSpec) {
 	projectedComponent := projectComponent(component)
-	type candidate struct {
-		name    string
-		hash    string
-		percent int32
-		latest  bool
-	}
-	candidates := make([]candidate, 0, len(status.Traffic))
+	candidates := make([]allocationCandidate, 0, len(status.Traffic))
 	total := int32(0)
 	for _, target := range status.Traffic {
 		total += target.Percent
@@ -459,7 +472,7 @@ func (b *projector) projectComponentAllocations(component omev1beta1.ComponentTy
 			b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
 			continue
 		}
-		candidates = append(candidates, candidate{name: target.RevisionName, hash: hash, percent: target.Percent, latest: target.LatestRevision})
+		candidates = append(candidates, allocationCandidate{name: target.RevisionName, hash: hash, percent: target.Percent, latest: target.LatestRevision})
 	}
 	if total != 100 {
 		b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
@@ -481,6 +494,10 @@ func (b *projector) projectComponentAllocations(component omev1beta1.ComponentTy
 		}
 		unique = append(unique, candidate)
 	}
+	stableName := ""
+	if b.content.Canary == nil || b.content.Canary.Component != projectedComponent {
+		stableName = b.stableAllocationName(component, projectedComponent, status.LatestRolledoutRevision, unique)
+	}
 	if len(unique) > maxAllocationsPerClass {
 		unique = unique[:maxAllocationsPerClass]
 		b.addIssue(reportv1alpha1.TrafficIssueAllocationsTruncated, projectedComponent, false)
@@ -488,14 +505,54 @@ func (b *projector) projectComponentAllocations(component omev1beta1.ComponentTy
 	}
 	for _, candidate := range unique {
 		b.content.Allocations = append(b.content.Allocations, reportv1alpha1.TrafficAllocation{
-			Component: projectedComponent, Role: b.allocationRole(projectedComponent, candidate.hash, candidate.name, candidate.latest, status),
+			Component: projectedComponent, Role: b.allocationRole(projectedComponent, candidate.hash, candidate.name, stableName),
 			RevisionName: candidate.name, RevisionHash: candidate.hash, Percent: candidate.percent,
 			Source: source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnverifiable),
 		})
 	}
 }
 
-func (b *projector) allocationRole(component reportv1alpha1.RuntimeComponentType, hash, name string, latest bool, status omev1beta1.ComponentStatusSpec) reportv1alpha1.TrafficAllocationRole {
+func (b *projector) stableAllocationName(
+	component omev1beta1.ComponentType,
+	projectedComponent reportv1alpha1.RuntimeComponentType,
+	rolledOutName string,
+	candidates []allocationCandidate,
+) string {
+	latestCount := 0
+	for _, candidate := range candidates {
+		if candidate.latest {
+			latestCount++
+		}
+	}
+	if latestCount > 1 {
+		b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
+	}
+
+	if rolledOutName != "" {
+		if _, valid := revisionTargetHash(b.isvc.Name, component, rolledOutName); !valid {
+			b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
+			return ""
+		}
+		for _, candidate := range candidates {
+			if candidate.name == rolledOutName {
+				return rolledOutName
+			}
+		}
+		b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
+		return ""
+	}
+
+	if len(candidates) > 1 {
+		b.addIssue(reportv1alpha1.TrafficIssueAllocationInvalid, projectedComponent, true)
+		return ""
+	}
+	if len(candidates) == 1 && candidates[0].latest {
+		return candidates[0].name
+	}
+	return ""
+}
+
+func (b *projector) allocationRole(component reportv1alpha1.RuntimeComponentType, hash, name, stableName string) reportv1alpha1.TrafficAllocationRole {
 	if b.content.Canary != nil && b.content.Canary.Component == component {
 		if b.content.Canary.StableRevisionHash != "" && hash == b.content.Canary.StableRevisionHash {
 			return reportv1alpha1.TrafficRoleStable
@@ -508,7 +565,7 @@ func (b *projector) allocationRole(component reportv1alpha1.RuntimeComponentType
 		}
 		return reportv1alpha1.TrafficRoleOther
 	}
-	if latest || name == status.LatestRolledoutRevision {
+	if stableName != "" && name == stableName {
 		return reportv1alpha1.TrafficRoleStable
 	}
 	return reportv1alpha1.TrafficRoleOther

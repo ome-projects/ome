@@ -165,6 +165,12 @@ func TestProjectDoesNotInferNoopFromInvalidReadyCondition(t *testing.T) {
 			},
 		},
 		{
+			name: "missing observed generation",
+			mutate: func(condition *metav1.Condition) {
+				condition.ObservedGeneration = 0
+			},
+		},
+		{
 			name: "future observed generation",
 			mutate: func(condition *metav1.Condition) {
 				condition.ObservedGeneration = 8
@@ -189,6 +195,61 @@ func TestProjectDoesNotInferNoopFromInvalidReadyCondition(t *testing.T) {
 			assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueConditionInvalid})
 		})
 	}
+}
+
+func TestProjectMissingConditionGenerationCannotBindPresentTrafficFields(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Traffic.Conditions[0].ObservedGeneration = 0
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, [][]string{
+		{"STATE", "-", "Invalid", "Computed/Unverifiable"},
+		{"TRANSLATOR", "-", "envoy-gateway", "Computed/Unverifiable"},
+		{"ALGORITHM", "-", "RoundRobin", "Reported/Unverifiable"},
+		{"POLICY-READY", "-", "Unknown/Pending", "Reported/Unverifiable"},
+		{"UNSUPPORTED", "-", "Unknown", "Reported/Unverifiable"},
+		{"ROUTES", "-", "2", "Reported/Unverifiable"},
+		{"ENDPOINTS", "-", "2", "Reported/Unverifiable"},
+		{"CANARY", "engine", "1/2 @ 20%", "Reported/Unverifiable"},
+		{"WEIGHT", "engine", "stable:a1b2c3d4=80%", "Reported/Unverifiable"},
+		{"WEIGHT", "engine", "canary:e5f6a7b8=20%", "Reported/Unverifiable"},
+		{"ISSUE", "-", "ConditionInvalid", "Computed/Unverifiable"},
+	}, got.Table().Rows)
+	require.NotNil(t, got.Content.Policy)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Policy.Source.Freshness)
+	for _, route := range got.Content.Routes {
+		assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, route.Source.Freshness)
+	}
+	var rendered bytes.Buffer
+	require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+	assert.Contains(t, rendered.String(), `"observedGeneration": 0`)
+	assert.Contains(t, rendered.String(), `"code": "ConditionInvalid"`)
+	assert.NotContains(t, rendered.String(), `"freshness": "Stale"`)
+}
+
+func TestProjectRejectsNoTranslatorConditionWithRecognizedPolicy(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	setReadyCondition(isvc, metav1.ConditionFalse, omev1beta1.TrafficReasonNoTranslatorAvailable, 7)
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, [][]string{
+		{"STATE", "-", "Invalid", "Computed/Unverifiable"},
+		{"TRANSLATOR", "-", "Unavailable", "Computed/Unverifiable"},
+		{"ALGORITHM", "-", "RoundRobin", "Reported/Current"},
+		{"POLICY-READY", "-", "False/NoTranslatorAvailable", "Reported/Current"},
+		{"UNSUPPORTED", "-", "Unknown", "Reported/Current"},
+	}, got.Table().Rows[:5])
+	assert.Equal(t, [][]string{{"ISSUE", "-", "StatusCombinationInvalid", "Computed/Unverifiable"}}, tableRows(got.Table().Rows, "ISSUE"))
+	require.NotNil(t, got.Content.Policy, "retain the allowlisted reported policy for diagnosis")
+	var rendered bytes.Buffer
+	require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+	assert.Contains(t, rendered.String(), `"translator": "Unavailable"`)
+	assert.Contains(t, rendered.String(), `"code": "StatusCombinationInvalid"`)
+	assert.NotContains(t, rendered.String(), `"translator": "noop"`)
 }
 
 func TestProjectDoesNotInferNoopFromConflictingReadyConditions(t *testing.T) {
@@ -267,6 +328,160 @@ func TestProjectCanaryUsesPinnedActiveRunPlan(t *testing.T) {
 	require.NotNil(t, got.Content.Canary)
 	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canary.Component)
 	assert.Equal(t, int32(2), got.Content.Canary.TotalSteps)
+}
+
+func TestProjectRejectsMissingCanaryStatusForEveryRequiredPrimaryPhase(t *testing.T) {
+	for _, phase := range []omev1beta1.RolloutPhase{
+		omev1beta1.RolloutPhasePending,
+		omev1beta1.RolloutPhaseCanarying,
+		omev1beta1.RolloutPhasePaused,
+		omev1beta1.RolloutPhasePromoting,
+		omev1beta1.RolloutPhaseRollingBack,
+		omev1beta1.RolloutPhaseRolledBack,
+		omev1beta1.RolloutPhaseFailed,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Status.Canary = nil
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = phase
+			component.LatestRolledoutRevision = "chat-engine-rev-a1b2c3d4"
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+			assert.Nil(t, got.Content.Canary)
+			assert.Equal(t, []reportv1alpha1.TrafficIssue{{Code: reportv1alpha1.TrafficIssueCanaryInvalid}}, got.Content.Issues)
+			assert.Equal(t, [][]string{{"ISSUE", "-", "CanaryInvalid", "Computed/Unverifiable"}}, tableRows(got.Table().Rows, "ISSUE"))
+			var rendered bytes.Buffer
+			require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+			assert.Contains(t, rendered.String(), `"code": "CanaryInvalid"`)
+			assert.NotContains(t, rendered.String(), `"canary":`)
+		})
+	}
+}
+
+func TestProjectAllowsMissingCanaryStatusOutsideRequiredPhases(t *testing.T) {
+	for _, phase := range []omev1beta1.RolloutPhase{
+		"",
+		omev1beta1.RolloutPhaseStable,
+		omev1beta1.RolloutPhaseBlueGreenStandby,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Status.Canary = nil
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = phase
+			component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+				RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 100, LatestRevision: true,
+			}}
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
+		})
+	}
+}
+
+func TestProjectUsesRolledOutRevisionAsTheOnlyStableTargetDuringSplit(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Rollout = nil
+	isvc.Status.Canary = nil
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.RolloutPhase = omev1beta1.RolloutPhaseStable
+	component.LatestRolledoutRevision = "chat-engine-rev-a1b2c3d4"
+	component.Traffic = []omev1beta1.ComponentTrafficTarget{
+		{RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 50, LatestRevision: true},
+		{RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 50},
+	}
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, []reportv1alpha1.TrafficAllocation{
+		{
+			Component: reportv1alpha1.RuntimeComponentEngine, Role: reportv1alpha1.TrafficRoleStable,
+			RevisionName: "chat-engine-rev-a1b2c3d4", RevisionHash: "a1b2c3d4", Percent: 50,
+			Source: reportv1alpha1.TrafficValueSource{Evidence: reportv1alpha1.EvidenceReported, Freshness: reportv1alpha1.TrafficFreshnessUnverifiable},
+		},
+		{
+			Component: reportv1alpha1.RuntimeComponentEngine, Role: reportv1alpha1.TrafficRoleOther,
+			RevisionName: "chat-engine-rev-e5f6a7b8", RevisionHash: "e5f6a7b8", Percent: 50,
+			Source: reportv1alpha1.TrafficValueSource{Evidence: reportv1alpha1.EvidenceReported, Freshness: reportv1alpha1.TrafficFreshnessUnverifiable},
+		},
+	}, got.Content.Allocations)
+	assert.Empty(t, got.Content.Issues)
+	assert.Equal(t, [][]string{
+		{"WEIGHT", "engine", "stable:a1b2c3d4=50%", "Reported/Unverifiable"},
+		{"WEIGHT", "engine", "other:e5f6a7b8=50%", "Reported/Unverifiable"},
+	}, tableRows(got.Table().Rows, "WEIGHT"))
+	var rendered bytes.Buffer
+	require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+	assert.Equal(t, 1, strings.Count(rendered.String(), `"role": "stable"`))
+	assert.Equal(t, 1, strings.Count(rendered.String(), `"role": "other"`))
+}
+
+func TestProjectRejectsAmbiguousOrMalformedStableRevisionEvidence(t *testing.T) {
+	tests := []struct {
+		name       string
+		rolledOut  string
+		latest     [2]bool
+		wantRoles  []reportv1alpha1.TrafficAllocationRole
+		secretText string
+	}{
+		{
+			name: "split without rolled out identity", latest: [2]bool{false, true},
+			wantRoles: []reportv1alpha1.TrafficAllocationRole{reportv1alpha1.TrafficRoleOther, reportv1alpha1.TrafficRoleOther},
+		},
+		{
+			name: "multiple latest markers", rolledOut: "chat-engine-rev-a1b2c3d4", latest: [2]bool{true, true},
+			wantRoles: []reportv1alpha1.TrafficAllocationRole{reportv1alpha1.TrafficRoleStable, reportv1alpha1.TrafficRoleOther},
+		},
+		{
+			name: "malformed rolled out identity", rolledOut: "SECRET_ROLLED_OUT", latest: [2]bool{false, true}, secretText: "SECRET_ROLLED_OUT",
+			wantRoles: []reportv1alpha1.TrafficAllocationRole{reportv1alpha1.TrafficRoleOther, reportv1alpha1.TrafficRoleOther},
+		},
+		{
+			name: "rolled out identity absent from targets", rolledOut: "chat-engine-rev-cccccccc", latest: [2]bool{false, true},
+			wantRoles: []reportv1alpha1.TrafficAllocationRole{reportv1alpha1.TrafficRoleOther, reportv1alpha1.TrafficRoleOther},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Spec.Rollout = nil
+			isvc.Status.Canary = nil
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = omev1beta1.RolloutPhaseStable
+			component.LatestRolledoutRevision = tt.rolledOut
+			component.Traffic = []omev1beta1.ComponentTrafficTarget{
+				{RevisionName: "chat-engine-rev-a1b2c3d4", Percent: 50, LatestRevision: tt.latest[0]},
+				{RevisionName: "chat-engine-rev-e5f6a7b8", Percent: 50, LatestRevision: tt.latest[1]},
+			}
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+
+			got, err := trafficprojection.Project(isvc, projectionClock)
+
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+			assert.Equal(t, tt.wantRoles, trafficAllocationRoles(got.Content.Allocations))
+			assert.Equal(t, []reportv1alpha1.TrafficIssue{{
+				Code: reportv1alpha1.TrafficIssueAllocationInvalid, Component: reportv1alpha1.RuntimeComponentEngine,
+			}}, got.Content.Issues)
+			assert.LessOrEqual(t, strings.Count(flattenRows(got.Table().Rows), "stable:"), 1)
+			if tt.secretText != "" {
+				var rendered bytes.Buffer
+				require.NoError(t, report.Write(&rendered, report.FormatJSON, got))
+				assert.NotContains(t, rendered.String(), tt.secretText)
+			}
+		})
+	}
 }
 
 func TestProjectCanaryPrimaryFollowsControllerPriority(t *testing.T) {
@@ -780,6 +995,16 @@ func flattenRows(rows [][]string) string {
 		values[i] = strings.Join(rows[i], "|")
 	}
 	return strings.Join(values, "\n")
+}
+
+func tableRows(rows [][]string, field string) [][]string {
+	result := make([][]string, 0)
+	for _, row := range rows {
+		if len(row) > 0 && row[0] == field {
+			result = append(result, row)
+		}
+	}
+	return result
 }
 
 func issueComponent(code reportv1alpha1.TrafficIssueCode) reportv1alpha1.RuntimeComponentType {
