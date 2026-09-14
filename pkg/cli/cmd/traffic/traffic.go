@@ -20,5 +20,9 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 		clock:   reportv1alpha1.SystemClock{},
 		project: trafficprojection.Project,
 	}))
+	cmd.AddCommand(newExplainCmd(f, streams, explainDependencies{
+		clock:   reportv1alpha1.SystemClock{},
+		project: trafficprojection.ProjectExplain,
+	}))
 	return cmd
 }
