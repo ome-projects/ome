@@ -1,9 +1,7 @@
-// Package rollout implements read-only rollout inspection commands.
 package rollout
 
 import (
 	"context"
-	"errors"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,54 +15,21 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/rolloutprojection"
 )
 
-var (
-	// ErrReturnedInferenceServiceNameMismatch rejects a response that is not
-	// bound to the requested resource name.
-	ErrReturnedInferenceServiceNameMismatch = errors.New("returned inference service name does not match request")
-	// ErrReturnedInferenceServiceNamespaceMismatch rejects a response that is
-	// not bound to the resolved request namespace.
-	ErrReturnedInferenceServiceNamespaceMismatch = errors.New("returned inference service namespace does not match request")
-	// ErrInvalidInferenceServiceName rejects an invalid local resource identity
-	// without copying the hostile value into user-visible output.
-	ErrInvalidInferenceServiceName = errors.New("inference service name is invalid")
-	// ErrInvalidNamespace rejects an empty or malformed resolved namespace.
-	ErrInvalidNamespace = errors.New("namespace is invalid")
-)
-
-// NewCmd builds the rollout command family.
-func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
-	return newCmdWithClock(f, streams, reportv1alpha1.SystemClock{})
-}
-
-func newCmdWithClock(
-	f factory.Factory,
-	streams genericiooptions.IOStreams,
-	clock reportv1alpha1.Clock,
-) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "rollout",
-		Short: "Inspect InferenceService rollouts",
-	}
-	cmd.AddCommand(newStatusCmd(f, streams, clock))
-	cmd.AddCommand(newExplainCmd(f, streams, clock))
-	return cmd
-}
-
-type statusOptions struct {
+type explainOptions struct {
 	streams genericiooptions.IOStreams
 	output  string
 	clock   reportv1alpha1.Clock
 }
 
-func newStatusCmd(
+func newExplainCmd(
 	f factory.Factory,
 	streams genericiooptions.IOStreams,
 	clock reportv1alpha1.Clock,
 ) *cobra.Command {
-	options := &statusOptions{streams: streams, clock: clock}
+	options := &explainOptions{streams: streams, clock: clock}
 	cmd := &cobra.Command{
-		Use:   "status INFERENCESERVICE",
-		Short: "Show rollout progress for an InferenceService",
+		Use:   "explain INFERENCESERVICE",
+		Short: "Explain rollout intent, effective plan, and observed progress",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			format, err := report.ParseFormat(options.output)
@@ -78,7 +43,7 @@ func newStatusCmd(
 	return cmd
 }
 
-func (o *statusOptions) run(
+func (o *explainOptions) run(
 	ctx context.Context,
 	f factory.Factory,
 	name string,
@@ -90,6 +55,9 @@ func (o *statusOptions) run(
 	namespace, _, err := f.Namespace()
 	if err != nil {
 		return err
+	}
+	if problems := utilvalidation.IsDNS1123Label(namespace); len(problems) > 0 {
+		return ErrInvalidNamespace
 	}
 	client, err := f.OMEClient()
 	if err != nil {
@@ -108,7 +76,7 @@ func (o *statusOptions) run(
 	if isvc.Namespace != namespace {
 		return ErrReturnedInferenceServiceNamespaceMismatch
 	}
-	reportValue, err := rolloutprojection.Project(isvc, o.clock)
+	reportValue, err := rolloutprojection.ProjectExplain(isvc, o.clock)
 	if err != nil {
 		return err
 	}

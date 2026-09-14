@@ -1,0 +1,194 @@
+{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "RolloutExplainReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "2026-08-31T18:30:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "uid": "isvc-uid",
+      "generation": 7,
+      "evidence": "Observed",
+      "collectedAt": "2026-08-31T18:30:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "effectivePlan": {
+        "mode": "Pinned",
+        "evidence": "Reported"
+      },
+      "planReady": {
+        "state": "True",
+        "reason": "Pinned",
+        "evidence": "Reported"
+      },
+      "planDrift": {
+        "state": "True",
+        "reason": "SpecNewerThanRun",
+        "evidence": "Reported"
+      }
+    },
+    "declaredGroups": [
+      {
+        "index": 0,
+        "evidence": "Declared",
+        "source": "Inline",
+        "strategy": "Canary",
+        "progressionOrigin": "Configured",
+        "defaulted": false,
+        "components": [
+          "engine"
+        ],
+        "order": [],
+        "steps": [
+          {
+            "index": 0,
+            "capacity": "25%",
+            "traffic": 10,
+            "gate": "Manual"
+          },
+          {
+            "index": 1,
+            "capacity": "100%",
+            "traffic": 100,
+            "gate": "Immediate"
+          }
+        ]
+      }
+    ],
+    "liveGroups": [
+      {
+        "index": 0,
+        "evidence": "Declared",
+        "source": "Inline",
+        "strategy": "Canary",
+        "progressionOrigin": "Configured",
+        "defaulted": false,
+        "components": [
+          "engine"
+        ],
+        "order": [],
+        "steps": [
+          {
+            "index": 0,
+            "capacity": "25%",
+            "traffic": 10,
+            "gate": "Manual"
+          },
+          {
+            "index": 1,
+            "capacity": "100%",
+            "traffic": 100,
+            "gate": "Immediate"
+          }
+        ]
+      }
+    ],
+    "effectiveGroups": [
+      {
+        "index": 0,
+        "evidence": "Reported",
+        "source": "Policy",
+        "strategy": "Canary",
+        "progressionOrigin": "Policy",
+        "defaulted": false,
+        "components": [
+          "engine"
+        ],
+        "order": [],
+        "policy": {
+          "kind": "RolloutPolicy",
+          "name": "guarded",
+          "progression": "canary",
+          "generation": 4,
+          "digest": "rp1:aaaaaaaaaaaa",
+          "evidence": "Reported"
+        },
+        "portableDigest": "rp1:aaaaaaaaaaaa",
+        "steps": [
+          {
+            "index": 0,
+            "capacity": "50%",
+            "traffic": 20,
+            "gate": "Manual"
+          },
+          {
+            "index": 1,
+            "capacity": "100%",
+            "traffic": 100,
+            "gate": "Immediate"
+          }
+        ]
+      }
+    ],
+    "observed": {
+      "summary": {
+        "state": "Unknown",
+        "reportedState": "InProgress",
+        "evidence": "Reported",
+        "epoch": "Unverifiable",
+        "coordinationReady": "NotApplicable"
+      },
+      "groups": [
+        {
+          "index": 0,
+          "strategy": "Canary",
+          "phase": "Canarying",
+          "components": [
+            "engine"
+          ],
+          "stableRevisionHash": "aaaaaaaa",
+          "targetRevisionHash": "bbbbbbbb",
+          "step": {
+            "index": 0,
+            "total": 2,
+            "capacity": "50%",
+            "targetTraffic": 20,
+            "observedTraffic": 20,
+            "gate": "Manual"
+          }
+        }
+      ],
+      "components": [
+        {
+          "type": "engine",
+          "strategy": "Canary",
+          "group": 0,
+          "phase": "Canarying",
+          "rolledOutRevisionHash": "aaaaaaaa",
+          "readyRevisionHash": "bbbbbbbb",
+          "traffic": [
+            {
+              "revisionHash": "aaaaaaaa",
+              "percent": 80,
+              "role": "Current"
+            },
+            {
+              "revisionHash": "bbbbbbbb",
+              "percent": 20,
+              "role": "Target"
+            }
+          ]
+        }
+      ],
+      "issues": [
+        {
+          "code": "EpochUnverifiable"
+        }
+      ]
+    },
+    "holds": [],
+    "issues": []
+  },
+  "warnings": [
+    {
+      "code": "PartialData"
+    }
+  ]
+}

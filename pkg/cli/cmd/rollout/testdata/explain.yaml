@@ -1,0 +1,134 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-08-31T18:30:00Z"
+content:
+  declaredGroups:
+  - components:
+    - engine
+    defaulted: false
+    evidence: Declared
+    index: 0
+    order: []
+    progressionOrigin: Configured
+    source: Inline
+    steps:
+    - capacity: 25%
+      gate: Manual
+      index: 0
+      traffic: 10
+    - capacity: 100%
+      gate: Immediate
+      index: 1
+      traffic: 100
+    strategy: Canary
+  effectiveGroups:
+  - components:
+    - engine
+    defaulted: false
+    evidence: Reported
+    index: 0
+    order: []
+    policy:
+      digest: rp1:aaaaaaaaaaaa
+      evidence: Reported
+      generation: 4
+      kind: RolloutPolicy
+      name: guarded
+      progression: canary
+    portableDigest: rp1:aaaaaaaaaaaa
+    progressionOrigin: Policy
+    source: Policy
+    steps:
+    - capacity: 50%
+      gate: Manual
+      index: 0
+      traffic: 20
+    - capacity: 100%
+      gate: Immediate
+      index: 1
+      traffic: 100
+    strategy: Canary
+  holds: []
+  issues: []
+  liveGroups:
+  - components:
+    - engine
+    defaulted: false
+    evidence: Declared
+    index: 0
+    order: []
+    progressionOrigin: Configured
+    source: Inline
+    steps:
+    - capacity: 25%
+      gate: Manual
+      index: 0
+      traffic: 10
+    - capacity: 100%
+      gate: Immediate
+      index: 1
+      traffic: 100
+    strategy: Canary
+  observed:
+    components:
+    - group: 0
+      phase: Canarying
+      readyRevisionHash: bbbbbbbb
+      rolledOutRevisionHash: aaaaaaaa
+      strategy: Canary
+      traffic:
+      - percent: 80
+        revisionHash: aaaaaaaa
+        role: Current
+      - percent: 20
+        revisionHash: bbbbbbbb
+        role: Target
+      type: engine
+    groups:
+    - components:
+      - engine
+      index: 0
+      phase: Canarying
+      stableRevisionHash: aaaaaaaa
+      step:
+        capacity: 50%
+        gate: Manual
+        index: 0
+        observedTraffic: 20
+        targetTraffic: 20
+        total: 2
+      strategy: Canary
+      targetRevisionHash: bbbbbbbb
+    issues:
+    - code: EpochUnverifiable
+    summary:
+      coordinationReady: NotApplicable
+      epoch: Unverifiable
+      evidence: Reported
+      reportedState: InProgress
+      state: Unknown
+  summary:
+    effectivePlan:
+      evidence: Reported
+      mode: Pinned
+    planDrift:
+      evidence: Reported
+      reason: SpecNewerThanRun
+      state: "True"
+    planReady:
+      evidence: Reported
+      reason: Pinned
+      state: "True"
+kind: RolloutExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-08-31T18:30:00Z"
+  evidence: Observed
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+  uid: isvc-uid
+warnings:
+- code: PartialData
