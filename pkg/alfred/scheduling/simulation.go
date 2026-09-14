@@ -272,13 +272,17 @@ func liveNodeNames(objects []runtime.RawExtension) (map[string]struct{}, error) 
 	for i := range objects {
 		object := objects[i]
 		if object.Object != nil {
+			gvk := object.Object.GetObjectKind().GroupVersionKind()
 			switch node := object.Object.(type) {
 			case *corev1.Node:
+				if !gvk.Empty() && (gvk.Group != "" || gvk.Version != "v1" || gvk.Kind != "Node") {
+					continue
+				}
 				if node.Name != "" {
 					nodes[node.Name] = struct{}{}
 				}
 			default:
-				if object.Object.GetObjectKind().GroupVersionKind().Kind == "Node" {
+				if gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Node" {
 					accessor, err := apiMeta.Accessor(object.Object)
 					if err != nil {
 						return nil, fmt.Errorf("clusterObjects[%d] Node metadata: %w", i, err)

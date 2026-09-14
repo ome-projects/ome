@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -19,6 +20,63 @@ func TestValidateResultAcceptsFullFeasiblePlacement(t *testing.T) {
 	})
 	if err := ValidateResult(req, result); err != nil {
 		t.Fatalf("ValidateResult() = %v, want nil", err)
+	}
+}
+
+func TestValidateResultRecognizesOnlyCoreV1NodeObjects(t *testing.T) {
+	tests := []struct {
+		name    string
+		object  runtime.Object
+		wantErr string
+	}{
+		{
+			name:   "typed core node with empty type metadata",
+			object: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-c"}},
+		},
+		{
+			name: "unstructured core v1 node",
+			object: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "v1", "kind": "Node",
+				"metadata": map[string]interface{}{"name": "gpu-c"},
+			}},
+		},
+		{
+			name: "unstructured custom resource named Node",
+			object: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "example.com/v1", "kind": "Node",
+				"metadata": map[string]interface{}{"name": "gpu-c"},
+			}},
+			wantErr: "unknown node",
+		},
+		{
+			name: "typed core node with contradictory type metadata",
+			object: &corev1.Node{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "example.com/v1", Kind: "Node"},
+				ObjectMeta: metav1.ObjectMeta{Name: "gpu-c"},
+			},
+			wantErr: "unknown node",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := validRequest()
+			req.ClusterObjects[2] = runtime.RawExtension{Object: tc.object}
+			result := matchingResult(req, []Placement{
+				{Pod: identity(req.ReplacementPods[0]), NodeName: "gpu-c"},
+				{Pod: identity(req.ReplacementPods[1]), NodeName: "gpu-d"},
+			})
+			err := ValidateResult(req, result)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateResult() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateResult() error = %v, want mention of %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
