@@ -73,7 +73,7 @@ func newCmdWithDependencies(f factory.Factory, streams genericiooptions.IOStream
 		},
 	}
 	cmd.Flags().StringVarP(&o.Component, "component", "c", "", "Only this component: engine, decoder or router")
-	cmd.Flags().Int64Var(&o.Instance, "instance", o.Instance, "Only this OMENative instance index (requires --component)")
+	cmd.Flags().Int64Var(&o.Instance, "instance", o.Instance, "Only this OMENative instance index (requires --component or a full --revision)")
 	cmd.Flags().StringVar(&o.Revision, "revision", "", "Only this OMENative revision hash or full ControllerRevision name")
 	cmd.Flags().StringVar(&o.Container, "container", "", "Container name (default: the OME main container, falling back to the pod's first container)")
 	cmd.Flags().BoolVarP(&o.Follow, "follow", "f", false, "Stream new log lines as they arrive")
@@ -158,7 +158,12 @@ func (o *Options) run(ctx context.Context, f factory.Factory, deps dependencies)
 	if collection.Truncated {
 		return fmt.Errorf("pod discovery was truncated after %d requests; narrow the query with --component, --instance, or --revision", collection.Requests)
 	}
-	pods := collection.Items
+	pods := make([]corev1.Pod, 0, len(collection.Items))
+	for _, pod := range collection.Items {
+		if pod.Namespace == ns {
+			pods = append(pods, pod)
+		}
+	}
 	if len(pods) == 0 {
 		return fmt.Errorf("no pods found for InferenceService %q in namespace %q (selector %s)", o.Name, ns, selector)
 	}

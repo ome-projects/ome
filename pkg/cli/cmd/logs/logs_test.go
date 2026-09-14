@@ -159,6 +159,26 @@ func TestLogsFullRevisionInfersComponentForInstance(t *testing.T) {
 	assert.Equal(t, "fake logs\n", out)
 }
 
+func TestLogsAcceptsMaximumInstanceIndex(t *testing.T) {
+	f := factory.Static{
+		Kube: kubefake.NewSimpleClientset(
+			omenativePod("llama-engine-max", "llama", "engine", "2147483647", "deadbeef"),
+		),
+		NS: "team-a",
+	}
+
+	out, err := execute(t, f, "llama", "--component", "engine", "--instance", "2147483647")
+	require.NoError(t, err)
+	assert.Equal(t, "fake logs\n", out)
+}
+
+func TestLogsHelpDescribesFullRevisionComponentInference(t *testing.T) {
+	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{})
+	flag := cmd.Flags().Lookup("instance")
+	require.NotNil(t, flag)
+	assert.Contains(t, flag.Usage, "requires --component or a full --revision")
+}
+
 func TestLogsRejectsInvalidOMENativeFilters(t *testing.T) {
 	tooLarge := fmt.Sprintf("%d", int64(1)<<31)
 	tests := []struct {
@@ -196,6 +216,20 @@ func TestLogsRefiltersUntrustedListResponses(t *testing.T) {
 		return true, &corev1.PodList{Items: []corev1.Pod{
 			*omenativePod("foreign", "other", "engine", "2", "deadbeef"),
 		}}, nil
+	})
+
+	_, err := execute(t, factory.Static{Kube: kube, NS: "team-a"},
+		"llama", "--component", "engine", "--instance", "2", "--revision", "deadbeef")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no pods found")
+}
+
+func TestLogsRejectsMatchingPodReturnedFromAnotherNamespace(t *testing.T) {
+	kube := kubefake.NewSimpleClientset()
+	kube.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		foreign := omenativePod("llama-engine-2", "llama", "engine", "2", "deadbeef")
+		foreign.Namespace = "other-team"
+		return true, &corev1.PodList{Items: []corev1.Pod{*foreign}}, nil
 	})
 
 	_, err := execute(t, factory.Static{Kube: kube, NS: "team-a"},
