@@ -14,6 +14,7 @@ import (
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/migrationcollection"
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -51,7 +52,8 @@ type recordCandidate struct {
 }
 
 // Project validates source identity before reading status and emits only
-// allowlisted, message-free evidence from current InferenceReplica records.
+// allowlisted evidence and bounded, sanitized controller messages from current
+// InferenceReplica records.
 func Project(
 	snapshot migrationcollection.Result,
 	componentFilter string,
@@ -380,6 +382,7 @@ func projectRecord(source sourceSnapshot, input omev1beta1.MigrationStatus, maxN
 	if input.Message == "" {
 		candidate.record.MessageEvidence = reportv1alpha1.MigrationMessageAbsent
 	} else {
+		candidate.record.Message = printers.BoundedCell(input.Message, reportv1alpha1.MigrationMessageMaxDisplayWidth)
 		candidate.record.MessageEvidence = reportv1alpha1.MigrationMessagePresent
 	}
 	candidate.record.Outcome = migrationOutcome(candidate.record.Phase, input.Succeeded)

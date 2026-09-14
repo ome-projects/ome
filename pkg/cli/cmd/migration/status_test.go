@@ -33,7 +33,7 @@ func TestStatusProductionWiringReadsOnlyParentAndRelatedReplicas(t *testing.T) {
 	ir := commandIR(parent, omev1beta1.EngineComponent)
 	ir.Status.Migrations = []omev1beta1.MigrationStatus{{
 		RequestUUID: "12345678-1234-1234-1234-123456789abc", Trigger: omev1beta1.MigrationTriggerManual,
-		SourceInstance: 1, Phase: omev1beta1.MigrationPhaseAccepted,
+		SourceInstance: 1, Phase: omev1beta1.MigrationPhaseAccepted, Message: "waiting for target capacity to become available",
 		StartedAt: metav1.NewTime(commandNow.Add(-time.Minute)), Deadline: metav1.NewTime(commandNow.Add(time.Hour)),
 	}}
 	client := omefake.NewSimpleClientset(parent, &ir)
@@ -44,8 +44,8 @@ func TestStatusProductionWiringReadsOnlyParentAndRelatedReplicas(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t,
-		"REQUEST/COMP      STATUS                    ISSUE\n"+
-			"12345678/engine   Accepted/Active/Current   -\n",
+		"SUBJECT/COMP      STATUS                    DETAIL\n"+
+			"12345678/engine   Accepted/Active/Current   MSG: waiting for target...\n",
 		out,
 	)
 	actions := client.Actions()
@@ -60,6 +60,15 @@ func TestStatusProductionWiringReadsOnlyParentAndRelatedReplicas(t *testing.T) {
 	value, found := list.GetListRestrictions().Labels.RequiresExactMatch(constants.InferenceServicePodLabelKey)
 	assert.True(t, found)
 	assert.Equal(t, "chat", value)
+}
+
+func TestStatusHelpDocumentsBoundedMessageRendering(t *testing.T) {
+	t.Parallel()
+
+	command := newStatusCmd(panicFactory{}, genericiooptions.IOStreams{})
+
+	assert.Contains(t, command.Long, "256 display columns")
+	assert.Contains(t, command.Long, "80 columns")
 }
 
 func TestStatusComponentFilterAndMachineFormatsUseTypedContract(t *testing.T) {

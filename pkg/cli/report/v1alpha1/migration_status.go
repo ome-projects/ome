@@ -6,11 +6,16 @@ import (
 	"sort"
 	"time"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 )
 
 // MigrationStatusReportKind identifies the migration status output schema.
 const MigrationStatusReportKind = "MigrationStatusReport"
+
+// MigrationMessageMaxDisplayWidth bounds the sanitized controller message in
+// every output format while retaining enough text for an actionable blocker.
+const MigrationMessageMaxDisplayWidth = 256
 
 // MigrationSourceKind is the closed set read by migration status.
 type MigrationSourceKind string
@@ -182,6 +187,7 @@ type MigrationRecord struct {
 	Deadline            *time.Time               `json:"deadline,omitempty"`
 	CompletedAt         *time.Time               `json:"completedAt,omitempty"`
 	ReasonEvidence      MigrationReasonEvidence  `json:"reasonEvidence"`
+	Message             string                   `json:"message,omitempty"`
 	MessageEvidence     MigrationMessageEvidence `json:"messageEvidence"`
 	Outcome             MigrationOutcome         `json:"outcome"`
 	Issues              []MigrationIssueCode     `json:"issues"`
@@ -270,6 +276,7 @@ func (r MigrationStatusReport) Canonical() MigrationStatusReport {
 		record.AllocatedAt = copyTime(record.AllocatedAt)
 		record.Deadline = copyTime(record.Deadline)
 		record.CompletedAt = copyTime(record.CompletedAt)
+		record.Message = printers.BoundedCell(record.Message, MigrationMessageMaxDisplayWidth)
 		record.TargetNodeHints = sortedUniqueStrings(record.TargetNodeHints)
 		record.Issues = sortedUniqueIssueCodes(record.Issues)
 	}
@@ -293,14 +300,19 @@ func (r MigrationStatusReport) Canonical() MigrationStatusReport {
 // display columns; JSON and YAML retain the detailed timestamps and evidence.
 func (r MigrationStatusReport) Table() report.Table {
 	canonical := r.Canonical()
-	table := report.Table{Headers: []string{"REQUEST/COMP", "STATUS", "ISSUE"}}
+	table := report.Table{Headers: []string{"SUBJECT/COMP", "STATUS", "DETAIL"}}
 	table.Rows = make([][]string, 0, len(canonical.Content.Migrations)+len(canonical.Content.Issues))
 	seenIssues := make(map[MigrationIssue]struct{})
 	for _, migration := range canonical.Content.Migrations {
 		subject := compactRequestID(migration.RequestID) + "/" + compactComponent(migration.Component)
 		status := compactPhase(migration.Phase) + "/" + compactClassification(migration.Classification) + "/" + compactFreshness(migration.Freshness)
+		if migration.Message != "" {
+			table.Rows = append(table.Rows, []string{subject, status, compactMigrationMessage(migration.Message)})
+		}
 		if len(migration.Issues) == 0 {
-			table.Rows = append(table.Rows, []string{subject, status, "-"})
+			if migration.Message == "" {
+				table.Rows = append(table.Rows, []string{subject, status, "-"})
+			}
 			continue
 		}
 		for _, code := range migration.Issues {
@@ -327,16 +339,29 @@ func (r MigrationStatusReport) Table() report.Table {
 	return table
 }
 
+func compactMigrationMessage(value string) string {
+	return printers.BoundedCell("MSG: "+value, 26)
+}
+
 func compactMigrationIssueSubject(issue MigrationIssue) string {
 	request := "REPORT"
 	if issue.RequestID != "" {
 		request = compactRequestID(issue.RequestID)
+	} else if issue.SourceName != "" {
+		request = compactSourceName(issue.SourceName)
 	}
 	component := "-"
 	if issue.Component != "" {
 		component = compactComponent(issue.Component)
 	}
 	return request + "/" + component
+}
+
+func compactSourceName(value string) string {
+	if !safeResourceName(value) {
+		return "INVALID"
+	}
+	return printers.BoundedMiddleCell(value, 8)
 }
 
 func reportFreshness(report MigrationStatusReport) string {
@@ -390,7 +415,8 @@ func compareMigrationRecords(a, b MigrationRecord) int {
 		compareMigrationTimePointers(a.AllocatedAt, b.AllocatedAt),
 		compareMigrationTimePointers(a.Deadline, b.Deadline),
 		compareMigrationTimePointers(a.CompletedAt, b.CompletedAt),
-		cmp.Compare(a.ReasonEvidence, b.ReasonEvidence), cmp.Compare(a.MessageEvidence, b.MessageEvidence),
+		cmp.Compare(a.ReasonEvidence, b.ReasonEvidence), cmp.Compare(a.Message, b.Message),
+		cmp.Compare(a.MessageEvidence, b.MessageEvidence),
 		cmp.Compare(a.Outcome, b.Outcome), slices.Compare(a.Issues, b.Issues),
 	)
 }
@@ -560,6 +586,23 @@ func safeIdentifier(value string) bool {
 		}
 	}
 	return true
+}
+
+func safeResourceName(value string) bool {
+	if value == "" || len(value) > 253 || !asciiLowerNumeric(value[0]) || !asciiLowerNumeric(value[len(value)-1]) {
+		return false
+	}
+	for i := range len(value) {
+		char := value[i]
+		if !asciiLowerNumeric(char) && char != '-' && char != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLowerNumeric(char byte) bool {
+	return char >= 'a' && char <= 'z' || char >= '0' && char <= '9'
 }
 
 func asciiAlphaNumeric(value byte) bool {

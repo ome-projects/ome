@@ -103,6 +103,10 @@ InferenceReplicas owned by one InferenceService. The command reads exactly that
 InferenceService and a label-selected, identity-validated InferenceReplica
 collection. It never reads migration audit ConfigMaps, pods, or Events.
 
+Controller blocker and terminal-outcome messages are sanitized and capped at
+256 display columns in machine output. Table details are clipped further so
+the table's maximum natural width remains 80 columns.
+
 The current API does not report a request timestamp or capacity/rate limits;
 machine output marks that evidence unavailable instead of inferring it.`,
 		Example: `  kubectl ome migration status chat -n prod

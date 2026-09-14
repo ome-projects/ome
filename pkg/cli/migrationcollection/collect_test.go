@@ -16,6 +16,7 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -166,13 +167,73 @@ func TestCollectPropagatesCancellationAndListErrorsWithoutPartialSnapshot(t *tes
 	})
 }
 
+func TestCollectRejectsMissingClientWithoutAttemptingARead(t *testing.T) {
+	t.Parallel()
+
+	got, err := Collect(context.Background(), nil, "prod", "chat", collectionTestLimits)
+
+	require.ErrorIs(t, err, ErrClientRequired)
+	assert.Nil(t, got.InferenceService)
+	assert.Empty(t, got.InferenceReplicas)
+}
+
+func TestCollectPropagatesGetAndMissingListResponsesWithoutPartialSnapshot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("get error", func(t *testing.T) {
+		boom := errors.New("get failed")
+		client := omefake.NewSimpleClientset()
+		client.PrependReactor("get", "inferenceservices", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, boom
+		})
+
+		got, err := Collect(context.Background(), client.OmeV1beta1(), "prod", "chat", collectionTestLimits)
+
+		require.ErrorIs(t, err, boom)
+		assert.Nil(t, got.InferenceService)
+		assert.Empty(t, got.InferenceReplicas)
+		require.Len(t, client.Actions(), 1)
+	})
+
+	t.Run("missing list response", func(t *testing.T) {
+		fake := omefake.NewSimpleClientset(collectionISVC("chat", "prod", "uid-chat"))
+		client := collectionMissingListClient{OmeV1beta1Interface: fake.OmeV1beta1()}
+
+		got, err := Collect(context.Background(), client, "prod", "chat", collectionTestLimits)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty InferenceReplica list response")
+		assert.Nil(t, got.InferenceService)
+		assert.Empty(t, got.InferenceReplicas)
+		require.Len(t, fake.Actions(), 1)
+	})
+}
+
 func TestCollectRejectsInvalidLimitsBeforeAnyRead(t *testing.T) {
 	t.Parallel()
 
-	client := omefake.NewSimpleClientset(collectionISVC("chat", "prod", "uid-chat"))
-	_, err := Collect(context.Background(), client.OmeV1beta1(), "prod", "chat", paging.Limits{})
-	require.Error(t, err)
-	assert.Empty(t, client.Actions())
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+		want   string
+	}{
+		{name: "page size", mutate: func(limits *paging.Limits) { limits.PageSize = 0 }, want: "page size must be positive"},
+		{name: "item limit", mutate: func(limits *paging.Limits) { limits.MaxItems = 0 }, want: "item limit must be positive"},
+		{name: "page limit", mutate: func(limits *paging.Limits) { limits.MaxPages = 0 }, want: "page limit must be positive"},
+		{name: "request timeout", mutate: func(limits *paging.Limits) { limits.RequestTimeout = 0 }, want: "request timeout must be positive"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := omefake.NewSimpleClientset(collectionISVC("chat", "prod", "uid-chat"))
+			limits := collectionTestLimits
+			test.mutate(&limits)
+
+			_, err := Collect(context.Background(), client.OmeV1beta1(), "prod", "chat", limits)
+
+			require.EqualError(t, err, test.want)
+			assert.Empty(t, client.Actions())
+		})
+	}
 }
 
 func TestCollectRejectsInvalidRequestIdentityBeforeAnyRead(t *testing.T) {
@@ -213,4 +274,20 @@ func collectionIR(name, namespace, uid string) omev1beta1.InferenceReplica {
 		Name: name, Namespace: namespace, UID: types.UID(uid),
 		Labels: map[string]string{constants.InferenceServicePodLabelKey: "chat"},
 	}}
+}
+
+type collectionMissingListClient struct {
+	omeclient.OmeV1beta1Interface
+}
+
+func (collectionMissingListClient) InferenceReplicas(string) omeclient.InferenceReplicaInterface {
+	return collectionMissingInferenceReplicas{}
+}
+
+type collectionMissingInferenceReplicas struct {
+	omeclient.InferenceReplicaInterface
+}
+
+func (collectionMissingInferenceReplicas) List(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+	return nil, nil
 }

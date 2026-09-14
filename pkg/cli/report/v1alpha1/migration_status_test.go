@@ -74,14 +74,14 @@ func TestMigrationStatusReportCanonicalRecordOrderUsesAllFields(t *testing.T) {
 		RequestID: "same-request", SourceName: "chat-engine", Component: RuntimeComponentEngine,
 		SourceInstance: 1, Trigger: MigrationTriggerManual, Phase: MigrationPhaseAccepted,
 		Classification: MigrationClassificationActive, Freshness: StatusFreshnessCurrent,
-		RequestedAtEvidence: EvidenceUnavailable, Deadline: &late,
-		ReasonEvidence: MigrationReasonUnavailable, MessageEvidence: MigrationMessageAbsent,
+		RequestedAtEvidence: EvidenceUnavailable, StartedAt: &early, Deadline: &late,
+		ReasonEvidence: MigrationReasonUnavailable, MessageEvidence: MigrationMessagePresent,
 		Outcome: MigrationOutcomeInProgress, TargetNodeHints: []string{}, Issues: []MigrationIssueCode{},
 	}
 	first := base
-	first.StartedAt = &early
+	first.Message = "a-message"
 	second := base
-	second.StartedAt = &late
+	second.Message = "b-message"
 	left := MigrationStatusReport{Content: MigrationStatusContent{Migrations: []MigrationRecord{second, first}}}.Canonical()
 	right := MigrationStatusReport{Content: MigrationStatusContent{Migrations: []MigrationRecord{first, second}}}.Canonical()
 
@@ -90,6 +90,232 @@ func TestMigrationStatusReportCanonicalRecordOrderUsesAllFields(t *testing.T) {
 	rightJSON, err := json.Marshal(right)
 	require.NoError(t, err)
 	assert.Equal(t, string(leftJSON), string(rightJSON))
+}
+
+func TestMigrationStatusReportCanonicalSanitizesAndCapsMessageWithoutMutatingInput(t *testing.T) {
+	t.Parallel()
+
+	message := "blocked\n\x1b[31m\u202esecret " + strings.Repeat("界", 300)
+	input := MigrationStatusReport{Content: MigrationStatusContent{Migrations: []MigrationRecord{{Message: message}}}}
+
+	got := input.Canonical()
+
+	require.Len(t, got.Content.Migrations, 1)
+	projected := got.Content.Migrations[0].Message
+	assert.NotContains(t, projected, "\n")
+	assert.NotContains(t, projected, "\x1b")
+	assert.NotContains(t, projected, "\u202e")
+	assert.Contains(t, projected, `\n`)
+	assert.Contains(t, projected, `\u001b`)
+	assert.Contains(t, projected, `\u202e`)
+	assert.LessOrEqual(t, len([]rune(projected)), MigrationMessageMaxDisplayWidth)
+	assert.True(t, strings.HasSuffix(projected, "..."), projected)
+	assert.Equal(t, message, input.Content.Migrations[0].Message)
+}
+
+func TestMigrationStatusMachineOutputIsExact(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		format report.Format
+		want   string
+	}{
+		{name: "json", format: report.FormatJSON, want: `{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "MigrationStatusReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "2026-09-14T19:00:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "uid": "isvc-uid",
+      "generation": 4,
+      "freshness": "Current",
+      "collectedAt": "2026-09-14T19:00:00Z"
+    },
+    {
+      "kind": "InferenceReplica",
+      "namespace": "prod",
+      "name": "chat-engine",
+      "uid": "ir-uid",
+      "generation": 2,
+      "observedGeneration": 2,
+      "freshness": "Current",
+      "collectedAt": "2026-09-14T19:00:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "state": "Partial",
+      "records": 1,
+      "active": 1,
+      "terminal": 0,
+      "invalid": 0
+    },
+    "capacity": {
+      "evidence": "Computed",
+      "activeAllocated": 1,
+      "concurrencyLimitEvidence": "Unavailable",
+      "rateLimitEvidence": "Unavailable"
+    },
+    "migrations": [
+      {
+        "requestID": "12345678-1234-1234-1234-123456789abc",
+        "sourceName": "chat-engine",
+        "component": "engine",
+        "sourceInstance": 1,
+        "surgeInstance": 2,
+        "trigger": "Manual",
+        "phase": "SurgeReady",
+        "classification": "Active",
+        "freshness": "Current",
+        "fromNode": "node-a",
+        "targetNodeHints": [
+          "node-b",
+          "node-c"
+        ],
+        "requestedAtEvidence": "Unavailable",
+        "startedAt": "2026-09-14T18:55:00Z",
+        "allocatedAt": "2026-09-14T18:56:00Z",
+        "deadline": "2026-09-14T19:30:00Z",
+        "reasonEvidence": "OperatorSupplied",
+        "message": "waiting for replacement pod readiness",
+        "messageEvidence": "Present",
+        "outcome": "InProgress",
+        "issues": []
+      }
+    ],
+    "issues": [
+      {
+        "code": "SourceOwnerMismatch",
+        "sourceName": "chat-engine-shadow",
+        "component": "engine"
+      }
+    ]
+  },
+  "warnings": [
+    {
+      "code": "PartialData"
+    }
+  ]
+}
+`},
+		{name: "yaml", format: report.FormatYAML, want: `apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-14T19:00:00Z"
+content:
+  capacity:
+    activeAllocated: 1
+    concurrencyLimitEvidence: Unavailable
+    evidence: Computed
+    rateLimitEvidence: Unavailable
+  issues:
+  - code: SourceOwnerMismatch
+    component: engine
+    sourceName: chat-engine-shadow
+  migrations:
+  - allocatedAt: "2026-09-14T18:56:00Z"
+    classification: Active
+    component: engine
+    deadline: "2026-09-14T19:30:00Z"
+    freshness: Current
+    fromNode: node-a
+    issues: []
+    message: waiting for replacement pod readiness
+    messageEvidence: Present
+    outcome: InProgress
+    phase: SurgeReady
+    reasonEvidence: OperatorSupplied
+    requestID: 12345678-1234-1234-1234-123456789abc
+    requestedAtEvidence: Unavailable
+    sourceInstance: 1
+    sourceName: chat-engine
+    startedAt: "2026-09-14T18:55:00Z"
+    surgeInstance: 2
+    targetNodeHints:
+    - node-b
+    - node-c
+    trigger: Manual
+  summary:
+    active: 1
+    invalid: 0
+    records: 1
+    state: Partial
+    terminal: 0
+kind: MigrationStatusReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-09-14T19:00:00Z"
+  freshness: Current
+  generation: 4
+  kind: InferenceService
+  name: chat
+  namespace: prod
+  uid: isvc-uid
+- collectedAt: "2026-09-14T19:00:00Z"
+  freshness: Current
+  generation: 2
+  kind: InferenceReplica
+  name: chat-engine
+  namespace: prod
+  observedGeneration: 2
+  uid: ir-uid
+warnings:
+- code: PartialData
+`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			require.NoError(t, report.Write(&output, test.format, migrationStatusGoldenReport()))
+			assert.Equal(t, test.want, output.String())
+		})
+	}
+}
+
+func migrationStatusGoldenReport() MigrationStatusReport {
+	collected := time.Date(2026, time.September, 14, 19, 0, 0, 0, time.UTC)
+	started := collected.Add(-5 * time.Minute)
+	allocated := collected.Add(-4 * time.Minute)
+	deadline := collected.Add(30 * time.Minute)
+	surge := int32(2)
+	return MigrationStatusReport{
+		Metadata: Metadata{Namespace: "prod", Name: "chat"}, CollectedAt: collected,
+		Sources: []MigrationSourceReference{
+			{Kind: MigrationSourceInferenceReplica, Namespace: "prod", Name: "chat-engine", UID: "ir-uid", Generation: 2, ObservedGeneration: 2, Freshness: StatusFreshnessCurrent, CollectedAt: collected},
+			{Kind: MigrationSourceInferenceService, Namespace: "prod", Name: "chat", UID: "isvc-uid", Generation: 4, Freshness: StatusFreshnessCurrent, CollectedAt: collected},
+		},
+		Content: MigrationStatusContent{
+			Summary: MigrationSummary{State: MigrationReportStatePartial, Records: 1, Active: 1},
+			Capacity: MigrationCapacityEvidence{
+				Evidence: EvidenceComputed, ActiveAllocated: 1,
+				ConcurrencyLimit: EvidenceUnavailable, RateLimit: EvidenceUnavailable,
+			},
+			Migrations: []MigrationRecord{{
+				RequestID: "12345678-1234-1234-1234-123456789abc", SourceName: "chat-engine",
+				Component: RuntimeComponentEngine, SourceInstance: 1, SurgeInstance: &surge,
+				Trigger: MigrationTriggerManual, Phase: MigrationPhaseSurgeReady,
+				Classification: MigrationClassificationActive, Freshness: StatusFreshnessCurrent,
+				FromNode: "node-a", TargetNodeHints: []string{"node-c", "node-b"},
+				RequestedAtEvidence: EvidenceUnavailable, StartedAt: &started, AllocatedAt: &allocated,
+				Deadline: &deadline, ReasonEvidence: MigrationReasonOperatorSupplied,
+				Message: "waiting for replacement pod readiness", MessageEvidence: MigrationMessagePresent,
+				Outcome: MigrationOutcomeInProgress, Issues: []MigrationIssueCode{},
+			}},
+			Issues: []MigrationIssue{{
+				Code: MigrationIssueSourceOwnerMismatch, SourceName: "chat-engine-shadow", Component: RuntimeComponentEngine,
+			}},
+		},
+		Warnings: []MigrationWarning{{Code: MigrationWarningPartialData}},
+	}
 }
 
 func TestMigrationStatusTableIsCompactAndExplicitWhenEmpty(t *testing.T) {
@@ -113,7 +339,7 @@ func TestMigrationStatusTableIsCompactAndExplicitWhenEmpty(t *testing.T) {
 		Issues: []MigrationIssue{},
 	}}
 	table := report.Table()
-	assert.Equal(t, []string{"REQUEST/COMP", "STATUS", "ISSUE"}, table.Headers)
+	assert.Equal(t, []string{"SUBJECT/COMP", "STATUS", "DETAIL"}, table.Headers)
 	assert.Equal(t, [][]string{
 		{"12345678/decoder", "SurgePending/Active/Current", "SourceGenerationStale"},
 		{"12345678/decoder", "SurgePending/Active/Current", "TimestampInvalid"},
@@ -143,7 +369,7 @@ func TestMigrationStatusTableNamesFreshnessAndIssueCodes(t *testing.T) {
 	}}
 
 	table := document.Table()
-	assert.Equal(t, []string{"REQUEST/COMP", "STATUS", "ISSUE"}, table.Headers)
+	assert.Equal(t, []string{"SUBJECT/COMP", "STATUS", "DETAIL"}, table.Headers)
 	assert.Equal(t, [][]string{
 		{"12345678/decoder", "Accepted/Active/Stale", "SourceGenerationStale"},
 		{"12345678/decoder", "Accepted/Active/Stale", "TimestampInvalid"},
@@ -167,10 +393,47 @@ func TestMigrationStatusTableDeduplicatesOnlyExactScopedIssues(t *testing.T) {
 	table := document.Table()
 
 	assert.Equal(t, [][]string{
-		{"REPORT/engine", "Partial/Current", "SourceOwnerMismatch"},
-		{"REPORT/engine", "Partial/Current", "SourceOwnerMismatch"},
-		{"REPORT/router", "Partial/Current", "SourceOwnerMismatch"},
+		{"cha...ne/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"cha...ow/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"cha...er/router", "Partial/Current", "SourceOwnerMismatch"},
 	}, table.Rows)
+}
+
+func TestMigrationStatusTableRejectsUntrustedSourceSubject(t *testing.T) {
+	t.Parallel()
+
+	document := MigrationStatusReport{Content: MigrationStatusContent{
+		Summary: MigrationSummary{State: MigrationReportStatePartial},
+		Issues: []MigrationIssue{{
+			Code: MigrationIssueSourceIdentityInvalid, SourceName: "bad\n\x1b\u202esource", Component: RuntimeComponentEngine,
+		}},
+	}}
+
+	table := document.Table()
+
+	assert.Equal(t, [][]string{{
+		"INVALID/engine", "Partial/Current", "SourceIdentityInvalid",
+	}}, table.Rows)
+}
+
+func TestMigrationStatusTableShowsBoundedControllerMessage(t *testing.T) {
+	t.Parallel()
+
+	document := MigrationStatusReport{Content: MigrationStatusContent{
+		Summary: MigrationSummary{State: MigrationReportStateReported},
+		Migrations: []MigrationRecord{{
+			RequestID: "12345678-1234", SourceName: "chat-engine", Component: RuntimeComponentEngine,
+			Phase: MigrationPhaseAccepted, Classification: MigrationClassificationActive,
+			Freshness: StatusFreshnessCurrent, Message: "waiting for target capacity to become available",
+			MessageEvidence: MigrationMessagePresent,
+		}},
+	}}
+
+	table := document.Table()
+
+	assert.Equal(t, [][]string{{
+		"12345678/engine", "Accepted/Active/Current", "MSG: waiting for target...",
+	}}, table.Rows)
 }
 
 func TestMigrationStatusTableStaysWithin80ColumnsAtCommonTerminalWidths(t *testing.T) {
@@ -218,6 +481,7 @@ func TestMigrationStatusTableSanitizesDefensiveTypedValues(t *testing.T) {
 			RequestID: "bad\nrequest", Component: RuntimeComponentType("engine\n\x1b\u202e" + strings.Repeat("界", 80)),
 			Trigger: MigrationTrigger("Manual\rvalue"), Phase: MigrationPhase("Future\tphase" + strings.Repeat("x", 100)),
 			Classification: MigrationClassification("Invalid" + strings.Repeat("x", 100)),
+			Message:        "blocked\n\x1b[31m\u202e" + strings.Repeat("界", 80),
 		}},
 	}}
 	for _, writer := range []interface {

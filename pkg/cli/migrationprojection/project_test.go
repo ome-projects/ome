@@ -20,7 +20,7 @@ import (
 
 var projectionNow = time.Date(2026, time.September, 14, 19, 0, 0, 0, time.UTC)
 
-func TestProjectUsesOnlyCurrentIRMigrationRecordsAndRedactsFreeText(t *testing.T) {
+func TestProjectUsesOnlyCurrentIRMigrationRecordsAndPreservesOnlyBoundedMessageText(t *testing.T) {
 	t.Parallel()
 
 	parent := projectionISVC()
@@ -28,7 +28,7 @@ func TestProjectUsesOnlyCurrentIRMigrationRecordsAndRedactsFreeText(t *testing.T
 	engine.Status.Migrations = []omev1beta1.MigrationStatus{{
 		RequestUUID: "11111111-1111-1111-1111-111111111111", Trigger: omev1beta1.MigrationTriggerManual,
 		SourceInstance: 2, FromNode: "node-a", HintTargetNodes: []string{"node-c", "node-b"},
-		Phase: omev1beta1.MigrationPhaseAccepted, Reason: "token=do-not-copy", Message: "secret blocker",
+		Phase: omev1beta1.MigrationPhaseAccepted, Reason: "token=do-not-copy", Message: "waiting for replacement capacity",
 		StartedAt: metaTime(projectionNow.Add(-10 * time.Minute)), Deadline: metaTime(projectionNow.Add(20 * time.Minute)),
 	}}
 	router := projectionIR(parent, "chat-router", omev1beta1.RouterComponent)
@@ -36,7 +36,7 @@ func TestProjectUsesOnlyCurrentIRMigrationRecordsAndRedactsFreeText(t *testing.T
 	router.Status.Migrations = []omev1beta1.MigrationStatus{{
 		RequestUUID: "22222222-2222-2222-2222-222222222222", Trigger: omev1beta1.MigrationTriggerAuto,
 		SourceInstance: 4, FromNode: "node-z", Phase: omev1beta1.MigrationPhaseRelocated,
-		Attempt: 2, Reason: "AutoRecover", Message: "controller detail", StartedAt: metaTime(projectionNow.Add(-time.Hour)),
+		Attempt: 2, Reason: "AutoRecover", Message: "relocation confirmed by ready instance", StartedAt: metaTime(projectionNow.Add(-time.Hour)),
 		Deadline: metaTime(projectionNow.Add(-time.Hour)), CompletedAt: metaTimePointer(projectionNow.Add(-50 * time.Minute)),
 		Succeeded: &succeeded,
 	}}
@@ -73,11 +73,58 @@ func TestProjectUsesOnlyCurrentIRMigrationRecordsAndRedactsFreeText(t *testing.T
 	encoded, err := json.Marshal(got)
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "token=do-not-copy")
-	assert.NotContains(t, string(encoded), "secret blocker")
-	assert.NotContains(t, string(encoded), "controller detail")
+	var wire struct {
+		Content struct {
+			Migrations []struct {
+				Message string `json:"message"`
+			} `json:"migrations"`
+		} `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	require.Len(t, wire.Content.Migrations, 2)
+	assert.Equal(t, "waiting for replacement capacity", wire.Content.Migrations[0].Message)
+	assert.Equal(t, "relocation confirmed by ready instance", wire.Content.Migrations[1].Message)
 	assert.NotContains(t, string(encoded), "resourceVersion")
 	assert.NotContains(t, string(encoded), "ownerReferences")
 	assert.NotContains(t, string(encoded), "annotations")
+}
+
+func TestProjectSanitizesAndCapsMigrationMessage(t *testing.T) {
+	t.Parallel()
+
+	parent := projectionISVC()
+	engine := projectionIR(parent, "chat-engine", omev1beta1.EngineComponent)
+	message := "waiting\n\x1b[31m\u202esecret " + strings.Repeat("界", 300)
+	record := validManualRecord("bounded-message", omev1beta1.MigrationPhaseAccepted)
+	record.Message = message
+	engine.Status.Migrations = []omev1beta1.MigrationStatus{record}
+
+	got, err := Project(
+		migrationcollection.Result{InferenceService: parent, InferenceReplicas: []omev1beta1.InferenceReplica{engine}},
+		"", Limits{MaxRecords: 20, MaxScannedRecords: 80, MaxNodeHints: 4, MaxScannedNodeHints: 32}, fixedClock{projectionNow},
+	)
+
+	require.NoError(t, err)
+	encoded, err := json.Marshal(got)
+	require.NoError(t, err)
+	var wire struct {
+		Content struct {
+			Migrations []struct {
+				Message string `json:"message"`
+			} `json:"migrations"`
+		} `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	require.Len(t, wire.Content.Migrations, 1)
+	projected := wire.Content.Migrations[0].Message
+	assert.NotContains(t, projected, "\n")
+	assert.NotContains(t, projected, "\x1b")
+	assert.NotContains(t, projected, "\u202e")
+	assert.Contains(t, projected, `\n`)
+	assert.Contains(t, projected, `\u001b`)
+	assert.Contains(t, projected, `\u202e`)
+	assert.LessOrEqual(t, len([]rune(projected)), 256)
+	assert.True(t, strings.HasSuffix(projected, "..."), projected)
 }
 
 func TestProjectClassifiesOnlyCurrentExecutionPhases(t *testing.T) {
