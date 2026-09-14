@@ -25,6 +25,8 @@ func TestRootCommandTree(t *testing.T) {
 	})
 	got := commandPaths(root)
 	want := []string{
+		"ome accelerator",
+		"ome accelerator explain",
 		"ome autoscale",
 		"ome autoscale explain",
 		"ome autoscale status",
@@ -91,6 +93,18 @@ func TestRootCommandTree(t *testing.T) {
 	if retryBlocks.Use != "retry-blocks INFERENCESERVICE --component COMPONENT" ||
 		retryBlocks.Short != "Show controller-reported retry authority" {
 		t.Fatalf("instance retry-blocks contract changed: Use=%q Short=%q", retryBlocks.Use, retryBlocks.Short)
+	}
+	acceleratorExplain, _, err := root.Find([]string{"accelerator", "explain"})
+	if err != nil {
+		t.Fatalf("find accelerator explain: %v", err)
+	}
+	if acceleratorExplain.Use != "explain INFERENCESERVICE" ||
+		acceleratorExplain.Short != "Explain accelerator intent and reported selection" {
+		t.Fatalf("accelerator explain contract changed: Use=%q Short=%q",
+			acceleratorExplain.Use, acceleratorExplain.Short)
+	}
+	if !strings.Contains(root.Long, "accelerator-selection evidence") {
+		t.Fatalf("root overview does not describe accelerator diagnostics: %q", root.Long)
 	}
 }
 

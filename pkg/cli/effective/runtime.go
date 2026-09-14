@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -851,4 +852,41 @@ func componentDeploymentModeSource(
 		return DeploymentModeLeaderWorkerShape
 	}
 	return DeploymentModeDefault
+}
+
+// mergedAcceleratorBaseContainer resolves only the serving container's base
+// resources. Keeping this seam beside MergeEffectiveComponents ensures the
+// CLI reuses the operator's pure container/resource merge primitives without
+// exposing the private runtime or component payload to report packages.
+func mergedAcceleratorBaseContainer(
+	podSpec *v1beta1.PodSpec,
+	runner *v1beta1.RunnerSpec,
+	runtimeSpec *v1beta1.ServingRuntimeSpec,
+	mergeRuntimeResources bool,
+) (*corev1.Container, error) {
+	if podSpec == nil {
+		return nil, errors.New("component pod spec must not be nil")
+	}
+	converted, err := isvcutils.ConvertPodSpec(podSpec.DeepCopy())
+	if err != nil {
+		return nil, err
+	}
+	if runner == nil {
+		if len(converted.Containers) == 0 {
+			return nil, errors.New("component serving container is unavailable")
+		}
+		return converted.Containers[0].DeepCopy(), nil
+	}
+	runnerCopy := runner.DeepCopy()
+	if mergeRuntimeResources {
+		isvcutils.MergeResource(&runnerCopy.Container, nil, runtimeSpec)
+	}
+	base := corev1.Container{}
+	for i := range converted.Containers {
+		if converted.Containers[i].Name == runnerCopy.Name {
+			base = *converted.Containers[i].DeepCopy()
+			break
+		}
+	}
+	return isvcutils.MergeRuntimeContainers(&runnerCopy.Container, &base)
 }
