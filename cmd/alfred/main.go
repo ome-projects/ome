@@ -1,17 +1,18 @@
 // Alfred is the OME GPU cluster caretaker (OEP-0008): a leader-elected
 // controller that observes the physical GPU layer, recommends corrective
-// migrations, and — only in execute mode — actuates them through the
-// migration-request annotation executed by the workload-owning controllers.
+// migrations. Future execution will use migration-request annotations handled
+// by the workload-owning controllers; no dispatcher is wired yet.
 //
 // This binary wires two loops onto a controller-runtime manager:
 //   - the observation loop (every replica): snapshot + gauges, read-only;
-//   - the decision loop (leader only): policies → arbiter → reporter →
+//   - the decision loop (leader only): policies → optional prediction → arbiter → reporter →
 //     dispatcher (added by later change sets).
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/observer"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
+	"sigs.k8s.io/ome/pkg/alfred/scheduling/process"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -65,6 +67,8 @@ type Options struct {
 	namespace            string
 	configMapName        string
 	configMapKey         string
+	simulationWorkers    string
+	simulationTimeout    time.Duration
 	zapOpts              zap.Options
 }
 
@@ -79,6 +83,7 @@ func DefaultOptions() Options {
 		namespace:            constants.OMENamespace,
 		configMapName:        "alfred-config",
 		configMapKey:         "config.yaml",
+		simulationTimeout:    10 * time.Second,
 	}
 }
 
@@ -93,6 +98,8 @@ func GetOptions() Options {
 		"Namespace holding Alfred's ConfigMaps and leader-election Lease.")
 	flag.StringVar(&opts.configMapName, "config-name", opts.configMapName, "Name of the Alfred configuration ConfigMap.")
 	flag.StringVar(&opts.configMapKey, "config-key", opts.configMapKey, "Key inside the ConfigMap holding config.yaml.")
+	flag.StringVar(&opts.simulationWorkers, "simulation-workers", "", "Absolute path to the trusted startup worker registry JSON; empty disables prediction.")
+	flag.DurationVar(&opts.simulationTimeout, "simulation-timeout", opts.simulationTimeout, "Whole-process timeout per scheduler prediction (positive, at most 1m).")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -101,6 +108,7 @@ func GetOptions() Options {
 func main() {
 	opts := GetOptions()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts.zapOpts)))
+	ctx := ctrl.SetupSignalHandler()
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), manager.Options{
 		Scheme:                  scheme,
@@ -187,11 +195,17 @@ func main() {
 		setupLog.Error(err, "unable to add early ticker")
 		os.Exit(1)
 	}
+	predictions, err := predictionStage(ctx, mgr.GetAPIReader(), opts)
+	if err != nil {
+		setupLog.Error(err, "unable to configure recommendation simulation")
+		os.Exit(1)
+	}
 	decisionLoop := &engine.DecisionLoop{
-		Snapshots: observationLoop,
-		Store:     store,
-		Policies:  []policy.Policy{&defrag.Policy{}},
-		Arbiter:   &engine.Arbiter{Ledger: engine.NewLedger()},
+		Snapshots:   observationLoop,
+		Store:       store,
+		Policies:    []policy.Policy{&defrag.Policy{}},
+		Predictions: predictions,
+		Arbiter:     &engine.Arbiter{Ledger: engine.NewLedger()},
 		Reporter: &engine.Reporter{
 			Client:        mgr.GetClient(),
 			DirectReader:  mgr.GetAPIReader(),
@@ -219,8 +233,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := ctrl.SetupSignalHandler()
-
 	// alfred_leader_status: 0 on every replica until this one wins the
 	// Lease; only the leader runs the decision loop.
 	go func() {
@@ -239,6 +251,23 @@ func main() {
 		setupLog.Error(err, "problem running alfred")
 		os.Exit(1)
 	}
+}
+
+func predictionStage(ctx context.Context, reader client.Reader, opts Options) (*engine.PredictionStage, error) {
+	if opts.simulationTimeout <= 0 || opts.simulationTimeout > time.Minute {
+		return nil, fmt.Errorf("simulation-timeout must be positive and at most 1m")
+	}
+	if opts.simulationWorkers == "" {
+		return nil, nil
+	}
+	// Bound the complete startup probe, not just each configured worker.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	registry, err := process.Load(ctx, opts.simulationWorkers, opts.simulationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &engine.PredictionStage{Reader: reader, Simulator: registry}, nil
 }
 
 func ptr[T any](v T) *T { return &v }

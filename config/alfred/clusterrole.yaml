@@ -21,6 +21,17 @@ rules:
     resources: [ "pods" ]
     verbs: [ "get", "list", "watch" ]
 
+  # Lossless scheduler snapshot inputs; these never grant mutation rights.
+  - apiGroups: [ "" ]
+    resources: [ "namespaces", "services", "replicationcontrollers" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets", "statefulsets" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "scheduling.x-k8s.io" ]
+    resources: [ "podgroups" ]
+    verbs: [ "get", "list", "watch" ]
+
   # PVCs / PVs (read-only) — PVC-backed model topology in the snapshot.
   - apiGroups: [ "" ]
     resources: [ "persistentvolumeclaims", "persistentvolumes" ]

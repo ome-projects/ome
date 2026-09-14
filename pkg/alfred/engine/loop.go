@@ -28,10 +28,12 @@ type DecisionLoop struct {
 	Snapshots SnapshotSource
 	Store     *config.Store
 	Policies  []policy.Policy
-	Arbiter   *Arbiter
-	Reporter  *Reporter
-	Metrics   *metrics.Metrics
-	Log       logr.Logger
+	// Predictions is optional and can only enrich non-executable advice.
+	Predictions *PredictionStage
+	Arbiter     *Arbiter
+	Reporter    *Reporter
+	Metrics     *metrics.Metrics
+	Log         logr.Logger
 
 	// EarlyTick advances the next tick when a subscribed event (a node
 	// condition change) arrives; it never interrupts a running pass. The
@@ -85,8 +87,12 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 	for _, p := range l.Policies {
 		candidates = append(candidates, p.Evaluate(snap, cfg)...)
 	}
-	for i, candidate := range candidates {
-		candidates[i] = gateSchedulingCandidate(snap, cfg, candidate)
+	if l.Predictions != nil {
+		candidates = l.Predictions.Annotate(ctx, snap, cfg, candidates)
+	} else {
+		for i, candidate := range candidates {
+			candidates[i] = gateSchedulingCandidate(snap, cfg, candidate)
+		}
 	}
 	decisions := l.Arbiter.Admit(snap, candidates, cfg, l.now())
 

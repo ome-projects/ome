@@ -31,16 +31,9 @@ scheduling:
 `
 
 type schedulingRecommendation struct {
-	Outcome        string `json:"outcome"`
-	AdvisoryReason string `json:"advisoryReason"`
-	Scheduling     *struct {
-		SchedulerName    string `json:"schedulerName"`
-		Backend          string `json:"backend"`
-		SchedulerVersion string `json:"schedulerVersion"`
-		ConfigurationID  string `json:"configurationID"`
-		Status           string `json:"status"`
-		Reason           string `json:"reason"`
-	} `json:"scheduling"`
+	Outcome        string                        `json:"outcome"`
+	AdvisoryReason string                        `json:"advisoryReason"`
+	Scheduling     *policy.SchedulingDiagnostics `json:"scheduling"`
 }
 
 func readSchedulingRecommendation(t *testing.T, reporter *Reporter) schedulingRecommendation {

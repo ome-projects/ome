@@ -6,9 +6,11 @@
 package policy
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
+	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -135,6 +137,10 @@ type SchedulingDiagnostics struct {
 	ConfigurationID  string `json:"configurationID,omitempty"`
 	Status           string `json:"status"`
 	Reason           string `json:"reason"`
+	// Prediction provenance and placements are advisory, never arbiter hints.
+	SnapshotID   string                 `json:"snapshotID,omitempty"`
+	SnapshotTime *metav1.Time           `json:"snapshotTime,omitempty"`
+	Placements   []scheduling.Placement `json:"placements,omitempty"`
 }
 
 // Policy is a pluggable decision module: a pure function of the snapshot.

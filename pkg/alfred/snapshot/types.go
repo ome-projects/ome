@@ -117,7 +117,9 @@ type Node struct {
 type PodInfo struct {
 	Namespace string
 	Name      string
-	Node      string
+	// UID fences a scheduling prediction against a same-name replacement Pod.
+	UID  types.UID
+	Node string
 	// GPUs is the pod's GPU request.
 	GPUs int64
 	// Ready reports the pod Ready condition.

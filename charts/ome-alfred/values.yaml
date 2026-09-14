@@ -59,6 +59,13 @@ healthPort: 8081
 # ConfigMap, and the namespaced RBAC write grant all follow this value.
 configMapName: alfred-config
 
+# Opt-in recommendation simulation. Use an existing immutable ConfigMap with
+# workers.json and scheduler YAML files; paths are /etc/alfred-simulation/...
+# This is trusted startup configuration, not the hot-reloaded policy map.
+simulation:
+  configMapName: ""
+  timeout: 10s
+
 # Alfred's policy configuration (OEP-0008 §Configuration), rendered verbatim
 # into <configMapName>'s config.yaml and hot-reloaded by every replica. A
 # config that fails schema validation is rejected at reload and the
@@ -77,9 +84,9 @@ alfredConfig:
   earlyTickOn: [NodeConditionChange]
 
   # Scheduler simulation is mandatory before execution. Profiles are keyed by
-  # the effective replacement Pod schedulerName. Worker integration does not
-  # exist yet, so profiles cannot activate execution and the shipped default is
-  # intentionally empty. A future worker mapping has this shape:
+  # the effective replacement Pod schedulerName. Opt-in worker integration
+  # produces recommendations only, even in execute mode. The shipped default
+  # is intentionally empty. Copy the exact worker --print-profile identity:
   # profiles:
   #   default-scheduler:
   #     backend: kube-v135

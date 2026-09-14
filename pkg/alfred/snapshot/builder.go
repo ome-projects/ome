@@ -194,6 +194,7 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 	info := PodInfo{
 		Namespace:   pod.Namespace,
 		Name:        pod.Name,
+		UID:         pod.UID,
 		Node:        pod.Spec.NodeName,
 		GPUs:        gpus,
 		Ready:       podIsReady(pod),

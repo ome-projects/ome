@@ -1228,18 +1228,26 @@ scheduler and other actors can still consume capacity after simulation.
 **Current gate.** Public profile selection, the request/result protocol and
 validation, and a mandatory gate return structured `scheduling` diagnostics.
 Diagnostics record `schedulerName`, `backend`, `schedulerVersion`,
-`configurationID`, `status`, and `reason`; status is `Unavailable` or
-`Unsupported` at the current gate. Current reasons include
+`configurationID`, `status`, and `reason`; status is `Unavailable`,
+`Unsupported`, `Feasible`, or `Infeasible`. Current reasons include
 `ProfileNotConfigured`, `NoTemplates`, `TemplateBound`, `ProfileInvalid`,
 `GangUnsupported`, `MixedSchedulers`, `SimulationUnavailable`, and
 `OMENativeObservationInvalid`. The original advisory reason remains alongside
-these diagnostics. A standalone worker evaluates complete supplied relocation
-Pods and snapshot objects. Alfred's input library can now construct those
-requests without an owner-side preview, but production Alfred has no lossless
-input collection, worker registry or invocation wired into the decision loop,
-or Dispatcher. Consequently every Candidate remains non-executable in
-practice, and adding a profile to Alfred configuration cannot activate
-execution. The protocol and worker depend on public contracts rather than
+these diagnostics. Alfred's opt-in recommendation stage captures full public
+API objects once per leader decision pass, checks that the selected source's
+owners, revisions, incarnation and complete Pod membership/placement still
+match, then invokes an exact-profile worker from a trusted startup registry.
+No owner-side preview is required. Each pass attempts at most eight candidates
+within 30 seconds; policy and lossless observations must remain at most 30
+seconds old, checked again after evaluation. Prediction provenance and at most
+128 placements are reported separately from policy/Arbiter target hints.
+Registry paths and fixed process arguments cannot be supplied by hot-reloaded
+policy configuration. The Alfred image bundles the offline worker; deployment
+and matching-profile setup are documented in
+[the simulator guide](../../pkg/alfred/simulator/README.md).
+There is still no Dispatcher: even a feasible prediction is advisory-only in
+execute mode and consumes no migration budget. Adding a profile or worker
+cannot activate execution. The protocol and worker depend on public contracts rather than
 controller internals, but pre-existing Alfred snapshot imports remain separate
 debt.
 
@@ -1632,8 +1640,8 @@ config.yaml: |
   observationLoopInterval: 30s
   earlyTickOn: [NodeConditionChange]  # adds a serialized early pass; periodic cadence is unchanged ([] disables)
 
-  # Illustrative only: current Alfred has no worker integration, so profiles
-  # cannot enable execution. Shipped defaults use `profiles: {}`.
+  # Illustrative identities: copy the exact startup worker probe result.
+  # Integration is recommendation-only. Shipped defaults use `profiles: {}`.
   scheduling:
     profiles:                       # keyed by effective replacement schedulerName
       default-scheduler:
@@ -1704,8 +1712,8 @@ identity, `schedulerVersion` pins the scheduler build, `configurationID`
 immutably identifies its profile/plugins/arguments/feature gates, and
 `gangScheduling` declares whether the worker implements complete atomic gang
 admission. Configuration never supplies fallback semantics. Empty profiles are
-valid and are the shipped default; because worker integration is not yet
-implemented, even the illustrative entries above cannot activate execution.
+valid and are the shipped default. Worker integration is opt-in and
+recommendation-only; even a matching feasible result cannot activate execution.
 
 **Aggressiveness is a scoring knob, not a kill switch.** `conservative` raises
 the benefit/cost threshold a candidate must clear before the Arbiter will admit
@@ -2863,9 +2871,9 @@ engine must not preclude them.
   fail-closed unavailable-worker diagnostics landed, followed by the isolated
   scheduler worker and Alfred-owned predictive input library. Inputs model
   checked observed Pods; an owner-side rendering/admission preview is not
-  required. Production worker wiring and Dispatcher remain unimplemented.
-- TBD: Complete Alpha implementation (production lossless input collection and
-  matching-scheduler worker integration, capability Lease, Policy #2, Dispatcher,
+  required. Opt-in production collection and exact-profile subprocess wiring
+  now annotate recommendations; they do not promote or dispatch candidates.
+- TBD: Complete Alpha implementation (execution admission, capability Lease, Policy #2, Dispatcher,
   and outcome-fed safety ledger).
 - TBD: First Beta user.
 - TBD: First Beta release.

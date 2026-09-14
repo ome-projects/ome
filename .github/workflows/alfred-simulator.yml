@@ -7,6 +7,11 @@ on:
     paths:
       - '.github/workflows/alfred-simulator.yml'
       - 'pkg/alfred/scheduling/**'
+      - 'pkg/alfred/config/**'
+      - 'pkg/alfred/engine/**'
+      - 'pkg/alfred/snapshot/**'
+      - 'pkg/alfred/policy/**'
+      - 'cmd/alfred/**'
       - 'pkg/alfred/simulator/**'
       - 'scheduler/**'
       - 'go.mod'
@@ -16,6 +21,11 @@ on:
     paths:
       - '.github/workflows/alfred-simulator.yml'
       - 'pkg/alfred/scheduling/**'
+      - 'pkg/alfred/config/**'
+      - 'pkg/alfred/engine/**'
+      - 'pkg/alfred/snapshot/**'
+      - 'pkg/alfred/policy/**'
+      - 'cmd/alfred/**'
       - 'pkg/alfred/simulator/**'
       - 'scheduler/**'
       - 'go.mod'
@@ -62,9 +72,9 @@ jobs:
         run: go build ./cmd/alfred-simulator
 
       - name: Test root wire compatibility
-        run: go test ./pkg/alfred/scheduling
+        run: go test ./pkg/alfred/scheduling/...
 
-      - name: Test predictive inputs against simulator
+      - name: Test predictive inputs and recommendation loop against simulator
         env:
           ALFRED_SIMULATOR_BINARY: ${{ github.workspace }}/pkg/alfred/simulator/alfred-simulator
-        run: go test -race ./pkg/alfred/scheduling/input
+        run: go test -race ./pkg/alfred/scheduling/input ./pkg/alfred/engine

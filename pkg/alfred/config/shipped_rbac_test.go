@@ -96,3 +96,19 @@ func TestChartRBACMatchesKustomize(t *testing.T) {
 		})
 	}
 }
+
+func TestPredictionRBACIsReadOnly(t *testing.T) {
+	for _, path := range []string{"../../../config/alfred/clusterrole.yaml", "../../../charts/ome-alfred/templates/rbac.yaml"} {
+		got := grants(t, path, "ClusterRole")
+		for _, resource := range []string{"/namespaces", "/services", "/replicationcontrollers", "apps/replicasets", "apps/statefulsets", "scheduling.x-k8s.io/podgroups"} {
+			if !got[resource+":list"] {
+				t.Errorf("%s: missing %s list", path, resource)
+			}
+			for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+				if got[resource+":"+verb] {
+					t.Errorf("%s: prediction must not grant %s %s", path, resource, verb)
+				}
+			}
+		}
+	}
+}

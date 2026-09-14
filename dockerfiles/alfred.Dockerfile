@@ -20,6 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY cmd/ cmd/
 COPY pkg/ pkg/
+COPY scheduler/ scheduler/
 
 # Build arguments for version info
 ARG VERSION
@@ -32,6 +33,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -a \
     -ldflags "-X sigs.k8s.io/ome/pkg/version.GitVersion=${GIT_TAG} -X sigs.k8s.io/ome/pkg/version.GitCommit=${GIT_COMMIT}" \
     -o alfred ./cmd/alfred
+
+# Keep the pinned Kubernetes scheduler and staging replacements in their
+# separate module. No scheduler dependencies enter Alfred's root Go module.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    cd pkg/alfred/simulator && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -o /workspace/alfred-simulator ./cmd/alfred-simulator
 
 # Use the base image specified at the top of the file
 ARG BASE_IMAGE
@@ -48,6 +57,7 @@ RUN if [ -f /usr/bin/microdnf ]; then \
     fi
 WORKDIR /
 COPY --from=builder /workspace/alfred .
+COPY --from=builder /workspace/alfred-simulator .
 USER 65532:65532
 
 ENTRYPOINT ["/alfred"]

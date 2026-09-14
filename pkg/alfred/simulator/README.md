@@ -6,11 +6,82 @@ against private clients populated only from the JSON request. It does not read a
 kubeconfig, use in-cluster credentials, contact an API server, or change a live
 cluster.
 
-This worker is not connected to production Alfred. Alfred's
-`pkg/alfred/scheduling/input` package can capture full public cluster objects
-and build predictive relocation requests; production collection, worker
-registry/invocation, and dispatch are not yet wired. Supplying a profile in
-Alfred configuration therefore does not enable migration execution.
+Alfred can opt into this worker for **recommendations only**. Its leader-only
+decision loop captures full public cluster objects through the uncached API
+reader, builds predictive relocation requests, and invokes an exact-profile
+worker from its startup registry. Supplying a worker or profile never enables
+migration execution, even with `mode: execute`; the Dispatcher is not wired.
+
+## Enable recommendation simulation
+
+The Alfred image bundles `/alfred-simulator`. Pin the image by digest and mount
+an operator-owned **immutable** ConfigMap containing `workers.json` and one
+scheduler configuration per worker. Keep it separate from the hot-reloaded
+Alfred policy ConfigMap. Print each identity using the **same image artifact**,
+configuration file and empty environment used by Alfred:
+
+```sh
+env -i /alfred-simulator --backend alfred-default-v1 \
+  --scheduler-config /etc/alfred-simulation/default.yaml --print-profile
+```
+
+Copy that result into the trusted startup manifest (substitute the exact
+printed identity and gang capability; do not use these placeholders literally):
+
+```json
+{
+  "workers": [{
+    "binaryPath": "/alfred-simulator",
+    "schedulerConfigPath": "/etc/alfred-simulation/default.yaml",
+    "identity": {
+      "schedulerName": "default-scheduler",
+      "backend": "alfred-default-v1",
+      "schedulerVersion": "v1.35.4",
+      "configurationID": "<printed configurationID>"
+    },
+    "gangScheduling": false
+  }]
+}
+```
+
+Set `simulation.configMapName` in the `ome-alfred` Helm chart to this existing
+ConfigMap's name. The chart mounts every key under `/etc/alfred-simulation` and
+passes `--simulation-workers=/etc/alfred-simulation/workers.json`. For the
+Kustomize installation, add that same read-only volume/mount and flag through
+your deployment overlay. The default empty registry flag disables prediction.
+Also copy the identity/capability into `alfredConfig.scheduling.profiles` as
+described below. The startup probe rejects mismatches; changing the policy
+ConfigMap cannot introduce another executable or cause a scheduler fallback.
+To change the registry or scheduler configuration, create a new immutable
+ConfigMap, update the deployment reference and restart Alfred.
+
+Each decision cycle attempts at most eight candidates in policy order, with
+one fresh lossless capture, a 30-second total deadline, and a 30-second maximum
+age for both the policy observation and capture. Freshness is checked again
+after evaluation. The worker timeout defaults to ten seconds (chart
+`simulation.timeout` or `--simulation-timeout`, maximum one minute), subject
+to the shorter cycle deadline. The worker receives 80% of the remaining
+whole-process budget for evaluation, leaving headroom to return a validated
+`Unsupported` timeout result. Captures are non-atomic and predictions reserve
+nothing. Source owner UID/generation, revision, incarnation, complete Pod
+identity and placement must still match the observation that selected it.
+
+Recommendation JSON records the closed scheduling status/reason, snapshot ID
+and time, and at most 128 predicted Pod placements separately from policy
+target hints. Larger cohorts are reported `RecommendationTooLarge`; other
+unmodelled inputs remain `InputUnsupported`. Results are never executable and
+never consume migration budgets. An original advisory reason such as
+`OMENativeUnavailable` stays visible even when a prediction is feasible.
+
+The registry runs only explicit executables with fixed arguments, one process
+at a time, no shell, an empty environment, bounded input/output, cancellation
+and child reaping. Manifest/config files are capped at 1 MiB; requests/results
+at 16 MiB; profile output/stderr at 64 KiB. It accepts only one strictly decoded
+response tied to the exact request, snapshot and profile. Raw worker errors
+are not published in recommendations. This is **not an OS sandbox**: the
+trusted binary shares Alfred's filesystem and service-account mounts. Only
+deploy the reviewed offline worker; environment stripping does not make an
+arbitrary replacement executable safe.
 
 ## Build and test
 
@@ -161,7 +232,7 @@ snapshot. It creates no live scheduler reservation, and cluster state may change
 immediately after the result. Workload configuration and admission behavior may
 also change before real replacements are created. Unsupported or drifted input
 models must not be treated as feasible. Production dispatch still requires a
-configured worker integration, fresh source/profile checks, Arbiter
+fresh execution-time source/profile checks, Arbiter
 revalidation, and the separate guarded migration dispatcher; no live execution
 is provided here.
 
@@ -186,11 +257,20 @@ capacity must be available before the migration owner drains the source. The
 builder declines unsupported inputs rather than copying workload-controller
 rendering logic.
 
-The dedicated simulator CI runs a real-binary roundtrip from these input APIs.
+Excluded source nodes are marked unschedulable **only in the worker's private
+Node copies**, before gang domain planning. The final exclusion filter remains
+in place. This prevents spare capacity on an excluded source from attracting a
+gang whose worker affinity then waits for its rejected leader. Source Pods and
+their resource occupancy remain present; neither input objects nor live nodes
+are modified.
+
+The dedicated simulator CI runs real-binary roundtrips from these input APIs
+and through the production registry and recommendation loop, for single Pods
+and complete OME gangs, including insufficient/partial replacement capacity.
 Run it locally after building the worker:
 
 ```sh
 # From the repository root.
 ALFRED_SIMULATOR_BINARY="$PWD/pkg/alfred/simulator/bin/alfred-simulator" \
-  go test ./pkg/alfred/scheduling/input -run TestWorkerIntegration -v
+  go test ./pkg/alfred/scheduling/input ./pkg/alfred/engine -run 'TestWorkerIntegration|TestPredictionWorkerIntegration' -v
 ```

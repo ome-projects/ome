@@ -48,17 +48,26 @@ func (s *privateState) deny(err error) {
 	s.signal()
 }
 func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Clientset, *privateState) {
+	excluded := exclusions{}
+	for _, node := range r.ExcludedNodes {
+		excluded[node] = true
+	}
 	objects := make([]runtime.Object, 0, len(snapshot.Objects))
 	for _, o := range snapshot.Objects {
 		switch o.(type) {
 		case *v1.Pod, *v1.Node, *v1.Namespace, *v1.Service, *v1.ReplicationController, *appsv1.ReplicaSet, *appsv1.StatefulSet:
-			objects = append(objects, o.DeepCopyObject())
+			copy := o.DeepCopyObject()
+			if node, ok := copy.(*v1.Node); ok && excluded[node.Name] {
+				// Apply the hard exclusion before OME's domain planning, not
+				// only in Filter: otherwise spare source capacity can attract
+				// a gang whose worker affinity then waits for a rejected leader.
+				// Only this private copy changes; all occupied Pods stay put.
+				node.Spec.Unschedulable = true
+			}
+			objects = append(objects, copy)
 		}
 	}
-	s := &privateState{requested: map[types.NamespacedName]*v1.Pod{}, nodes: snapshot.Nodes, excluded: exclusions{}, bound: map[types.NamespacedName]string{}, completed: map[types.NamespacedName]bool{}, wake: make(chan struct{}, 1), active: map[types.UID]bool{}}
-	for _, node := range r.ExcludedNodes {
-		s.excluded[node] = true
-	}
+	s := &privateState{requested: map[types.NamespacedName]*v1.Pod{}, nodes: snapshot.Nodes, excluded: excluded, bound: map[types.NamespacedName]string{}, completed: map[types.NamespacedName]bool{}, wake: make(chan struct{}, 1), active: map[types.UID]bool{}}
 	usedUIDs := map[types.UID]bool{}
 	for _, pod := range snapshot.Pods {
 		usedUIDs[pod.UID] = true

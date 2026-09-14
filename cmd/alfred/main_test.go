@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -23,6 +25,9 @@ func resetFlags(t *testing.T, args []string) {
 
 func TestDefaultOptions(t *testing.T) {
 	opts := DefaultOptions()
+	if opts.simulationWorkers != "" || opts.simulationTimeout != 10*time.Second {
+		t.Fatalf("simulation must be opt-in with a bounded timeout: %+v", opts)
+	}
 	if opts.metricsAddr != ":8080" || opts.probeAddr != ":8081" {
 		t.Fatalf("default addresses: %+v", opts)
 	}
@@ -48,6 +53,25 @@ func TestGetOptionsDefaults(t *testing.T) {
 	}
 }
 
+func TestPredictionStageDisabledAndInvalidStartup(t *testing.T) {
+	opts := DefaultOptions()
+	stage, err := predictionStage(context.Background(), nil, opts)
+	if err != nil || stage != nil {
+		t.Fatalf("default should not create a worker: %v %v", stage, err)
+	}
+	for _, timeout := range []time.Duration{0, -time.Second, time.Minute + time.Second} {
+		opts.simulationTimeout = timeout
+		if _, err := predictionStage(context.Background(), nil, opts); err == nil {
+			t.Fatalf("accepted invalid timeout %v", timeout)
+		}
+	}
+	opts = DefaultOptions()
+	opts.simulationWorkers = "/does-not-exist/alfred-workers.json"
+	if _, err := predictionStage(context.Background(), nil, opts); err == nil {
+		t.Fatal("configured missing registry must fail startup")
+	}
+}
+
 func TestGetOptionsCustom(t *testing.T) {
 	resetFlags(t, []string{
 		"alfred",
@@ -57,8 +81,13 @@ func TestGetOptionsCustom(t *testing.T) {
 		"--namespace=caretaker",
 		"--config-name=my-config",
 		"--config-key=alfred.yaml",
+		"--simulation-workers=/etc/alfred/workers.json",
+		"--simulation-timeout=7s",
 	})
 	opts := GetOptions()
+	if opts.simulationWorkers != "/etc/alfred/workers.json" || opts.simulationTimeout != 7*time.Second {
+		t.Fatalf("simulation options not parsed: %+v", opts)
+	}
 	if opts.metricsAddr != ":9090" || opts.probeAddr != ":9091" {
 		t.Fatalf("addresses not parsed: %+v", opts)
 	}
@@ -76,6 +105,7 @@ func TestPodCacheTransform(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "p",
+			UID:         "source-pod-uid",
 			Labels:      map[string]string{"keep": "me"},
 			Annotations: map[string]string{"drop": "me"},
 			ManagedFields: []metav1.ManagedFieldsEntry{
@@ -151,7 +181,7 @@ func TestPodCacheTransform(t *testing.T) {
 	}
 
 	// Kept: everything the snapshot reads.
-	if got.Labels["keep"] != "me" || got.Spec.NodeName != "node1" || got.Spec.NodeSelector["pool"] != "h100" {
+	if got.UID != "source-pod-uid" || got.Labels["keep"] != "me" || got.Spec.NodeName != "node1" || got.Spec.NodeSelector["pool"] != "h100" {
 		t.Fatalf("needed fields lost: %+v", got)
 	}
 	if got.Spec.Containers[0].Resources.Limits.Name("nvidia.com/gpu", resource.DecimalSI).Value() != 2 {

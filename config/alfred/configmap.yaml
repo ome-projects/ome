@@ -23,8 +23,9 @@ data:
     earlyTickOn: [NodeConditionChange]
 
     # Scheduler simulation is mandatory before execution. Profiles are keyed by
-    # the effective replacement Pod schedulerName. No simulation workers ship
-    # with Alfred yet, so defaults remain empty and every candidate fails closed.
+    # the effective replacement Pod schedulerName. Workers are opt-in through
+    # trusted startup configuration and only produce recommendations. Defaults
+    # remain empty and no profile can enable migration execution.
     scheduling:
       profiles: {}
 

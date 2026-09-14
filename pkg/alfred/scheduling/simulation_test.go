@@ -23,6 +23,80 @@ func TestValidateResultAcceptsFullFeasiblePlacement(t *testing.T) {
 	}
 }
 
+func TestValidateResponseAcceptsValidDecisions(t *testing.T) {
+	req := validRequest()
+	placements := []Placement{
+		{Pod: identity(req.ReplacementPods[0]), NodeName: "gpu-c"},
+		{Pod: identity(req.ReplacementPods[1]), NodeName: "gpu-d"},
+	}
+	tests := []struct {
+		name       string
+		decision   Decision
+		reason     SimulationReason
+		placements []Placement
+	}{
+		{name: "feasible", decision: DecisionFeasible, reason: SimulationReasonPlacementFound, placements: placements},
+		{name: "infeasible", decision: DecisionInfeasible, reason: SimulationReasonNoFeasiblePlacement},
+		{name: "unsupported", decision: DecisionUnsupported, reason: SimulationReasonUnsupported},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := matchingResult(req, tc.placements)
+			result.Decision = tc.decision
+			result.Reason = tc.reason
+			if err := ValidateResponse(req, result); err != nil {
+				t.Fatalf("ValidateResponse() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestValidateResponseRejectsDecisionReasonAndPlacementMismatches(t *testing.T) {
+	req := validRequest()
+	placements := []Placement{
+		{Pod: identity(req.ReplacementPods[0]), NodeName: "gpu-c"},
+		{Pod: identity(req.ReplacementPods[1]), NodeName: "gpu-d"},
+	}
+	tests := []struct {
+		name       string
+		decision   Decision
+		reason     SimulationReason
+		placements []Placement
+		wantErr    string
+	}{
+		{name: "feasible wrong reason", decision: DecisionFeasible, reason: SimulationReasonNoFeasiblePlacement, placements: placements, wantErr: "invalid reason"},
+		{name: "infeasible wrong reason", decision: DecisionInfeasible, reason: SimulationReasonUnsupported, wantErr: "invalid reason"},
+		{name: "unsupported wrong reason", decision: DecisionUnsupported, reason: SimulationReasonNoFeasiblePlacement, wantErr: "invalid reason"},
+		{name: "infeasible placements", decision: DecisionInfeasible, reason: SimulationReasonNoFeasiblePlacement, placements: placements, wantErr: "placements"},
+		{name: "unsupported placements", decision: DecisionUnsupported, reason: SimulationReasonUnsupported, placements: placements, wantErr: "placements"},
+		{name: "unknown decision", decision: Decision("Maybe"), reason: SimulationReasonUnsupported, wantErr: "unknown decision"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := matchingResult(req, tc.placements)
+			result.Decision = tc.decision
+			result.Reason = tc.reason
+			err := ValidateResponse(req, result)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateResponse() error = %v, want mention of %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateResponseRejectsStaleNegativeEnvelope(t *testing.T) {
+	req := validRequest()
+	result := matchingResult(req, nil)
+	result.Decision = DecisionInfeasible
+	result.Reason = SimulationReasonNoFeasiblePlacement
+	result.Profile.ConfigurationID = "sha256:stale"
+	if err := ValidateResponse(req, result); err == nil || !strings.Contains(err.Error(), "profile identity") {
+		t.Fatalf("ValidateResponse() error = %v, want profile identity mismatch", err)
+	}
+}
+
 func TestValidateResultRecognizesOnlyCoreV1NodeObjects(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -157,7 +231,7 @@ func TestValidateResultRejectsResponsesThatCannotBeAccepted(t *testing.T) {
 
 	for _, decision := range []Decision{DecisionInfeasible, DecisionUnsupported} {
 		t.Run(string(decision), func(t *testing.T) {
-			result := matchingResult(req, placements)
+			result := matchingResult(req, nil)
 			result.Decision = decision
 			if decision == DecisionInfeasible {
 				result.Reason = SimulationReasonNoFeasiblePlacement

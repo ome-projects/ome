@@ -94,10 +94,10 @@ type Simulator interface {
 	Evaluate(context.Context, Request) (Result, error)
 }
 
-// ValidateResult returns nil only for a matching Feasible response with one
-// valid placement for every replacement Pod. A nil error does not reserve
-// nodes or assert that the live scheduler will make the same decision.
-func ValidateResult(request Request, result Result) error {
+// ValidateResponse validates the request and the complete response envelope for
+// every decision. Feasible responses must contain one valid placement for every
+// replacement Pod; negative responses must not contain placements.
+func ValidateResponse(request Request, result Result) error {
 	expected, excluded, err := validateRequest(request)
 	if err != nil {
 		return err
@@ -117,17 +117,29 @@ func ValidateResult(request Request, result Result) error {
 	if result.Profile != request.Profile {
 		return fmt.Errorf("simulation result profile identity does not match request")
 	}
-	if result.Decision != DecisionFeasible {
-		if !knownDecision(result.Decision) {
-			return fmt.Errorf("simulation result has unknown decision %q", result.Decision)
+	switch result.Decision {
+	case DecisionFeasible:
+		if result.Reason != SimulationReasonPlacementFound {
+			return fmt.Errorf("feasible simulation result has invalid reason %q", result.Reason)
 		}
-		if !knownReason(result.Reason) {
-			return fmt.Errorf("simulation result has unknown reason %q", result.Reason)
+	case DecisionInfeasible:
+		if result.Reason != SimulationReasonNoFeasiblePlacement {
+			return fmt.Errorf("infeasible simulation result has invalid reason %q", result.Reason)
 		}
-		return fmt.Errorf("simulation result is not feasible: %s", result.Decision)
-	}
-	if result.Reason != SimulationReasonPlacementFound {
-		return fmt.Errorf("feasible simulation result has invalid reason %q", result.Reason)
+		if len(result.Placements) != 0 {
+			return fmt.Errorf("infeasible simulation result must not contain placements")
+		}
+		return nil
+	case DecisionUnsupported:
+		if result.Reason != SimulationReasonUnsupported {
+			return fmt.Errorf("unsupported simulation result has invalid reason %q", result.Reason)
+		}
+		if len(result.Placements) != 0 {
+			return fmt.Errorf("unsupported simulation result must not contain placements")
+		}
+		return nil
+	default:
+		return fmt.Errorf("simulation result has unknown decision %q", result.Decision)
 	}
 
 	liveNodes, err := liveNodeNames(request.ClusterObjects)
@@ -158,6 +170,19 @@ func ValidateResult(request Request, result Result) error {
 		if _, ok := placed[pod]; !ok {
 			return fmt.Errorf("simulation result is missing placement for pod %s/%s", pod.Namespace, pod.Name)
 		}
+	}
+	return nil
+}
+
+// ValidateResult returns nil only for a matching Feasible response with one
+// valid placement for every replacement Pod. A nil error does not reserve
+// nodes or assert that the live scheduler will make the same decision.
+func ValidateResult(request Request, result Result) error {
+	if err := ValidateResponse(request, result); err != nil {
+		return err
+	}
+	if result.Decision != DecisionFeasible {
+		return fmt.Errorf("simulation result is not feasible: %s", result.Decision)
 	}
 	return nil
 }
@@ -258,14 +283,6 @@ func identityForReplacement(pod corev1.Pod) (PodIdentity, error) {
 
 func podIdentity(pod corev1.Pod) PodIdentity {
 	return PodIdentity{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID}
-}
-
-func knownDecision(decision Decision) bool {
-	return decision == DecisionFeasible || decision == DecisionInfeasible || decision == DecisionUnsupported
-}
-
-func knownReason(reason SimulationReason) bool {
-	return reason == SimulationReasonPlacementFound || reason == SimulationReasonNoFeasiblePlacement || reason == SimulationReasonUnsupported
 }
 
 func liveNodeNames(objects []runtime.RawExtension) (map[string]struct{}, error) {
