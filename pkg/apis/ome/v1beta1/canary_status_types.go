@@ -7,6 +7,13 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // entered (Auto promotion measures Pause.Duration from here), and which
 // revision is the canary. Absent when no canary is in progress.
 type CanaryStatus struct {
+	// TargetID identifies the canary group's pinned Component target set. A new
+	// target set re-arms the canary even when the externally routed Component's
+	// revision did not change. It is scoped to the canary group rather than the
+	// whole rollout run, so unrelated groups cannot reset canary progress.
+	// +optional
+	TargetID string `json:"targetID,omitempty"`
+
 	// CanaryRevisionHash is the revision hash being rolled out.
 	// +optional
 	CanaryRevisionHash string `json:"canaryRevisionHash,omitempty"`
@@ -53,10 +60,10 @@ type CanaryStatus struct {
 	PreStepHold bool `json:"preStepHold,omitempty"`
 
 	// RolledBackRevisionHash is set when a rollback (ome.io/rollout-rollback)
-	// abandons a canary: it records the rejected revision hash. While set, the
-	// component is held on the stable revision and the rejected revision is NOT
-	// retried — even after the annotation is cleared. The rollout re-arms only
-	// when a different target revision appears (a fresh spec change / fix).
+	// abandons a canary: it records the primary Component's rejected revision
+	// hash. While set, the group is held on its stable revisions and the rejected
+	// target set is NOT retried — even after the annotation is cleared. The
+	// rollout re-arms only when a different target set appears.
 	// +optional
 	RolledBackRevisionHash string `json:"rolledBackRevisionHash,omitempty"`
 

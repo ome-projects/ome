@@ -74,6 +74,10 @@ type ReconcileInputs struct {
 	// re-arms toward a new target — opening a run is the run layer's job, and
 	// starting a canary outside a pinned run would execute an unpinned plan.
 	RunActive bool
+	// TargetID identifies the canary group's pinned Component target set. Unlike
+	// the primary revision hash, it changes when only a secondary Component
+	// changes, but not when an unrelated rollout group changes.
+	TargetID string
 	// DefaultReadyTimeout is the operator-configured capacity-gate bound used
 	// when neither the ready-timeout annotation nor the plan's readyTimeout
 	// sets one. Zero means no configured default: the gate never escalates to
@@ -147,7 +151,14 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	if paused, _ := constants.RolloutPauseState(in.ISVC.Annotations); paused {
 		return pausedResult(cs, plan, in.DesiredReplicas), nil
 	}
-	// Stable and canary identities must remain distinct. The controller supplies
+	targetChanged := cs != nil && in.RunActive && in.TargetID != "" && cs.TargetID != "" && cs.TargetID != in.TargetID
+	if cs != nil && cs.TargetID == "" && in.TargetID != "" {
+		// Adopt status written before canary state was bound to a rollout run.
+		cs.TargetID = in.TargetID
+	}
+	// When the primary changes, stable and canary identities must remain
+	// distinct. A secondary-only run intentionally uses the same primary hash
+	// for both identities and is distinguished by TargetID. The controller supplies
 	// the IR's current revision when it can repair an invalid persisted pair.
 	if cs != nil && cs.CanaryRevisionHash != "" && cs.StableRevisionHash == cs.CanaryRevisionHash &&
 		in.StableRevisionHash != "" && in.StableRevisionHash != cs.CanaryRevisionHash {
@@ -167,8 +178,8 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		// reopens the run on a target change in the same pass, so RunActive
 		// here means the fresh run is already pinned. Without one, hold state
 		// as-is rather than start a fresh canary on an unpinned plan.
-		if in.RunActive && in.CanaryRevisionHash != "" && in.CanaryRevisionHash != cs.CanaryRevisionHash {
-			resetCanaryStatus(cs, in.CanaryRevisionHash, in.Now)
+		if in.RunActive && in.CanaryRevisionHash != "" && (targetChanged || in.CanaryRevisionHash != cs.CanaryRevisionHash) {
+			resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
 		}
 	}
 
@@ -187,11 +198,12 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 			// revision we're holding on, not a new target. Exclude both the stable
 			// revision and the rejected revision itself.
 			stableHash := stableHashFor(cs, in.PerRevisionPods, cs.RolledBackRevisionHash)
-			if in.RunActive && in.CanaryRevisionHash != "" && in.CanaryRevisionHash != cs.RolledBackRevisionHash && in.CanaryRevisionHash != stableHash {
+			if in.RunActive && in.CanaryRevisionHash != "" &&
+				(targetChanged || (in.CanaryRevisionHash != cs.RolledBackRevisionHash && in.CanaryRevisionHash != stableHash)) {
 				if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutRollbackAnnotation); err != nil {
 					return nil, err
 				}
-				resetCanaryStatus(cs, in.CanaryRevisionHash, in.Now)
+				resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
 				// fall through: start a fresh canary toward the new target.
 			} else {
 				return reconcileRollback(in, cs), nil
@@ -215,8 +227,9 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// (the observed target reports stable while no canary pods remain).
 	if cs != nil && in.ISVC.Status.Components[in.Component].RolloutPhase == v1beta1.RolloutPhaseFailed {
 		stableHash := stableHashFor(cs, in.PerRevisionPods, cs.CanaryRevisionHash)
-		if in.RunActive && in.CanaryRevisionHash != "" && in.CanaryRevisionHash != cs.CanaryRevisionHash && in.CanaryRevisionHash != stableHash {
-			resetCanaryStatus(cs, in.CanaryRevisionHash, in.Now)
+		if in.RunActive && in.CanaryRevisionHash != "" &&
+			(targetChanged || (in.CanaryRevisionHash != cs.CanaryRevisionHash && in.CanaryRevisionHash != stableHash)) {
+			resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
 			// fall through: start a fresh canary toward the new target.
 		} else {
 			return &Result{Active: true, RequeueAfter: failedRequeue}, nil
@@ -230,8 +243,8 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// back on the old revision after completion. No-op unless a new target
 	// appears, in which case start a fresh canary.
 	if cs != nil && int(cs.CurrentStep) >= len(plan.Steps) {
-		if in.RunActive && in.CanaryRevisionHash != "" && in.CanaryRevisionHash != cs.CanaryRevisionHash {
-			resetCanaryStatus(cs, in.CanaryRevisionHash, in.Now)
+		if in.RunActive && in.CanaryRevisionHash != "" && (targetChanged || in.CanaryRevisionHash != cs.CanaryRevisionHash) {
+			resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
 		} else {
 			// This return skips the main-path syncPromotedThrough, so converge any
 			// promote residue here: a canary can complete while the durable record
@@ -245,10 +258,10 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 
 	// Initialize the state machine on first sight of a NEW canary. Don't start
 	// one when the component is already fully converged on the target revision —
-	// or when the target isn't known yet — so adding a canary to an
-	// already-rolled-out ISVC is a no-op, not a phantom rollout.
+	// or when the target isn't known yet. Without a run identity, adding a canary
+	// to an already-rolled-out ISVC remains a no-op rather than a phantom rollout.
 	if cs == nil {
-		if in.CanaryRevisionHash == "" || readyCanaryCapacity(in) >= in.DesiredReplicas {
+		if in.CanaryRevisionHash == "" || (in.TargetID == "" && readyCanaryCapacity(in) >= in.DesiredReplicas) {
 			if in.CanaryRevisionHash != "" && in.DesiredReplicas > 0 {
 				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
 			}
@@ -262,6 +275,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 			return &Result{Active: false}, nil
 		}
 		in.ISVC.Status.Canary = &v1beta1.CanaryStatus{
+			TargetID:           in.TargetID,
 			CanaryRevisionHash: in.CanaryRevisionHash,
 			StableRevisionHash: in.StableRevisionHash,
 			CurrentStep:        0,
@@ -446,8 +460,9 @@ func pausedResult(cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, desiredRe
 // StableRevisionHash is the one field PRESERVED: a mid-canary retarget does
 // not change which revision was stable when the rollout began, and dropping
 // it would make a later rollback target the partially-rolled intermediate.
-func resetCanaryStatus(cs *v1beta1.CanaryStatus, hash string, now time.Time) {
+func resetCanaryStatus(cs *v1beta1.CanaryStatus, targetID, hash string, now time.Time) {
 	*cs = v1beta1.CanaryStatus{
+		TargetID:           targetID,
 		CanaryRevisionHash: hash,
 		StableRevisionHash: cs.StableRevisionHash,
 		StepEnteredTime:    &metav1.Time{Time: now},
@@ -490,7 +505,7 @@ func reconcileRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 	// with no run to open (the rejected target is excluded from run-open
 	// divergence by design). With no stable identity to compare against,
 	// degrade to the rejected-revision check rather than never completing.
-	rollingBack := in.PerRevisionPods[cs.RolledBackRevisionHash] > 0
+	rollingBack := cs.RolledBackRevisionHash != stableHash && in.PerRevisionPods[cs.RolledBackRevisionHash] > 0
 	if stableHash != "" {
 		for h, n := range in.PerRevisionPods {
 			if h != "" && h != stableHash && n > 0 {

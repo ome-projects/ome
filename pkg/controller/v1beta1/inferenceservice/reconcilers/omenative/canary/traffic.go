@@ -12,6 +12,11 @@ import (
 // single target.) Each entry carries its revision's pairing protocol so the
 // routing consumer can pair engine/decoder targets by equal values.
 func canaryWeights(canaryHash, stableHash, canaryProtocol, stableProtocol string, weight int32) []coordination.RevisionWeight {
+	if canaryHash != "" && canaryHash == stableHash {
+		return []coordination.RevisionWeight{{
+			RevisionHash: canaryHash, Percent: 100, Tag: "canary", LatestRevision: true, PairingProtocol: canaryProtocol,
+		}}
+	}
 	return []coordination.RevisionWeight{
 		{RevisionHash: canaryHash, Percent: weight, Tag: "canary", LatestRevision: true, PairingProtocol: canaryProtocol},
 		{RevisionHash: stableHash, Percent: 100 - weight, Tag: "stable", PairingProtocol: stableProtocol},

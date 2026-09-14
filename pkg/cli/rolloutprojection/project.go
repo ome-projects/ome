@@ -142,7 +142,8 @@ func validStoredRolloutPlan(spec *omev1beta1.InferenceServiceSpec) bool {
 			}
 			if analysis.OnInconclusive != nil &&
 				*analysis.OnInconclusive != omev1beta1.OnInconclusiveHold &&
-				*analysis.OnInconclusive != omev1beta1.OnInconclusiveRollback {
+				*analysis.OnInconclusive != omev1beta1.OnInconclusiveRollback &&
+				*analysis.OnInconclusive != omev1beta1.OnInconclusiveRollbackOnStall {
 				return false
 			}
 		}

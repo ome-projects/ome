@@ -92,14 +92,83 @@ func groupKind(g *v1beta1.RolloutGroup) v1beta1.RolloutProgressionKind {
 	return v1beta1.RolloutProgressionBlueGreen
 }
 
-// stickyRejectHash is the canary engine's rolled-back hold: a target equal to
-// it is the rejected revision, not a new rollout — neither an open trigger
-// nor a retarget.
-func stickyRejectHash(isvc *v1beta1.InferenceService) string {
-	if isvc.Status.Canary == nil {
+// primaryCanaryComponent is the externally routed member whose scalar canary
+// status mirrors the per-Component rollout record.
+func primaryCanaryComponent(isvc *v1beta1.InferenceService) v1beta1.ComponentType {
+	if isvc == nil || isvc.Spec.Rollout == nil {
 		return ""
 	}
-	return isvc.Status.Canary.RolledBackRevisionHash
+	for gi := range isvc.Spec.Rollout.Groups {
+		g := &isvc.Spec.Rollout.Groups[gi]
+		if groupKind(g) != v1beta1.RolloutProgressionCanary {
+			continue
+		}
+		for _, preferred := range []v1beta1.ComponentType{
+			v1beta1.RouterComponent,
+			v1beta1.EngineComponent,
+			v1beta1.DecoderComponent,
+		} {
+			for _, comp := range g.Components {
+				if comp == preferred {
+					return comp
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// stickyRejectHashes returns the rejected target for each Component in the
+// rolled-back canary group. Run status supplies the exact active or closed
+// target set. For legacy status, the primary scalar identifies whether the
+// current IR targets are still the rejected group; only then is it reconstructed.
+func stickyRejectHashes(isvc *v1beta1.InferenceService, targets map[v1beta1.ComponentType]targetPair) map[v1beta1.ComponentType]string {
+	rejected := map[v1beta1.ComponentType]string{}
+	if isvc.Status.Canary == nil || isvc.Status.Canary.RolledBackRevisionHash == "" {
+		return rejected
+	}
+	primary := primaryCanaryComponent(isvc)
+	if primary == "" {
+		return rejected
+	}
+	if isvc.Status.Rollout != nil {
+		if active := isvc.Status.Rollout.ActiveRun; active != nil {
+			for _, target := range active.TargetRevisions {
+				if target.Component == primary && target.Revision == isvc.Status.Canary.RolledBackRevisionHash {
+					for _, member := range active.TargetRevisions {
+						rejected[member.Component] = member.Revision
+					}
+					return rejected
+				}
+			}
+		}
+		if last := isvc.Status.Rollout.LastRun; last != nil && last.Outcome == v1beta1.RolloutRunRolledBack {
+			for _, target := range last.TargetRevisions {
+				if target.Component == primary && target.Revision == isvc.Status.Canary.RolledBackRevisionHash {
+					for _, member := range last.TargetRevisions {
+						rejected[member.Component] = member.Revision
+					}
+					return rejected
+				}
+			}
+		}
+	}
+	rejected[primary] = isvc.Status.Canary.RolledBackRevisionHash
+	if targets[primary].target != isvc.Status.Canary.RolledBackRevisionHash {
+		return rejected
+	}
+	for gi := range isvc.Spec.Rollout.Groups {
+		g := &isvc.Spec.Rollout.Groups[gi]
+		if groupKind(g) != v1beta1.RolloutProgressionCanary {
+			continue
+		}
+		for _, comp := range g.Components {
+			if target := targets[comp].target; target != "" {
+				rejected[comp] = target
+			}
+		}
+	}
+	return rejected
 }
 
 // divergedMember reports whether any grouped Component needs a roll: its
@@ -109,7 +178,7 @@ func stickyRejectHash(isvc *v1beta1.InferenceService) string {
 // Without the straggler clause a revert-to-current would open no run, and
 // the plan gate would then hold the straggler updates forever.
 func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.ComponentType]targetPair) bool {
-	reject := stickyRejectHash(isvc)
+	rejected := stickyRejectHashes(isvc, targets)
 	if isvc.Spec.Rollout == nil {
 		return false
 	}
@@ -120,7 +189,7 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 			// The rejected revision is a HOLD, not a pending roll — and it
 			// keeps being the IR's spec target throughout the hold, so both
 			// clauses below would otherwise re-open a run toward it forever.
-			if groupKind(g) == v1beta1.RolloutProgressionCanary && t.target != "" && t.target == reject {
+			if groupKind(g) == v1beta1.RolloutProgressionCanary && t.target != "" && t.target == rejected[comp] {
 				continue
 			}
 			if t.replicas > 0 && t.updated < t.replicas {

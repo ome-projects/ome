@@ -56,9 +56,9 @@ func TestPodTermination_UsesFinishedAtNotNow(t *testing.T) {
 	}
 }
 
-// Branch 2: the exact shape from the usc1-1 incident — live state is Waiting
-// with CrashLoopBackOff, and the crash that caused it is in
-// LastTerminationState. Exit code is zero there, so branch 1 does not match.
+// Branch 2: live state is Waiting with CrashLoopBackOff, and the crash that
+// caused it is in LastTerminationState. Exit code is zero there, so branch 1
+// does not match.
 func TestPodTermination_CrashLoopBackOffUsesLastTerminationFinishedAt(t *testing.T) {
 	pod := podWithStatus("router-0-default-0", corev1.ContainerStatus{
 		Name: "ome-container",

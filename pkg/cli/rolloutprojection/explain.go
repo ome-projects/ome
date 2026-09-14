@@ -691,7 +691,7 @@ func (b *explainProjector) projectSteps(
 			onInconclusive := omev1beta1.OnInconclusiveHold
 			if step.Analysis.OnInconclusive != nil {
 				switch *step.Analysis.OnInconclusive {
-				case omev1beta1.OnInconclusiveHold, omev1beta1.OnInconclusiveRollback:
+				case omev1beta1.OnInconclusiveHold, omev1beta1.OnInconclusiveRollback, omev1beta1.OnInconclusiveRollbackOnStall:
 					onInconclusive = *step.Analysis.OnInconclusive
 				default:
 					b.addIssue(malformedCode, view, ptrInt(group))

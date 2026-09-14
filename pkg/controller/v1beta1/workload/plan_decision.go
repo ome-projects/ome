@@ -12,6 +12,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 )
@@ -405,10 +406,14 @@ func planUpdateSelection(ctx context.Context, input ReconcileInput, plan Compone
 		// converging to target are never held (they must finish); see
 		// PartitionHeldIndices for the full candidacy rule.
 		if heldIndices[inst.Index] {
+			logf.FromContext(ctx).V(1).Info("update not selected: held by partition",
+				"component", plan.Component, "instance", inst.Index, "target", target.Name)
 			continue
 		}
 		dec := workloadops.EvaluateUpdateTrigger(input, inst, target, input.DesiredSpec.PodSpec, updateByInstance[inst.Index])
 		if dec.AdoptRevision {
+			logf.FromContext(ctx).V(1).Info("update not selected: adopting revision in place",
+				"component", plan.Component, "instance", inst.Index, "target", target.Name)
 			sel.Items = append(sel.Items, UpdateItem{Instance: inst, AdoptRevision: true})
 			continue
 		}
@@ -424,8 +429,25 @@ func planUpdateSelection(ctx context.Context, input ReconcileInput, plan Compone
 			// yet its superseded-revision wreckage must still be
 			// abandoned toward the current desired state. Pure snapshot
 			// read; the effect runs in Execute (ops.CleanupWreckage).
-			if s := findObservedInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index); workloadops.EvaluateWreckage(s, target, updateByInstance[inst.Index]) {
+			s := findObservedInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index)
+			cleanup := workloadops.EvaluateWreckage(s, target, updateByInstance[inst.Index])
+			if cleanup {
 				sel.Items = append(sel.Items, UpdateItem{Instance: inst, CleanupOnly: true})
+			}
+			// The trigger declining is the single most common reason a
+			// rollout makes no progress, and the phase/revision pair it
+			// keyed on is not otherwise recoverable after the fact.
+			log := logf.FromContext(ctx).V(1)
+			if s == nil {
+				log.Info("update not triggered: no observed status",
+					"component", plan.Component, "instance", inst.Index,
+					"target", target.Name, "cleanupOnly", cleanup)
+			} else {
+				log.Info("update not triggered",
+					"component", plan.Component, "instance", inst.Index,
+					"phase", s.Phase, "runningRevision", s.RunningRevision,
+					"target", target.Name, "hasOperation", s.Operation != nil,
+					"retryAfter", dec.RetryAfter, "cleanupOnly", cleanup)
 			}
 			continue
 		}
@@ -435,7 +457,20 @@ func planUpdateSelection(ctx context.Context, input ReconcileInput, plan Compone
 				!(s.Phase == InstancePhaseFailed && s.Operation != nil && s.Operation.Type == InstanceOperationUpdate))
 		gateExempt := startingFresh && strategy != UpdateStrategySurgeThenDrain &&
 			s != nil && s.Phase == InstancePhaseFailed && s.ServingPodCount == 0
+		logf.FromContext(ctx).V(1).Info("update selected",
+			"component", plan.Component, "instance", inst.Index, "target", target.Name,
+			"startingFresh", startingFresh, "coordGateExempt", gateExempt)
 		sel.Items = append(sel.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt})
 	}
+	// Budgets are decided here but spent in Execute, so record them with the
+	// selection they apply to: a selection that is non-empty yet starts
+	// nothing is a budget or gate outcome, not a selection one.
+	logf.FromContext(ctx).V(1).Info("update selection complete",
+		"component", plan.Component, "target", target.Name,
+		"considered", len(plan.Instances), "selected", len(sel.Items),
+		"strategy", sel.Strategy, "surgeBudget", sel.SurgeBudget,
+		"unavailBudget", sel.UnavailBudget,
+		"priorSurgeInFlight", sel.PriorSurgeInFlight,
+		"priorUnavailInFlight", sel.PriorUnavailInFlight)
 	return sel, retryBlockWait, nil
 }

@@ -558,6 +558,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			return reconcile.Result{}, errors.Wrapf(runErr, "fails to reconcile rollout run")
 		}
 		rolloutRunRequeue = runOutcome.RequeueAfter
+		if runOutcome.Opened {
+			// Bind/reset the canary state before persisting the run boundary so
+			// activeRun and its step state become visible atomically. Adoption is
+			// the exception: preserve the in-flight step and attach its target ID.
+			canary.BindRun(isvc, runOutcome.Adopted)
+		}
 		// A run boundary (open/close/repin) is persisted IMMEDIATELY: the pin
 		// is load-bearing for the update gates and the partition stamp, and a
 		// fallible reconciler erroring downstream would otherwise drop the

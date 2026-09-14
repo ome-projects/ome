@@ -4752,6 +4752,11 @@ func (in *RolloutRunRecord) DeepCopyInto(out *RolloutRunRecord) {
 		in, out := &in.ClosedAt, &out.ClosedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.TargetRevisions != nil {
+		in, out := &in.TargetRevisions, &out.TargetRevisions
+		*out = make([]RolloutRunTarget, len(*in))
+		copy(*out, *in)
+	}
 	if in.Groups != nil {
 		in, out := &in.Groups, &out.Groups
 		*out = make([]RolloutRunProvenance, len(*in))

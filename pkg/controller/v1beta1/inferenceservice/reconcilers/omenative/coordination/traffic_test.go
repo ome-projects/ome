@@ -357,3 +357,48 @@ func TestTrafficWithinDeadband_LatestRevisionFlipNotSuppressed(t *testing.T) {
 		t.Errorf("LatestRevision flip: must not be suppressed even with identical percent")
 	}
 }
+
+// A canary step whose canary and stable revision are the same -- what a revert
+// of a failed rollout produces, since the hash is content-addressed over the
+// pod template -- must emit ONE target, not two. Status.Components.<c>.Traffic
+// is +listMapKey=revisionName, so a duplicate makes the apiserver reject every
+// subsequent status write for the ISVC.
+func TestBuildTrafficTargets_MergesSameRevision(t *testing.T) {
+	got := BuildTrafficTargets("llama", v1beta1.RouterComponent, []RevisionWeight{
+		{RevisionHash: "samehash", Percent: 10, Tag: "canary", LatestRevision: true, PairingProtocol: "p1"},
+		{RevisionHash: "samehash", Percent: 90, Tag: "stable"},
+	})
+	want := []v1beta1.ComponentTrafficTarget{
+		{RevisionName: "llama-router-rev-samehash", Percent: 100, Tag: "canary", LatestRevision: true, PairingProtocol: "p1"},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("BuildTrafficTargets diff (-want +got):\n%s", diff)
+	}
+}
+
+// The latest-revision weight owns the merged target's tag regardless of the
+// order the weights arrive in (SortedWeights puts the larger percent first, so
+// the stable entry leads whenever the canary weight is under 50).
+func TestBuildTrafficTargets_MergeKeepsLatestIdentityWhenStableLeads(t *testing.T) {
+	got := BuildTrafficTargets("llama", v1beta1.RouterComponent, []RevisionWeight{
+		{RevisionHash: "samehash", Percent: 90, Tag: "stable"},
+		{RevisionHash: "samehash", Percent: 10, Tag: "canary", LatestRevision: true, PairingProtocol: "p1"},
+	})
+	if len(got) != 1 {
+		t.Fatalf("merge: got %d entries want 1: %+v", len(got), got)
+	}
+	if got[0].Percent != 100 || got[0].Tag != "canary" || !got[0].LatestRevision || got[0].PairingProtocol != "p1" {
+		t.Errorf("merged target: %+v", got[0])
+	}
+}
+
+// Distinct revisions must still produce distinct targets.
+func TestBuildTrafficTargets_DoesNotMergeDistinctRevisions(t *testing.T) {
+	got := BuildTrafficTargets("llama", v1beta1.RouterComponent, []RevisionWeight{
+		{RevisionHash: "a", Percent: 10, Tag: "canary", LatestRevision: true},
+		{RevisionHash: "b", Percent: 90, Tag: "stable"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("distinct revisions: got %d entries want 2: %+v", len(got), got)
+	}
+}

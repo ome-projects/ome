@@ -1124,3 +1124,220 @@ func TestReconcile_RestartPass_PerInstanceSemanticsPreserved(t *testing.T) {
 		}
 	}
 }
+
+type restartScaleTestFixture struct {
+	isvc   *v1beta1.InferenceService
+	client client.Client
+	input  workload.ReconcileInput
+	plan   workload.ComponentPlan
+	target *appsv1.ControllerRevision
+}
+
+func newRestartScaleTestFixture(
+	t *testing.T,
+	name string,
+	replicas int32,
+	paused bool,
+	status workload.InstanceStatus,
+	runners []workload.RunnerPlan,
+	pods ...client.Object,
+) *restartScaleTestFixture {
+	t.Helper()
+	scheme := makeScheme(t)
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", UID: types.UID("uid-" + name)},
+	}
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Namespace: isvc.Namespace, Name: isvc.Name + "-engine"},
+		Status: v1beta1.InferenceReplicaStatus{InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			v1beta1convert.InstanceStatusFromWorkload(status),
+		}},
+	}
+	objects := []client.Object{isvc, ir}
+	objects = append(objects, pods...)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
+		WithObjects(objects...).Build()
+
+	input := minimalInput(t)
+	input.OwnerObject = isvc
+	input.EventTarget = isvc
+	input.Key.OwnerName = isvc.Name
+	input.DesiredSpec.Replicas = replicas
+	input.DesiredSpec.MultiPod = len(runners) > 1
+	input.DesiredSpec.Paused = paused
+	input.ObservedState.UpdateRevision = status.RunningRevision
+	input.ObservedState.InstanceStatuses = []workload.InstanceStatus{cloneTestInstanceStatus(status)}
+	input.MutateInstance = roundTripMutateInstance(c, isvc, workload.ComponentEngine)
+
+	instances := make([]workload.InstancePlan, 0, replicas)
+	for idx := int32(0); idx < replicas; idx++ {
+		incarnation := int64(1)
+		if idx == status.Index {
+			incarnation = status.Incarnation
+		}
+		instances = append(instances, workload.InstancePlan{
+			Index: idx, Incarnation: incarnation,
+			Runners: append([]workload.RunnerPlan(nil), runners...),
+		})
+	}
+	plan := workload.ComponentPlan{
+		Component:            workload.ComponentEngine,
+		Replicas:             replicas,
+		RestartPolicy:        workload.RestartPolicyRecreateInstance,
+		InstanceReadyTimeout: time.Minute,
+		Paused:               paused,
+		Instances:            instances,
+	}
+	target := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: status.RunningRevision, Namespace: isvc.Namespace},
+	}
+	return &restartScaleTestFixture{isvc: isvc, client: c, input: input, plan: plan, target: target}
+}
+
+func podNameSet(t *testing.T, c client.Client, namespace string) map[string]bool {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	names := make(map[string]bool, len(pods.Items))
+	for i := range pods.Items {
+		names[pods.Items[i].Name] = true
+	}
+	return names
+}
+
+// An in-flight Restart owns its existing Instance, but it must not prevent
+// unrelated absent indices from beginning their Create lifecycle.
+func TestReconcile_ScaleUpDuringRestart_CreatesFreshIndices(t *testing.T) {
+	name := "scale-during-restart"
+	targetName := name + "-engine-target"
+	f := newRestartScaleTestFixture(t, name, 3, false, workload.InstanceStatus{
+		Index: 0, Incarnation: 2, Phase: workload.InstancePhaseRestarting,
+		RunningRevision: targetName,
+		Operation: &workload.InstanceOperation{
+			ID: "restart-0", Type: workload.InstanceOperationRestart, Step: "Drain",
+		},
+	}, []workload.RunnerPlan{{Name: "default", Size: 1}})
+
+	result, err := workload.Reconcile(context.Background(), workload.Deps{
+		Client: f.client, APIReader: f.client, Expectations: workload.NewExpectations(),
+	}, f.input, f.plan, f.target)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("an in-flight restart must schedule another pass; got %+v", result)
+	}
+
+	names := podNameSet(t, f.client, f.isvc.Namespace)
+	for idx := int32(0); idx < 3; idx++ {
+		name := query.PodName(f.isvc.Name, workload.ComponentEngine, idx, "default", 0)
+		if !names[name] {
+			t.Errorf("expected pod %q to be materialized in the restart pass; got %v", name, names)
+		}
+	}
+	s0 := instanceStatusByIndex(f.client, f.isvc, v1beta1.EngineComponent, 0)
+	if s0 == nil || s0.Phase != v1beta1.OMENativeInstanceRestarting || s0.Operation == nil ||
+		s0.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Errorf("restart-owned index 0 must remain Restarting with its Restart operation; got %+v", s0)
+	}
+	for _, idx := range []int32{1, 2} {
+		s := instanceStatusByIndex(f.client, f.isvc, v1beta1.EngineComponent, idx)
+		if s == nil || s.Phase != v1beta1.OMENativeInstanceCreating || s.Operation == nil ||
+			s.Operation.Type != v1beta1.InstanceOperationCreate {
+			t.Errorf("fresh index %d must begin a Create operation; got %+v", idx, s)
+		}
+	}
+}
+
+// A committed partial gang is eligible for Restart even though the reconcile's
+// observation still describes it as Create-owned. Once Restart takes ownership,
+// the fresh-index Create pass must exclude that index while creating an
+// unrelated absent index.
+func TestReconcile_ScaleUpDuringRestart_ExcludesRestartSelectedCreateOwner(t *testing.T) {
+	name := "scale-partial-gang"
+	targetName := name + "-engine-target"
+	leader := enginePod(name, "prod", 0)
+	leader.Name = query.PodName(name, workload.ComponentEngine, 0, "leader", 0)
+	leader.Labels[query.LabelRunner] = "leader"
+	f := newRestartScaleTestFixture(t, name, 2, false, workload.InstanceStatus{
+		Index: 0, Incarnation: 1, Phase: workload.InstancePhaseCreating, PodCount: 1,
+		RunningRevision: targetName, TargetRevision: targetName,
+		Operation: &workload.InstanceOperation{
+			ID: "create-0", Type: workload.InstanceOperationCreate, Step: "CreatePods",
+			TargetRevision: targetName,
+		},
+	}, []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}, leader)
+
+	result, err := workload.Reconcile(context.Background(), workload.Deps{
+		Client: f.client, APIReader: f.client, Expectations: workload.NewExpectations(),
+	}, f.input, f.plan, f.target)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("the partial-gang restart must schedule another pass; got %+v", result)
+	}
+
+	s0 := instanceStatusByIndex(f.client, f.isvc, v1beta1.EngineComponent, 0)
+	if s0 == nil || s0.Phase != v1beta1.OMENativeInstanceRestarting || s0.Incarnation != 2 ||
+		s0.Operation == nil || s0.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Fatalf("index 0 must remain owned by Restart at incarnation 2; got %+v", s0)
+	}
+	s1 := instanceStatusByIndex(f.client, f.isvc, v1beta1.EngineComponent, 1)
+	if s1 == nil || s1.Phase != v1beta1.OMENativeInstanceCreating || s1.Operation == nil ||
+		s1.Operation.Type != v1beta1.InstanceOperationCreate {
+		t.Errorf("unrelated absent index 1 must begin a Create operation; got %+v", s1)
+	}
+
+	names := podNameSet(t, f.client, f.isvc.Namespace)
+	for _, runner := range []string{"leader", "worker"} {
+		freshName := query.PodName(f.isvc.Name, workload.ComponentEngine, 1, runner, 0)
+		if !names[freshName] {
+			t.Errorf("expected fresh-index pod %q; got %v", freshName, names)
+		}
+		restartName := query.PodName(f.isvc.Name, workload.ComponentEngine, 0, runner, 0)
+		if names[restartName] {
+			t.Errorf("restart-selected index 0 must not be recreated from the stale Create observation; found %q in %v", restartName, names)
+		}
+	}
+}
+
+// A standard pause permits an existing Restart to advance, but it continues to
+// prohibit Create work for absent desired indices.
+func TestReconcile_PausedRestart_DoesNotCreateFreshIndices(t *testing.T) {
+	name := "paused-restart"
+	targetName := name + "-engine-target"
+	f := newRestartScaleTestFixture(t, name, 2, true, workload.InstanceStatus{
+		Index: 0, Incarnation: 2, Phase: workload.InstancePhaseRestarting,
+		RunningRevision: targetName,
+		Operation: &workload.InstanceOperation{
+			ID: "restart-0", Type: workload.InstanceOperationRestart, Step: "Drain",
+		},
+	}, []workload.RunnerPlan{{Name: "default", Size: 1}})
+
+	result, err := workload.Reconcile(context.Background(), workload.Deps{
+		Client: f.client, APIReader: f.client, Expectations: workload.NewExpectations(),
+	}, f.input, f.plan, f.target)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatalf("the permitted restart must schedule another pass; got %+v", result)
+	}
+
+	names := podNameSet(t, f.client, f.isvc.Namespace)
+	restartName := query.PodName(f.isvc.Name, workload.ComponentEngine, 0, "default", 0)
+	if !names[restartName] {
+		t.Errorf("paused reconcile must still advance the existing restart; got %v", names)
+	}
+	freshName := query.PodName(f.isvc.Name, workload.ComponentEngine, 1, "default", 0)
+	if names[freshName] {
+		t.Errorf("paused reconcile must not materialize absent index 1; got %v", names)
+	}
+	if s := instanceStatusByIndex(f.client, f.isvc, v1beta1.EngineComponent, 1); s != nil {
+		t.Errorf("paused reconcile must not allocate status for absent index 1; got %+v", s)
+	}
+}

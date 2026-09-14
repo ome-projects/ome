@@ -281,8 +281,11 @@ type RolloutAnalysis struct {
 	//   - Hold (default): keep traffic at the current step and escalate to Failed
 	//     for an operator decision. A monitoring outage is not evidence the canary
 	//     is bad.
-	//   - Rollback: fail-safe — treat "can't tell" as "assume bad" and roll back.
-	// +kubebuilder:validation:Enum=Hold;Rollback
+	//   - Rollback: fail-safe — treat "can't tell" as "assume bad" and roll back
+	//     on the first inconclusive sample, without waiting out the stall timeout.
+	//   - RollbackOnStall: ride out transient gaps like Hold, but roll back
+	//     instead of parking once the stall timeout expires.
+	// +kubebuilder:validation:Enum=Hold;Rollback;RollbackOnStall
 	// +optional
 	OnInconclusive *OnInconclusive `json:"onInconclusive,omitempty"`
 
@@ -386,6 +389,12 @@ const (
 	// for an operator decision. The conservative default: do not revert on a
 	// monitoring outage.
 	OnInconclusiveHold OnInconclusive = "Hold"
-	// OnInconclusiveRollback treats "can't tell" as "assume bad" and rolls back.
+	// OnInconclusiveRollback treats "can't tell" as "assume bad" and rolls back
+	// on the first inconclusive sample.
 	OnInconclusiveRollback OnInconclusive = "Rollback"
+	// OnInconclusiveRollbackOnStall keeps sampling through transient gaps as Hold
+	// does, then rolls back rather than parking once analysis has been unable to
+	// read health for the stall timeout. A scrape blip does not revert a healthy
+	// canary, and a gate that never recovers does not leave the fleet split.
+	OnInconclusiveRollbackOnStall OnInconclusive = "RollbackOnStall"
 )

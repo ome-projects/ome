@@ -125,6 +125,28 @@ func TestEvaluateAnalysisStep(t *testing.T) {
 			wantCalls: 1,
 		},
 		{
+			name: "inconclusive holds before stall when OnInconclusive=RollbackOnStall",
+			mutate: func(a *v1beta1.RolloutAnalysis) {
+				a.OnInconclusive = onInconclusivePtr(v1beta1.OnInconclusiveRollbackOnStall)
+			},
+			step:      stepNoPause,
+			cs:        &v1beta1.CanaryStatus{CanaryRevisionHash: canaryHash, StepEnteredTime: &metav1.Time{Time: now}, LastConclusiveEvaluationTime: &metav1.Time{Time: now.Add(-time.Minute)}},
+			outcome:   analysis.Inconclusive,
+			wantDec:   decHold,
+			wantCalls: 1,
+		},
+		{
+			name: "inconclusive past stall rolls back when OnInconclusive=RollbackOnStall",
+			mutate: func(a *v1beta1.RolloutAnalysis) {
+				a.OnInconclusive = onInconclusivePtr(v1beta1.OnInconclusiveRollbackOnStall)
+			},
+			step:      stepNoPause,
+			cs:        &v1beta1.CanaryStatus{CanaryRevisionHash: canaryHash, StepEnteredTime: &metav1.Time{Time: now.Add(-20 * time.Minute)}, LastConclusiveEvaluationTime: &metav1.Time{Time: now.Add(-20 * time.Minute)}},
+			outcome:   analysis.Inconclusive,
+			wantDec:   decRollback,
+			wantCalls: 1,
+		},
+		{
 			name:      "warmup holds without sampling",
 			mutate:    func(a *v1beta1.RolloutAnalysis) { a.InitialDelay = &metav1.Duration{Duration: 5 * time.Minute} },
 			step:      stepNoPause,

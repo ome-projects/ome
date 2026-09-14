@@ -158,17 +158,19 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 	}
 	// The IR revision pair authoritatively assigns current=stable and
 	// update=canary while the two revisions are distinct.
-	stableHash := ""
-	if revisions.currentHash != canaryHash {
-		stableHash = revisions.currentHash
-	}
-	if sc := d.ISVC.Status.Canary; sc != nil && sc.StableRevisionHash != "" {
-		// A distinct authoritative current revision can repair an active canary
-		// whose persisted stable and target identities are the same.
-		if revisions.fromIR && revisions.currentHash != "" && revisions.currentHash != canaryHash && sc.StableRevisionHash == canaryHash {
+	stableHash := activeRunStableRevisionHash(d.ISVC, primary)
+	if stableHash == "" {
+		if revisions.currentHash != canaryHash {
 			stableHash = revisions.currentHash
-		} else {
-			stableHash = sc.StableRevisionHash
+		}
+		if sc := d.ISVC.Status.Canary; sc != nil && sc.StableRevisionHash != "" {
+			// A distinct authoritative current revision can repair an active canary
+			// whose persisted stable and target identities are the same.
+			if revisions.fromIR && revisions.currentHash != "" && revisions.currentHash != canaryHash && sc.StableRevisionHash == canaryHash {
+				stableHash = revisions.currentHash
+			} else {
+				stableHash = sc.StableRevisionHash
+			}
 		}
 	}
 	// Resolve the two revisions' pairing protocols through the cached client:
@@ -202,6 +204,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 		BundledPrometheusAddress: d.BundledPrometheusAddress,
 		QueryTimeout:             d.QueryTimeout,
 		RunActive:                v1beta1.RolloutRunActive(d.ISVC),
+		TargetID:                 activeCanaryTargetID(d.ISVC),
 		DefaultReadyTimeout:      d.DefaultReadyTimeout,
 	})
 	if err != nil {
@@ -216,14 +219,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 	// them — signaling only the primary leaves the engine/decoder serving the
 	// rejected revision behind the rolled-back router.
 	for _, comp := range configuredComponents(d.ISVC) {
-		// The persisted stable identity is recorded through the primary (the
-		// step machine's Component). Revision hashes are per-Component, so it
-		// can never name a secondary's revision — secondaries resolve their
-		// rollback target from their own revision history instead.
-		persistedStable := ""
-		if comp == primary && d.ISVC.Status.Canary != nil {
-			persistedStable = d.ISVC.Status.Canary.StableRevisionHash
-		}
+		persistedStable := componentStableRevisionHash(d.ISVC, comp, primary)
 		if err := reconcileRollbackSignal(ctx, d.Client, d.Reader, d.ISVC, comp, persistedStable, res.RolledBack); err != nil {
 			return 0, err
 		}
@@ -263,15 +259,12 @@ func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.
 	}
 	var want *string
 	if rolledBack {
-		// The rejected revision is this Component's OWN canary target (revision
-		// hashes are per-Component, so the primary's rejected hash never names a
-		// secondary's revision). canaryTargetHash reads the IR's UpdateRevision,
-		// which keeps naming the canary (spec) target throughout the rollback.
-		rejected, err := canaryTargetHash(ctx, reads, isvc, comp)
-		if err != nil {
-			return err
+		// An unknown stable identity must not clear a rollback signal that may
+		// already carry the correct target, or guess from revision ordering.
+		if stableHash == "" {
+			return nil
 		}
-		stable, err := stableRevisionName(ctx, reads, isvc, comp, rejected, stableHash)
+		stable, err := stableRevisionName(ctx, reads, isvc, comp, stableHash)
 		if err != nil {
 			return err
 		}
@@ -279,9 +272,10 @@ func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.
 		// GC'd, or only the canary revision exists) must NOT fall back to the
 		// canary revision — that would be a no-op roll. Leaving the signal unset
 		// lets the IR reconciler's NotFound path degrade gracefully.
-		if stable != "" {
-			want = &stable
+		if stable == "" {
+			return nil
 		}
+		want = &stable
 	}
 	var cur *string
 	if ir.Spec.Pacing != nil {
@@ -297,25 +291,16 @@ func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.
 	return c.Update(ctx, ir)
 }
 
-// stableRevisionName resolves the ControllerRevision name of the stable,
-// pre-canary revision for a Component. With a persisted stable identity
-// (stableHash) the match is exact: the ControllerRevision carrying that hash,
-// or "" when it is no longer retained — never a guess, so a rollback after an
-// A→B→C retarget targets A, not the newest partially-rolled intermediate.
-// Without one, it falls back to ordering inference: the highest-numbered
-// ControllerRevision in the Component's history whose revision hash is NOT
-// the rejected (canary) hash — the canary is the latest spec target so it
-// owns the highest .Revision. Returns "" when nothing resolves (better no
-// signal than the wrong one).
+// stableRevisionName resolves the ControllerRevision name of an exact stable
+// revision hash. Rollback safety requires an explicit identity: revision
+// ordering cannot distinguish a promoted revision from a newer transient one.
 //
 // Reading the history is what makes the rollback target survive the canary's
 // forward roll — once every Instance is on the canary revision, neither the IR
 // status nor the live pod set still names the stable revision, but its
 // ControllerRevision is retained.
-func stableRevisionName(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, rejectedHash, stableHash string) (string, error) {
-	// Without either a persisted stable identity or a known rejected (canary)
-	// hash the stable revision is indistinguishable from the canary: don't guess.
-	if stableHash == "" && rejectedHash == "" {
+func stableRevisionName(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, stableHash string) (string, error) {
+	if stableHash == "" {
 		return "", nil
 	}
 	list := &appsv1.ControllerRevisionList{}
@@ -327,28 +312,46 @@ func stableRevisionName(ctx context.Context, reads client.Reader, isvc *v1beta1.
 	if err := reads.List(ctx, list, client.InNamespace(isvc.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
 		return "", err
 	}
-	if stableHash != "" {
-		want := query.RevisionFromHash(stableHash)
-		for i := range list.Items {
-			cr := &list.Items[i]
-			if query.RevisionOf(cr).Same(want) {
-				return cr.Name, nil
-			}
-		}
-		return "", nil
-	}
-	bestName := ""
-	var bestRev int64
+	want := query.RevisionFromHash(stableHash)
 	for i := range list.Items {
 		cr := &list.Items[i]
-		if query.RevisionOf(cr).Same(query.RevisionFromHash(rejectedHash)) {
-			continue
-		}
-		if bestName == "" || cr.Revision > bestRev {
-			bestName, bestRev = cr.Name, cr.Revision
+		if query.RevisionOf(cr).Same(want) {
+			return cr.Name, nil
 		}
 	}
-	return bestName, nil
+	return "", nil
+}
+
+// componentStableRevisionHash reads the run-scoped per-Component identity.
+// The scalar canary field and component rollout status support objects written
+// before per-Component run targets carried stable revisions.
+func componentStableRevisionHash(isvc *v1beta1.InferenceService, comp, primary v1beta1.ComponentType) string {
+	if stable := activeRunStableRevisionHash(isvc, comp); stable != "" {
+		return stable
+	}
+	if isvc.Status.Rollout != nil {
+		if last := isvc.Status.Rollout.LastRun; last != nil && last.Outcome == v1beta1.RolloutRunRolledBack {
+			for _, target := range last.TargetRevisions {
+				if target.Component == comp && target.StableRevision != "" {
+					return target.StableRevision
+				}
+			}
+		}
+	}
+	if comp == primary && isvc.Status.Canary != nil && isvc.Status.Canary.StableRevisionHash != "" {
+		return isvc.Status.Canary.StableRevisionHash
+	}
+	if status, ok := isvc.Status.Components[comp]; ok {
+		return query.RevisionFromName(status.LatestRolledoutRevision).Hash()
+	}
+	return ""
+}
+
+func activeRunStableRevisionHash(isvc *v1beta1.InferenceService, comp v1beta1.ComponentType) string {
+	if target, ok := activeRunTarget(isvc, comp); ok {
+		return target.StableRevision
+	}
+	return ""
 }
 
 // samplerOrNil converts a possibly-nil *Sampler into the stepSampler interface,
@@ -605,12 +608,6 @@ func observeCanaryRevisions(ctx context.Context, reads client.Reader, isvc *v1be
 		}
 	}
 	return observedCanaryRevisions{}, nil
-}
-
-// canaryTargetHash returns the revision hash the canary is rolling toward.
-func canaryTargetHash(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (string, error) {
-	revisions, err := observeCanaryRevisions(ctx, reads, isvc, c)
-	return revisions.targetHash, err
 }
 
 // primaryComponent is the externally-routed Component the canary group drives its

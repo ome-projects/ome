@@ -362,6 +362,47 @@ func TestReconcile_AlreadyConvergedNoRestart(t *testing.T) {
 	}
 }
 
+func TestReconcile_NewRunRearmsUnchangedPrimary(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	isvc.Status.Canary = &v1beta1.CanaryStatus{
+		TargetID:           "target-1",
+		CanaryRevisionHash: "router",
+		CurrentStep:        2,
+	}
+	in := baseInputs(isvc, map[string]int32{"router": 4})
+	in.CanaryRevisionHash = "router"
+	in.StableRevisionHash = "router"
+	in.TargetID = "target-2"
+	in.SecondaryCapacityReady = false
+
+	res, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Active || isvc.Status.Canary.CurrentStep != 0 || isvc.Status.Canary.TargetID != "target-2" {
+		t.Fatalf("new group run must re-arm unchanged primary: status=%+v result=%+v", isvc.Status.Canary, res)
+	}
+	if phaseOf(isvc) != v1beta1.RolloutPhasePending {
+		t.Fatalf("secondary capacity gate must hold the re-armed run, got %q", phaseOf(isvc))
+	}
+}
+
+func TestReconcile_LegacyStatusAdoptsRunWithoutRestart(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	isvc.Status.Canary = &v1beta1.CanaryStatus{CanaryRevisionHash: "router", CurrentStep: 2}
+	in := baseInputs(isvc, map[string]int32{"router": 4})
+	in.CanaryRevisionHash = "router"
+	in.TargetID = "target-1"
+
+	res, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Active || isvc.Status.Canary.CurrentStep != 2 || isvc.Status.Canary.TargetID != "target-1" {
+		t.Fatalf("legacy status must adopt the run without restarting: status=%+v result=%+v", isvc.Status.Canary, res)
+	}
+}
+
 // TestReconcile_UnknownTargetNoStart guards the IR-not-ready window: with no
 // known target hash yet (empty), the canary must wait rather than initialize a
 // state machine keyed on an empty revision.
@@ -446,6 +487,57 @@ func TestReconcile_Rollback(t *testing.T) {
 	Reconcile(context.Background(), in)
 	if isvc.Status.Canary.RolledBackRevisionHash != "" || isvc.Status.Canary.CanaryRevisionHash != "v3" || isvc.Status.Canary.CurrentStep != 0 {
 		t.Fatalf("new target must re-arm a fresh canary toward v3, got %+v", isvc.Status.Canary)
+	}
+}
+
+func TestReconcile_NewRunRearmsRollbackWithUnchangedPrimary(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	isvc.Status.Canary = &v1beta1.CanaryStatus{
+		TargetID:               "target-1",
+		CanaryRevisionHash:     "router",
+		StableRevisionHash:     "router",
+		RolledBackRevisionHash: "router",
+	}
+	setPhase(isvc, v1beta1.EngineComponent, v1beta1.RolloutPhaseRolledBack)
+	in := baseInputs(isvc, map[string]int32{"router": 4})
+	in.CanaryRevisionHash = "router"
+	in.StableRevisionHash = "router"
+	in.TargetID = "target-2"
+	in.SecondaryCapacityReady = false
+
+	res, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Active || isvc.Status.Canary.TargetID != "target-2" || isvc.Status.Canary.RolledBackRevisionHash != "" {
+		t.Fatalf("new group run must clear the old rollback hold: status=%+v result=%+v", isvc.Status.Canary, res)
+	}
+	if phaseOf(isvc) != v1beta1.RolloutPhasePending {
+		t.Fatalf("secondary capacity gate must hold the re-armed run, got %q", phaseOf(isvc))
+	}
+}
+
+func TestReconcile_UnchangedPrimaryRollbackCompletes(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	isvc.Status.Canary = &v1beta1.CanaryStatus{
+		TargetID:               "target-1",
+		CanaryRevisionHash:     "router",
+		StableRevisionHash:     "router",
+		RolledBackRevisionHash: "router",
+	}
+	in := baseInputs(isvc, map[string]int32{"router": 4})
+	in.Component = v1beta1.RouterComponent
+	in.CanaryRevisionHash = "router"
+	in.StableRevisionHash = "router"
+	in.TargetID = "target-1"
+
+	res, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase := isvc.Status.Components[v1beta1.RouterComponent].RolloutPhase
+	if !res.RolledBack || phase != v1beta1.RolloutPhaseRolledBack {
+		t.Fatalf("unchanged primary is already at its stable revision: phase=%q result=%+v", phase, res)
 	}
 }
 

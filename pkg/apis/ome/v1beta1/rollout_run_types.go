@@ -85,9 +85,9 @@ type RolloutRun struct {
 	PinnedAt metav1.Time `json:"pinnedAt"`
 
 	// TargetRevisions records, per grouped Component, the revision hash this
-	// run is rolling toward. A Component's target changing mid-run is a
-	// retarget: the run closes (Superseded) and a fresh run opens with a fresh
-	// render.
+	// run is rolling toward and the stable hash it can roll back to. A
+	// Component's target changing mid-run is a retarget: the run closes
+	// (Superseded) and a fresh run opens with a fresh render.
 	// +optional
 	// +listType=map
 	// +listMapKey=component
@@ -104,6 +104,10 @@ type RolloutRunTarget struct {
 	// Revision is the Component's target revision hash at run open.
 	// +optional
 	Revision string `json:"revision,omitempty"`
+	// StableRevision is the Component's last promoted revision hash at run
+	// open. It is preserved across retargets and is the exact rollback target.
+	// +optional
+	StableRevision string `json:"stableRevision,omitempty"`
 }
 
 // RolloutRunPlan is the frozen effective plan: the resolved groups in their
@@ -152,6 +156,13 @@ type RolloutRunRecord struct {
 	OpenedAt *metav1.Time `json:"openedAt,omitempty"`
 	// +optional
 	ClosedAt *metav1.Time `json:"closedAt,omitempty"`
+	// TargetRevisions retains each Component's target and stable revision so a
+	// rolled-back hold has an exact per-Component identity after ActiveRun is
+	// dropped.
+	// +optional
+	// +listType=map
+	// +listMapKey=component
+	TargetRevisions []RolloutRunTarget `json:"targetRevisions,omitempty"`
 	// Groups carries per-group provenance (groups may reference different
 	// policies, so one digest per run would be lossy).
 	// +optional

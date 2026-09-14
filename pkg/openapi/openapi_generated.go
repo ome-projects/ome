@@ -3020,6 +3020,13 @@ func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) comm
 				Description: "CanaryStatus tracks progress of a spec.rollout.groups[].canary rollout. It is the executor's persistent state machine: which step is active, when it was entered (Auto promotion measures Pause.Duration from here), and which revision is the canary. Absent when no canary is in progress.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"targetID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TargetID identifies the canary group's pinned Component target set. A new target set re-arms the canary even when the externally routed Component's revision did not change. It is scoped to the canary group rather than the whole rollout run, so unrelated groups cannot reset canary progress.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"canaryRevisionHash": {
 						SchemaProps: spec.SchemaProps{
 							Description: "CanaryRevisionHash is the revision hash being rolled out.",
@@ -3072,7 +3079,7 @@ func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) comm
 					},
 					"rolledBackRevisionHash": {
 						SchemaProps: spec.SchemaProps{
-							Description: "RolledBackRevisionHash is set when a rollback (ome.io/rollout-rollback) abandons a canary: it records the rejected revision hash. While set, the component is held on the stable revision and the rejected revision is NOT retried — even after the annotation is cleared. The rollout re-arms only when a different target revision appears (a fresh spec change / fix).",
+							Description: "RolledBackRevisionHash is set when a rollback (ome.io/rollout-rollback) abandons a canary: it records the primary Component's rejected revision hash. While set, the group is held on its stable revisions and the rejected target set is NOT retried — even after the annotation is cleared. The rollout re-arms only when a different target set appears.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -10147,7 +10154,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutAnalysis(ref common.ReferenceCallback) c
 					},
 					"onInconclusive": {
 						SchemaProps: spec.SchemaProps{
-							Description: "OnInconclusive selects what to do when a sample cannot be completed (Prometheus unreachable, query error, or empty result) past the stall timeout — distinct from a metric breach.\n  - Hold (default): keep traffic at the current step and escalate to Failed\n    for an operator decision. A monitoring outage is not evidence the canary\n    is bad.\n  - Rollback: fail-safe — treat \"can't tell\" as \"assume bad\" and roll back.",
+							Description: "OnInconclusive selects what to do when a sample cannot be completed (Prometheus unreachable, query error, or empty result) past the stall timeout — distinct from a metric breach.\n  - Hold (default): keep traffic at the current step and escalate to Failed\n    for an operator decision. A monitoring outage is not evidence the canary\n    is bad.\n  - Rollback: fail-safe — treat \"can't tell\" as \"assume bad\" and roll back\n    on the first inconclusive sample, without waiting out the stall timeout.\n  - RollbackOnStall: ride out transient gaps like Hold, but roll back\n    instead of parking once the stall timeout expires.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -11024,7 +11031,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutRun(ref common.ReferenceCallback) common
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "TargetRevisions records, per grouped Component, the revision hash this run is rolling toward. A Component's target changing mid-run is a retarget: the run closes (Superseded) and a fresh run opens with a fresh render.",
+							Description: "TargetRevisions records, per grouped Component, the revision hash this run is rolling toward and the stable hash it can roll back to. A Component's target changing mid-run is a retarget: the run closes (Superseded) and a fresh run opens with a fresh render.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -11194,6 +11201,28 @@ func schema_pkg_apis_ome_v1beta1_RolloutRunRecord(ref common.ReferenceCallback) 
 							Ref: ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
 						},
 					},
+					"targetRevisions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"component",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "TargetRevisions retains each Component's target and stable revision so a rolled-back hold has an exact per-Component identity after ActiveRun is dropped.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutRunTarget"),
+									},
+								},
+							},
+						},
+					},
 					"groups": {
 						VendorExtensible: spec.VendorExtensible{
 							Extensions: spec.Extensions{
@@ -11218,7 +11247,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutRunRecord(ref common.ReferenceCallback) 
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutRunProvenance"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutRunProvenance", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutRunTarget"},
 	}
 }
 
@@ -11239,6 +11268,13 @@ func schema_pkg_apis_ome_v1beta1_RolloutRunTarget(ref common.ReferenceCallback) 
 					"revision": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Revision is the Component's target revision hash at run open.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"stableRevision": {
+						SchemaProps: spec.SchemaProps{
+							Description: "StableRevision is the Component's last promoted revision hash at run open. It is preserved across retargets and is the exact rollback target.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

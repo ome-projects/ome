@@ -48,17 +48,47 @@ type RevisionWeight struct {
 // backendRef consumer reads. The writer fills RevisionName with the
 // per-revision Service name (`<isvc>-<component>-rev-<hash>`) so the
 // consumer can use it directly as a backend reference.
+//
+// Weights naming the same revision are merged into one target, summing
+// their percent. That list is +listType=map +listMapKey=revisionName, so
+// emitting the same revisionName twice makes the apiserver reject the whole
+// status write -- not just the traffic field -- and every subsequent
+// reconcile for that ISVC fails with it, freezing conditions, rollout phase
+// and replica counts until the underlying state changes.
+//
+// It is reachable, and by an ordinary operation: canaryWeights always emits
+// a canary and a stable entry, and a revision hash is content-addressed over
+// the rendered pod template. Reverting a failed rollout to its pre-rollout
+// template therefore resolves the canary target back onto the revision
+// already serving, so canary and stable carry the same hash while the step
+// weight is still strictly between 0 and 100 and neither entry is dropped by
+// the Percent<=0 filter below.
 func BuildTrafficTargets(isvcName string, component v1beta1.ComponentType, weights []RevisionWeight) []v1beta1.ComponentTrafficTarget {
 	if len(weights) == 0 {
 		return nil
 	}
 	out := make([]v1beta1.ComponentTrafficTarget, 0, len(weights))
+	at := make(map[string]int, len(weights))
 	for _, w := range weights {
 		if w.Percent <= 0 || w.RevisionHash == "" {
 			continue
 		}
+		name := PerRevisionServiceName(isvcName, component, w.RevisionHash)
+		if i, ok := at[name]; ok {
+			out[i].Percent += w.Percent
+			// The latest-revision weight owns the merged target's cosmetic
+			// identity, so an operator reading status still sees the incoming
+			// revision tagged as the incoming one.
+			if w.LatestRevision {
+				out[i].LatestRevision = true
+				out[i].Tag = w.Tag
+				out[i].PairingProtocol = w.PairingProtocol
+			}
+			continue
+		}
+		at[name] = len(out)
 		out = append(out, v1beta1.ComponentTrafficTarget{
-			RevisionName:    PerRevisionServiceName(isvcName, component, w.RevisionHash),
+			RevisionName:    name,
 			Percent:         w.Percent,
 			Tag:             w.Tag,
 			LatestRevision:  w.LatestRevision,

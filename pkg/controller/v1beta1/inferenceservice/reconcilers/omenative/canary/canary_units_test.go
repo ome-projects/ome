@@ -66,6 +66,11 @@ func TestCanaryWeights(t *testing.T) {
 	if w[0].PairingProtocol != "proto-b" || w[1].PairingProtocol != "proto-a" {
 		t.Fatalf("pairing protocols not carried per revision: %+v", w)
 	}
+
+	w = canaryWeights("same", "same", "proto", "proto", 10)
+	if len(w) != 1 || w[0].RevisionHash != "same" || w[0].Percent != 100 {
+		t.Fatalf("unchanged primary must remain a single 100%% route, got %+v", w)
+	}
 }
 
 func TestApplyTraffic(t *testing.T) {

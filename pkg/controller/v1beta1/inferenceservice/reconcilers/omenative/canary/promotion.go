@@ -180,7 +180,12 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 		if a.OnInconclusive != nil && *a.OnInconclusive == v1beta1.OnInconclusiveRollback {
 			dec = decRollback
 		} else if analysisStalled(cs, resolveReadyTimeout(in, effectiveCanaryPlan(in.ISVC)), in.Now) {
+			// A stall is terminal either way; RollbackOnStall reverts instead of
+			// parking, so an unreadable gate cannot leave the fleet split.
 			dec = decFailed
+			if a.OnInconclusive != nil && *a.OnInconclusive == v1beta1.OnInconclusiveRollbackOnStall {
+				dec = decRollback
+			}
 		}
 	}
 	recordAnalysisSample(in.ISVC, in.Component, res, cs.AnalysisFailedChecks)
@@ -193,7 +198,8 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 // analysisStalled reports whether analysis has been unable to read health for
 // longer than timeout, measured from the last conclusive sample (or step entry
 // if none yet). A stall means "can't tell," not "bad": the caller parks Failed,
-// it does not roll back (unless OnInconclusive=Rollback handled that earlier).
+// it does not roll back, unless OnInconclusive is Rollback (handled earlier) or
+// RollbackOnStall (handled at the stall edge).
 func analysisStalled(cs *v1beta1.CanaryStatus, timeout time.Duration, now time.Time) bool {
 	if timeout <= 0 {
 		return false

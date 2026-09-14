@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 	"sigs.k8s.io/ome/pkg/validation"
 )
@@ -72,6 +73,11 @@ type Outcome struct {
 	Parked       bool
 	StateChanged bool
 	RequeueAfter time.Duration
+	// Opened reports that this pass created a fresh ActiveRun. Adopted
+	// distinguishes status-loss recovery, whose existing executor progress must
+	// be bound to the run without being reset.
+	Opened  bool
+	Adopted bool
 }
 
 // composedPlan is one rendered effective plan: the pinnable groups plus their
@@ -101,6 +107,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 	}
 
 	active := activeRun(isvc)
+	retargeting := false
 
 	// Every group deleted mid-run: the pinned plan continues (an inert edit,
 	// like any other); deleting a group never aborts a run, so point at the
@@ -122,6 +129,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		return Outcome{}, err
 	}
 
+	stableOverrides := map[v1beta1.ComponentType]string{}
 	if active != nil {
 		if _, ok := isvc.Annotations[constants.RolloutRepinAnnotation]; ok {
 			changed, err := handleRepin(ctx, in, active, now)
@@ -134,6 +142,10 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 			return Outcome{RequeueAfter: shortRequeue}, nil
 		}
 		if retargeted(isvc, active, targets) {
+			retargeting = true
+			for _, target := range active.TargetRevisions {
+				stableOverrides[target.Component] = target.StableRevision
+			}
 			closeRun(isvc, active, v1beta1.RolloutRunSuperseded, now)
 			recordRunClosed(isvc, v1beta1.RolloutRunSuperseded)
 			emit(in.Recorder, isvc, corev1.EventTypeNormal, EventRunClosed,
@@ -181,8 +193,8 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		return Outcome{Parked: true, RequeueAfter: parkRequeue}, nil
 	}
 
-	adopting := isvc.Status.Canary != nil && canaryMidFlight(isvc)
-	openRun(isvc, plan, targets, now)
+	adopting := !retargeting && isvc.Status.Canary != nil && canaryMidFlight(isvc)
+	openRun(isvc, plan, targets, stableOverrides, adopting, now)
 	recordRunOpened(isvc, plan, adopting)
 	setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonPinned,
 		fmt.Sprintf("run %s pinned", isvc.Status.Rollout.ActiveRun.RunID), now)
@@ -194,7 +206,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		emit(in.Recorder, isvc, corev1.EventTypeNormal, EventRunOpened,
 			"run %s opened (%s)", isvc.Status.Rollout.ActiveRun.RunID, combinedPlanDigest(plan.digests))
 	}
-	return Outcome{StateChanged: true, RequeueAfter: shortRequeue}, nil
+	return Outcome{StateChanged: true, RequeueAfter: shortRequeue, Opened: true, Adopted: adopting}, nil
 }
 
 func activeRun(isvc *v1beta1.InferenceService) *v1beta1.RolloutRun {
@@ -293,7 +305,7 @@ func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedP
 // canary and coordination engines own their counters and reset them under
 // their own rules (which is what makes adopt-in-place a no-op for a roll
 // already in flight).
-func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1beta1.ComponentType]targetPair, now metav1.Time) {
+func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1beta1.ComponentType]targetPair, stableOverrides map[v1beta1.ComponentType]string, adopting bool, now metav1.Time) {
 	var pinned []v1beta1.RolloutRunTarget
 	seen := map[v1beta1.ComponentType]bool{}
 	for i := range plan.groups {
@@ -307,7 +319,15 @@ func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1be
 			if rev == "" {
 				rev = t.current
 			}
-			pinned = append(pinned, v1beta1.RolloutRunTarget{Component: comp, Revision: rev})
+			stable, carried := stableOverrides[comp]
+			if !carried {
+				stable = componentStableRevision(isvc, comp, rev, t, adopting)
+			}
+			pinned = append(pinned, v1beta1.RolloutRunTarget{
+				Component:      comp,
+				Revision:       rev,
+				StableRevision: stable,
+			})
 		}
 	}
 	if isvc.Status.Rollout == nil {
@@ -337,19 +357,42 @@ func closeRun(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, outcom
 	}
 	opened := active.OpenedAt
 	isvc.Status.Rollout.LastRun = &v1beta1.RolloutRunRecord{
-		Outcome:  outcome,
-		OpenedAt: &opened,
-		ClosedAt: &now,
-		Groups:   provenance,
+		Outcome:         outcome,
+		OpenedAt:        &opened,
+		ClosedAt:        &now,
+		TargetRevisions: append([]v1beta1.RolloutRunTarget(nil), active.TargetRevisions...),
+		Groups:          provenance,
 	}
 	isvc.Status.Rollout.ActiveRun = nil
+}
+
+// componentStableRevision resolves the last promoted revision for a Component.
+// A distinct IR current revision is authoritative at run open. The scalar
+// primary and per-Component rollout status cover adoption of an older run that
+// has already advanced CurrentRevision to its target.
+func componentStableRevision(isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, pinnedRevision string, target targetPair, adopting bool) string {
+	if target.current != "" && target.current != pinnedRevision {
+		return target.current
+	}
+	if comp == primaryCanaryComponent(isvc) && isvc.Status.Canary != nil && isvc.Status.Canary.StableRevisionHash != "" {
+		return isvc.Status.Canary.StableRevisionHash
+	}
+	if status, ok := isvc.Status.Components[comp]; ok {
+		if hash := query.RevisionFromName(status.LatestRolledoutRevision).Hash(); hash != "" {
+			return hash
+		}
+	}
+	if !adopting {
+		return target.current
+	}
+	return ""
 }
 
 // retargeted reports whether any pinned member's observed target moved off
 // the run's pinned revision (the canary sticky reject is a hold, not a new
 // target).
 func retargeted(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targets map[v1beta1.ComponentType]targetPair) bool {
-	reject := stickyRejectHash(isvc)
+	rejected := stickyRejectHashes(isvc, targets)
 	pinnedFor := map[v1beta1.ComponentType]string{}
 	for _, t := range active.TargetRevisions {
 		pinnedFor[t.Component] = t.Revision
@@ -361,7 +404,7 @@ func retargeted(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targ
 			if obs.target == "" || pinnedRev == "" {
 				continue
 			}
-			if obs.target != pinnedRev && obs.target != reject {
+			if obs.target != pinnedRev && obs.target != rejected[comp] {
 				return true
 			}
 		}

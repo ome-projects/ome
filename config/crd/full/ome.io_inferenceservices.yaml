@@ -26911,6 +26911,7 @@ spec:
                                           enum:
                                             - Hold
                                             - Rollback
+                                            - RollbackOnStall
                                           type: string
                                       required:
                                         - failureLimit
@@ -31571,6 +31572,8 @@ spec:
                     stepEnteredTime:
                       format: date-time
                       type: string
+                    targetID:
+                      type: string
                   required:
                     - currentStep
                     - observedTrafficWeight
@@ -32251,6 +32254,7 @@ spec:
                                                       enum:
                                                         - Hold
                                                         - Rollback
+                                                        - RollbackOnStall
                                                       type: string
                                                   required:
                                                     - failureLimit
@@ -32386,6 +32390,8 @@ spec:
                                 type: string
                               revision:
                                 type: string
+                              stableRevision:
+                                type: string
                             required:
                               - component
                             type: object
@@ -32492,6 +32498,22 @@ spec:
                             - RolledBack
                             - Superseded
                           type: string
+                        targetRevisions:
+                          items:
+                            properties:
+                              component:
+                                type: string
+                              revision:
+                                type: string
+                              stableRevision:
+                                type: string
+                            required:
+                              - component
+                            type: object
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - component
+                          x-kubernetes-list-type: map
                       required:
                         - outcome
                       type: object

@@ -28,6 +28,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
@@ -164,7 +165,7 @@ func Execute(ctx context.Context, deps Deps, input ReconcileInput, plan Componen
 // marks a scale-down status-commit boundary. Other early returns preserve the
 // existing end-of-pass escalation and pruning behavior.
 func executeActions(ctx context.Context, deps Deps, input ReconcileInput, plan ComponentPlan, target *appsv1.ControllerRevision, snapshot *ObservedSnapshot, d Decision) (ctrl.Result, bool, error) {
-	for _, action := range d.Actions {
+	for actionIndex, action := range d.Actions {
 		switch action.Kind {
 		// 1. Scale-down.
 		case ActionScaleDown:
@@ -199,7 +200,16 @@ func executeActions(ctx context.Context, deps Deps, input ReconcileInput, plan C
 				}
 			}
 			if anyRestarting {
-				return ctrl.Result{RequeueAfter: workloadops.RestartRequeueInterval}, false, nil
+				result := ctrl.Result{RequeueAfter: workloadops.RestartRequeueInterval}
+				if hasActionKind(d.Actions[actionIndex+1:], ActionCreate) {
+					freshPlan := planExcludingRestartSelections(plan, action.Restarts)
+					createResult, ferr := workloadops.CreateFreshIndices(ctx, deps, input, freshPlan, target)
+					if ferr != nil {
+						return createResult, false, fmt.Errorf("workload.Reconcile: create fresh indices during restart: %w", ferr)
+					}
+					result = foldRetryAfter(createResult, workloadops.RestartRequeueInterval)
+				}
+				return result, false, nil
 			}
 
 		// 4. Migration expiry pass. When anything expired, requeue
@@ -292,6 +302,32 @@ func executeActions(ctx context.Context, deps Deps, input ReconcileInput, plan C
 	// Only a paused Decision ends without a Create action: scale-down
 	// (if any) has run, nothing else may.
 	return ctrl.Result{}, false, nil
+}
+
+func hasActionKind(actions []PlannedAction, kind ActionKind) bool {
+	for _, action := range actions {
+		if action.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func planExcludingRestartSelections(plan ComponentPlan, restarts []RestartSelection) ComponentPlan {
+	excluded := make(map[int32]struct{}, len(restarts))
+	for _, restart := range restarts {
+		excluded[restart.Instance.Index] = struct{}{}
+	}
+
+	filtered := plan
+	filtered.Instances = make([]InstancePlan, 0, len(plan.Instances))
+	for _, instance := range plan.Instances {
+		if _, restarting := excluded[instance.Index]; restarting {
+			continue
+		}
+		filtered.Instances = append(filtered.Instances, instance)
+	}
+	return filtered
 }
 
 func scaleDownPollResult(input ReconcileInput, policyRequeueAfter time.Duration, policyDeadlineDue bool) ctrl.Result {
@@ -450,6 +486,10 @@ func executeUpdatePass(ctx context.Context, deps Deps, input ReconcileInput, pla
 				// UpdateItem.CoordGateExempt).
 				if allowed, gate, reason := input.UpdateGate(sel.Strategy, inFlightSurge, gateUnavail); !allowed {
 					anyGated = true
+					logf.FromContext(ctx).V(1).Info("update start denied by coordination gate",
+						"component", plan.Component, "instance", item.Instance.Index,
+						"target", target.Name, "gate", gate, "reason", reason,
+						"inFlightSurge", inFlightSurge, "gateUnavail", gateUnavail)
 					if hold == nil {
 						hold = &RolloutHold{Gate: gate, Reason: reason, Target: target.Name}
 					}

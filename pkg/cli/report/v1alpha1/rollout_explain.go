@@ -962,7 +962,7 @@ func (g RolloutPlanGroup) canonical() RolloutPlanGroup {
 				analysis.FailureLimit = 0
 			}
 			switch analysis.OnInconclusive {
-			case "Hold", "Rollback":
+			case "Hold", "Rollback", "RollbackOnStall":
 			default:
 				analysis.OnInconclusive = "Unknown"
 			}

@@ -100,6 +100,20 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 
 	pods := instancePods
 
+	// UpdateStrategy is not part of the revision payload, so a strategy edit
+	// retargets nothing: the same roll continues under a different mechanism,
+	// and the mode resolved below can differ from the one that opened the
+	// Operation. Only SurgeThenDrain leaves state another mode cannot see —
+	// a second pod at the alternate ordinal slot, the ActiveOrdinal advance
+	// that ends the cycle, and a drain hold on the source released only by
+	// the source's deletion. Dispatching another mode over that drains or
+	// deletes the source while its replacement is still coming up, and
+	// strands the surge pod. Keep the surge machine in control; it decides
+	// whether to unwind (still uncommitted) or finish the cycle.
+	if isSurgeOwnedStatus(findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index)) {
+		return surgeUpdate(ctx, deps, input, plan, inst, target, pods)
+	}
+
 	// Eligibility compares against the recorded running revision, NOT the
 	// live pod. Live pods carry apiserver-defaulted fields and Render
 	// overlays (hostname/subdomain/serving gate); byte-comparing those
@@ -507,6 +521,19 @@ func isMigrateOwnedStatus(s *workload.InstanceStatus) bool {
 		return true
 	}
 	return false
+}
+
+// isSurgeOwnedStatus reports whether the SurgeThenDrain state machine owns
+// this Instance's in-flight Operation, so a mode resolved from a since-edited
+// strategy must not be dispatched over it.
+//
+// Phase=Failed is excluded. A failed surge has already escalated to operator
+// attention, and editing the strategy is one of the levers used to rescue it;
+// holding the Instance on the surge machine would take that lever away.
+func isSurgeOwnedStatus(s *workload.InstanceStatus) bool {
+	return s != nil && s.Phase != workload.InstancePhaseFailed &&
+		s.Operation != nil && s.Operation.Type == workload.InstanceOperationUpdate &&
+		isSurgeUpdateStep(s.Operation.Step)
 }
 
 // isGangSurgeTargetMarker reports whether s is a gang surge-target marker —
