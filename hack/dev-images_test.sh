@@ -56,14 +56,40 @@ for unprivileged_job in verify-public-images verify-dev-charts notify; do
 done
 assert_yq '.jobs.build-and-push-images.steps[] | select(.name == "Log in to GitHub Container Registry") | .with.password == "${{ secrets.GITHUB_TOKEN }}"' "${dev_workflow}" \
   "dev image publishing must use the repository-scoped GITHUB_TOKEN"
-for required_step in "Sign image index" "Install Syft" "Generate signed per-platform SBOM attestations"; do
+for required_step in "Sign image index" "Generate signed per-platform SBOM attestations"; do
   assert_yq ".jobs.build-and-push-images.steps[] | select(.name == \"${required_step}\") | .name == \"${required_step}\"" "${dev_workflow}" \
     "dev image publisher is missing required step: ${required_step}"
+done
+for installer in cosign syft; do
+  action="sigstore/cosign-installer@v3"
+  if [[ "${installer}" == "syft" ]]; then
+    action="anchore/sbom-action/download-syft@v0"
+  fi
+  assert_yq "
+    [.jobs.build-and-push-images.steps[] | select(.id == \"${installer}_1\" or .id == \"${installer}_2\" or .id == \"${installer}_3\")] as \$attempts |
+    [
+      (\$attempts | length) == 3,
+      (\$attempts | map(.uses == \"${action}\") | all),
+      (\$attempts[0].[\"continue-on-error\"] == true),
+      (\$attempts[1].[\"continue-on-error\"] == true),
+      (\$attempts[2].[\"continue-on-error\"] == null),
+      (\$attempts[0].if == null),
+      (\$attempts[1].if == \"\${{ steps.${installer}_1.outcome == 'failure' }}\"),
+      (\$attempts[2].if == \"\${{ steps.${installer}_1.outcome == 'failure' && steps.${installer}_2.outcome == 'failure' }}\")
+    ] | all
+  " "${dev_workflow}" \
+    "${installer} installation must use three conditional attempts with a hard-failing final attempt"
 done
 if grep -Fq 'cosign attach sbom' "${dev_workflow}"; then
   echo "deprecated unsigned SBOM attachments must not be published" >&2
   exit 1
 fi
+assert_yq '
+  .jobs.build-and-push-images.steps[] |
+  select(.name == "Generate signed per-platform SBOM attestations") |
+  .env.SYFT == "${{ steps.syft_1.outcome == '\''success'\'' && steps.syft_1.outputs.cmd || steps.syft_2.outcome == '\''success'\'' && steps.syft_2.outputs.cmd || steps.syft_3.outputs.cmd }}"
+' "${dev_workflow}" \
+  "SBOM generation must use the command from the successful Syft installer attempt"
 sbom_attestation="$(${yq_bin} eval '.jobs.build-and-push-images.steps[] | select(.name == "Generate signed per-platform SBOM attestations") | .run' "${dev_workflow}")"
 for required_fragment in \
   'linux/amd64' \

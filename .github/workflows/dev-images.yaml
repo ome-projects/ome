@@ -74,7 +74,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install cosign
+      - name: Install cosign (attempt 1)
+        id: cosign_1
+        continue-on-error: true
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install cosign (attempt 2)
+        id: cosign_2
+        if: ${{ steps.cosign_1.outcome == 'failure' }}
+        continue-on-error: true
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install cosign (attempt 3)
+        id: cosign_3
+        if: ${{ steps.cosign_1.outcome == 'failure' && steps.cosign_2.outcome == 'failure' }}
         uses: sigstore/cosign-installer@v3
 
       - name: Generate version info
@@ -142,15 +155,27 @@ jobs:
         run: |
           cosign sign --yes "${IMAGE}@${IMAGE_DIGEST}"
 
-      - name: Install Syft
-        id: syft
+      - name: Install Syft (attempt 1)
+        id: syft_1
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install Syft (attempt 2)
+        id: syft_2
+        if: ${{ steps.syft_1.outcome == 'failure' }}
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install Syft (attempt 3)
+        id: syft_3
+        if: ${{ steps.syft_1.outcome == 'failure' && steps.syft_2.outcome == 'failure' }}
         uses: anchore/sbom-action/download-syft@v0
 
       - name: Generate signed per-platform SBOM attestations
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/${{ matrix.component.image }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          SYFT: ${{ steps.syft.outputs.cmd }}
+          SYFT: ${{ steps.syft_1.outcome == 'success' && steps.syft_1.outputs.cmd || steps.syft_2.outcome == 'success' && steps.syft_2.outputs.cmd || steps.syft_3.outputs.cmd }}
         run: |
           expected_platforms=(linux/amd64)
           if [[ "${{ inputs.express }}" != "true" ]]; then
