@@ -53,15 +53,88 @@ func TestProjectReportsCurrentSelectionAndRedactedReason(t *testing.T) {
 	assert.Empty(t, component.Issues)
 	require.Len(t, got.Sources, 3)
 	assert.Equal(t, "AcceleratorClass", got.Sources[0].Kind)
-	assert.Equal(t, "9", got.Sources[0].ResourceVersion)
 	assert.Equal(t, "InferenceService", got.Sources[1].Kind)
-	assert.Equal(t, "17", got.Sources[1].ResourceVersion)
 	assert.Equal(t, "ServingRuntime", got.Sources[2].Kind)
 	assert.Equal(t, "runtime-uid", got.Sources[2].UID)
-	assert.Equal(t, "runtime-rv", got.Sources[2].ResourceVersion)
 	data, err := json.Marshal(got)
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "selected by policy")
+	assert.NotContains(t, string(data), "resourceVersion")
+}
+
+func TestProjectSelectionWithoutRequestsPreservesClassAndReportsAbsence(t *testing.T) {
+	isvc := acceleratorProjectionISVC()
+	isvc.Spec.AcceleratorSelector = &omev1beta1.AcceleratorSelector{
+		Policy: omev1beta1.CheapestPolicy,
+	}
+	isvc.Status.Components = map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
+		omev1beta1.EngineComponent: {
+			SelectedAccelerator: &omev1beta1.AcceleratorSelection{
+				AcceleratorClass: "gpu-a",
+			},
+		},
+	}
+	class, err := ObserveAcceleratorClass(&omev1beta1.AcceleratorClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gpu-a", UID: "class-uid", ResourceVersion: "9", Generation: 2,
+		},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"gpu-a"}, ReportedAcceleratorClassNames(isvc))
+	got, err := Project(
+		isvc,
+		acceleratorBaseFixture(effective.AcceleratorActiveAvailable, true),
+		map[string]AcceleratorClassEvidence{"gpu-a": class},
+		fixedClock(),
+	)
+
+	require.NoError(t, err)
+	require.Len(t, got.Content.Components, 1)
+	component := got.Content.Components[0]
+	assert.Equal(t, reportv1alpha1.AcceleratorSelectionReported, component.Selection.State)
+	assert.Equal(t, "gpu-a", component.Selection.Class)
+	assert.Equal(t, reportv1alpha1.AcceleratorClassObserved, component.Class.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotReported, component.Requests.State)
+	assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+		component.Requests.Base)
+	assert.Empty(t, component.Requests.Effective)
+	assert.Contains(t, component.Issues, reportv1alpha1.AcceleratorIssueRequestsNotReported)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainPartial, got.Content.Summary.State)
+}
+
+func TestProjectExplicitEmptyRequestsRemainReported(t *testing.T) {
+	isvc := acceleratorProjectionISVC()
+	isvc.Spec.AcceleratorSelector = &omev1beta1.AcceleratorSelector{
+		Policy: omev1beta1.CheapestPolicy,
+	}
+	isvc.Status.Components = map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
+		omev1beta1.EngineComponent: {
+			SelectedAccelerator: &omev1beta1.AcceleratorSelection{
+				AcceleratorClass: "gpu-a", ResourceRequests: map[string]string{},
+			},
+		},
+	}
+	class, err := ObserveAcceleratorClass(&omev1beta1.AcceleratorClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gpu-a", UID: "class-uid", ResourceVersion: "9", Generation: 2,
+		},
+	})
+	require.NoError(t, err)
+
+	got, err := Project(
+		isvc,
+		acceleratorBaseFixture(effective.AcceleratorActiveAvailable, true),
+		map[string]AcceleratorClassEvidence{"gpu-a": class},
+		fixedClock(),
+	)
+
+	require.NoError(t, err)
+	component := got.Content.Components[0]
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsReported, component.Requests.State)
+	assert.Empty(t, component.Requests.Effective)
+	assert.NotContains(t, component.Issues, reportv1alpha1.AcceleratorIssueRequestsNotReported)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainReported, got.Content.Summary.State)
 }
 
 func TestProjectStaleStatusNeverClaimsSelectionOrRequests(t *testing.T) {
@@ -181,6 +254,78 @@ func TestProjectUnavailableClassPreservesReportedSelection(t *testing.T) {
 	assert.Equal(t, reportv1alpha1.AcceleratorExplainPartial, got.Content.Summary.State)
 }
 
+func TestProjectMapsEveryUnavailableClassState(t *testing.T) {
+	tests := []struct {
+		state reportv1alpha1.AcceleratorClassState
+		issue reportv1alpha1.AcceleratorExplainIssueCode
+	}{
+		{state: reportv1alpha1.AcceleratorClassNotFound,
+			issue: reportv1alpha1.AcceleratorIssueClassNotFound},
+		{state: reportv1alpha1.AcceleratorClassForbidden,
+			issue: reportv1alpha1.AcceleratorIssueClassForbidden},
+		{state: reportv1alpha1.AcceleratorClassUnsupportedAPI,
+			issue: reportv1alpha1.AcceleratorIssueClassUnsupportedAPI},
+		{state: reportv1alpha1.AcceleratorClassUnreadable,
+			issue: reportv1alpha1.AcceleratorIssueClassUnreadable},
+		{state: reportv1alpha1.AcceleratorClassInvalid,
+			issue: reportv1alpha1.AcceleratorIssueClassInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.state), func(t *testing.T) {
+			isvc := acceleratorProjectionISVC()
+			isvc.Spec.AcceleratorSelector = &omev1beta1.AcceleratorSelector{
+				Policy: omev1beta1.FirstAvailablePolicy,
+			}
+			isvc.Status.Components = map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{
+				omev1beta1.EngineComponent: {
+					SelectedAccelerator: &omev1beta1.AcceleratorSelection{
+						AcceleratorClass: "gpu-a", ResourceRequests: map[string]string{},
+					},
+				},
+			}
+			evidence, err := UnavailableAcceleratorClass("gpu-a", tt.state)
+			require.NoError(t, err)
+
+			got, err := Project(
+				isvc,
+				acceleratorBaseFixture(effective.AcceleratorActiveAvailable, true),
+				map[string]AcceleratorClassEvidence{"gpu-a": evidence},
+				fixedClock(),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.state, got.Content.Components[0].Class.State)
+			assert.Contains(t, got.Content.Components[0].Issues, tt.issue)
+			require.Len(t, got.Sources, 3)
+			assert.Equal(t, reportv1alpha1.EvidenceUnavailable, got.Sources[0].Evidence)
+		})
+	}
+}
+
+func TestProjectAcceptsBoundControllerRevisionBase(t *testing.T) {
+	base := acceleratorBaseFixture(effective.AcceleratorActiveAvailable, false)
+	base.ActiveOrigin = effective.ConfigurationOriginControllerRevision
+	base.ActiveConsistency = effective.RevisionConsistencyConsistent
+	base.ActiveRevisionName = "revision-a"
+	base.ActiveSourceKind = "ControllerRevision"
+	base.ActiveSourceName = "revision-a"
+	base.ActiveSourceNamespace = "ome"
+	base.ActiveSourceUID = "revision-uid"
+	base.ActiveSourceResourceVersion = "revision-rv"
+	base.ActiveSourceGeneration = 0
+
+	got, err := Project(acceleratorProjectionISVC(), base, nil, fixedClock())
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainNotConfigured,
+		got.Content.Summary.State)
+	assert.Contains(t, got.Sources, reportv1alpha1.AcceleratorSourceReference{
+		Kind: "ControllerRevision", Namespace: "ome", Name: "revision-a",
+		UID: "revision-uid", Evidence: reportv1alpha1.EvidenceObserved,
+		CollectedAt: fixedClock().Now(),
+	})
+}
+
 func TestProjectRejectsMalformedCurrentStatusWithoutEchoingIt(t *testing.T) {
 	const secret = "ghp_status-secret"
 	isvc := acceleratorProjectionISVC()
@@ -286,7 +431,8 @@ func TestProjectNoIntentAndNoStatusIsNotConfigured(t *testing.T) {
 	assert.Equal(t, reportv1alpha1.AcceleratorIntentNotConfigured, component.Intent.State)
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotConfigured, component.Selection.State)
 	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.State)
-	assert.Empty(t, component.Requests.Base)
+	assert.Equal(t, []reportv1alpha1.AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+		component.Requests.Base)
 	assert.Empty(t, component.Issues)
 }
 
@@ -308,7 +454,7 @@ func TestProjectNoIntentIgnoresUnavailableRuntimeThatCannotAffectSelection(t *te
 	assert.Empty(t, got.Content.Components[0].Issues)
 }
 
-func TestProjectNoIntentIgnoresIrrelevantStaleStatusAndBaseDiagnostics(t *testing.T) {
+func TestProjectNoIntentKeepsIndependentBaseDiagnostics(t *testing.T) {
 	isvc := acceleratorProjectionISVC()
 	isvc.Status.ObservedGeneration--
 	base := acceleratorBaseFixture(effective.AcceleratorActiveAvailable, false)
@@ -319,11 +465,13 @@ func TestProjectNoIntentIgnoresIrrelevantStaleStatusAndBaseDiagnostics(t *testin
 	got, err := Project(isvc, base, nil, fixedClock())
 
 	require.NoError(t, err)
-	assert.Equal(t, reportv1alpha1.AcceleratorExplainNotConfigured, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.AcceleratorExplainInvalid, got.Content.Summary.State)
 	component := got.Content.Components[0]
 	assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotConfigured, component.Selection.State)
-	assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured, component.Requests.State)
-	assert.Empty(t, component.Issues)
+	assert.Equal(t, reportv1alpha1.AcceleratorRequestsInvalid, component.Requests.State)
+	assert.Equal(t, []reportv1alpha1.AcceleratorExplainIssueCode{
+		reportv1alpha1.AcceleratorIssueRequestsInvalid,
+	}, component.Issues)
 }
 
 func TestProjectUnavailableRuntimeSuppressesApparentlyCurrentStatus(t *testing.T) {

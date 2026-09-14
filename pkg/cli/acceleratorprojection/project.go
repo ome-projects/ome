@@ -109,16 +109,13 @@ func Project(
 	)
 	reportValue.Sources = append(reportValue.Sources, reportv1alpha1.AcceleratorSourceReference{
 		Kind: "InferenceService", Namespace: isvc.Namespace, Name: isvc.Name,
-		UID: string(isvc.UID), Generation: isvc.Generation,
-		ResourceVersion: isvc.ResourceVersion, Evidence: reportv1alpha1.EvidenceObserved,
+		UID: string(isvc.UID), Generation: isvc.Generation, Evidence: reportv1alpha1.EvidenceObserved,
 	})
 	if base.ActiveSourceName != "" {
 		reportValue.Sources = append(reportValue.Sources, reportv1alpha1.AcceleratorSourceReference{
 			Kind: base.ActiveSourceKind, Namespace: base.ActiveSourceNamespace,
 			Name: base.ActiveSourceName, UID: base.ActiveSourceUID,
-			Generation:      base.ActiveSourceGeneration,
-			ResourceVersion: base.ActiveSourceResourceVersion,
-			Evidence:        reportv1alpha1.EvidenceObserved,
+			Generation: base.ActiveSourceGeneration, Evidence: reportv1alpha1.EvidenceObserved,
 		})
 	}
 
@@ -174,21 +171,22 @@ func projectComponent(
 	}
 	configured := intent.State != reportv1alpha1.AcceleratorIntentNotConfigured
 	status := isvc.Status.Components[baseComponent.Type].SelectedAccelerator
+	if baseComponent.State == effective.AcceleratorBaseInvalid {
+		component.Requests.Base = []reportv1alpha1.AcceleratorResourceRequest{}
+		component.Requests.State = reportv1alpha1.AcceleratorRequestsInvalid
+		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueRequestsInvalid)
+	}
 	if !configured && status == nil {
 		component.Selection.State = reportv1alpha1.AcceleratorSelectionNotConfigured
 		component.Selection.Reason.State = reportv1alpha1.AcceleratorReasonNotReported
-		component.Requests.State = reportv1alpha1.AcceleratorRequestsNotConfigured
-		component.Requests.Base = []reportv1alpha1.AcceleratorResourceRequest{}
+		if baseComponent.State != effective.AcceleratorBaseInvalid {
+			component.Requests.State = reportv1alpha1.AcceleratorRequestsNotConfigured
+		}
 		return canonicalComponent(component), ""
 	}
 	if base.ActiveState == effective.AcceleratorActiveInconsistent {
 		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueActiveRevisionInconsistent)
 	}
-	if baseComponent.State == effective.AcceleratorBaseInvalid {
-		component.Requests.Base = []reportv1alpha1.AcceleratorResourceRequest{}
-		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueRequestsInvalid)
-	}
-
 	if base.ActiveState == effective.AcceleratorActiveUnavailable {
 		component.Issues = append(component.Issues,
 			reportv1alpha1.AcceleratorIssueActiveConfigurationUnavailable)
@@ -250,8 +248,15 @@ func projectComponent(
 	component.Selection.State = reportv1alpha1.AcceleratorSelectionReported
 	component.Selection.Class = status.AcceleratorClass
 	component.Selection.Reason = projectReason(status.Reason)
-	component.Requests.State = reportv1alpha1.AcceleratorRequestsReported
-	component.Requests.Effective = requests
+	if status.ResourceRequests == nil {
+		component.Requests.State = reportv1alpha1.AcceleratorRequestsNotReported
+		component.Issues = append(
+			component.Issues, reportv1alpha1.AcceleratorIssueRequestsNotReported,
+		)
+	} else {
+		component.Requests.State = reportv1alpha1.AcceleratorRequestsReported
+		component.Requests.Effective = requests
+	}
 	if !configured {
 		component.Issues = append(component.Issues, reportv1alpha1.AcceleratorIssueSelectionUnexpected)
 	}
@@ -607,8 +612,8 @@ func classSource(evidence AcceleratorClassEvidence) reportv1alpha1.AcceleratorSo
 	}
 	return reportv1alpha1.AcceleratorSourceReference{
 		Kind: "AcceleratorClass", Name: evidence.name, UID: evidence.uid,
-		Generation: evidence.generation, ResourceVersion: evidence.resourceVersion,
-		Evidence: level, UnavailableReason: evidence.unavailableReason,
+		Generation: evidence.generation, Evidence: level,
+		UnavailableReason: evidence.unavailableReason,
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
+	"sigs.k8s.io/ome/pkg/cli/report"
 )
 
 func TestAcceleratorExplainCanonicalAndCompactTable(t *testing.T) {
@@ -116,6 +117,7 @@ func TestAcceleratorExplainMachineSchemaNeverCarriesRawReason(t *testing.T) {
 }
 
 func TestAcceleratorExplainWideTableIsCompleteAndDeterministic(t *testing.T) {
+	collectedAt := time.Date(2026, 9, 14, 20, 30, 0, 0, time.UTC)
 	component := AcceleratorExplainComponent{
 		Type: RuntimeComponentEngine,
 		Intent: AcceleratorIntent{
@@ -135,27 +137,296 @@ func TestAcceleratorExplainWideTableIsCompleteAndDeterministic(t *testing.T) {
 		Issues: []AcceleratorExplainIssueCode{AcceleratorIssueClassForbidden},
 	}
 	content := AcceleratorExplainContent{
-		Summary:    AcceleratorExplainSummary{State: AcceleratorExplainPartial},
+		Summary: AcceleratorExplainSummary{
+			State: AcceleratorExplainPartial, StatusFreshness: StatusFreshnessStale,
+		},
 		Components: []AcceleratorExplainComponent{component},
-		Issues:     []AcceleratorExplainIssue{{Code: AcceleratorIssueClassForbidden, Component: RuntimeComponentEngine}},
+		Issues: []AcceleratorExplainIssue{
+			{Code: AcceleratorIssueUnexpectedComponentEvidence, Component: RuntimeComponentRouter},
+			{Code: AcceleratorIssueStatusStale},
+			{Code: AcceleratorIssueClassForbidden, Component: RuntimeComponentEngine},
+		},
 	}
-	reversed := content
-	reversed.Components = []AcceleratorExplainComponent{component}
-	reversed.Components[0].Requests.Base = []AcceleratorResourceRequest{{Name: "cpu", Quantity: "1"}}
+	reportValue := NewAcceleratorExplainReport(
+		Metadata{Namespace: "prod", Name: "chat"}, content,
+		ClockFunc(func() time.Time { return collectedAt }),
+	)
+	reportValue.Sources = []AcceleratorSourceReference{
+		{Kind: "InferenceService", Namespace: "prod", Name: "chat", UID: "isvc-uid",
+			Generation: 4, Evidence: EvidenceObserved},
+		{Kind: "AcceleratorClass", Name: "gpu-a", Evidence: EvidenceUnavailable,
+			UnavailableReason: UnavailableForbidden},
+	}
+	reportValue.Warnings = []AcceleratorWarning{
+		{Code: AcceleratorWarningStaleEvidence},
+		{Code: AcceleratorWarningSourceUnavailable},
+		{Code: AcceleratorWarningPartialData},
+	}
+	reversed := reportValue
+	reversed.Sources = []AcceleratorSourceReference{
+		reportValue.Sources[1], reportValue.Sources[0],
+	}
+	reversed.Warnings = []AcceleratorWarning{
+		reportValue.Warnings[2], reportValue.Warnings[1], reportValue.Warnings[0],
+	}
+	reversed.Content.Issues = []AcceleratorExplainIssue{
+		content.Issues[2], content.Issues[1], content.Issues[0],
+	}
 
-	assert.Equal(t, content.WideTable(), reversed.WideTable())
+	assert.Equal(t, reportValue.WideTable(), reversed.WideTable())
 	assert.Equal(t, [][]string{
 		{"SUMMARY", "-", "STATE", "Partial", "Computed"},
+		{"SUMMARY", "-", "STATUS_FRESHNESS", "Stale", "Computed"},
 		{"INTENT", "engine", "MODE", "Policy", "Declared"},
 		{"INTENT", "engine", "POLICY", "FirstAvailable", "Declared/Component"},
 		{"SELECTION", "engine", "STATE", "Reported", "Reported"},
 		{"SELECTION", "engine", "CLASS", "gpu-a", "Reported"},
-		{"SELECTION", "engine", "REASON", "rs1:0123456789ab", "Reported/Redacted"},
+		{"SELECTION", "engine", "REASON_STATE", "Reported", "Reported"},
+		{"SELECTION", "engine", "REASON_DIGEST", "rs1:0123456789ab", "Reported/Redacted"},
 		{"CLASS", "engine", "STATE", "Forbidden", "Unavailable"},
+		{"CLASS", "engine", "NAME", "gpu-a", "Unavailable"},
+		{"REQUEST", "engine", "STATE", "Reported", "Reported"},
 		{"REQUEST", "engine", "BASE", "cpu=1", "Computed"},
 		{"REQUEST", "engine", "EFFECTIVE", "example.com/gpu=2", "Reported"},
 		{"ISSUE", "engine", "ClassForbidden", "-", "Computed"},
-	}, content.WideTable().Rows)
+		{"ISSUE", "router", "UnexpectedComponentEvidence", "-", "Computed"},
+		{"ISSUE", "-", "StatusStale", "-", "Computed"},
+		{"SOURCE", "AcceleratorClass", "NAME", "gpu-a", "Unavailable"},
+		{"SOURCE", "AcceleratorClass", "UID", "-", "Unavailable"},
+		{"SOURCE", "AcceleratorClass", "GENERATION", "-", "Unavailable"},
+		{"SOURCE", "AcceleratorClass", "COLLECTED_AT", "2026-09-14T20:30:00Z", "Unavailable"},
+		{"SOURCE", "AcceleratorClass", "UNAVAILABLE_REASON", "Forbidden", "Unavailable"},
+		{"SOURCE", "InferenceService", "NAME", "prod/chat", "Observed"},
+		{"SOURCE", "InferenceService", "UID", "isvc-uid", "Observed"},
+		{"SOURCE", "InferenceService", "GENERATION", "4", "Observed"},
+		{"SOURCE", "InferenceService", "COLLECTED_AT", "2026-09-14T20:30:00Z", "Observed"},
+		{"WARNING", "-", "CODE", "PartialData", "Computed"},
+		{"WARNING", "-", "CODE", "SourceUnavailable", "Computed"},
+		{"WARNING", "-", "CODE", "StaleEvidence", "Computed"},
+	}, reportValue.WideTable().Rows)
+}
+
+func TestAcceleratorExplainWideTableAlwaysShowsReasonAndRequestStates(t *testing.T) {
+	content := AcceleratorExplainContent{
+		Summary: AcceleratorExplainSummary{
+			State: AcceleratorExplainPartial, StatusFreshness: StatusFreshnessCurrent,
+		},
+		Components: []AcceleratorExplainComponent{{
+			Type: RuntimeComponentEngine,
+			Intent: AcceleratorIntent{
+				State: AcceleratorIntentPolicy, Policy: AcceleratorPolicyCheapest,
+				PolicySource: AcceleratorSelectorSourceService,
+			},
+			Selection: AcceleratorSelectionObservation{
+				State: AcceleratorSelectionReported, Class: "gpu-a",
+				Reason: AcceleratorReason{State: AcceleratorReasonNotReported},
+			},
+			Class: AcceleratorClassObservation{State: AcceleratorClassObserved, Name: "gpu-a"},
+			Requests: AcceleratorRequestObservation{
+				State: AcceleratorRequestsNotReported,
+				Base:  []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+			},
+			Issues: []AcceleratorExplainIssueCode{AcceleratorIssueRequestsNotReported},
+		}},
+		Issues: []AcceleratorExplainIssue{{
+			Code: AcceleratorIssueRequestsNotReported, Component: RuntimeComponentEngine,
+		}},
+	}
+
+	rows := content.WideTable().Rows
+	assert.Contains(t, rows, []string{
+		"SELECTION", "engine", "REASON_STATE", "NotReported", "Unavailable",
+	})
+	assert.Contains(t, rows, []string{
+		"REQUEST", "engine", "STATE", "NotReported", "Unavailable",
+	})
+	assert.NotContains(t, rows, []string{
+		"REQUEST", "engine", "EFFECTIVE", "None", "Reported",
+	})
+}
+
+func TestAcceleratorExplainNotReportedRequestsMachineOutputIsExact(t *testing.T) {
+	reportValue := NewAcceleratorExplainReport(Metadata{Namespace: "prod", Name: "chat"},
+		AcceleratorExplainContent{
+			Summary: AcceleratorExplainSummary{
+				State: AcceleratorExplainPartial, StatusFreshness: StatusFreshnessCurrent,
+			},
+			Components: []AcceleratorExplainComponent{{
+				Type: RuntimeComponentEngine,
+				Intent: AcceleratorIntent{
+					State: AcceleratorIntentPolicy, Policy: AcceleratorPolicyCheapest,
+					PolicySource: AcceleratorSelectorSourceService,
+				},
+				Selection: AcceleratorSelectionObservation{
+					State: AcceleratorSelectionReported, Class: "gpu-a",
+					Reason: AcceleratorReason{State: AcceleratorReasonNotReported},
+				},
+				Class: AcceleratorClassObservation{State: AcceleratorClassObserved, Name: "gpu-a"},
+				Requests: AcceleratorRequestObservation{
+					State: AcceleratorRequestsNotReported,
+					Base:  []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}},
+				},
+				Issues: []AcceleratorExplainIssueCode{AcceleratorIssueRequestsNotReported},
+			}},
+			Issues: []AcceleratorExplainIssue{{
+				Code: AcceleratorIssueRequestsNotReported, Component: RuntimeComponentEngine,
+			}},
+		}, ClockFunc(func() time.Time { return time.Unix(0, 0) }))
+	reportValue.Sources = []AcceleratorSourceReference{{
+		Kind: "InferenceService", Namespace: "prod", Name: "chat",
+		UID: "isvc-uid", Generation: 4, Evidence: EvidenceObserved,
+	}}
+	reportValue.Warnings = []AcceleratorWarning{{Code: AcceleratorWarningPartialData}}
+
+	tests := []struct {
+		name   string
+		format report.Format
+		want   string
+	}{
+		{name: "json", format: report.FormatJSON, want: `{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "AcceleratorExplainReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "1970-01-01T00:00:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "uid": "isvc-uid",
+      "generation": 4,
+      "evidence": "Observed",
+      "collectedAt": "1970-01-01T00:00:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "state": "Partial",
+      "statusFreshness": "Current"
+    },
+    "components": [
+      {
+        "type": "engine",
+        "intent": {
+          "state": "Policy",
+          "policy": "Cheapest",
+          "policySource": "Service"
+        },
+        "selection": {
+          "state": "Reported",
+          "class": "gpu-a",
+          "reason": {
+            "state": "NotReported"
+          }
+        },
+        "class": {
+          "state": "Observed",
+          "name": "gpu-a"
+        },
+        "requests": {
+          "state": "NotReported",
+          "base": [
+            {
+              "name": "cpu",
+              "quantity": "2"
+            }
+          ],
+          "effective": []
+        },
+        "issues": [
+          "RequestsNotReported"
+        ]
+      }
+    ],
+    "issues": [
+      {
+        "code": "RequestsNotReported",
+        "component": "engine"
+      }
+    ]
+  },
+  "warnings": [
+    {
+      "code": "PartialData"
+    }
+  ]
+}
+`},
+		{name: "yaml", format: report.FormatYAML, want: `apiVersion: cli.ome.io/v1alpha1
+collectedAt: "1970-01-01T00:00:00Z"
+content:
+  components:
+  - class:
+      name: gpu-a
+      state: Observed
+    intent:
+      policy: Cheapest
+      policySource: Service
+      state: Policy
+    issues:
+    - RequestsNotReported
+    requests:
+      base:
+      - name: cpu
+        quantity: "2"
+      effective: []
+      state: NotReported
+    selection:
+      class: gpu-a
+      reason:
+        state: NotReported
+      state: Reported
+    type: engine
+  issues:
+  - code: RequestsNotReported
+    component: engine
+  summary:
+    state: Partial
+    statusFreshness: Current
+kind: AcceleratorExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "1970-01-01T00:00:00Z"
+  evidence: Observed
+  generation: 4
+  kind: InferenceService
+  name: chat
+  namespace: prod
+  uid: isvc-uid
+warnings:
+- code: PartialData
+`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			require.NoError(t, report.Write(&output, test.format, reportValue))
+			assert.Equal(t, test.want, output.String())
+			assert.NotContains(t, output.String(), "resourceVersion")
+		})
+	}
+}
+
+func TestAcceleratorExplainCompactIssueCountIncludesGlobalDiagnostics(t *testing.T) {
+	content := AcceleratorExplainContent{
+		Components: []AcceleratorExplainComponent{{
+			Type:   RuntimeComponentEngine,
+			Issues: []AcceleratorExplainIssueCode{AcceleratorIssueClassForbidden},
+		}},
+		Issues: []AcceleratorExplainIssue{
+			{Code: AcceleratorIssueClassForbidden, Component: RuntimeComponentEngine},
+			{Code: AcceleratorIssueStatusStale},
+			{Code: AcceleratorIssueUnexpectedComponentEvidence, Component: RuntimeComponentRouter},
+		},
+	}
+
+	require.Len(t, content.Table().Rows, 1)
+	assert.Equal(t, "3", content.Table().Rows[0][5])
 }
 
 func TestAcceleratorExplainCompactTableNeverExceedsEightyColumns(t *testing.T) {

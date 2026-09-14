@@ -81,6 +81,7 @@ type AcceleratorRequestState string
 
 const (
 	AcceleratorRequestsReported      AcceleratorRequestState = "Reported"
+	AcceleratorRequestsNotReported   AcceleratorRequestState = "NotReported"
 	AcceleratorRequestsUnavailable   AcceleratorRequestState = "Unavailable"
 	AcceleratorRequestsNotConfigured AcceleratorRequestState = "NotConfigured"
 	AcceleratorRequestsInvalid       AcceleratorRequestState = "Invalid"
@@ -101,6 +102,7 @@ const (
 	AcceleratorIssuePolicyInvalid                  AcceleratorExplainIssueCode = "PolicyInvalid"
 	AcceleratorIssueReportedClassMismatch          AcceleratorExplainIssueCode = "ReportedClassMismatch"
 	AcceleratorIssueRequestsInvalid                AcceleratorExplainIssueCode = "RequestsInvalid"
+	AcceleratorIssueRequestsNotReported            AcceleratorExplainIssueCode = "RequestsNotReported"
 	AcceleratorIssueSelectionNotReported           AcceleratorExplainIssueCode = "SelectionNotReported"
 	AcceleratorIssueSelectionUnexpected            AcceleratorExplainIssueCode = "SelectionUnexpected"
 	AcceleratorIssueStatusInvalid                  AcceleratorExplainIssueCode = "StatusInvalid"
@@ -127,7 +129,6 @@ type AcceleratorSourceReference struct {
 	Name              string            `json:"name"`
 	UID               string            `json:"uid,omitempty"`
 	Generation        int64             `json:"generation,omitempty"`
-	ResourceVersion   string            `json:"resourceVersion,omitempty"`
 	Evidence          EvidenceLevel     `json:"evidence"`
 	CollectedAt       time.Time         `json:"collectedAt"`
 	UnavailableReason UnavailableReason `json:"unavailableReason,omitempty"`
@@ -244,7 +245,41 @@ func (r AcceleratorExplainReport) Canonical() AcceleratorExplainReport {
 
 func (r AcceleratorExplainReport) Table() report.Table { return r.Canonical().Content.Table() }
 
-func (r AcceleratorExplainReport) WideTable() report.Table { return r.Canonical().Content.WideTable() }
+func (r AcceleratorExplainReport) WideTable() report.Table {
+	canonical := r.Canonical()
+	table := canonical.Content.WideTable()
+	for _, source := range canonical.Sources {
+		evidence := string(source.Evidence)
+		name := source.Name
+		if source.Namespace != "" {
+			name = source.Namespace + "/" + source.Name
+		}
+		table.Rows = append(table.Rows,
+			[]string{"SOURCE", source.Kind, "NAME", name, evidence},
+			[]string{"SOURCE", source.Kind, "UID", printers.OrDash(source.UID), evidence},
+			[]string{
+				"SOURCE", source.Kind, "GENERATION",
+				optionalAcceleratorGeneration(source.Generation), evidence,
+			},
+			[]string{
+				"SOURCE", source.Kind, "COLLECTED_AT",
+				source.CollectedAt.Format(time.RFC3339Nano), evidence,
+			},
+		)
+		if source.UnavailableReason != "" {
+			table.Rows = append(table.Rows, []string{
+				"SOURCE", source.Kind, "UNAVAILABLE_REASON",
+				string(source.UnavailableReason), evidence,
+			})
+		}
+	}
+	for _, warning := range canonical.Warnings {
+		table.Rows = append(table.Rows, []string{
+			"WARNING", "-", "CODE", string(warning.Code), "Computed",
+		})
+	}
+	return table
+}
 
 func (c AcceleratorExplainContent) Canonical() AcceleratorExplainContent {
 	result := c
@@ -288,7 +323,8 @@ func (c AcceleratorExplainContent) Table() report.Table {
 			string(component.Type), compactAcceleratorPolicy(component.Intent),
 			printers.OrDash(printers.BoundedMiddleCell(className, 16)),
 			compactAcceleratorSelection(component.Selection.State),
-			compactAcceleratorRequests(component.Requests), strconv.Itoa(len(component.Issues)),
+			compactAcceleratorRequests(component.Requests),
+			strconv.Itoa(compactAcceleratorIssueCount(canonical, component)),
 		})
 	}
 	return table
@@ -298,6 +334,10 @@ func (c AcceleratorExplainContent) WideTable() report.Table {
 	canonical := c.Canonical()
 	table := report.Table{Headers: []string{"SCOPE", "COMP", "FIELD", "VALUE", "EVIDENCE"}}
 	table.Rows = append(table.Rows, []string{"SUMMARY", "-", "STATE", string(canonical.Summary.State), "Computed"})
+	table.Rows = append(table.Rows, []string{
+		"SUMMARY", "-", "STATUS_FRESHNESS",
+		printers.OrDash(string(canonical.Summary.StatusFreshness)), "Computed",
+	})
 	for _, component := range canonical.Components {
 		comp := string(component.Type)
 		table.Rows = append(table.Rows, []string{"INTENT", comp, "MODE", string(component.Intent.State), "Declared"})
@@ -319,27 +359,43 @@ func (c AcceleratorExplainContent) WideTable() report.Table {
 		if component.Selection.Class != "" {
 			table.Rows = append(table.Rows, []string{"SELECTION", comp, "CLASS", component.Selection.Class, "Reported"})
 		}
+		table.Rows = append(table.Rows, []string{
+			"SELECTION", comp, "REASON_STATE", string(component.Selection.Reason.State),
+			reasonEvidence(component.Selection.Reason.State),
+		})
 		if component.Selection.Reason.Digest != "" {
 			table.Rows = append(table.Rows, []string{
-				"SELECTION", comp, "REASON", component.Selection.Reason.Digest, "Reported/Redacted",
+				"SELECTION", comp, "REASON_DIGEST", component.Selection.Reason.Digest,
+				"Reported/Redacted",
 			})
 		}
 		table.Rows = append(table.Rows, []string{
 			"CLASS", comp, "STATE", string(component.Class.State), classEvidence(component.Class.State),
+		})
+		if component.Class.Name != "" {
+			table.Rows = append(table.Rows, []string{
+				"CLASS", comp, "NAME", component.Class.Name, classEvidence(component.Class.State),
+			})
+		}
+		table.Rows = append(table.Rows, []string{
+			"REQUEST", comp, "STATE", string(component.Requests.State),
+			requestEvidence(component.Requests.State),
 		})
 		if len(component.Requests.Base) > 0 {
 			table.Rows = append(table.Rows, []string{
 				"REQUEST", comp, "BASE", joinAcceleratorRequests(component.Requests.Base), "Computed",
 			})
 		}
-		if len(component.Requests.Effective) > 0 || component.Requests.State == AcceleratorRequestsReported {
+		if component.Requests.State == AcceleratorRequestsReported {
 			table.Rows = append(table.Rows, []string{
 				"REQUEST", comp, "EFFECTIVE", joinAcceleratorRequests(component.Requests.Effective), "Reported",
 			})
 		}
-		for _, issue := range component.Issues {
-			table.Rows = append(table.Rows, []string{"ISSUE", comp, string(issue), "-", "Computed"})
-		}
+	}
+	for _, issue := range allAcceleratorIssues(canonical) {
+		table.Rows = append(table.Rows, []string{
+			"ISSUE", printers.OrDash(string(issue.Component)), string(issue.Code), "-", "Computed",
+		})
 	}
 	return table
 }
@@ -377,7 +433,7 @@ func compactAcceleratorRequests(requests AcceleratorRequestObservation) string {
 	switch requests.State {
 	case AcceleratorRequestsNotConfigured:
 		return "None"
-	case AcceleratorRequestsUnavailable:
+	case AcceleratorRequestsNotReported, AcceleratorRequestsUnavailable:
 		return "Unknown"
 	default:
 		return printers.OrDash(string(requests.State))
@@ -453,11 +509,79 @@ func classEvidence(state AcceleratorClassState) string {
 	return "Unavailable"
 }
 
+func reasonEvidence(state AcceleratorReasonState) string {
+	if state == AcceleratorReasonReported {
+		return "Reported"
+	}
+	return "Unavailable"
+}
+
+func requestEvidence(state AcceleratorRequestState) string {
+	switch state {
+	case AcceleratorRequestsReported:
+		return "Reported"
+	case AcceleratorRequestsNotConfigured:
+		return "Declared"
+	default:
+		return "Unavailable"
+	}
+}
+
+func optionalAcceleratorGeneration(generation int64) string {
+	if generation == 0 {
+		return "-"
+	}
+	return strconv.FormatInt(generation, 10)
+}
+
+func compactAcceleratorIssueCount(
+	content AcceleratorExplainContent,
+	component AcceleratorExplainComponent,
+) int {
+	knownComponents := make(map[RuntimeComponentType]struct{}, len(content.Components))
+	for _, candidate := range content.Components {
+		knownComponents[candidate.Type] = struct{}{}
+	}
+	keys := make(map[string]struct{}, len(component.Issues)+len(content.Issues))
+	for _, code := range component.Issues {
+		keys[string(component.Type)+"\x00"+string(code)] = struct{}{}
+	}
+	for _, issue := range content.Issues {
+		_, represented := knownComponents[issue.Component]
+		if issue.Component != component.Type && issue.Component != "" && represented {
+			continue
+		}
+		keys[string(issue.Component)+"\x00"+string(issue.Code)] = struct{}{}
+	}
+	return len(keys)
+}
+
+func allAcceleratorIssues(content AcceleratorExplainContent) []AcceleratorExplainIssue {
+	issues := append([]AcceleratorExplainIssue{}, content.Issues...)
+	for _, component := range content.Components {
+		for _, code := range component.Issues {
+			issues = append(issues, AcceleratorExplainIssue{
+				Code: code, Component: component.Type,
+			})
+		}
+	}
+	sort.Slice(issues, func(i, j int) bool {
+		left, right := issues[i], issues[j]
+		if acceleratorComponentRank(left.Component) != acceleratorComponentRank(right.Component) {
+			return acceleratorComponentRank(left.Component) < acceleratorComponentRank(right.Component)
+		}
+		if left.Component != right.Component {
+			return left.Component < right.Component
+		}
+		return left.Code < right.Code
+	})
+	return dedupeAcceleratorIssues(issues)
+}
+
 func acceleratorSourceKey(source AcceleratorSourceReference) string {
 	return strings.Join([]string{
 		source.Kind, source.Namespace, source.Name, source.UID,
-		strconv.FormatInt(source.Generation, 10), source.ResourceVersion,
-		string(source.Evidence),
+		strconv.FormatInt(source.Generation, 10), string(source.Evidence),
 		source.CollectedAt.Format(time.RFC3339Nano), string(source.UnavailableReason),
 	}, "\x00")
 }

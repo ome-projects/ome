@@ -247,7 +247,7 @@ func TestExplainUsesBoundControllerRevisionForPinAwareBaseRequests(t *testing.T)
 	}}, got.Content.Components[0].Requests.Base)
 	assert.Contains(t, got.Sources, reportv1alpha1.AcceleratorSourceReference{
 		Kind: "ControllerRevision", Namespace: "control-plane", Name: revisionName,
-		UID: "revision-uid", ResourceVersion: "31", Evidence: reportv1alpha1.EvidenceObserved,
+		UID: "revision-uid", Evidence: reportv1alpha1.EvidenceObserved,
 		CollectedAt: fixedCommandClock().Now(),
 	})
 }
@@ -284,7 +284,98 @@ func TestExplainNeverEmitsArbitraryServiceRuntimeOrClassPayloads(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, output.String(), secret)
 	assert.NotContains(t, output.String(), "private.example/token")
+	assert.NotContains(t, output.String(), "resourceVersion")
 	assert.Contains(t, output.String(), `"digest": "rs1:`)
+}
+
+func TestExplainProductionProjectionPreservesBaseRequestsWithoutSelector(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceService, *omev1beta1.ServingRuntime)
+		want   []reportv1alpha1.AcceleratorResourceRequest
+	}{
+		{
+			name: "direct service request",
+			mutate: func(isvc *omev1beta1.InferenceService, _ *omev1beta1.ServingRuntime) {
+				isvc.Spec.Engine.Runner.Container.Resources.Requests = corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("3"),
+				}
+			},
+			want: []reportv1alpha1.AcceleratorResourceRequest{{Name: "cpu", Quantity: "3"}},
+		},
+		{
+			name: "inherited runtime request",
+			mutate: func(_ *omev1beta1.InferenceService, runtimeObject *omev1beta1.ServingRuntime) {
+				runtimeObject.Spec.EngineConfig.Runner = &omev1beta1.RunnerSpec{
+					Container: corev1.Container{Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceName("example.com/gpu"): resource.MustParse("2"),
+						},
+					}},
+				}
+			},
+			want: []reportv1alpha1.AcceleratorResourceRequest{{
+				Name: "example.com/gpu", Quantity: "2",
+			}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc, runtimeObject, _ := acceleratorCommandFixtures()
+			isvc.Spec.AcceleratorSelector = nil
+			isvc.Status.Components = nil
+			runtimeObject.Spec.AcceleratorRequirements = nil
+			tt.mutate(isvc, runtimeObject)
+			f := factory.Static{
+				OME: omefake.NewSimpleClientset(isvc), Kube: k8sfake.NewSimpleClientset(),
+				Runtime: ctrlfake.NewClientBuilder().WithScheme(acceleratorScheme(t)).
+					WithObjects(runtimeObject).Build(),
+				NS: "prod",
+			}
+			var output bytes.Buffer
+			cmd := newExplainCmdWithDependencies(f, genericiooptions.IOStreams{
+				In: &bytes.Buffer{}, Out: &output, ErrOut: &bytes.Buffer{},
+			}, fixedExplainDependencies())
+			cmd.SetArgs([]string{"chat", "-o", "json"})
+
+			require.NoError(t, cmd.Execute())
+			var got reportv1alpha1.AcceleratorExplainReport
+			require.NoError(t, json.Unmarshal(output.Bytes(), &got))
+			require.Len(t, got.Content.Components, 1)
+			component := got.Content.Components[0]
+			assert.Equal(t, reportv1alpha1.AcceleratorSelectionNotConfigured,
+				component.Selection.State)
+			assert.Equal(t, reportv1alpha1.AcceleratorRequestsNotConfigured,
+				component.Requests.State)
+			assert.Equal(t, tt.want, component.Requests.Base)
+		})
+	}
+}
+
+func TestExplainProductionWideShowsAbsentRequestEvidenceAndProvenance(t *testing.T) {
+	isvc, runtimeObject, class := acceleratorCommandFixtures()
+	isvc.Status.Components[omev1beta1.EngineComponent].SelectedAccelerator.ResourceRequests = nil
+	f := factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, class), Kube: k8sfake.NewSimpleClientset(),
+		Runtime: ctrlfake.NewClientBuilder().WithScheme(acceleratorScheme(t)).
+			WithObjects(runtimeObject).Build(),
+		NS: "prod",
+	}
+	var output bytes.Buffer
+	cmd := newExplainCmdWithDependencies(f, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: &output, ErrOut: &bytes.Buffer{},
+	}, fixedExplainDependencies())
+	cmd.SetArgs([]string{"chat", "-o", "wide"})
+
+	require.NoError(t, cmd.Execute())
+	assert.Contains(t, output.String(), "STATUS_FRESHNESS")
+	assert.Contains(t, output.String(), "REASON_STATE")
+	assert.Contains(t, output.String(), "NotReported")
+	assert.Contains(t, output.String(), "RequestsNotReported")
+	assert.Contains(t, output.String(), "SOURCE")
+	assert.Contains(t, output.String(), "InferenceService")
+	assert.Contains(t, output.String(), "WARNING")
+	assert.NotContains(t, output.String(), "EFFECTIVE")
 }
 
 func TestExplainStaleStatusSkipsAcceleratorClassRead(t *testing.T) {
@@ -437,6 +528,59 @@ func TestExplainClassReadFailuresAreTypedAndDoNotEchoServerMessages(t *testing.T
 	}
 }
 
+func TestExplainPrimaryReadFailuresUseFixedSafeClassification(t *testing.T) {
+	const secret = "ghp_hostile-proxy-error-secret"
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "not found", err: apierrors.NewNotFound(
+			schema.GroupResource{Group: "ome.io", Resource: "inferenceservices"}, "chat",
+		), want: `read InferenceService "prod/chat": not found`},
+		{name: "unsupported API", err: &apierrors.StatusError{ErrStatus: metav1.Status{
+			Reason:  metav1.StatusReasonNotFound,
+			Message: "the server could not find the requested resource: " + secret,
+		}}, want: `read InferenceService "prod/chat": unsupported API`},
+		{name: "forbidden", err: apierrors.NewForbidden(
+			schema.GroupResource{Group: "ome.io", Resource: "inferenceservices"},
+			"chat", errors.New(secret),
+		), want: `read InferenceService "prod/chat": forbidden`},
+		{name: "unauthorized", err: apierrors.NewUnauthorized(secret),
+			want: `read InferenceService "prod/chat": forbidden`},
+		{name: "timeout", err: apierrors.NewTimeoutError(secret, 1),
+			want: `read InferenceService "prod/chat": timed out`},
+		{name: "unreadable", err: errors.New(secret),
+			want: `read InferenceService "prod/chat": unreadable`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			omeClient := omefake.NewSimpleClientset()
+			omeClient.PrependReactor(
+				"get", "inferenceservices",
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.err
+				},
+			)
+			cmd := newExplainCmdWithDependencies(
+				factory.Static{OME: omeClient, NS: "prod"},
+				genericiooptions.IOStreams{
+					In: &bytes.Buffer{}, Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{},
+				}, fixedExplainDependencies(),
+			)
+			cmd.SetArgs([]string{"chat"})
+
+			err := cmd.Execute()
+
+			require.Error(t, err)
+			assert.Equal(t, tt.want, err.Error())
+			assert.NotContains(t, err.Error(), secret)
+			assert.NotContains(t, fmt.Sprintf("%#v", err), secret)
+			assert.ErrorIs(t, err, tt.err)
+		})
+	}
+}
+
 func TestExplainMismatchedOrUnboundClassResponseBecomesInvalidEvidence(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -495,6 +639,7 @@ func TestExplainFormatsShareOneTypedProjection(t *testing.T) {
 
 			require.NoError(t, cmd.Execute())
 			assert.NotEmpty(t, output.String())
+			assert.NotContains(t, output.String(), "resourceVersion")
 			switch format {
 			case "table":
 				assert.Contains(t, output.String(), "COMP")
@@ -534,6 +679,18 @@ func TestExplainValidationAndWriterErrors(t *testing.T) {
 		NS:      "prod",
 	}, genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: failingWriter{}, ErrOut: &bytes.Buffer{}}, fixedExplainDependencies())
 	cmd.SetArgs([]string{"chat"})
+	require.ErrorContains(t, cmd.Execute(), "write accelerator explain report")
+
+	isvc, runtimeObject, class = acceleratorCommandFixtures()
+	cmd = newExplainCmdWithDependencies(factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, class), Kube: k8sfake.NewSimpleClientset(),
+		Runtime: ctrlfake.NewClientBuilder().WithScheme(acceleratorScheme(t)).
+			WithObjects(runtimeObject).Build(),
+		NS: "prod",
+	}, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: failingWriter{}, ErrOut: &bytes.Buffer{},
+	}, fixedExplainDependencies())
+	cmd.SetArgs([]string{"chat", "-o", "wide"})
 	require.ErrorContains(t, cmd.Execute(), "write accelerator explain report")
 }
 
@@ -638,6 +795,32 @@ func TestCollectAcceleratorEvidenceRejectsInvalidLimitsAndFactoryFailures(t *tes
 		namespace.NewOptions(), "chat", commandLimits(),
 	)
 	require.ErrorIs(t, err, clientFailure)
+
+	isvc, _, _ := acceleratorCommandFixtures()
+	kubeFailure := errors.New("Kubernetes client failed")
+	_, err = collectAcceleratorEvidence(
+		context.Background(), &acceleratorTrackingFactory{
+			namespace: "prod", ome: omefake.NewSimpleClientset(isvc), kubeErr: kubeFailure,
+		}, namespace.NewOptions(), "chat", commandLimits(),
+	)
+	require.ErrorIs(t, err, kubeFailure)
+
+	runtimeFailure := errors.New("runtime client failed")
+	_, err = collectAcceleratorEvidence(
+		context.Background(), &acceleratorTrackingFactory{
+			namespace: "prod", ome: omefake.NewSimpleClientset(isvc),
+			kube: k8sfake.NewSimpleClientset(), runtimeErr: runtimeFailure,
+		}, namespace.NewOptions(), "chat", commandLimits(),
+	)
+	require.ErrorIs(t, err, runtimeFailure)
+
+	canceledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = collectAcceleratorEvidence(
+		canceledContext, &acceleratorTrackingFactory{namespace: "prod"},
+		namespace.NewOptions(), "chat", commandLimits(),
+	)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func acceleratorCommandFixtures() (*omev1beta1.InferenceService, *omev1beta1.ServingRuntime, *omev1beta1.AcceleratorClass) {

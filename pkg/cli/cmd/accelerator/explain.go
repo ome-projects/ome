@@ -15,7 +15,6 @@ import (
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/acceleratorprojection"
-	"sigs.k8s.io/ome/pkg/cli/apierror"
 	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/namespace"
@@ -31,6 +30,30 @@ var (
 	errRuntimeRevisionIdentityMismatch  = errors.New("runtime revision response does not match the requested identity")
 	errRuntimeRevisionIdentityUnbound   = errors.New("runtime revision response could not be safely bound")
 )
+
+type primaryReadClassification string
+
+const (
+	primaryReadNotFound       primaryReadClassification = "not found"
+	primaryReadForbidden      primaryReadClassification = "forbidden"
+	primaryReadUnsupportedAPI primaryReadClassification = "unsupported API"
+	primaryReadTimedOut       primaryReadClassification = "timed out"
+	primaryReadUnreadable     primaryReadClassification = "unreadable"
+)
+
+type primaryInferenceServiceReadError struct {
+	target         string
+	classification primaryReadClassification
+	cause          error
+}
+
+func (e *primaryInferenceServiceReadError) Error() string {
+	return fmt.Sprintf("read InferenceService %q: %s", e.target, e.classification)
+}
+
+func (e *primaryInferenceServiceReadError) GoString() string { return e.Error() }
+
+func (e *primaryInferenceServiceReadError) Unwrap() error { return e.cause }
 
 type explainEvidence struct {
 	inferenceService *omev1beta1.InferenceService
@@ -193,10 +216,7 @@ func collectAcceleratorEvidence(
 	isvc, err := omeClient.OmeV1beta1().InferenceServices(resolved.WorkloadNamespace).
 		Get(acquisitionContext, name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf(
-			"get InferenceService %q: %w",
-			resolved.WorkloadNamespace+"/"+name, apierror.Friendly(err),
-		)
+		return nil, safePrimaryReadError(resolved.WorkloadNamespace, name, err)
 	}
 	if err := acquisitionContext.Err(); err != nil {
 		return nil, err
@@ -279,6 +299,39 @@ func collectAcceleratorEvidence(
 		classes[className] = observed
 	}
 	return &explainEvidence{inferenceService: isvc, base: base, classes: classes}, nil
+}
+
+func safePrimaryReadError(
+	namespace, name string,
+	cause error,
+) error {
+	classification := primaryReadUnreadable
+	switch {
+	case apierrors.IsForbidden(cause), apierrors.IsUnauthorized(cause):
+		classification = primaryReadForbidden
+	case unsupportedPrimaryAPI(cause):
+		classification = primaryReadUnsupportedAPI
+	case apierrors.IsNotFound(cause):
+		classification = primaryReadNotFound
+	case apierrors.IsTimeout(cause), apierrors.IsServerTimeout(cause),
+		errors.Is(cause, context.DeadlineExceeded):
+		classification = primaryReadTimedOut
+	}
+	return &primaryInferenceServiceReadError{
+		target: namespace + "/" + name, classification: classification, cause: cause,
+	}
+}
+
+func unsupportedPrimaryAPI(err error) bool {
+	if !apierrors.IsNotFound(err) {
+		return false
+	}
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	details := status.Status().Details
+	return details == nil || details.Name == ""
 }
 
 func validateRuntimeEvidence(
