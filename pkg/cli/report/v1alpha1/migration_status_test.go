@@ -151,6 +151,28 @@ func TestMigrationStatusTableNamesFreshnessAndIssueCodes(t *testing.T) {
 	}, table.Rows)
 }
 
+func TestMigrationStatusTableDeduplicatesOnlyExactScopedIssues(t *testing.T) {
+	t.Parallel()
+
+	document := MigrationStatusReport{Content: MigrationStatusContent{
+		Summary: MigrationSummary{State: MigrationReportStatePartial},
+		Issues: []MigrationIssue{
+			{Code: MigrationIssueSourceOwnerMismatch, SourceName: "chat-engine", Component: RuntimeComponentEngine},
+			{Code: MigrationIssueSourceOwnerMismatch, SourceName: "chat-engine", Component: RuntimeComponentEngine},
+			{Code: MigrationIssueSourceOwnerMismatch, SourceName: "chat-engine-shadow", Component: RuntimeComponentEngine},
+			{Code: MigrationIssueSourceOwnerMismatch, SourceName: "chat-router", Component: RuntimeComponentRouter},
+		},
+	}}
+
+	table := document.Table()
+
+	assert.Equal(t, [][]string{
+		{"REPORT/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"REPORT/engine", "Partial/Current", "SourceOwnerMismatch"},
+		{"REPORT/router", "Partial/Current", "SourceOwnerMismatch"},
+	}, table.Rows)
+}
+
 func TestMigrationStatusTableStaysWithin80ColumnsAtCommonTerminalWidths(t *testing.T) {
 	t.Parallel()
 

@@ -295,7 +295,7 @@ func (r MigrationStatusReport) Table() report.Table {
 	canonical := r.Canonical()
 	table := report.Table{Headers: []string{"REQUEST/COMP", "STATUS", "ISSUE"}}
 	table.Rows = make([][]string, 0, len(canonical.Content.Migrations)+len(canonical.Content.Issues))
-	seenIssues := make(map[MigrationIssueCode]struct{})
+	seenIssues := make(map[MigrationIssue]struct{})
 	for _, migration := range canonical.Content.Migrations {
 		subject := compactRequestID(migration.RequestID) + "/" + compactComponent(migration.Component)
 		status := compactPhase(migration.Phase) + "/" + compactClassification(migration.Classification) + "/" + compactFreshness(migration.Freshness)
@@ -305,18 +305,21 @@ func (r MigrationStatusReport) Table() report.Table {
 		}
 		for _, code := range migration.Issues {
 			table.Rows = append(table.Rows, []string{subject, status, compactMigrationIssueCode(code)})
-			seenIssues[code] = struct{}{}
+			seenIssues[MigrationIssue{
+				Code: code, SourceName: migration.SourceName, RequestID: migration.RequestID,
+				Component: migration.Component,
+			}] = struct{}{}
 		}
 	}
 	status := compactReportState(canonical.Content.Summary.State) + "/" + reportFreshness(canonical)
 	for _, issue := range canonical.Content.Issues {
-		if _, seen := seenIssues[issue.Code]; seen {
+		if _, seen := seenIssues[issue]; seen {
 			continue
 		}
 		table.Rows = append(table.Rows, []string{
 			compactMigrationIssueSubject(issue), status, compactMigrationIssueCode(issue.Code),
 		})
-		seenIssues[issue.Code] = struct{}{}
+		seenIssues[issue] = struct{}{}
 	}
 	if len(table.Rows) == 0 {
 		table.Rows = [][]string{{"-/-", status, "-"}}
