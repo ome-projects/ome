@@ -18,7 +18,7 @@ const schedulingSimulationUnavailable = "SimulationUnavailable"
 // Candidate is copied by value, and its diagnostic is newly allocated so
 // policies can retain their output without sharing mutable engine state.
 func gateSchedulingCandidate(snap *snapshot.ClusterSnapshot, cfg *config.Config, c policy.Candidate) policy.Candidate {
-	if c.Mode != constants.OMENative || c.Instance < 0 {
+	if c.Mode != constants.OMENative || (c.Instance < 0 && !c.Executable) {
 		return c
 	}
 	diagnostic := schedulingDiagnostic(snap, cfg, c)

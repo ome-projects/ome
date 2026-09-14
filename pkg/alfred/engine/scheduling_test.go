@@ -118,6 +118,9 @@ func TestRunOnceSchedulingDiagnostics(t *testing.T) {
 		{name: "invalid component observation", mutate: func(comp *snapshot.Component, _ *policy.Candidate) { comp.ObservationValid = false }, wantStatus: "Unavailable", wantReason: "OMENativeObservationInvalid"},
 		{name: "invalid instance observation", mutate: func(comp *snapshot.Component, _ *policy.Candidate) { comp.Instances[0].ObservationValid = false }, wantStatus: "Unavailable", wantReason: "OMENativeObservationInvalid"},
 		{name: "missing instance", mutate: func(comp *snapshot.Component, _ *policy.Candidate) { comp.Instances = nil }, wantStatus: "Unavailable", wantReason: "OMENativeObservationInvalid"},
+		{name: "executable component-wide", mutate: func(_ *snapshot.Component, c *policy.Candidate) {
+			c.Instance = policy.ComponentWideInstance
+		}, wantStatus: "Unavailable", wantReason: "OMENativeObservationInvalid"},
 		{name: "missing templates", mutate: func(comp *snapshot.Component, _ *policy.Candidate) { comp.IR.Spec.Runners = nil }, wantStatus: "Unavailable", wantReason: "NoTemplates"},
 		{name: "invalid runner size", mutate: func(comp *snapshot.Component, _ *policy.Candidate) { comp.IR.Spec.Runners[0].Size = 0 }, wantStatus: "Unavailable", wantReason: "OMENativeObservationInvalid"},
 		{name: "runner size needs gang", mutate: func(comp *snapshot.Component, _ *policy.Candidate) { comp.IR.Spec.Runners[0].Size = 2 }, wantScheduler: "default-scheduler", wantBackend: "kube-worker", wantStatus: "Unsupported", wantReason: "GangUnsupported"},
@@ -236,7 +239,7 @@ scheduling:
 	p.out = []policy.Candidate{c}
 	loop.RunOnce(context.Background())
 	got = readSchedulingRecommendation(t, reporter)
-	if got.Scheduling != nil || got.AdvisoryReason != policy.AdvisoryVolumePinned {
+	if got.Outcome != OutcomeAdvisory || got.Scheduling != nil || got.AdvisoryReason != policy.AdvisoryVolumePinned {
 		t.Fatalf("component-wide advice changed: %+v", got)
 	}
 
