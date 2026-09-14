@@ -748,7 +748,17 @@ func TestProjectUnknownComponentAndHostileFieldsCannotLeak(t *testing.T) {
 	assert.Empty(t, got.Content.Components)
 	assert.Equal(t, []reportv1alpha1.AutoscaleIssue{{Code: reportv1alpha1.AutoscaleIssueUnknownComponentStatus}}, got.Content.Issues)
 
-	for _, format := range []report.Format{report.FormatTable, report.FormatJSON, report.FormatYAML} {
+	var compact bytes.Buffer
+	require.NoError(t, report.Write(&compact, report.FormatTable, got))
+	assert.Contains(t, compact.String(), "UnknownCom...")
+	assert.NotContains(t, compact.String(), "SECRET_")
+
+	var wide bytes.Buffer
+	require.NoError(t, got.WideTable().Write(&wide))
+	assert.Contains(t, wide.String(), string(reportv1alpha1.AutoscaleIssueUnknownComponentStatus))
+	assert.NotContains(t, wide.String(), "SECRET_")
+
+	for _, format := range []report.Format{report.FormatJSON, report.FormatYAML} {
 		var output bytes.Buffer
 		require.NoError(t, report.Write(&output, format, got))
 		assert.Contains(t, output.String(), string(reportv1alpha1.AutoscaleIssueUnknownComponentStatus))

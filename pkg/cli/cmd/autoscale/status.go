@@ -58,18 +58,20 @@ func newStatusCmd(
 		Short: "Show controller-reported autoscaling status",
 		Long: `Show autoscaling evidence already reported on the InferenceService parent.
 It does not query HPA, KEDA ScaledObject, Deployment, or InferenceReplica
-objects, so "Reported" describes controller-reported evidence, not freshness.`,
+objects, so "Reported" describes controller-reported evidence, not freshness.
+The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
+as UTC MonDD HH:MMZ; use -o wide for complete identities and timestamps.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.run(cmd.Context(), f, args[0])
 		},
 	}
-	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, json or yaml")
+	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
 }
 
 func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string) error {
-	format, err := report.ParseFormat(o.output)
+	format, wide, err := parseAutoscaleStatusOutput(o.output)
 	if err != nil {
 		return err
 	}
@@ -112,8 +114,27 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 	if err != nil {
 		return fmt.Errorf("project autoscale status for InferenceService %q: %w", namespace+"/"+name, err)
 	}
+	if wide {
+		if err := reportValue.WideTable().Write(o.Out); err != nil {
+			return fmt.Errorf("write autoscale status: %w", err)
+		}
+		return nil
+	}
 	if err := report.Write(o.Out, format, reportValue); err != nil {
 		return fmt.Errorf("write autoscale status: %w", err)
 	}
 	return nil
+}
+
+func parseAutoscaleStatusOutput(value string) (report.Format, bool, error) {
+	if value == "wide" {
+		return report.FormatTable, true, nil
+	}
+	format, err := report.ParseFormat(value)
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"unsupported output format %q (supported: table, wide, json, yaml)", value,
+		)
+	}
+	return format, false, nil
 }

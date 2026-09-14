@@ -2,6 +2,7 @@ package v1alpha1_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -222,6 +223,26 @@ func TestAutoscaleStatusTableUsesOnlyTypedReportedEvidence(t *testing.T) {
 	reportValue := autoscaleStatusFixture()
 
 	assert.Equal(t, report.Table{
+		Headers: []string{"FIELD", "SERVICE", "ENGINE", "DECODER", "ROUTER"},
+		Rows: [][]string{
+			{"STATE", "Reported", "Reported", "-", "-"},
+			{"CLASS", "-", "HPA", "-", "-"},
+			{"MANAGED-BY", "-", "ome", "-", "-"},
+			{"SPEC-SOURCE", "-", "default", "-", "-"},
+			{"TARGET-KIND", "-", "IR", "-", "-"},
+			{"TARGET-NAME", "-", "chat-engine", "-", "-"},
+			{"TARGET-EVIDENCE", "-", "Reported", "-", "-"},
+			{"CURRENT", "-", "2", "-", "-"},
+			{"DESIRED", "-", "3", "-", "-"},
+			{"REPLICA-EVIDENCE", "-", "Reported", "-", "-"},
+			{"LAST-SCALE", "-", "Aug31 18:20Z", "-", "-"},
+			{"COND-EVIDENCE", "-", "Reported", "-", "-"},
+			{"ABLE-TO-SCALE", "-", "True", "-", "-"},
+			{"SCALING-ACTIVE", "-", "True", "-", "-"},
+		},
+	}, reportValue.Table())
+
+	assert.Equal(t, report.Table{
 		Headers: []string{
 			"STATE", "COMPONENT", "COMPONENT-STATE", "CLASS", "MANAGED-BY", "SPEC-SOURCE",
 			"TARGET", "TARGET-EVIDENCE", "CURRENT", "DESIRED", "REPLICA-EVIDENCE", "LAST-SCALE", "CONDITION-EVIDENCE", "CONDITIONS", "ISSUES",
@@ -231,13 +252,26 @@ func TestAutoscaleStatusTableUsesOnlyTypedReportedEvidence(t *testing.T) {
 			"InferenceReplica/prod/chat-engine", "Reported", "2", "3", "Reported", "2026-08-31T18:20:00Z",
 			"Reported", "AbleToScale=True,ScalingActive=True", "-",
 		}},
-	}, reportValue.Table())
+	}, reportValue.WideTable())
 
 	var output bytes.Buffer
 	require.NoError(t, report.Write(&output, report.FormatTable, reportValue))
 	assert.Equal(t,
-		"STATE      COMPONENT   COMPONENT-STATE   CLASS   MANAGED-BY   SPEC-SOURCE   TARGET                              TARGET-EVIDENCE   CURRENT   DESIRED   REPLICA-EVIDENCE   LAST-SCALE             CONDITION-EVIDENCE   CONDITIONS                            ISSUES\n"+
-			"Reported   engine      Reported          HPA     ome          default       InferenceReplica/prod/chat-engine   Reported          2         3         Reported           2026-08-31T18:20:00Z   Reported             AbleToScale=True,ScalingActive=True   -\n",
+		"FIELD              SERVICE    ENGINE         DECODER   ROUTER\n"+
+			"STATE              Reported   Reported       -         -\n"+
+			"CLASS              -          HPA            -         -\n"+
+			"MANAGED-BY         -          ome            -         -\n"+
+			"SPEC-SOURCE        -          default        -         -\n"+
+			"TARGET-KIND        -          IR             -         -\n"+
+			"TARGET-NAME        -          chat-engine    -         -\n"+
+			"TARGET-EVIDENCE    -          Reported       -         -\n"+
+			"CURRENT            -          2              -         -\n"+
+			"DESIRED            -          3              -         -\n"+
+			"REPLICA-EVIDENCE   -          Reported       -         -\n"+
+			"LAST-SCALE         -          Aug31 18:20Z   -         -\n"+
+			"COND-EVIDENCE      -          Reported       -         -\n"+
+			"ABLE-TO-SCALE      -          True           -         -\n"+
+			"SCALING-ACTIVE     -          True           -         -\n",
 		output.String())
 }
 
@@ -259,9 +293,12 @@ func TestAutoscaleStatusTableSurfacesGlobalIssuesWithoutEchoingUnknownComponents
 	}
 
 	table := content.Table()
-	require.Len(t, table.Rows, 1)
-	assert.Equal(t, "ScaleTargetNotReported,UnknownComponentStatus", table.Rows[0][14])
-	assert.NotContains(t, strings.Join(table.Rows[0], " "), "SECRET_COMPONENT")
+	require.NotEmpty(t, table.Rows)
+	issues := table.Rows[len(table.Rows)-1]
+	assert.Equal(t, "ISSUES", issues[0])
+	assert.Equal(t, "UnknownCom...", issues[1])
+	assert.Equal(t, "ScaleTarge...", issues[2])
+	assert.NotContains(t, strings.Join(issues, " "), "SECRET_COMPONENT")
 }
 
 func TestAutoscaleStatusTableShowsUnavailableSummaryWithoutComponents(t *testing.T) {
@@ -272,9 +309,92 @@ func TestAutoscaleStatusTableShowsUnavailableSummaryWithoutComponents(t *testing
 	}
 
 	table := content.Table()
-	assert.Equal(t, [][]string{{
-		"Unavailable", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
-	}}, table.Rows)
+	assert.Equal(t, [][]string{{"STATE", "Unavailable", "-", "-", "-"}}, table.Rows)
+}
+
+func TestAutoscaleStatusCompactTableBoundsThreeComponents(t *testing.T) {
+	reportValue := autoscaleStatusFixture()
+	base := reportValue.Content.Components[0]
+	reportValue.Content.Components = nil
+	for _, componentType := range []v1alpha1.RuntimeComponentType{
+		v1alpha1.RuntimeComponentEngine,
+		v1alpha1.RuntimeComponentDecoder,
+		v1alpha1.RuntimeComponentRouter,
+	} {
+		component := base
+		component.Type = componentType
+		component.Target.Name = strings.Repeat(string(componentType)+"-", 20) + "target"
+		reportValue.Content.Components = append(reportValue.Content.Components, component)
+		reportValue.Content.Issues = append(reportValue.Content.Issues, v1alpha1.AutoscaleIssue{
+			Code: v1alpha1.AutoscaleIssueUnexpectedScalerEvidence, Component: componentType,
+		})
+	}
+
+	var output bytes.Buffer
+	require.NoError(t, report.Write(&output, report.FormatTable, reportValue))
+	for _, line := range strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n") {
+		assert.LessOrEqual(t, len([]rune(line)), 80, "line %q", line)
+	}
+	assert.NotContains(t, output.String(), strings.Repeat("engine-", 20))
+
+	encoded, err := json.Marshal(reportValue.Canonical())
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), strings.Repeat("engine-", 20)+"target")
+}
+
+func TestAutoscaleStatusCompactTableCoversDeploymentAndConditionStates(t *testing.T) {
+	content := v1alpha1.AutoscaleStatusContent{
+		Summary: v1alpha1.AutoscaleSummary{State: v1alpha1.AutoscaleStatePartial},
+		Components: []v1alpha1.AutoscaleComponentStatus{{
+			Type:       v1alpha1.RuntimeComponentEngine,
+			State:      v1alpha1.AutoscaleComponentPartial,
+			Class:      v1alpha1.AutoscaleClassKEDA,
+			ManagedBy:  v1alpha1.AutoscaleManagedByExternal,
+			SpecSource: v1alpha1.AutoscaleSpecSourcePolicy,
+			Target: v1alpha1.AutoscaleTarget{
+				State: v1alpha1.AutoscaleTargetReported,
+				Kind:  v1alpha1.AutoscaleTargetDeployment,
+				Name:  "an-extremely-long-deployment-name",
+			},
+			Replicas: v1alpha1.AutoscaleReplicaStatus{State: v1alpha1.AutoscaleReplicasUnavailable},
+			Conditions: v1alpha1.AutoscaleConditionsStatus{
+				State: v1alpha1.AutoscaleConditionsReported,
+				Items: []v1alpha1.AutoscaleCondition{
+					{Type: v1alpha1.AutoscaleConditionScalingLimited, Status: v1alpha1.AutoscaleConditionFalse},
+					{Type: v1alpha1.AutoscaleConditionReady, Status: v1alpha1.AutoscaleConditionTrue},
+					{Type: v1alpha1.AutoscaleConditionActive, Status: v1alpha1.AutoscaleConditionUnknown},
+					{Type: v1alpha1.AutoscaleConditionFallback, Status: v1alpha1.AutoscaleConditionFalse},
+					{Type: v1alpha1.AutoscaleConditionPaused, Status: v1alpha1.AutoscaleConditionTrue},
+				},
+			},
+		}},
+	}
+
+	rows := make(map[string][]string)
+	for _, row := range content.Table().Rows {
+		rows[row[0]] = row
+	}
+	assert.Equal(t, "Deployment", rows["TARGET-KIND"][2])
+	assert.Equal(t, "an-ex...-name", rows["TARGET-NAME"][2])
+	assert.Equal(t, "False", rows["SCALING-LIMITED"][2])
+	assert.Equal(t, "True", rows["READY"][2])
+	assert.Equal(t, "Unknown", rows["ACTIVE"][2])
+	assert.Equal(t, "False", rows["FALLBACK"][2])
+	assert.Equal(t, "True", rows["PAUSED"][2])
+}
+
+func TestAutoscaleStatusCompactTableDoesNotEchoUnknownComponentNames(t *testing.T) {
+	content := v1alpha1.AutoscaleStatusContent{
+		Summary: v1alpha1.AutoscaleSummary{State: v1alpha1.AutoscaleStateInvalid},
+		Components: []v1alpha1.AutoscaleComponentStatus{{
+			Type: v1alpha1.RuntimeComponentType("SECRET_COMPONENT"),
+		}},
+	}
+
+	table := content.Table()
+	require.Len(t, table.Rows, 2)
+	assert.Equal(t, []string{"OTHER", "1 omitted", "-", "-", "-"}, table.Rows[1])
+	assert.NotContains(t, strings.Join(table.Rows[1], " "), "SECRET_COMPONENT")
 }
 
 func autoscaleStatusFixture() v1alpha1.AutoscaleStatusReport {

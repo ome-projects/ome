@@ -45,8 +45,21 @@ func TestStatusGetsOneInferenceServiceAndWritesExactTable(t *testing.T) {
 	require.NotNil(t, projected)
 	assert.Equal(t, isvc.ObjectMeta, projected.ObjectMeta)
 	assert.Equal(t,
-		"STATE      COMPONENT   COMPONENT-STATE   CLASS   MANAGED-BY   SPEC-SOURCE   TARGET                              TARGET-EVIDENCE   CURRENT   DESIRED   REPLICA-EVIDENCE   LAST-SCALE             CONDITION-EVIDENCE   CONDITIONS                            ISSUES\n"+
-			"Reported   engine      Reported          HPA     ome          default       InferenceReplica/prod/chat-engine   Reported          2         3         Reported           2026-08-31T18:20:00Z   Reported             AbleToScale=True,ScalingActive=True   -\n",
+		"FIELD              SERVICE    ENGINE         DECODER   ROUTER\n"+
+			"STATE              Reported   Reported       -         -\n"+
+			"CLASS              -          HPA            -         -\n"+
+			"MANAGED-BY         -          ome            -         -\n"+
+			"SPEC-SOURCE        -          default        -         -\n"+
+			"TARGET-KIND        -          IR             -         -\n"+
+			"TARGET-NAME        -          chat-engine    -         -\n"+
+			"TARGET-EVIDENCE    -          Reported       -         -\n"+
+			"CURRENT            -          2              -         -\n"+
+			"DESIRED            -          3              -         -\n"+
+			"REPLICA-EVIDENCE   -          Reported       -         -\n"+
+			"LAST-SCALE         -          Aug31 18:20Z   -         -\n"+
+			"COND-EVIDENCE      -          Reported       -         -\n"+
+			"ABLE-TO-SCALE      -          True           -         -\n"+
+			"SCALING-ACTIVE     -          True           -         -\n",
 		out,
 	)
 	require.Len(t, client.Actions(), 1)
@@ -67,7 +80,7 @@ func TestStatusValidatesArgumentsBeforeFactoryAccess(t *testing.T) {
 	}{
 		{name: "missing name", want: "accepts 1 arg(s), received 0"},
 		{name: "extra name", args: []string{"chat", "other"}, want: "accepts 1 arg(s), received 2"},
-		{name: "unsupported output", args: []string{"chat", "--output", "wide"}, want: `unsupported output format "wide"`},
+		{name: "unsupported output", args: []string{"chat", "--output", "toml"}, want: `unsupported output format "toml"`},
 		{name: "invalid name", args: []string{"Bad_Name"}, want: `invalid InferenceService name "Bad_Name"`},
 	}
 	for _, tt := range tests {
@@ -77,6 +90,30 @@ func TestStatusValidatesArgumentsBeforeFactoryAccess(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.want)
 		})
 	}
+}
+
+func TestStatusWidePreservesCompleteLegacyTable(t *testing.T) {
+	isvc := &omev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+		Name: "chat", Namespace: "prod", UID: types.UID("uid-chat"),
+	}}
+	deps := statusDependencies{project: func(
+		*omev1beta1.InferenceService,
+		reportv1alpha1.Clock,
+	) (reportv1alpha1.AutoscaleStatusReport, error) {
+		return commandReportFixture(), nil
+	}}
+
+	out, err := executeStatus(
+		t, factory.Static{OME: omefake.NewSimpleClientset(isvc), NS: "prod"},
+		deps, "chat", "--output", "wide",
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t,
+		"STATE      COMPONENT   COMPONENT-STATE   CLASS   MANAGED-BY   SPEC-SOURCE   TARGET                              TARGET-EVIDENCE   CURRENT   DESIRED   REPLICA-EVIDENCE   LAST-SCALE             CONDITION-EVIDENCE   CONDITIONS                            ISSUES\n"+
+			"Reported   engine      Reported          HPA     ome          default       InferenceReplica/prod/chat-engine   Reported          2         3         Reported           2026-08-31T18:20:00Z   Reported             AbleToScale=True,ScalingActive=True   -\n",
+		out,
+	)
 }
 
 func TestStatusRejectsUnboundInferenceServiceResponses(t *testing.T) {
@@ -257,6 +294,26 @@ func TestStatusReturnsProjectionAndWriterErrors(t *testing.T) {
 			}},
 		)
 		cmd.SetArgs([]string{"chat"})
+
+		err := cmd.Execute()
+
+		require.ErrorIs(t, err, wantErr)
+		assert.Contains(t, err.Error(), "write autoscale status")
+	})
+
+	t.Run("wide writer", func(t *testing.T) {
+		wantErr := errors.New("wide writer failed")
+		cmd := newStatusCmd(
+			factory.Static{OME: omefake.NewSimpleClientset(isvc), NS: "prod"},
+			genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: errorWriter{err: wantErr}, ErrOut: &bytes.Buffer{}},
+			statusDependencies{project: func(
+				*omev1beta1.InferenceService,
+				reportv1alpha1.Clock,
+			) (reportv1alpha1.AutoscaleStatusReport, error) {
+				return commandReportFixture(), nil
+			}},
+		)
+		cmd.SetArgs([]string{"chat", "--output", "wide"})
 
 		err := cmd.Execute()
 

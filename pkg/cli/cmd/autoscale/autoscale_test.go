@@ -99,12 +99,14 @@ func TestStatusHelpDefinesTheReportedEvidenceBoundary(t *testing.T) {
 	assert.Equal(t, `Show autoscaling evidence already reported on the InferenceService parent.
 It does not query HPA, KEDA ScaledObject, Deployment, or InferenceReplica
 objects, so "Reported" describes controller-reported evidence, not freshness.
+The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
+as UTC MonDD HH:MMZ; use -o wide for complete identities and timestamps.
 
 Usage:
   autoscale status INFERENCESERVICE [flags]
 
 Flags:
   -h, --help            help for status
-  -o, --output string   Output format: table, json or yaml (default "table")
+  -o, --output string   Output format: table, wide, json or yaml (default "table")
 `, output.String())
 }
