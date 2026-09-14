@@ -1,9 +1,12 @@
 package status
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"knative.dev/pkg/apis"
@@ -16,6 +19,401 @@ import (
 // aggregate Ready last.
 var componentOrder = []v1beta1.ComponentType{
 	v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent,
+}
+
+const (
+	maxCompactSummaryRunes      = 64
+	maxCompactComponentRunes    = 12
+	maxCompactExtraComponents   = 5
+	maxCompactRestartExact      = 9999999
+	maxCompactWarnings          = 5
+	maxCompactWarningRunes      = 72
+	maxCompactEvents            = 5
+	maxCompactEventObjectRunes  = 24
+	maxCompactEventReasonRunes  = 20
+	maxCompactEventMessageRunes = 28
+)
+
+func renderCompact(r *report, w io.Writer) error {
+	isvc := r.ISVC
+	ready := "Unknown"
+	readyCondition := isvc.Status.GetCondition(apis.ConditionReady)
+	if readyCondition != nil {
+		ready = compactConditionStatus(readyCondition.Status)
+	}
+	runtime := "(auto-selected)"
+	if isvc.Spec.Runtime != nil {
+		runtime = isvc.Spec.Runtime.Name
+	}
+	summary := printers.Table{
+		Headers: []string{"FIELD", "VALUE"},
+		Rows: [][]string{
+			{"NAME", compactMiddle(isvc.Name, maxCompactSummaryRunes)},
+			{"NAMESPACE", compactMiddle(isvc.Namespace, maxCompactSummaryRunes)},
+			{"READY", ready},
+		},
+	}
+	if readyCondition != nil && readyCondition.Reason != "" {
+		summary.Rows = append(summary.Rows, []string{
+			"READY-REASON", compactText(readyCondition.Reason, maxCompactSummaryRunes),
+		})
+	}
+	if isvc.Status.URL != nil {
+		summary.Rows = append(summary.Rows, []string{
+			"URL", compactMiddle(isvc.Status.URL.String(), maxCompactSummaryRunes),
+		})
+	}
+	if isvc.Spec.Model != nil {
+		summary.Rows = append(summary.Rows, []string{
+			"MODEL", compactMiddle(isvc.Spec.Model.Name, maxCompactSummaryRunes),
+		})
+	}
+	if isvc.Status.ModelStatus.TransitionStatus != "" {
+		summary.Rows = append(summary.Rows, []string{
+			"MODEL-STATE", compactText(string(isvc.Status.ModelStatus.TransitionStatus), maxCompactSummaryRunes),
+		})
+	}
+	summary.Rows = append(summary.Rows, []string{
+		"RUNTIME", compactMiddle(runtime, maxCompactSummaryRunes),
+	})
+	if err := summary.WriteSanitized(w); err != nil {
+		return err
+	}
+
+	components, omittedComponents := compactComponentTable(r)
+	if len(components.Rows) > 0 {
+		if err := writeStatusf(w, "\n"); err != nil {
+			return err
+		}
+		if err := components.WriteSanitized(w); err != nil {
+			return err
+		}
+		if omittedComponents > 0 {
+			if err := writeStatusf(
+				w, "... %d more %s; use -o wide\n",
+				omittedComponents, plural("component", omittedComponents),
+			); err != nil {
+				return err
+			}
+		}
+		if err := writeStatusf(
+			w,
+			"Phase key: R=Running P=Pending F=Failed S=Succeeded U=Unknown T=Terminating\n",
+		); err != nil {
+			return err
+		}
+	}
+
+	if err := writeStatusf(w, "\n"); err != nil {
+		return err
+	}
+	features := printers.Table{
+		Headers: []string{"FEATURE", "STATUS"},
+		Rows: [][]string{
+			{"TRAFFIC", compactPresence(isvc.Status.Traffic != nil)},
+			{"ROLLOUT", compactRolloutPresence(isvc)},
+		},
+	}
+	if err := features.WriteSanitized(w); err != nil {
+		return err
+	}
+
+	if len(r.Warnings) > 0 {
+		if err := writeStatusf(w, "\nObservation Warnings:\n"); err != nil {
+			return err
+		}
+		warnings := printers.Table{Headers: []string{"WARNING"}}
+		limit := min(len(r.Warnings), maxCompactWarnings)
+		for _, warning := range r.Warnings[:limit] {
+			warnings.Rows = append(warnings.Rows, []string{
+				compactText(warning, maxCompactWarningRunes),
+			})
+		}
+		if omitted := len(r.Warnings) - limit; omitted > 0 {
+			warnings.Rows = append(warnings.Rows, []string{
+				fmt.Sprintf("... %d more %s; use -o wide", omitted, plural("warning", omitted)),
+			})
+		}
+		if err := warnings.WriteSanitized(w); err != nil {
+			return err
+		}
+	}
+
+	if len(r.Events) > 0 {
+		if err := writeStatusf(w, "\nRecent Warning Events:\n"); err != nil {
+			return err
+		}
+		events := printers.Table{Headers: []string{"OBJECT", "REASON", "MESSAGE"}}
+		recent := compactRecentEvents(r.Events)
+		limit := min(len(recent), maxCompactEvents)
+		for _, event := range recent[:limit] {
+			events.Rows = append(events.Rows, []string{
+				compactMiddle(
+					printers.OrDash(event.InvolvedObject.Kind)+"/"+printers.OrDash(event.InvolvedObject.Name),
+					maxCompactEventObjectRunes,
+				),
+				compactText(event.Reason, maxCompactEventReasonRunes),
+				compactText(event.Message, maxCompactEventMessageRunes),
+			})
+		}
+		if err := events.WriteSanitized(w); err != nil {
+			return err
+		}
+		if omitted := len(recent) - limit; omitted > 0 {
+			return writeStatusf(
+				w, "... %d more %s; use -o wide\n", omitted, plural("event", omitted),
+			)
+		}
+	}
+	return nil
+}
+
+func compactRecentEvents(events []corev1.Event) []corev1.Event {
+	recent := append([]corev1.Event(nil), events...)
+	sort.SliceStable(recent, func(i, j int) bool {
+		leftTime := compactEventTime(recent[i])
+		rightTime := compactEventTime(recent[j])
+		if !leftTime.Equal(rightTime) {
+			return leftTime.After(rightTime)
+		}
+		return cmp.Or(
+			cmp.Compare(recent[i].Namespace, recent[j].Namespace),
+			cmp.Compare(recent[i].Name, recent[j].Name),
+			cmp.Compare(recent[i].InvolvedObject.Kind, recent[j].InvolvedObject.Kind),
+			cmp.Compare(recent[i].InvolvedObject.Namespace, recent[j].InvolvedObject.Namespace),
+			cmp.Compare(recent[i].InvolvedObject.Name, recent[j].InvolvedObject.Name),
+			cmp.Compare(string(recent[i].InvolvedObject.UID), string(recent[j].InvolvedObject.UID)),
+			cmp.Compare(recent[i].Reason, recent[j].Reason),
+			cmp.Compare(recent[i].Message, recent[j].Message),
+		) < 0
+	})
+	return recent
+}
+
+func compactEventTime(event corev1.Event) time.Time {
+	if event.Series != nil && !event.Series.LastObservedTime.IsZero() {
+		return event.Series.LastObservedTime.Time
+	}
+	if !event.LastTimestamp.IsZero() {
+		return event.LastTimestamp.Time
+	}
+	if !event.EventTime.IsZero() {
+		return event.EventTime.Time
+	}
+	if !event.FirstTimestamp.IsZero() {
+		return event.FirstTimestamp.Time
+	}
+	return event.CreationTimestamp.Time
+}
+
+func compactPresence(present bool) string {
+	if present {
+		return "present"
+	}
+	return "-"
+}
+
+func compactRolloutPresence(isvc *v1beta1.InferenceService) string {
+	var sources []string
+	if isvc.Status.Rollout != nil {
+		sources = append(sources, "run")
+	}
+	if isvc.Status.Canary != nil {
+		sources = append(sources, "canary")
+	}
+	if isvc.Status.RolloutCoordination != nil {
+		sources = append(sources, "coordination")
+	}
+	if len(sources) == 0 {
+		return "-"
+	}
+	return strings.Join(sources, ",")
+}
+
+func compactComponentTable(r *report) (printers.Table, int) {
+	table := printers.Table{
+		Headers: []string{"COMPONENT", "STATUS", "READY-PODS", "RESTARTS", "PHASES"},
+	}
+	seen := make(map[v1beta1.ComponentType]bool, len(componentOrder))
+	for _, component := range componentOrder {
+		seen[component] = true
+		if _, inStatus := r.ISVC.Status.Components[component]; !inStatus &&
+			len(r.Pods[component]) == 0 && compactComponentCondition(r.ISVC, component) == nil {
+			continue
+		}
+		table.Rows = append(table.Rows, compactComponentRow(r, component))
+	}
+
+	remainingSet := make(map[v1beta1.ComponentType]struct{})
+	for component := range r.ISVC.Status.Components {
+		if !seen[component] {
+			remainingSet[component] = struct{}{}
+		}
+	}
+	for component := range r.Pods {
+		if !seen[component] {
+			remainingSet[component] = struct{}{}
+		}
+	}
+	remaining := make([]v1beta1.ComponentType, 0, len(remainingSet))
+	for component := range remainingSet {
+		remaining = append(remaining, component)
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
+	visible := min(len(remaining), maxCompactExtraComponents)
+	for _, component := range remaining[:visible] {
+		table.Rows = append(table.Rows, compactComponentRow(r, component))
+	}
+	omitted := len(remaining) - visible
+	if omitted > 0 {
+		var pods []corev1.Pod
+		for _, component := range remaining[visible:] {
+			pods = append(pods, r.Pods[component]...)
+		}
+		table.Rows = append(table.Rows, compactPodsRow(
+			fmt.Sprintf("(%d more)", omitted), "-", pods,
+		))
+	}
+	return table, omitted
+}
+
+func compactComponentRow(r *report, component v1beta1.ComponentType) []string {
+	condition := "-"
+	if observed := compactComponentCondition(r.ISVC, component); observed != nil {
+		condition = compactConditionStatus(observed.Status)
+	}
+	return compactPodsRow(componentLabel(component), condition, r.Pods[component])
+}
+
+func compactPodsRow(label, condition string, pods []corev1.Pod) []string {
+	ready := 0
+	var restarts int64
+	phaseCounts := make(map[string]int)
+	for _, pod := range pods {
+		if compactPodReady(pod) {
+			ready++
+		}
+		for _, status := range pod.Status.ContainerStatuses {
+			restarts += int64(status.RestartCount)
+		}
+		phaseCounts[compactPodPhase(pod)]++
+	}
+	return []string{
+		compactText(label, maxCompactComponentRunes),
+		condition,
+		fmt.Sprintf("%d/%d", ready, len(pods)),
+		compactRestartCount(restarts),
+		compactPhaseSummary(phaseCounts),
+	}
+}
+
+func compactConditionStatus(status corev1.ConditionStatus) string {
+	switch status {
+	case corev1.ConditionTrue, corev1.ConditionFalse, corev1.ConditionUnknown:
+		return string(status)
+	default:
+		return "Unknown"
+	}
+}
+
+func compactRestartCount(restarts int64) string {
+	if restarts > maxCompactRestartExact {
+		return fmt.Sprintf(">%d", maxCompactRestartExact)
+	}
+	return fmt.Sprintf("%d", restarts)
+}
+
+func compactComponentCondition(
+	isvc *v1beta1.InferenceService,
+	component v1beta1.ComponentType,
+) *apis.Condition {
+	var conditionType apis.ConditionType
+	switch component {
+	case v1beta1.EngineComponent:
+		conditionType = v1beta1.EngineReady
+	case v1beta1.DecoderComponent:
+		conditionType = v1beta1.DecoderReady
+	case v1beta1.RouterComponent:
+		conditionType = v1beta1.RouterReady
+	default:
+		return nil
+	}
+	return isvc.Status.GetCondition(conditionType)
+}
+
+func compactPodReady(pod corev1.Pod) bool {
+	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func compactPodPhase(pod corev1.Pod) string {
+	if pod.DeletionTimestamp != nil {
+		return "Terminating"
+	}
+	switch pod.Status.Phase {
+	case corev1.PodPending:
+		return "Pending"
+	case corev1.PodRunning:
+		return "Running"
+	case corev1.PodSucceeded:
+		return "Succeeded"
+	case corev1.PodFailed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
+func compactPhaseSummary(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "-"
+	}
+	order := []struct {
+		name string
+		code string
+	}{
+		{name: "Running", code: "R"},
+		{name: "Pending", code: "P"},
+		{name: "Failed", code: "F"},
+		{name: "Succeeded", code: "S"},
+		{name: "Unknown", code: "U"},
+		{name: "Terminating", code: "T"},
+	}
+	parts := make([]string, 0, len(counts))
+	for _, phase := range order {
+		if count := counts[phase.name]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s%d", phase.code, count))
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func compactText(value string, limit int) string {
+	if value == "" {
+		return "-"
+	}
+	return printers.BoundedCell(value, limit)
+}
+
+func compactMiddle(value string, limit int) string {
+	if value == "" {
+		return "-"
+	}
+	return printers.BoundedMiddleCell(value, limit)
+}
+
+func plural(word string, count int) string {
+	if count == 1 {
+		return word
+	}
+	return word + "s"
 }
 
 func render(r *report, w io.Writer) error {
