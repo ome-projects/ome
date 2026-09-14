@@ -26,6 +26,7 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/paging"
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/runtimegraph"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
@@ -148,6 +149,49 @@ Collection: InferenceService scope=Namespace/ome-cli-tree-b4d9098
   status=Complete pages=1 items=5
 `, out.String())
 	assert.NotContains(t, out.String(), treeSecretCanary)
+}
+
+// TestTreeWideKeepsCompleteLegacyHumanOutput catches the wide path reusing
+// compact rows or clipping a complete identity that operators requested for
+// detailed human inspection.
+func TestTreeWideKeepsCompleteLegacyHumanOutput(t *testing.T) {
+	runtimeKind := "ClusterServingRuntime"
+	client := omefake.NewSimpleClientset(
+		clusterRuntimeWithExactName("root", ""),
+		&omev1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "team-a",
+				Name:      "uses-root-with-an-intentionally-long-but-valid-name-that-wide-must-not-clip",
+			},
+			Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{
+				Name: "root", Kind: &runtimeKind,
+			}},
+		},
+	)
+	var out bytes.Buffer
+
+	errOut, err := executeTree(
+		t,
+		factory.Static{OME: client, NS: "team-a"},
+		&out,
+		"root", "--kind", "ClusterServingRuntime", "--output", "wide",
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, errOut)
+	assert.Equal(t, `RUNTIME TREE
+Target: ClusterServingRuntime/root
+Context: Cluster (resolution: Complete)
+Head: ClusterServingRuntime/root
+ClusterServingRuntime/root [selected]
+`+"`"+`-- InferenceService/team-a/uses-root-with-an-intentionally-long-but-valid-name-that-wide-must-not-clip
+Snapshot: Complete
+Collection: ClusterServingRuntime scope=Cluster status=Complete pages=1 items=1
+Collection: ServingRuntime scope=AllNamespaces status=Complete pages=1 items=0
+Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=1
+`, out.String())
+	assert.NotContains(t, out.String(), "...")
+	assert.Greater(t, printers.CellDisplayWidth(strings.Split(out.String(), "\n")[5]), 80)
 }
 
 // TestTreeExplainsHowToResolveKindCollisions catches an implicit target
@@ -1135,8 +1179,8 @@ func TestTreeValidationPrecedesClientAcquisition(t *testing.T) {
 		{name: "zero arguments", wantError: "accepts 1 arg(s)"},
 		{name: "two arguments", args: []string{"one", "two"}, wantError: "accepts 1 arg(s)"},
 		{name: "invalid runtime name", args: []string{"Bad_Name"}, wantError: "runtime name"},
-		{name: "invalid output", args: []string{"runtime", "--output", "xml"}, wantError: "unsupported output format"},
-		{name: "invalid output first", args: []string{"Bad_Name", "--output", "xml"}, wantError: "unsupported output format"},
+		{name: "invalid output", args: []string{"runtime", "--output", "xml"}, wantError: `unsupported output format "xml" (supported: table, wide, json, yaml)`},
+		{name: "invalid output first", args: []string{"Bad_Name", "--output", "xml"}, wantError: `unsupported output format "xml" (supported: table, wide, json, yaml)`},
 		{name: "invalid kind", args: []string{"runtime", "--kind", "Pod"}, wantError: "unsupported runtime kind"},
 	}
 	for _, test := range tests {
@@ -1172,6 +1216,8 @@ func TestTreeHelpShowsCollisionSafeInvocations(t *testing.T) {
 		"kubectl ome runtime tree vllm-runtime",
 		"--kind ClusterServingRuntime",
 		"--kind ServingRuntime -n team-a -o json",
+		"Use -o wide for the complete unabridged tree",
+		"Output format: table, wide, json or yaml",
 		"explicitly reference each visible runtime head",
 		"inheritance is rendered only from complete runtime collections",
 		"InferenceService collection remains visible as partial dependency evidence",
@@ -1462,7 +1508,7 @@ func TestTreeHonorsCancellationBeforeListing(t *testing.T) {
 
 func TestTreePreservesOutputWriterFailures(t *testing.T) {
 	writerFailure := errors.New("tree writer sentinel")
-	for _, format := range []string{"table", "json", "yaml"} {
+	for _, format := range []string{"table", "wide", "json", "yaml"} {
 		t.Run(format, func(t *testing.T) {
 			client := omefake.NewSimpleClientset(clusterRuntimeWithExactName("root", ""))
 			_, err := executeTree(

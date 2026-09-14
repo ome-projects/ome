@@ -36,6 +36,7 @@ type treeOptions struct {
 	kind         string
 	output       string
 	format       report.Format
+	wide         bool
 }
 
 func newTreeCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -67,7 +68,11 @@ InferenceService collection remains visible as partial dependency evidence.
 Runtime specs, InferenceService specs and status, labels, annotations, and
 resource versions are never printed. Namespaced targets list ServingRuntimes
 and InferenceServices only in the selected namespace; cluster targets expand
-those reads across namespaces.`,
+those reads across namespaces.
+
+The default table bounds every line to 80 display columns and marks each
+clipped identity component with a stable fingerprint.
+Use -o wide for the complete unabridged tree.`,
 		Example: `  # Auto-detect when the name resolves to exactly one runtime
   kubectl ome runtime tree vllm-runtime
 
@@ -86,16 +91,17 @@ those reads across namespaces.`,
 		},
 	}
 	cmd.Flags().StringVar(&o.kind, "kind", "", "Runtime kind: ServingRuntime or ClusterServingRuntime (auto-detected when omitted)")
-	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, json or yaml")
+	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
 }
 
 func (o *treeOptions) validate() error {
-	format, err := report.ParseFormat(o.output)
+	format, wide, err := parseRuntimeTreeOutput(o.output)
 	if err != nil {
 		return err
 	}
 	o.format = format
+	o.wide = wide
 	if problems := validation.IsDNS1123Subdomain(o.name); len(problems) > 0 {
 		return fmt.Errorf("runtime name %q is invalid: %s", o.name, strings.Join(problems, "; "))
 	}
@@ -108,6 +114,19 @@ func (o *treeOptions) validate() error {
 			o.kind,
 		)
 	}
+}
+
+func parseRuntimeTreeOutput(value string) (report.Format, bool, error) {
+	if value == "wide" {
+		return report.FormatTable, true, nil
+	}
+	format, err := report.ParseFormat(value)
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"unsupported output format %q (supported: table, wide, json, yaml)", value,
+		)
+	}
+	return format, false, nil
 }
 
 func (o *treeOptions) run(ctx context.Context, f factory.Factory) error {
@@ -268,6 +287,12 @@ func (o *treeOptions) run(ctx context.Context, f factory.Factory) error {
 	}, o.dependencies.clock)
 	if err != nil {
 		return fmt.Errorf("build runtime tree report: %w", err)
+	}
+	if o.wide {
+		if err := reportv1alpha1.RuntimeTreeWideTable(projected).Write(o.Out); err != nil {
+			return fmt.Errorf("write runtime tree report: write report table: %w", err)
+		}
+		return nil
 	}
 	if err := report.Write(o.Out, o.format, projected); err != nil {
 		return fmt.Errorf("write runtime tree report: %w", err)

@@ -232,6 +232,59 @@ func TestRuntimeTreeDefaultOutputBoundsEveryLineByDisplayWidth(t *testing.T) {
 	assert.Contains(t, first, `\u2066`)
 }
 
+// TestRuntimeTreeWideTablePreservesCompleteLegacyRows catches the detailed
+// human view sharing compact clipping or dropping canonical envelope warnings.
+func TestRuntimeTreeWideTablePreservesCompleteLegacyRows(t *testing.T) {
+	target := treeIdentity(
+		v1alpha1.RuntimeKindServingRuntime,
+		"team-a",
+		"runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail",
+	)
+	reportValue := v1alpha1.NewRuntimeTreeReport(
+		v1alpha1.Metadata{Namespace: "team-a", Name: target.Name},
+		v1alpha1.RuntimeTreeContent{
+			Target: target,
+			Snapshot: v1alpha1.RuntimeTreeSnapshot{
+				Completeness: v1alpha1.RuntimeTreeSnapshotComplete,
+			},
+			Contexts: []v1alpha1.RuntimeTreeContext{{
+				Context: v1alpha1.RuntimeTreeResolutionContext{
+					Mode: v1alpha1.RuntimeTreeResolutionModeNamespaced, Namespace: "team-a",
+				},
+				ResolutionCompleteness: v1alpha1.RuntimeTreeSnapshotComplete,
+				Paths: []v1alpha1.RuntimeTreePath{{
+					Head:     target,
+					Runtimes: []v1alpha1.RuntimeTreeRuntime{{Identity: target}},
+					Dependents: []v1alpha1.RuntimeTreeDependent{{
+						Kind:      v1alpha1.RuntimeTreeDependentInferenceService,
+						Namespace: "team-a",
+						Name:      "service-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-tail",
+					}},
+				}},
+			}},
+		},
+		treeClock(),
+	)
+	reportValue.Warnings = []v1alpha1.RuntimeWarning{
+		{Code: v1alpha1.WarningSourceUnavailable},
+		{Code: v1alpha1.WarningPartialData},
+	}
+	var output bytes.Buffer
+
+	require.NoError(t, v1alpha1.RuntimeTreeWideTable(reportValue).Write(&output))
+
+	assert.Equal(t, `RUNTIME TREE
+Target: ServingRuntime/team-a/runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail
+Context: Namespaced/team-a (resolution: Complete)
+Head: ServingRuntime/runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail
+ServingRuntime/runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail [selected]
+`+"`"+`-- InferenceService/service-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-tail
+Snapshot: Complete
+Warning: PartialData
+Warning: SourceUnavailable
+`, output.String())
+}
+
 func TestRuntimeTreeTableKeepsIdentitySeparatorsForHostileComponents(t *testing.T) {
 	output := renderTreeReport(t, hostileLongRuntimeTreeReport(), report.FormatTable)
 
@@ -296,6 +349,12 @@ func TestRuntimeTreeTableKeepsLongCollectionScopeAndCountersSeparate(t *testing.
 		"Collection: ServingRuntime scope=Namespace/"+
 			"aaaaaaaaaaaaa...zzzzzzzzzzzz#32627e25\n"+
 			"  status=Complete pages=1 items=1\n")
+	wide := renderWideTreeReport(t, reportValue)
+	assert.Contains(t, wide,
+		"Collection: ServingRuntime scope=Namespace/"+
+			"aaaaaaaaaaaaaaaaaaaaaaaaxzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz "+
+			"status=Complete pages=1 items=1\n")
+	assert.NotContains(t, wide, "#32627e25")
 }
 
 func TestRuntimeTreeTableKeepsEveryOversizedIssuePathEdge(t *testing.T) {
@@ -334,6 +393,11 @@ func TestRuntimeTreeTableKeepsEveryOversizedIssuePathEdge(t *testing.T) {
 			"  -> ClusterServingRuntime/target\n"+
 			"  -> ClusterServingRuntime/level-2\n")
 	assert.NotContains(t, output, "ClusterServingRuntime/level...arget")
+	wide := renderWideTreeReport(t, reportValue)
+	assert.Contains(t, wide,
+		"Issue path: ClusterServingRuntime/level-6 -> ClusterServingRuntime/level-5 -> "+
+			"ClusterServingRuntime/level-4 -> ClusterServingRuntime/target -> "+
+			"ClusterServingRuntime/level-2\n")
 }
 
 func TestRuntimeTreeTableCompactsPathologicalIndentWithoutDroppingIdentity(t *testing.T) {
@@ -366,6 +430,9 @@ func TestRuntimeTreeTableCompactsPathologicalIndentWithoutDroppingIdentity(t *te
 		assert.Equalf(t, line, printers.BoundedCell(line, 80),
 			"line %d exceeds 80 terminal columns: %q", number+1, line)
 	}
+	wide := renderWideTreeReport(t, reportValue)
+	assert.Contains(t, wide, strings.Repeat("    ", 98)+"`-- ClusterServingRuntime/node-099\n")
+	assert.NotContains(t, wide, "[depth=98]")
 }
 
 func TestRuntimeTreeMachineFormatsKeepCompleteIdentitiesWhenTableClips(t *testing.T) {
@@ -672,6 +739,10 @@ func TestRuntimeTreeWriteReturnsShortWritesForEveryFormat(t *testing.T) {
 			assert.ErrorIs(t, err, io.ErrShortWrite)
 		})
 	}
+
+	err := v1alpha1.RuntimeTreeWideTable(reportValue).Write(treeShortWriter{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, io.ErrShortWrite)
 }
 
 func TestRuntimeTreeSchemaIsStrictlyAllowlisted(t *testing.T) {
@@ -750,6 +821,16 @@ func renderTreeReport(t *testing.T, reportValue v1alpha1.RuntimeEnvelope[v1alpha
 	t.Helper()
 	var output bytes.Buffer
 	require.NoError(t, report.Write(&output, format, reportValue))
+	return output.String()
+}
+
+func renderWideTreeReport(
+	t *testing.T,
+	reportValue v1alpha1.RuntimeEnvelope[v1alpha1.RuntimeTreeContent],
+) string {
+	t.Helper()
+	var output bytes.Buffer
+	require.NoError(t, v1alpha1.RuntimeTreeWideTable(reportValue).Write(&output))
 	return output.String()
 }
 

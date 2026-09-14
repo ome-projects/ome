@@ -248,6 +248,14 @@ func (c RuntimeTreeContent) Table() report.Table {
 	return c.tableWithWarnings(nil)
 }
 
+// RuntimeTreeWideTable returns the complete legacy human view of value. The
+// envelope is canonicalized so warnings retain the same deterministic order as
+// compact and machine output.
+func RuntimeTreeWideTable(value RuntimeEnvelope[RuntimeTreeContent]) report.Table {
+	canonical := value.Canonical()
+	return canonical.Content.wideTableWithWarnings(canonical.Warnings)
+}
+
 func (c RuntimeTreeContent) tableWithWarnings(warnings []RuntimeWarning) report.Table {
 	canonical := c.Canonical()
 	rows := [][]string{{formatRuntimeTreeIdentityRow("Target: ", canonical.Target, nil, "")}}
@@ -306,6 +314,59 @@ func (c RuntimeTreeContent) tableWithWarnings(warnings []RuntimeWarning) report.
 	return report.Table{Headers: []string{"RUNTIME TREE"}, Rows: rows}
 }
 
+func (c RuntimeTreeContent) wideTableWithWarnings(warnings []RuntimeWarning) report.Table {
+	canonical := c.Canonical()
+	rows := [][]string{{"Target: " + formatRuntimeTreeIdentity(canonical.Target)}}
+	for _, context := range canonical.Contexts {
+		rows = append(rows, []string{
+			"Context: " + formatRuntimeTreeContext(context.Context) +
+				" (resolution: " + string(context.ResolutionCompleteness) + ")",
+		})
+		for _, path := range context.Paths {
+			rows = append(rows, []string{
+				"Head: " + formatRuntimeTreeIdentityInContext(path.Head, context.Context),
+			})
+			for i, runtime := range path.Runtimes {
+				prefix := ""
+				if i > 0 {
+					prefix = strings.Repeat("    ", i-1) + "`-- "
+				}
+				rows = append(rows, []string{
+					prefix + formatRuntimeTreeIdentityInContext(runtime.Identity, context.Context) +
+						selectedSuffix(runtime.Identity == canonical.Target),
+				})
+			}
+			dependentPrefix := strings.Repeat("    ", max(0, len(path.Runtimes)-1))
+			for i, dependent := range path.Dependents {
+				branch := "|-- "
+				if i == len(path.Dependents)-1 {
+					branch = "`-- "
+				}
+				rows = append(rows, []string{
+					dependentPrefix + branch +
+						formatRuntimeTreeDependentInContext(dependent, context.Context),
+				})
+			}
+			if path.Issue != nil {
+				rows = append(rows, []string{formatRuntimeTreeIssue(*path.Issue, context.Context)})
+				if len(path.Issue.Path) > 0 {
+					rows = append(rows, []string{
+						formatRuntimeTreeIssuePath(path.Issue.Path, context.Context),
+					})
+				}
+			}
+		}
+	}
+	rows = append(rows, []string{"Snapshot: " + string(canonical.Snapshot.Completeness)})
+	for _, collection := range canonical.Snapshot.Collections {
+		rows = append(rows, []string{formatRuntimeTreeCollection(collection)})
+	}
+	for _, warning := range warnings {
+		rows = append(rows, []string{"Warning: " + string(warning.Code)})
+	}
+	return report.Table{Headers: []string{"RUNTIME TREE"}, Rows: rows}
+}
+
 func selectedSuffix(selected bool) string {
 	if selected {
 		return " [selected]"
@@ -336,6 +397,13 @@ func formatRuntimeTreeContextRow(context RuntimeTreeContext) string {
 	return prefix + boundedRuntimeTreeComponent(values[0], widths[0]) + "/" +
 		boundedRuntimeTreeComponent(values[1], widths[1]) + middle +
 		boundedRuntimeTreeComponent(values[2], widths[2]) + suffix
+}
+
+func formatRuntimeTreeContext(context RuntimeTreeResolutionContext) string {
+	if context.Namespace == "" {
+		return string(context.Mode)
+	}
+	return strings.Join([]string{string(context.Mode), context.Namespace}, "/")
 }
 
 func formatRuntimeTreeIdentity(identity RuntimeTreeIdentity) string {
@@ -408,6 +476,16 @@ func formatRuntimeTreeDependentRow(
 		string(dependent.Kind), namespace, dependent.Name,
 		runtimeTreeTableWidth-printers.CellDisplayWidth(prefix),
 	)
+}
+
+func formatRuntimeTreeDependentInContext(
+	dependent RuntimeTreeDependent,
+	context RuntimeTreeResolutionContext,
+) string {
+	if context.Mode == RuntimeTreeResolutionModeNamespaced && dependent.Namespace == context.Namespace {
+		return strings.Join([]string{string(dependent.Kind), dependent.Name}, "/")
+	}
+	return strings.Join([]string{string(dependent.Kind), dependent.Namespace, dependent.Name}, "/")
 }
 
 func formatRuntimeTreeIssue(issue RuntimeTreeIssue, context RuntimeTreeResolutionContext) string {
