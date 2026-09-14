@@ -552,6 +552,94 @@ func TestExplainClassReadFailuresAreTypedAndDoNotEchoServerMessages(t *testing.T
 	}
 }
 
+func TestExplainWrappedClassReadFailuresRemainTypedAndRedacted(t *testing.T) {
+	const (
+		wrapperSecret = "ghp_hostile-wrapper-secret"
+		causeSecret   = "ghp_hostile-cause-secret"
+		missingPhrase = "the server could not find the requested resource"
+	)
+	tests := []struct {
+		name string
+		err  error
+		want reportv1alpha1.AcceleratorClassState
+	}{
+		{
+			name: "wrapped named object not found",
+			err: fmt.Errorf("%s: %w", wrapperSecret, &apierrors.StatusError{
+				ErrStatus: metav1.Status{
+					Reason:  metav1.StatusReasonNotFound,
+					Message: missingPhrase + ": " + causeSecret,
+					Details: &metav1.StatusDetails{
+						Name: "gpu-a", Group: "ome.io", Kind: "acceleratorclasses",
+					},
+				},
+			}),
+			want: reportv1alpha1.AcceleratorClassNotFound,
+		},
+		{
+			name: "wrapped resource not found",
+			err: fmt.Errorf("%s: %w", wrapperSecret,
+				apierrors.NewGenericServerResponse(
+					404, "get",
+					schema.GroupResource{Group: "ome.io", Resource: "acceleratorclasses"},
+					"", causeSecret, 0, true,
+				),
+			),
+			want: reportv1alpha1.AcceleratorClassUnsupportedAPI,
+		},
+		{
+			name: "plain hostile phrase",
+			err:  errors.New(missingPhrase + ": " + causeSecret),
+			want: reportv1alpha1.AcceleratorClassUnreadable,
+		},
+	}
+	for _, test := range tests {
+		for _, format := range []string{"table", "wide", "json", "yaml"} {
+			t.Run(test.name+"/"+format, func(t *testing.T) {
+				isvc, runtimeObject, _ := acceleratorCommandFixtures()
+				omeClient := omefake.NewSimpleClientset(isvc)
+				omeClient.PrependReactor(
+					"get", "acceleratorclasses",
+					func(ktesting.Action) (bool, runtime.Object, error) {
+						return true, nil, test.err
+					},
+				)
+				f := factory.Static{
+					OME: omeClient, Kube: k8sfake.NewSimpleClientset(),
+					Runtime: ctrlfake.NewClientBuilder().WithScheme(acceleratorScheme(t)).
+						WithObjects(runtimeObject).Build(),
+					NS: "prod",
+				}
+				var captured reportv1alpha1.AcceleratorExplainReport
+				dependencies := fixedExplainDependencies()
+				dependencies.project = func(
+					isvc *omev1beta1.InferenceService,
+					base effective.AcceleratorBaseResolution,
+					classes map[string]acceleratorprojection.AcceleratorClassEvidence,
+					clock reportv1alpha1.Clock,
+				) (reportv1alpha1.AcceleratorExplainReport, error) {
+					projected, err := acceleratorprojection.Project(isvc, base, classes, clock)
+					captured = projected
+					return projected, err
+				}
+				var output bytes.Buffer
+				cmd := newExplainCmdWithDependencies(f, genericiooptions.IOStreams{
+					In: &bytes.Buffer{}, Out: &output, ErrOut: &bytes.Buffer{},
+				}, dependencies)
+				cmd.SetArgs([]string{"chat", "-o", format})
+
+				require.NoError(t, cmd.Execute())
+				require.Len(t, captured.Content.Components, 1)
+				assert.Equal(t, test.want, captured.Content.Components[0].Class.State)
+				assert.NotEmpty(t, output.String())
+				assert.NotContains(t, output.String(), wrapperSecret)
+				assert.NotContains(t, output.String(), causeSecret)
+				assert.NotContains(t, output.String(), missingPhrase)
+			})
+		}
+	}
+}
+
 func TestExplainPrimaryReadFailuresUseFixedSafeClassification(t *testing.T) {
 	const secret = "ghp_hostile-proxy-error-secret"
 	tests := []struct {
