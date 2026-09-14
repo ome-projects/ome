@@ -48,7 +48,7 @@ func (s *privateState) deny(err error) {
 	s.signal()
 }
 func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Clientset, *privateState) {
-	objects := make([]runtime.Object, 0, len(snapshot.Objects)+len(r.ReplacementPods))
+	objects := make([]runtime.Object, 0, len(snapshot.Objects))
 	for _, o := range snapshot.Objects {
 		switch o.(type) {
 		case *v1.Pod, *v1.Node, *v1.Namespace, *v1.Service, *v1.ReplicationController, *appsv1.ReplicaSet, *appsv1.StatefulSet:
