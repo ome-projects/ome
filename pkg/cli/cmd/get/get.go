@@ -126,6 +126,10 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 		return nil
 	}
 	table := printers.Table{}
+	includeNamespace := o.AllNamespaces && o.entry.Namespaced
+	if includeNamespace {
+		table.Headers = append(table.Headers, "NAMESPACE")
+	}
 	for _, c := range o.entry.Columns {
 		if c.Wide && o.Output != "wide" {
 			continue
@@ -134,10 +138,19 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 	}
 	for _, obj := range objs {
 		if o.entry.TableRows != nil {
-			table.Rows = append(table.Rows, o.entry.TableRows(obj, o.Output == "wide")...)
+			rows := o.entry.TableRows(obj, o.Output == "wide")
+			if includeNamespace {
+				for i := range rows {
+					rows[i] = append([]string{objectNamespace(obj)}, rows[i]...)
+				}
+			}
+			table.Rows = append(table.Rows, rows...)
 			continue
 		}
 		var row []string
+		if includeNamespace {
+			row = append(row, objectNamespace(obj))
+		}
 		for _, c := range o.entry.Columns {
 			if c.Wide && o.Output != "wide" {
 				continue
@@ -147,4 +160,12 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 		table.Rows = append(table.Rows, row)
 	}
 	return table.Write(o.Out)
+}
+
+func objectNamespace(obj runtime.Object) string {
+	object, ok := obj.(metav1.Object)
+	if !ok {
+		return "?"
+	}
+	return printers.OrDash(object.GetNamespace())
 }

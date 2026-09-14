@@ -12,8 +12,10 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"knative.dev/pkg/apis"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
@@ -1045,6 +1047,109 @@ var acceleratorQuotasEntry = &entry{
 	},
 }
 
+var rolloutPoliciesEntry = &entry{
+	Canonical:  "rolloutpolicies",
+	Aliases:    []string{"rolloutpolicy", "rp"},
+	Namespaced: true,
+	Columns: []column{
+		{Name: "NAME", Extract: safeCol(func(p *v1beta1.RolloutPolicy) string { return p.Name })},
+		{Name: "PROGRESSION", Extract: safeCol(func(p *v1beta1.RolloutPolicy) string {
+			progression, ok := p.Spec.Progression()
+			if !ok {
+				return "-"
+			}
+			return string(progression)
+		})},
+		{Name: "READY", Extract: safeCol(func(p *v1beta1.RolloutPolicy) string {
+			return rolloutPolicyConditionStatus(p, v1beta1.RolloutPolicyReadyCondition)
+		})},
+		{Name: "DIGEST", Extract: safeCol(func(p *v1beta1.RolloutPolicy) string {
+			if !rolloutPolicyStatusCurrent(p) {
+				return "-"
+			}
+			return printers.OrDash(p.Status.PortableDigest)
+		})},
+		{Name: "REFS", Extract: safeCol(func(p *v1beta1.RolloutPolicy) string {
+			if !rolloutPolicyStatusCurrent(p) {
+				return "-"
+			}
+			return fmt.Sprintf("%d", p.Status.AttachedGroups)
+		})},
+		{Name: "REASON", Wide: true, Extract: safeCol(func(p *v1beta1.RolloutPolicy) string {
+			if !rolloutPolicyStatusCurrent(p) {
+				return "-"
+			}
+			condition := meta.FindStatusCondition(p.Status.Conditions, v1beta1.RolloutPolicyReadyCondition)
+			if condition == nil {
+				return "-"
+			}
+			return printers.OrDash(condition.Reason)
+		})},
+		{Name: "IN-USE", Wide: true, Extract: safeCol(func(p *v1beta1.RolloutPolicy) string {
+			return rolloutPolicyConditionStatus(p, v1beta1.RolloutPolicyInUseCondition)
+		})},
+		{Name: "STATUS-FRESHNESS", Wide: true, Extract: safeCol(rolloutPolicyStatusFreshness)},
+		{Name: "AGE", Extract: safeCol(func(p *v1beta1.RolloutPolicy) string { return printers.Age(p.CreationTimestamp) })},
+	},
+	List: func(ctx context.Context, f factory.Factory, ns string, opts metav1.ListOptions) ([]runtime.Object, error) {
+		client, err := f.RuntimeClient()
+		if err != nil {
+			return nil, err
+		}
+		selector, err := labels.Parse(opts.LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		return paging.ListAllPaged(ctx, func(pageOpts metav1.ListOptions) ([]runtime.Object, string, error) {
+			pageOpts.LabelSelector = opts.LabelSelector
+			list := &v1beta1.RolloutPolicyList{}
+			if err := client.List(ctx, list, &ctrlclient.ListOptions{
+				Namespace:     ns,
+				LabelSelector: selector,
+				Limit:         pageOpts.Limit,
+				Continue:      pageOpts.Continue,
+				Raw:           &pageOpts,
+			}); err != nil {
+				return nil, "", err
+			}
+			items := make([]runtime.Object, 0, len(list.Items))
+			for i := range list.Items {
+				items = append(items, &list.Items[i])
+			}
+			return items, list.Continue, nil
+		})
+	},
+	GetOne: func(ctx context.Context, f factory.Factory, ns, name string) (runtime.Object, error) {
+		client, err := f.RuntimeClient()
+		if err != nil {
+			return nil, err
+		}
+		policy := &v1beta1.RolloutPolicy{}
+		if err := client.Get(ctx, ctrlclient.ObjectKey{Namespace: ns, Name: name}, policy); err != nil {
+			return nil, err
+		}
+		return policy, nil
+	},
+}
+
+func rolloutPolicyStatusFreshness(policy *v1beta1.RolloutPolicy) string {
+	if policy.Status.ObservedGeneration == 0 {
+		return "Unobserved"
+	}
+	return generationFreshness(policy.Generation, policy.Status.ObservedGeneration)
+}
+
+func rolloutPolicyStatusCurrent(policy *v1beta1.RolloutPolicy) bool {
+	return rolloutPolicyStatusFreshness(policy) == "Current"
+}
+
+func rolloutPolicyConditionStatus(policy *v1beta1.RolloutPolicy, conditionType string) string {
+	if !rolloutPolicyStatusCurrent(policy) {
+		return "Unknown"
+	}
+	return conditionStatus(policy.Status.Conditions, conditionType)
+}
+
 const (
 	acceleratorQuotaColumns     = 12
 	acceleratorQuotaWideColumns = 15
@@ -1095,5 +1200,5 @@ var registry = []*entry{
 	baseModelsEntry, clusterBaseModelsEntry,
 	runtimesEntry, servingRuntimesEntry, clusterServingRuntimesEntry,
 	acceleratorClassesEntry, acceleratorQuotasEntry, benchmarkJobsEntry,
-	fineTunedWeightsEntry, inferenceReplicasEntry, workloadClustersEntry,
+	fineTunedWeightsEntry, inferenceReplicasEntry, workloadClustersEntry, rolloutPoliciesEntry,
 }

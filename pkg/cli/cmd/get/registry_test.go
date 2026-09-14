@@ -27,6 +27,15 @@ func TestResolveAcceleratorQuotaCanonicalAndAlias(t *testing.T) {
 	}
 }
 
+func TestResolveRolloutPolicyCanonicalAndAliases(t *testing.T) {
+	for _, name := range []string{"rolloutpolicies", "rolloutpolicy", "rp", "RP"} {
+		e, err := resolve(name)
+		require.NoError(t, err, name)
+		assert.Equal(t, "rolloutpolicies", e.Canonical, name)
+		assert.True(t, e.Namespaced, name)
+	}
+}
+
 func TestResolveUnknownListsChoices(t *testing.T) {
 	_, err := resolve("banana")
 	require.Error(t, err)
@@ -39,7 +48,7 @@ func TestRegistryHasAllResources(t *testing.T) {
 		"inferenceservices", "basemodels", "clusterbasemodels",
 		"servingruntimes", "clusterservingruntimes", "acceleratorclasses",
 		"acceleratorquotas", "benchmarkjobs", "finetunedweights", "inferencereplicas",
-		"workloadclusters", "models", "runtimes",
+		"workloadclusters", "rolloutpolicies", "models", "runtimes",
 	}
 	var got []string
 	for _, e := range registry {

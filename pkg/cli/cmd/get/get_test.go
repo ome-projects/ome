@@ -2,6 +2,7 @@ package get
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"os"
@@ -13,11 +14,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/paging"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 )
 
@@ -54,6 +60,49 @@ func fixtureISVC(name, ns string) *v1beta1.InferenceService {
 	}
 }
 
+func getScheme(t *testing.T) *k8sruntime.Scheme {
+	t.Helper()
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(v1beta1.AddToScheme(scheme))
+	return scheme
+}
+
+func fixtureRolloutPolicy(name, ns string) *v1beta1.RolloutPolicy {
+	return &v1beta1.RolloutPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Generation: 1, Labels: map[string]string{"tier": "gold"}},
+		Spec:       v1beta1.RolloutPolicySpec{Canary: &v1beta1.GroupCanary{}},
+		Status: v1beta1.RolloutPolicyStatus{
+			ObservedGeneration: 1,
+			PortableDigest:     "rp1:1234567890ab",
+			AttachedGroups:     2,
+			Conditions: []metav1.Condition{
+				{Type: v1beta1.RolloutPolicyReadyCondition, Status: metav1.ConditionTrue, Reason: v1beta1.RolloutPolicyReasonBodyValid},
+				{Type: v1beta1.RolloutPolicyInUseCondition, Status: metav1.ConditionTrue},
+			},
+		},
+	}
+}
+
+type pagingRuntimeClient struct {
+	ctrlclient.Client
+	pages    [][]v1beta1.RolloutPolicy
+	requests []ctrlclient.ListOptions
+}
+
+func (c *pagingRuntimeClient) List(_ context.Context, list ctrlclient.ObjectList, options ...ctrlclient.ListOption) error {
+	request := ctrlclient.ListOptions{}
+	request.ApplyOptions(options)
+	c.requests = append(c.requests, request)
+
+	policies := list.(*v1beta1.RolloutPolicyList)
+	page := len(c.requests) - 1
+	policies.Items = append(policies.Items, c.pages[page]...)
+	if page+1 < len(c.pages) {
+		policies.Continue = "next-page"
+	}
+	return nil
+}
+
 func TestGetISVCTable(t *testing.T) {
 	f := factory.Static{
 		OME: omefake.NewSimpleClientset(fixtureISVC("a-isvc", "team-a"), fixtureISVC("b-isvc", "team-a")),
@@ -62,6 +111,79 @@ func TestGetISVCTable(t *testing.T) {
 	out, err := execute(t, f, "isvc")
 	require.NoError(t, err)
 	assertGolden(t, "isvc_list.golden", []byte(out))
+}
+
+func TestGetRolloutPolicyUsesRuntimeClientAndSelector(t *testing.T) {
+	selected := fixtureRolloutPolicy("guarded", "team-a")
+	unselected := fixtureRolloutPolicy("other", "team-a")
+	unselected.Labels = map[string]string{"tier": "silver"}
+	f := factory.Static{
+		Runtime: ctrlfake.NewClientBuilder().WithScheme(getScheme(t)).WithObjects(selected, unselected).Build(),
+		NS:      "team-a",
+	}
+
+	out, err := execute(t, f, "rp", "-l", "tier=gold")
+	require.NoError(t, err)
+	assert.Contains(t, out, "NAME")
+	assert.Contains(t, out, "PROGRESSION")
+	assert.Contains(t, out, "guarded")
+	assert.NotContains(t, out, "other")
+
+	wide, err := execute(t, f, "rolloutpolicies", "-o", "wide")
+	require.NoError(t, err)
+	assert.Contains(t, wide, "REASON")
+	assert.Contains(t, wide, "IN-USE")
+	assert.Contains(t, wide, "STATUS-FRESHNESS")
+	assert.Contains(t, wide, v1beta1.RolloutPolicyReasonBodyValid)
+}
+
+func TestGetRolloutPolicyForwardsPagingOptions(t *testing.T) {
+	client := &pagingRuntimeClient{pages: [][]v1beta1.RolloutPolicy{
+		{*fixtureRolloutPolicy("first", "team-a")},
+		{*fixtureRolloutPolicy("second", "team-a")},
+	}}
+	f := factory.Static{Runtime: client, NS: "team-a"}
+
+	out, err := execute(t, f, "rp")
+	require.NoError(t, err)
+	assert.Contains(t, out, "first")
+	assert.Contains(t, out, "second")
+	require.Len(t, client.requests, 2)
+	assert.Equal(t, int64(paging.ChunkSize), client.requests[0].Limit)
+	assert.Empty(t, client.requests[0].Continue)
+	assert.Equal(t, int64(paging.ChunkSize), client.requests[1].Limit)
+	assert.Equal(t, "next-page", client.requests[1].Continue)
+}
+
+func TestGetRolloutPolicyAllNamespacesAndMachineFormats(t *testing.T) {
+	teamA := fixtureRolloutPolicy("guarded", "team-a")
+	teamB := fixtureRolloutPolicy("guarded", "team-b")
+	f := factory.Static{
+		Runtime: ctrlfake.NewClientBuilder().WithScheme(getScheme(t)).WithObjects(teamA, teamB).Build(),
+		NS:      "team-a",
+	}
+
+	out, err := execute(t, f, "rolloutpolicy", "-A")
+	require.NoError(t, err)
+	assert.Contains(t, out, "NAMESPACE")
+	assert.Contains(t, out, "guarded")
+	assert.Equal(t, 2, strings.Count(out, "guarded"))
+	assert.Contains(t, out, "team-a")
+	assert.Contains(t, out, "team-b")
+
+	wideOut, err := execute(t, f, "rolloutpolicy", "-A", "-o", "wide")
+	require.NoError(t, err)
+	assert.Contains(t, wideOut, "NAMESPACE")
+	assert.Contains(t, wideOut, "team-a")
+	assert.Contains(t, wideOut, "team-b")
+
+	jsonOut, err := execute(t, f, "rp", "guarded", "-o", "json")
+	require.NoError(t, err)
+	assert.Contains(t, jsonOut, `"name": "guarded"`)
+
+	yamlOut, err := execute(t, f, "rp", "guarded", "-o", "yaml")
+	require.NoError(t, err)
+	assert.Contains(t, yamlOut, "name: guarded")
 }
 
 func TestGetModelsMerged(t *testing.T) {

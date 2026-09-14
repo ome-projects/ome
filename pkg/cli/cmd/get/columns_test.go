@@ -51,6 +51,91 @@ func TestISVCColumnsNilRefs(t *testing.T) {
 	}
 }
 
+// TestRolloutPolicyColumns pins the inventory contract for a current reusable
+// rollout policy. Stale and unobserved status are covered separately below.
+func TestRolloutPolicyColumns(t *testing.T) {
+	e, err := resolve("rp")
+	require.NoError(t, err)
+	policy := &v1beta1.RolloutPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "guarded", Generation: 7},
+		Spec:       v1beta1.RolloutPolicySpec{Canary: &v1beta1.GroupCanary{}},
+		Status: v1beta1.RolloutPolicyStatus{
+			ObservedGeneration: 7,
+			PortableDigest:     "rp1:1234567890ab",
+			AttachedGroups:     3,
+			Conditions: []metav1.Condition{
+				{Type: v1beta1.RolloutPolicyReadyCondition, Status: metav1.ConditionTrue, Reason: v1beta1.RolloutPolicyReasonBodyValid},
+				{Type: v1beta1.RolloutPolicyInUseCondition, Status: metav1.ConditionTrue},
+			},
+		},
+	}
+	got := map[string]string{}
+	for _, c := range e.Columns {
+		got[c.Name] = c.Extract(policy)
+	}
+	assert.Equal(t, "guarded", got["NAME"])
+	assert.Equal(t, "canary", got["PROGRESSION"])
+	assert.Equal(t, "True", got["READY"])
+	assert.Equal(t, "rp1:1234567890ab", got["DIGEST"])
+	assert.Equal(t, "3", got["REFS"])
+	assert.Equal(t, v1beta1.RolloutPolicyReasonBodyValid, got["REASON"])
+	assert.Equal(t, "True", got["IN-USE"])
+	assert.Equal(t, "Current", got["STATUS-FRESHNESS"])
+}
+
+func TestRolloutPolicyColumnsMissingStatusAndWrongType(t *testing.T) {
+	e, err := resolve("rolloutpolicy")
+	require.NoError(t, err)
+
+	missing := &v1beta1.RolloutPolicy{}
+	got := map[string]string{}
+	for _, c := range e.Columns {
+		got[c.Name] = c.Extract(missing)
+	}
+	assert.Equal(t, "-", got["PROGRESSION"])
+	assert.Equal(t, "Unknown", got["READY"])
+	assert.Equal(t, "-", got["DIGEST"])
+	assert.Equal(t, "-", got["REFS"])
+	assert.Equal(t, "-", got["REASON"])
+	assert.Equal(t, "Unknown", got["IN-USE"])
+	assert.Equal(t, "Unobserved", got["STATUS-FRESHNESS"])
+
+	wrong := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "wrong-kind"}}
+	for _, c := range e.Columns {
+		var value string
+		assert.NotPanics(t, func() { value = c.Extract(wrong) }, c.Name)
+		assert.Equal(t, "?", value, c.Name)
+	}
+}
+
+func TestRolloutPolicyColumnsHideStaleStatus(t *testing.T) {
+	e, err := resolve("rolloutpolicy")
+	require.NoError(t, err)
+
+	policy := &v1beta1.RolloutPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "stale", Generation: 7},
+		Status: v1beta1.RolloutPolicyStatus{
+			ObservedGeneration: 6,
+			PortableDigest:     "rp1:stale",
+			AttachedGroups:     3,
+			Conditions: []metav1.Condition{
+				{Type: v1beta1.RolloutPolicyReadyCondition, Status: metav1.ConditionTrue, Reason: v1beta1.RolloutPolicyReasonBodyValid},
+				{Type: v1beta1.RolloutPolicyInUseCondition, Status: metav1.ConditionTrue},
+			},
+		},
+	}
+	got := map[string]string{}
+	for _, c := range e.Columns {
+		got[c.Name] = c.Extract(policy)
+	}
+	assert.Equal(t, "Unknown", got["READY"])
+	assert.Equal(t, "-", got["DIGEST"])
+	assert.Equal(t, "-", got["REFS"])
+	assert.Equal(t, "-", got["REASON"])
+	assert.Equal(t, "Unknown", got["IN-USE"])
+	assert.Equal(t, "Stale", got["STATUS-FRESHNESS"])
+}
+
 func TestModelColumnsMergedScope(t *testing.T) {
 	e, err := resolve("models")
 	require.NoError(t, err)
