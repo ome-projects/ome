@@ -3,6 +3,7 @@ package rolloutprojection_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/rolloutprojection"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
 func TestProjectCanaryProducesSafeFaithfulReport(t *testing.T) {
@@ -1086,6 +1088,122 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 			assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
 				Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
 			})
+		})
+	}
+}
+
+func TestProjectAcceptsGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
+	tests := []struct {
+		name            string
+		oldSteps        []omev1beta1.RolloutGroupStep
+		steps           []omev1beta1.RolloutGroupStep
+		currentStep     int32
+		observedTraffic int32
+		phase           omev1beta1.RolloutPhase
+		promotedThrough string
+		wantTarget      int32
+	}{
+		{
+			name: "lowering repin",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 20},
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 10},
+				{Capacity: intstr.FromString("50%"), Traffic: 30},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			currentStep:     1,
+			observedTraffic: 50,
+			phase:           omev1beta1.RolloutPhasePaused,
+			wantTarget:      30,
+		},
+		{
+			name: "equal repin with promotion residue",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			currentStep:     0,
+			observedTraffic: 100,
+			phase:           omev1beta1.RolloutPhasePromoting,
+			promotedThrough: "SECRET_PREVIOUS_PROMOTION",
+			wantTarget:      100,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := activeCanaryInferenceService()
+			// Repin replaces a controller-valid old ladder before the
+			// executor runs: [10, 30, 100] leaves 50% above the new target,
+			// while [100] clamps a completed 100% step to zero at equal
+			// exposure and retains the prior promotion record.
+			// Neither case arms PreStepHold; global pause preserves the
+			// boundary until the executor is allowed to reconcile it.
+			group := omev1beta1.RolloutGroup{
+				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+				Canary:     &omev1beta1.GroupCanary{Steps: tt.steps},
+			}
+			isvc.Spec.Rollout = &omev1beta1.RolloutSpec{Groups: []omev1beta1.RolloutGroup{group}}
+			entered := metav1.NewTime(time.Date(2026, time.August, 31, 18, 20, 0, 0, time.UTC))
+			isvc.Status.Canary.CurrentStep = tt.currentStep
+			isvc.Status.Canary.ObservedTrafficWeight = tt.observedTraffic
+			isvc.Status.Canary.StepEnteredTime = &entered
+			isvc.Status.Canary.PromotedThrough = tt.promotedThrough
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.RolloutPhase = tt.phase
+			component.Traffic = []omev1beta1.ComponentTrafficTarget{{
+				RevisionName: "chat-engine-rev-bbbbbbbb", Percent: tt.observedTraffic,
+			}}
+			if tt.observedTraffic < 100 {
+				component.Traffic = append(component.Traffic, omev1beta1.ComponentTrafficTarget{
+					RevisionName: "chat-engine-rev-aaaaaaaa", Percent: 100 - tt.observedTraffic,
+				})
+			}
+			isvc.Status.Components[omev1beta1.EngineComponent] = component
+			opened := metav1.NewTime(time.Date(2026, time.August, 31, 18, 15, 0, 0, time.UTC))
+			pinned := metav1.NewTime(time.Date(2026, time.August, 31, 18, 25, 0, 0, time.UTC))
+			oldGroup := group
+			oldGroup.Canary = &omev1beta1.GroupCanary{Steps: tt.oldSteps}
+			oldDigest, digestErr := rolloutpolicy.ProgressionDigest(&oldGroup)
+			require.NoError(t, digestErr)
+			pinnedDigest, digestErr := rolloutpolicy.ProgressionDigest(&group)
+			require.NoError(t, digestErr)
+			runIdentity := fmt.Sprintf(
+				"%s=%s;%s%s", omev1beta1.EngineComponent, "bbbbbbbb",
+				oldDigest, opened.Time.UTC().Format(time.RFC3339),
+			)
+			isvc.Status.Rollout = &omev1beta1.RolloutStatus{ActiveRun: &omev1beta1.RolloutRun{
+				RunID: "chat-" + rolloutpolicy.ShortHash([]byte(runIdentity)), OpenedAt: opened, PinnedAt: pinned,
+				TargetRevisions: []omev1beta1.RolloutRunTarget{{
+					Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb",
+				}},
+				Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{
+					Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: pinnedDigest, Group: group,
+				}}},
+			}}
+			isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+
+			require.NoError(t, err)
+			require.Len(t, got.Content.Groups, 1)
+			require.NotNil(t, got.Content.Groups[0].Step)
+			assert.Equal(t, tt.currentStep, got.Content.Groups[0].Step.Index)
+			assert.Equal(t, int32(len(tt.steps)), got.Content.Groups[0].Step.Total)
+			assert.Equal(t, tt.wantTarget, got.Content.Groups[0].Step.TargetTraffic)
+			assert.Equal(t, tt.observedTraffic, got.Content.Groups[0].Step.ObservedTraffic)
+			assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+				Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+			})
+			encoded, marshalErr := json.Marshal(got)
+			require.NoError(t, marshalErr)
+			assert.NotContains(t, string(encoded), "SECRET_PREVIOUS_PROMOTION")
 		})
 	}
 }

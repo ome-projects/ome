@@ -367,7 +367,10 @@ func (b *projector) applyCanaryStatus(
 		b.markMalformed(reportv1alpha1.RolloutIssueCanaryStepInvalid, ptrInt(projected.Index), "")
 		return
 	}
-	if !validCanaryPhaseStepResidue(projected.Phase, group.Canary.Steps, status) {
+	repinBoundary := canaryevidence.ValidPausedNonRaisingRepinBoundary(
+		b.isvc, primary, projected.Phase, group.Canary.Steps, status,
+	)
+	if !validCanaryPhaseStepResidue(projected.Phase, group.Canary.Steps, status) && !repinBoundary {
 		b.markMalformed(reportv1alpha1.RolloutIssueStatusMalformed, ptrInt(projected.Index), "")
 	}
 	if canaryevidence.StatusBindsTraffic(projected.Phase, status) &&
@@ -376,7 +379,8 @@ func (b *projector) applyCanaryStatus(
 	}
 	stepSpec := &group.Canary.Steps[status.CurrentStep]
 	if canaryPhaseBindsStepTraffic(projected.Phase) &&
-		!canaryObservedTrafficMatchesStep(projected.Phase, group.Canary.Steps, status) {
+		!canaryObservedTrafficMatchesStep(projected.Phase, group.Canary.Steps, status) &&
+		!repinBoundary {
 		b.markMalformed(reportv1alpha1.RolloutIssueStatusMalformed, ptrInt(projected.Index), "")
 	}
 	step := reportv1alpha1.RolloutStepStatus{

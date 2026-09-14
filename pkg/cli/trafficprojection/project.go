@@ -433,8 +433,11 @@ func (b *projector) validCanaryEpoch(
 			component.Traffic,
 		)
 	}
+	repinBoundary := canaryevidence.ValidPausedNonRaisingRepinBoundary(
+		b.isvc, primary, phase, steps, status,
+	)
 	if !canaryevidence.PhaseNeedsStatus(phase) ||
-		!canaryevidence.ValidPhaseStepResidue(phase, steps, status) {
+		(!canaryevidence.ValidPhaseStepResidue(phase, steps, status) && !repinBoundary) {
 		return false
 	}
 	if canaryevidence.StatusBindsTraffic(phase, status) &&
@@ -442,7 +445,8 @@ func (b *projector) validCanaryEpoch(
 		return false
 	}
 	return !canaryevidence.PhaseBindsStepTraffic(phase) ||
-		canaryevidence.ObservedTrafficMatchesStep(phase, steps, status)
+		canaryevidence.ObservedTrafficMatchesStep(phase, steps, status) ||
+		repinBoundary
 }
 
 func (b *projector) projectAllocations() {

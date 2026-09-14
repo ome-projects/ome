@@ -3,6 +3,7 @@
 package canaryevidence
 
 import (
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -14,9 +15,12 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
 var revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
+
+var rolloutRunHashPattern = regexp.MustCompile(`^[0-9a-f]{12}$`)
 
 // Primary returns the component whose traffic is authoritative for a canary
 // group and whether every member is unique and supported. The selected value
@@ -231,6 +235,123 @@ func ValidPhaseStepResidue(
 		return status.PromotedThrough == status.CanaryRevisionHash
 	}
 	return true
+}
+
+// ValidPausedNonRaisingRepinBoundary recognizes the exact boundary the
+// controller can persist when it replaces an active run's pinned plan and a
+// global rollout pause prevents the canary executor from reconciling the old
+// phase and step evidence against that new plan. It applies only to repins
+// that hold or lower exposure; a raising repin is represented by PreStepHold.
+//
+// PinnedAt alone is not sufficient evidence. A valid boundary must carry a
+// structurally bound active run, a pin strictly newer than both the run open
+// and the current step entry, the same canary target, and the exact pinned
+// steps being projected. These constraints preserve fail-closed handling for
+// stale or externally malformed status.
+func ValidPausedNonRaisingRepinBoundary(
+	isvc *omev1beta1.InferenceService,
+	primary omev1beta1.ComponentType,
+	phase reportv1alpha1.RolloutPhase,
+	steps []omev1beta1.RolloutGroupStep,
+	status *omev1beta1.CanaryStatus,
+) bool {
+	if isvc == nil || status == nil || status.PreStepHold || len(steps) == 0 {
+		return false
+	}
+	paused, _ := constants.RolloutPauseState(isvc.Annotations)
+	if !paused {
+		return false
+	}
+	switch phase {
+	case reportv1alpha1.RolloutPhaseCanarying,
+		reportv1alpha1.RolloutPhasePaused,
+		reportv1alpha1.RolloutPhasePromoting:
+	default:
+		return false
+	}
+
+	current := int(status.CurrentStep)
+	if current < 0 || current >= len(steps) ||
+		status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 ||
+		steps[current].Traffic < 0 || steps[current].Traffic > status.ObservedTrafficWeight ||
+		!SafeRevisionHash(status.CanaryRevisionHash) ||
+		!SafeRevisionHash(status.StableRevisionHash) ||
+		status.StableRevisionHash == status.CanaryRevisionHash ||
+		status.RolledBackRevisionHash != "" ||
+		status.StepEnteredTime == nil || status.StepEnteredTime.IsZero() {
+		return false
+	}
+
+	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
+		return false
+	}
+	run := isvc.Status.Rollout.ActiveRun
+	prefix := isvc.Name + "-"
+	if !strings.HasPrefix(run.RunID, prefix) ||
+		!rolloutRunHashPattern.MatchString(strings.TrimPrefix(run.RunID, prefix)) ||
+		run.OpenedAt.IsZero() || run.PinnedAt.IsZero() ||
+		!run.PinnedAt.Time.After(run.OpenedAt.Time) ||
+		!run.PinnedAt.Time.After(status.StepEnteredTime.Time) {
+		return false
+	}
+
+	expectedTargets := make([]omev1beta1.ComponentType, 0, 3)
+	seenTargets := make(map[omev1beta1.ComponentType]struct{}, 3)
+	matchingCanary := 0
+	canaryGroups := 0
+	for i := range run.Plan.Groups {
+		pinnedGroup := &run.Plan.Groups[i]
+		group := &pinnedGroup.Group
+		digest, err := rolloutpolicy.ProgressionDigest(group)
+		if err != nil || digest == "" || digest != pinnedGroup.PortableDigest || group.PolicyRef != nil {
+			return false
+		}
+		switch pinnedGroup.Source {
+		case omev1beta1.RolloutPlanSourceInline:
+			if pinnedGroup.PolicyRef != nil || pinnedGroup.PolicyGeneration != 0 {
+				return false
+			}
+		case omev1beta1.RolloutPlanSourcePolicy:
+			if pinnedGroup.PolicyRef == nil || pinnedGroup.PolicyRef.Name == "" || pinnedGroup.PolicyGeneration < 0 {
+				return false
+			}
+		default:
+			return false
+		}
+		for _, component := range group.Components {
+			if !supportedComponent(component) {
+				return false
+			}
+			if _, seen := seenTargets[component]; seen {
+				return false
+			}
+			seenTargets[component] = struct{}{}
+			expectedTargets = append(expectedTargets, component)
+		}
+		if group.Canary == nil {
+			continue
+		}
+		canaryGroups++
+		groupPrimary, valid := Primary(group.Components)
+		if valid && groupPrimary == primary && reflect.DeepEqual(group.Canary.Steps, steps) {
+			matchingCanary++
+		}
+	}
+	if canaryGroups != 1 || matchingCanary != 1 || len(run.TargetRevisions) != len(expectedTargets) {
+		return false
+	}
+
+	primaryBound := false
+	for i := range run.TargetRevisions {
+		target := run.TargetRevisions[i]
+		if target.Component != expectedTargets[i] || !SafeRevisionHash(target.Revision) {
+			return false
+		}
+		if target.Component == primary {
+			primaryBound = target.Revision == status.CanaryRevisionHash
+		}
+	}
+	return primaryBound
 }
 
 // validPreStepHold recognizes only states the controller can persist after
