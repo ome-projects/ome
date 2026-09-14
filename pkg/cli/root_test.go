@@ -34,6 +34,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome instance",
 		"ome instance list",
 		"ome instance retry-blocks",
+		"ome instance status",
 		"ome logs",
 		"ome migration",
 		"ome migration history",
@@ -115,6 +116,14 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if migrationHistory.Use != "history INFERENCESERVICE" || migrationHistory.Short != "Show bounded migration evidence history" {
 		t.Fatalf("migration history contract changed: Use=%q Short=%q", migrationHistory.Use, migrationHistory.Short)
+	}
+	status, _, err := root.Find([]string{"instance", "status"})
+	if err != nil {
+		t.Fatalf("find instance status: %v", err)
+	}
+	if status.Use != "status INFERENCESERVICE INDEX --component COMPONENT" ||
+		status.Short != "Show one logical instance and bounded live evidence" {
+		t.Fatalf("instance status contract changed: Use=%q Short=%q", status.Use, status.Short)
 	}
 }
 

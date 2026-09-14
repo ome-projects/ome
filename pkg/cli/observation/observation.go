@@ -32,6 +32,9 @@ type ObjectRef struct {
 	Kind      string
 	Name      string
 	UID       types.UID
+	// Priority is applied before the deterministic identity order when a
+	// target cap is reached. Larger values win; it does not affect identity.
+	Priority int
 }
 
 // EventLimits bounds target fan-out, concurrent requests, and pagination for
@@ -67,14 +70,20 @@ func CollectPods(ctx context.Context, pods coreclient.PodsGetter, namespace, lab
 	result, err := paging.ListBounded(ctx, metav1.ListOptions{LabelSelector: labelSelector}, limits,
 		func(requestCtx context.Context, opts metav1.ListOptions) (paging.Page[corev1.Pod], error) {
 			list, listErr := pods.Pods(namespace).List(requestCtx, opts)
+			if requestErr := requestCtx.Err(); requestErr != nil {
+				return paging.Page[corev1.Pod]{}, requestErr
+			}
 			if listErr != nil {
 				return paging.Page[corev1.Pod]{}, listErr
+			}
+			if list == nil {
+				return paging.Page[corev1.Pod]{}, fmt.Errorf("Pod list returned nil")
 			}
 			return paging.Page[corev1.Pod]{Items: list.Items, Continue: list.Continue}, nil
 		})
 	items := make([]corev1.Pod, 0, len(result.Items))
 	for _, pod := range result.Items {
-		if selector.Matches(labels.Set(pod.Labels)) {
+		if pod.Namespace == namespace && selector.Matches(labels.Set(pod.Labels)) {
 			items = append(items, *pod.DeepCopy())
 		}
 	}
@@ -122,6 +131,9 @@ func CollectWarningEvents(ctx context.Context, events coreclient.EventsGetter, t
 	ordered := append([]ObjectRef(nil), targets...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		left, right := ordered[i], ordered[j]
+		if left.Priority != right.Priority {
+			return left.Priority > right.Priority
+		}
 		if left.Namespace != right.Namespace {
 			return left.Namespace < right.Namespace
 		}
@@ -134,10 +146,14 @@ func CollectWarningEvents(ctx context.Context, events coreclient.EventsGetter, t
 		return left.UID < right.UID
 	})
 	unique := make([]ObjectRef, 0, len(ordered))
+	seenTargets := make(map[objectRefIdentity]struct{}, len(ordered))
 	for _, target := range ordered {
-		if len(unique) == 0 || unique[len(unique)-1] != target {
-			unique = append(unique, target)
+		identity := objectRefIdentity{Namespace: target.Namespace, Kind: target.Kind, Name: target.Name, UID: target.UID}
+		if _, duplicate := seenTargets[identity]; duplicate {
+			continue
 		}
+		seenTargets[identity] = struct{}{}
+		unique = append(unique, target)
 	}
 	ordered = unique
 	if len(ordered) > limits.MaxTargets {
@@ -221,8 +237,14 @@ func collectWarningEventsForTarget(ctx context.Context, events coreclient.Events
 	return paging.ListBounded(ctx, base, limits,
 		func(requestCtx context.Context, opts metav1.ListOptions) (paging.Page[corev1.Event], error) {
 			list, err := events.Events(target.Namespace).List(requestCtx, opts)
+			if requestErr := requestCtx.Err(); requestErr != nil {
+				return paging.Page[corev1.Event]{}, requestErr
+			}
 			if err != nil {
 				return paging.Page[corev1.Event]{}, err
+			}
+			if list == nil {
+				return paging.Page[corev1.Event]{}, fmt.Errorf("Event list returned nil")
 			}
 			return paging.Page[corev1.Event]{Items: list.Items, Continue: list.Continue}, nil
 		})
@@ -232,5 +254,15 @@ func eventMatchesTarget(event corev1.Event, target ObjectRef) bool {
 	if event.Namespace != target.Namespace || event.Type != corev1.EventTypeWarning || event.InvolvedObject.Kind != target.Kind || event.InvolvedObject.Name != target.Name {
 		return false
 	}
+	if event.InvolvedObject.Namespace != "" && event.InvolvedObject.Namespace != target.Namespace {
+		return false
+	}
 	return target.UID == "" || event.InvolvedObject.UID == target.UID
+}
+
+type objectRefIdentity struct {
+	Namespace string
+	Kind      string
+	Name      string
+	UID       types.UID
 }

@@ -71,6 +71,44 @@ func TestCollectPodsDefendsAgainstSelectorBlindSource(t *testing.T) {
 	assert.Equal(t, "wanted", got.Items[0].Name)
 }
 
+func TestCollectPodsRejectsWrongNamespaceFromSelectorBlindSource(t *testing.T) {
+	t.Parallel()
+
+	getter := staticPodGetter{list: &corev1.PodList{Items: []corev1.Pod{
+		*pod("wanted", "chat"),
+		{ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: "team-b", Labels: map[string]string{"ome.io/inferenceservice": "chat"}}},
+	}}}
+	got, err := CollectPods(context.Background(), getter, "team-a", "ome.io/inferenceservice=chat", paging.Limits{
+		PageSize: 10, MaxItems: 10, MaxPages: 1, RequestTimeout: time.Second,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, "wanted", got.Items[0].Name)
+}
+
+func TestCollectPodsRejectsNilListResponse(t *testing.T) {
+	t.Parallel()
+
+	got, err := CollectPods(context.Background(), staticPodGetter{}, "team-a", "ome.io/inferenceservice=chat", paging.Limits{
+		PageSize: 10, MaxItems: 10, MaxPages: 1, RequestTimeout: time.Second,
+	})
+
+	require.ErrorContains(t, err, "Pod list returned nil")
+	assert.Empty(t, got.Items)
+}
+
+func TestCollectPodsRejectsSuccessfulResponseAfterCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	got, err := CollectPods(ctx, cancelingPodGetter{cancel: cancel}, "team-a", "ome.io/inferenceservice=chat", paging.Limits{
+		PageSize: 10, MaxItems: 10, MaxPages: 1, RequestTimeout: time.Second,
+	})
+
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Empty(t, got.Items)
+}
+
 func TestCollectedSnapshotsDoNotShareNestedSourceData(t *testing.T) {
 	t.Parallel()
 
@@ -218,6 +256,22 @@ func TestCollectWarningEventsRejectsIncompleteTargetWithoutRequest(t *testing.T)
 	assert.False(t, requested)
 }
 
+func TestCollectWarningEventsPreservesNilListResponseAsSourceFailure(t *testing.T) {
+	t.Parallel()
+
+	got, err := CollectWarningEvents(context.Background(), nilEventGetter{}, []ObjectRef{{
+		Namespace: "team-a", Kind: "Pod", Name: "pod-a",
+	}}, EventLimits{
+		Paging:     paging.Limits{PageSize: 10, MaxItems: 10, MaxPages: 1, RequestTimeout: time.Second},
+		MaxTargets: 1, MaxConcurrent: 1,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, got.Failures, 1)
+	assert.ErrorContains(t, got.Failures[0].Err, "Event list returned nil")
+	assert.Empty(t, got.Items)
+}
+
 func TestCollectWarningEventsSortsAndDeduplicatesEachTarget(t *testing.T) {
 	t.Parallel()
 
@@ -296,6 +350,33 @@ func TestCollectWarningEventsDeduplicatesTargetsBeforeApplyingCap(t *testing.T) 
 	assert.Equal(t, []string{"event-a", "event-b"}, []string{got.Items[0].Name, got.Items[1].Name})
 }
 
+func TestCollectWarningEventsAppliesPriorityBeforeTargetCap(t *testing.T) {
+	t.Parallel()
+
+	kube := kubefake.NewSimpleClientset()
+	kube.PrependReactor("list", "events", func(action ktesting.Action) (bool, runtime.Object, error) {
+		restrictions := action.(ktesting.ListAction).GetListRestrictions().Fields
+		name, _ := restrictions.RequiresExactMatch("involvedObject.name")
+		kind, _ := restrictions.RequiresExactMatch("involvedObject.kind")
+		event := warningEvent("event-"+name, types.UID("uid-"+name), name)
+		event.InvolvedObject.Kind = kind
+		return true, &corev1.EventList{Items: []corev1.Event{event}}, nil
+	})
+	targets := []ObjectRef{
+		{Namespace: "team-a", Kind: "Pod", Name: "healthy-a", Priority: 0},
+		{Namespace: "team-a", Kind: "Pod", Name: "unhealthy-z", Priority: 10},
+		{Namespace: "team-a", Kind: "InferenceReplica", Name: "ir", Priority: 20},
+	}
+	got, err := CollectWarningEvents(context.Background(), kube.CoreV1(), targets, EventLimits{
+		Paging:     paging.Limits{PageSize: 10, MaxItems: 10, MaxPages: 1, RequestTimeout: time.Second},
+		MaxTargets: 2, MaxConcurrent: 1,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Items, 2)
+	assert.Equal(t, []string{"event-ir", "event-unhealthy-z"}, []string{got.Items[0].Name, got.Items[1].Name})
+	assert.True(t, got.Truncated)
+}
+
 func pod(name, service string) *corev1.Pod {
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name:      name,
@@ -320,6 +401,38 @@ type blockingEventGetter struct {
 }
 
 type blindPodGetter struct{}
+
+type cancelingPodGetter struct {
+	cancel context.CancelFunc
+}
+
+func (getter cancelingPodGetter) Pods(string) coreclient.PodInterface {
+	return cancelingPodInterface{PodInterface: nil, cancel: getter.cancel}
+}
+
+type cancelingPodInterface struct {
+	coreclient.PodInterface
+	cancel context.CancelFunc
+}
+
+func (pods cancelingPodInterface) List(context.Context, metav1.ListOptions) (*corev1.PodList, error) {
+	pods.cancel()
+	return &corev1.PodList{Items: []corev1.Pod{*pod("late", "chat")}}, nil
+}
+
+type nilEventGetter struct{}
+
+func (nilEventGetter) Events(string) coreclient.EventInterface {
+	return nilEventInterface{EventInterface: nil}
+}
+
+type nilEventInterface struct {
+	coreclient.EventInterface
+}
+
+func (nilEventInterface) List(context.Context, metav1.ListOptions) (*corev1.EventList, error) {
+	return nil, nil
+}
 
 type staticPodGetter struct {
 	list *corev1.PodList

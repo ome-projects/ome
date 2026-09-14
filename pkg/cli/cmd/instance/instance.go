@@ -38,5 +38,6 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 		},
 		maxRetryBlocks: defaultMaxRetryBlocks,
 	}))
+	cmd.AddCommand(newStatusCmd(f, streams))
 	return cmd
 }

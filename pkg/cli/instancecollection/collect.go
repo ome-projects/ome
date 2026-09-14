@@ -26,13 +26,15 @@ var (
 	ErrListerRequired                    = errors.New("instance collection requires an InferenceReplica lister")
 	ErrMaxStatusRowsInvalid              = errors.New("instance collection requires a positive status-row limit")
 	ErrMaxRetryBlocksInvalid             = errors.New("instance collection requires a non-negative retry-block limit")
+	ErrDetailLimitsInvalid               = errors.New("instance collection detail limits are invalid")
 )
 
 const (
-	invalidIdentityName   = "INVALID"
-	maxUIDLength          = 128
-	maxRetryRevisionBytes = 1024
-	maxRetryReasonBytes   = 4096
+	invalidIdentityName    = "INVALID"
+	maxUIDLength           = 128
+	maxRetryRevisionBytes  = 1024
+	maxRetryReasonBytes    = 4096
+	maxInstanceDetailBytes = 1024
 )
 
 type RejectionReason string
@@ -58,6 +60,31 @@ type Limits struct {
 	// MaxRetryBlocks bounds retry-block copies across every accepted source.
 	// Zero disables collection for callers that do not consume these records.
 	MaxRetryBlocks int
+	Details        DetailLimits
+}
+
+// DetailLimits enables bounded copying of the nested fields needed by the
+// single-instance status command. A zero value disables detail copying so the
+// existing instance-list boundary remains unchanged.
+type DetailLimits struct {
+	MaxConditions        int
+	MaxScannedConditions int
+	MaxNodeHints         int
+	MaxScannedNodeHints  int
+}
+
+type DetailKind string
+
+const (
+	DetailConditions DetailKind = "Conditions"
+	DetailNodeHints  DetailKind = "NodeHints"
+)
+
+type DetailTruncation struct {
+	Name      string
+	Component omev1beta1.ComponentType
+	Index     int32
+	Kind      DetailKind
 }
 
 // StatusRowsTruncation identifies a related InferenceReplica whose nested
@@ -81,6 +108,7 @@ type Result struct {
 	Rejected             []Rejection
 	StatusRowsTruncated  []StatusRowsTruncation
 	RetryBlocksTruncated []RetryBlocksTruncation
+	DetailsTruncated     []DetailTruncation
 	Pages                int
 	Truncated            bool
 }
@@ -122,6 +150,9 @@ func CollectRelated(
 	if limits.MaxRetryBlocks < 0 {
 		return Result{}, ErrMaxRetryBlocksInvalid
 	}
+	if !validDetailLimits(limits.Details) {
+		return Result{}, ErrDetailLimitsInvalid
+	}
 	requireRelationshipLabel := len(validation.IsValidLabelValue(isvc.Name)) == 0
 	listOptions := metav1.ListOptions{}
 	if requireRelationshipLabel {
@@ -151,6 +182,7 @@ func CollectRelated(
 		Rejected:             make([]Rejection, 0),
 		StatusRowsTruncated:  make([]StatusRowsTruncation, 0),
 		RetryBlocksTruncated: make([]RetryBlocksTruncation, 0),
+		DetailsTruncated:     make([]DetailTruncation, 0),
 		Pages:                listed.Pages, Truncated: listed.Truncated,
 	}
 	accepted := make([]*omev1beta1.InferenceReplica, 0, len(listed.Items))
@@ -193,7 +225,9 @@ func CollectRelated(
 				Name: item.Name, Component: item.Spec.Component,
 			})
 		}
-		result.Items = append(result.Items, boundedReplicaCopy(item, isvc, copyRows, copyRetryBlocks))
+		copied, truncations := boundedReplicaCopy(item, isvc, copyRows, copyRetryBlocks, limits.Details)
+		result.Items = append(result.Items, copied)
+		result.DetailsTruncated = append(result.DetailsTruncated, truncations...)
 		if copyRows {
 			remainingRows -= len(item.Status.InstanceStatuses)
 		}
@@ -212,7 +246,8 @@ func boundedReplicaCopy(
 	isvc *omev1beta1.InferenceService,
 	copyRows bool,
 	copyRetryBlocks bool,
-) omev1beta1.InferenceReplica {
+	detailLimits DetailLimits,
+) (omev1beta1.InferenceReplica, []DetailTruncation) {
 	controller := true
 	result := omev1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{
@@ -245,8 +280,9 @@ func boundedReplicaCopy(
 		}
 	}
 	if !copyRows {
-		return copyBoundedRetryBlocks(result, ir, copyRetryBlocks)
+		return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), nil
 	}
+	truncations := make([]DetailTruncation, 0)
 	result.Status.InstanceStatuses = make([]omev1beta1.OMENativeInstanceStatus, len(ir.Status.InstanceStatuses))
 	for i := range ir.Status.InstanceStatuses {
 		source := &ir.Status.InstanceStatuses[i]
@@ -257,15 +293,121 @@ func boundedReplicaCopy(
 			AvailablePodCount: source.AvailablePodCount,
 			Admitted:          source.Admitted,
 		}
-		if source.Operation != nil {
-			row.Operation = &omev1beta1.InstanceOperation{}
-		}
-		if source.LastFailure != nil {
-			row.LastFailure = &omev1beta1.InstanceTermination{}
+		if detailLimits.enabled() {
+			row.Conditions, truncations = copyConditions(
+				source.Conditions, detailLimits, ir, source.Index, truncations,
+			)
+			if source.Operation != nil {
+				operation := *source.Operation
+				operation.ID = boundedClone(source.Operation.ID, maxInstanceDetailBytes)
+				operation.Step = boundedClone(source.Operation.Step, maxInstanceDetailBytes)
+				operation.TargetRevision = boundedClone(source.Operation.TargetRevision, maxInstanceDetailBytes)
+				operation.Reason = boundedClone(source.Operation.Reason, maxInstanceDetailBytes)
+				operation.FromNode = boundedClone(source.Operation.FromNode, maxInstanceDetailBytes)
+				operation.RequestUUID = boundedClone(source.Operation.RequestUUID, maxInstanceDetailBytes)
+				operation.SurgeIndex = copyInt32(source.Operation.SurgeIndex)
+				operation.HintTargetNodes = nil
+				if len(source.Operation.HintTargetNodes) > detailLimits.MaxScannedNodeHints {
+					truncations = appendDetailTruncation(truncations, ir, source.Index, DetailNodeHints)
+				} else {
+					operation.HintTargetNodes = make([]string, len(source.Operation.HintTargetNodes))
+					for i := range source.Operation.HintTargetNodes {
+						operation.HintTargetNodes[i] = boundedClone(source.Operation.HintTargetNodes[i], maxInstanceDetailBytes)
+					}
+					sort.Strings(operation.HintTargetNodes)
+					if len(operation.HintTargetNodes) > detailLimits.MaxNodeHints {
+						operation.HintTargetNodes = operation.HintTargetNodes[:detailLimits.MaxNodeHints]
+						truncations = appendDetailTruncation(truncations, ir, source.Index, DetailNodeHints)
+					}
+				}
+				row.Operation = &operation
+			}
+			if source.LastFailure != nil {
+				failure := *source.LastFailure
+				failure.PodName = boundedClone(source.LastFailure.PodName, maxInstanceDetailBytes)
+				failure.ContainerName = boundedClone(source.LastFailure.ContainerName, maxInstanceDetailBytes)
+				failure.Reason = boundedClone(source.LastFailure.Reason, maxInstanceDetailBytes)
+				failure.ExitCode = copyInt32(source.LastFailure.ExitCode)
+				failure.Message = ""
+				row.LastFailure = &failure
+			}
+		} else {
+			if source.Operation != nil {
+				row.Operation = &omev1beta1.InstanceOperation{}
+			}
+			if source.LastFailure != nil {
+				row.LastFailure = &omev1beta1.InstanceTermination{}
+			}
 		}
 		result.Status.InstanceStatuses[i] = row
 	}
-	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks)
+	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), truncations
+}
+
+func validDetailLimits(limits DetailLimits) bool {
+	if !limits.enabled() {
+		return limits == (DetailLimits{})
+	}
+	return limits.MaxConditions > 0 && limits.MaxScannedConditions >= limits.MaxConditions &&
+		limits.MaxNodeHints > 0 && limits.MaxScannedNodeHints >= limits.MaxNodeHints
+}
+
+func (limits DetailLimits) enabled() bool {
+	return limits.MaxConditions != 0 || limits.MaxScannedConditions != 0 ||
+		limits.MaxNodeHints != 0 || limits.MaxScannedNodeHints != 0
+}
+
+func copyConditions(
+	input []metav1.Condition,
+	limits DetailLimits,
+	ir *omev1beta1.InferenceReplica,
+	index int32,
+	truncations []DetailTruncation,
+) ([]metav1.Condition, []DetailTruncation) {
+	if len(input) > limits.MaxScannedConditions {
+		return nil, appendDetailTruncation(truncations, ir, index, DetailConditions)
+	}
+	conditions := make([]metav1.Condition, len(input))
+	for i := range input {
+		conditions[i] = metav1.Condition{
+			Type: boundedClone(input[i].Type, maxInstanceDetailBytes), Status: input[i].Status,
+			ObservedGeneration: input[i].ObservedGeneration, LastTransitionTime: input[i].LastTransitionTime,
+			Reason: boundedClone(input[i].Reason, maxInstanceDetailBytes),
+		}
+	}
+	sort.Slice(conditions, func(i, j int) bool {
+		if conditions[i].Type != conditions[j].Type {
+			return conditions[i].Type < conditions[j].Type
+		}
+		if conditions[i].Status != conditions[j].Status {
+			return conditions[i].Status < conditions[j].Status
+		}
+		return conditions[i].Reason < conditions[j].Reason
+	})
+	if len(conditions) > limits.MaxConditions {
+		conditions = conditions[:limits.MaxConditions]
+		truncations = appendDetailTruncation(truncations, ir, index, DetailConditions)
+	}
+	return conditions, truncations
+}
+
+func appendDetailTruncation(
+	truncations []DetailTruncation,
+	ir *omev1beta1.InferenceReplica,
+	index int32,
+	kind DetailKind,
+) []DetailTruncation {
+	return append(truncations, DetailTruncation{
+		Name: ir.Name, Component: ir.Spec.Component, Index: index, Kind: kind,
+	})
+}
+
+func copyInt32(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func copyBoundedRetryBlocks(
