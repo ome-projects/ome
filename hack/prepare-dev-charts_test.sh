@@ -5,8 +5,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 yq_bin="${YQ_BIN:-yq}"
 helm_bin="${HELM_BIN:-helm}"
-chart_version="0.0.0-dev.20260914010101+abcdef1"
-image_tag="dev-abcdef1"
+chart_version="0.0.0-dev.20260914152756+5b92ab8"
+image_tag="dev-5b92ab8-amd64"
 image_hub="ghcr.io/ome-projects"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf -- "${temp_dir}"' EXIT
@@ -86,6 +86,17 @@ grep -Fq "${image_hub}/ome-agent:${image_tag}" <<<"${resources_render}"
 grep -Fq "ghcr.io/moirai-internal/genai-bench:0.1.113" <<<"${resources_render}"
 grep -Fq "${image_hub}/ome-scheduler:${image_tag}" <<<"${scheduler_render}"
 grep -Fq "${image_hub}/alfred:${image_tag}" <<<"${alfred_render}"
+
+expected_alfred_chart_label='helm.sh/chart: "ome-alfred-0.0.0-dev.20260914152756_5b92ab8"'
+actual_alfred_chart_labels="$(grep -oE 'helm[.]sh/chart: "[^"]+"' <<<"${alfred_render}" | sort -u)"
+if [[ "${actual_alfred_chart_labels}" != "${expected_alfred_chart_label}" ]]; then
+  echo "Alfred chart labels are not Kubernetes-safe: ${actual_alfred_chart_labels}" >&2
+  exit 1
+fi
+if grep -Eq 'helm[.]sh/chart:.*[+]' <<<"${alfred_render}"; then
+  echo "Alfred chart labels contain invalid SemVer build metadata separators" >&2
+  exit 1
+fi
 
 blocked_dir="${temp_dir}/blocked"
 mkdir -p "${blocked_dir}"

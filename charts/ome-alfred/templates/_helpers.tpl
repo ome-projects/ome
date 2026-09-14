@@ -1,4 +1,11 @@
 {{/*
+Chart name and version, suitable for use as a Kubernetes label value.
+*/}}
+{{- define "ome-alfred.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
 Common labels. The control-plane label is the stable selector key and must
 never change; the rest follow chart conventions.
 */}}
@@ -8,7 +15,7 @@ app.kubernetes.io/component: "ome-alfred"
 app.kubernetes.io/name: ome-alfred
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+helm.sh/chart: {{ include "ome-alfred.chart" . | quote }}
 {{- end }}
 
 {{/*
