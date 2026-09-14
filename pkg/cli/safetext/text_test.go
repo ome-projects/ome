@@ -20,6 +20,8 @@ func TestSanitizeRecognizesCredentialShapesAndPreservesOrdinaryReasons(t *testin
 		"AKIAIOSFODNN7EXAMPLE",
 		"Bearer secret",
 		"password=hunter2",
+		"failure_ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+		"context_password=hunter2",
 		"-----BEGIN PRIVATE KEY-----",
 	} {
 		assert.Equal(t, "[REDACTED]", safetext.Sanitize("prefix "+value, 256))

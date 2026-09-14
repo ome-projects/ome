@@ -22,12 +22,14 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/instancecollection"
 	"sigs.k8s.io/ome/pkg/cli/instancestatusprojection"
+	clinamespace "sigs.k8s.io/ome/pkg/cli/namespace"
 	"sigs.k8s.io/ome/pkg/cli/observation"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 )
 
 var (
@@ -53,6 +55,7 @@ func defaultInstanceStatusDependencies() statusDependencies {
 			MaxStatusRows: 4096,
 			Details: instancecollection.DetailLimits{
 				MaxConditions: 16, MaxScannedConditions: 64, MaxNodeHints: 16, MaxScannedNodeHints: 64,
+				MaxMigrations: 16, MaxScannedMigrations: 64,
 			},
 		},
 		podLimits:     paging.Limits{PageSize: 32, MaxItems: 64, MaxPages: 2, RequestTimeout: 10 * time.Second},
@@ -68,13 +71,14 @@ func defaultInstanceStatusDependencies() statusDependencies {
 }
 
 type statusOptions struct {
-	streams   genericiooptions.IOStreams
-	output    string
-	component string
-	format    report.Format
-	wide      bool
-	index     int32
-	deps      statusDependencies
+	streams    genericiooptions.IOStreams
+	output     string
+	component  string
+	format     report.Format
+	wide       bool
+	index      int32
+	deps       statusDependencies
+	namespaces *clinamespace.Options
 }
 
 func newStatusCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -82,7 +86,7 @@ func newStatusCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.
 }
 
 func newStatusCmdWithDependencies(f factory.Factory, streams genericiooptions.IOStreams, deps statusDependencies) *cobra.Command {
-	o := &statusOptions{streams: streams, deps: deps}
+	o := &statusOptions{streams: streams, deps: deps, namespaces: clinamespace.NewOptions()}
 	cmd := &cobra.Command{
 		Use:   "status INFERENCESERVICE INDEX --component COMPONENT",
 		Short: "Show one logical instance and bounded live evidence",
@@ -92,6 +96,13 @@ IR status is authoritative for identity, phase, incarnation, revisions,
 admission, persisted pod counts, conditions, operation, and last failure. Pods
 never create a logical instance or upgrade stale, malformed, or duplicate IR
 evidence. A RawDeployment component is reported as NotOMENative.
+
+Effective deployment mode follows the controller's live-runtime or pinned
+ControllerRevision snapshot; --ome-namespace selects the revision namespace.
+The report includes ReadySince, active ordinal, and migrations involving the
+selected source or surge instance. Because the current typed API removed its
+encoding discriminator, encoding provenance is explicitly UnsupportedAPI and
+the command never guesses DenseV1.
 
 POD Ready is the Kubernetes Ready condition. Serving is the controller-owned
 ome.io/serving readiness gate. POD restarts total bounded init and regular
@@ -116,6 +127,7 @@ operation details, and timestamps. JSON and YAML retain the same safe report.`,
 	}
 	cmd.Flags().StringVar(&o.component, "component", "", "Component: engine, decoder or router (required)")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
+	o.namespaces.AddOMEFlags(cmd.Flags())
 	return cmd
 }
 
@@ -155,6 +167,10 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 	if namespace == "" || len(utilvalidation.IsDNS1123Label(namespace)) > 0 {
 		return ErrInvalidNamespace
 	}
+	resolvedNamespaces, err := o.namespaces.Resolve(namespace)
+	if err != nil {
+		return err
+	}
 	omeClient, err := f.OMEClient()
 	if err != nil {
 		return fmt.Errorf("create OME client: %w", err)
@@ -173,12 +189,13 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 		return err
 	}
 	component := omev1beta1.ComponentType(o.component)
-	mode := resolveStatusDeployment(ctx, f, isvc, component, o.deps.runtimeLimits)
+	mode := resolveStatusDeployment(ctx, f, isvc, component, resolvedNamespaces.OMENamespace, o.deps.runtimeLimits)
 	input := instancestatusprojection.Input{
 		InferenceService: isvc, Component: component, Index: o.index,
 		NotOMENative:          mode.resolved && mode.mode != constants.OMENative,
 		DeploymentMode:        reportv1alpha1.DeploymentMode(mode.mode),
 		DeploymentModeSource:  reportv1alpha1.DeploymentModeSource(mode.source),
+		DeploymentModeOrigin:  mode.origin,
 		DeploymentUnavailable: mode.unavailable,
 		Pods:                  observation.Collection[corev1.Pod]{Items: []corev1.Pod{}},
 		Events:                observation.EventCollection{Items: []corev1.Event{}, Failures: []observation.SourceFailure{}},
@@ -281,37 +298,87 @@ func (o *statusOptions) write(projected reportv1alpha1.InstanceStatusReport) err
 type statusDeploymentResolution struct {
 	mode        constants.DeploymentModeType
 	source      effective.ComponentDeploymentModeSource
+	origin      string
 	resolved    bool
 	unavailable reportv1alpha1.UnavailableReason
 }
 
-func resolveStatusDeployment(ctx context.Context, f factory.Factory, isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType, limits paging.Limits) statusDeploymentResolution {
+func resolveStatusDeployment(ctx context.Context, f factory.Factory, isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType, omeNamespace string, limits paging.Limits) statusDeploymentResolution {
 	if mode, source, ok := definitiveStatusDeployment(isvc, component); ok {
-		return statusDeploymentResolution{mode: mode, source: source, resolved: true}
+		return statusDeploymentResolution{mode: mode, source: source, origin: "InferenceService", resolved: true}
 	}
 	client, err := f.RuntimeClient()
 	if err != nil {
 		return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableUnreadable}
 	}
-	resolver, err := effective.NewBoundedRuntimeResolver(client, limits)
+	liveResolver, err := effective.NewBoundedRuntimeResolver(client, limits)
+	if err != nil {
+		return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableUnreadable}
+	}
+	kubeClient, err := f.KubeClient()
+	if err != nil {
+		return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableUnreadable}
+	}
+	resolver, err := effective.NewRuntimePinResolver(kubeClient.AppsV1(), liveResolver, omeNamespace, limits)
 	if err != nil {
 		return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableUnreadable}
 	}
 	resolveCtx, cancel := context.WithTimeout(ctx, limits.RequestTimeout)
 	defer cancel()
-	configuration, err := resolver.ResolveLive(resolveCtx, isvc)
+	state, err := resolver.Resolve(resolveCtx, isvc, effective.RuntimeResolveOptions{})
 	if err != nil {
 		return statusDeploymentResolution{unavailable: unavailableReason(err)}
 	}
-	for _, candidate := range configuration.Components {
+	active, err := state.RequireActive()
+	if err != nil {
+		return statusDeploymentResolution{unavailable: deploymentUnavailableReason(state)}
+	}
+	for _, candidate := range active.Components() {
 		if candidate.Type == component {
-			return statusDeploymentResolution{mode: candidate.DeploymentMode, source: candidate.DeploymentModeSource, resolved: true}
+			return statusDeploymentResolution{mode: candidate.DeploymentMode, source: candidate.DeploymentModeSource, origin: string(active.Origin), resolved: true}
 		}
 	}
 	return statusDeploymentResolution{unavailable: reportv1alpha1.UnavailableNotConfigured}
 }
 
+func deploymentUnavailableReason(state *effective.RuntimeState) reportv1alpha1.UnavailableReason {
+	if state == nil {
+		return reportv1alpha1.UnavailableUnreadable
+	}
+	switch state.LiveAvailability() {
+	case effective.LiveRuntimeNotFound:
+		return reportv1alpha1.UnavailableNotFound
+	case effective.LiveRuntimeDisabled:
+		return reportv1alpha1.UnavailableDisabled
+	}
+	for _, issue := range state.SourceIssues() {
+		var cycle *runtimeinheritance.CycleError
+		var depth *runtimeinheritance.MaxDepthExceededError
+		switch {
+		case errors.As(issue, &cycle):
+			return reportv1alpha1.UnavailableCycle
+		case errors.As(issue, &depth):
+			return reportv1alpha1.UnavailableMaxDepthExceeded
+		case apierrors.IsForbidden(issue):
+			return reportv1alpha1.UnavailableForbidden
+		}
+	}
+	switch state.PinState {
+	case effective.RuntimePinStateRevisionMissing:
+		return reportv1alpha1.UnavailableNotFound
+	case effective.RuntimePinStateRevisionDisabled:
+		return reportv1alpha1.UnavailableDisabled
+	case effective.RuntimePinStateRevisionInvalid, effective.RuntimePinStateInvalidIntent:
+		return reportv1alpha1.UnavailableMalformedPayload
+	default:
+		return reportv1alpha1.UnavailableUnreadable
+	}
+}
+
 func definitiveStatusDeployment(isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType) (constants.DeploymentModeType, effective.ComponentDeploymentModeSource, bool) {
+	if isvc.Spec.DeploymentMode != nil && *isvc.Spec.DeploymentMode == constants.VirtualDeployment {
+		return constants.VirtualDeployment, effective.DeploymentModeServiceSpec, true
+	}
 	if value, present := isvc.Annotations[constants.DeploymentMode]; present && constants.DeploymentModeType(value) == constants.VirtualDeployment {
 		return constants.VirtualDeployment, effective.DeploymentModeServiceAnnotation, true
 	}

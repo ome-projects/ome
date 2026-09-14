@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
 )
@@ -31,7 +32,7 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 			LastFailure: &InstanceStatusFailure{PodName: "chat-engine-2-0", ContainerName: "runner", Reason: unsafe},
 		},
 		Pods: []InstanceStatusPod{
-			{Name: "pod-z", Runner: "worker", Revision: "rev-b", Incarnation: 7, Phase: "Running", Ready: true, ServingReady: true},
+			{Name: "pod-z", Runner: "worker", Revision: "rev-b", Incarnation: 7, Phase: "Running", Ready: "True", ServingReady: "True"},
 			{Name: "pod-a", Runner: "leader", Revision: "rev-a", Incarnation: 7, Phase: "Pending"},
 		},
 		Events: []InstanceStatusEvent{
@@ -113,16 +114,44 @@ func TestInstanceStatusCanonicalRedactsCredentialShapesWithoutKeywordFalsePositi
 	assert.Equal(t, "TokenExpired", report.Content.Instance.Conditions[1].Reason)
 }
 
+func TestInstanceStatusEveryOutputRedactsEmbeddedCredentialShapes(t *testing.T) {
+	t.Parallel()
+	secret := "failure_ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+	password := "context_password=hunter2"
+	report := NewInstanceStatusReport(Metadata{Name: "chat"}, InstanceStatusContent{
+		Summary:  InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+		Instance: &InstanceStatusInstance{Conditions: []InstanceStatusCondition{{Type: "Ready", Status: "False", Reason: secret}}, Migrations: []InstanceStatusMigration{{RequestUUID: "request", Role: "Source", Reason: password, TargetNodeHints: []string{}}}},
+	}, ClockFunc(func() time.Time { return time.Unix(0, 0) })).Canonical()
+	var table, wide bytes.Buffer
+	require.NoError(t, report.Table().Write(&table))
+	require.NoError(t, report.WideTable().Write(&wide))
+	jsonData, err := json.Marshal(report)
+	require.NoError(t, err)
+	yamlData, err := yaml.Marshal(report)
+	require.NoError(t, err)
+	for _, output := range []string{table.String(), wide.String(), string(jsonData), string(yamlData)} {
+		assert.NotContains(t, output, "ghp_")
+		assert.NotContains(t, output, "hunter2")
+		assert.Contains(t, output, "[REDACTED]")
+	}
+}
+
 func TestInstanceStatusCanonicalUsesTotalOrderingForHostileDuplicates(t *testing.T) {
 	t.Parallel()
 	first := time.Date(2026, 9, 14, 1, 0, 0, 0, time.UTC)
 	second := first.Add(time.Minute)
 	content := InstanceStatusContent{
 		Summary: InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
-		Instance: &InstanceStatusInstance{Conditions: []InstanceStatusCondition{
-			{Type: "Ready", Status: "False", Reason: "Same", LastTransitionTime: &second},
-			{Type: "Ready", Status: "False", Reason: "Same", LastTransitionTime: &first},
-		}},
+		Instance: &InstanceStatusInstance{
+			Conditions: []InstanceStatusCondition{
+				{Type: "Ready", Status: "False", Reason: "Same", LastTransitionTime: &second},
+				{Type: "Ready", Status: "False", Reason: "Same", LastTransitionTime: &first},
+			},
+			Migrations: []InstanceStatusMigration{
+				{RequestUUID: "same", Role: "Source", Phase: "Accepted", Reason: "z", TargetNodeHints: []string{}},
+				{RequestUUID: "same", Role: "Source", Phase: "Accepted", Reason: "a", TargetNodeHints: []string{}},
+			},
+		},
 		Pods: []InstanceStatusPod{
 			{Name: "duplicate", Runner: "worker", Revision: "z"},
 			{Name: "duplicate", Runner: "worker", Revision: "a"},
@@ -135,6 +164,8 @@ func TestInstanceStatusCanonicalUsesTotalOrderingForHostileDuplicates(t *testing
 	reversed := content
 	instanceCopy := *content.Instance
 	reversed.Instance = &instanceCopy
+	reversed.Instance.Migrations = append([]InstanceStatusMigration{}, content.Instance.Migrations...)
+	slicesReverseStatus(reversed.Instance.Migrations)
 	reversed.Instance.Conditions = append([]InstanceStatusCondition{}, content.Instance.Conditions...)
 	reversed.Pods = append([]InstanceStatusPod{}, content.Pods...)
 	reversed.Events = append([]InstanceStatusEvent{}, content.Events...)
@@ -200,4 +231,23 @@ func TestInstanceStatusWideTableRetainsCompleteBoundedOperationalFields(t *testi
 	for _, want := range []string{revision, "OMENative", "ComponentAnnotation", "operation-id", "node-old", "node-new", now.Format(time.RFC3339)} {
 		assert.Contains(t, text, want)
 	}
+}
+
+func TestInstanceStatusWideTableDoesNotJoinOrTruncateSafeFields(t *testing.T) {
+	t.Parallel()
+	first := strings.Repeat("a", 253)
+	second := strings.Repeat("b", 253)
+	target := strings.Repeat("p", 253)
+	report := NewInstanceStatusReport(Metadata{Name: "chat"}, InstanceStatusContent{
+		Summary:  InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+		Instance: &InstanceStatusInstance{Operation: &InstanceStatusOperation{TargetNodeHints: []string{second, first}}},
+		Events:   []InstanceStatusEvent{{TargetKind: "Pod", TargetName: target, Reason: "Failed"}},
+	}, ClockFunc(func() time.Time { return time.Unix(0, 0) }))
+	var out bytes.Buffer
+	require.NoError(t, report.WideTable().Write(&out))
+	text := out.String()
+	assert.Contains(t, text, first)
+	assert.Contains(t, text, second)
+	assert.Contains(t, text, target)
+	assert.NotContains(t, text, first+","+second)
 }

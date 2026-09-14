@@ -301,6 +301,57 @@ func TestCollectRelatedBoundsNestedStatusCopies(t *testing.T) {
 	assert.NotContains(t, string(encoded), "SECRET-NESTED-OPAQUE-VALUE")
 }
 
+func TestCollectRelatedCopiesSelectedLifecycleAndRelevantMigrationsOnly(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ready := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{
+		{Index: 2, Phase: omev1beta1.OMENativeInstanceReady, ReadySince: &ready, ActiveOrdinal: 1},
+		{Index: 3, Phase: omev1beta1.OMENativeInstanceReady, ReadySince: &ready, Operation: &omev1beta1.InstanceOperation{Reason: "NONSELECTED_SENTINEL"}},
+	}
+	surge := int32(2)
+	ir.Status.Migrations = []omev1beta1.MigrationStatus{
+		{RequestUUID: "source", Trigger: omev1beta1.MigrationTriggerManual, SourceInstance: 2, Phase: omev1beta1.MigrationPhaseDraining, FromNode: "node-a", Reason: "move"},
+		{RequestUUID: "surge", Trigger: omev1beta1.MigrationTriggerManual, SourceInstance: 1, SurgeInstance: &surge, Phase: omev1beta1.MigrationPhaseSurgeReady},
+		{RequestUUID: "other", Trigger: omev1beta1.MigrationTriggerManual, SourceInstance: 9, Phase: omev1beta1.MigrationPhaseAccepted, Message: "NONSELECTED_SENTINEL"},
+	}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8, MaxMigrations: 4, MaxScannedMigrations: 8, SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2}
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+	}), isvc, limits)
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	require.Len(t, got.Items[0].Status.Migrations, 2)
+	assert.Equal(t, []string{"source", "surge"}, []string{got.Items[0].Status.Migrations[0].RequestUUID, got.Items[0].Status.Migrations[1].RequestUUID})
+	assert.Equal(t, int32(1), got.Items[0].Status.InstanceStatuses[0].ActiveOrdinal)
+	require.NotNil(t, got.Items[0].Status.InstanceStatuses[0].ReadySince)
+	assert.Nil(t, got.Items[0].Status.InstanceStatuses[1].ReadySince)
+	encoded, err := json.Marshal(got.Items[0])
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "NONSELECTED_SENTINEL")
+}
+
+func TestCollectRelatedDropsMigrationDetailsBeyondScanBound(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{Index: 2, Phase: omev1beta1.OMENativeInstanceReady}}
+	ir.Status.Migrations = make([]omev1beta1.MigrationStatus, 9)
+	for i := range ir.Status.Migrations {
+		ir.Status.Migrations[i] = omev1beta1.MigrationStatus{RequestUUID: "SECRET-MIGRATION", SourceInstance: 2}
+	}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8, MaxMigrations: 4, MaxScannedMigrations: 8, SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2}
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+	}), isvc, limits)
+	require.NoError(t, err)
+	assert.Empty(t, got.Items[0].Status.Migrations)
+	assert.Contains(t, got.DetailsTruncated, instancecollection.DetailTruncation{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailMigrations})
+}
+
 func TestCollectRelatedBoundsAndDefensivelyCopiesRetryBlocks(t *testing.T) {
 	t.Parallel()
 

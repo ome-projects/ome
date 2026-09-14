@@ -60,6 +60,7 @@ const (
 	InstanceStatusIssueInstanceMissing           InstanceStatusIssueCode = "InstanceMissing"
 	InstanceStatusIssueNotOMENative              InstanceStatusIssueCode = "NotOMENative"
 	InstanceStatusIssueConditionsTruncated       InstanceStatusIssueCode = "ConditionsTruncated"
+	InstanceStatusIssueConditionGenerationStale  InstanceStatusIssueCode = "ConditionGenerationStale"
 	InstanceStatusIssueOperationDetailsTruncated InstanceStatusIssueCode = "OperationDetailsTruncated"
 	InstanceStatusIssueOperationInvalid          InstanceStatusIssueCode = "OperationInvalid"
 	InstanceStatusIssueLastFailureInvalid        InstanceStatusIssueCode = "LastFailureInvalid"
@@ -70,6 +71,9 @@ const (
 	InstanceStatusIssueEventsUnavailable         InstanceStatusIssueCode = "EventsUnavailable"
 	InstanceStatusIssueEventsTruncated           InstanceStatusIssueCode = "EventsTruncated"
 	InstanceStatusIssueEventIdentityRejected     InstanceStatusIssueCode = "EventIdentityRejected"
+	InstanceStatusIssueMigrationsTruncated       InstanceStatusIssueCode = "MigrationsTruncated"
+	InstanceStatusIssueMigrationInvalid          InstanceStatusIssueCode = "MigrationInvalid"
+	InstanceStatusIssueEncodingUnsupported       InstanceStatusIssueCode = "EncodingUnsupported"
 )
 
 type InstanceStatusSummary struct {
@@ -83,15 +87,24 @@ type InstanceStatusSummary struct {
 type InstanceStatusDeployment struct {
 	Mode              DeploymentMode       `json:"mode,omitempty"`
 	Source            DeploymentModeSource `json:"source,omitempty"`
+	Origin            string               `json:"origin,omitempty"`
 	Evidence          EvidenceLevel        `json:"evidence"`
 	UnavailableReason UnavailableReason    `json:"unavailableReason,omitempty"`
 }
 
+type InstanceStatusEncoding struct {
+	Name              string            `json:"name,omitempty"`
+	Evidence          EvidenceLevel     `json:"evidence"`
+	UnavailableReason UnavailableReason `json:"unavailableReason,omitempty"`
+}
+
 type InstanceStatusCondition struct {
-	Type               string     `json:"type"`
-	Status             string     `json:"status"`
-	Reason             string     `json:"reason,omitempty"`
-	LastTransitionTime *time.Time `json:"lastTransitionTime,omitempty"`
+	Type               string                `json:"type"`
+	Status             string                `json:"status"`
+	ObservedGeneration int64                 `json:"observedGeneration"`
+	Evidence           InstanceEvidenceState `json:"evidence"`
+	Reason             string                `json:"reason,omitempty"`
+	LastTransitionTime *time.Time            `json:"lastTransitionTime,omitempty"`
 }
 
 type InstanceStatusOperation struct {
@@ -118,6 +131,25 @@ type InstanceStatusFailure struct {
 	Time          *time.Time `json:"time,omitempty"`
 }
 
+type InstanceStatusMigration struct {
+	RequestUUID     string     `json:"requestUUID"`
+	Role            string     `json:"role"`
+	Trigger         string     `json:"trigger"`
+	SourceInstance  int32      `json:"sourceInstance"`
+	SurgeInstance   *int32     `json:"surgeInstance,omitempty"`
+	Phase           string     `json:"phase"`
+	AllocatedAt     *time.Time `json:"allocatedAt,omitempty"`
+	FromNode        string     `json:"fromNode,omitempty"`
+	TargetNodeHints []string   `json:"targetNodeHints"`
+	Attempt         int32      `json:"attempt"`
+	Reason          string     `json:"reason,omitempty"`
+	Message         string     `json:"message,omitempty"`
+	StartedAt       *time.Time `json:"startedAt,omitempty"`
+	Deadline        *time.Time `json:"deadline,omitempty"`
+	CompletedAt     *time.Time `json:"completedAt,omitempty"`
+	Succeeded       *bool      `json:"succeeded,omitempty"`
+}
+
 type InstanceStatusInstance struct {
 	InferenceReplica string                    `json:"inferenceReplica"`
 	Index            int32                     `json:"index"`
@@ -127,7 +159,10 @@ type InstanceStatusInstance struct {
 	TargetRevision   string                    `json:"targetRevision,omitempty"`
 	Pods             InstancePodCounts         `json:"pods"`
 	Admitted         bool                      `json:"admitted"`
+	ReadySince       *time.Time                `json:"readySince,omitempty"`
+	ActiveOrdinal    *int32                    `json:"activeOrdinal,omitempty"`
 	Conditions       []InstanceStatusCondition `json:"conditions"`
+	Migrations       []InstanceStatusMigration `json:"migrations"`
 	Operation        *InstanceStatusOperation  `json:"operation,omitempty"`
 	LastFailure      *InstanceStatusFailure    `json:"lastFailure,omitempty"`
 }
@@ -138,8 +173,8 @@ type InstanceStatusPod struct {
 	Revision     string `json:"revision,omitempty"`
 	Incarnation  int64  `json:"incarnation"`
 	Phase        string `json:"phase"`
-	Ready        bool   `json:"ready"`
-	ServingReady bool   `json:"servingReady"`
+	Ready        string `json:"ready"`
+	ServingReady string `json:"servingReady"`
 	Node         string `json:"node,omitempty"`
 	RestartCount int32  `json:"restartCount"`
 	Deleting     bool   `json:"deleting"`
@@ -166,6 +201,7 @@ type InstanceStatusWarning struct {
 type InstanceStatusContent struct {
 	Summary    InstanceStatusSummary    `json:"summary"`
 	Deployment InstanceStatusDeployment `json:"deployment"`
+	Encoding   InstanceStatusEncoding   `json:"encoding"`
 	Instance   *InstanceStatusInstance  `json:"instance,omitempty"`
 	Pods       []InstanceStatusPod      `json:"pods"`
 	Events     []InstanceStatusEvent    `json:"events"`
@@ -227,6 +263,11 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 	if out.Deployment.Evidence == "" {
 		out.Deployment.Evidence = EvidenceUnavailable
 	}
+	if out.Encoding.Evidence == "" {
+		out.Encoding.Evidence = EvidenceUnavailable
+	}
+	out.Encoding.Name = safeInstanceStatusText(out.Encoding.Name, 32)
+	out.Deployment.Origin = safeInstanceStatusText(out.Deployment.Origin, 32)
 	out.Pods = append([]InstanceStatusPod{}, in.Pods...)
 	for i := range out.Pods {
 		pod := &out.Pods[i]
@@ -241,8 +282,8 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 		return cmp.Or(
 			cmp.Compare(a.Name, b.Name), cmp.Compare(a.Runner, b.Runner),
 			cmp.Compare(a.Revision, b.Revision), cmp.Compare(a.Incarnation, b.Incarnation),
-			cmp.Compare(a.Phase, b.Phase), compareInstanceStatusBool(a.Ready, b.Ready),
-			compareInstanceStatusBool(a.ServingReady, b.ServingReady), cmp.Compare(a.Node, b.Node),
+			cmp.Compare(a.Phase, b.Phase), cmp.Compare(a.Ready, b.Ready),
+			cmp.Compare(a.ServingReady, b.ServingReady), cmp.Compare(a.Node, b.Node),
 			cmp.Compare(a.RestartCount, b.RestartCount), compareInstanceStatusBool(a.Deleting, b.Deleting),
 		) < 0
 	})
@@ -276,6 +317,8 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 	instance.InferenceReplica = safeInstanceStatusText(instance.InferenceReplica, 253)
 	instance.RunningRevision = safeInstanceStatusText(instance.RunningRevision, 253)
 	instance.TargetRevision = safeInstanceStatusText(instance.TargetRevision, 253)
+	instance.ReadySince = copyInstanceStatusTime(instance.ReadySince)
+	instance.ActiveOrdinal = copyInstanceStatusInt32(instance.ActiveOrdinal)
 	instance.Conditions = append([]InstanceStatusCondition{}, in.Instance.Conditions...)
 	for i := range instance.Conditions {
 		condition := &instance.Conditions[i]
@@ -287,8 +330,44 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 	sort.SliceStable(instance.Conditions, func(i, j int) bool {
 		a, b := instance.Conditions[i], instance.Conditions[j]
 		return cmp.Or(
-			cmp.Compare(a.Type, b.Type), cmp.Compare(a.Status, b.Status),
+			cmp.Compare(a.Type, b.Type), cmp.Compare(a.Status, b.Status), cmp.Compare(a.ObservedGeneration, b.ObservedGeneration), cmp.Compare(a.Evidence, b.Evidence),
 			cmp.Compare(a.Reason, b.Reason), compareInstanceStatusTime(a.LastTransitionTime, b.LastTransitionTime),
+		) < 0
+	})
+	instance.Migrations = append([]InstanceStatusMigration{}, in.Instance.Migrations...)
+	for i := range instance.Migrations {
+		migration := &instance.Migrations[i]
+		migration.RequestUUID = safeInstanceStatusText(migration.RequestUUID, 128)
+		migration.Role = safeInstanceStatusText(migration.Role, 16)
+		migration.Trigger = safeInstanceStatusText(migration.Trigger, 16)
+		migration.Phase = safeInstanceStatusText(migration.Phase, 32)
+		migration.FromNode = safeInstanceStatusText(migration.FromNode, 253)
+		migration.Reason = safeInstanceStatusText(migration.Reason, 128)
+		migration.Message = safeInstanceStatusText(migration.Message, instanceStatusTextWidth)
+		migration.SurgeInstance = copyInstanceStatusInt32(migration.SurgeInstance)
+		migration.AllocatedAt = copyInstanceStatusTime(migration.AllocatedAt)
+		migration.StartedAt = copyInstanceStatusTime(migration.StartedAt)
+		migration.Deadline = copyInstanceStatusTime(migration.Deadline)
+		migration.CompletedAt = copyInstanceStatusTime(migration.CompletedAt)
+		migration.Succeeded = copyInstanceStatusBool(migration.Succeeded)
+		migration.TargetNodeHints = append([]string{}, migration.TargetNodeHints...)
+		for j := range migration.TargetNodeHints {
+			migration.TargetNodeHints[j] = safeInstanceStatusText(migration.TargetNodeHints[j], 253)
+		}
+		sort.Strings(migration.TargetNodeHints)
+		migration.TargetNodeHints = slices.Compact(migration.TargetNodeHints)
+	}
+	sort.SliceStable(instance.Migrations, func(i, j int) bool {
+		a, b := instance.Migrations[i], instance.Migrations[j]
+		return cmp.Or(
+			cmp.Compare(a.RequestUUID, b.RequestUUID), cmp.Compare(a.Role, b.Role),
+			cmp.Compare(a.Trigger, b.Trigger), cmp.Compare(a.SourceInstance, b.SourceInstance),
+			compareInstanceStatusInt32(a.SurgeInstance, b.SurgeInstance), cmp.Compare(a.Phase, b.Phase),
+			compareInstanceStatusTime(a.AllocatedAt, b.AllocatedAt), cmp.Compare(a.FromNode, b.FromNode),
+			cmp.Compare(strings.Join(a.TargetNodeHints, "\x00"), strings.Join(b.TargetNodeHints, "\x00")),
+			cmp.Compare(a.Attempt, b.Attempt), cmp.Compare(a.Reason, b.Reason), cmp.Compare(a.Message, b.Message),
+			compareInstanceStatusTime(a.StartedAt, b.StartedAt), compareInstanceStatusTime(a.Deadline, b.Deadline),
+			compareInstanceStatusTime(a.CompletedAt, b.CompletedAt), compareInstanceStatusBoolPointer(a.Succeeded, b.Succeeded),
 		) < 0
 	})
 	if in.Instance.Operation != nil {
@@ -332,13 +411,15 @@ func (r InstanceStatusReport) Table() report.Table {
 		table.Rows = append(table.Rows, []string{printers.BoundedCell(field, 12), printers.BoundedCell(value, 64)})
 	}
 	add("state", fmt.Sprintf("%s %s[%d] evidence=%s", c.Content.Summary.State, c.Content.Summary.Component, c.Content.Summary.Index, c.Content.Summary.Evidence))
-	add("deployment", fmt.Sprintf("mode=%s source=%s evidence=%s", dash(string(c.Content.Deployment.Mode)), dash(string(c.Content.Deployment.Source)), c.Content.Deployment.Evidence))
+	add("deployment", fmt.Sprintf("mode=%s source=%s origin=%s evidence=%s", dash(string(c.Content.Deployment.Mode)), dash(string(c.Content.Deployment.Source)), dash(c.Content.Deployment.Origin), c.Content.Deployment.Evidence))
+	add("encoding", fmt.Sprintf("name=%s evidence=%s reason=%s", dash(c.Content.Encoding.Name), c.Content.Encoding.Evidence, dash(string(c.Content.Encoding.UnavailableReason))))
 	if instance := c.Content.Instance; instance != nil {
 		add("instance", fmt.Sprintf("%s inc=%d phase=%s admitted=%t", instance.InferenceReplica, instance.Incarnation, instance.Phase, instance.Admitted))
 		add("revisions", fmt.Sprintf("running=%s target=%s", dash(instance.RunningRevision), dash(instance.TargetRevision)))
 		add("persisted", fmt.Sprintf("pods=%d serving=%d available=%d", instance.Pods.Total, instance.Pods.Serving, instance.Pods.Available))
+		add("lifecycle", fmt.Sprintf("activeOrdinal=%s readySince=%s", statusInt32(instance.ActiveOrdinal), statusTime(instance.ReadySince)))
 		for _, condition := range instance.Conditions {
-			add("condition", fmt.Sprintf("%s=%s reason=%s", condition.Type, condition.Status, dash(condition.Reason)))
+			add("condition", fmt.Sprintf("%s=%s gen=%d evidence=%s reason=%s", condition.Type, condition.Status, condition.ObservedGeneration, condition.Evidence, dash(condition.Reason)))
 		}
 		if operation := instance.Operation; operation != nil {
 			add("operation", fmt.Sprintf("%s id=%s step=%s retry=%d", operation.Type, operation.ID, operation.Step, operation.RetryCount))
@@ -350,9 +431,12 @@ func (r InstanceStatusReport) Table() report.Table {
 			add("failure", fmt.Sprintf("pod=%s container=%s reason=%s exit=%s", failure.PodName, dash(failure.ContainerName), dash(failure.Reason), statusInt32(failure.ExitCode)))
 			add("fail time", statusTime(failure.Time))
 		}
+		for _, migration := range instance.Migrations {
+			add("migration", fmt.Sprintf("%s role=%s phase=%s source=%d surge=%s", migration.RequestUUID, migration.Role, migration.Phase, migration.SourceInstance, statusInt32(migration.SurgeInstance)))
+		}
 	}
 	for _, pod := range c.Content.Pods {
-		add("pod", fmt.Sprintf("%s %s/%s ready=%t serving=%t restarts=%d node=%s deleting=%t", pod.Name, pod.Runner, pod.Phase, pod.Ready, pod.ServingReady, pod.RestartCount, dash(pod.Node), pod.Deleting))
+		add("pod", fmt.Sprintf("%s %s/%s ready=%s serving=%s restarts=%d node=%s deleting=%t", pod.Name, pod.Runner, pod.Phase, pod.Ready, pod.ServingReady, pod.RestartCount, dash(pod.Node), pod.Deleting))
 	}
 	for _, event := range c.Content.Events {
 		add("event", fmt.Sprintf("%s/%s reason=%s count=%d", event.TargetKind, event.TargetName, event.Reason, event.Count))
@@ -382,10 +466,14 @@ func (r InstanceStatusReport) WideTable() report.Table {
 	add("truncated", strconv.FormatBool(c.Content.Summary.Truncated))
 	add("deployment mode", dash(string(c.Content.Deployment.Mode)))
 	add("deployment source", dash(string(c.Content.Deployment.Source)))
+	add("deployment origin", dash(c.Content.Deployment.Origin))
 	add("deployment evidence", string(c.Content.Deployment.Evidence))
 	if c.Content.Deployment.UnavailableReason != "" {
 		add("deployment unavailable", string(c.Content.Deployment.UnavailableReason))
 	}
+	add("encoding name", dash(c.Content.Encoding.Name))
+	add("encoding evidence", string(c.Content.Encoding.Evidence))
+	add("encoding unavailable", dash(string(c.Content.Encoding.UnavailableReason)))
 	if instance := c.Content.Instance; instance != nil {
 		add("inference replica", instance.InferenceReplica)
 		add("incarnation", strconv.FormatInt(instance.Incarnation, 10))
@@ -396,9 +484,13 @@ func (r InstanceStatusReport) WideTable() report.Table {
 		add("persisted pods", strconv.FormatInt(int64(instance.Pods.Total), 10))
 		add("persisted serving", strconv.FormatInt(int64(instance.Pods.Serving), 10))
 		add("persisted available", strconv.FormatInt(int64(instance.Pods.Available), 10))
+		add("ready since", statusTime(instance.ReadySince))
+		add("active ordinal", statusInt32(instance.ActiveOrdinal))
 		for _, condition := range instance.Conditions {
 			add("condition type", condition.Type)
 			add("condition status", condition.Status)
+			add("condition generation", strconv.FormatInt(condition.ObservedGeneration, 10))
+			add("condition evidence", string(condition.Evidence))
 			add("condition reason", dash(condition.Reason))
 			add("condition transition", statusTime(condition.LastTransitionTime))
 		}
@@ -411,7 +503,12 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add("operation retries", strconv.FormatInt(int64(operation.RetryCount), 10))
 			add("operation surge index", statusInt32(operation.SurgeIndex))
 			add("operation from node", dash(operation.FromNode))
-			add("operation target nodes", dash(strings.Join(operation.TargetNodeHints, ",")))
+			if len(operation.TargetNodeHints) == 0 {
+				add("operation target node", "-")
+			}
+			for _, node := range operation.TargetNodeHints {
+				add("operation target node", node)
+			}
 			add("operation request UUID", dash(operation.RequestUUID))
 			add("operation started", statusTime(operation.StartedAt))
 			add("operation progress", statusTime(operation.LastProgressAt))
@@ -424,6 +521,26 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add("failure exit code", statusInt32(failure.ExitCode))
 			add("failure time", statusTime(failure.Time))
 		}
+		for _, migration := range instance.Migrations {
+			add("migration request UUID", migration.RequestUUID)
+			add("migration role", migration.Role)
+			add("migration trigger", migration.Trigger)
+			add("migration source index", strconv.FormatInt(int64(migration.SourceInstance), 10))
+			add("migration surge index", statusInt32(migration.SurgeInstance))
+			add("migration phase", migration.Phase)
+			add("migration attempt", strconv.FormatInt(int64(migration.Attempt), 10))
+			add("migration from node", dash(migration.FromNode))
+			for _, node := range migration.TargetNodeHints {
+				add("migration target node", node)
+			}
+			add("migration reason", dash(migration.Reason))
+			add("migration message", dash(migration.Message))
+			add("migration started", statusTime(migration.StartedAt))
+			add("migration allocated", statusTime(migration.AllocatedAt))
+			add("migration deadline", statusTime(migration.Deadline))
+			add("migration completed", statusTime(migration.CompletedAt))
+			add("migration succeeded", statusBool(migration.Succeeded))
+		}
 	}
 	for _, pod := range c.Content.Pods {
 		add("pod name", pod.Name)
@@ -431,14 +548,15 @@ func (r InstanceStatusReport) WideTable() report.Table {
 		add("pod revision", dash(pod.Revision))
 		add("pod incarnation", strconv.FormatInt(pod.Incarnation, 10))
 		add("pod phase", pod.Phase)
-		add("pod ready", strconv.FormatBool(pod.Ready))
-		add("pod serving ready", strconv.FormatBool(pod.ServingReady))
+		add("pod ready", pod.Ready)
+		add("pod serving ready", pod.ServingReady)
 		add("pod node", dash(pod.Node))
 		add("pod restarts", strconv.FormatInt(int64(pod.RestartCount), 10))
 		add("pod deleting", strconv.FormatBool(pod.Deleting))
 	}
 	for _, event := range c.Content.Events {
-		add("event target", event.TargetKind+"/"+event.TargetName)
+		add("event target kind", event.TargetKind)
+		add("event target name", event.TargetName)
 		add("event reason", event.Reason)
 		add("event count", strconv.FormatInt(int64(event.Count), 10))
 		add("event first seen", statusTime(event.FirstSeen))
@@ -477,6 +595,32 @@ func compareInstanceStatusTime(left, right *time.Time) int {
 	return left.Compare(*right)
 }
 
+func compareInstanceStatusInt32(left, right *int32) int {
+	if left == nil && right == nil {
+		return 0
+	}
+	if left == nil {
+		return -1
+	}
+	if right == nil {
+		return 1
+	}
+	return cmp.Compare(*left, *right)
+}
+
+func compareInstanceStatusBoolPointer(left, right *bool) int {
+	if left == nil && right == nil {
+		return 0
+	}
+	if left == nil {
+		return -1
+	}
+	if right == nil {
+		return 1
+	}
+	return compareInstanceStatusBool(*left, *right)
+}
+
 func copyInstanceStatusTime(value *time.Time) *time.Time {
 	if value == nil {
 		return nil
@@ -486,6 +630,14 @@ func copyInstanceStatusTime(value *time.Time) *time.Time {
 }
 
 func copyInstanceStatusInt32(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyInstanceStatusBool(value *bool) *bool {
 	if value == nil {
 		return nil
 	}
@@ -512,4 +664,11 @@ func statusInt32(value *int32) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", *value)
+}
+
+func statusBool(value *bool) string {
+	if value == nil {
+		return "-"
+	}
+	return strconv.FormatBool(*value)
 }

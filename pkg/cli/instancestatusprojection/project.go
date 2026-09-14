@@ -21,6 +21,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 var (
@@ -46,6 +47,7 @@ type Input struct {
 	NotOMENative          bool
 	DeploymentMode        reportv1alpha1.DeploymentMode
 	DeploymentModeSource  reportv1alpha1.DeploymentModeSource
+	DeploymentModeOrigin  string
 	DeploymentUnavailable reportv1alpha1.UnavailableReason
 	Pods                  observation.Collection[corev1.Pod]
 	PodsUnavailable       reportv1alpha1.UnavailableReason
@@ -67,6 +69,16 @@ func EventTargets(
 		return []observation.ObjectRef{}, 0
 	}
 	result := []observation.ObjectRef{}
+	expectedIncarnation, authoritativeRows := int64(0), 0
+	for i := range ir.Status.InstanceStatuses {
+		if ir.Status.InstanceStatuses[i].Index == index {
+			expectedIncarnation = ir.Status.InstanceStatuses[i].Incarnation
+			authoritativeRows++
+		}
+	}
+	if authoritativeRows != 1 || expectedIncarnation < 0 {
+		return []observation.ObjectRef{}, 0
+	}
 	valid := make([]*corev1.Pod, 0, len(pods))
 	names, uids := map[string]int{}, map[types.UID]int{}
 	for i := range pods {
@@ -89,7 +101,10 @@ func EventTargets(
 		priority := 10
 		if pod.DeletionTimestamp != nil {
 			priority = 25
-		} else if pod.Status.Phase != corev1.PodRunning || !readyOK || !servingOK || !ready || !serving {
+		} else if pod.Status.Phase != corev1.PodRunning || !readyOK || !servingOK ||
+			ready != string(corev1.ConditionTrue) || serving != string(corev1.ConditionTrue) {
+			priority = 20
+		} else if incarnation, err := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64); err != nil || incarnation != expectedIncarnation {
 			priority = 20
 		}
 		result = append(result, observation.ObjectRef{
@@ -144,11 +159,14 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		},
 		Deployment: reportv1alpha1.InstanceStatusDeployment{
 			Mode: input.DeploymentMode, Source: input.DeploymentModeSource,
+			Origin:   input.DeploymentModeOrigin,
 			Evidence: reportv1alpha1.EvidenceReported, UnavailableReason: input.DeploymentUnavailable,
 		},
-		Pods: []reportv1alpha1.InstanceStatusPod{}, Events: []reportv1alpha1.InstanceStatusEvent{},
+		Encoding: reportv1alpha1.InstanceStatusEncoding{Evidence: reportv1alpha1.EvidenceUnavailable, UnavailableReason: reportv1alpha1.UnavailableUnsupportedAPI},
+		Pods:     []reportv1alpha1.InstanceStatusPod{}, Events: []reportv1alpha1.InstanceStatusEvent{},
 		Issues: []reportv1alpha1.InstanceStatusIssue{},
 	}, reportv1alpha1.ClockFunc(func() time.Time { return list.CollectedAt }))
+	report.Content.Issues = append(report.Content.Issues, reportv1alpha1.InstanceStatusIssue{Code: reportv1alpha1.InstanceStatusIssueEncodingUnsupported, UnavailableReason: reportv1alpha1.UnavailableUnsupportedAPI})
 	if input.DeploymentUnavailable != "" || input.DeploymentMode == "" {
 		report.Content.Deployment.Evidence = reportv1alpha1.EvidenceUnavailable
 	}
@@ -221,7 +239,7 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		addIssue(&report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
 		return finish(report), nil
 	}
-	report.Content.Instance = projectAuthoritative(row, rawRow, &report)
+	report.Content.Instance = projectAuthoritative(row, rawRow, ir, input.Index, &report)
 	if component.State == reportv1alpha1.InstanceEvidenceStale {
 		report.Content.Summary.State = reportv1alpha1.InstanceStatusStatePartial
 	}
@@ -237,21 +255,76 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 func projectAuthoritative(
 	row reportv1alpha1.InstanceListInstance,
 	raw *omev1beta1.OMENativeInstanceStatus,
+	ir *omev1beta1.InferenceReplica,
+	selectedIndex int32,
 	report *reportv1alpha1.InstanceStatusReport,
 ) *reportv1alpha1.InstanceStatusInstance {
 	result := &reportv1alpha1.InstanceStatusInstance{
 		InferenceReplica: row.InferenceReplica, Index: row.Index, Incarnation: row.Incarnation,
 		Phase: row.Phase, RunningRevision: row.RunningRevision, TargetRevision: row.TargetRevision,
 		Pods: row.Pods, Admitted: row.Admitted, Conditions: []reportv1alpha1.InstanceStatusCondition{},
+		ReadySince: metaTimePointerValue(raw.ReadySince),
+		Migrations: []reportv1alpha1.InstanceStatusMigration{},
+	}
+	if raw.ActiveOrdinal == 0 || raw.ActiveOrdinal == 1 {
+		result.ActiveOrdinal = copyInt32(&raw.ActiveOrdinal)
+	} else {
+		addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
+	}
+	contradictory := map[string]bool{}
+	statuses := map[string]metav1.ConditionStatus{}
+	for _, condition := range raw.Conditions {
+		if previous, present := statuses[condition.Type]; present && previous != condition.Status {
+			contradictory[condition.Type] = true
+		} else {
+			statuses[condition.Type] = condition.Status
+		}
 	}
 	for _, condition := range raw.Conditions {
+		if contradictory[condition.Type] {
+			addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
+			continue
+		}
 		if !validConditionStatus(condition.Status) {
 			addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
 			continue
 		}
+		evidence := reportv1alpha1.InstanceEvidenceReported
+		if condition.ObservedGeneration != ir.Generation {
+			evidence = reportv1alpha1.InstanceEvidenceStale
+			addIssue(report, reportv1alpha1.InstanceStatusIssueConditionGenerationStale, "")
+		}
 		result.Conditions = append(result.Conditions, reportv1alpha1.InstanceStatusCondition{
-			Type: condition.Type, Status: string(condition.Status), Reason: condition.Reason,
+			Type: condition.Type, Status: string(condition.Status), ObservedGeneration: condition.ObservedGeneration, Evidence: evidence, Reason: condition.Reason,
 			LastTransitionTime: metaTimePointer(condition.LastTransitionTime),
+		})
+	}
+	migrationIDs := make(map[string]int, len(ir.Status.Migrations))
+	for i := range ir.Status.Migrations {
+		migrationIDs[ir.Status.Migrations[i].RequestUUID]++
+	}
+	for i := range ir.Status.Migrations {
+		migration := &ir.Status.Migrations[i]
+		role := ""
+		if migration.SourceInstance == selectedIndex {
+			role = "Source"
+		} else if migration.SurgeInstance != nil && *migration.SurgeInstance == selectedIndex {
+			role = "Surge"
+		} else {
+			continue
+		}
+		if migrationIDs[migration.RequestUUID] != 1 || !validMigration(migration) {
+			addIssue(report, reportv1alpha1.InstanceStatusIssueMigrationInvalid, reportv1alpha1.UnavailableMalformedPayload)
+			continue
+		}
+		result.Migrations = append(result.Migrations, reportv1alpha1.InstanceStatusMigration{
+			RequestUUID: migration.RequestUUID, Role: role, Trigger: string(migration.Trigger),
+			SourceInstance: migration.SourceInstance, SurgeInstance: copyInt32(migration.SurgeInstance),
+			Phase: string(migration.Phase), AllocatedAt: metaTimePointerValue(migration.AllocatedAt),
+			FromNode: migration.FromNode, TargetNodeHints: append([]string{}, migration.HintTargetNodes...),
+			Attempt: migration.Attempt, Reason: migration.Reason, Message: migration.Message,
+			StartedAt: metaTimePointer(migration.StartedAt), Deadline: metaTimePointer(migration.Deadline),
+			CompletedAt: metaTimePointerValue(migration.CompletedAt), Succeeded: copyBool(migration.Succeeded),
 		})
 	}
 	if raw.Operation != nil {
@@ -297,7 +370,6 @@ func projectPods(
 	if input.PodsUnavailable != "" {
 		report.Sources[len(report.Sources)-1].Evidence = reportv1alpha1.EvidenceUnavailable
 		addIssue(report, reportv1alpha1.InstanceStatusIssuePodsUnavailable, input.PodsUnavailable)
-		return []reportv1alpha1.InstanceStatusPod{}
 	}
 	type candidate struct {
 		value    reportv1alpha1.InstanceStatusPod
@@ -332,9 +404,7 @@ func projectPods(
 		restarts, statusesOK := restartTotal(pod, limits.MaxContainerStatuses)
 		if !statusesOK {
 			addIssue(report, reportv1alpha1.InstanceStatusIssuePodDetailsTruncated, reportv1alpha1.UnavailableMalformedPayload)
-			if len(pod.Status.ContainerStatuses)+len(pod.Status.InitContainerStatuses) <= limits.MaxContainerStatuses {
-				continue
-			}
+			continue
 		}
 		incarnation, _ := strconv.ParseInt(pod.Labels[query.LabelInstanceIncarnation], 10, 64)
 		value := reportv1alpha1.InstanceStatusPod{
@@ -345,7 +415,8 @@ func projectPods(
 		priority := 2
 		if pod.DeletionTimestamp != nil {
 			priority = 0
-		} else if pod.Status.Phase != corev1.PodRunning || !ready || !serving || incarnation != row.Incarnation {
+		} else if pod.Status.Phase != corev1.PodRunning || ready != string(corev1.ConditionTrue) ||
+			serving != string(corev1.ConditionTrue) || incarnation != row.Incarnation {
 			priority = 1
 		}
 		candidates = append(candidates, candidate{value: value, priority: priority})
@@ -411,8 +482,8 @@ func projectEvents(
 		}
 		items = append(items, reportv1alpha1.InstanceStatusEvent{
 			TargetKind: event.InvolvedObject.Kind, TargetName: event.InvolvedObject.Name,
-			Reason: event.Reason, Count: event.Count,
-			FirstSeen: metaTimePointer(event.FirstTimestamp), LastSeen: eventLastSeen(event),
+			Reason: event.Reason, Count: eventCount(event),
+			FirstSeen: eventFirstSeen(event), LastSeen: eventLastSeen(event),
 		})
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -422,7 +493,19 @@ func projectEvents(
 		if items[i].TargetName != items[j].TargetName {
 			return items[i].TargetName < items[j].TargetName
 		}
-		return items[i].Reason < items[j].Reason
+		if items[i].Reason != items[j].Reason {
+			return items[i].Reason < items[j].Reason
+		}
+		if items[i].Count != items[j].Count {
+			return items[i].Count < items[j].Count
+		}
+		if timePointerLess(items[i].FirstSeen, items[j].FirstSeen) {
+			return true
+		}
+		if timePointerLess(items[j].FirstSeen, items[i].FirstSeen) {
+			return false
+		}
+		return timePointerLess(items[i].LastSeen, items[j].LastSeen)
 	})
 	if input.Events.Truncated || input.Events.SkippedTargets > 0 || len(items) > limits.MaxEvents {
 		addIssue(report, reportv1alpha1.InstanceStatusIssueEventsTruncated, "")
@@ -432,6 +515,13 @@ func projectEvents(
 		items = items[:limits.MaxEvents]
 	}
 	report.Content.Events = items
+}
+
+func timePointerLess(left, right *time.Time) bool {
+	if left == nil {
+		return right != nil
+	}
+	return right != nil && left.Before(*right)
 }
 
 func findComponent(list reportv1alpha1.InstanceListReport, component omev1beta1.ComponentType) (reportv1alpha1.InstanceListComponent, int) {
@@ -518,6 +608,8 @@ func copyDetailCompleteness(report *reportv1alpha1.InstanceStatusReport, collect
 			addIssue(report, reportv1alpha1.InstanceStatusIssueConditionsTruncated, "")
 		case instancecollection.DetailNodeHints:
 			addIssue(report, reportv1alpha1.InstanceStatusIssueOperationDetailsTruncated, "")
+		case instancecollection.DetailMigrations:
+			addIssue(report, reportv1alpha1.InstanceStatusIssueMigrationsTruncated, "")
 		}
 		report.Content.Summary.Truncated = true
 	}
@@ -538,25 +630,48 @@ func validSelectedPod(pod *corev1.Pod, isvc *omev1beta1.InferenceService, ir *om
 		return false
 	}
 	if len(validation.IsDNS1123Label(pod.Labels[query.LabelRunner])) != 0 ||
-		len(validation.IsDNS1123Label(pod.Labels[query.LabelRevisionHash])) != 0 {
+		(pod.Labels[query.LabelRevisionHash] != "" && len(validation.IsDNS1123Label(pod.Labels[query.LabelRevisionHash])) != 0) {
 		return false
+	}
+	if rawOrdinal, present := pod.Labels[query.LabelPodOrdinal]; present {
+		ordinal, err := strconv.ParseInt(rawOrdinal, 10, 32)
+		if err != nil || ordinal < 0 || rawOrdinal != strconv.FormatInt(ordinal, 10) ||
+			pod.Name != query.PodName(isvc.Name, workload.ComponentType(ir.Spec.Component), index, pod.Labels[query.LabelRunner], int32(ordinal)) {
+			return false
+		}
 	}
 	return exactControllerOwner(pod.OwnerReferences, "InferenceReplica", ir.Name, ir.UID)
 }
 
 func validSelectedEvent(event *corev1.Event, namespace string, pods map[string]types.UID) bool {
-	if event == nil || event.Namespace != namespace || event.Type != corev1.EventTypeWarning || event.Count < 0 {
+	if event == nil || event.Namespace != namespace || event.Type != corev1.EventTypeWarning ||
+		event.Count < 0 || (event.Series != nil && event.Series.Count < 0) {
 		return false
 	}
 	ref := event.InvolvedObject
 	if ref.Namespace != "" && ref.Namespace != namespace {
 		return false
 	}
-	if ref.Kind != "Pod" {
+	if ref.APIVersion != "v1" || ref.Kind != "Pod" {
 		return false
 	}
 	uid, ok := pods[ref.Name]
 	return ok && uid != "" && ref.UID == uid
+}
+
+func eventCount(event *corev1.Event) int32 {
+	if event.Series != nil {
+		return event.Series.Count
+	}
+	return event.Count
+}
+
+func eventFirstSeen(event *corev1.Event) *time.Time {
+	if !event.EventTime.IsZero() {
+		value := event.EventTime.Time.UTC()
+		return &value
+	}
+	return metaTimePointer(event.FirstTimestamp)
 }
 
 func exactControllerOwner(owners []metav1.OwnerReference, kind, name string, uid types.UID) bool {
@@ -572,18 +687,21 @@ func exactControllerOwner(owners []metav1.OwnerReference, kind, name string, uid
 	return count == 1 && matched
 }
 
-func podCondition(conditions []corev1.PodCondition, kind corev1.PodConditionType, max int) (bool, bool) {
+func podCondition(conditions []corev1.PodCondition, kind corev1.PodConditionType, max int) (string, bool) {
 	if len(conditions) > max {
-		return false, false
+		return "", false
 	}
 	found := false
-	value := false
+	value := string(corev1.ConditionUnknown)
 	for _, condition := range conditions {
 		if condition.Type == kind {
 			if found {
-				return false, false
+				return "", false
 			}
-			found, value = true, condition.Status == corev1.ConditionTrue
+			if condition.Status != corev1.ConditionTrue && condition.Status != corev1.ConditionFalse && condition.Status != corev1.ConditionUnknown {
+				return "", false
+			}
+			found, value = true, string(condition.Status)
 		}
 	}
 	return value, true
@@ -645,12 +763,38 @@ func validFailure(failure *omev1beta1.InstanceTermination) bool {
 		(failure.ContainerName == "" || len(validation.IsDNS1123Label(failure.ContainerName)) == 0)
 }
 
+func validMigration(migration *omev1beta1.MigrationStatus) bool {
+	if migration == nil || migration.RequestUUID == "" || migration.SourceInstance < 0 || migration.Attempt < 0 ||
+		(migration.SurgeInstance != nil && (*migration.SurgeInstance < 0 || *migration.SurgeInstance == migration.SourceInstance)) {
+		return false
+	}
+	if migration.Trigger != omev1beta1.MigrationTriggerManual && migration.Trigger != omev1beta1.MigrationTriggerAuto {
+		return false
+	}
+	switch migration.Phase {
+	case omev1beta1.MigrationPhaseAccepted, omev1beta1.MigrationPhaseSurgePending,
+		omev1beta1.MigrationPhaseSurgeReady, omev1beta1.MigrationPhaseDraining,
+		omev1beta1.MigrationPhaseCompleted, omev1beta1.MigrationPhaseFailed,
+		omev1beta1.MigrationPhaseRelocated:
+		return true
+	default:
+		return false
+	}
+}
+
 func metaTimePointer(value metav1.Time) *time.Time {
 	if value.IsZero() {
 		return nil
 	}
 	result := value.Time.UTC()
 	return &result
+}
+
+func metaTimePointerValue(value *metav1.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	return metaTimePointer(*value)
 }
 
 func eventLastSeen(event *corev1.Event) *time.Time {
@@ -705,6 +849,14 @@ func evidenceUnavailableReason(state reportv1alpha1.InstanceEvidenceState) repor
 }
 
 func copyInt32(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyBool(value *bool) *bool {
 	if value == nil {
 		return nil
 	}

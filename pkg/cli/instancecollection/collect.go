@@ -72,6 +72,8 @@ type DetailLimits struct {
 	MaxScannedConditions int
 	MaxNodeHints         int
 	MaxScannedNodeHints  int
+	MaxMigrations        int
+	MaxScannedMigrations int
 	SelectedComponent    omev1beta1.ComponentType
 	SelectedIndex        int32
 }
@@ -81,6 +83,7 @@ type DetailKind string
 const (
 	DetailConditions DetailKind = "Conditions"
 	DetailNodeHints  DetailKind = "NodeHints"
+	DetailMigrations DetailKind = "Migrations"
 )
 
 type DetailTruncation struct {
@@ -299,6 +302,8 @@ func boundedReplicaCopy(
 			Admitted:          source.Admitted,
 		}
 		if detailLimits.selects(ir.Spec.Component, source.Index) {
+			row.ReadySince = copyTime(source.ReadySince)
+			row.ActiveOrdinal = source.ActiveOrdinal
 			row.Conditions, truncations = copyConditions(
 				source.Conditions, detailLimits, ir, source.Index, truncations,
 			)
@@ -346,7 +351,70 @@ func boundedReplicaCopy(
 		}
 		result.Status.InstanceStatuses[i] = row
 	}
+	if detailLimits.MaxMigrations > 0 && detailLimits.SelectedComponent == ir.Spec.Component {
+		result.Status.Migrations, truncations = copyMigrations(ir.Status.Migrations, detailLimits, ir, truncations)
+	}
 	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), truncations
+}
+
+func copyMigrations(
+	input []omev1beta1.MigrationStatus,
+	limits DetailLimits,
+	ir *omev1beta1.InferenceReplica,
+	truncations []DetailTruncation,
+) ([]omev1beta1.MigrationStatus, []DetailTruncation) {
+	if len(input) > limits.MaxScannedMigrations {
+		return nil, appendDetailTruncation(truncations, ir, limits.SelectedIndex, DetailMigrations)
+	}
+	identities := make(map[string]int, len(input))
+	for i := range input {
+		if input[i].SourceInstance == limits.SelectedIndex || (input[i].SurgeInstance != nil && *input[i].SurgeInstance == limits.SelectedIndex) {
+			identities[input[i].RequestUUID]++
+		}
+	}
+	selected := make([]omev1beta1.MigrationStatus, 0, min(len(input), limits.MaxMigrations))
+	for i := range input {
+		source := &input[i]
+		if source.SourceInstance != limits.SelectedIndex && (source.SurgeInstance == nil || *source.SurgeInstance != limits.SelectedIndex) {
+			continue
+		}
+		if identities[source.RequestUUID] != 1 {
+			truncations = appendDetailTruncation(truncations, ir, limits.SelectedIndex, DetailMigrations)
+			continue
+		}
+		copy := *source
+		copy.RequestUUID = boundedClone(source.RequestUUID, maxInstanceDetailBytes)
+		copy.SurgeInstance = copyInt32(source.SurgeInstance)
+		copy.AllocatedAt = copyTime(source.AllocatedAt)
+		copy.FromNode = boundedClone(source.FromNode, maxInstanceDetailBytes)
+		copy.Reason = boundedClone(source.Reason, maxInstanceDetailBytes)
+		copy.Message = boundedClone(source.Message, maxInstanceDetailBytes)
+		copy.StartedAt = *copyTime(&source.StartedAt)
+		copy.Deadline = *copyTime(&source.Deadline)
+		copy.CompletedAt = copyTime(source.CompletedAt)
+		copy.Succeeded = copyBool(source.Succeeded)
+		copy.HintTargetNodes = nil
+		if len(source.HintTargetNodes) > limits.MaxScannedNodeHints {
+			truncations = appendDetailTruncation(truncations, ir, limits.SelectedIndex, DetailMigrations)
+		} else {
+			copy.HintTargetNodes = make([]string, len(source.HintTargetNodes))
+			for j := range source.HintTargetNodes {
+				copy.HintTargetNodes[j] = boundedClone(source.HintTargetNodes[j], maxInstanceDetailBytes)
+			}
+			sort.Strings(copy.HintTargetNodes)
+			if len(copy.HintTargetNodes) > limits.MaxNodeHints {
+				copy.HintTargetNodes = copy.HintTargetNodes[:limits.MaxNodeHints]
+				truncations = appendDetailTruncation(truncations, ir, limits.SelectedIndex, DetailMigrations)
+			}
+		}
+		selected = append(selected, copy)
+	}
+	sort.Slice(selected, func(i, j int) bool { return selected[i].RequestUUID < selected[j].RequestUUID })
+	if len(selected) > limits.MaxMigrations {
+		selected = selected[:limits.MaxMigrations]
+		truncations = appendDetailTruncation(truncations, ir, limits.SelectedIndex, DetailMigrations)
+	}
+	return selected, truncations
 }
 
 func validDetailLimits(limits DetailLimits) bool {
@@ -355,12 +423,15 @@ func validDetailLimits(limits DetailLimits) bool {
 	}
 	return limits.MaxConditions > 0 && limits.MaxScannedConditions >= limits.MaxConditions &&
 		limits.MaxNodeHints > 0 && limits.MaxScannedNodeHints >= limits.MaxNodeHints &&
+		((limits.MaxMigrations == 0 && limits.MaxScannedMigrations == 0) ||
+			(limits.MaxMigrations > 0 && limits.MaxScannedMigrations >= limits.MaxMigrations)) &&
 		validDetailComponent(limits.SelectedComponent) && limits.SelectedIndex >= 0
 }
 
 func (limits DetailLimits) enabled() bool {
 	return limits.MaxConditions != 0 || limits.MaxScannedConditions != 0 ||
 		limits.MaxNodeHints != 0 || limits.MaxScannedNodeHints != 0 ||
+		limits.MaxMigrations != 0 || limits.MaxScannedMigrations != 0 ||
 		limits.SelectedComponent != "" || limits.SelectedIndex != 0
 }
 
@@ -423,6 +494,14 @@ func appendDetailTruncation(
 }
 
 func copyInt32(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyBool(value *bool) *bool {
 	if value == nil {
 		return nil
 	}

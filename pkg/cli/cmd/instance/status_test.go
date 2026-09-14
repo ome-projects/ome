@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +37,7 @@ import (
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/runtimerevision"
 )
 
 func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
@@ -183,6 +186,84 @@ func TestStatusEffectiveRuntimeComponentModeOverridesServiceSpecBothWays(t *test
 	}
 }
 
+func TestStatusUsesPinnedRuntimeAndExplicitControlPlaneNamespace(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, liveMode, pinnedMode, wantState string
+		livePresent                           bool
+	}{
+		{name: "pinned native beats live raw", liveMode: string(constants.RawDeployment), pinnedMode: string(constants.OMENative), wantState: "Reported", livePresent: true},
+		{name: "pinned raw beats live native", liveMode: string(constants.OMENative), pinnedMode: string(constants.RawDeployment), wantState: "NotOMENative", livePresent: true},
+		{name: "deleted live runtime retains valid pin", pinnedMode: string(constants.OMENative), wantState: "Reported"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isvc := commandISVC()
+			kind, autoSync := "ServingRuntime", false
+			isvc.Spec.Runtime = &omev1beta1.ServingRuntimeRef{Name: "runtime", Kind: &kind, AutoSync: &autoSync}
+			isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+			live := &omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "prod", UID: "runtime-uid"}, Spec: statusRuntimeSpec(test.liveMode)}
+			pinned := statusRuntimeRevision(t, "control-plane", "runtime", statusRuntimeSpec(test.pinnedMode))
+			isvc.Status.PinnedRevisionName = pinned.Name
+			ir := commandIR(isvc)
+			scheme := runtime.NewScheme()
+			require.NoError(t, omev1beta1.AddToScheme(scheme))
+			builder := ctrlfake.NewClientBuilder().WithScheme(scheme)
+			if test.livePresent {
+				builder = builder.WithObjects(live)
+			}
+			ctrl := builder.Build()
+			kube := kubefake.NewSimpleClientset(pinned)
+			out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kube, Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "--ome-namespace", "control-plane", "-o", "json")
+			require.NoError(t, err)
+			assert.Contains(t, out, `"state": "`+test.wantState+`"`)
+			assert.Contains(t, out, `"mode": "`+test.pinnedMode+`"`)
+			assert.Contains(t, out, `"origin": "ControllerRevision"`)
+			get := firstCoreAction(t, kube.Actions(), "controllerrevisions")
+			assert.Equal(t, "control-plane", get.GetNamespace())
+		})
+	}
+}
+
+func TestStatusClassifiesInvalidPinnedRevisionEvidence(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, want string
+		mutate     func(*appsv1.ControllerRevision)
+		missing    bool
+	}{
+		{name: "missing", want: "NotFound", missing: true},
+		{name: "malformed", want: "MalformedPayload", mutate: func(revision *appsv1.ControllerRevision) { revision.Data.Raw = []byte(`{`) }},
+		{name: "disabled", want: "Disabled", mutate: func(revision *appsv1.ControllerRevision) {
+			spec := statusRuntimeSpec(string(constants.OMENative))
+			spec.Disabled = boolPointer(true)
+			revision.Data.Raw, _ = json.Marshal(&spec)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isvc := commandISVC()
+			kind, autoSync, requested := "ServingRuntime", false, ""
+			isvc.Spec.Runtime = &omev1beta1.ServingRuntimeRef{Name: "runtime", Kind: &kind, AutoSync: &autoSync, Revision: &requested}
+			isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+			live := &omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "prod", UID: "runtime-uid"}, Spec: statusRuntimeSpec(string(constants.OMENative))}
+			revision := statusRuntimeRevision(t, "ome", "runtime", statusRuntimeSpec(string(constants.OMENative)))
+			requested = revision.Name
+			if test.mutate != nil {
+				test.mutate(revision)
+			}
+			objects := []runtime.Object{}
+			if !test.missing {
+				objects = append(objects, revision)
+			}
+			scheme := runtime.NewScheme()
+			require.NoError(t, omev1beta1.AddToScheme(scheme))
+			ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
+			out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, commandIR(isvc)), Kube: kubefake.NewSimpleClientset(objects...), Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+			require.NoError(t, err)
+			assert.Contains(t, out, `"unavailableReason": "`+test.want+`"`)
+		})
+	}
+}
+
 func TestStatusResolutionUnavailableKeepsExactCurrentIRAndReportsModeEvidence(t *testing.T) {
 	t.Parallel()
 	isvc := commandISVC()
@@ -194,6 +275,59 @@ func TestStatusResolutionUnavailableKeepsExactCurrentIRAndReportsModeEvidence(t 
 	assert.Contains(t, out, `"state": "Reported"`)
 	assert.Contains(t, out, `"deployment": {`)
 	assert.Contains(t, out, `"evidence": "Unavailable"`)
+}
+
+func TestStatusClassifiesMissingDisabledAndCyclicRuntimeEvidence(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, reason string
+		objects      []ctrlclient.Object
+	}{
+		{name: "missing", reason: "NotFound"},
+		{name: "disabled", reason: "Disabled", objects: []ctrlclient.Object{&omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "prod", UID: "runtime-uid"}, Spec: omev1beta1.ServingRuntimeSpec{Disabled: boolPointer(true)}}}},
+		{name: "cycle", reason: "Cycle", objects: []ctrlclient.Object{
+			&omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "prod", UID: "runtime-uid", Annotations: map[string]string{constants.RuntimeInheritFromAnnotationKey: "parent"}}, Spec: statusRuntimeSpec(string(constants.OMENative))},
+			&omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "parent", Namespace: "prod", UID: "parent-uid", Annotations: map[string]string{constants.RuntimeInheritFromAnnotationKey: "runtime"}}, Spec: statusRuntimeSpec(string(constants.OMENative))},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isvc := commandISVC()
+			kind := "ServingRuntime"
+			isvc.Spec.Runtime = &omev1beta1.ServingRuntimeRef{Name: "runtime", Kind: &kind}
+			isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+			ir := commandIR(isvc)
+			scheme := runtime.NewScheme()
+			require.NoError(t, omev1beta1.AddToScheme(scheme))
+			ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(test.objects...).Build()
+			out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+			require.NoError(t, err)
+			assert.Contains(t, out, `"unavailableReason": "`+test.reason+`"`)
+			assert.Contains(t, out, `"inferenceReplica": "chat-engine"`)
+		})
+	}
+}
+
+func TestStatusClassifiesRuntimeInheritanceMaxDepth(t *testing.T) {
+	t.Parallel()
+	isvc := commandISVC()
+	kind := "ServingRuntime"
+	isvc.Spec.Runtime = &omev1beta1.ServingRuntimeRef{Name: "runtime-00", Kind: &kind}
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+	objects := make([]ctrlclient.Object, 40)
+	for i := range objects {
+		name := fmt.Sprintf("runtime-%02d", i)
+		annotations := map[string]string{}
+		if i+1 < len(objects) {
+			annotations[constants.RuntimeInheritFromAnnotationKey] = fmt.Sprintf("runtime-%02d", i+1)
+		}
+		objects[i] = &omev1beta1.ServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", UID: types.UID("uid-" + name), Annotations: annotations}, Spec: statusRuntimeSpec(string(constants.OMENative))}
+	}
+	scheme := runtime.NewScheme()
+	require.NoError(t, omev1beta1.AddToScheme(scheme))
+	ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, commandIR(isvc)), Kube: kubefake.NewSimpleClientset(), Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"unavailableReason": "MaxDepthExceeded"`)
 }
 
 func TestStatusWideOutputAndWriterFailure(t *testing.T) {
@@ -419,7 +553,8 @@ func TestStatusHelpDefinesFieldsBoundsAndReadOnlyBehavior(t *testing.T) {
 	require.NoError(t, cmd.Execute())
 	for _, want := range []string{
 		"IR status is authoritative", "serving readiness gate", "Event messages are never shown",
-		"POD restarts", "table, wide, json or yaml", "read-only",
+		"POD restarts", "table, wide, json or yaml", "read-only", "--ome-namespace",
+		"ControllerRevision", "migration", "encoding",
 	} {
 		assert.Contains(t, out.String(), want)
 	}
@@ -437,6 +572,10 @@ func TestStatusDefinitiveDeploymentModeResolutionIsFailClosed(t *testing.T) {
 	}{
 		{name: "typed raw requires runtime merge", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &raw }, want: false},
 		{name: "typed native", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &native }, want: false},
+		{name: "typed virtual", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
+			mode := constants.VirtualDeployment
+			isvc.Spec.DeploymentMode = &mode
+		}, want: true},
 		{name: "engine annotation raw", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(raw)}}}
 		}, want: true},
@@ -494,7 +633,7 @@ func statusCommandDependencies() statusDependencies {
 		clock: commandClock,
 		irLimits: instancecollection.Limits{
 			Paging: paging.Limits{PageSize: 2, MaxItems: 6, MaxPages: 3, RequestTimeout: time.Second}, MaxStatusRows: 100,
-			Details: instancecollection.DetailLimits{MaxConditions: 8, MaxScannedConditions: 16, MaxNodeHints: 8, MaxScannedNodeHints: 16},
+			Details: instancecollection.DetailLimits{MaxConditions: 8, MaxScannedConditions: 16, MaxNodeHints: 8, MaxScannedNodeHints: 16, MaxMigrations: 8, MaxScannedMigrations: 16},
 		},
 		podLimits:     paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
 		runtimeLimits: paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
@@ -528,8 +667,28 @@ func commandStatusEvent(name, kind, target string, uid types.UID) corev1.Event {
 	return corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", UID: types.UID("uid-" + name)},
 		Type:       corev1.EventTypeWarning, Reason: "FailedMount", Count: 1,
-		InvolvedObject: corev1.ObjectReference{Kind: kind, Namespace: "prod", Name: target, UID: uid},
+		InvolvedObject: corev1.ObjectReference{APIVersion: "v1", Kind: kind, Namespace: "prod", Name: target, UID: uid},
 	}
+}
+
+func statusRuntimeSpec(mode string) omev1beta1.ServingRuntimeSpec {
+	return omev1beta1.ServingRuntimeSpec{EngineConfig: &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: mode}}}}
+}
+
+func boolPointer(value bool) *bool { return &value }
+
+func statusRuntimeRevision(t *testing.T, namespace, runtimeName string, spec omev1beta1.ServingRuntimeSpec) *appsv1.ControllerRevision {
+	t.Helper()
+	full, short, err := runtimerevision.Hash(&spec)
+	require.NoError(t, err)
+	require.Len(t, full, 64)
+	raw, err := json.Marshal(&spec)
+	require.NoError(t, err)
+	return &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: runtimerevision.Name(runtimerevision.KindServingRuntime, "prod", runtimeName, short), Namespace: namespace, UID: "revision-uid",
+		Labels:      map[string]string{constants.RuntimeRevisionOfLabelKey: runtimeName, constants.RuntimeRevisionOfKindLabelKey: "ServingRuntime", constants.RuntimeRevisionOfNamespaceLabelKey: "prod", constants.RuntimeRevisionHashLabelKey: short},
+		Annotations: map[string]string{constants.RuntimeRevisionCreatedByKey: constants.RuntimeRevisionCreatedByOMEValue},
+	}, Data: runtime.RawExtension{Raw: raw}, Revision: 1}
 }
 
 func firstCoreAction(t *testing.T, actions []ktesting.Action, resource string) ktesting.Action {
