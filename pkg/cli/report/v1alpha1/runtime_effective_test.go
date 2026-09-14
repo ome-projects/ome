@@ -207,6 +207,79 @@ func TestRuntimeEffectiveCompactTableBoundsAndDisambiguatesIdentities(t *testing
 	assert.Contains(t, structured.String(), namespace)
 }
 
+// TestRuntimeEffectiveCompactIdentityRowsDisambiguateBeyondSafetyClip catches
+// display tags being derived after a 1024-column safety clip. Each pair differs
+// only in the discarded middle, so only a complete-identity hash can keep the
+// compact runtime and revision rows distinct.
+func TestRuntimeEffectiveCompactIdentityRowsDisambiguateBeyondSafetyClip(t *testing.T) {
+	prefix := strings.Repeat("a", 511)
+	suffix := strings.Repeat("z", 510)
+	firstName := prefix + "first-distinct-middle" + suffix
+	secondName := prefix + "second-distinct-middle" + suffix
+	firstRuntime := runtimeObject(v1alpha1.RuntimeKindServingRuntime, "prod", firstName)
+	secondRuntime := runtimeObject(v1alpha1.RuntimeKindServingRuntime, "prod", secondName)
+	tests := []struct {
+		name    string
+		field   string
+		content v1alpha1.RuntimeEffectiveContent
+	}{
+		{
+			name:  "runtime rows",
+			field: "RUNTIME",
+			content: v1alpha1.RuntimeEffectiveContent{
+				Live:   v1alpha1.RuntimeConfiguration{Source: &firstRuntime},
+				Active: v1alpha1.RuntimeConfiguration{Source: &secondRuntime},
+			},
+		},
+		{
+			name:  "revision rows",
+			field: "REVISION",
+			content: v1alpha1.RuntimeEffectiveContent{
+				Live: v1alpha1.RuntimeConfiguration{Revision: &v1alpha1.RuntimeRevisionReference{
+					Namespace: "ome", Name: firstName,
+				}},
+				Active: v1alpha1.RuntimeConfiguration{Revision: &v1alpha1.RuntimeRevisionReference{
+					Namespace: "ome", Name: secondName,
+				}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			firstTable := tt.content.Table()
+			secondTable := tt.content.Table()
+			var identities []string
+			for _, row := range firstTable.Rows {
+				if row[1] == tt.field {
+					identities = append(identities, row[2])
+					assert.LessOrEqual(t, runtimeEffectiveFixtureWidth(row[2]), 54)
+				}
+			}
+			require.Len(t, identities, 2)
+			assert.NotEqual(t, identities[0], identities[1])
+			assert.Equal(t, firstTable, secondTable)
+
+			var compact bytes.Buffer
+			require.NoError(t, firstTable.Write(&compact))
+			for _, line := range strings.Split(strings.TrimSuffix(compact.String(), "\n"), "\n") {
+				assert.LessOrEqual(t, runtimeEffectiveFixtureWidth(line), 80, "line %q", line)
+			}
+
+			var wide bytes.Buffer
+			require.NoError(t, tt.content.WideTable().Write(&wide))
+			assert.Contains(t, wide.String(), firstName)
+			assert.Contains(t, wide.String(), secondName)
+
+			for _, format := range []report.Format{report.FormatJSON, report.FormatYAML} {
+				var structured bytes.Buffer
+				require.NoError(t, report.Write(&structured, format, tt.content))
+				assert.Contains(t, structured.String(), firstName)
+				assert.Contains(t, structured.String(), secondName)
+			}
+		})
+	}
+}
+
 func TestRuntimeEffectiveCompactTableHandlesPartialAndUnknownValues(t *testing.T) {
 	unknown := runtimeObject(v1alpha1.RuntimeKindUnknown, "team-a", "runtime")
 	longRevision := "revision-" + strings.Repeat("x", 120)

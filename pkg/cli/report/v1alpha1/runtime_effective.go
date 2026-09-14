@@ -258,11 +258,11 @@ func compactRuntimePin(pin RuntimePin) string {
 
 func compactRuntimeEffectiveIdentity(value string) string {
 	const normalizedIdentityLimit = 1024
+	digest := sha256.Sum256([]byte(value))
 	clean := printers.BoundedMiddleCell(value, normalizedIdentityLimit)
 	if printers.BoundedMiddleCell(clean, compactRuntimeEffectiveValueWidth) == clean {
 		return clean
 	}
-	digest := sha256.Sum256([]byte(clean))
 	prefix := printers.BoundedMiddleCell(
 		clean, compactRuntimeEffectiveValueWidth-1-8,
 	)
@@ -315,11 +315,12 @@ func compactRuntimeKind(kind RuntimeKind) string {
 
 func compactRuntimeIdentityComponent(value string, width int) string {
 	const normalizedIdentityLimit = 1024
-	clean := printers.BoundedMiddleCell(orDash(value), normalizedIdentityLimit)
+	identity := orDash(value)
+	digest := sha256.Sum256([]byte(identity))
+	clean := printers.BoundedMiddleCell(identity, normalizedIdentityLimit)
 	if printers.BoundedMiddleCell(clean, width) == clean {
 		return clean
 	}
-	digest := sha256.Sum256([]byte(clean))
 	prefix := printers.BoundedMiddleCell(clean, width-1-8)
 	return prefix + "#" + hex.EncodeToString(digest[:4])
 }
