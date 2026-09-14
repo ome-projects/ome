@@ -633,15 +633,16 @@ func TestProjectRejectsContradictoryCanaryEpochEvidence(t *testing.T) {
 
 func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	tests := []struct {
-		name        string
-		phase       omev1beta1.RolloutPhase
-		globalPause string
+		name               string
+		phase              omev1beta1.RolloutPhase
+		globalPause        string
+		postRepinStepClock bool
 	}{
-		{name: "capacity pending", phase: omev1beta1.RolloutPhasePending},
+		{name: "capacity pending after step clock refresh", phase: omev1beta1.RolloutPhasePending, postRepinStepClock: true},
 		{name: "immediately persisted repin boundary", phase: omev1beta1.RolloutPhaseCanarying},
 		{name: "globally paused repin boundary", phase: omev1beta1.RolloutPhaseCanarying, globalPause: "true"},
-		{name: "ready and paused", phase: omev1beta1.RolloutPhasePaused},
-		{name: "capacity wait failed", phase: omev1beta1.RolloutPhaseFailed},
+		{name: "ready and paused after step clock refresh", phase: omev1beta1.RolloutPhasePaused, postRepinStepClock: true},
+		{name: "capacity wait failed after step clock refresh", phase: omev1beta1.RolloutPhaseFailed, postRepinStepClock: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -655,6 +656,10 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 			// stand-alone CanaryStatus residue.
 			configureTrafficRepin(t, isvc, isvc.Spec.Rollout.Groups[0].Canary.Steps,
 				newSteps, 0, 20, tt.phase, true)
+			if tt.postRepinStepClock {
+				entered := metav1.NewTime(isvc.Status.Rollout.ActiveRun.PinnedAt.Add(time.Minute))
+				isvc.Status.Canary.StepEnteredTime = &entered
+			}
 			if tt.globalPause != "" {
 				// A run-boundary repin is flushed before canary reconciliation.
 				// Global pause then returns without replacing the pre-repin phase,
@@ -687,8 +692,8 @@ func TestProjectRejectsUnprovenRepinPreStepHold(t *testing.T) {
 		{name: "initial pin is not a repin", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.PinnedAt = isvc.Status.Rollout.ActiveRun.OpenedAt
 		}},
-		{name: "pin does not postdate step", mutate: func(isvc *omev1beta1.InferenceService) {
-			isvc.Status.Rollout.ActiveRun.PinnedAt = *isvc.Status.Canary.StepEnteredTime
+		{name: "step entry time missing", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.StepEnteredTime = nil
 		}},
 		{name: "primary target differs", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = "cccccccc"
@@ -750,6 +755,7 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 		promotedThrough string
 		wantTarget      int32
 		accepted        bool
+		postRepinClock  bool
 	}{
 		{
 			name: "lowering repin",
@@ -768,6 +774,24 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			phase:           omev1beta1.RolloutPhasePaused,
 			wantTarget:      30,
 			accepted:        true,
+		},
+		{
+			name: "non-raising boundary after step clock refresh",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 20},
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 10},
+				{Capacity: intstr.FromString("50%"), Traffic: 30},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			currentStep:     1,
+			observedTraffic: 50,
+			phase:           omev1beta1.RolloutPhasePaused,
+			wantTarget:      30,
+			postRepinClock:  true,
 		},
 		{
 			name: "equal repin with promotion residue",
@@ -872,6 +896,10 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 					Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: pinnedDigest, Group: group,
 				}}},
 			}}
+			if tt.postRepinClock {
+				entered := metav1.NewTime(pinned.Add(time.Minute))
+				isvc.Status.Canary.StepEnteredTime = &entered
+			}
 			isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
 
 			got, err := trafficprojection.Project(isvc, projectionClock)
@@ -915,6 +943,18 @@ func TestProjectRejectsImpossiblePolicyRepinProvenance(t *testing.T) {
 		}},
 		{name: "policy progression invalid", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = "SECRET_PROGRESSION"
+		}},
+		{name: "derived provenance carries progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyGeneration = 0
+		}},
+		{name: "derived provenance carries kind", mutate: func(isvc *omev1beta1.InferenceService) {
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.PolicyGeneration = 0
+			pinned.PolicyRef.Progression = ""
+			pinned.PolicyRef.Kind = "RolloutPolicy"
+		}},
+		{name: "local provenance omits progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = ""
 		}},
 		{name: "policy capacity is absolute", mutate: func(isvc *omev1beta1.InferenceService) {
 			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
@@ -1029,6 +1069,18 @@ func TestProjectAcceptsPolicyRepinWithReorderedTargets(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Content.Canary)
 	assert.Equal(t, int32(1), got.Content.Canary.CurrentStep)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code: reportv1alpha1.TrafficIssueCanaryInvalid,
+	})
+
+	// A derived service pins the same policy body from name-only provenance;
+	// no local policy object means there is no generation, kind, or progression.
+	pinned.PolicyGeneration = 0
+	pinned.PolicyRef.Kind = ""
+	pinned.PolicyRef.Progression = ""
+	got, err = trafficprojection.Project(isvc, projectionClock)
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
 	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
 		Code: reportv1alpha1.TrafficIssueCanaryInvalid,
 	})

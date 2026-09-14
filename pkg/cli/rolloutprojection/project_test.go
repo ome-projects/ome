@@ -1046,16 +1046,17 @@ func TestProjectRejectsControllerImpossibleCanaryStateMatrix(t *testing.T) {
 
 func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 	tests := []struct {
-		name        string
-		phase       omev1beta1.RolloutPhase
-		globalPause string
-		wantState   reportv1alpha1.RolloutState
+		name               string
+		phase              omev1beta1.RolloutPhase
+		globalPause        string
+		wantState          reportv1alpha1.RolloutState
+		postRepinStepClock bool
 	}{
-		{name: "capacity pending", phase: omev1beta1.RolloutPhasePending, wantState: reportv1alpha1.RolloutStateInProgress},
+		{name: "capacity pending after step clock refresh", phase: omev1beta1.RolloutPhasePending, wantState: reportv1alpha1.RolloutStateInProgress, postRepinStepClock: true},
 		{name: "immediately persisted repin boundary", phase: omev1beta1.RolloutPhaseCanarying, wantState: reportv1alpha1.RolloutStateInProgress},
 		{name: "globally paused repin boundary", phase: omev1beta1.RolloutPhaseCanarying, globalPause: "true", wantState: reportv1alpha1.RolloutStateInProgress},
-		{name: "ready and paused", phase: omev1beta1.RolloutPhasePaused, wantState: reportv1alpha1.RolloutStatePaused},
-		{name: "capacity wait failed", phase: omev1beta1.RolloutPhaseFailed, wantState: reportv1alpha1.RolloutStateFailed},
+		{name: "ready and paused after step clock refresh", phase: omev1beta1.RolloutPhasePaused, wantState: reportv1alpha1.RolloutStatePaused, postRepinStepClock: true},
+		{name: "capacity wait failed after step clock refresh", phase: omev1beta1.RolloutPhaseFailed, wantState: reportv1alpha1.RolloutStateFailed, postRepinStepClock: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1069,6 +1070,10 @@ func TestProjectAcceptsControllerRepinPreStepHold(t *testing.T) {
 			// stand-alone CanaryStatus residue.
 			configureRolloutRepin(t, isvc, isvc.Spec.Rollout.Groups[0].Canary.Steps,
 				newSteps, 0, 50, tt.phase, true)
+			if tt.postRepinStepClock {
+				entered := metav1.NewTime(isvc.Status.Rollout.ActiveRun.PinnedAt.Add(time.Minute))
+				isvc.Status.Canary.StepEnteredTime = &entered
+			}
 			if tt.globalPause != "" {
 				// Repin boundaries flush before the canary executor. A global
 				// pause makes the old Canarying phase durable until resume.
@@ -1103,8 +1108,8 @@ func TestProjectRejectsUnprovenRepinPreStepHold(t *testing.T) {
 		{name: "initial pin is not a repin", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.PinnedAt = isvc.Status.Rollout.ActiveRun.OpenedAt
 		}},
-		{name: "pin does not postdate step", mutate: func(isvc *omev1beta1.InferenceService) {
-			isvc.Status.Rollout.ActiveRun.PinnedAt = *isvc.Status.Canary.StepEnteredTime
+		{name: "step entry time missing", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Canary.StepEnteredTime = nil
 		}},
 		{name: "primary target differs", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = "cccccccc"
@@ -1166,6 +1171,7 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 		promotedThrough string
 		wantTarget      int32
 		accepted        bool
+		postRepinClock  bool
 	}{
 		{
 			name: "lowering repin",
@@ -1184,6 +1190,24 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 			phase:           omev1beta1.RolloutPhasePaused,
 			wantTarget:      30,
 			accepted:        true,
+		},
+		{
+			name: "non-raising boundary after step clock refresh",
+			oldSteps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 20},
+				{Capacity: intstr.FromString("50%"), Traffic: 50},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			steps: []omev1beta1.RolloutGroupStep{
+				{Capacity: intstr.FromString("25%"), Traffic: 10},
+				{Capacity: intstr.FromString("50%"), Traffic: 30},
+				{Capacity: intstr.FromString("100%"), Traffic: 100},
+			},
+			currentStep:     1,
+			observedTraffic: 50,
+			phase:           omev1beta1.RolloutPhasePaused,
+			wantTarget:      30,
+			postRepinClock:  true,
 		},
 		{
 			name: "equal repin with promotion residue",
@@ -1285,6 +1309,10 @@ func TestProjectValidatesGloballyPausedNonRaisingRepinBoundary(t *testing.T) {
 					Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: pinnedDigest, Group: group,
 				}}},
 			}}
+			if tt.postRepinClock {
+				entered := metav1.NewTime(pinned.Add(time.Minute))
+				isvc.Status.Canary.StepEnteredTime = &entered
+			}
 			isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
 
 			got, err := rolloutprojection.Project(isvc, fixedClock())
@@ -1328,6 +1356,18 @@ func TestProjectRejectsImpossiblePolicyRepinProvenance(t *testing.T) {
 		}},
 		{name: "policy progression invalid", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = "SECRET_PROGRESSION"
+		}},
+		{name: "derived provenance carries progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyGeneration = 0
+		}},
+		{name: "derived provenance carries kind", mutate: func(isvc *omev1beta1.InferenceService) {
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.PolicyGeneration = 0
+			pinned.PolicyRef.Progression = ""
+			pinned.PolicyRef.Kind = "RolloutPolicy"
+		}},
+		{name: "local provenance omits progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = ""
 		}},
 		{name: "policy capacity is absolute", mutate: func(isvc *omev1beta1.InferenceService) {
 			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
@@ -1443,6 +1483,18 @@ func TestProjectAcceptsPolicyRepinWithReorderedTargets(t *testing.T) {
 	require.Len(t, got.Content.Groups, 1)
 	require.NotNil(t, got.Content.Groups[0].Step)
 	assert.Equal(t, int32(1), got.Content.Groups[0].Step.Index)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+		Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
+	})
+
+	// A derived service pins the same policy body from name-only provenance;
+	// no local policy object means there is no generation, kind, or progression.
+	pinned.PolicyGeneration = 0
+	pinned.PolicyRef.Kind = ""
+	pinned.PolicyRef.Progression = ""
+	got, err = rolloutprojection.Project(isvc, fixedClock())
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Groups[0].Step)
 	assert.NotContains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
 		Code: reportv1alpha1.RolloutIssueStatusMalformed, Group: ptrInt(0),
 	})

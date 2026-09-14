@@ -19,23 +19,17 @@ import (
 func TestValidCanaryRepinBindsPlanTargetAndEpoch(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*omev1beta1.InferenceService, *metav1.Time)
+		mutate func(*omev1beta1.InferenceService)
 		valid  bool
 	}{
 		{name: "complete repin evidence", valid: true},
-		{name: "initial pin", mutate: func(isvc *omev1beta1.InferenceService, _ *metav1.Time) {
+		{name: "initial pin", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.PinnedAt = isvc.Status.Rollout.ActiveRun.OpenedAt
 		}},
-		{name: "pin at step entry", mutate: func(isvc *omev1beta1.InferenceService, entered *metav1.Time) {
-			isvc.Status.Rollout.ActiveRun.PinnedAt = *entered
-		}},
-		{name: "step entry missing", mutate: func(_ *omev1beta1.InferenceService, entered *metav1.Time) {
-			*entered = metav1.Time{}
-		}},
-		{name: "primary target differs", mutate: func(isvc *omev1beta1.InferenceService, _ *metav1.Time) {
+		{name: "primary target differs", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = "dddddddd"
 		}},
-		{name: "projected steps differ", mutate: func(isvc *omev1beta1.InferenceService, _ *metav1.Time) {
+		{name: "projected steps differ", mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps[1].Traffic = 40
 			refreshDigest(t, &isvc.Status.Rollout.ActiveRun.Plan.Groups[0])
 		}},
@@ -43,13 +37,13 @@ func TestValidCanaryRepinBindsPlanTargetAndEpoch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			isvc, steps, entered := validRepinISVC(t)
+			isvc, steps, _ := validRepinISVC(t)
 			projected := append([]omev1beta1.RolloutGroupStep{}, steps...)
 			if tt.mutate != nil {
-				tt.mutate(isvc, &entered)
+				tt.mutate(isvc)
 			}
 			assert.Equal(t, tt.valid, pinnedevidence.ValidCanaryRepin(
-				isvc, omev1beta1.EngineComponent, projected, "bbbbbbbb", &entered,
+				isvc, omev1beta1.EngineComponent, projected, "bbbbbbbb",
 			))
 		})
 	}
@@ -82,6 +76,21 @@ func TestValidActiveRunRejectsImpossibleEvidence(t *testing.T) {
 		{name: "policy progression differs", mutate: func(isvc *omev1beta1.InferenceService) {
 			asPolicy(isvc)
 			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = omev1beta1.RolloutProgressionBlueGreen
+		}},
+		{name: "derived policy carries progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			asPolicy(isvc)
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyGeneration = 0
+		}},
+		{name: "derived policy carries kind", mutate: func(isvc *omev1beta1.InferenceService) {
+			asPolicy(isvc)
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.PolicyGeneration = 0
+			pinned.PolicyRef.Progression = ""
+			pinned.PolicyRef.Kind = "RolloutPolicy"
+		}},
+		{name: "local policy omits progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			asPolicy(isvc)
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = ""
 		}},
 		{name: "policy kind invalid", mutate: func(isvc *omev1beta1.InferenceService) {
 			asPolicy(isvc)
@@ -142,12 +151,177 @@ func TestValidActiveRunAcceptsControllerShapes(t *testing.T) {
 
 	asPolicy(isvc)
 	assert.True(t, pinnedevidence.ValidActiveRun(isvc))
+	isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Kind = "RolloutPolicy"
+	assert.True(t, pinnedevidence.ValidActiveRun(isvc))
 
 	// A derived ISVC recovers policy provenance from an annotation, which
 	// carries the policy name but not a declared progression.
+	isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Kind = ""
 	isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyRef.Progression = ""
 	isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PolicyGeneration = 0
 	assert.True(t, pinnedevidence.ValidActiveRun(isvc))
+}
+
+func TestValidActiveRunRejectsIncompleteAndBoundedEvidence(t *testing.T) {
+	badOnInconclusive := omev1beta1.OnInconclusive("Ignore")
+	tests := []struct {
+		name   string
+		make   func(*testing.T) *omev1beta1.InferenceService
+		mutate func(*omev1beta1.InferenceService)
+	}{
+		{name: "nil service", make: func(*testing.T) *omev1beta1.InferenceService { return nil }},
+		{name: "missing rollout", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout = nil
+		}},
+		{name: "missing active run", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun = nil
+		}},
+		{name: "missing service name", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Name = ""
+		}},
+		{name: "missing open time", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.OpenedAt = metav1.Time{}
+		}},
+		{name: "missing pin time", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.PinnedAt = metav1.Time{}
+		}},
+		{name: "missing pinned plan", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups = nil
+		}},
+		{name: "too many groups", mutate: func(isvc *omev1beta1.InferenceService) {
+			group := isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			isvc.Status.Rollout.ActiveRun.Plan.Groups = append(
+				isvc.Status.Rollout.ActiveRun.Plan.Groups, group, group, group,
+			)
+		}},
+		{name: "group has no components", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Components = nil
+		}},
+		{name: "group has too many components", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Components = []omev1beta1.ComponentType{
+				omev1beta1.RouterComponent,
+				omev1beta1.EngineComponent,
+				omev1beta1.DecoderComponent,
+				"frontend",
+			}
+		}},
+		{name: "group order is too long", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Order = []omev1beta1.ComponentType{
+				omev1beta1.RouterComponent,
+				omev1beta1.EngineComponent,
+				omev1beta1.DecoderComponent,
+				omev1beta1.EngineComponent,
+			}
+		}},
+		{name: "canary has too many steps", mutate: func(isvc *omev1beta1.InferenceService) {
+			step := isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps[0]
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps = make(
+				[]omev1beta1.RolloutGroupStep, 21,
+			)
+			for i := range isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps {
+				isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps[i] = step
+			}
+		}},
+		{name: "analysis has too many metrics", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps[0].Analysis =
+				&omev1beta1.RolloutAnalysis{Metrics: make([]omev1beta1.AnalysisMetric, 11)}
+		}},
+		{name: "analysis inconclusive action is invalid", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps[0].Analysis =
+				&omev1beta1.RolloutAnalysis{OnInconclusive: &badOnInconclusive}
+		}},
+		{name: "group has no pinned progression", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary = nil
+		}},
+		{name: "group has multiple pinned progressions", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.BlueGreen = &omev1beta1.GroupBlueGreen{}
+		}},
+		{name: "source does not default", mutate: func(isvc *omev1beta1.InferenceService) {
+			isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Source = ""
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var isvc *omev1beta1.InferenceService
+			if tt.make != nil {
+				isvc = tt.make(t)
+			} else {
+				isvc, _, _ = validRepinISVC(t)
+			}
+			if tt.mutate != nil {
+				tt.mutate(isvc)
+			}
+			assert.False(t, pinnedevidence.ValidActiveRun(isvc))
+		})
+	}
+}
+
+func TestValidActiveRunAcceptsNonCanaryProgressions(t *testing.T) {
+	tests := []struct {
+		name   string
+		update func(*omev1beta1.RolloutGroup)
+	}{
+		{name: "blue green", update: func(group *omev1beta1.RolloutGroup) {
+			group.BlueGreen = &omev1beta1.GroupBlueGreen{}
+		}},
+		{name: "rolling update", update: func(group *omev1beta1.RolloutGroup) {
+			maxSurge := intstr.FromString("25%")
+			maxUnavailable := intstr.FromString("25%")
+			group.RollingUpdate = &omev1beta1.GroupRollingUpdate{
+				MaxSurge: &maxSurge, MaxUnavailable: &maxUnavailable,
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc, _, _ := validRepinISVC(t)
+			isvc.Spec.Decoder = nil
+			pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+			pinned.Group.Components = []omev1beta1.ComponentType{omev1beta1.EngineComponent}
+			pinned.Group.Canary = nil
+			tt.update(&pinned.Group)
+			isvc.Status.Rollout.ActiveRun.TargetRevisions = []omev1beta1.RolloutRunTarget{{
+				Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb",
+			}}
+			refreshDigest(t, pinned)
+
+			assert.True(t, pinnedevidence.ValidActiveRun(isvc))
+		})
+	}
+}
+
+func TestValidCanaryRepinRejectsOtherProgressionAndPrimary(t *testing.T) {
+	isvc, steps, _ := validRepinISVC(t)
+	assert.False(t, pinnedevidence.ValidCanaryRepin(
+		isvc, omev1beta1.RouterComponent, steps, "bbbbbbbb",
+	))
+
+	isvc.Spec.Decoder = nil
+	pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+	pinned.Group.Components = []omev1beta1.ComponentType{omev1beta1.EngineComponent}
+	pinned.Group.Canary = nil
+	pinned.Group.BlueGreen = &omev1beta1.GroupBlueGreen{}
+	isvc.Status.Rollout.ActiveRun.TargetRevisions = []omev1beta1.RolloutRunTarget{{
+		Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb",
+	}}
+	refreshDigest(t, pinned)
+	require.True(t, pinnedevidence.ValidActiveRun(isvc))
+	assert.False(t, pinnedevidence.ValidCanaryRepin(
+		isvc, omev1beta1.EngineComponent, steps, "bbbbbbbb",
+	))
+}
+
+func TestValidationDoesNotMutateEvidence(t *testing.T) {
+	isvc, steps, _ := validRepinISVC(t)
+	want := isvc.DeepCopy()
+
+	require.True(t, pinnedevidence.ValidActiveRun(isvc))
+	require.True(t, pinnedevidence.ValidCanaryRepin(
+		isvc, omev1beta1.EngineComponent, steps, "bbbbbbbb",
+	))
+	assert.Equal(t, want, isvc)
 }
 
 func validRepinISVC(

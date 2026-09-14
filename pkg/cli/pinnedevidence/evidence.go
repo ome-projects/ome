@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"strings"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -36,19 +35,18 @@ func ValidActiveRun(isvc *omev1beta1.InferenceService) bool {
 
 // ValidCanaryRepin reports whether a fully valid active run proves that the
 // supplied canary status was clamped against the supplied steps by a repin.
-// A repin advances PinnedAt strictly beyond both the run open and the step
-// entry. The pinned canary group and primary target must match exactly.
+// A repin advances PinnedAt strictly beyond the run open. The pinned canary
+// group and primary target must match exactly. StepEnteredTime is deliberately
+// not part of this proof: the canary capacity reconciler may re-stamp it after
+// the repin while a raising PreStepHold remains armed.
 func ValidCanaryRepin(
 	isvc *omev1beta1.InferenceService,
 	primary omev1beta1.ComponentType,
 	steps []omev1beta1.RolloutGroupStep,
 	targetRevision string,
-	stepEnteredAt *metav1.Time,
 ) bool {
 	validated, valid := validateActiveRun(isvc)
-	if !valid || stepEnteredAt == nil || stepEnteredAt.IsZero() ||
-		!validated.run.PinnedAt.Time.After(validated.run.OpenedAt.Time) ||
-		!validated.run.PinnedAt.Time.After(stepEnteredAt.Time) ||
+	if !valid || !validated.run.PinnedAt.Time.After(validated.run.OpenedAt.Time) ||
 		!revisionHashPattern.MatchString(targetRevision) ||
 		validated.targets[primary] != targetRevision {
 		return false
@@ -177,7 +175,7 @@ func validSource(
 		return pinned.PolicyRef == nil && pinned.PolicyGeneration == 0
 	case omev1beta1.RolloutPlanSourcePolicy:
 		if pinned.PolicyRef == nil || pinned.PolicyGeneration < 0 ||
-			!validPolicyRef(pinned.PolicyRef, progression) {
+			!validPolicyRef(pinned.PolicyRef, progression, pinned.PolicyGeneration) {
 			return false
 		}
 		policy := &omev1beta1.RolloutPolicySpec{
@@ -194,17 +192,21 @@ func validSource(
 func validPolicyRef(
 	ref *omev1beta1.RolloutPolicyRef,
 	progression omev1beta1.RolloutProgressionKind,
+	generation int64,
 ) bool {
-	if ref.Kind != "" && ref.Kind != validation.RolloutPolicyKind {
-		return false
-	}
 	if ref.Name == "" || len(utilvalidation.IsDNS1123Subdomain(ref.Name)) != 0 {
 		return false
 	}
-	// Derived ISVC provenance contains only the policy name. For a locally
-	// resolved ref, admission requires an explicit progression. In both cases
-	// any reported non-empty progression must match the resolved body exactly.
-	return ref.Progression == "" || ref.Progression == progression
+	// A derived ISVC recovers only a policy name from its derive-time
+	// annotation and has no local object generation. A locally resolved ref
+	// retains the admission-validated kind and declared progression, and the
+	// Kubernetes object has a positive generation.
+	if generation == 0 {
+		return ref.Kind == "" && ref.Progression == ""
+	}
+	return generation > 0 &&
+		(ref.Kind == "" || ref.Kind == validation.RolloutPolicyKind) &&
+		ref.Progression == progression
 }
 
 func progressionKind(

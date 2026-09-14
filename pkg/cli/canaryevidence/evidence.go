@@ -265,7 +265,7 @@ func validPhaseStepResidue(
 //
 // A formatted PinnedAt alone is insufficient. The complete pinned plan,
 // provenance, topology, target map, canary step body, typed traffic, and
-// strictly advancing run/step clocks must all bind to one active epoch.
+// controller-producible clocks must all bind to one active epoch.
 func ValidRepinBoundary(
 	isvc *omev1beta1.InferenceService,
 	primary omev1beta1.ComponentType,
@@ -275,9 +275,10 @@ func ValidRepinBoundary(
 	traffic []omev1beta1.ComponentTrafficTarget,
 ) bool {
 	if isvc == nil || status == nil || len(steps) == 0 ||
+		status.StepEnteredTime == nil || status.StepEnteredTime.IsZero() ||
 		!promotingTrafficComplete(phase, status) ||
 		!pinnedevidence.ValidCanaryRepin(
-			isvc, primary, steps, status.CanaryRevisionHash, status.StepEnteredTime,
+			isvc, primary, steps, status.CanaryRevisionHash,
 		) ||
 		!ActiveTrafficMatches(isvc.Name, primary, phase, status, traffic) {
 		return false
@@ -314,7 +315,9 @@ func validPausedNonRaisingBoundary(
 		!SafeRevisionHash(status.StableRevisionHash) ||
 		status.StableRevisionHash == status.CanaryRevisionHash ||
 		status.RolledBackRevisionHash != "" ||
-		status.StepEnteredTime == nil || status.StepEnteredTime.IsZero() {
+		status.StepEnteredTime == nil || status.StepEnteredTime.IsZero() ||
+		isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil ||
+		!isvc.Status.Rollout.ActiveRun.PinnedAt.Time.After(status.StepEnteredTime.Time) {
 		return false
 	}
 	return true
