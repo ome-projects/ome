@@ -14,6 +14,6 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 		Use:   "migration",
 		Short: "Inspect OMENative migrations",
 	}
-	cmd.AddCommand(newStatusCmd(f, streams))
+	cmd.AddCommand(newHistoryCmd(f, streams), newStatusCmd(f, streams))
 	return cmd
 }

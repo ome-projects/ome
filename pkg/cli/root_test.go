@@ -36,6 +36,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome instance retry-blocks",
 		"ome logs",
 		"ome migration",
+		"ome migration history",
 		"ome migration status",
 		"ome rollout",
 		"ome rollout explain",
@@ -105,6 +106,13 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if !strings.Contains(root.Long, "accelerator-selection evidence") {
 		t.Fatalf("root overview does not describe accelerator diagnostics: %q", root.Long)
+	}
+	migrationHistory, _, err := root.Find([]string{"migration", "history"})
+	if err != nil {
+		t.Fatalf("find migration history: %v", err)
+	}
+	if migrationHistory.Use != "history INFERENCESERVICE" || migrationHistory.Short != "Show bounded migration evidence history" {
+		t.Fatalf("migration history contract changed: Use=%q Short=%q", migrationHistory.Use, migrationHistory.Short)
 	}
 }
 
