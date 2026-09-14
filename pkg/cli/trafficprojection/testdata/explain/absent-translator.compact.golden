@@ -1,0 +1,10 @@
+LAYER       STATE           VALUE                    SOURCE
+SUMMARY     Pending         -                        Computed/Unavailable
+INTENT      Declared        RoundRobin               Declared/Current
+SUPPORT     Pending         -                        Reported/Current
+TRANSLATE   Computed        Unavailable              Computed/Unavailable
+REALIZE     Unavailable     r=0 e=0 w=0              Unavailable/Unavailable
+CHECK       Match           algorithm                Computed/Current
+CHECK       Unverifiable    policy                   Computed/Current
+CHECK       NotApplicable   canary-weight            Computed/Current
+ISSUE       -               RealizationUnavailable   Computed/Unverifiable

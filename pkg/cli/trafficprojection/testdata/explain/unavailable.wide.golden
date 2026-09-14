@@ -1,0 +1,25 @@
+LAYER            FIELD               STATE           VALUE                                     SOURCE
+REPORT           api-version         -               cli.ome.io/v1alpha1                       -
+REPORT           kind                -               TrafficExplainReport                      -
+SUBJECT          namespace           -               prod                                      -
+SUBJECT          name                -               chat                                      -
+REPORT           collected-at        -               2026-09-14T17:00:00Z                      -
+SOURCE           InferenceService    Reported        prod/chat gen=7 at=2026-09-14T17:00:00Z   Reported/Current
+SUMMARY          state               Unavailable     -                                         Computed/Unavailable
+SUMMARY          intent              Declared        -                                         Declared/Current
+SUMMARY          support             Unavailable     -                                         Reported/Unavailable
+SUMMARY          realization         Unavailable     routes=0 endpoints=0 targets=0            Unavailable/Unavailable
+INTENT           algorithm           Declared        RoundRobin                                Declared/Current
+INTENT           consistent-hash     Absent          -                                         Declared/Current
+INTENT           endpoint-override   Absent          -                                         Declared/Current
+REPORTED         algorithm           Unavailable     Unknown                                   Reported/Unavailable
+REPORTED         translator          Computed        Unavailable                               Computed/Unavailable
+REPORTED         policy-ready        Unknown         NotReported                               Reported/Unavailable
+REPORTED         unsupported         Unknown         -                                         Reported/Unavailable
+REPORTED-ISSUE   -                   -               TrafficStatusMissing                      Computed/Unverifiable
+CHECK            algorithm           Unverifiable    -                                         Computed/Unavailable
+CHECK            policy              Unverifiable    -                                         Computed/Unavailable
+CHECK            canary-weight       NotApplicable   -                                         Computed/Current
+ISSUE            -                   -               IntentNotReported                         Computed/Unverifiable
+ISSUE            -                   -               RealizationUnavailable                    Computed/Unverifiable
+WARNING          -                   -               SourceUnavailable                         Computed/Unverifiable

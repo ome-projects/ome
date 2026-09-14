@@ -2,6 +2,8 @@ package trafficprojection_test
 
 import (
 	"bytes"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -469,6 +471,7 @@ func TestProjectExplainStaleAndMissingEvidenceRemainUnverifiable(t *testing.T) {
 
 func TestProjectExplainNoIntentIsNotAnError(t *testing.T) {
 	isvc := currentTrafficISVC(t)
+	isvc.Spec.Rollout = nil
 	isvc.Spec.Traffic = nil
 	isvc.Annotations = nil
 	isvc.Status.Traffic = nil
@@ -507,6 +510,88 @@ func TestProjectExplainSamplesClockOnceAndDoesNotMutateInput(t *testing.T) {
 	assert.Equal(t, 1, calls)
 	assert.Equal(t, explainProjectionNow.Add(time.Second), got.CollectedAt)
 	assert.Equal(t, original, isvc)
+}
+
+func TestProjectExplainPolicyRequiresCurrentReadiness(t *testing.T) {
+	for _, generation := range []int64{6, 0, 8, -1} {
+		t.Run(fmt.Sprint(generation), func(t *testing.T) {
+			isvc := currentTrafficISVC(t)
+			isvc.Spec.Traffic = trafficAlgorithmSpec(omev1beta1.LoadBalancingTypeRoundRobin)
+			isvc.Status.Traffic.Conditions = []metav1.Condition{trafficCondition(
+				omev1beta1.TrafficConditionBackendPolicyReady, metav1.ConditionTrue,
+				omev1beta1.TrafficReasonAcceptedByGateway, generation)}
+			if generation == -1 {
+				isvc.Status.Traffic.Conditions = nil
+			}
+			got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+			require.NoError(t, err)
+			require.NotNil(t, got.Content.Reported.Policy)
+			assert.Equal(t, reportv1alpha1.TrafficComparisonUnverifiable,
+				explainComparison(t, got, reportv1alpha1.TrafficComparisonPolicy).State)
+		})
+	}
+}
+
+func TestProjectExplainStaleUnsupportedIsHistorical(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Rollout = nil
+	isvc.Spec.Traffic = trafficAlgorithmSpec(omev1beta1.LoadBalancingTypeRoundRobin)
+	isvc.Status.Addresses = nil
+	isvc.Status.Components = nil
+	isvc.Status.Canary = nil
+	isvc.Status.Traffic.Conditions = []metav1.Condition{
+		trafficCondition(omev1beta1.TrafficConditionBackendPolicyReady, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7),
+		trafficCondition(omev1beta1.TrafficConditionBackendPolicyUnsupportedFields, metav1.ConditionTrue, omev1beta1.TrafficReasonUnsupportedField, 6),
+	}
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficExplainPartial, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessStale, got.Content.Summary.Source.Freshness)
+	assert.Equal(t, reportv1alpha1.TrafficUnsupportedPresent, got.Content.Reported.Summary.Unsupported)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficExplainIssue{Code: reportv1alpha1.TrafficExplainIssueUnsupportedDeclaredFields})
+}
+
+func TestProjectExplainInvalidEndpointDoesNotInvalidatePolicy(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Traffic = trafficAlgorithmSpec(omev1beta1.LoadBalancingTypeRoundRobin)
+	isvc.Status.Traffic.Conditions = []metav1.Condition{trafficCondition(
+		omev1beta1.TrafficConditionBackendPolicyReady, metav1.ConditionTrue,
+		omev1beta1.TrafficReasonAcceptedByGateway, 7)}
+	isvc.Status.Addresses[0].URL.User = url.UserPassword("secret-user", "secret-password")
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficExplainInvalid, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficRealizationInvalid, got.Content.Summary.Realization)
+	assert.Equal(t, reportv1alpha1.TrafficSupportHonored, got.Content.Summary.Support)
+	for _, field := range []reportv1alpha1.TrafficComparisonField{reportv1alpha1.TrafficComparisonAlgorithm, reportv1alpha1.TrafficComparisonPolicy} {
+		assert.Equal(t, reportv1alpha1.TrafficComparisonMatch, explainComparison(t, got, field).State)
+	}
+}
+
+func TestProjectExplainCanaryOnlyIsTrafficIntent(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Traffic = nil
+	isvc.Annotations = nil
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficIntentDeclared, got.Content.Intent.State)
+	assert.Equal(t, reportv1alpha1.TrafficExplainConsistent, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficSupportNotApplicable, got.Content.Summary.Support)
+	assert.Equal(t, reportv1alpha1.TrafficComparisonNotApplicable, explainComparison(t, got, reportv1alpha1.TrafficComparisonPolicy).State)
+	assert.Equal(t, reportv1alpha1.TrafficComparisonMatch, explainComparison(t, got, reportv1alpha1.TrafficComparisonCanaryWeight).State)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Summary.Source.Freshness)
+}
+
+func TestProjectExplainConflictingConditionsRemainInvalid(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Spec.Traffic = trafficAlgorithmSpec(omev1beta1.LoadBalancingTypeRoundRobin)
+	ready := trafficCondition(omev1beta1.TrafficConditionBackendPolicyReady,
+		metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
+	isvc.Status.Traffic.Conditions = []metav1.Condition{ready, ready}
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficSupportInvalid, got.Content.Summary.Support)
+	assert.Equal(t, reportv1alpha1.TrafficComparisonInvalid, explainComparison(t, got, reportv1alpha1.TrafficComparisonPolicy).State)
 }
 
 func explainComparison(

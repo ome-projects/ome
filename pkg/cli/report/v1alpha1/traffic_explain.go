@@ -314,7 +314,8 @@ func (c TrafficExplainContent) Table() report.Table {
 	rows := [][]string{
 		{"SUMMARY", string(c.Summary.State), "-", trafficSourceCell(c.Summary.Source)},
 		{"INTENT", string(c.Intent.State), string(c.Intent.Algorithm), trafficSourceCell(c.Intent.Source)},
-		{"SUPPORT", string(c.Summary.Support), string(c.Reported.Summary.Translator), trafficSourceCell(c.Reported.Summary.Source.PolicyReady)},
+		{"SUPPORT", string(c.Summary.Support), "-", trafficSourceCell(c.Reported.Summary.Source.PolicyReady)},
+		{"TRANSLATE", string(c.Reported.Summary.Source.Translator.Evidence), string(c.Reported.Summary.Translator), trafficSourceCell(c.Reported.Summary.Source.Translator)},
 		{"REALIZE", string(c.Summary.Realization), trafficCompactRealizationCell(c.Reported), trafficSourceCell(trafficRealizationSource(c.Reported))},
 	}
 	for _, comparison := range c.Comparisons {
@@ -397,6 +398,12 @@ func trafficExplainReportedRows(c TrafficStatusContent) [][]string {
 		rows = append(rows, []string{
 			"OBSERVED", "canary", "Reported",
 			fmt.Sprintf("%s step=%d/%d traffic=%d%%", c.Canary.Component, c.Canary.CurrentStep+1, c.Canary.TotalSteps, c.Canary.ObservedTraffic),
+			trafficSourceCell(c.Canary.Source),
+		}, []string{
+			"OBSERVED", "stable-revision", "Reported", c.Canary.StableRevisionHash,
+			trafficSourceCell(c.Canary.Source),
+		}, []string{
+			"OBSERVED", "canary-revision", "Reported", c.Canary.CanaryRevisionHash,
 			trafficSourceCell(c.Canary.Source),
 		})
 	}

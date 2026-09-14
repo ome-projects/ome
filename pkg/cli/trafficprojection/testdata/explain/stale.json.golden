@@ -1,0 +1,158 @@
+{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "TrafficExplainReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "2026-09-14T17:00:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "generation": 7,
+      "evidence": "Reported",
+      "collectedAt": "2026-09-14T17:00:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "state": "Partial",
+      "intent": "Declared",
+      "support": "Partial",
+      "realization": "Partial",
+      "source": {
+        "evidence": "Computed",
+        "freshness": "Stale"
+      }
+    },
+    "intent": {
+      "state": "Declared",
+      "algorithm": "RoundRobin",
+      "consistentHash": {
+        "state": "Absent",
+        "variant": "Unavailable",
+        "inputCount": 0
+      },
+      "endpointOverride": {
+        "state": "Absent",
+        "variant": "Unavailable",
+        "inputCount": 0
+      },
+      "extensions": [],
+      "source": {
+        "evidence": "Declared",
+        "freshness": "Current"
+      }
+    },
+    "reported": {
+      "summary": {
+        "state": "Partial",
+        "translator": "envoy-gateway",
+        "algorithm": "RoundRobin",
+        "policyReady": {
+          "status": "True",
+          "reason": "AcceptedByGateway"
+        },
+        "unsupported": "Unknown",
+        "source": {
+          "state": {
+            "evidence": "Computed",
+            "freshness": "Unverifiable"
+          },
+          "translator": {
+            "evidence": "Computed",
+            "freshness": "Stale"
+          },
+          "algorithm": {
+            "evidence": "Reported",
+            "freshness": "Stale"
+          },
+          "policyReady": {
+            "evidence": "Reported",
+            "freshness": "Stale"
+          },
+          "unsupported": {
+            "evidence": "Reported",
+            "freshness": "Stale"
+          }
+        }
+      },
+      "policy": {
+        "apiVersion": "gateway.envoyproxy.io/v1alpha1",
+        "kind": "BackendTrafficPolicy",
+        "namespace": "prod",
+        "name": "chat",
+        "source": {
+          "evidence": "Reported",
+          "freshness": "Stale"
+        }
+      },
+      "routes": [
+        {
+          "name": "chat",
+          "source": {
+            "evidence": "Reported",
+            "freshness": "Stale"
+          }
+        }
+      ],
+      "endpoints": [],
+      "allocations": [],
+      "conditions": [
+        {
+          "type": "BackendPolicyReady",
+          "status": "True",
+          "reason": "AcceptedByGateway",
+          "observedGeneration": 6,
+          "lastTransitionTime": "2026-09-14T16:59:00Z",
+          "source": {
+            "evidence": "Reported",
+            "freshness": "Stale"
+          }
+        }
+      ],
+      "issues": []
+    },
+    "comparisons": [
+      {
+        "field": "algorithm",
+        "state": "Unverifiable",
+        "source": {
+          "evidence": "Computed",
+          "freshness": "Stale"
+        }
+      },
+      {
+        "field": "policy",
+        "state": "Unverifiable",
+        "source": {
+          "evidence": "Computed",
+          "freshness": "Stale"
+        }
+      },
+      {
+        "field": "canary-weight",
+        "state": "NotApplicable",
+        "source": {
+          "evidence": "Computed",
+          "freshness": "Current"
+        }
+      }
+    ],
+    "issues": [
+      {
+        "code": "ReportedEvidenceStale"
+      }
+    ]
+  },
+  "warnings": [
+    {
+      "code": "PartialData"
+    },
+    {
+      "code": "StaleEvidence"
+    }
+  ]
+}

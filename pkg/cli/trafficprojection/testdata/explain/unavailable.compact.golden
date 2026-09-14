@@ -1,0 +1,11 @@
+LAYER       STATE           VALUE                    SOURCE
+SUMMARY     Unavailable     -                        Computed/Unavailable
+INTENT      Declared        RoundRobin               Declared/Current
+SUPPORT     Unavailable     -                        Reported/Unavailable
+TRANSLATE   Computed        Unavailable              Computed/Unavailable
+REALIZE     Unavailable     r=0 e=0 w=0              Unavailable/Unavailable
+CHECK       Unverifiable    algorithm                Computed/Unavailable
+CHECK       Unverifiable    policy                   Computed/Unavailable
+CHECK       NotApplicable   canary-weight            Computed/Current
+ISSUE       -               IntentNotReported        Computed/Unverifiable
+ISSUE       -               RealizationUnavailable   Computed/Unverifiable

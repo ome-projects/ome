@@ -1,0 +1,10 @@
+LAYER       STATE           VALUE               SOURCE
+SUMMARY     Mismatch        -                   Computed/Current
+INTENT      Declared        LeastRequest        Declared/Current
+SUPPORT     Honored         -                   Reported/Current
+TRANSLATE   Computed        envoy-gateway       Computed/Current
+REALIZE     Reported        r=1 e=0 w=0         Reported/Current
+CHECK       Mismatch        algorithm           Computed/Current
+CHECK       Match           policy              Computed/Current
+CHECK       NotApplicable   canary-weight       Computed/Current
+ISSUE       -               AlgorithmMismatch   Computed/Unverifiable

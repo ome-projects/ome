@@ -1,0 +1,25 @@
+LAYER      FIELD               STATE           VALUE                                                                          SOURCE
+REPORT     api-version         -               cli.ome.io/v1alpha1                                                            -
+REPORT     kind                -               TrafficExplainReport                                                           -
+SUBJECT    namespace           -               prod                                                                           -
+SUBJECT    name                -               chat                                                                           -
+REPORT     collected-at        -               2026-09-14T17:00:00Z                                                           -
+SOURCE     InferenceService    Reported        prod/chat gen=7 at=2026-09-14T17:00:00Z                                        Reported/Current
+SUMMARY    state               Unsupported     -                                                                              Computed/Unavailable
+SUMMARY    intent              Declared        -                                                                              Declared/Current
+SUMMARY    support             Rejected        -                                                                              Reported/Current
+SUMMARY    realization         Unavailable     routes=0 endpoints=0 targets=0                                                 Unavailable/Unavailable
+INTENT     algorithm           Declared        RoundRobin                                                                     Declared/Current
+INTENT     consistent-hash     Absent          -                                                                              Declared/Current
+INTENT     endpoint-override   Absent          -                                                                              Declared/Current
+REPORTED   algorithm           Degraded        RoundRobin                                                                     Reported/Current
+REPORTED   translator          Computed        Unavailable                                                                    Computed/Current
+REPORTED   policy-ready        False           NoTranslatorAvailable                                                          Reported/Current
+REPORTED   unsupported         Unknown         -                                                                              Reported/Current
+REPORTED   condition           Reported        BackendPolicyReady=False/NoTranslatorAvailable gen=7 at=2026-09-14T16:59:00Z   Reported/Current
+CHECK      algorithm           Match           -                                                                              Computed/Current
+CHECK      policy              Mismatch        -                                                                              Computed/Current
+CHECK      canary-weight       NotApplicable   -                                                                              Computed/Current
+ISSUE      -                   -               NoTranslatorAvailable                                                          Computed/Unverifiable
+ISSUE      -                   -               RealizationUnavailable                                                         Computed/Unverifiable
+WARNING    -                   -               PartialData                                                                    Computed/Unverifiable

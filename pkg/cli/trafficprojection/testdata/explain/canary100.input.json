@@ -1,0 +1,74 @@
+{
+  "metadata": {
+    "name": "chat",
+    "namespace": "prod",
+    "uid": "SECRET_UID",
+    "generation": 7
+  },
+  "spec": {
+    "traffic": {
+      "algorithm": "RoundRobin"
+    },
+    "rollout": {
+      "groups": [
+        {
+          "components": [
+            "engine"
+          ],
+          "canary": {
+            "steps": [
+              {
+                "capacity": "50%",
+                "traffic": 20
+              },
+              {
+                "capacity": "100%",
+                "traffic": 100
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "status": {
+    "traffic": {
+      "algorithm": "RoundRobin",
+      "backendPolicyResource": {
+        "apiVersion": "gateway.envoyproxy.io/v1alpha1",
+        "kind": "BackendTrafficPolicy",
+        "name": "chat"
+      },
+      "targetedHTTPRoutes": [
+        "chat"
+      ],
+      "conditions": [
+        {
+          "type": "BackendPolicyReady",
+          "status": "True",
+          "reason": "AcceptedByGateway",
+          "observedGeneration": 7,
+          "lastTransitionTime": "2026-09-14T16:59:00Z"
+        }
+      ]
+    },
+    "canary": {
+      "currentStep": 1,
+      "observedTrafficWeight": 100,
+      "stableRevisionHash": "a1b2c3d4",
+      "canaryRevisionHash": "e5f6a7b8"
+    },
+    "components": {
+      "engine": {
+        "rolloutPhase": "Promoting",
+        "traffic": [
+          {
+            "revisionName": "chat-engine-rev-e5f6a7b8",
+            "percent": 100,
+            "latestRevision": true
+          }
+        ]
+      }
+    }
+  }
+}

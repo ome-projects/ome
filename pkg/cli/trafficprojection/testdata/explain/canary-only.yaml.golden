@@ -1,0 +1,123 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-14T17:00:00Z"
+content:
+  comparisons:
+  - field: algorithm
+    source:
+      evidence: Computed
+      freshness: Current
+    state: NotApplicable
+  - field: policy
+    source:
+      evidence: Computed
+      freshness: Current
+    state: NotApplicable
+  - field: canary-weight
+    source:
+      evidence: Computed
+      freshness: Unverifiable
+    state: Match
+  intent:
+    algorithm: Default
+    consistentHash:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    endpointOverride:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    extensions: []
+    source:
+      evidence: Declared
+      freshness: Current
+    state: Declared
+  issues: []
+  reported:
+    allocations:
+    - component: engine
+      percent: 100
+      revisionHash: e5f6a7b8
+      revisionName: chat-engine-rev-e5f6a7b8
+      role: canary
+      source:
+        evidence: Reported
+        freshness: Unverifiable
+    canary:
+      canaryRevisionHash: e5f6a7b8
+      component: engine
+      currentStep: 1
+      observedTraffic: 100
+      source:
+        evidence: Reported
+        freshness: Unverifiable
+      stableRevisionHash: a1b2c3d4
+      totalSteps: 2
+    conditions:
+    - lastTransitionTime: "2026-09-14T16:59:00Z"
+      observedGeneration: 7
+      reason: AcceptedByGateway
+      source:
+        evidence: Reported
+        freshness: Current
+      status: "True"
+      type: BackendPolicyReady
+    endpoints: []
+    issues: []
+    policy:
+      apiVersion: gateway.envoyproxy.io/v1alpha1
+      kind: BackendTrafficPolicy
+      name: chat
+      namespace: prod
+      source:
+        evidence: Reported
+        freshness: Current
+    routes:
+    - name: chat
+      source:
+        evidence: Reported
+        freshness: Current
+    summary:
+      algorithm: RoundRobin
+      policyReady:
+        reason: AcceptedByGateway
+        status: "True"
+      source:
+        algorithm:
+          evidence: Reported
+          freshness: Current
+        policyReady:
+          evidence: Reported
+          freshness: Current
+        state:
+          evidence: Computed
+          freshness: Unverifiable
+        translator:
+          evidence: Computed
+          freshness: Current
+        unsupported:
+          evidence: Reported
+          freshness: Current
+      state: Reported
+      translator: envoy-gateway
+      unsupported: None
+  summary:
+    intent: Declared
+    realization: Reported
+    source:
+      evidence: Computed
+      freshness: Unverifiable
+    state: Consistent
+    support: NotApplicable
+kind: TrafficExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-09-14T17:00:00Z"
+  evidence: Reported
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings: []

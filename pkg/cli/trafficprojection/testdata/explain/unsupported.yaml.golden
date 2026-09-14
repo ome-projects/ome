@@ -1,0 +1,115 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-14T17:00:00Z"
+content:
+  comparisons:
+  - field: algorithm
+    source:
+      evidence: Computed
+      freshness: Current
+    state: Match
+  - field: policy
+    source:
+      evidence: Computed
+      freshness: Current
+    state: Match
+  - field: canary-weight
+    source:
+      evidence: Computed
+      freshness: Current
+    state: NotApplicable
+  intent:
+    algorithm: RoundRobin
+    consistentHash:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    endpointOverride:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    extensions: []
+    source:
+      evidence: Declared
+      freshness: Current
+    state: Declared
+  issues:
+  - code: UnsupportedDeclaredFields
+  reported:
+    allocations: []
+    conditions:
+    - lastTransitionTime: "2026-09-14T16:59:00Z"
+      observedGeneration: 7
+      reason: AcceptedByGateway
+      source:
+        evidence: Reported
+        freshness: Current
+      status: "True"
+      type: BackendPolicyReady
+    - lastTransitionTime: "2026-09-14T16:59:00Z"
+      observedGeneration: 7
+      reason: UnsupportedField
+      source:
+        evidence: Reported
+        freshness: Current
+      status: "True"
+      type: BackendPolicyUnsupportedFields
+    endpoints: []
+    issues: []
+    policy:
+      apiVersion: gateway.envoyproxy.io/v1alpha1
+      kind: BackendTrafficPolicy
+      name: chat
+      namespace: prod
+      source:
+        evidence: Reported
+        freshness: Current
+    routes:
+    - name: chat
+      source:
+        evidence: Reported
+        freshness: Current
+    summary:
+      algorithm: RoundRobin
+      policyReady:
+        reason: AcceptedByGateway
+        status: "True"
+      source:
+        algorithm:
+          evidence: Reported
+          freshness: Current
+        policyReady:
+          evidence: Reported
+          freshness: Current
+        state:
+          evidence: Computed
+          freshness: Unverifiable
+        translator:
+          evidence: Computed
+          freshness: Current
+        unsupported:
+          evidence: Reported
+          freshness: Current
+      state: Partial
+      translator: envoy-gateway
+      unsupported: Present
+  summary:
+    intent: Declared
+    realization: Partial
+    source:
+      evidence: Computed
+      freshness: Current
+    state: Unsupported
+    support: Partial
+kind: TrafficExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-09-14T17:00:00Z"
+  evidence: Reported
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings:
+- code: PartialData

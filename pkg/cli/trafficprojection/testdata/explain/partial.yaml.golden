@@ -1,0 +1,99 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-14T17:00:00Z"
+content:
+  comparisons:
+  - field: algorithm
+    source:
+      evidence: Computed
+      freshness: Unverifiable
+    state: Unverifiable
+  - field: policy
+    source:
+      evidence: Computed
+      freshness: Unavailable
+    state: Unverifiable
+  - field: canary-weight
+    source:
+      evidence: Computed
+      freshness: Current
+    state: NotApplicable
+  intent:
+    algorithm: RoundRobin
+    consistentHash:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    endpointOverride:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    extensions: []
+    source:
+      evidence: Declared
+      freshness: Current
+    state: Declared
+  issues: []
+  reported:
+    allocations: []
+    conditions: []
+    endpoints: []
+    issues:
+    - code: PolicyConditionMissing
+    policy:
+      apiVersion: gateway.envoyproxy.io/v1alpha1
+      kind: BackendTrafficPolicy
+      name: chat
+      namespace: prod
+      source:
+        evidence: Reported
+        freshness: Unverifiable
+    routes:
+    - name: chat
+      source:
+        evidence: Reported
+        freshness: Unverifiable
+    summary:
+      algorithm: RoundRobin
+      policyReady:
+        reason: NotReported
+        status: Unknown
+      source:
+        algorithm:
+          evidence: Reported
+          freshness: Unverifiable
+        policyReady:
+          evidence: Reported
+          freshness: Unavailable
+        state:
+          evidence: Computed
+          freshness: Unverifiable
+        translator:
+          evidence: Computed
+          freshness: Unverifiable
+        unsupported:
+          evidence: Reported
+          freshness: Unavailable
+      state: Unavailable
+      translator: envoy-gateway
+      unsupported: Unknown
+  summary:
+    intent: Declared
+    realization: Reported
+    source:
+      evidence: Computed
+      freshness: Unavailable
+    state: Partial
+    support: Partial
+kind: TrafficExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-09-14T17:00:00Z"
+  evidence: Reported
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings:
+- code: PartialData

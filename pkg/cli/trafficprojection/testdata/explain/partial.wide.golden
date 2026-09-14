@@ -1,0 +1,25 @@
+LAYER            FIELD               STATE           VALUE                                                           SOURCE
+REPORT           api-version         -               cli.ome.io/v1alpha1                                             -
+REPORT           kind                -               TrafficExplainReport                                            -
+SUBJECT          namespace           -               prod                                                            -
+SUBJECT          name                -               chat                                                            -
+REPORT           collected-at        -               2026-09-14T17:00:00Z                                            -
+SOURCE           InferenceService    Reported        prod/chat gen=7 at=2026-09-14T17:00:00Z                         Reported/Current
+SUMMARY          state               Partial         -                                                               Computed/Unavailable
+SUMMARY          intent              Declared        -                                                               Declared/Current
+SUMMARY          support             Partial         -                                                               Reported/Unavailable
+SUMMARY          realization         Reported        routes=1 endpoints=0 targets=0                                  Reported/Unverifiable
+INTENT           algorithm           Declared        RoundRobin                                                      Declared/Current
+INTENT           consistent-hash     Absent          -                                                               Declared/Current
+INTENT           endpoint-override   Absent          -                                                               Declared/Current
+REPORTED         algorithm           Unavailable     RoundRobin                                                      Reported/Unverifiable
+REPORTED         translator          Computed        envoy-gateway                                                   Computed/Unverifiable
+REPORTED         policy-ready        Unknown         NotReported                                                     Reported/Unavailable
+REPORTED         unsupported         Unknown         -                                                               Reported/Unavailable
+REPORTED         policy              Reported        gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy/prod/chat   Reported/Unverifiable
+REPORTED         route               Reported        chat                                                            Reported/Unverifiable
+REPORTED-ISSUE   -                   -               PolicyConditionMissing                                          Computed/Unverifiable
+CHECK            algorithm           Unverifiable    -                                                               Computed/Unverifiable
+CHECK            policy              Unverifiable    -                                                               Computed/Unavailable
+CHECK            canary-weight       NotApplicable   -                                                               Computed/Current
+WARNING          -                   -               PartialData                                                     Computed/Unverifiable

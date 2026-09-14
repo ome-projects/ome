@@ -1,0 +1,10 @@
+LAYER       STATE           VALUE                     SOURCE
+SUMMARY     Invalid         -                         Computed/Current
+INTENT      Declared        RoundRobin                Declared/Current
+SUPPORT     Invalid         -                         Reported/Current
+TRANSLATE   Computed        Unavailable               Computed/Unavailable
+REALIZE     Invalid         r=1 e=0 w=0               Reported/Current
+CHECK       Invalid         algorithm                 Computed/Current
+CHECK       Invalid         policy                    Computed/Current
+CHECK       NotApplicable   canary-weight             Computed/Current
+ISSUE       -               ReportedEvidenceInvalid   Computed/Unverifiable

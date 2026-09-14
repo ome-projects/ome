@@ -1,0 +1,9 @@
+LAYER       STATE           VALUE           SOURCE
+SUMMARY     Partial         -               Computed/Unavailable
+INTENT      Declared        RoundRobin      Declared/Current
+SUPPORT     Partial         -               Reported/Unavailable
+TRANSLATE   Computed        envoy-gateway   Computed/Unverifiable
+REALIZE     Reported        r=1 e=0 w=0     Reported/Unverifiable
+CHECK       Unverifiable    algorithm       Computed/Unverifiable
+CHECK       Unverifiable    policy          Computed/Unavailable
+CHECK       NotApplicable   canary-weight   Computed/Current

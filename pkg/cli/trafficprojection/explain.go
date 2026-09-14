@@ -46,6 +46,11 @@ func ProjectExplain(
 	support := projectTrafficSupport(intent.State, statusReport.Content)
 	realization := projectTrafficRealization(statusReport.Content)
 	comparisons := projectTrafficComparisons(isvc, intent, support, statusReport.Content)
+	// Canary traffic is intent even when no backend-policy feature is declared.
+	// Keep policy support/comparisons scoped to the original policy intent.
+	if intent.State == reportv1alpha1.TrafficIntentAbsent && hasDeclaredCanary(isvc) {
+		intent.State = reportv1alpha1.TrafficIntentDeclared
+	}
 	issues := projectTrafficExplainIssues(
 		intent.State, specInvalid, annotationsInvalid, support,
 		realization, statusReport.Content, comparisons,
@@ -59,7 +64,7 @@ func ProjectExplain(
 			State: state, Intent: intent.State, Support: support,
 			Realization: realization,
 			Source: trafficExplainSummarySource(
-				intent.State, statusReport.Content, realization,
+				intent.State, support, statusReport.Content, comparisons,
 			),
 		},
 		Intent: intent, Reported: statusReport.Content,
@@ -287,7 +292,7 @@ func projectTrafficSupport(
 	if intent == reportv1alpha1.TrafficIntentInvalid {
 		return reportv1alpha1.TrafficSupportInvalid
 	}
-	if status.Summary.State == reportv1alpha1.TrafficStateInvalid {
+	if trafficPolicyEvidenceInvalid(status) {
 		return reportv1alpha1.TrafficSupportInvalid
 	}
 	if hasTrafficIssue(status.Issues, reportv1alpha1.TrafficIssueTrafficStatusMissing) {
@@ -298,6 +303,9 @@ func projectTrafficSupport(
 	}
 	switch status.Summary.PolicyReady.Status {
 	case reportv1alpha1.TrafficConditionTrue:
+		if status.Summary.Source.Unsupported.Freshness != reportv1alpha1.TrafficFreshnessCurrent {
+			return reportv1alpha1.TrafficSupportPartial
+		}
 		switch status.Summary.Unsupported {
 		case reportv1alpha1.TrafficUnsupportedNone:
 			return reportv1alpha1.TrafficSupportHonored
@@ -346,7 +354,7 @@ func projectTrafficComparisons(
 		algorithm = reportv1alpha1.TrafficComparisonNotApplicable
 		algorithmFreshness = reportv1alpha1.TrafficFreshnessCurrent
 	case intent.State == reportv1alpha1.TrafficIntentInvalid ||
-		status.Summary.State == reportv1alpha1.TrafficStateInvalid:
+		trafficPolicyEvidenceInvalid(status):
 		algorithm = reportv1alpha1.TrafficComparisonInvalid
 	case status.Summary.Source.Algorithm.Freshness != reportv1alpha1.TrafficFreshnessCurrent:
 		algorithm = reportv1alpha1.TrafficComparisonUnverifiable
@@ -362,12 +370,15 @@ func projectTrafficComparisons(
 	case intent.State == reportv1alpha1.TrafficIntentAbsent:
 		policy = reportv1alpha1.TrafficComparisonNotApplicable
 		policyFreshness = reportv1alpha1.TrafficFreshnessCurrent
-	case intent.State == reportv1alpha1.TrafficIntentInvalid ||
-		support == reportv1alpha1.TrafficSupportInvalid:
+	case intent.State == reportv1alpha1.TrafficIntentInvalid:
+		policy = reportv1alpha1.TrafficComparisonInvalid
+	case policyFreshness != reportv1alpha1.TrafficFreshnessCurrent:
+		policy = reportv1alpha1.TrafficComparisonUnverifiable
+	case support == reportv1alpha1.TrafficSupportInvalid:
 		policy = reportv1alpha1.TrafficComparisonInvalid
 	case support == reportv1alpha1.TrafficSupportHonored ||
 		support == reportv1alpha1.TrafficSupportPartial:
-		if status.Policy != nil {
+		if status.Policy != nil && status.Policy.Source.Freshness == reportv1alpha1.TrafficFreshnessCurrent {
 			policy = reportv1alpha1.TrafficComparisonMatch
 		}
 	case support == reportv1alpha1.TrafficSupportRejected:
@@ -426,7 +437,7 @@ func projectTrafficExplainIssues(
 		add(reportv1alpha1.TrafficExplainIssueReportedEvidenceStale)
 	}
 	if support == reportv1alpha1.TrafficSupportPartial &&
-		status.Summary.Unsupported == reportv1alpha1.TrafficUnsupportedPresent {
+		currentUnsupportedFields(status) {
 		add(reportv1alpha1.TrafficExplainIssueUnsupportedDeclaredFields)
 	}
 	if support == reportv1alpha1.TrafficSupportRejected {
@@ -470,7 +481,7 @@ func projectTrafficExplainState(
 		return reportv1alpha1.TrafficExplainNoIntent
 	}
 	if support == reportv1alpha1.TrafficSupportPartial &&
-		status.Summary.Unsupported == reportv1alpha1.TrafficUnsupportedPresent ||
+		currentUnsupportedFields(status) ||
 		(support == reportv1alpha1.TrafficSupportRejected &&
 			status.Summary.PolicyReady.Reason == reportv1alpha1.TrafficReasonNoTranslatorAvailable) {
 		return reportv1alpha1.TrafficExplainUnsupported
@@ -486,6 +497,7 @@ func projectTrafficExplainState(
 		return reportv1alpha1.TrafficExplainUnavailable
 	}
 	if support == reportv1alpha1.TrafficSupportPartial ||
+		hasComparisonState(comparisons, reportv1alpha1.TrafficComparisonUnverifiable) ||
 		realization == reportv1alpha1.TrafficRealizationPartial ||
 		realization == reportv1alpha1.TrafficRealizationUnavailable {
 		return reportv1alpha1.TrafficExplainPartial
@@ -495,20 +507,54 @@ func projectTrafficExplainState(
 
 func trafficExplainSummarySource(
 	intent reportv1alpha1.TrafficIntentState,
+	support reportv1alpha1.TrafficSupportState,
 	status reportv1alpha1.TrafficStatusContent,
-	realization reportv1alpha1.TrafficRealizationState,
+	comparisons []reportv1alpha1.TrafficExplainComparison,
 ) reportv1alpha1.TrafficValueSource {
 	if intent == reportv1alpha1.TrafficIntentAbsent {
 		return computedTrafficSource(reportv1alpha1.TrafficFreshnessCurrent)
 	}
-	freshness := status.Summary.Source.PolicyReady.Freshness
-	if realization != reportv1alpha1.TrafficRealizationUnavailable {
-		realizationSource := explainRealizationSource(status)
-		if explainFreshnessRank(realizationSource.Freshness) > explainFreshnessRank(freshness) {
-			freshness = realizationSource.Freshness
+	freshness := reportv1alpha1.TrafficFreshnessCurrent
+	consider := func(candidate reportv1alpha1.TrafficValueSource) {
+		if explainFreshnessRank(candidate.Freshness) > explainFreshnessRank(freshness) {
+			freshness = candidate.Freshness
 		}
 	}
+	if support != reportv1alpha1.TrafficSupportNotApplicable {
+		consider(status.Summary.Source.PolicyReady)
+		consider(status.Summary.Source.Unsupported)
+		consider(status.Summary.Source.Algorithm)
+		if status.Policy != nil {
+			consider(status.Policy.Source)
+		}
+	}
+	consider(explainRealizationSource(status))
+	for _, comparison := range comparisons {
+		consider(comparison.Source)
+	}
 	return computedTrafficSource(freshness)
+}
+
+func currentUnsupportedFields(status reportv1alpha1.TrafficStatusContent) bool {
+	return status.Summary.Unsupported == reportv1alpha1.TrafficUnsupportedPresent &&
+		status.Summary.Source.Unsupported.Freshness == reportv1alpha1.TrafficFreshnessCurrent
+}
+
+// Endpoint, route, allocation and canary errors belong to realization. They
+// must not invalidate independent backend-policy evidence.
+func trafficPolicyEvidenceInvalid(status reportv1alpha1.TrafficStatusContent) bool {
+	for _, issue := range status.Issues {
+		switch issue.Code {
+		case reportv1alpha1.TrafficIssueAlgorithmInvalid,
+			reportv1alpha1.TrafficIssueConditionInvalid,
+			reportv1alpha1.TrafficIssueConditionConflict,
+			reportv1alpha1.TrafficIssuePolicyReferenceInvalid,
+			reportv1alpha1.TrafficIssuePolicyKindUnsupported,
+			reportv1alpha1.TrafficIssueStatusCombinationInvalid:
+			return true
+		}
+	}
+	return false
 }
 
 func explainRealizationSource(content reportv1alpha1.TrafficStatusContent) reportv1alpha1.TrafficValueSource {

@@ -1,0 +1,35 @@
+{
+  "metadata": {
+    "name": "chat",
+    "namespace": "prod",
+    "uid": "SECRET_UID",
+    "generation": 7
+  },
+  "spec": {
+    "traffic": {
+      "algorithm": "LeastRequest"
+    }
+  },
+  "status": {
+    "traffic": {
+      "algorithm": "RoundRobin",
+      "backendPolicyResource": {
+        "apiVersion": "gateway.envoyproxy.io/v1alpha1",
+        "kind": "BackendTrafficPolicy",
+        "name": "chat"
+      },
+      "targetedHTTPRoutes": [
+        "chat"
+      ],
+      "conditions": [
+        {
+          "type": "BackendPolicyReady",
+          "status": "True",
+          "reason": "AcceptedByGateway",
+          "observedGeneration": 7,
+          "lastTransitionTime": "2026-09-14T16:59:00Z"
+        }
+      ]
+    }
+  }
+}

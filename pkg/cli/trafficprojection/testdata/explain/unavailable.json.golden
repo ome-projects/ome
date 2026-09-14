@@ -1,0 +1,132 @@
+{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "TrafficExplainReport",
+  "metadata": {
+    "namespace": "prod",
+    "name": "chat"
+  },
+  "collectedAt": "2026-09-14T17:00:00Z",
+  "sources": [
+    {
+      "kind": "InferenceService",
+      "namespace": "prod",
+      "name": "chat",
+      "generation": 7,
+      "evidence": "Reported",
+      "collectedAt": "2026-09-14T17:00:00Z"
+    }
+  ],
+  "content": {
+    "summary": {
+      "state": "Unavailable",
+      "intent": "Declared",
+      "support": "Unavailable",
+      "realization": "Unavailable",
+      "source": {
+        "evidence": "Computed",
+        "freshness": "Unavailable"
+      }
+    },
+    "intent": {
+      "state": "Declared",
+      "algorithm": "RoundRobin",
+      "consistentHash": {
+        "state": "Absent",
+        "variant": "Unavailable",
+        "inputCount": 0
+      },
+      "endpointOverride": {
+        "state": "Absent",
+        "variant": "Unavailable",
+        "inputCount": 0
+      },
+      "extensions": [],
+      "source": {
+        "evidence": "Declared",
+        "freshness": "Current"
+      }
+    },
+    "reported": {
+      "summary": {
+        "state": "Unavailable",
+        "translator": "Unavailable",
+        "algorithm": "Unknown",
+        "policyReady": {
+          "status": "Unknown",
+          "reason": "NotReported"
+        },
+        "unsupported": "Unknown",
+        "source": {
+          "state": {
+            "evidence": "Computed",
+            "freshness": "Unverifiable"
+          },
+          "translator": {
+            "evidence": "Computed",
+            "freshness": "Unavailable"
+          },
+          "algorithm": {
+            "evidence": "Reported",
+            "freshness": "Unavailable"
+          },
+          "policyReady": {
+            "evidence": "Reported",
+            "freshness": "Unavailable"
+          },
+          "unsupported": {
+            "evidence": "Reported",
+            "freshness": "Unavailable"
+          }
+        }
+      },
+      "routes": [],
+      "endpoints": [],
+      "allocations": [],
+      "conditions": [],
+      "issues": [
+        {
+          "code": "TrafficStatusMissing"
+        }
+      ]
+    },
+    "comparisons": [
+      {
+        "field": "algorithm",
+        "state": "Unverifiable",
+        "source": {
+          "evidence": "Computed",
+          "freshness": "Unavailable"
+        }
+      },
+      {
+        "field": "policy",
+        "state": "Unverifiable",
+        "source": {
+          "evidence": "Computed",
+          "freshness": "Unavailable"
+        }
+      },
+      {
+        "field": "canary-weight",
+        "state": "NotApplicable",
+        "source": {
+          "evidence": "Computed",
+          "freshness": "Current"
+        }
+      }
+    ],
+    "issues": [
+      {
+        "code": "IntentNotReported"
+      },
+      {
+        "code": "RealizationUnavailable"
+      }
+    ]
+  },
+  "warnings": [
+    {
+      "code": "SourceUnavailable"
+    }
+  ]
+}

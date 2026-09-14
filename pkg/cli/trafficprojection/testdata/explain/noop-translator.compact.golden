@@ -1,0 +1,11 @@
+LAYER       STATE           VALUE                    SOURCE
+SUMMARY     Unsupported     -                        Computed/Unavailable
+INTENT      Declared        RoundRobin               Declared/Current
+SUPPORT     Rejected        -                        Reported/Current
+TRANSLATE   Computed        Unavailable              Computed/Current
+REALIZE     Unavailable     r=0 e=0 w=0              Unavailable/Unavailable
+CHECK       Match           algorithm                Computed/Current
+CHECK       Mismatch        policy                   Computed/Current
+CHECK       NotApplicable   canary-weight            Computed/Current
+ISSUE       -               NoTranslatorAvailable    Computed/Unverifiable
+ISSUE       -               RealizationUnavailable   Computed/Unverifiable

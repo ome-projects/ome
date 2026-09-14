@@ -1,0 +1,96 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-14T17:00:00Z"
+content:
+  comparisons:
+  - field: algorithm
+    source:
+      evidence: Computed
+      freshness: Current
+    state: Match
+  - field: policy
+    source:
+      evidence: Computed
+      freshness: Current
+    state: Mismatch
+  - field: canary-weight
+    source:
+      evidence: Computed
+      freshness: Current
+    state: NotApplicable
+  intent:
+    algorithm: RoundRobin
+    consistentHash:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    endpointOverride:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    extensions: []
+    source:
+      evidence: Declared
+      freshness: Current
+    state: Declared
+  issues:
+  - code: NoTranslatorAvailable
+  - code: RealizationUnavailable
+  reported:
+    allocations: []
+    conditions:
+    - lastTransitionTime: "2026-09-14T16:59:00Z"
+      observedGeneration: 7
+      reason: NoTranslatorAvailable
+      source:
+        evidence: Reported
+        freshness: Current
+      status: "False"
+      type: BackendPolicyReady
+    endpoints: []
+    issues: []
+    routes: []
+    summary:
+      algorithm: RoundRobin
+      policyReady:
+        reason: NoTranslatorAvailable
+        status: "False"
+      source:
+        algorithm:
+          evidence: Reported
+          freshness: Current
+        policyReady:
+          evidence: Reported
+          freshness: Current
+        state:
+          evidence: Computed
+          freshness: Unverifiable
+        translator:
+          evidence: Computed
+          freshness: Current
+        unsupported:
+          evidence: Reported
+          freshness: Current
+      state: Degraded
+      translator: Unavailable
+      unsupported: Unknown
+  summary:
+    intent: Declared
+    realization: Unavailable
+    source:
+      evidence: Computed
+      freshness: Unavailable
+    state: Unsupported
+    support: Rejected
+kind: TrafficExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-09-14T17:00:00Z"
+  evidence: Reported
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings:
+- code: PartialData

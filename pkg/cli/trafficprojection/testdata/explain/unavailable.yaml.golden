@@ -1,0 +1,89 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-14T17:00:00Z"
+content:
+  comparisons:
+  - field: algorithm
+    source:
+      evidence: Computed
+      freshness: Unavailable
+    state: Unverifiable
+  - field: policy
+    source:
+      evidence: Computed
+      freshness: Unavailable
+    state: Unverifiable
+  - field: canary-weight
+    source:
+      evidence: Computed
+      freshness: Current
+    state: NotApplicable
+  intent:
+    algorithm: RoundRobin
+    consistentHash:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    endpointOverride:
+      inputCount: 0
+      state: Absent
+      variant: Unavailable
+    extensions: []
+    source:
+      evidence: Declared
+      freshness: Current
+    state: Declared
+  issues:
+  - code: IntentNotReported
+  - code: RealizationUnavailable
+  reported:
+    allocations: []
+    conditions: []
+    endpoints: []
+    issues:
+    - code: TrafficStatusMissing
+    routes: []
+    summary:
+      algorithm: Unknown
+      policyReady:
+        reason: NotReported
+        status: Unknown
+      source:
+        algorithm:
+          evidence: Reported
+          freshness: Unavailable
+        policyReady:
+          evidence: Reported
+          freshness: Unavailable
+        state:
+          evidence: Computed
+          freshness: Unverifiable
+        translator:
+          evidence: Computed
+          freshness: Unavailable
+        unsupported:
+          evidence: Reported
+          freshness: Unavailable
+      state: Unavailable
+      translator: Unavailable
+      unsupported: Unknown
+  summary:
+    intent: Declared
+    realization: Unavailable
+    source:
+      evidence: Computed
+      freshness: Unavailable
+    state: Unavailable
+    support: Unavailable
+kind: TrafficExplainReport
+metadata:
+  name: chat
+  namespace: prod
+sources:
+- collectedAt: "2026-09-14T17:00:00Z"
+  evidence: Reported
+  generation: 7
+  kind: InferenceService
+  name: chat
+  namespace: prod
+warnings:
+- code: SourceUnavailable

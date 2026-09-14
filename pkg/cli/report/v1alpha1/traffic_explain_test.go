@@ -80,7 +80,8 @@ func TestTrafficExplainCompactAndWideTables(t *testing.T) {
 		Rows: [][]string{
 			{"SUMMARY", "Consistent", "-", "Computed/Unverifiable"},
 			{"INTENT", "Declared", "RoundRobin", "Declared/Current"},
-			{"SUPPORT", "Honored", "envoy-gateway", "Reported/Current"},
+			{"SUPPORT", "Honored", "-", "Reported/Current"},
+			{"TRANSLATE", "Computed", "envoy-gateway", "Computed/Current"},
 			{"REALIZE", "Reported", "r=2 e=1 w=2", "Reported/Unverifiable"},
 			{"CHECK", "Match", "algorithm", "Computed/Current"},
 			{"CHECK", "Match", "policy", "Computed/Current"},
@@ -113,6 +114,14 @@ func TestTrafficExplainCompactAndWideTables(t *testing.T) {
 	} {
 		assert.Contains(t, joined, wanted)
 	}
+}
+
+func TestTrafficExplainWideRetainsUnallocatedCanaryHashes(t *testing.T) {
+	value := trafficExplainReportFixture()
+	value.Content.Reported.Allocations = nil
+	wide := flattenTrafficTable(value.WideTable())
+	assert.Contains(t, wide, "OBSERVED|stable-revision|Reported|a1b2c3d4|Reported/Unverifiable")
+	assert.Contains(t, wide, "OBSERVED|canary-revision|Reported|e5f6a7b8|Reported/Unverifiable")
 }
 
 func TestTrafficExplainMachineOutputIsTypedAndSecretFree(t *testing.T) {
