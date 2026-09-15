@@ -10,7 +10,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
 
 func migrationTestWorkload() *Workload {
@@ -46,19 +45,7 @@ func withMigrationIR(workload *Workload, component v1beta1.ComponentType, migrat
 
 func TestParsePendingMigrationAcceptsCanonicalSnakeCase(t *testing.T) {
 	now := time.Date(2026, 8, 31, 9, 30, 0, 0, time.UTC)
-	raw, err := json.Marshal(audit.MigrationRequest{
-		SchemaVersion:   audit.SchemaV1,
-		Component:       string(v1beta1.EngineComponent),
-		Instance:        2,
-		FromNode:        "gpu-a",
-		HintTargetNodes: []string{"gpu-b", "gpu-c"},
-		Reason:          "fragmentation",
-		RequestedAt:     now.Format(time.RFC3339),
-		RequestedBy:     "alfred-controller",
-	})
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
+	raw := `{"schemaVersion":"v1","component":"engine","instance":2,"from_node":"gpu-a","hint_target_nodes":["gpu-b","gpu-c"],"reason":"fragmentation","requested_at":"2026-08-31T09:30:00Z","requested_by":"alfred-controller"}`
 
 	got, err := parsePendingMigration("request-1", string(raw), migrationTestWorkload())
 	if err != nil {
@@ -91,30 +78,23 @@ func TestParsePendingMigrationRejectsCamelCase(t *testing.T) {
 }
 
 func TestParsePendingMigrationValidatesCurrentInstance(t *testing.T) {
-	valid := audit.MigrationRequest{
-		SchemaVersion: audit.SchemaV1,
-		Component:     string(v1beta1.EngineComponent),
-		Instance:      2,
-		FromNode:      "gpu-a",
-		RequestedAt:   "2026-08-31T09:30:00Z",
-	}
 	tests := []struct {
 		name        string
 		uuid        string
-		mutate      func(*audit.MigrationRequest)
+		mutate      func(map[string]any)
 		wantErrPart string
 	}{
-		{name: "empty UUID", uuid: "", mutate: func(*audit.MigrationRequest) {}, wantErrPart: "UUID"},
-		{name: "missing source", uuid: "request-1", mutate: func(r *audit.MigrationRequest) { r.FromNode = "" }, wantErrPart: "from_node"},
-		{name: "negative instance", uuid: "request-1", mutate: func(r *audit.MigrationRequest) { r.Instance = -1 }, wantErrPart: "instance"},
-		{name: "unknown component", uuid: "request-1", mutate: func(r *audit.MigrationRequest) { r.Component = "sidecar" }, wantErrPart: "component"},
-		{name: "missing current instance", uuid: "request-1", mutate: func(r *audit.MigrationRequest) { r.Instance = 1 }, wantErrPart: "current instance"},
-		{name: "invalid requested_at", uuid: "request-1", mutate: func(r *audit.MigrationRequest) { r.RequestedAt = "yesterday" }, wantErrPart: "requested_at"},
+		{name: "empty UUID", uuid: "", mutate: func(map[string]any) {}, wantErrPart: "UUID"},
+		{name: "missing source", uuid: "request-1", mutate: func(r map[string]any) { r["from_node"] = "" }, wantErrPart: "from_node"},
+		{name: "negative instance", uuid: "request-1", mutate: func(r map[string]any) { r["instance"] = -1 }, wantErrPart: "instance"},
+		{name: "unknown component", uuid: "request-1", mutate: func(r map[string]any) { r["component"] = "sidecar" }, wantErrPart: "component"},
+		{name: "missing current instance", uuid: "request-1", mutate: func(r map[string]any) { r["instance"] = 1 }, wantErrPart: "current instance"},
+		{name: "invalid requested_at", uuid: "request-1", mutate: func(r map[string]any) { r["requested_at"] = "yesterday" }, wantErrPart: "requested_at"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := valid
-			tt.mutate(&req)
+			req := map[string]any{"schemaVersion": "v1", "component": "engine", "instance": 2, "from_node": "gpu-a", "requested_at": "2026-08-31T09:30:00Z"}
+			tt.mutate(req)
 			raw, err := json.Marshal(req)
 			if err != nil {
 				t.Fatalf("marshal request: %v", err)
@@ -128,16 +108,7 @@ func TestParsePendingMigrationValidatesCurrentInstance(t *testing.T) {
 }
 
 func TestParsePendingMigrationPreservesMissingRequestedAt(t *testing.T) {
-	raw, err := json.Marshal(audit.MigrationRequest{
-		SchemaVersion: audit.SchemaV1,
-		Component:     string(v1beta1.EngineComponent),
-		Instance:      2,
-		FromNode:      "gpu-a",
-		RequestedBy:   "foreign-controller",
-	})
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
+	raw := `{"schemaVersion":"v1","component":"engine","instance":2,"from_node":"gpu-a","requested_by":"foreign-controller"}`
 
 	got, err := parsePendingMigration("legacy-1", string(raw), migrationTestWorkload())
 	if err != nil {
@@ -149,17 +120,7 @@ func TestParsePendingMigrationPreservesMissingRequestedAt(t *testing.T) {
 }
 
 func TestApplyMigrationStatePreservesRequesterFromPendingAnnotation(t *testing.T) {
-	raw, err := json.Marshal(audit.MigrationRequest{
-		SchemaVersion: audit.SchemaV1,
-		Component:     string(v1beta1.EngineComponent),
-		Instance:      0,
-		FromNode:      "gpu-a",
-		RequestedAt:   "2026-08-31T09:30:00Z",
-		RequestedBy:   "alfred-controller",
-	})
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
+	raw := `{"schemaVersion":"v1","component":"engine","instance":0,"from_node":"gpu-a","requested_at":"2026-08-31T09:30:00Z","requested_by":"alfred-controller"}`
 
 	workload := migrationTestWorkload()
 	started := time.Date(2026, 8, 31, 9, 30, 0, 0, time.UTC)
@@ -221,17 +182,7 @@ func TestApplyMigrationStateStoresPayloadFreeMalformedRequestReason(t *testing.T
 
 func TestApplyMigrationStateOverlaysAuthoritativeIRStatus(t *testing.T) {
 	now := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
-	annotation, err := json.Marshal(audit.MigrationRequest{
-		SchemaVersion: audit.SchemaV1,
-		Component:     string(v1beta1.EngineComponent),
-		Instance:      0,
-		FromNode:      "gpu-a",
-		RequestedAt:   now.Add(-time.Minute).Format(time.RFC3339),
-		RequestedBy:   "alfred-controller",
-	})
-	if err != nil {
-		t.Fatalf("marshal annotation: %v", err)
-	}
+	annotation := `{"schemaVersion":"v1","component":"engine","instance":0,"from_node":"gpu-a","requested_at":"2026-08-31T09:59:00Z","requested_by":"alfred-controller"}`
 
 	t.Run("annotation only", func(t *testing.T) {
 		workload := migrationTestWorkload()
@@ -530,44 +481,79 @@ func TestApplyMigrationStateIgnoresLegacyMigrationHistory(t *testing.T) {
 	}
 }
 
-func TestMarshalAlfredMigrationRequestRoundTripsThroughAudit(t *testing.T) {
-	now := time.Date(2026, 8, 31, 9, 30, 0, 0, time.UTC)
-	req := audit.MigrationRequest{
-		SchemaVersion:   audit.SchemaV1,
-		Component:       string(v1beta1.EngineComponent),
-		Instance:        2,
-		FromNode:        "gpu-a",
-		HintTargetNodes: []string{"gpu-b", "gpu-c"},
-		Reason:          "fragmentation",
-		RequestedAt:     now.UTC().Format(time.RFC3339),
-		RequestedBy:     "alfred-controller",
+func TestPendingMigrationWireCompatibility(t *testing.T) {
+	const valid = `{"schemaVersion":"v1","component":"engine","instance":2,"from_node":"gpu-a","hint_target_nodes":["gpu-b"],"reason":"fragmentation","requested_at":"2026-08-31T09:30:00Z","requested_by":"alfred-controller"}`
+	wantTime := time.Date(2026, 8, 31, 9, 30, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name         string
+		raw          string
+		wantInstance int32
+		wantTime     time.Time
+		wantErr      bool
+	}{
+		{name: "canonical", raw: valid, wantInstance: 2, wantTime: wantTime},
+		{name: "additive nested field", raw: strings.TrimSuffix(valid, "}") + `,"future":{"flags":[true,1,"value"]}}`, wantInstance: 2, wantTime: wantTime},
+		{name: "fractional offset timestamp", raw: strings.Replace(valid, "2026-08-31T09:30:00Z", "2026-08-31T02:30:00.123456789-07:00", 1), wantInstance: 2, wantTime: wantTime.Add(123456789 * time.Nanosecond)},
+		{name: "missing instance defaults to zero", raw: strings.Replace(valid, `"instance":2,`, "", 1), wantTime: wantTime},
+		{name: "null instance defaults to zero", raw: strings.Replace(valid, `"instance":2`, `"instance":null`, 1), wantTime: wantTime},
+		{name: "duplicate scalar uses last value", raw: strings.Replace(valid, `"instance":2`, `"instance":1,"instance":2`, 1), wantInstance: 2, wantTime: wantTime},
+		{name: "unsupported schema", raw: strings.Replace(valid, `"v1"`, `"v2"`, 1), wantErr: true},
+		{name: "missing schema", raw: strings.Replace(valid, `"schemaVersion":"v1",`, "", 1), wantErr: true},
+		{name: "null schema", raw: strings.Replace(valid, `"schemaVersion":"v1"`, `"schemaVersion":null`, 1), wantErr: true},
+		{name: "trailing object", raw: valid + `{}`, wantErr: true},
+		{name: "trailing whitespace", raw: valid + "\n\t ", wantInstance: 2, wantTime: wantTime},
+		{name: "null request", raw: `null`, wantErr: true},
+		{name: "array request", raw: `[]`, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePendingMigration("request-1", tt.raw, migrationTestWorkload())
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("accepted invalid migration request")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.UUID != "request-1" || got.Component != v1beta1.EngineComponent || got.Instance != tt.wantInstance || got.FromNode != "gpu-a" || got.RequestedBy != "alfred-controller" || !got.RequestedAt.Equal(tt.wantTime) {
+				t.Fatalf("migration = %+v, want instance %d and requested_at %v with unchanged identity", got, tt.wantInstance, tt.wantTime)
+			}
+		})
 	}
-	raw, err := json.Marshal(req)
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-	var keys map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &keys); err != nil {
-		t.Fatalf("inspect request keys: %v", err)
-	}
-	for _, key := range []string{"from_node", "hint_target_nodes", "requested_at", "requested_by"} {
-		if _, ok := keys[key]; !ok {
-			t.Errorf("canonical key %q missing from %s", key, raw)
-		}
-	}
-	for _, key := range []string{"fromNode", "hintTargetNodes", "requestedAt", "requestedBy"} {
-		if _, ok := keys[key]; ok {
-			t.Errorf("camel-case key %q present in %s", key, raw)
-		}
-	}
-	parsed, err := audit.ParseMigrationRequest(string(raw))
-	if err != nil {
-		t.Fatalf("audit.ParseMigrationRequest: %v", err)
-	}
-	if parsed.FromNode != req.FromNode || parsed.RequestedAt != req.RequestedAt || parsed.RequestedBy != req.RequestedBy {
-		t.Fatalf("round-trip mismatch: got %+v want %+v", parsed, req)
-	}
-	if got := migrationAnnotationKey("request-1"); got != audit.MigrationRequestAnnotationPrefix+"request-1" {
+	if got := migrationAnnotationKey("request-1"); got != "ome.io/migration-request-v1-request-1" {
 		t.Fatalf("migrationAnnotationKey = %q", got)
+	}
+}
+
+func TestPendingMigrationRejectsMalformedKnownFields(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "schema type", field: "schemaVersion", value: 1},
+		{name: "component type", field: "component", value: []string{"engine"}},
+		{name: "instance string", field: "instance", value: "2"},
+		{name: "instance fraction", field: "instance", value: 2.5},
+		{name: "instance overflow", field: "instance", value: int64(2147483648)},
+		{name: "source type", field: "from_node", value: 1},
+		{name: "hints scalar", field: "hint_target_nodes", value: "gpu-b"},
+		{name: "hints element type", field: "hint_target_nodes", value: []any{"gpu-b", 1}},
+		{name: "reason type", field: "reason", value: false},
+		{name: "timestamp type", field: "requested_at", value: 1},
+		{name: "requester type", field: "requested_by", value: map[string]any{"name": "alfred"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request := map[string]any{"schemaVersion": "v1", "component": "engine", "instance": 2, "from_node": "gpu-a"}
+			request[tt.field] = tt.value
+			raw, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := parsePendingMigration("request-1", string(raw), migrationTestWorkload()); err == nil {
+				t.Fatalf("accepted invalid %s: %s", tt.field, raw)
+			}
+		})
 	}
 }

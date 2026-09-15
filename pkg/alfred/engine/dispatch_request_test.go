@@ -13,11 +13,11 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
 
 func TestDispatchPayloadUsesExistingPublicWireContract(t *testing.T) {
 	c := cand("prod/a", "source", "target")
+	c.Reason = "node maintenance"
 	e, err := newDispatchEntry(c, "isvc-uid", "a-engine", "ir-uid", "fingerprint", testNow)
 	if err != nil {
 		t.Fatal(err)
@@ -25,19 +25,17 @@ func TestDispatchPayloadUsesExistingPublicWireContract(t *testing.T) {
 	if _, err := uuid.Parse(e.UUID); err != nil {
 		t.Fatal(err)
 	}
-	request, err := audit.ParseMigrationRequest(e.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if request.SchemaVersion != "v1" || request.Component != "engine" || request.Instance != 0 || request.FromNode != "source" || request.RequestedBy != "alfred" || !reflect.DeepEqual(request.HintTargetNodes, []string{"target"}) {
-		t.Fatalf("wrong migration payload: %+v", request)
-	}
 	var fields map[string]any
 	if err := json.Unmarshal([]byte(e.Payload), &fields); err != nil {
 		t.Fatal(err)
 	}
-	if len(fields) != 8 {
-		t.Fatalf("unexpected API fields: %v", fields)
+	want := map[string]any{
+		"schemaVersion": "v1", "component": "engine", "instance": float64(0),
+		"from_node": "source", "hint_target_nodes": []any{"target"},
+		"reason": "node maintenance", "requested_at": "2026-01-01T12:00:00Z", "requested_by": "alfred",
+	}
+	if !reflect.DeepEqual(fields, want) {
+		t.Fatalf("migration wire fields = %v, want %v", fields, want)
 	}
 	if e.Phase != "prepared" || e.LastAttempt != nil {
 		t.Fatalf("new intent must not imply a write: %+v", e)

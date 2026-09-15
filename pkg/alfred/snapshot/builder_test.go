@@ -2,7 +2,6 @@ package snapshot
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
 
 var (
@@ -94,32 +92,11 @@ func omePod(namespace, name, node, isvc string, component string, gpus int64, re
 func buildTestSnapshot(t *testing.T) *ClusterSnapshot {
 	t.Helper()
 
-	requestPayloadBytes, err := json.Marshal(audit.MigrationRequest{
-		SchemaVersion: audit.SchemaV1,
-		Component:     "engine",
-		Instance:      0,
-		FromNode:      "node1",
-		RequestedAt:   buildNow.Add(-time.Minute).Format(time.RFC3339),
-		RequestedBy:   "alfred-controller",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestPayload := string(requestPayloadBytes)
+	requestPayload := `{"schemaVersion":"v1","component":"engine","instance":0,"from_node":"node1","requested_at":"2026-01-02T11:59:00Z","requested_by":"alfred-controller"}`
 	// ackedPayload shares its UUID ("done-1") with a terminal history entry
 	// below — the ack-race window where the executor has recorded the
 	// terminal outcome but not yet cleared the annotation.
-	ackedPayloadBytes, err := json.Marshal(audit.MigrationRequest{
-		SchemaVersion: audit.SchemaV1,
-		Component:     "engine",
-		Instance:      0,
-		FromNode:      "node2",
-		RequestedAt:   buildNow.Add(-3 * time.Hour).Format(time.RFC3339),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ackedPayload := string(ackedPayloadBytes)
+	ackedPayload := `{"schemaVersion":"v1","component":"engine","instance":0,"from_node":"node2","requested_at":"2026-01-02T09:00:00Z"}`
 
 	llamaLabel := constants.GetClusterBaseModelLabel("llama")
 

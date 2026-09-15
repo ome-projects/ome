@@ -15,13 +15,19 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
 const (
+	// OMENative's observed Pod identity labels are a wire boundary, not a
+	// dependency on the controller's query or readiness implementation.
+	labelManagedBy           = "ome.io/managed-by"
+	managedByOMENative       = "OMENative"
+	labelInstanceIndex       = "ome.io/instance-index"
+	labelInstanceIncarnation = "ome.io/instance-incarnation"
+	labelRunner              = "ome.io/runner"
+	labelPodOrdinal          = "ome.io/pod-ordinal"
+
 	// caScaleDownDisabledAnnotation is the operator-set cluster-autoscaler
 	// annotation excluding a node from scale-down.
 	caScaleDownDisabledAnnotation = "cluster-autoscaler.kubernetes.io/scale-down-disabled"
@@ -205,7 +211,7 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 		Ready:       podIsReady(pod),
 		Terminating: pod.DeletionTimestamp != nil,
 		Component:   component,
-		ManagedBy:   pod.Labels[query.LabelManagedBy],
+		ManagedBy:   pod.Labels[labelManagedBy],
 	}
 	parseOMENativePodIdentity(&info, pod)
 	if pod.Status.StartTime != nil {
@@ -223,7 +229,7 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 			if info.Terminating {
 				node.TerminatingGPUs += gpus
 			}
-			if isvcName != "" || info.ControllerOwnerValid || info.ManagedBy == query.ManagedByOMENative {
+			if isvcName != "" || info.ControllerOwnerValid || info.ManagedBy == managedByOMENative {
 				node.OMEPods = append(node.OMEPods, info)
 			} else {
 				node.OtherOccupants = append(node.OtherOccupants, info)
@@ -313,27 +319,6 @@ func buildWorkload(
 	return w
 }
 
-type workloadComponentSpec struct {
-	ctype   v1beta1.ComponentType
-	present bool
-	mode    constants.DeploymentModeType
-}
-
-func workloadComponentSpecs(isvc *v1beta1.InferenceService) []workloadComponentSpec {
-	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(
-		isvc.Spec.Engine, isvc.Spec.Decoder, isvc.Spec.Router, nil, isvc.Spec.DeploymentMode)
-	if err != nil {
-		// An ISVC without an engine spec is invalid but may transiently
-		// exist; fall back to the default mode so its pods still appear.
-		engineMode, decoderMode, routerMode = constants.RawDeployment, constants.RawDeployment, constants.RawDeployment
-	}
-	return []workloadComponentSpec{
-		{v1beta1.EngineComponent, isvc.Spec.Engine != nil, engineMode},
-		{v1beta1.DecoderComponent, isvc.Spec.Decoder != nil, decoderMode},
-		{v1beta1.RouterComponent, isvc.Spec.Router != nil, routerMode},
-	}
-}
-
 func scheduledPods(pods []PodInfo) []PodInfo {
 	result := make([]PodInfo, 0, len(pods))
 	for _, pod := range pods {
@@ -345,16 +330,16 @@ func scheduledPods(pods []PodInfo) []PodInfo {
 }
 
 func parseOMENativePodIdentity(info *PodInfo, pod *corev1.Pod) {
-	info.InstanceIndex, info.InstanceIndexPresent, info.InstanceIndexValid = parseInt32Identity(pod.Labels, query.LabelInstanceIdx, false)
-	info.Incarnation, info.IncarnationPresent, info.IncarnationValid = parseInt64Identity(pod.Labels, query.LabelInstanceIncarnation, true)
-	rawRunner, runnerPresent := pod.Labels[query.LabelRunner]
+	info.InstanceIndex, info.InstanceIndexPresent, info.InstanceIndexValid = parseInt32Identity(pod.Labels, labelInstanceIndex, false)
+	info.Incarnation, info.IncarnationPresent, info.IncarnationValid = parseInt64Identity(pod.Labels, labelInstanceIncarnation, true)
+	rawRunner, runnerPresent := pod.Labels[labelRunner]
 	info.Runner = v1beta1.RunnerName(rawRunner)
 	info.RunnerPresent = runnerPresent
 	switch info.Runner {
 	case v1beta1.RunnerNameDefault, v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker:
 		info.RunnerValid = runnerPresent
 	}
-	info.PodOrdinal, info.PodOrdinalPresent, info.PodOrdinalValid = parseInt32Identity(pod.Labels, query.LabelPodOrdinal, false)
+	info.PodOrdinal, info.PodOrdinalPresent, info.PodOrdinalValid = parseInt32Identity(pod.Labels, labelPodOrdinal, false)
 
 	for i := range pod.OwnerReferences {
 		owner := &pod.OwnerReferences[i]
@@ -465,10 +450,10 @@ func applyMigrationState(w *Workload, isvc *v1beta1.InferenceService) {
 	w.MigrationStateReason = ""
 
 	for key, raw := range isvc.Annotations {
-		if !strings.HasPrefix(key, audit.MigrationRequestAnnotationPrefix) {
+		if !strings.HasPrefix(key, migrationRequestAnnotationPrefix) {
 			continue
 		}
-		uuid := strings.TrimPrefix(key, audit.MigrationRequestAnnotationPrefix)
+		uuid := strings.TrimPrefix(key, migrationRequestAnnotationPrefix)
 		pending, err := parsePendingMigration(uuid, raw, w)
 		if err != nil {
 			// Malformed request annotations stay visible: any prefixed

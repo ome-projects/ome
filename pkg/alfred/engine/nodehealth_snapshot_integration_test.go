@@ -20,7 +20,6 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
 func TestOwnerResolvedMalformedOMEPodPreventsFalseNodeDrained(t *testing.T) {
@@ -80,12 +79,12 @@ func TestOwnerResolvedMalformedOMEPodPreventsFalseNodeDrained(t *testing.T) {
 			// The ISVC label is deliberately absent. Controller ownership proves
 			// the canonical occupancy target, but the raw join must stay invalid.
 			Labels: map[string]string{
-				constants.OMEComponentLabel:    string(v1beta1.EngineComponent),
-				query.LabelManagedBy:           query.ManagedByOMENative,
-				query.LabelInstanceIdx:         "3",
-				query.LabelInstanceIncarnation: "1",
-				query.LabelRunner:              string(v1beta1.RunnerNameDefault),
-				query.LabelPodOrdinal:          "0",
+				constants.OMEComponentLabel:   string(v1beta1.EngineComponent),
+				"ome.io/managed-by":           "OMENative",
+				"ome.io/instance-index":       "3",
+				"ome.io/instance-incarnation": "1",
+				"ome.io/runner":               string(v1beta1.RunnerNameDefault),
+				"ome.io/pod-ordinal":          "0",
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: v1beta1.SchemeGroupVersion.String(),
@@ -166,7 +165,7 @@ func TestOwnerResolvedMalformedOMEPodPreventsFalseNodeDrained(t *testing.T) {
 
 	t.Run("absent IR keeps unnamed OME occupancy", func(t *testing.T) {
 		orphanPod := pod.DeepCopy()
-		delete(orphanPod.Labels, query.LabelManagedBy)
+		delete(orphanPod.Labels, "ome.io/managed-by")
 		orphanReader := fake.NewClientBuilder().WithScheme(scheme).
 			WithObjects(node.DeepCopy(), isvc.DeepCopy(), orphanPod).Build()
 		orphanSnap, err := snapshot.Build(context.Background(), orphanReader,

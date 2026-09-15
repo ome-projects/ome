@@ -9,7 +9,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
 const (
@@ -174,7 +173,7 @@ func routeWorkloadPods(
 			appendPod(pod.ISVC, pod.Component, pod)
 			continue
 		}
-		if !ownerMatched && pod.ManagedBy == query.ManagedByOMENative {
+		if !ownerMatched && pod.ManagedBy == managedByOMENative {
 			for _, component := range layout.nativeComponents {
 				appendPod(pod.ISVC, component, pod)
 			}
@@ -479,7 +478,7 @@ func validPodIdentity(
 	isvc *v1beta1.InferenceService,
 	component v1beta1.ComponentType,
 ) bool {
-	return pod.ManagedBy == query.ManagedByOMENative &&
+	return pod.ManagedBy == managedByOMENative &&
 		pod.ISVC == (types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}) &&
 		pod.Component == component &&
 		pod.InstanceIndexPresent && pod.InstanceIndexValid &&

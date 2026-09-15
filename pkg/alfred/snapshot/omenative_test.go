@@ -20,7 +20,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
 func TestBuildOMENativeCopiesDenseStatus(t *testing.T) {
@@ -117,21 +116,21 @@ func TestBuildOMENativeRejectsInvalidIRAndPodEvidence(t *testing.T) {
 		{name: "wrong IR owner API version in same group", mutate: func(f *omeNativeFixture) {
 			f.ir.OwnerReferences[0].APIVersion = v1beta1.SchemeGroupVersion.Group + "/v1alpha1"
 		}},
-		{name: "missing identity label", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, query.LabelPodOrdinal) }},
-		{name: "missing instance index", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, query.LabelInstanceIdx) }},
-		{name: "missing incarnation", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, query.LabelInstanceIncarnation) }},
-		{name: "missing runner", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, query.LabelRunner) }},
-		{name: "malformed identity label", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIdx] = "secret-malformed" }},
-		{name: "negative instance index", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIdx] = "-1" }},
-		{name: "negative incarnation", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIncarnation] = "-1" }},
-		{name: "wrong managed by", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelManagedBy] = "Deployment" }},
+		{name: "missing identity label", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, "ome.io/pod-ordinal") }},
+		{name: "missing instance index", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, "ome.io/instance-index") }},
+		{name: "missing incarnation", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, "ome.io/instance-incarnation") }},
+		{name: "missing runner", mutate: func(f *omeNativeFixture) { delete(f.pods[0].Labels, "ome.io/runner") }},
+		{name: "malformed identity label", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/instance-index"] = "secret-malformed" }},
+		{name: "negative instance index", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/instance-index"] = "-1" }},
+		{name: "negative incarnation", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/instance-incarnation"] = "-1" }},
+		{name: "wrong managed by", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/managed-by"] = "Deployment" }},
 		{name: "wrong Pod controller UID", mutate: func(f *omeNativeFixture) { f.pods[0].OwnerReferences[0].UID = "other-ir" }},
 		{name: "wrong Pod controller name", mutate: func(f *omeNativeFixture) { f.pods[0].OwnerReferences[0].Name = "other-ir" }},
 		{name: "wrong Pod controller kind", mutate: func(f *omeNativeFixture) { f.pods[0].OwnerReferences[0].Kind = "Deployment" }},
 		{name: "wrong Pod controller API version", mutate: func(f *omeNativeFixture) {
 			f.pods[0].OwnerReferences[0].APIVersion = "apps/v1"
 		}},
-		{name: "stale incarnation", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIncarnation] = "2" }},
+		{name: "stale incarnation", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/instance-incarnation"] = "2" }},
 		{name: "missing Pod", mutate: func(f *omeNativeFixture) { f.pods = nil }},
 		{name: "extra Pod", mutate: func(f *omeNativeFixture) { f.pods = append(f.pods, omeNativePod(f, 3, 1, "default", 1, "node-b")) }},
 		{name: "duplicate Pod identity", mutate: func(f *omeNativeFixture) {
@@ -139,14 +138,14 @@ func TestBuildOMENativeRejectsInvalidIRAndPodEvidence(t *testing.T) {
 			duplicate.Name += "-duplicate"
 			f.pods = append(f.pods, duplicate)
 		}},
-		{name: "statusless Pod index", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelInstanceIdx] = "9" }},
+		{name: "statusless Pod index", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/instance-index"] = "9" }},
 		{name: "terminating current Pod", mutate: func(f *omeNativeFixture) {
 			now := metav1.Now()
 			f.pods[0].DeletionTimestamp = &now
 			f.pods[0].Finalizers = []string{"test/finalizer"}
 		}},
-		{name: "unknown runner", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelRunner] = "sidecar" }},
-		{name: "negative pod ordinal", mutate: func(f *omeNativeFixture) { f.pods[0].Labels[query.LabelPodOrdinal] = "-1" }},
+		{name: "unknown runner", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/runner"] = "sidecar" }},
+		{name: "negative pod ordinal", mutate: func(f *omeNativeFixture) { f.pods[0].Labels["ome.io/pod-ordinal"] = "-1" }},
 		{name: "unsupported runner layout", mutate: func(f *omeNativeFixture) {
 			f.ir.Spec.Runners = []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 2}}
 		}},
@@ -269,13 +268,13 @@ func TestBuildOMENativeInvalidInstanceIndexDoesNotTargetZeroOrSibling(t *testing
 		{
 			name: "missing",
 			mutate: func(pod *corev1.Pod) {
-				delete(pod.Labels, query.LabelInstanceIdx)
+				delete(pod.Labels, "ome.io/instance-index")
 			},
 		},
 		{
 			name: "malformed",
 			mutate: func(pod *corev1.Pod) {
-				pod.Labels[query.LabelInstanceIdx] = "not-an-index"
+				pod.Labels["ome.io/instance-index"] = "not-an-index"
 			},
 		},
 	}
@@ -549,7 +548,7 @@ func TestBuildDoesNotProjectMalformedNonInferenceReplicaOwner(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newOMENativeFixture()
 			delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
-			delete(fixture.pods[0].Labels, query.LabelManagedBy)
+			delete(fixture.pods[0].Labels, "ome.io/managed-by")
 			test.mutate(&fixture.pods[0].OwnerReferences[0])
 			snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
 
@@ -567,7 +566,7 @@ func TestBuildDoesNotProjectMalformedNonInferenceReplicaOwner(t *testing.T) {
 func TestBuildDoesNotCanonicalizeUnmatchedInferenceReplicaOwnerName(t *testing.T) {
 	fixture := newOMENativeFixture()
 	delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
-	delete(fixture.pods[0].Labels, query.LabelManagedBy)
+	delete(fixture.pods[0].Labels, "ome.io/managed-by")
 	fixture.pods[0].OwnerReferences[0].Name = "missing-ir"
 	snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
 
@@ -585,7 +584,7 @@ func TestBuildDoesNotCanonicalizeUnmatchedInferenceReplicaOwnerName(t *testing.T
 func TestBuildKeepsOrphanInferenceReplicaOwnerAsUnresolvedOMEOccupant(t *testing.T) {
 	fixture := newOMENativeFixture()
 	delete(fixture.pods[0].Labels, constants.InferenceServicePodLabelKey)
-	delete(fixture.pods[0].Labels, query.LabelManagedBy)
+	delete(fixture.pods[0].Labels, "ome.io/managed-by")
 	fixture.ir = nil
 	snap := buildOMENativeFixtureSnapshot(t, fixture, gpuNode("node-a", "8", nil))
 
@@ -618,7 +617,7 @@ func TestBuildKeepsManagedByOMENativeAsUnresolvedOMEOccupant(t *testing.T) {
 	}
 	occupant := node.OMEPods[0]
 	if occupant.ISVC.Name != "" || occupant.Component != v1beta1.EngineComponent ||
-		occupant.ManagedBy != query.ManagedByOMENative || occupant.ControllerOwnerPresent {
+		occupant.ManagedBy != "OMENative" || occupant.ControllerOwnerPresent {
 		t.Fatalf("unresolved managed-by identity = %+v", occupant)
 	}
 }
@@ -750,7 +749,7 @@ func TestBuildOMENativeAllowsTrustworthyTransitionalMembership(t *testing.T) {
 		{
 			name: "terminating stale incarnation",
 			mutate: func(f *omeNativeFixture) {
-				f.pods[0].Labels[query.LabelInstanceIncarnation] = "2"
+				f.pods[0].Labels["ome.io/instance-incarnation"] = "2"
 				now := metav1.Now()
 				f.pods[0].DeletionTimestamp = &now
 				f.pods[0].Finalizers = []string{"test/finalizer"}
@@ -859,11 +858,11 @@ func readyOMERow(index int32, incarnation int64, pods int32) v1beta1.OMENativeIn
 func omeNativePod(f *omeNativeFixture, index int32, incarnation int64, runner string, ordinal int32, node string) *corev1.Pod {
 	pod := omePod("prod", "svc-engine-pod", node, "svc", "engine", 1, true)
 	pod.Name += "-" + runner + "-" + string(rune('0'+ordinal)) + "-" + string(rune('0'+index))
-	pod.Labels[query.LabelManagedBy] = query.ManagedByOMENative
-	pod.Labels[query.LabelInstanceIdx] = strconv.FormatInt(int64(index), 10)
-	pod.Labels[query.LabelInstanceIncarnation] = strconv.FormatInt(incarnation, 10)
-	pod.Labels[query.LabelRunner] = runner
-	pod.Labels[query.LabelPodOrdinal] = strconv.FormatInt(int64(ordinal), 10)
+	pod.Labels["ome.io/managed-by"] = "OMENative"
+	pod.Labels["ome.io/instance-index"] = strconv.FormatInt(int64(index), 10)
+	pod.Labels["ome.io/instance-incarnation"] = strconv.FormatInt(incarnation, 10)
+	pod.Labels["ome.io/runner"] = runner
+	pod.Labels["ome.io/pod-ordinal"] = strconv.FormatInt(int64(ordinal), 10)
 	pod.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceReplica", Name: f.ir.Name,
 		UID: f.ir.UID, Controller: ptr.To(true),

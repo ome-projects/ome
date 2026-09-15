@@ -1,33 +1,51 @@
 package snapshot
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
 
 const (
+	migrationRequestAnnotationPrefix   = "ome.io/migration-request-v1-"
 	migrationStateReasonRequestInvalid = "migration request annotation is invalid"
 	migrationStateReasonStatusInvalid  = "inference replica migration status is invalid"
 )
 
-func migrationAnnotationKey(uuid string) string {
-	return audit.MigrationRequestAnnotationPrefix + uuid
+// observedMigrationRequest is the existing public v1 annotation format. Keep
+// every known field typed, including those not projected into InFlight, so
+// malformed values cannot silently become accepted as unknown fields.
+type observedMigrationRequest struct {
+	SchemaVersion   string   `json:"schemaVersion"`
+	Component       string   `json:"component"`
+	Instance        int32    `json:"instance"`
+	FromNode        string   `json:"from_node"`
+	HintTargetNodes []string `json:"hint_target_nodes,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
+	RequestedAt     string   `json:"requested_at,omitempty"`
+	RequestedBy     string   `json:"requested_by,omitempty"`
 }
 
-// parsePendingMigration adapts the canonical workload request into Alfred's
-// immutable snapshot model. The workload parser owns schema validation;
-// Alfred additionally fences the request against the source state it is about
-// to reason about.
+func migrationAnnotationKey(uuid string) string {
+	return migrationRequestAnnotationPrefix + uuid
+}
+
+// parsePendingMigration observes the public annotation contract without
+// depending on the executor's parser. Unknown additive fields are accepted for
+// v1 version skew; unknown schemas and malformed known fields are rejected.
+// Alfred additionally checks the request against the observed source instance.
 func parsePendingMigration(uuid string, raw string, workload *Workload) (InFlight, error) {
 	if uuid == "" {
 		return InFlight{}, fmt.Errorf("migration request UUID must not be empty")
 	}
-	req, err := audit.ParseMigrationRequest(raw)
-	if err != nil {
-		return InFlight{}, err
+	var req observedMigrationRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		return InFlight{}, fmt.Errorf("parse migration request: %w", err)
+	}
+	if req.SchemaVersion != "v1" {
+		return InFlight{}, fmt.Errorf("unsupported migration request schema version: %q", req.SchemaVersion)
 	}
 	if req.FromNode == "" {
 		return InFlight{}, fmt.Errorf("migration request from_node must not be empty")
@@ -49,6 +67,7 @@ func parsePendingMigration(uuid string, raw string, workload *Workload) (InFligh
 
 	var requestedAt time.Time
 	if req.RequestedAt != "" {
+		var err error
 		requestedAt, err = time.Parse(time.RFC3339, req.RequestedAt)
 		if err != nil {
 			return InFlight{}, fmt.Errorf("migration request requested_at %q is invalid: %w", req.RequestedAt, err)
