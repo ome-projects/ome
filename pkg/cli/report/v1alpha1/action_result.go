@@ -31,18 +31,19 @@ type ActionTarget struct {
 // ActionResult is the separate, versioned stdout contract shared by guarded
 // mutating commands. Preview, confirmation, and warnings remain on stderr.
 type ActionResult struct {
-	APIVersion   string       `json:"apiVersion"`
-	Kind         string       `json:"kind"`
-	CollectedAt  time.Time    `json:"collectedAt"`
-	Action       string       `json:"action"`
-	Target       ActionTarget `json:"target"`
-	DryRun       DryRunMode   `json:"dryRun"`
-	RequestID    string       `json:"requestID,omitempty"`
-	RevisionHash string       `json:"revisionHash,omitempty"`
-	Accepted     bool         `json:"accepted"`
-	Applied      bool         `json:"applied"`
-	Message      string       `json:"message,omitempty"`
-	FollowUp     string       `json:"followUp,omitempty"`
+	APIVersion   string              `json:"apiVersion"`
+	Kind         string              `json:"kind"`
+	CollectedAt  time.Time           `json:"collectedAt"`
+	Action       string              `json:"action"`
+	Target       ActionTarget        `json:"target"`
+	DryRun       DryRunMode          `json:"dryRun"`
+	RequestID    string              `json:"requestID,omitempty"`
+	RevisionHash string              `json:"revisionHash,omitempty"`
+	Accepted     bool                `json:"accepted"`
+	Applied      bool                `json:"applied"`
+	Message      string              `json:"message,omitempty"`
+	FollowUp     string              `json:"followUp,omitempty"`
+	Scale        *ScaleActionDetails `json:"scale,omitempty"`
 }
 
 // NewActionResult creates an unapplied result using an injectable clock.
@@ -68,6 +69,10 @@ func (r ActionResult) Canonical() ActionResult {
 	result.APIVersion = APIVersion
 	result.Kind = ActionResultKind
 	result.CollectedAt = r.CollectedAt.UTC()
+	if r.Scale != nil {
+		copy := r.Scale.canonical()
+		result.Scale = &copy
+	}
 	if result.DryRun != DryRunNone {
 		result.Applied = false
 	}
@@ -79,11 +84,22 @@ func (r ActionResult) Canonical() ActionResult {
 
 // Table derives the concise human view from the typed action result.
 func (r ActionResult) Table() report.Table {
+	if r.Scale != nil {
+		return r.scaleTable(false)
+	}
 	rows := [][]string{{"action", r.Action}, {"target", r.Target.displayName()}, {"dry-run", string(r.DryRun)}, {"accepted", yesNo(r.Accepted)}, {"applied", yesNo(r.Applied)}, {"request-id", orDash(r.RequestID)}, {"revision-hash", orDash(r.RevisionHash)}, {"message", orDash(r.Message)}, {"follow-up", orDash(r.FollowUp)}, {"hint", "Use -o json or -o yaml for full values."}}
 	for i := range rows {
 		rows[i][1] = printers.BoundedCell(rows[i][1], 56)
 	}
 	return report.Table{Headers: []string{"FIELD", "VALUE"}, Rows: rows}
+}
+
+// WideTable derives a bounded expanded view from the same canonical value.
+func (r ActionResult) WideTable() report.Table {
+	if r.Scale != nil {
+		return r.scaleTable(true)
+	}
+	return r.Table()
 }
 
 func (t ActionTarget) displayName() string {

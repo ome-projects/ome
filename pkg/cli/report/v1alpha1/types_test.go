@@ -274,6 +274,10 @@ func assertTypedSchema(t *testing.T, typ reflect.Type, seen map[reflect.Type]boo
 
 func isForbiddenSchemaField(field reflect.StructField) bool {
 	jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+	// The scale source is a typed fixed provenance label, not a payload spec.
+	if field.Name == "SpecSource" && jsonName == "specSource" && field.Type == reflect.TypeOf(v1alpha1.ScaleSpecSource("")) {
+		return false
+	}
 	name := strings.ToLower(field.Name + " " + jsonName)
 	for _, fragment := range []string{
 		"annotation", "detail", "environment", "envfrom", "header",

@@ -105,15 +105,23 @@ func copyTransportConfig(config *rest.Config) *rest.Config {
 // JSONPatch applies patch exactly as supplied and returns an unmodified JSON
 // object response with unambiguous identity fields. It never replays a request.
 func (c *Client) JSONPatch(ctx context.Context, resource Resource, patch []byte, options JSONPatchOptions) ([]byte, error) {
+	return c.jsonPatch(ctx, resource, "", patch, options)
+}
+
+func (c *Client) jsonPatch(ctx context.Context, resource Resource, subresource string, patch []byte, options JSONPatchOptions) ([]byte, error) {
 	patchOptions := metav1.PatchOptions{}
 	if options.DryRun {
 		patchOptions.DryRun = []string{metav1.DryRunAll}
 	}
 
-	result := c.rest.Patch(types.JSONPatchType).
+	request := c.rest.Patch(types.JSONPatchType).
 		Namespace(resource.Namespace).
 		Resource(resource.Resource).
-		Name(resource.Name).
+		Name(resource.Name)
+	if subresource != "" {
+		request = request.SubResource(subresource)
+	}
+	result := request.
 		VersionedParams(&patchOptions, transportParameterCodec).
 		Body(patch).
 		WarningHandlerWithContext(rest.NoWarnings{}).
@@ -149,16 +157,23 @@ func (c *Client) Watch(ctx context.Context, collection Collection, options metav
 
 // GetInferenceReplicaScale returns an InferenceReplica's scale subresource.
 func (c *Client) GetInferenceReplicaScale(ctx context.Context, namespace, name string, options metav1.GetOptions) (*autoscalingv1.Scale, error) {
-	result := &autoscalingv1.Scale{}
-	err := c.rest.Get().
+	result := c.rest.Get().
 		Namespace(namespace).
 		Resource("inferencereplicas").
 		Name(name).
 		SubResource("scale").
 		VersionedParams(&options, transportParameterCodec).
-		Do(ctx).
-		Into(result)
-	return result, err
+		WarningHandlerWithContext(rest.NoWarnings{}).
+		MaxRetries(0).
+		Do(ctx)
+	if err := result.Error(); err != nil {
+		return nil, err
+	}
+	raw, err := result.Raw()
+	if err != nil {
+		return nil, err
+	}
+	return decodeScaleResponse(raw)
 }
 
 // UpdateInferenceReplicaScale updates an InferenceReplica's scale subresource.

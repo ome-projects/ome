@@ -154,6 +154,7 @@ type EffectiveAutoscalingComponent struct {
 	MetricCount          int
 	TriggerCount         int
 	Issues               []AutoscalingIssueCode
+	autoscaler           *v1beta1.ComponentAutoscaler
 }
 
 // EffectiveScalingPolicy is the active whole-service policy and its support
@@ -504,6 +505,7 @@ func resolveAutoscalingComponent(
 	if resolved == nil {
 		return EffectiveAutoscalingComponent{}, ErrAutoscalingEvidenceInvalid
 	}
+	result.autoscaler = resolved.DeepCopy()
 	result.Class = resolved.Class
 	result.ManagedBy = managedByForClass(resolved.Class)
 	result.MetricCount, result.TriggerCount = effectiveAutoscalerCounts(resolved)
