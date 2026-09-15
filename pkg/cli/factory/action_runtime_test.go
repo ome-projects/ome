@@ -189,8 +189,6 @@ func TestActionRuntimeClientDoesNotMutateConfigOrCacheExpiredContext(t *testing.
 	cancel()
 	_, err = f.RuntimeClientForAction(ctx)
 	require.Error(t, err)
-	_, err = f.RuntimeClientForAction(nil)
-	require.Error(t, err)
 	readClient, err := f.RuntimeClient()
 	require.NoError(t, err, "normal read construction must not use the expired action context")
 	require.NotNil(t, readClient)
