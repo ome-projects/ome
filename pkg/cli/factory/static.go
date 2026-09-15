@@ -19,6 +19,7 @@ type Static struct {
 	Runtime    ctrlclient.Client
 	NS         string
 	NSExplicit bool
+	Context    string
 }
 
 func (s Static) RESTConfig() (*rest.Config, error) { return &rest.Config{}, nil }
@@ -45,3 +46,10 @@ func (s Static) RuntimeClient() (ctrlclient.Client, error) {
 }
 
 func (s Static) Namespace() (string, bool, error) { return s.NS, s.NSExplicit, nil }
+
+func (s Static) ContextName() (string, error) {
+	if s.Context == "" {
+		return "", errors.New("static factory: no context configured")
+	}
+	return s.Context, nil
+}

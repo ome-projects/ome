@@ -50,6 +50,8 @@ func TestRootCommandTree(t *testing.T) {
 		"ome rollout",
 		"ome rollout explain",
 		"ome rollout history",
+		"ome rollout pause",
+		"ome rollout resume",
 		"ome rollout status",
 		"ome rollout validate",
 		"ome runtime",
@@ -68,6 +70,12 @@ func TestRootCommandTree(t *testing.T) {
 	}
 	if !root.SilenceErrors || !root.SilenceUsage {
 		t.Fatalf("root error policy = (SilenceErrors=%t, SilenceUsage=%t), want both true", root.SilenceErrors, root.SilenceUsage)
+	}
+	for _, action := range []string{"pause", "resume"} {
+		command, _, err := root.Find([]string{"rollout", action})
+		if err != nil || command.Use != action+" INFERENCESERVICE" || !strings.Contains(command.Long, "RestartPolicy repair continues") {
+			t.Fatalf("guarded rollout %s is not registered with current semantics", action)
+		}
 	}
 	explain, _, err := root.Find([]string{"runtime", "explain"})
 	if err != nil {

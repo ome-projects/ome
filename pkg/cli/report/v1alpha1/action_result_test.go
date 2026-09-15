@@ -88,8 +88,17 @@ func TestActionResultTableUsesTypedResult(t *testing.T) {
 	var output bytes.Buffer
 
 	require.NoError(t, report.Write(&output, report.FormatTable, result))
-	assert.Equal(t, "ACTION   TARGET                       DRY-RUN   ACCEPTED   APPLIED   REQUEST-ID   REVISION-HASH   MESSAGE             FOLLOW-UP\n"+
-		"pause    InferenceService/prod/chat   server    Yes        No        request-7    sha256:abc      request validated   kubectl ome status chat -n prod\n", output.String())
+	assert.Equal(t, "FIELD           VALUE\n"+
+		"action          pause\n"+
+		"target          InferenceService/prod/chat\n"+
+		"dry-run         server\n"+
+		"accepted        Yes\n"+
+		"applied         No\n"+
+		"request-id      request-7\n"+
+		"revision-hash   sha256:abc\n"+
+		"message         request validated\n"+
+		"follow-up       kubectl ome status chat -n prod\n"+
+		"hint            Use -o json or -o yaml for full values.\n", output.String())
 }
 
 func TestActionResultTableIncludesOperationalFields(t *testing.T) {
@@ -101,14 +110,14 @@ func TestActionResultTableIncludesOperationalFields(t *testing.T) {
 
 	got := result.Table()
 
-	assert.Equal(t, []string{
-		"ACTION", "TARGET", "DRY-RUN", "ACCEPTED", "APPLIED",
-		"REQUEST-ID", "REVISION-HASH", "MESSAGE", "FOLLOW-UP",
-	}, got.Headers)
-	assert.Equal(t, [][]string{{
-		"pause", "InferenceService/prod/chat", "none", "No", "No",
-		"request-7", "sha256:abc", "request accepted", "kubectl ome status chat -n prod",
-	}}, got.Rows)
+	assert.Equal(t, []string{"FIELD", "VALUE"}, got.Headers)
+	assert.Equal(t, [][]string{
+		{"action", "pause"}, {"target", "InferenceService/prod/chat"},
+		{"dry-run", "none"}, {"accepted", "No"}, {"applied", "No"},
+		{"request-id", "request-7"}, {"revision-hash", "sha256:abc"},
+		{"message", "request accepted"}, {"follow-up", "kubectl ome status chat -n prod"},
+		{"hint", "Use -o json or -o yaml for full values."},
+	}, got.Rows)
 }
 
 func TestActionResultTableUsesDashesForEmptyOptionalFields(t *testing.T) {
@@ -116,7 +125,9 @@ func TestActionResultTableUsesDashesForEmptyOptionalFields(t *testing.T) {
 
 	got := result.Table()
 
-	assert.Equal(t, []string{"-", "-", "-", "-"}, got.Rows[0][5:])
+	for _, row := range got.Rows[5:9] {
+		assert.Equal(t, "-", row[1])
+	}
 }
 
 func TestActionResultMachineOutputContract(t *testing.T) {

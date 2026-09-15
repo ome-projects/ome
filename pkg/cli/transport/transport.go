@@ -92,6 +92,7 @@ func (c *Client) JSONPatch(ctx context.Context, resource Resource, patch []byte,
 		Name(resource.Name).
 		VersionedParams(&patchOptions, transportParameterCodec).
 		Body(patch).
+		MaxRetries(0).
 		Do(ctx)
 	if err := result.Error(); err != nil {
 		return nil, err

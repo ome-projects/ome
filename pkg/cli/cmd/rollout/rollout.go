@@ -1,4 +1,4 @@
-// Package rollout implements read-only rollout inspection commands.
+// Package rollout implements rollout inspection and guarded alpha actions.
 package rollout
 
 import (
@@ -50,6 +50,8 @@ func newCmdWithClock(
 	cmd.AddCommand(newExplainCmd(f, streams, clock))
 	cmd.AddCommand(newHistoryCmd(f, streams, clock))
 	cmd.AddCommand(newValidateCmd(f, streams, clock))
+	cmd.AddCommand(newActionCmd(f, streams, clock, "pause"))
+	cmd.AddCommand(newActionCmd(f, streams, clock, "resume"))
 	return cmd
 }
 

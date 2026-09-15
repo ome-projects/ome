@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 )
 
@@ -78,23 +79,11 @@ func (r ActionResult) Canonical() ActionResult {
 
 // Table derives the concise human view from the typed action result.
 func (r ActionResult) Table() report.Table {
-	return report.Table{
-		Headers: []string{
-			"ACTION", "TARGET", "DRY-RUN", "ACCEPTED", "APPLIED",
-			"REQUEST-ID", "REVISION-HASH", "MESSAGE", "FOLLOW-UP",
-		},
-		Rows: [][]string{{
-			r.Action,
-			r.Target.displayName(),
-			string(r.DryRun),
-			yesNo(r.Accepted),
-			yesNo(r.Applied),
-			orDash(r.RequestID),
-			orDash(r.RevisionHash),
-			orDash(r.Message),
-			orDash(r.FollowUp),
-		}},
+	rows := [][]string{{"action", r.Action}, {"target", r.Target.displayName()}, {"dry-run", string(r.DryRun)}, {"accepted", yesNo(r.Accepted)}, {"applied", yesNo(r.Applied)}, {"request-id", orDash(r.RequestID)}, {"revision-hash", orDash(r.RevisionHash)}, {"message", orDash(r.Message)}, {"follow-up", orDash(r.FollowUp)}, {"hint", "Use -o json or -o yaml for full values."}}
+	for i := range rows {
+		rows[i][1] = printers.BoundedCell(rows[i][1], 56)
 	}
+	return report.Table{Headers: []string{"FIELD", "VALUE"}, Rows: rows}
 }
 
 func (t ActionTarget) displayName() string {

@@ -48,7 +48,8 @@ func newRootCmd(f factory.Factory, configFlags *genericclioptions.ConfigFlags, s
 It provides model-centric visibility into OME resources: rich listings,
 controller-reported autoscaling, logical-instance, migration, and traffic
 evidence, InferenceService readiness and rollout diagnosis, runtime-selection
-explanations, accelerator-selection evidence, and component-aware log streaming.`,
+explanations, accelerator-selection evidence, and component-aware log streaming.
+Guarded alpha rollout pause/resume actions use exact identity and confirmation.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
