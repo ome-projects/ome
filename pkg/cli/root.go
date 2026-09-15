@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/cmd/quota"
 	"sigs.k8s.io/ome/pkg/cli/cmd/rollout"
 	runtimecmd "sigs.k8s.io/ome/pkg/cli/cmd/runtime"
+	"sigs.k8s.io/ome/pkg/cli/cmd/scale"
 	"sigs.k8s.io/ome/pkg/cli/cmd/status"
 	"sigs.k8s.io/ome/pkg/cli/cmd/traffic"
 	"sigs.k8s.io/ome/pkg/cli/cmd/version"
@@ -73,6 +74,7 @@ Guarded alpha rollout pause/resume actions use exact identity and confirmation.`
 	cmd.AddCommand(quota.NewCmd(f, streams))
 	cmd.AddCommand(rollout.NewCmd(f, streams))
 	cmd.AddCommand(runtimecmd.NewCmd(f, streams))
+	cmd.AddCommand(scale.NewCmd(f, streams))
 	cmd.AddCommand(status.NewCmd(f, streams))
 	cmd.AddCommand(traffic.NewCmd(f, streams))
 	cmd.AddCommand(version.NewCmd(f, streams))

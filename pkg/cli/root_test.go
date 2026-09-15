@@ -112,6 +112,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome runtime explain",
 		"ome runtime history",
 		"ome runtime tree",
+		"ome scale",
 		"ome status",
 		"ome traffic",
 		"ome traffic explain",
@@ -202,6 +203,35 @@ func TestRootCommandTree(t *testing.T) {
 	if status.Use != "status INFERENCESERVICE INDEX --component COMPONENT" ||
 		status.Short != "Show one logical instance and bounded live evidence" {
 		t.Fatalf("instance status contract changed: Use=%q Short=%q", status.Use, status.Short)
+	}
+}
+
+func TestRootScaleRegistrationAndClosedParser(t *testing.T) {
+	var out, stderr bytes.Buffer
+	f := &waitFlagFactory{}
+	root := NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+	command, _, err := root.Find([]string{"scale"})
+	if err != nil || command.Use != "scale INFERENCESERVICE" || !strings.Contains(command.Long, "transient") {
+		t.Fatal("guarded transient scale command is not registered")
+	}
+	for _, flag := range []string{"component", "replicas", "override-autoscaler", "yes", "dry-run", "output", "ome-namespace"} {
+		if command.Flags().Lookup(flag) == nil {
+			t.Fatalf("scale flag %s is missing", flag)
+		}
+	}
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, flag := range []string{"--replicas=0", "--replicas=-1", "--replicas=2147483648", "--yes=" + credential, "--insecure-skip-tls-verify=" + credential, "--context=" + credential} {
+		out.Reset()
+		stderr.Reset()
+		f = &waitFlagFactory{}
+		root = NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+		root.SetArgs([]string{"scale", "chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", flag})
+		if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || f.calls != 0 {
+			t.Fatalf("invalid scale flags acquired clients or emitted a report: code=%d acquisitions=%d", code, f.calls)
+		}
+		if strings.Contains(stderr.String(), credential) {
+			t.Fatal("invalid scale flags disclosed their value")
+		}
 	}
 }
 
