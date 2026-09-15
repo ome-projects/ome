@@ -21,9 +21,12 @@ const parentWire = `{"apiVersion":"ome.io/v1beta1","kind":"InferenceService","me
 func TestNamedPrimaryAndOnlyRequestedOptionalReads(t *testing.T) {
 	for _, view := range []View{Status, Explain, Endpoint} {
 		t.Run(string(view), func(t *testing.T) {
+			var pathsMu sync.Mutex
 			var paths []string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				pathsMu.Lock()
 				paths = append(paths, r.Method+" "+r.URL.RequestURI())
+				pathsMu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
 				case "/apis/ome.io/v1beta1/namespaces/cli-demo/inferenceservices/demo":
@@ -54,8 +57,11 @@ func TestNamedPrimaryAndOnlyRequestedOptionalReads(t *testing.T) {
 			if view != Status {
 				wantReads = 2
 			}
-			if len(paths) != wantReads {
-				t.Fatalf("reads = %v, want %d", paths, wantReads)
+			pathsMu.Lock()
+			observedPaths := append([]string(nil), paths...)
+			pathsMu.Unlock()
+			if len(observedPaths) != wantReads {
+				t.Fatalf("reads = %v, want %d", observedPaths, wantReads)
 			}
 			if view == Explain && (!got.Fleet.Complete || got.Fleet.Pages != 1) {
 				t.Fatalf("fleet = %+v", got.Fleet)
@@ -107,18 +113,18 @@ func TestFleetPaginationBudgetsAndOptionalFailure(t *testing.T) {
 		{"unsupported", 0, 404, false, 0, 0, "UnsupportedAPI"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reads := 0
+			var reads atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				if strings.HasSuffix(r.URL.Path, "inferenceservices/demo") {
 					fmt.Fprint(w, parentWire)
 					return
 				}
-				reads++
+				read := reads.Add(1)
 				if r.URL.Query().Get("limit") != "32" {
 					t.Errorf("limit = %s", r.URL.RawQuery)
 				}
-				if reads == 2 && r.URL.Query().Get("continue") != "fixture-next" {
+				if read == 2 && r.URL.Query().Get("continue") != "fixture-next" {
 					t.Errorf("continuation = %s", r.URL.RawQuery)
 				}
 				if tc.code != 200 {
@@ -128,12 +134,12 @@ func TestFleetPaginationBudgetsAndOptionalFailure(t *testing.T) {
 				}
 				items := []json.RawMessage{}
 				for i := 0; i < tc.perPage; i++ {
-					items = append(items, json.RawMessage(fmt.Sprintf(`{"metadata":{"name":"cluster-%d-%d"}}`, reads, i)))
+					items = append(items, json.RawMessage(fmt.Sprintf(`{"metadata":{"name":"cluster-%d-%d"}}`, read, i)))
 				}
 				cont := ""
 				if tc.continuation {
 					cont = "fixture-next"
-					if reads == 2 {
+					if read == 2 {
 						cont = "fixture-next2"
 					}
 				}
@@ -191,9 +197,9 @@ func TestCancellationAndPerRequestDeadline(t *testing.T) {
 }
 
 func TestReadDoesNotRetryRateLimitedResponse(t *testing.T) {
-	reads := 0
+	var reads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		reads++
+		reads.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "0")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -202,8 +208,8 @@ func TestReadDoesNotRetryRateLimitedResponse(t *testing.T) {
 	defer server.Close()
 	client, _ := versioned.NewForConfig(&rest.Config{Host: server.URL})
 	_, err := Collect(context.Background(), client.OmeV1beta1(), "cli-demo", "demo", Status)
-	if err == nil || reads != 1 {
-		t.Fatalf("read retried: reads=%d err=%v", reads, err)
+	if err == nil || reads.Load() != 1 {
+		t.Fatalf("read retried: reads=%d err=%v", reads.Load(), err)
 	}
 }
 

@@ -90,11 +90,6 @@ func publicName(value string) bool {
 	if safetext.Sanitize(value, 253) != value {
 		return false
 	}
-	for _, word := range []string{"secret", "password", "token", "credential"} {
-		if strings.Contains(strings.ToLower(value), word) {
-			return false
-		}
-	}
 	return true
 }
 

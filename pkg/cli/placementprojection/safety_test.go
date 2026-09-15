@@ -104,7 +104,9 @@ func TestFleetMalformedLabelsDuplicatesAndPartialUncertainty(t *testing.T) {
 				s.WorkloadClusters[0].Labels[fmt.Sprintf("key%d", i)] = "x"
 			}
 		}, "Observed", "Unknown"},
-		{"bad-identity", func(s *c.Result) { s.WorkloadClusters[0].Name = "private-token" }, "Unavailable", ""},
+		{"bad-identity", func(s *c.Result) {
+			s.WorkloadClusters[0].Name = "private-sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+		}, "Unavailable", ""},
 		{"duplicate-conflict", func(s *c.Result) {
 			copyValue := *s.WorkloadClusters[0].DeepCopy()
 			copyValue.Generation++
@@ -190,7 +192,7 @@ func TestAbsentAndUnknownEvidenceNeverSuccessfulDefaults(t *testing.T) {
 	}
 	s := fixture(t)
 	s.InferenceService.Status.Placement.Phase = "Future"
-	s.InferenceService.Status.Placement.Cluster = "private-token"
+	s.InferenceService.Status.Placement.Cluster = "private-sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
 	s.InferenceService.Status.Placement.Candidates[0].Phase = "Future"
 	s.InferenceService.Spec.Placement.Split.Replicas = nil
 	s.InferenceService.Spec.Placement.Split.Spread = false
@@ -228,7 +230,7 @@ func TestRoutingCapacityGatewayAndAckCompatibilityOnly(t *testing.T) {
 	if r.Content.Routing.Gateway == nil || r.Content.Routing.Gateway.State != "ReportedReferenceNotResolved" || r.Content.Routing.Acknowledgement != "ReportedTrue" || r.Content.Entries[0].Capacity.Source != "Endpoint" || *r.Content.Entries[0].Capacity.Reported.Value != 4 {
 		t.Fatalf("compatibility=%+v", r.Content)
 	}
-	s.TrafficMap.Status.GatewayRef.Name = "private-token"
+	s.TrafficMap.Status.GatewayRef.Name = "private-sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
 	s.TrafficMap.Status.Programmed = false
 	s.TrafficMap.Status.ObservedTrafficMapGeneration = 4
 	r, _ = ProjectEndpoint(s, fixtureClock)

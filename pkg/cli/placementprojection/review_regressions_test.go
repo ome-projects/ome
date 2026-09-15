@@ -77,6 +77,119 @@ func TestCredentialShapedNamesRejectWithoutTaskDiskFalsePositive(t *testing.T) {
 	}
 }
 
+func TestOrdinaryCredentialWordsRemainValidInAllPlacementViews(t *testing.T) {
+	for _, name := range []string{"tokenizer", "secretary", "token-classifier"} {
+		for _, field := range []string{"service", "namespace", "home", "workload-cluster", "policy", "gateway"} {
+			t.Run(field+"/"+name, func(t *testing.T) {
+				s := fixture(t)
+				s.TrafficMap.Status.GatewayRef = &ome.TrafficMapGatewayRef{Group: "gateway.networking.k8s.io", Kind: "Gateway", Namespace: "cli-demo", Name: "demo-gateway"}
+				wantName, wantNamespace := "placement-demo", "cli-demo"
+				wantHome, wantCluster := "demo-a", "demo-a"
+				wantPolicy, wantRollout, wantGateway := "demo-policy", "demo-rollout", "demo-gateway"
+				switch field {
+				case "service":
+					s.InferenceService.Name = name
+					s.TrafficMap.Name = name
+					s.TrafficMap.Spec.Service = name
+					s.TrafficMap.OwnerReferences[0].Name = name
+					wantName = name
+				case "namespace":
+					s.InferenceService.Namespace = name
+					s.TrafficMap.Namespace = name
+					s.TrafficMap.Status.GatewayRef.Namespace = name
+					wantNamespace = name
+				case "home":
+					s.InferenceService.Status.Placement.Candidates[0].Cluster = name
+					s.TrafficMap.Spec.Entries[0].Cluster = name
+					wantHome = name
+				case "workload-cluster":
+					s.WorkloadClusters[0].Name = name
+					wantCluster = name
+				case "policy":
+					s.InferenceService.Status.Placement.Candidates[0].Autoscaling.Policies[0].Name = name
+					s.InferenceService.Status.Placement.Candidates[0].Rollout.ActiveGroups[0].PolicyName = name
+					wantPolicy, wantRollout = name, name
+				case "gateway":
+					s.TrafficMap.Status.GatewayRef.Name = name
+					wantGateway = name
+				}
+				status, statusErr := ProjectStatus(s, fixtureClock)
+				explain, explainErr := ProjectExplain(s, fixtureClock)
+				endpoint, endpointErr := ProjectEndpoint(s, fixtureClock)
+				if statusErr != nil || explainErr != nil || endpointErr != nil {
+					t.Fatalf("ordinary identity rejected: status=%v explain=%v endpoint=%v", statusErr, explainErr, endpointErr)
+				}
+				for _, metadata := range []v.Metadata{status.Metadata, explain.Metadata, endpoint.Metadata} {
+					if metadata.Name != wantName || metadata.Namespace != wantNamespace {
+						t.Fatalf("ordinary identity lost: %+v", metadata)
+					}
+				}
+				for _, content := range []v.PlacementStatusContent{status.Content, explain.Content.Status, endpoint.Content.Status} {
+					if content.Placement.HomePreview.State != "Validated" || len(content.Placement.Homes) != 2 {
+						t.Fatalf("ordinary home rejected: %+v", content.Placement)
+					}
+					found := false
+					for _, home := range content.Placement.Homes {
+						if home.Cluster == wantHome {
+							found = true
+							if home.Provenance.State != "Reported" || len(home.Provenance.Policies) != 1 || home.Provenance.Policies[0].Name != wantPolicy || len(home.Provenance.ActiveGroups) != 2 || home.Provenance.ActiveGroups[0].PolicyName != wantRollout {
+								t.Fatalf("ordinary policy rejected: %+v", home.Provenance)
+							}
+						}
+					}
+					if !found {
+						t.Fatalf("ordinary home lost: %q", wantHome)
+					}
+				}
+				if explain.Content.Fleet.State != "Observed" || len(explain.Content.Clusters) != 1 || explain.Content.Clusters[0].Name != wantCluster {
+					t.Fatalf("ordinary WLC rejected: %+v", explain.Content)
+				}
+				if endpoint.Content.Routing.Acquisition.State != "Observed" || len(endpoint.Content.Entries) != 2 || endpoint.Content.Routing.Gateway == nil || endpoint.Content.Routing.Gateway.Name != wantGateway || endpoint.Content.Routing.Gateway.Namespace != s.InferenceService.Namespace || endpoint.Content.Routing.Gateway.Kind != "Gateway" {
+					t.Fatalf("ordinary routing/reference rejected: %+v", endpoint.Content)
+				}
+				for _, format := range []report.Format{report.FormatTable, "wide", report.FormatJSON, report.FormatYAML} {
+					for view, write := range []func(*bytes.Buffer) error{
+						func(out *bytes.Buffer) error {
+							if format == "wide" {
+								return status.Content.WideTable().Write(out)
+							}
+							return report.Write(out, format, status)
+						},
+						func(out *bytes.Buffer) error {
+							if format == "wide" {
+								return explain.Content.WideTable().Write(out)
+							}
+							return report.Write(out, format, explain)
+						},
+						func(out *bytes.Buffer) error {
+							if format == "wide" {
+								return endpoint.Content.WideTable().Write(out)
+							}
+							return report.Write(out, format, endpoint)
+						},
+					} {
+						var out bytes.Buffer
+						if err := write(&out); err != nil || strings.Contains(out.String(), "MalformedPayload") || strings.Contains(out.String(), "[REDACTED]") {
+							t.Fatalf("ordinary name lost in %s output: %s err=%v", format, &out, err)
+						}
+						visible := field != "workload-cluster" && field != "gateway" || field == "workload-cluster" && view == 1 || field == "gateway" && view == 2
+						if visible && (format == report.FormatJSON || format == report.FormatYAML) && !strings.Contains(out.String(), name) {
+							t.Fatalf("ordinary name missing from %s output: %s", format, &out)
+						}
+						if format == report.FormatTable || format == "wide" {
+							for _, line := range strings.Split(out.String(), "\n") {
+								if len(line) > 80 {
+									t.Fatalf("overwidth ordinary-name output: %s", line)
+								}
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestLateNestedPolicyConflictIsInspectedBeforeOuterHomeCap(t *testing.T) {
 	s := fixture(t)
 	base := s.InferenceService.Status.Placement.Candidates[0]
