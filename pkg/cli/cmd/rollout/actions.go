@@ -7,14 +7,12 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/cli/effective"
-	"sigs.k8s.io/ome/pkg/cli/exitcode"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/mutate"
 	"sigs.k8s.io/ome/pkg/cli/namespace"
@@ -261,19 +259,5 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 }
 
 func guardedPatchError(err error) error {
-	conflict := apierrors.IsConflict(err)
-	var status apierrors.APIStatus
-	if errors.As(err, &status) && status.Status().Code == 422 {
-		s := status.Status()
-		d := s.Details
-		// The API server hides JSON Patch application causes behind this exact
-		// generic status. It proves a guarded rejection, not which test failed.
-		// Admission Invalid statuses carry resource/causes and must stay ordinary
-		// API errors, even if their arbitrary messages quote JSON Patch text.
-		conflict = s.Status == metav1.StatusFailure && s.Reason == metav1.StatusReasonInvalid && s.Message == "the server rejected our request due to an error in our request" && d != nil && d.Name == "" && d.Group == "" && d.Kind == "" && d.UID == "" && d.RetryAfterSeconds == 0 && len(d.Causes) == 0
-	}
-	if conflict {
-		return &exitcode.PreconditionError{Err: errors.New("guarded annotation patch rejected; refresh rollout status and retry explicitly")}
-	}
-	return mutate.SafeAPIError(err)
+	return mutate.GuardedPatchError(err)
 }
