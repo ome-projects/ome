@@ -213,6 +213,9 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 				if errors.Is(err, transport.ErrResponseTooLarge) {
 					return errors.New("API response exceeds bounds; outcome unknown; inspect migration status using the preview UUID")
 				}
+				if errors.Is(err, transport.ErrResponseIdentity) {
+					return errors.New("API response is not bound to request; outcome unknown; inspect migration status using the preview UUID")
+				}
 				classified := mutate.GuardedPatchError(err)
 				if exitcode.FromError(classified) == exitcode.MutationConflict {
 					return classified

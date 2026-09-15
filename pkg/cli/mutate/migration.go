@@ -180,7 +180,14 @@ func parseMigrationRequest(raw string) (migrationRequest, error) {
 	if json.Unmarshal([]byte(raw), &fields) != nil {
 		return request, errors.New("invalid retained migration payload")
 	}
-	for _, value := range fields {
+	for key, value := range fields {
+		// Go struct decoding folds field names; retained request authority
+		// requires these exact wire tags, not case aliases of any field.
+		switch key {
+		case "schemaVersion", "component", "instance", "from_node", "hint_target_nodes", "reason", "requested_at", "requested_by":
+		default:
+			return request, errors.New("invalid retained migration field")
+		}
 		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			return request, errors.New("invalid retained migration field type")
 		}

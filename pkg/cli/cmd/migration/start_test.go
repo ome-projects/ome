@@ -180,6 +180,13 @@ func runStartWire(t *testing.T, fixture startFixture, suffix ...string) (error, 
 				_, _ = io.WriteString(w, `{`)
 				return
 			}
+			if fixture.responseKind == "aliased kind" {
+				response.Kind = "Secret"
+				body, err := json.Marshal(response)
+				require.NoError(t, err)
+				_, _ = io.WriteString(w, strings.TrimSuffix(string(body), "}")+`,"Kind":"InferenceService"}`)
+				return
+			}
 			if fixture.responseKind == "oversized" {
 				_, _ = io.WriteString(w, strings.Repeat("x", 1048577))
 				return
@@ -379,6 +386,17 @@ func TestStartAcquisitionAndResponseFailures(t *testing.T) {
 			require.NotContains(t, err.Error(), "private secret")
 		})
 	}
+}
+
+func TestStartReviewAmbiguousIdentityClosedOutcome(t *testing.T) {
+	f := newStartFixture()
+	f.responseKind = "aliased kind"
+	err, result, patches, _ := runStartWire(t, f, "-o=json")
+	require.Equal(t, 1, exitcode.FromError(err))
+	require.Equal(t, 1, patches)
+	require.Empty(t, result.Kind)
+	require.Contains(t, err.Error(), "API response is not bound to request; outcome unknown")
+	require.Contains(t, err.Error(), "inspect migration status using the preview UUID")
 }
 
 // Catches missing source acquisition/planning and a second/unscoped patch.

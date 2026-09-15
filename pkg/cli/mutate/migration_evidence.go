@@ -178,6 +178,11 @@ func CollectMigrationEvidence(ctx context.Context, ome omeclient.OmeV1beta1Inter
 		if *e.ir.Spec.Replicas < 0 {
 			return MigrationEvidence{}, migrationConflict()
 		}
+		// Bound desired slot expansion before the non-cancelable pure planner.
+		// This is a count budget, never a limit on canonical sparse indices.
+		if *e.ir.Spec.Replicas > 2048 {
+			return MigrationEvidence{}, ErrBounds
+		}
 		desired.Replicas = *e.ir.Spec.Replicas
 	}
 	if e.ir.Spec.Lifecycle != nil {
@@ -317,7 +322,7 @@ func (e *MigrationEvidence) collectAudit(ctx context.Context, kube kubernetes.In
 	if raw == "" {
 		return nil
 	}
-	if len(raw) > 1024*1024 || !strictJSON([]byte(raw)) {
+	if len(raw) > 1024*1024 || !strings.HasPrefix(strings.TrimSpace(raw), "{") || !strictJSON([]byte(raw)) {
 		return errors.New("audit lookup payload is invalid or exceeds bounds")
 	}
 	var ledger struct {
