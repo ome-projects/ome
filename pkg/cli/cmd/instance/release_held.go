@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -21,6 +22,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/transport"
+	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
 
 type releaseHeldOptions struct {
@@ -119,13 +121,29 @@ func (o *releaseHeldOptions) run(parent context.Context, f factory.Factory, name
 	if config.Timeout <= 0 || config.Timeout > 10*time.Second {
 		config.Timeout = 10 * time.Second
 	}
-	client, err := f.OMEClient()
+	var client versioned.Interface
+	if owned, ok := f.(factory.ActionReadClientsResolver); ok {
+		client, err = owned.OMEClientForAction(ctx)
+	} else {
+		client, err = f.OMEClient()
+	}
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
-	kube, err := f.KubeClient()
+	if client == nil {
+		return errors.New("held-release OME client is unavailable")
+	}
+	var kube kubernetes.Interface
+	if owned, ok := f.(factory.ActionReadClientsResolver); ok {
+		kube, err = owned.KubeClientForAction(ctx)
+	} else {
+		kube, err = f.KubeClient()
+	}
 	if err != nil {
 		return mutate.SafeAPIError(err)
+	}
+	if kube == nil {
+		return errors.New("held-release Kubernetes client is unavailable")
 	}
 	var runtimeClient ctrlclient.Client
 	if bounded, ok := f.(factory.ActionRuntimeResolver); ok {
