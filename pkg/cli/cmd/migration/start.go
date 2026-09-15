@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -23,6 +24,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/transport"
+	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
 
 type startOptions struct {
@@ -119,7 +121,12 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 	if err != nil || !mutate.SafeScalar(contextName) {
 		return errors.New("selected context is unavailable or unsafe")
 	}
-	client, err := f.OMEClient()
+	var client versioned.Interface
+	if owned, ok := f.(factory.ActionReadClientsResolver); ok {
+		client, err = owned.OMEClientForAction(ctx)
+	} else {
+		client, err = f.OMEClient()
+	}
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
@@ -139,7 +146,12 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 	if v.Name != name || v.Namespace != resolved.WorkloadNamespace {
 		return errors.New("action target response does not match exact request")
 	}
-	kube, err := f.KubeClient()
+	var kube kubernetes.Interface
+	if owned, ok := f.(factory.ActionReadClientsResolver); ok {
+		kube, err = owned.KubeClientForAction(ctx)
+	} else {
+		kube, err = f.KubeClient()
+	}
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
