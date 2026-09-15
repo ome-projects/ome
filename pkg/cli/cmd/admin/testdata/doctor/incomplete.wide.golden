@@ -1,0 +1,15 @@
+SUBJECT                    EVIDENCE         DETAIL
+Doctor                     Incomplete       GET-only; not authorization
+Context                    local            Current kubeconfig context
+Workload namespace         team-a           Only selected named GET
+OME namespace              control          Named manager Deployment GET
+inferencereplicas          Unavailable      Optional Forbidden ome.io/v1beta1 InferenceReplica Namespaced
+inferenceservices          Available        Required  ome.io/v1beta1 InferenceService Namespaced
+ManagerDeployment          Available        GET apps/v1 deployments control/ome-controller-manager
+SelectedInferenceService   Available        GET ome.io/v1beta1 inferenceservices team-a/chat
+CLI version                v1.2.0           CanonicalCandidate
+Manager image candidate    v1.2.3           SelectedStableTag
+Operator compatibility     Unverifiable     No canonical running version
+Image-tag comparison       WithinOneMinor   Computed; not compatibility
+Lifecycle                  Present          Generation unverifiable
+Traffic                    Present          Generation unverifiable

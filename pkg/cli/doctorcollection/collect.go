@@ -147,7 +147,7 @@ func Collect(ctx context.Context, clients Clients, selected Selection, timeout t
 func read(ctx context.Context, timeout time.Duration, request *rest.Request, target runtime.Object) r.DoctorReason {
 	call, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result := request.MaxRetries(0).Do(call)
+	result := request.WarningHandlerWithContext(rest.NoWarnings{}).MaxRetries(0).Do(call)
 	if call.Err() != nil {
 		return r.DoctorTimeout
 	}

@@ -74,6 +74,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome accelerator",
 		"ome accelerator explain",
 		"ome admin",
+		"ome admin doctor",
 		"ome admin recommendations",
 		"ome autoscale",
 		"ome autoscale explain",
@@ -304,6 +305,24 @@ func TestInjectedRootCarriesAllKubectlConfigFlags(t *testing.T) {
 	}
 	if flag := root.PersistentFlags().Lookup("namespace"); flag == nil || flag.Shorthand != "n" {
 		t.Fatalf("namespace flag = %#v, want -n shorthand", flag)
+	}
+}
+
+func TestRootDoctorRegistrationGlobalFlagsAndClosedParser(t *testing.T) {
+	var out, stderr bytes.Buffer
+	root := NewRootCmdWithFactory(factory.Static{}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+	doctor, _, err := root.Find([]string{"admin", "doctor"})
+	if err != nil || doctor.Use != "doctor" {
+		t.Fatal("doctor is not registered")
+	}
+	for _, name := range []string{"namespace", "context", "kubeconfig", "as", "request-timeout", "ome-namespace"} {
+		if doctor.Flags().Lookup(name) == nil && doctor.InheritedFlags().Lookup(name) == nil {
+			t.Fatalf("doctor lacks global flag %s", name)
+		}
+	}
+	root.SetArgs([]string{"admin", "doctor", "--insecure-skip-tls-verify=sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"})
+	if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || stderr.String() != "error: invalid doctor flags; use --help\n" {
+		t.Fatalf("root doctor parser: code=%d stdout=%s stderr=%s", code, &out, &stderr)
 	}
 }
 

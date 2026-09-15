@@ -8,6 +8,7 @@ import (
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 
 	"sigs.k8s.io/ome/pkg/cli/alfredrecommendations"
+	"sigs.k8s.io/ome/pkg/cli/doctorcollection"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/namespace"
 	"sigs.k8s.io/ome/pkg/cli/report"
@@ -20,6 +21,7 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 	ns := namespace.NewOptions()
 	ns.AddFlags(cmd.PersistentFlags())
 	cmd.AddCommand(newRecommendationsCmd(f, streams, ns))
+	cmd.AddCommand(newDoctorCmd(f, streams, ns, doctorDependencies{clock: reportv1.SystemClock{}, collect: doctorcollection.Collect}))
 	return cmd
 }
 

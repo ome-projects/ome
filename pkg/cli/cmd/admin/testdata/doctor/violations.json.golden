@@ -1,0 +1,108 @@
+{
+  "apiVersion": "cli.ome.io/v1alpha1",
+  "kind": "DoctorReport",
+  "metadata": {
+    "namespace": "team-a",
+    "name": "doctor"
+  },
+  "collectedAt": "2026-09-15T12:00:00Z",
+  "sources": [
+    {
+      "kind": "Deployment",
+      "namespace": "control",
+      "name": "ome-controller-manager",
+      "generation": 1,
+      "evidence": "Observed",
+      "collectedAt": "2026-09-15T12:00:00Z"
+    },
+    {
+      "kind": "InferenceService",
+      "namespace": "team-a",
+      "name": "chat",
+      "generation": 9,
+      "evidence": "Observed",
+      "collectedAt": "2026-09-15T12:00:00Z"
+    }
+  ],
+  "content": {
+    "context": {
+      "name": "local",
+      "workloadNamespace": "team-a",
+      "omeNamespace": "control"
+    },
+    "summary": {
+      "state": "Violations",
+      "requiredAPIViolations": 1,
+      "unavailableEvidence": 2
+    },
+    "apis": [
+      {
+        "id": "ome.io/v1beta1/inferencereplicas",
+        "groupVersion": "ome.io/v1beta1",
+        "resource": "inferencereplicas",
+        "kind": "InferenceReplica",
+        "scope": "Namespaced",
+        "required": false,
+        "availability": "Available",
+        "evidence": "Observed"
+      },
+      {
+        "id": "ome.io/v1beta1/inferenceservices",
+        "groupVersion": "ome.io/v1beta1",
+        "resource": "inferenceservices",
+        "kind": "InferenceService",
+        "scope": "Namespaced",
+        "required": true,
+        "availability": "NotDiscoverableAtVersion",
+        "evidence": "Unavailable"
+      }
+    ],
+    "reads": [
+      {
+        "id": "ManagerDeployment",
+        "method": "GET",
+        "groupVersion": "apps/v1",
+        "resource": "deployments",
+        "namespace": "control",
+        "name": "ome-controller-manager",
+        "outcome": "Available",
+        "evidence": "Observed"
+      },
+      {
+        "id": "SelectedInferenceService",
+        "method": "GET",
+        "groupVersion": "ome.io/v1beta1",
+        "resource": "inferenceservices",
+        "namespace": "team-a",
+        "name": "chat",
+        "outcome": "Available",
+        "evidence": "Observed"
+      }
+    ],
+    "version": {
+      "clientVersion": "v1.2.0",
+      "clientVersionState": "CanonicalCandidate",
+      "imageState": "SelectedStableTag",
+      "imageVersionCandidate": "v1.2.3",
+      "operatorVersionState": "Unverifiable",
+      "skewState": "Unverifiable",
+      "imageTagComparison": "WithinOneMinor",
+      "comparisonEvidence": "Computed"
+    },
+    "features": [
+      {
+        "id": "Lifecycle",
+        "availability": "Present",
+        "generationFreshness": "Unverifiable",
+        "evidence": "Reported"
+      },
+      {
+        "id": "Traffic",
+        "availability": "Present",
+        "generationFreshness": "Unverifiable",
+        "evidence": "Reported"
+      }
+    ]
+  },
+  "warnings": []
+}

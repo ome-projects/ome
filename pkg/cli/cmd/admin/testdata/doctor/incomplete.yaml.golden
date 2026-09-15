@@ -1,0 +1,84 @@
+apiVersion: cli.ome.io/v1alpha1
+collectedAt: "2026-09-15T12:00:00Z"
+content:
+  apis:
+  - availability: Unavailable
+    evidence: Unavailable
+    groupVersion: ome.io/v1beta1
+    id: ome.io/v1beta1/inferencereplicas
+    kind: InferenceReplica
+    reason: Forbidden
+    required: false
+    resource: inferencereplicas
+    scope: Namespaced
+  - availability: Available
+    evidence: Observed
+    groupVersion: ome.io/v1beta1
+    id: ome.io/v1beta1/inferenceservices
+    kind: InferenceService
+    required: true
+    resource: inferenceservices
+    scope: Namespaced
+  context:
+    name: local
+    omeNamespace: control
+    workloadNamespace: team-a
+  features:
+  - availability: Present
+    evidence: Reported
+    generationFreshness: Unverifiable
+    id: Lifecycle
+  - availability: Present
+    evidence: Reported
+    generationFreshness: Unverifiable
+    id: Traffic
+  reads:
+  - evidence: Observed
+    groupVersion: apps/v1
+    id: ManagerDeployment
+    method: GET
+    name: ome-controller-manager
+    namespace: control
+    outcome: Available
+    resource: deployments
+  - evidence: Observed
+    groupVersion: ome.io/v1beta1
+    id: SelectedInferenceService
+    method: GET
+    name: chat
+    namespace: team-a
+    outcome: Available
+    resource: inferenceservices
+  summary:
+    requiredAPIViolations: 0
+    state: Incomplete
+    unavailableEvidence: 2
+  version:
+    clientVersion: v1.2.0
+    clientVersionState: CanonicalCandidate
+    comparisonEvidence: Computed
+    imageState: SelectedStableTag
+    imageTagComparison: WithinOneMinor
+    imageVersionCandidate: v1.2.3
+    operatorVersionState: Unverifiable
+    skewState: Unverifiable
+kind: DoctorReport
+metadata:
+  name: doctor
+  namespace: team-a
+sources:
+- collectedAt: "2026-09-15T12:00:00Z"
+  evidence: Observed
+  generation: 1
+  kind: Deployment
+  name: ome-controller-manager
+  namespace: control
+- collectedAt: "2026-09-15T12:00:00Z"
+  evidence: Observed
+  generation: 9
+  kind: InferenceService
+  name: chat
+  namespace: team-a
+warnings:
+- code: SourceUnavailable
+  message: Diagnostic evidence is unavailable
