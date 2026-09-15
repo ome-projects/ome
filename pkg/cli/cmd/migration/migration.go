@@ -1,4 +1,4 @@
-// Package migration implements read-only OMENative migration inspection.
+// Package migration implements OMENative migration inspection and requests.
 package migration
 
 import (
@@ -12,8 +12,8 @@ import (
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "migration",
-		Short: "Inspect OMENative migrations",
+		Short: "Inspect and request OMENative migrations",
 	}
-	cmd.AddCommand(newHistoryCmd(f, streams), newStatusCmd(f, streams))
+	cmd.AddCommand(newHistoryCmd(f, streams), newStatusCmd(f, streams), newStartCmd(f, streams))
 	return cmd
 }

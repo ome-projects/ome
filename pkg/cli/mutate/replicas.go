@@ -25,6 +25,12 @@ var requestUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 // CollectReplicaEvidence reads only current-context related IRs. Every source
 // and every bounded relevant record is checked before any positive conclusion.
 func CollectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Interface, v *v1beta1.InferenceService, components []string, clock reportv1alpha1.Clock) (ReplicaEvidence, error) {
+	return collectReplicaEvidence(ctx, client, v, components, clock, nil)
+}
+
+// collected is private action evidence, copied only after whole-source bounds
+// and identity validation. An error never grants authority to its prefix.
+func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Interface, v *v1beta1.InferenceService, components []string, clock reportv1alpha1.Clock, collected *[]v1beta1.InferenceReplica) (ReplicaEvidence, error) {
 	if err := ValidateTarget(v); err != nil {
 		return ReplicaEvidence{}, err
 	}
@@ -81,6 +87,9 @@ func CollectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 			return ReplicaEvidence{}, ErrStale
 		}
 		seen[ir.Spec.Component] = true
+		if collected != nil {
+			*collected = append(*collected, *ir.DeepCopy())
+		}
 		if slices.Contains(components, string(ir.Spec.Component)) {
 			revision := ir.Status.UpdateRevision
 			if revision == "" {
