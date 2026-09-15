@@ -135,6 +135,37 @@ func TestAcceleratorExplainCanonicalComponentOrderIsTotal(t *testing.T) {
 	assert.Equal(t, "class-b", forward.Components[2].Intent.DeclaredClass)
 }
 
+func TestAcceleratorExplainCanonicalFramesCollectionBoundaries(t *testing.T) {
+	// Caller inputs are not validated by Canonical. These literal values move
+	// the same tokens across the effective-request/issue boundary.
+	requestComponent := AcceleratorExplainComponent{
+		Type: RuntimeComponentEngine,
+		Requests: AcceleratorRequestObservation{
+			EffectiveState: AcceleratorRequestsReported,
+			Effective:      []AcceleratorResourceRequest{{Name: "ClassForbidden", Quantity: "ClassInvalid"}},
+		},
+	}
+	issueComponent := AcceleratorExplainComponent{
+		Type:     RuntimeComponentEngine,
+		Requests: AcceleratorRequestObservation{EffectiveState: AcceleratorRequestsReported},
+		Issues:   []AcceleratorExplainIssueCode{AcceleratorIssueClassForbidden, AcceleratorIssueClassInvalid},
+	}
+	forward := AcceleratorExplainContent{Components: []AcceleratorExplainComponent{
+		requestComponent, issueComponent,
+	}}.Canonical()
+	reversed := AcceleratorExplainContent{Components: []AcceleratorExplainComponent{
+		issueComponent, requestComponent,
+	}}.Canonical()
+
+	assert.Equal(t, forward.Components, reversed.Components)
+	require.Len(t, forward.Components, 2)
+	assert.Empty(t, forward.Components[0].Requests.Effective)
+	assert.Equal(t, []AcceleratorExplainIssueCode{AcceleratorIssueClassForbidden, AcceleratorIssueClassInvalid},
+		forward.Components[0].Issues)
+	assert.Equal(t, []AcceleratorResourceRequest{{Name: "ClassForbidden", Quantity: "ClassInvalid"}},
+		forward.Components[1].Requests.Effective)
+}
+
 func TestAcceleratorExplainMachineSchemaNeverCarriesRawReason(t *testing.T) {
 	const secret = "ghp_secret-controller-reason"
 	reportValue := NewAcceleratorExplainReport(Metadata{Name: "chat"}, AcceleratorExplainContent{

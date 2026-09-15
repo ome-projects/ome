@@ -534,15 +534,20 @@ func acceleratorComponentCanonicalKey(component AcceleratorExplainComponent) str
 	appendValue(string(component.Class.State))
 	appendValue(component.Class.Name)
 	appendValue(string(component.Requests.BaseState))
+	// Counts frame the variable-length domains; individual string lengths
+	// alone cannot distinguish request tokens from state or issue tokens.
+	appendValue(strconv.Itoa(len(component.Requests.Base)))
 	for _, request := range component.Requests.Base {
 		appendValue(request.Name)
 		appendValue(request.Quantity)
 	}
 	appendValue(string(component.Requests.EffectiveState))
+	appendValue(strconv.Itoa(len(component.Requests.Effective)))
 	for _, request := range component.Requests.Effective {
 		appendValue(request.Name)
 		appendValue(request.Quantity)
 	}
+	appendValue(strconv.Itoa(len(component.Issues)))
 	for _, issue := range component.Issues {
 		appendValue(string(issue))
 	}

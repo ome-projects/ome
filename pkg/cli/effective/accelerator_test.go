@@ -116,7 +116,9 @@ func TestResolveAcceleratorBaseUsesLeaderServingTemplate(t *testing.T) {
 	assert.Equal(t, []AcceleratorBaseRequest{{Name: "cpu", Quantity: "3"}}, got.Components[0].Requests)
 }
 
-func TestResolveAcceleratorBasePreservesLeaderResourceOwnership(t *testing.T) {
+// Resource inheritance follows the controller's top-level runner check even
+// when the selected serving template belongs to the leader.
+func TestResolveAcceleratorBaseLeaderInheritsRuntimeResources(t *testing.T) {
 	t.Run("engine", func(t *testing.T) {
 		isvc := acceleratorISVCFixture()
 		isvc.Spec.Engine = &v1beta1.EngineSpec{
@@ -137,6 +139,18 @@ func TestResolveAcceleratorBasePreservesLeaderResourceOwnership(t *testing.T) {
 
 		got, err := ResolveAcceleratorBase(isvc, state)
 
+		require.NoError(t, err)
+		require.Len(t, got.Components, 1)
+		assert.Equal(t, []AcceleratorBaseRequest{
+			{Name: "cpu", Quantity: "3"}, {Name: "memory", Quantity: "64Gi"},
+		}, got.Components[0].Requests)
+
+		isvc.Spec.Engine.Runner = &v1beta1.RunnerSpec{Container: corev1.Container{
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("99"),
+			}},
+		}}
+		got, err = ResolveAcceleratorBase(isvc, state)
 		require.NoError(t, err)
 		require.Len(t, got.Components, 1)
 		assert.Equal(t, []AcceleratorBaseRequest{{Name: "cpu", Quantity: "3"}}, got.Components[0].Requests)
@@ -163,6 +177,18 @@ func TestResolveAcceleratorBasePreservesLeaderResourceOwnership(t *testing.T) {
 
 		got, err := ResolveAcceleratorBase(isvc, state)
 
+		require.NoError(t, err)
+		require.Len(t, got.Components, 1)
+		assert.Equal(t, []AcceleratorBaseRequest{
+			{Name: "cpu", Quantity: "4"}, {Name: "memory", Quantity: "64Gi"},
+		}, got.Components[0].Requests)
+
+		isvc.Spec.Decoder.Runner = &v1beta1.RunnerSpec{Container: corev1.Container{
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("99"),
+			}},
+		}}
+		got, err = ResolveAcceleratorBase(isvc, state)
 		require.NoError(t, err)
 		require.Len(t, got.Components, 1)
 		assert.Equal(t, []AcceleratorBaseRequest{{Name: "cpu", Quantity: "4"}}, got.Components[0].Requests)
