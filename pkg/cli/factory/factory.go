@@ -145,10 +145,7 @@ func (f *defaultFactory) RuntimeClient() (ctrlclient.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	scheme := runtime.NewScheme()
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(v1beta1.AddToScheme(scheme))
-	c, err := ctrlclient.New(cfg, ctrlclient.Options{Scheme: scheme})
+	c, err := newRuntimeClient(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -156,6 +153,13 @@ func (f *defaultFactory) RuntimeClient() (ctrlclient.Client, error) {
 	defer f.mu.Unlock()
 	f.runtime = c
 	return c, nil
+}
+
+func newRuntimeClient(cfg *rest.Config) (ctrlclient.Client, error) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1beta1.AddToScheme(scheme))
+	return ctrlclient.New(cfg, ctrlclient.Options{Scheme: scheme})
 }
 
 func (f *defaultFactory) Namespace() (string, bool, error) {

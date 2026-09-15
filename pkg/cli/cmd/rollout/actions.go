@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/exitcode"
@@ -119,7 +120,12 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
-	runtimeClient, err := f.RuntimeClient()
+	var runtimeClient ctrlclient.Client
+	if bounded, ok := f.(factory.ActionRuntimeResolver); ok {
+		runtimeClient, err = bounded.RuntimeClientForAction(ctx)
+	} else {
+		runtimeClient, err = f.RuntimeClient()
+	}
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
