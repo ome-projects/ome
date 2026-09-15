@@ -6,6 +6,7 @@ import (
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 
 	"sigs.k8s.io/ome/pkg/cli/cmd/accelerator"
+	"sigs.k8s.io/ome/pkg/cli/cmd/admin"
 	"sigs.k8s.io/ome/pkg/cli/cmd/autoscale"
 	"sigs.k8s.io/ome/pkg/cli/cmd/get"
 	"sigs.k8s.io/ome/pkg/cli/cmd/instance"
@@ -57,6 +58,7 @@ explanations, accelerator-selection evidence, and component-aware log streaming.
 
 	// Command families. Keep alphabetical.
 	cmd.AddCommand(accelerator.NewCmd(f, streams))
+	cmd.AddCommand(admin.NewCmd(f, streams))
 	cmd.AddCommand(autoscale.NewCmd(f, streams))
 	cmd.AddCommand(get.NewCmd(f, streams))
 	cmd.AddCommand(instance.NewCmd(f, streams))

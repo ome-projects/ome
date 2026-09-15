@@ -27,6 +27,8 @@ func TestRootCommandTree(t *testing.T) {
 	want := []string{
 		"ome accelerator",
 		"ome accelerator explain",
+		"ome admin",
+		"ome admin recommendations",
 		"ome autoscale",
 		"ome autoscale explain",
 		"ome autoscale status",
