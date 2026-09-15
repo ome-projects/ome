@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -13,11 +14,14 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/observation"
 	"sigs.k8s.io/ome/pkg/cli/paging"
+	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -33,6 +37,122 @@ type gatherLimits struct {
 	pods      paging.Limits
 	events    observation.EventLimits
 	maxEvents int
+}
+
+var errStatusCancelled = errors.New("status read was cancelled or timed out")
+
+// gatherTyped is the command's bounded read-only acquisition path. Legacy pure
+// gather/render helpers remain available to their existing compatibility tests.
+func gatherTyped(ctx context.Context, f factory.Factory, ns, name string) (*report, error) {
+	if ctx.Err() != nil {
+		return nil, errStatusCancelled
+	}
+	var ome omeclient.Interface
+	var kube kubernetes.Interface
+	var err error
+	owned, actionOwned := f.(factory.ActionReadClientsResolver)
+	if actionOwned {
+		ome, err = owned.OMEClientForAction(ctx)
+	} else {
+		ome, err = f.OMEClient()
+	}
+	if err != nil || ome == nil {
+		if ctx.Err() != nil {
+			return nil, errStatusCancelled
+		}
+		return nil, errors.New("status configuration is unavailable")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	v, err := ome.OmeV1beta1().InferenceServices(ns).Get(requestCtx, name, metav1.GetOptions{})
+	requestErr := requestCtx.Err()
+	cancel()
+	if ctx.Err() != nil || requestErr != nil {
+		return nil, errStatusCancelled
+	}
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, errors.New("status InferenceService was not found")
+		}
+		return nil, errors.New("status InferenceService could not be read")
+	}
+	if v == nil || v.Name != name || v.Namespace != ns || !statusPrivateIdentity(v.Name, string(v.UID)) || v.ResourceVersion == "" || len(v.ResourceVersion) > 253 {
+		return nil, errStatusSource
+	}
+	if actionOwned {
+		kube, err = owned.KubeClientForAction(ctx)
+	} else {
+		kube, err = f.KubeClient()
+	}
+	if err != nil || kube == nil {
+		if ctx.Err() != nil {
+			return nil, errStatusCancelled
+		}
+		return nil, errors.New("status configuration is unavailable")
+	}
+	limits := defaultGatherLimits()
+	r := &report{ISVC: v, Pods: map[v1beta1.ComponentType][]corev1.Pod{}, PodObservation: reportv1alpha1.StatusCollection{State: "Reported"}, EventObservation: reportv1alpha1.StatusCollection{State: "Reported"}}
+	pods, podErr := observation.CollectPods(ctx, kube.CoreV1(), ns, constants.InferenceServiceLabel+"="+name, limits.pods)
+	if ctx.Err() != nil {
+		return nil, errStatusCancelled
+	}
+	r.PodObservation.Observed = len(pods.Items)
+	r.PodObservation.Truncated = pods.Truncated
+	if podErr != nil {
+		r.PodObservation.State = "Unavailable"
+		if len(pods.Items) > 0 {
+			r.PodObservation.State = "Partial"
+		}
+		r.PodObservation.Reason = reportv1alpha1.StatusSourceReason(warningEventFailureReason(podErr))
+		r.PodObservation.Truncated = len(pods.Items) > 0 || pods.Truncated
+	}
+	if pods.Truncated && r.PodObservation.State == "Reported" {
+		r.PodObservation.State = "Partial"
+	}
+	for _, p := range pods.Items {
+		component := v1beta1.ComponentType(p.Labels[constants.OMEComponentLabel])
+		if component != v1beta1.EngineComponent && component != v1beta1.DecoderComponent && component != v1beta1.RouterComponent {
+			r.PodIssues = append(r.PodIssues, "UnsupportedComponent")
+			continue
+		}
+		r.Pods[component] = append(r.Pods[component], p)
+	}
+	accepted, podIssues := acceptedStatusPods(r)
+	r.PodIssues = append(r.PodIssues, podIssues...)
+	if len(r.PodIssues) > 0 {
+		r.PodObservation.State = "Partial"
+		if r.PodObservation.Reason == "" {
+			r.PodObservation.Reason = "MalformedPayload"
+		}
+	}
+	targets, skipped := statusEventTargets(ns, name, v, accepted, limits.events.MaxTargets)
+	events, eventErr := observation.CollectWarningEvents(ctx, kube.CoreV1(), targets, limits.events)
+	if ctx.Err() != nil {
+		return nil, errStatusCancelled
+	}
+	r.EventObservation.Truncated = events.Truncated || skipped > 0 || len(events.Items) > limits.maxEvents
+	r.EventObservation.SkippedTargets = min(events.SkippedTargets+skipped, maxStatusPods)
+	if eventErr != nil {
+		r.EventObservation.State = "Unavailable"
+		r.EventObservation.Reason = reportv1alpha1.StatusSourceReason(warningEventFailureReason(eventErr))
+	}
+	if len(events.Failures) > 0 {
+		reasons := []string{}
+		for _, failure := range events.Failures {
+			reasons = append(reasons, warningEventFailureReason(failure.Err))
+		}
+		slices.Sort(reasons)
+		r.EventObservation.Reason = reportv1alpha1.StatusSourceReason(reasons[0])
+		r.EventObservation.State = "Partial"
+		if len(events.Failures) == len(targets) {
+			r.EventObservation.State = "Unavailable"
+		}
+	}
+	if r.EventObservation.Truncated && r.EventObservation.State == "Reported" {
+		r.EventObservation.State = "Partial"
+	}
+	r.Events = events.Items[:min(len(events.Items), limits.maxEvents)]
+	r.EventObservation.Observed = len(r.Events)
+	return r, nil
 }
 
 func defaultGatherLimits() gatherLimits {
@@ -58,10 +178,13 @@ func defaultGatherLimits() gatherLimits {
 }
 
 type report struct {
-	ISVC     *v1beta1.InferenceService
-	Pods     map[v1beta1.ComponentType][]corev1.Pod
-	Events   []corev1.Event
-	Warnings []string
+	ISVC             *v1beta1.InferenceService
+	Pods             map[v1beta1.ComponentType][]corev1.Pod
+	Events           []corev1.Event
+	Warnings         []string
+	PodObservation   reportv1alpha1.StatusCollection
+	EventObservation reportv1alpha1.StatusCollection
+	PodIssues        []reportv1alpha1.StatusIssueCode
 }
 
 func gather(ctx context.Context, f factory.Factory, ns, name string) (*report, error) {

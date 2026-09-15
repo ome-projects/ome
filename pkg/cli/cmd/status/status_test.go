@@ -19,7 +19,7 @@ func execute(t *testing.T, f factory.Factory, args ...string) (string, error) {
 	t.Helper()
 	var out bytes.Buffer
 	streams := genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: &out, ErrOut: &out}
-	cmd := NewCmd(f, streams)
+	cmd := newCmd(f, streams, statusClock)
 	cmd.SetArgs(args)
 	err := cmd.Execute()
 	return out.String(), err
@@ -28,7 +28,7 @@ func execute(t *testing.T, f factory.Factory, args ...string) (string, error) {
 func TestStatusDefaultsToCompactReport(t *testing.T) {
 	f := factory.Static{
 		OME: omefake.NewSimpleClientset(&v1beta1.InferenceService{
-			ObjectMeta: metav1.ObjectMeta{Name: "demo-isvc", Namespace: "team-a"},
+			ObjectMeta: metav1.ObjectMeta{Name: "demo-isvc", Namespace: "team-a", UID: "fixture-uid", ResourceVersion: "fixture-rv"},
 		}),
 		Kube: kubefake.NewSimpleClientset(),
 		NS:   "team-a",
@@ -36,15 +36,20 @@ func TestStatusDefaultsToCompactReport(t *testing.T) {
 	out, err := execute(t, f, "demo-isvc")
 	require.NoError(t, err)
 	assert.Equal(t,
-		"FIELD       VALUE\n"+
-			"NAME        demo-isvc\n"+
-			"NAMESPACE   team-a\n"+
-			"READY       Unknown\n"+
-			"RUNTIME     (auto-selected)\n"+
-			"\n"+
-			"FEATURE   STATUS\n"+
-			"TRAFFIC   -\n"+
-			"ROLLOUT   -\n",
+		"FIELD               VALUE\n"+
+			"Name                demo-isvc\n"+
+			"Namespace           team-a\n"+
+			"Ready               NotRecorded / Unavailable\n"+
+			"Ready reason\n"+
+			"Runtime\n"+
+			"Model\n"+
+			"Generation          0 observed=0; advisory Unverifiable\n"+
+			"Pod observation     Reported count=0 truncated=false \n"+
+			"Event observation   Reported count=0 truncated=false \n"+
+			"Rollout             NotConfigured reported=NotConfigured\n"+
+			"Rollout evidence    Declared / NotApplicable\n"+
+			"Full safe values    Use -o json or -o yaml\n"+
+			"Rollout detail      kubectl ome rollout status NAME\n",
 		out,
 	)
 }
@@ -52,7 +57,7 @@ func TestStatusDefaultsToCompactReport(t *testing.T) {
 func TestStatusWidePreservesDetailedReport(t *testing.T) {
 	f := factory.Static{
 		OME: omefake.NewSimpleClientset(&v1beta1.InferenceService{
-			ObjectMeta: metav1.ObjectMeta{Name: "demo-isvc", Namespace: "team-a"},
+			ObjectMeta: metav1.ObjectMeta{Name: "demo-isvc", Namespace: "team-a", UID: "fixture-uid", ResourceVersion: "fixture-rv"},
 		}),
 		Kube: kubefake.NewSimpleClientset(),
 		NS:   "team-a",
@@ -62,27 +67,37 @@ func TestStatusWidePreservesDetailedReport(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t,
-		"Name:       demo-isvc\n"+
-			"Namespace:  team-a\n"+
-			"Ready:      Unknown\n"+
-			"Runtime:    (auto-selected)\n"+
-			"\n"+
-			"Conditions:\n"+
-			"  TYPE   STATUS   REASON   MESSAGE\n"+
-			"\n"+
-			"Components:\n"+
-			"\n"+
-			"Model Status:\n"+
-			"  Transition: -\n",
+		"FIELD                  VALUE\n"+
+			"Name                   demo-isvc\n"+
+			"Namespace              team-a\n"+
+			"Ready                  NotRecorded / Unavailable\n"+
+			"Ready reason\n"+
+			"Ready message\n"+
+			"Condition inspection   Complete 0/0\n"+
+			"Runtime\n"+
+			"Model\n"+
+			"Generation             0 observed=0; advisory Unverifiable\n"+
+			"Pod observation        Reported count=0 truncated=false \n"+
+			"Event observation      Reported count=0 truncated=false \n"+
+			"Pod targets skipped    0\n"+
+			"Event targets skip     0\n"+
+			"Rollout                NotConfigured reported=NotConfigured\n"+
+			"Rollout evidence       Declared / NotApplicable\n"+
+			"Coordination Ready     NotApplicable\n"+
+			"Full safe values       Use -o json or -o yaml\n"+
+			"Rollout detail         kubectl ome rollout status NAME\n"+
+			"Collected at           2026-09-15T12:00:00Z\n"+
+			"Source generation      0\n"+
+			"Source evidence        Observed\n",
 		out,
 	)
 }
 
 func TestStatusRejectsUnsupportedOutputBeforeReads(t *testing.T) {
-	out, err := execute(t, factory.Static{}, "demo-isvc", "-o", "json")
+	out, err := execute(t, factory.Static{}, "demo-isvc", "-o", "csv")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `unsupported output format "json" (supported: table, wide)`)
+	assert.Equal(t, "status output must be table, wide, json, or yaml", err.Error())
 	assert.Empty(t, out)
 }
 
