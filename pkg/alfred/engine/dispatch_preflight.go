@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"reflect"
 	"sort"
 	"time"
 
@@ -135,7 +134,7 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	if dispatchSourceFingerprint(finalOwner, finalIR, finalRequest.SourcePods, current.Instance) != fingerprint {
 		return empty, "SourceChanged"
 	}
-	if !reflect.DeepEqual(captured.Objects, finalCapture.Objects) {
+	if !input.SameSchedulingState(captured, finalCapture) {
 		return empty, "SchedulingStateChanged"
 	}
 	if reason := dispatchBudget(finalCapture, j, finalCandidate, cfg, d.now(), existing); reason != "" {
