@@ -24,6 +24,41 @@ import (
 
 var update = flag.Bool("update", false, "rewrite golden files")
 
+func TestRenderReadyEvidenceAgreesAcrossViews(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status corev1.ConditionStatus
+		want   string
+	}{
+		{name: "absent", want: "Unknown"},
+		{name: "unknown", status: corev1.ConditionUnknown, want: "Unknown"},
+		{name: "false", status: corev1.ConditionFalse, want: "False"},
+		{name: "true", status: corev1.ConditionTrue, want: "True"},
+		{name: "invalid", status: "HIDDEN-INVALID-READY", want: "Unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := &report{ISVC: &v1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team-a"},
+			}}
+			if test.status != "" {
+				r.ISVC.Status.Conditions = duckv1.Conditions{{
+					Type: apis.ConditionReady, Status: test.status,
+				}}
+			}
+			var compact, wide bytes.Buffer
+			require.NoError(t, renderCompact(r, &compact))
+			require.NoError(t, render(r, &wide))
+			assert.Contains(t, compact.String(), "READY       "+test.want+"\n")
+			assert.Contains(t, wide.String(), "Ready:      "+test.want+"\n")
+			assert.NotContains(t, compact.String(), "HIDDEN-")
+			// Wide conditions retain their existing independent detail view;
+			// the summary must never promote an invalid value to False or True.
+		})
+	}
+}
+
 func assertGolden(t *testing.T, name string, got []byte) {
 	t.Helper()
 	path := filepath.Join("testdata", name)

@@ -1,6 +1,6 @@
 Name:       llama-70b
 Namespace:  team-a
-Ready:      false
+Ready:      False
 Model:      llama-3-3-70b
 Runtime:    srt-llama-70b
 

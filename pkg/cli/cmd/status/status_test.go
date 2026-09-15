@@ -64,7 +64,7 @@ func TestStatusWidePreservesDetailedReport(t *testing.T) {
 	assert.Equal(t,
 		"Name:       demo-isvc\n"+
 			"Namespace:  team-a\n"+
-			"Ready:      false\n"+
+			"Ready:      Unknown\n"+
 			"Runtime:    (auto-selected)\n"+
 			"\n"+
 			"Conditions:\n"+

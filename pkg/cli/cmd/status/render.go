@@ -36,11 +36,7 @@ const (
 
 func renderCompact(r *report, w io.Writer) error {
 	isvc := r.ISVC
-	ready := "Unknown"
 	readyCondition := isvc.Status.GetCondition(apis.ConditionReady)
-	if readyCondition != nil {
-		ready = compactConditionStatus(readyCondition.Status)
-	}
 	runtime := "(auto-selected)"
 	if isvc.Spec.Runtime != nil {
 		runtime = isvc.Spec.Runtime.Name
@@ -50,7 +46,7 @@ func renderCompact(r *report, w io.Writer) error {
 		Rows: [][]string{
 			{"NAME", compactMiddle(isvc.Name, maxCompactSummaryRunes)},
 			{"NAMESPACE", compactMiddle(isvc.Namespace, maxCompactSummaryRunes)},
-			{"READY", ready},
+			{"READY", serviceReadyStatus(isvc)},
 		},
 	}
 	if readyCondition != nil && readyCondition.Reason != "" {
@@ -416,6 +412,14 @@ func plural(word string, count int) string {
 	return word + "s"
 }
 
+func serviceReadyStatus(isvc *v1beta1.InferenceService) string {
+	condition := isvc.Status.GetCondition(apis.ConditionReady)
+	if condition == nil {
+		return "Unknown"
+	}
+	return compactConditionStatus(condition.Status)
+}
+
 func render(r *report, w io.Writer) error {
 	isvc := r.ISVC
 	if err := writeStatusf(w, "Name:       %s\n", isvc.Name); err != nil {
@@ -424,7 +428,7 @@ func render(r *report, w io.Writer) error {
 	if err := writeStatusf(w, "Namespace:  %s\n", isvc.Namespace); err != nil {
 		return err
 	}
-	if err := writeStatusf(w, "Ready:      %t\n", isvc.Status.IsReady()); err != nil {
+	if err := writeStatusf(w, "Ready:      %s\n", serviceReadyStatus(isvc)); err != nil {
 		return err
 	}
 	if isvc.Status.URL != nil {

@@ -1,6 +1,6 @@
 Name:       orphan-pods
 Namespace:  team-b
-Ready:      true
+Ready:      True
 Runtime:    (auto-selected)
 
 Conditions:
