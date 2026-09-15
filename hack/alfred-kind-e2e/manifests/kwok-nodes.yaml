@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Node
+metadata:
+  name: alfred-kwok-gpu-a
+  annotations:
+    kwok.x-k8s.io/node: fake
+  labels:
+    alfred-e2e/virtual: "true"
+    kubernetes.io/arch: arm64
+    kubernetes.io/hostname: alfred-kwok-gpu-a
+    kubernetes.io/os: linux
+    node.kubernetes.io/instance-type: alfred-e2e-h100x8
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+    topology.kubernetes.io/region: alfred-e2e
+    topology.kubernetes.io/zone: alfred-zone-a
+spec:
+  taints:
+  - effect: NoSchedule
+    key: alfred-e2e/virtual
+    value: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: alfred-kwok-gpu-b
+  annotations:
+    kwok.x-k8s.io/node: fake
+  labels:
+    alfred-e2e/virtual: "true"
+    kubernetes.io/arch: arm64
+    kubernetes.io/hostname: alfred-kwok-gpu-b
+    kubernetes.io/os: linux
+    node.kubernetes.io/instance-type: alfred-e2e-h100x8
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+    topology.kubernetes.io/region: alfred-e2e
+    topology.kubernetes.io/zone: alfred-zone-b
+spec:
+  taints:
+  - effect: NoSchedule
+    key: alfred-e2e/virtual
+    value: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: alfred-kwok-gpu-c
+  annotations:
+    kwok.x-k8s.io/node: fake
+  labels:
+    alfred-e2e/virtual: "true"
+    kubernetes.io/arch: arm64
+    kubernetes.io/hostname: alfred-kwok-gpu-c
+    kubernetes.io/os: linux
+    node.kubernetes.io/instance-type: alfred-e2e-h100x8
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+    topology.kubernetes.io/region: alfred-e2e
+    topology.kubernetes.io/zone: alfred-zone-a
+spec:
+  taints:
+  - effect: NoSchedule
+    key: alfred-e2e/virtual
+    value: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: alfred-kwok-gpu-d
+  annotations:
+    kwok.x-k8s.io/node: fake
+  labels:
+    alfred-e2e/virtual: "true"
+    kubernetes.io/arch: arm64
+    kubernetes.io/hostname: alfred-kwok-gpu-d
+    kubernetes.io/os: linux
+    node.kubernetes.io/instance-type: alfred-e2e-h100x8
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+    topology.kubernetes.io/region: alfred-e2e
+    topology.kubernetes.io/zone: alfred-zone-b
+spec:
+  taints:
+  - effect: NoSchedule
+    key: alfred-e2e/virtual
+    value: "true"

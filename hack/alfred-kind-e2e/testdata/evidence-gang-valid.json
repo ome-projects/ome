@@ -1,0 +1,42 @@
+{
+  "scenario": "maintenance-gang",
+  "source": {
+    "instance": 0,
+    "zone": "alfred-zone-a",
+    "podGroup": {"name": "gang-engine-0", "minMember": 2, "topologyKey": "topology.kubernetes.io/zone"},
+    "pods": [
+      {"uid":"source-leader","node":"alfred-kwok-gpu-a","zone":"alfred-zone-a","runner":"leader","gpuRequest":8,"ready":true,"serving":true},
+      {"uid":"source-worker","node":"alfred-kwok-gpu-c","zone":"alfred-zone-a","runner":"worker","gpuRequest":8,"ready":true,"serving":true}
+    ],
+    "leaderEndpointReady": true,
+    "routingService": "gang-engine-rev-testhash"
+  },
+  "preTrigger": {"migrationRequestCount":0,"irReadyReplicas":1,"irServingReplicas":1,"irAvailableReplicas":1},
+  "request": {
+    "uuid":"01234567-89ab-4cde-8fab-0123456789ab",
+    "annotationKey":"ome.io/migration-request-v1-01234567-89ab-4cde-8fab-0123456789ab",
+    "payload":{"schemaVersion":"v1","component":"engine","instance":0,"from_node":"alfred-kwok-gpu-a","requested_by":"alfred","reason":"NodeMaintenance"}
+  },
+  "surge": {
+    "instance":1,"zone":"alfred-zone-b","holdSeconds":3,
+    "podGroup":{"name":"gang-engine-1","minMember":2,"topologyKey":"topology.kubernetes.io/zone"},
+    "pods":[
+      {"uid":"replacement-leader","node":"alfred-kwok-gpu-b","zone":"alfred-zone-b","runner":"leader","gpuRequest":8,"ready":false,"serving":false},
+      {"uid":"replacement-worker","node":"alfred-kwok-gpu-d","zone":"alfred-zone-b","runner":"worker","gpuRequest":8,"ready":false,"serving":false}
+    ],
+    "sourcePodsPresent":2,"sourcePodsReady":2,"sourcePodsServing":2,
+    "sourceLeaderEndpointReady":true,"replacementLeaderEndpointReady":false,
+    "alfredMaintenanceDrainedAt":null,"alfredOMEGPUOccupantsPresent":true
+  },
+  "handoff": [
+    {"routingService":"gang-engine-rev-testhash","sourceUIDs":["source-leader","source-worker"],"replacementUIDs":["replacement-leader","replacement-worker"],"sourceSafe":true,"replacementSafe":false},
+    {"routingService":"gang-engine-rev-testhash","sourceUIDs":["source-leader","source-worker"],"replacementUIDs":["replacement-leader","replacement-worker"],"sourceSafe":false,"replacementSafe":true}
+  ],
+  "completed": {
+    "migration":{"requestUUID":"01234567-89ab-4cde-8fab-0123456789ab","trigger":"Manual","sourceInstance":0,"surgeInstance":1,"fromNode":"alfred-kwok-gpu-a","phase":"Completed","startedAt":"2026-09-14T12:00:00Z","completedAt":"2026-09-14T12:00:15Z"},
+    "sourcePodUIDsPresent":[],"sourceEndpointPresent":false,
+    "replacementPodsReady":2,"replacementPodsServing":2,"replacementLeaderEndpointReady":true,
+    "irReadyReplicas":1,"irServingReplicas":1,"irAvailableReplicas":1
+  },
+  "alfred":{"workload":"alfred-e2e/gang","component":"engine","instance":0,"policy":"nodehealth","reason":"NodeMaintenance","fromNode":"alfred-kwok-gpu-a","requestUUID":"01234567-89ab-4cde-8fab-0123456789ab","dispatchStatus":"completed","maintenanceTriggers":["patching"],"maintenanceRequestedAt":"2026-09-14T12:00:00.123456789Z","maintenanceDrainedAt":"2026-09-14T12:00:15.456789123Z","omeGPUOccupantsPresent":false}
+}

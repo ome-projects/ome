@@ -1,0 +1,44 @@
+# Reference profile for static review. deploy.sh probes the exact config.yaml
+# mounted by the Helm-managed ome-scheduler and copies those bytes into Alfred's
+# immutable simulation ConfigMap.
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+leaderElection:
+  leaderElect: true
+  resourceName: ome-scheduler
+  resourceNamespace: ome
+profiles:
+  - schedulerName: ome-scheduler
+    percentageOfNodesToScore: 100
+    plugins:
+      multiPoint:
+        enabled:
+          - name: OMEGangPack
+        disabled:
+          - name: DefaultPreemption
+      score:
+        enabled:
+          - name: NodeResourcesFit
+            weight: 10
+          - name: OMEGangPack
+            weight: 10
+        disabled:
+          - name: PodTopologySpread
+    pluginConfig:
+      - name: OMEGangPack
+        args:
+          podGroupTopologyKeyAnnotation: ome.io/topology-key
+          unsupportedPlacementGroupLabel: ome.io/placement-group
+          defaultPermitTimeoutSeconds: 600
+          podGroupSyncTimeoutSeconds: 30
+          gcIntervalSeconds: 60
+          standaloneDomainPacking: true
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: MostAllocated
+            resources:
+              - name: cpu
+                weight: 1
+              - name: memory
+                weight: 1

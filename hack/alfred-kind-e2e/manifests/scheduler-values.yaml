@@ -1,0 +1,30 @@
+global:
+  hub: ""
+  imagePullSecrets: []
+
+scheduler:
+  name: ome-scheduler
+  image:
+    repository: alfred-e2e/scheduler
+    tag: local
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  leaderElect: true
+  percentageOfNodesToScore: 100
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  nodeSelector:
+    alfred-e2e/infrastructure: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  affinity: {}
+  topologySpreadConstraints: []

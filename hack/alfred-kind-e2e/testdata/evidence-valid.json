@@ -1,0 +1,91 @@
+{
+  "scenario": "maintenance-single",
+  "source": {
+    "name": "single-engine-0-default-0",
+    "uid": "source-uid",
+    "node": "alfred-gpu-a",
+    "instance": 0,
+    "incarnation": 1,
+    "ready": true,
+    "serving": true,
+    "endpointReady": true,
+    "routingService": "single-engine-rev-testhash"
+  },
+  "preTrigger": {
+    "migrationRequestCount": 0,
+    "irReadyReplicas": 1,
+    "irServingReplicas": 1,
+    "irAvailableReplicas": 1
+  },
+  "request": {
+    "uuid": "01234567-89ab-4cde-8fab-0123456789ab",
+    "annotationKey": "ome.io/migration-request-v1-01234567-89ab-4cde-8fab-0123456789ab",
+    "payload": {
+      "schemaVersion": "v1",
+      "component": "engine",
+      "instance": 0,
+      "from_node": "alfred-gpu-a",
+      "requested_by": "alfred",
+      "reason": "NodeMaintenance"
+    }
+  },
+  "surge": {
+    "observed": true,
+    "holdSeconds": 3,
+    "sourcePresent": true,
+    "sourceReady": true,
+    "sourceServing": true,
+    "sourceEndpointReady": true,
+    "replacementReady": false,
+    "replacementServing": false,
+    "replacementEndpointReady": false,
+    "alfredMaintenanceDrainedAt": null,
+    "alfredOMEGPUOccupantsPresent": true,
+    "replacement": {
+      "name": "single-engine-1-default-0",
+      "uid": "replacement-uid",
+      "node": "alfred-gpu-b",
+      "instance": 1,
+      "incarnation": 1
+    }
+  },
+  "handoff": [
+    {"routingService":"single-engine-rev-testhash","sourceUIDs":["source-uid"],"replacementUIDs":["replacement-uid"],"sourceSafe":true,"replacementSafe":false},
+    {"routingService":"single-engine-rev-testhash","sourceUIDs":["source-uid"],"replacementUIDs":["replacement-uid"],"sourceSafe":false,"replacementSafe":true}
+  ],
+  "completed": {
+    "migration": {
+      "requestUUID": "01234567-89ab-4cde-8fab-0123456789ab",
+      "trigger": "Manual",
+      "sourceInstance": 0,
+      "surgeInstance": 1,
+      "fromNode": "alfred-gpu-a",
+      "phase": "Completed",
+      "startedAt": "2026-09-14T12:00:00Z",
+      "completedAt": "2026-09-14T12:00:15Z"
+    },
+    "sourcePresent": false,
+    "sourceEndpointPresent": false,
+    "replacementPresent": true,
+    "replacementReady": true,
+    "replacementServing": true,
+    "replacementEndpointReady": true,
+    "irReadyReplicas": 1,
+    "irServingReplicas": 1,
+    "irAvailableReplicas": 1
+  },
+  "alfred": {
+    "workload": "alfred-e2e/single",
+    "component": "engine",
+    "instance": 0,
+    "policy": "nodehealth",
+    "reason": "NodeMaintenance",
+    "fromNode": "alfred-gpu-a",
+    "requestUUID": "01234567-89ab-4cde-8fab-0123456789ab",
+    "dispatchStatus": "completed",
+    "maintenanceTriggers": ["patching"],
+    "maintenanceRequestedAt": "2026-09-14T12:00:00.123456789Z",
+    "maintenanceDrainedAt": "2026-09-14T12:00:15.456789123Z",
+    "omeGPUOccupantsPresent": false
+  }
+}

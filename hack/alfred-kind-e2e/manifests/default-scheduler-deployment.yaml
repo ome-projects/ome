@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alfred-default-scheduler
+  namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alfred-default-scheduler-system-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: alfred-default-scheduler
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alfred-default-scheduler-system-volume-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:volume-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: alfred-default-scheduler
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alfred-default-scheduler-leader-election
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [alfred-default-scheduler]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alfred-default-scheduler-leader-election
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alfred-default-scheduler-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: alfred-default-scheduler
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alfred-default-scheduler-extension-apiserver-authentication-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: alfred-default-scheduler
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alfred-default-scheduler-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: alfred-default-scheduler
+    namespace: ome
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alfred-default-scheduler
+  namespace: ome
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alfred-default-scheduler
+  template:
+    metadata:
+      labels:
+        app: alfred-default-scheduler
+    spec:
+      serviceAccountName: alfred-default-scheduler
+      nodeSelector:
+        alfred-e2e/infrastructure: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scheduler
+          image: alfred-e2e/scheduler:local
+          imagePullPolicy: IfNotPresent
+          command: [/ome-scheduler]
+          args:
+            - --config=/etc/kubernetes/alfred-default-scheduler/config.yaml
+            - --v=2
+            - --bind-address=0.0.0.0
+            - --secure-port=10259
+          ports:
+            - name: https-metrics
+              containerPort: 10259
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https-metrics
+              scheme: HTTPS
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https-metrics
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubernetes/alfred-default-scheduler
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: alfred-default-scheduler-config
