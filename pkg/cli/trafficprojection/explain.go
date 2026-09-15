@@ -404,8 +404,7 @@ func projectTrafficComparisons(
 		canary = reportv1alpha1.TrafficComparisonUnverifiable
 		canaryFreshness = reportv1alpha1.TrafficFreshnessUnavailable
 		if hasTrafficIssue(status.Issues, reportv1alpha1.TrafficIssueCanaryInvalid) ||
-			hasTrafficIssue(status.Issues, reportv1alpha1.TrafficIssueAllocationInvalid) ||
-			hasTrafficIssue(status.Issues, reportv1alpha1.TrafficIssueAllocationConflict) {
+			hasCanaryAllocationIssue(isvc, status.Issues) {
 			canary = reportv1alpha1.TrafficComparisonInvalid
 			canaryFreshness = reportv1alpha1.TrafficFreshnessUnverifiable
 		} else if status.Canary != nil {
@@ -575,6 +574,30 @@ func hasDeclaredCanary(isvc *omev1beta1.InferenceService) bool {
 	for i := range rollout.Groups {
 		if rollout.Groups[i].Canary != nil {
 			return true
+		}
+	}
+	return false
+}
+
+func hasCanaryAllocationIssue(isvc *omev1beta1.InferenceService, issues []reportv1alpha1.TrafficIssue) bool {
+	rollout := omev1beta1.EffectiveRollout(isvc)
+	if rollout == nil {
+		return false
+	}
+	for i := range rollout.Groups {
+		group := &rollout.Groups[i]
+		if group.Canary == nil {
+			continue
+		}
+		primary, _, valid := canaryPrimary(group)
+		if !valid {
+			continue
+		}
+		for _, issue := range issues {
+			if issue.Component == primary && (issue.Code == reportv1alpha1.TrafficIssueAllocationInvalid ||
+				issue.Code == reportv1alpha1.TrafficIssueAllocationConflict) {
+				return true
+			}
 		}
 	}
 	return false

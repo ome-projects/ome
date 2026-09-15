@@ -20,6 +20,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/trafficprojection"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/yaml"
 )
 
 var explainProjectionNow = time.Date(2026, 9, 14, 17, 0, 0, 0, time.UTC)
@@ -669,6 +670,83 @@ func TestProjectExplainCompletedCanaryUsesTerminalDisplay(t *testing.T) {
 	assert.Contains(t, got.WideTable().Rows, []string{"OBSERVED", "stable-revision", "Reported", "-", "Reported/Unverifiable"})
 	require.Len(t, got.Content.Reported.Allocations, 1)
 	assert.Equal(t, int32(100), got.Content.Reported.Allocations[0].Percent)
+}
+
+func TestProjectExplainCanaryAllocationValidityIsPrimaryScoped(t *testing.T) {
+	for _, scenario := range []struct {
+		name             string
+		primary, invalid omev1beta1.ComponentType
+		comparison       string
+		conflict         bool
+	}{
+		{"engine-unrelated-decoder", omev1beta1.EngineComponent, omev1beta1.DecoderComponent, "Match", false},
+		{"engine-same-primary", omev1beta1.EngineComponent, omev1beta1.EngineComponent, "Invalid", false},
+		{"decoder-unrelated-engine", omev1beta1.DecoderComponent, omev1beta1.EngineComponent, "Match", false},
+		{"decoder-same-primary", omev1beta1.DecoderComponent, omev1beta1.DecoderComponent, "Invalid", false},
+		{"engine-unrelated-decoder-conflict", omev1beta1.EngineComponent, omev1beta1.DecoderComponent, "Match", true},
+		{"engine-same-primary-conflict", omev1beta1.EngineComponent, omev1beta1.EngineComponent, "Invalid", true},
+		{"decoder-unrelated-engine-conflict", omev1beta1.DecoderComponent, omev1beta1.EngineComponent, "Match", true},
+		{"decoder-same-primary-conflict", omev1beta1.DecoderComponent, omev1beta1.DecoderComponent, "Invalid", true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "explain", "canary-only.input.json"))
+			require.NoError(t, err)
+			var isvc omev1beta1.InferenceService
+			require.NoError(t, json.Unmarshal(data, &isvc))
+			isvc.Spec.Rollout.Groups[0].Components = []omev1beta1.ComponentType{scenario.primary}
+			component := isvc.Status.Components[omev1beta1.EngineComponent]
+			component.Traffic[0].RevisionName = "chat-" + string(scenario.primary) + "-rev-e5f6a7b8"
+			isvc.Status.Components = map[omev1beta1.ComponentType]omev1beta1.ComponentStatusSpec{scenario.primary: component}
+			baseline, err := trafficprojection.ProjectExplain(&isvc, projectionClock)
+			require.NoError(t, err)
+			require.NotNil(t, baseline.Content.Reported.Canary)
+			assert.Equal(t, reportv1alpha1.RuntimeComponentType(scenario.primary), baseline.Content.Reported.Canary.Component)
+			issueCode := reportv1alpha1.TrafficIssueAllocationInvalid
+			traffic := []omev1beta1.ComponentTrafficTarget{{RevisionName: "invalid", Percent: 100}}
+			if scenario.conflict {
+				issueCode = reportv1alpha1.TrafficIssueAllocationConflict
+				name := "chat-" + string(scenario.invalid) + "-rev-e5f6a7b8"
+				traffic = []omev1beta1.ComponentTrafficTarget{{RevisionName: name, Percent: 50}, {RevisionName: name, Percent: 50}}
+			}
+			isvc.Status.Components[scenario.invalid] = omev1beta1.ComponentStatusSpec{
+				Traffic: traffic,
+			}
+			got, err := trafficprojection.ProjectExplain(&isvc, projectionClock)
+			require.NoError(t, err)
+			assert.Equal(t, reportv1alpha1.TrafficRealizationInvalid, got.Content.Summary.Realization)
+			assert.Contains(t, got.Content.Reported.Issues, reportv1alpha1.TrafficIssue{
+				Code: issueCode, Component: reportv1alpha1.RuntimeComponentType(scenario.invalid),
+			})
+			if scenario.primary != scenario.invalid {
+				assert.Equal(t, baseline.Content.Reported.Canary, got.Content.Reported.Canary)
+			}
+			assert.Equal(t, scenario.comparison, string(explainComparison(t, got, reportv1alpha1.TrafficComparisonCanaryWeight).State))
+			assert.Equal(t, []string{"CHECK", scenario.comparison, "canary-weight", "Computed/Unverifiable"}, got.Table().Rows[7])
+			assert.Contains(t, got.WideTable().Rows, []string{"CHECK", "canary-weight", scenario.comparison, "-", "Computed/Unverifiable"})
+			for _, format := range []report.Format{report.FormatTable, report.Format("wide"), report.FormatJSON, report.FormatYAML} {
+				var out bytes.Buffer
+				if format == report.Format("wide") {
+					require.NoError(t, got.WideTable().Write(&out))
+				} else {
+					require.NoError(t, report.Write(&out, format, got))
+				}
+				if format == report.FormatTable || format == report.Format("wide") {
+					assert.Regexp(t, "CHECK +(?:"+scenario.comparison+" +canary-weight|canary-weight +"+scenario.comparison+") +(?:- +)?Computed/Unverifiable", out.String())
+					continue
+				}
+				machine := out.Bytes()
+				if format == report.FormatYAML {
+					machine, err = yaml.YAMLToJSON(machine)
+					require.NoError(t, err)
+				}
+				var decoded reportv1alpha1.TrafficExplainReport
+				require.NoError(t, json.Unmarshal(machine, &decoded))
+				assert.Equal(t, reportv1alpha1.TrafficRealizationInvalid, decoded.Content.Summary.Realization)
+				assert.Equal(t, scenario.comparison, string(explainComparison(t, decoded, reportv1alpha1.TrafficComparisonCanaryWeight).State))
+				assert.Equal(t, got.Content.Reported.Issues, decoded.Content.Reported.Issues)
+			}
+		})
+	}
 }
 
 func explainComparison(

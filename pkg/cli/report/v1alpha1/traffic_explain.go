@@ -277,8 +277,11 @@ func (c TrafficExplainContent) Canonical() TrafficExplainContent {
 	result.Intent.Extensions = append([]TrafficDeclaredExtension{}, c.Intent.Extensions...)
 	sort.Slice(result.Intent.Extensions, func(i, j int) bool {
 		a, b := result.Intent.Extensions[i], result.Intent.Extensions[j]
+		if rank := cmp.Compare(trafficExtensionRank(a.Kind), trafficExtensionRank(b.Kind)); rank != 0 {
+			return rank < 0
+		}
 		if a.Kind != b.Kind {
-			return trafficExtensionRank(a.Kind) < trafficExtensionRank(b.Kind)
+			return a.Kind < b.Kind
 		}
 		return a.Count < b.Count
 	})
@@ -289,8 +292,11 @@ func (c TrafficExplainContent) Canonical() TrafficExplainContent {
 	result.Comparisons = append([]TrafficExplainComparison{}, c.Comparisons...)
 	sort.Slice(result.Comparisons, func(i, j int) bool {
 		a, b := result.Comparisons[i], result.Comparisons[j]
+		if rank := cmp.Compare(trafficComparisonRank(a.Field), trafficComparisonRank(b.Field)); rank != 0 {
+			return rank < 0
+		}
 		if a.Field != b.Field {
-			return trafficComparisonRank(a.Field) < trafficComparisonRank(b.Field)
+			return a.Field < b.Field
 		}
 		if a.State != b.State {
 			return a.State < b.State

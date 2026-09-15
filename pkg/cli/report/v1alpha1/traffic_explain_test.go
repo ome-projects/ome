@@ -72,6 +72,21 @@ func TestTrafficExplainCanonicalizesWithoutMutatingCaller(t *testing.T) {
 	assert.Equal(t, "chat", value.Sources[0].Name)
 }
 
+func TestTrafficExplainCanonicalUnknownEnumsHaveTotalOrder(t *testing.T) {
+	for _, order := range [][]string{{"FutureB", "FutureA", "FutureC"}, {"FutureC", "FutureB", "FutureA"}, {"FutureA", "FutureC", "FutureB"}} {
+		value := v1alpha1.TrafficExplainContent{}
+		for _, enum := range order {
+			value.Intent.Extensions = append(value.Intent.Extensions, v1alpha1.TrafficDeclaredExtension{Kind: v1alpha1.TrafficExtensionKind(enum), Count: 1})
+			value.Comparisons = append(value.Comparisons, v1alpha1.TrafficExplainComparison{Field: v1alpha1.TrafficComparisonField(enum), State: v1alpha1.TrafficComparisonMatch})
+		}
+		got := value.Canonical()
+		assert.Equal(t, []v1alpha1.TrafficDeclaredExtension{{Kind: "FutureA", Count: 1}, {Kind: "FutureB", Count: 1}, {Kind: "FutureC", Count: 1}}, got.Intent.Extensions)
+		assert.Equal(t, []v1alpha1.TrafficExplainComparison{{Field: "FutureA", State: v1alpha1.TrafficComparisonMatch}, {Field: "FutureB", State: v1alpha1.TrafficComparisonMatch}, {Field: "FutureC", State: v1alpha1.TrafficComparisonMatch}}, got.Comparisons)
+		assert.Equal(t, order[0], string(value.Intent.Extensions[0].Kind))
+		assert.Equal(t, order[0], string(value.Comparisons[0].Field))
+	}
+}
+
 func TestTrafficExplainCompactAndWideTables(t *testing.T) {
 	value := trafficExplainReportFixture()
 
