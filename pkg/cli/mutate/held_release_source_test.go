@@ -203,7 +203,7 @@ func TestHeldReleaseLongParentScanAndDefensiveCopies(t *testing.T) {
 	_, err = PrepareHeldRelease(v, state, evidence, "engine", "aaaaaaaa", testClock)
 	require.Error(t, err)
 
-	v, state = nativeTarget(t)
+	v, _ = nativeTarget(t)
 	ir = heldReplica(v)
 	v.UID = types.UID(strings.Repeat("u", 256))
 	ir.OwnerReferences[0].UID = v.UID
