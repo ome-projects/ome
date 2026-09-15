@@ -597,6 +597,11 @@ func copyListIssues(report *reportv1alpha1.InstanceStatusReport, list reportv1al
 }
 
 func copyDetailCompleteness(report *reportv1alpha1.InstanceStatusReport, collection instancecollection.Result, name string, component omev1beta1.ComponentType, index int32) {
+	for _, malformed := range collection.DetailsMalformed {
+		if malformed.Name == name && malformed.Component == component && malformed.Index == index && malformed.Kind == instancecollection.DetailConditions {
+			addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
+		}
+	}
 	for _, truncation := range collection.DetailsTruncated {
 		if truncation.Name != name || truncation.Component != component || truncation.Index != index {
 			continue

@@ -1,6 +1,7 @@
 package instancestatusprojection_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,11 +24,126 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/instancecollection"
 	"sigs.k8s.io/ome/pkg/cli/instancestatusprojection"
 	"sigs.k8s.io/ome/pkg/cli/observation"
+	"sigs.k8s.io/ome/pkg/cli/paging"
+	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
+
+// These tests cross the collection boundary: projection alone cannot see a
+// contradictory partner that collection has already discarded at the cap.
+func TestCollectedConditionCutoffRejectsAmbiguousGroups(t *testing.T) {
+	t.Parallel()
+	current := metav1.Condition{Type: "ZReady", Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "Ready"}
+	for _, field := range []string{"status", "generation", "time", "reason"} {
+		t.Run(field, func(t *testing.T) {
+			other := current
+			switch field {
+			case "status":
+				other.Status = metav1.ConditionUnknown
+			case "generation":
+				other.ObservedGeneration = 1
+			case "time":
+				other.LastTransitionTime = metav1.NewTime(time.Unix(100, 0))
+			case "reason":
+				other.Reason = "Waiting"
+			}
+			conditions := make([]metav1.Condition, 15)
+			for i := range conditions {
+				conditions[i] = metav1.Condition{Type: "A" + strconv.Itoa(i), Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "Ready"}
+			}
+			conditions = append(conditions, current, other)
+			left := projectCollectedConditions(t, conditions)
+			slicesReverse(conditions)
+			right := projectCollectedConditions(t, conditions)
+			assert.Equal(t, left, right)
+			require.NotNil(t, left.Content.Instance)
+			require.Len(t, left.Content.Instance.Conditions, 15)
+			for _, condition := range left.Content.Instance.Conditions {
+				assert.NotEqual(t, "ZReady", condition.Type)
+			}
+			assert.Contains(t, issueCodes(left), reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid)
+			assert.Equal(t, reportv1alpha1.InstanceStatusStatePartial, left.Content.Summary.State)
+			for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+				var a, b bytes.Buffer
+				require.NoError(t, report.Write(&a, format, left))
+				require.NoError(t, report.Write(&b, format, right))
+				assert.Equal(t, a.String(), b.String())
+				assert.Contains(t, a.String(), "AuthoritativeInvalid")
+			}
+		})
+	}
+}
+
+func TestCollectedConditionsKeepOutputAndScanLimitsExplicit(t *testing.T) {
+	t.Parallel()
+	conditions := make([]metav1.Condition, 64)
+	for i := range conditions {
+		conditions[i] = metav1.Condition{Type: "A" + strconv.Itoa(i), Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "Ready"}
+	}
+	bounded := projectCollectedConditions(t, conditions)
+	require.Len(t, bounded.Content.Instance.Conditions, 16)
+	assert.True(t, bounded.Content.Summary.Truncated)
+	assert.Contains(t, issueCodes(bounded), reportv1alpha1.InstanceStatusIssueConditionsTruncated)
+	conditions = append(conditions, metav1.Condition{Type: "NeverScanned", Status: "Invalid"})
+	unavailable := projectCollectedConditions(t, conditions)
+	assert.Empty(t, unavailable.Content.Instance.Conditions)
+	assert.True(t, unavailable.Content.Summary.Truncated)
+	assert.Contains(t, issueCodes(unavailable), reportv1alpha1.InstanceStatusIssueConditionsTruncated)
+	assert.NotContains(t, issueCodes(unavailable), reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid)
+}
+
+func TestCollectedConditionsValidateHiddenGroupsAndDeduplicate(t *testing.T) {
+	t.Parallel()
+	conditions := make([]metav1.Condition, 16)
+	for i := range conditions {
+		conditions[i] = metav1.Condition{Type: "A" + strconv.Itoa(i), Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "Ready"}
+	}
+	for _, invalid := range []metav1.Condition{
+		{Type: "ZInvalid", Status: "Invalid", ObservedGeneration: 2},
+		{Type: "ZInvalid", Status: metav1.ConditionTrue, ObservedGeneration: -1},
+		{Type: "ZInvalid", Status: metav1.ConditionTrue, ObservedGeneration: 3},
+	} {
+		got := projectCollectedConditions(t, append(append([]metav1.Condition{}, conditions...), invalid))
+		require.Len(t, got.Content.Instance.Conditions, 16)
+		assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid)
+		assert.Contains(t, mustJSON(t, got), `"unavailableReason":"MalformedPayload"`)
+	}
+	duplicate := conditions[0]
+	duplicate.Message = "never emit raw messages"
+	got := projectCollectedConditions(t, append(conditions, duplicate))
+	require.Len(t, got.Content.Instance.Conditions, 16)
+	assert.NotContains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid)
+	assert.False(t, got.Content.Summary.Truncated)
+	assert.NotContains(t, mustJSON(t, got), "never emit raw messages")
+}
+
+type conditionLister struct{ replica omev1beta1.InferenceReplica }
+
+func (l conditionLister) List(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+	return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{l.replica}}, nil
+}
+
+func projectCollectedConditions(t *testing.T, conditions []metav1.Condition) reportv1alpha1.InstanceStatusReport {
+	t.Helper()
+	input := statusInput()
+	replica := input.Collection.Items[0]
+	replica.Status.InstanceStatuses[0].Conditions = conditions
+	before := replica.DeepCopy()
+	var err error
+	input.Collection, err = instancecollection.CollectRelated(context.Background(), conditionLister{replica}, input.InferenceService, instancecollection.Limits{
+		Paging: paging.Limits{PageSize: 20, MaxItems: 60, MaxPages: 3, RequestTimeout: time.Second}, MaxStatusRows: 4096,
+		Details: instancecollection.DetailLimits{MaxConditions: 16, MaxScannedConditions: 64, MaxNodeHints: 16, MaxScannedNodeHints: 64, MaxMigrations: 16, MaxScannedMigrations: 64, SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, before, &replica)
+	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+	require.NoError(t, err)
+	assert.Equal(t, before, &replica)
+	return got
+}
 
 func TestProjectJoinsNormalMultiPodInstanceWithAuthoritativeDetails(t *testing.T) {
 	t.Parallel()

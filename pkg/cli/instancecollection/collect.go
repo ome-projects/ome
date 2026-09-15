@@ -93,6 +93,15 @@ type DetailTruncation struct {
 	Kind      DetailKind
 }
 
+// DetailMalformed identifies rejected detail records independently of an
+// output or scan cutoff. It carries no raw condition values.
+type DetailMalformed struct {
+	Name      string
+	Component omev1beta1.ComponentType
+	Index     int32
+	Kind      DetailKind
+}
+
 // StatusRowsTruncation identifies a related InferenceReplica whose nested
 // status exceeded the collection work budget. No status row from that source
 // is copied or scanned.
@@ -115,6 +124,7 @@ type Result struct {
 	StatusRowsTruncated  []StatusRowsTruncation
 	RetryBlocksTruncated []RetryBlocksTruncation
 	DetailsTruncated     []DetailTruncation
+	DetailsMalformed     []DetailMalformed
 	Pages                int
 	Truncated            bool
 }
@@ -189,6 +199,7 @@ func CollectRelated(
 		StatusRowsTruncated:  make([]StatusRowsTruncation, 0),
 		RetryBlocksTruncated: make([]RetryBlocksTruncation, 0),
 		DetailsTruncated:     make([]DetailTruncation, 0),
+		DetailsMalformed:     make([]DetailMalformed, 0),
 		Pages:                listed.Pages, Truncated: listed.Truncated,
 	}
 	accepted := make([]*omev1beta1.InferenceReplica, 0, len(listed.Items))
@@ -231,9 +242,10 @@ func CollectRelated(
 				Name: item.Name, Component: item.Spec.Component,
 			})
 		}
-		copied, truncations := boundedReplicaCopy(item, isvc, copyRows, copyRetryBlocks, limits.Details)
+		copied, truncations, malformed := boundedReplicaCopy(item, isvc, copyRows, copyRetryBlocks, limits.Details)
 		result.Items = append(result.Items, copied)
 		result.DetailsTruncated = append(result.DetailsTruncated, truncations...)
+		result.DetailsMalformed = append(result.DetailsMalformed, malformed...)
 		if copyRows {
 			remainingRows -= len(item.Status.InstanceStatuses)
 		}
@@ -253,7 +265,7 @@ func boundedReplicaCopy(
 	copyRows bool,
 	copyRetryBlocks bool,
 	detailLimits DetailLimits,
-) (omev1beta1.InferenceReplica, []DetailTruncation) {
+) (omev1beta1.InferenceReplica, []DetailTruncation, []DetailMalformed) {
 	controller := true
 	result := omev1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{
@@ -287,9 +299,10 @@ func boundedReplicaCopy(
 		}
 	}
 	if !copyRows {
-		return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), nil
+		return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), nil, nil
 	}
 	truncations := make([]DetailTruncation, 0)
+	malformed := make([]DetailMalformed, 0)
 	result.Status.InstanceStatuses = make([]omev1beta1.OMENativeInstanceStatus, len(ir.Status.InstanceStatuses))
 	for i := range ir.Status.InstanceStatuses {
 		source := &ir.Status.InstanceStatuses[i]
@@ -304,9 +317,13 @@ func boundedReplicaCopy(
 		if detailLimits.selects(ir.Spec.Component, source.Index) {
 			row.ReadySince = copyTime(source.ReadySince)
 			row.ActiveOrdinal = source.ActiveOrdinal
-			row.Conditions, truncations = copyConditions(
+			var conditionsMalformed bool
+			row.Conditions, truncations, conditionsMalformed = copyConditions(
 				source.Conditions, detailLimits, ir, source.Index, truncations,
 			)
+			if conditionsMalformed {
+				malformed = append(malformed, DetailMalformed{Name: ir.Name, Component: ir.Spec.Component, Index: source.Index, Kind: DetailConditions})
+			}
 			if source.Operation != nil {
 				operation := *source.Operation
 				operation.ID = boundedClone(source.Operation.ID, maxInstanceDetailBytes)
@@ -354,7 +371,7 @@ func boundedReplicaCopy(
 	if detailLimits.MaxMigrations > 0 && detailLimits.SelectedComponent == ir.Spec.Component {
 		result.Status.Migrations, truncations = copyMigrations(ir.Status.Migrations, detailLimits, ir, truncations)
 	}
-	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), truncations
+	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), truncations, malformed
 }
 
 func copyMigrations(
@@ -452,9 +469,9 @@ func copyConditions(
 	ir *omev1beta1.InferenceReplica,
 	index int32,
 	truncations []DetailTruncation,
-) ([]metav1.Condition, []DetailTruncation) {
+) ([]metav1.Condition, []DetailTruncation, bool) {
 	if len(input) > limits.MaxScannedConditions {
-		return nil, appendDetailTruncation(truncations, ir, index, DetailConditions)
+		return nil, appendDetailTruncation(truncations, ir, index, DetailConditions), false
 	}
 	conditions := make([]metav1.Condition, len(input))
 	for i := range input {
@@ -464,20 +481,49 @@ func copyConditions(
 			Reason: boundedClone(input[i].Reason, maxInstanceDetailBytes),
 		}
 	}
-	sort.Slice(conditions, func(i, j int) bool {
-		if conditions[i].Type != conditions[j].Type {
-			return conditions[i].Type < conditions[j].Type
+	sort.Slice(conditions, func(i, j int) bool { return conditionLess(conditions[i], conditions[j]) })
+	// Inspect complete groups within the admitted scan budget before capping.
+	// A condition type has one authoritative value; differing allowlisted
+	// records are ambiguous, even if their status happens to agree.
+	valid := conditions[:0]
+	malformed := false
+	for start := 0; start < len(conditions); {
+		end := start + 1
+		for end < len(conditions) && conditions[end].Type == conditions[start].Type {
+			end++
 		}
-		if conditions[i].Status != conditions[j].Status {
-			return conditions[i].Status < conditions[j].Status
+		condition := conditions[start]
+		ambiguous := conditionLess(condition, conditions[end-1])
+		if ambiguous || (condition.Status != metav1.ConditionTrue && condition.Status != metav1.ConditionFalse && condition.Status != metav1.ConditionUnknown) ||
+			condition.ObservedGeneration < 0 || condition.ObservedGeneration > ir.Generation {
+			malformed = true
+		} else {
+			valid = append(valid, condition)
 		}
-		return conditions[i].Reason < conditions[j].Reason
-	})
+		start = end
+	}
+	conditions = valid
 	if len(conditions) > limits.MaxConditions {
 		conditions = conditions[:limits.MaxConditions]
 		truncations = appendDetailTruncation(truncations, ir, index, DetailConditions)
 	}
-	return conditions, truncations
+	return conditions, truncations, malformed
+}
+
+func conditionLess(left, right metav1.Condition) bool {
+	if left.Type != right.Type {
+		return left.Type < right.Type
+	}
+	if left.Status != right.Status {
+		return left.Status < right.Status
+	}
+	if left.Reason != right.Reason {
+		return left.Reason < right.Reason
+	}
+	if left.ObservedGeneration != right.ObservedGeneration {
+		return left.ObservedGeneration < right.ObservedGeneration
+	}
+	return left.LastTransitionTime.Before(&right.LastTransitionTime)
 }
 
 func appendDetailTruncation(
