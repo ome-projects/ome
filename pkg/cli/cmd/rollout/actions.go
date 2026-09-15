@@ -220,6 +220,9 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	if dryRun != reportv1alpha1.DryRunClient {
 		body, e := patchClient.JSONPatch(ctx, transport.Resource{Namespace: v.Namespace, Resource: "inferenceservices", Name: v.Name}, plan.Patch(), transport.JSONPatchOptions{DryRun: dryRun == reportv1alpha1.DryRunServer})
 		if e != nil {
+			if errors.Is(e, transport.ErrResponseIdentity) {
+				return errors.New("API response is not bound to the request; outcome unknown, check rollout status")
+			}
 			if errors.Is(e, transport.ErrResponseTooLarge) {
 				return errors.New("API response exceeds safety bounds; request outcome unknown, check rollout status")
 			}

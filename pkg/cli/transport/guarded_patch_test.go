@@ -37,7 +37,8 @@ func TestBoundedPatchResponseCapsReadsAndPreservesTransportWrapper(t *testing.T)
 		t.Run(strings.Repeat("x", size%10), func(t *testing.T) {
 			var observed atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.WriteString(w, strings.Repeat("x", size))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, "{}"+strings.Repeat(" ", size-2))
 			}))
 			defer server.Close()
 			config := &rest.Config{Host: server.URL, WrapTransport: func(inner http.RoundTripper) http.RoundTripper {

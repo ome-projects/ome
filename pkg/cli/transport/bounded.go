@@ -19,7 +19,7 @@ func NewBounded(config *rest.Config, limit int64) (*Client, error) {
 	if config == nil || limit < 1 || limit > 64*1024*1024 {
 		return nil, errors.New("transport: bounded response configuration is invalid")
 	}
-	cfg := rest.CopyConfig(config)
+	cfg := copyTransportConfig(config)
 	cfg.Wrap(func(inner http.RoundTripper) http.RoundTripper {
 		return &boundedTransport{inner: inner, limit: limit}
 	})
