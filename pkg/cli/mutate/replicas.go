@@ -344,7 +344,7 @@ func replicaPayloadBounded(ir *v1beta1.InferenceReplica) bool {
 		return false
 	}
 	for _, row := range ir.Status.InstanceStatuses {
-		if !add(string(row.Phase), row.RunningRevision, row.TargetRevision) || !conditions(row.Conditions) || len(row.NodesOccupied) > 64 {
+		if !add(string(row.Phase), row.RunningRevision, row.TargetRevision) || !conditions(row.Conditions) {
 			return false
 		}
 		if row.Operation != nil {

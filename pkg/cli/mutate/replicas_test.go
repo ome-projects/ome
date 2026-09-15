@@ -41,6 +41,54 @@ func validMigration(phase v1beta1.MigrationPhase) v1beta1.MigrationStatus {
 	return row
 }
 
+// Transient publication observations must not decide whether an exact-current
+// lifecycle operation can be paused, even when they regress or disappear.
+func TestPauseDoesNotDependOnTransientPodObservations(t *testing.T) {
+	nodes := make([]string, 65)
+	for i := range nodes {
+		nodes[i] = "node-" + strings.Repeat("a", i+1)
+	}
+	for _, tc := range []struct {
+		name             string
+		ready, scheduled int32
+		nodes            []string
+	}{
+		{name: "absent"},
+		{name: "published", ready: 2, scheduled: 2, nodes: []string{"node-a", "node-b"}},
+		{name: "regressed", scheduled: 1},
+		{name: "large bounded publication", ready: 65, scheduled: 65, nodes: nodes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, state := nativeTarget(t)
+			ir := replicaFor(v)
+			ir.Status.CurrentRevision = ir.Status.UpdateRevision
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceRestarting, ReadyPodCount: tc.ready, ScheduledPodCount: tc.scheduled, NodesOccupied: tc.nodes, Operation: &v1beta1.InstanceOperation{ID: "restart-0-123", Type: v1beta1.InstanceOperationRestart, Step: "Drain", StartedAt: metav1.NewTime(testNow.Add(-2e9)), LastProgressAt: metav1.NewTime(testNow.Add(-1e9))}}}
+			work, err := CollectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), v, []string{"engine"}, testClock)
+			require.NoError(t, err)
+			require.True(t, work.complete)
+			require.True(t, work.active)
+			require.Equal(t, 1, work.operations)
+			require.Zero(t, work.migrations)
+			plan, err := PrepareRollout(v, state, work, "pause", false, true, testClock)
+			require.NoError(t, err)
+			require.JSONEq(t, `[{"op":"test","path":"/metadata/uid","value":"uid-chat"},{"op":"test","path":"/metadata/resourceVersion","value":"42"},{"op":"add","path":"/metadata/annotations","value":{}},{"op":"add","path":"/metadata/annotations/ome.io~1rollout-paused","value":"true"}]`, string(plan.Patch()))
+		})
+	}
+}
+
+// Removing complete-object bounds would accept these payloads: the lifecycle
+// evidence is valid, and the single transient list element has no semantic role.
+func TestPauseStillBoundsCompleteTransientPodPayload(t *testing.T) {
+	for _, payloadBytes := range []int{1_048_577, 2_097_152} {
+		v := safeTarget()
+		ir := replicaFor(v)
+		ir.Status.CurrentRevision = ir.Status.UpdateRevision
+		ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceRestarting, NodesOccupied: []string{strings.Repeat("n", payloadBytes)}, Operation: &v1beta1.InstanceOperation{ID: "restart-0-123", Type: v1beta1.InstanceOperationRestart, Step: "Drain", StartedAt: metav1.NewTime(testNow.Add(-2e9)), LastProgressAt: metav1.NewTime(testNow.Add(-1e9))}}}
+		_, err := CollectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), v, []string{"engine"}, testClock)
+		require.ErrorIs(t, err, ErrBounds)
+	}
+}
+
 // Dropping source binding, complete-list or all-record validation would admit
 // unsafe lifecycle work. Literal operations exercise the real typed collector.
 func TestCollectReplicaEvidenceRecognizesLifecycleAndRejectsUnsafeSources(t *testing.T) {
