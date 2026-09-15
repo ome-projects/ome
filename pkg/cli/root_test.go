@@ -84,6 +84,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome get",
 		"ome instance",
 		"ome instance list",
+		"ome instance release-held",
 		"ome instance retry-blocks",
 		"ome instance status",
 		"ome logs",
@@ -220,6 +221,30 @@ func TestRootHelpListsLogicalInstanceInspection(t *testing.T) {
 	}
 	if !bytes.Contains(output.Bytes(), []byte("  instance    Inspect controller-reported logical instances\n")) {
 		t.Fatalf("root help does not list instance command:\n%s", output.String())
+	}
+}
+
+func TestRootHeldReleaseRegistrationAndClosedParser(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, flag := range []string{"--yes=" + credential, "--insecure-skip-tls-verify=" + credential, "--" + credential, "--dry-run"} {
+		t.Run(flag, func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			f := &waitFlagFactory{}
+			root := NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+			command, _, err := root.Find([]string{"instance", "release-held"})
+			if err != nil || command.Use != "release-held INFERENCESERVICE" || !strings.Contains(command.Long, "No implicit wait or automatic replay") {
+				t.Fatal("held release registration or acceptance contract changed")
+			}
+			for _, name := range []string{"component", "revision", "dry-run", "yes", "output"} {
+				if command.Flags().Lookup(name) == nil {
+					t.Fatalf("held release flag %s is missing", name)
+				}
+			}
+			root.SetArgs([]string{"instance", "release-held", "chat", "--component=engine", "--revision=aaaaaaaa", flag})
+			if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || f.calls != 0 || stderr.String() != "error: invalid held-release action flags; use --help\n" {
+				t.Fatalf("closed held parser: code=%d acquisitions=%d stdout=%q stderr=%q", code, f.calls, out.String(), stderr.String())
+			}
+		})
 	}
 }
 
