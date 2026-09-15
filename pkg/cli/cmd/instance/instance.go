@@ -1,4 +1,4 @@
-// Package instance implements read-only logical instance inspection commands.
+// Package instance implements logical instance inspection and guarded alpha actions.
 package instance
 
 import (
@@ -39,5 +39,6 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 		maxRetryBlocks: defaultMaxRetryBlocks,
 	}))
 	cmd.AddCommand(newStatusCmd(f, streams))
+	cmd.AddCommand(newReleaseHeldCmd(f, streams, reportv1alpha1.SystemClock{}))
 	return cmd
 }
