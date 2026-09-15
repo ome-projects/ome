@@ -20,17 +20,18 @@ var podsResource = schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 // privateState serializes binding, completion and denial. Once sealed, late
 // asynchronous scheduler work cannot alter the result or any snapshot object.
 type privateState struct {
-	mu        sync.Mutex
-	requested map[types.NamespacedName]*v1.Pod
-	nodes     map[string]*v1.Node
-	excluded  exclusions
-	bound     map[types.NamespacedName]string
-	completed map[types.NamespacedName]bool
-	denied    error
-	sealed    bool
-	wake      chan struct{}
-	active    map[types.UID]bool
-	cycles    sync.WaitGroup
+	mu           sync.Mutex
+	requested    map[types.NamespacedName]*v1.Pod
+	replacements map[types.NamespacedName]bool
+	nodes        map[string]*v1.Node
+	excluded     exclusions
+	bound        map[types.NamespacedName]string
+	completed    map[types.NamespacedName]bool
+	denied       error
+	sealed       bool
+	wake         chan struct{}
+	active       map[types.UID]bool
+	cycles       sync.WaitGroup
 }
 
 func (s *privateState) signal() {
@@ -48,26 +49,25 @@ func (s *privateState) deny(err error) {
 	s.signal()
 }
 func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Clientset, *privateState) {
-	excluded := exclusions{}
+	excluded := exclusions{nodes: map[string]bool{}, replacements: map[types.UID]bool{}}
 	for _, node := range r.ExcludedNodes {
-		excluded[node] = true
+		excluded.nodes[node] = true
 	}
+	s := &privateState{requested: map[types.NamespacedName]*v1.Pod{}, replacements: map[types.NamespacedName]bool{}, nodes: snapshot.Nodes, excluded: excluded, bound: map[types.NamespacedName]string{}, completed: map[types.NamespacedName]bool{}, wake: make(chan struct{}, 1), active: map[types.UID]bool{}}
 	objects := make([]runtime.Object, 0, len(snapshot.Objects))
 	for _, o := range snapshot.Objects {
 		switch o.(type) {
 		case *v1.Pod, *v1.Node, *v1.Namespace, *v1.Service, *v1.ReplicationController, *appsv1.ReplicaSet, *appsv1.StatefulSet:
 			copy := o.DeepCopyObject()
-			if node, ok := copy.(*v1.Node); ok && excluded[node.Name] {
-				// Apply the hard exclusion before OME's domain planning, not
-				// only in Filter: otherwise spare source capacity can attract
-				// a gang whose worker affinity then waits for a rejected leader.
-				// Only this private copy changes; all occupied Pods stay put.
-				node.Spec.Unschedulable = true
+			if pod, ok := copy.(*v1.Pod); ok && pod.Spec.NodeName == "" {
+				if pod.Spec.SchedulerName == "" {
+					pod.Spec.SchedulerName = v1.DefaultSchedulerName
+				}
+				s.requested[types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}] = pod.DeepCopy()
 			}
 			objects = append(objects, copy)
 		}
 	}
-	s := &privateState{requested: map[types.NamespacedName]*v1.Pod{}, nodes: snapshot.Nodes, excluded: excluded, bound: map[types.NamespacedName]string{}, completed: map[types.NamespacedName]bool{}, wake: make(chan struct{}, 1), active: map[types.UID]bool{}}
 	usedUIDs := map[types.UID]bool{}
 	for _, pod := range snapshot.Pods {
 		usedUIDs[pod.UID] = true
@@ -91,7 +91,10 @@ func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Cl
 			}
 		}
 		objects = append(objects, p)
-		s.requested[types.NamespacedName{Namespace: p.Namespace, Name: p.Name}] = p.DeepCopy()
+		key := types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
+		s.requested[key] = p.DeepCopy()
+		s.replacements[key] = true
+		s.excluded.replacements[p.UID] = true
 	}
 	client := fake.NewClientset(objects...)
 	client.PrependReactor("*", "*", func(action clienttesting.Action) (bool, runtime.Object, error) {
@@ -125,8 +128,9 @@ func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Cl
 			}
 			key := types.NamespacedName{Namespace: action.GetNamespace(), Name: binding.Name}
 			expected := s.requested[key]
-			if expected == nil || binding.UID != expected.UID || s.nodes[binding.Target.Name] == nil || s.excluded[binding.Target.Name] || s.bound[key] != "" {
-				return reject("binding must uniquely place an authorized replacement on an allowed node")
+			if expected == nil || binding.UID != expected.UID || s.nodes[binding.Target.Name] == nil ||
+				(s.replacements[key] && s.excluded.nodes[binding.Target.Name]) || s.bound[key] != "" {
+				return reject("binding must uniquely place an authorized simulation Pod on an allowed node")
 			}
 			obj, err := client.Tracker().Get(podsResource, key.Namespace, key.Name)
 			if err != nil {
@@ -134,7 +138,7 @@ func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Cl
 			}
 			pod := obj.(*v1.Pod).DeepCopy()
 			if pod.UID != expected.UID || pod.Spec.NodeName != "" {
-				return reject("replacement identity or binding changed")
+				return reject("simulation Pod identity or binding changed")
 			}
 			pod.Spec.NodeName = binding.Target.Name
 			if err := client.Tracker().Update(podsResource, pod, key.Namespace); err != nil {
@@ -151,11 +155,11 @@ func newPrivateClient(r protocol.Request, snapshot *protocol.Snapshot) (*fake.Cl
 			}
 			key := types.NamespacedName{Namespace: action.GetNamespace(), Name: patch.GetName()}
 			if s.requested[key] == nil {
-				return reject("status mutation of non-request Pod")
+				return reject("status mutation of non-simulation Pod")
 			}
 			return true, s.requested[key].DeepCopy(), nil
 		}
-		return reject("only replacement binding and private scheduler status recording are supported")
+		return reject("only simulation Pod binding and private scheduler status recording are supported")
 	})
 	return client, s
 }

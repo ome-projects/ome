@@ -330,6 +330,23 @@ func validateSnapshotReferences(request Request, snapshot *Snapshot) error {
 		}
 	}
 	controllers := suppliedControllers(snapshot.Objects)
+	for key, pod := range snapshot.Pods {
+		if pod.Spec.NodeName != "" {
+			continue
+		}
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			return fmt.Errorf("pending Pod %s is deleting or terminal", key)
+		}
+		if effectiveSchedulerName(pod.Spec.SchedulerName) != request.Profile.SchedulerName {
+			return fmt.Errorf("pending Pod %s scheduler name does not match profile", key)
+		}
+		if pod.Labels["scheduling.x-k8s.io/pod-group"] != "" {
+			return fmt.Errorf("pending PodGroup member %s is unsupported", key)
+		}
+		if err := validateControllerOwner(pod, controllers); err != nil {
+			return fmt.Errorf("pending Pod %s: %w", key, err)
+		}
+	}
 
 	replacementNames := make(map[types.NamespacedName]struct{}, len(request.ReplacementPods))
 	replacementUIDs := make(map[types.UID]struct{}, len(request.ReplacementPods))

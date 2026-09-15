@@ -244,6 +244,93 @@ func TestBuildRequestClonesCompleteGangAndRetargetsPrivateIdentity(t *testing.T)
 	}
 }
 
+func TestBuildRequestPreservesSameProfilePendingCompetition(t *testing.T) {
+	for _, gang := range []bool{false, true} {
+		name := "default-scheduler"
+		if gang {
+			name = "ome-scheduler"
+		}
+		t.Run(name, func(t *testing.T) {
+			objects, source := validSingleSourceObjects()
+			if gang {
+				objects, source = validGangSourceObjects()
+			}
+			pending := &corev1.Pod{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+				ObjectMeta: captureMeta("pending-competitor"),
+				Spec:       sourcePodSpec(name),
+				Status:     corev1.PodStatus{Phase: corev1.PodPending},
+			}
+			pending.Spec.Priority = ptr.To(int32(200))
+			objects = append(objects, pending)
+			snap := captureSourceFixture(t, objects)
+			request, err := BuildRequest(snap, source, testProfiles(gang), "pending-competition", captureTime.Add(time.Second), time.Minute)
+			if err != nil {
+				t.Fatalf("same-profile standalone pending competitor rejected: %v", err)
+			}
+			foundPending, foundSource := false, false
+			for _, raw := range request.ClusterObjects {
+				var pod corev1.Pod
+				if err := json.Unmarshal(raw.Raw, &pod); err != nil {
+					t.Fatal(err)
+				}
+				if pod.Kind != "Pod" {
+					continue
+				}
+				if pod.UID == pending.UID {
+					foundPending = reflect.DeepEqual(pod, *pending)
+				}
+				if pod.Name == "svc-engine-2-default-0" || pod.Name == "svc-engine-2-leader-0" {
+					foundSource = pod.Spec.NodeName == "source-a" && pod.Status.Phase == corev1.PodRunning
+				}
+			}
+			if !foundPending || !foundSource {
+				t.Fatalf("request lost pending competition or bound source occupancy: pending=%v source=%v", foundPending, foundSource)
+			}
+			for _, pod := range append(request.SourcePods, request.ReplacementPods...) {
+				if pod.UID == pending.UID {
+					t.Fatal("pending competitor became a requested replacement or source")
+				}
+			}
+			if request.RequireGang != gang {
+				t.Fatal("pending competitor changed replacement gang membership")
+			}
+			if err := snap.Validate(captureTime.Add(time.Second), time.Minute); err != nil {
+				t.Fatalf("request construction mutated the captured snapshot: %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildRequestRejectsUnsupportedPendingCompetition(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+	}{
+		{"mixed scheduler profiles", func(pod *corev1.Pod) { pod.Spec.SchedulerName = "other-scheduler" }},
+		{"pending gang", func(pod *corev1.Pod) { pod.Labels = map[string]string{labelPodGroup: "other-gang"} }},
+		{"persistent storage", func(pod *corev1.Pod) {
+			pod.Spec.Volumes = []corev1.Volume{{Name: "model", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "model"}}}}
+		}},
+		{"DRA", func(pod *corev1.Pod) {
+			pod.Spec.ResourceClaims = []corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptr.To("gpu-claim")}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects, source := validSingleSourceObjects()
+			pending := &corev1.Pod{ObjectMeta: captureMeta("pending-competitor"), Spec: sourcePodSpec("default-scheduler"), Status: corev1.PodStatus{Phase: corev1.PodPending}}
+			tc.mutate(pending)
+			objects = append(objects, pending)
+			profiles := testProfiles(false)
+			profiles.Profiles["other-scheduler"] = scheduling.Profile{Backend: "other", SchedulerVersion: "v1.35.8", ConfigurationID: "other-config"}
+			request, err := BuildRequest(captureSourceFixture(t, objects), source, profiles, "unsupported-competition", captureTime.Add(time.Second), time.Minute)
+			if err == nil || len(request.ReplacementPods) != 0 {
+				t.Fatalf("unsupported pending competition returned a usable request: %+v, %v", request, err)
+			}
+		})
+	}
+}
+
 func TestSyntheticInstanceIdentityAvoidsLiveCohortIndexes(t *testing.T) {
 	_, source := validSingleSourceObjects()
 	members := []podMember{{pod: *readySourcePod("source", "source-uid", "source-a", v1beta1.RunnerNameDefault, 0, "default-scheduler"), incarnation: 7}}
@@ -433,10 +520,6 @@ func TestBuildRequestRejectsUntrustworthySourceState(t *testing.T) {
 			at := metav1.NewTime(captureTime)
 			isvc.DeletionTimestamp = &at
 		}, want: "deleting"},
-		{name: "pending other pod", mutate: func(objects []client.Object) {
-			objects = append(objects, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "pending-other", UID: "pending-other-uid", ResourceVersion: "12"}, Spec: sourcePodSpec("default-scheduler"), Status: corev1.PodStatus{Phase: corev1.PodPending}})
-			sourcePodsSlice = objects
-		}, want: "pending"},
 		{name: "persistent storage", mutate: func(objects []client.Object) {
 			sourcePods(objects)[0].Spec.Volumes = []corev1.Volume{{Name: "model", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "model"}}}}
 		}, want: "storage"},

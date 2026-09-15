@@ -42,8 +42,9 @@ type Snapshot struct {
 // valid source. Supply a context deadline to bound API reads. A missing CRD,
 // permission error, partial list, or other read error returns no snapshot.
 // Pending and terminating Pods are retained so the model cannot silently omit
-// transient demand. BuildRequest rejects pending non-request Pods until the
-// worker can model that demand. Terminal Pods do not occupy scheduler capacity.
+// transient demand. The worker models supported same-profile standalone pending
+// competitors; other pending demand is rejected, never dropped. Terminal Pods
+// do not occupy scheduler capacity.
 func Capture(ctx context.Context, reader client.Reader, now func() time.Time) (*Snapshot, error) {
 	if reader == nil || now == nil {
 		return nil, fmt.Errorf("capture requires a reader and clock")

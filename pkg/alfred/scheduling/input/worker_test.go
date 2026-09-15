@@ -37,14 +37,19 @@ func TestWorkerIntegration(t *testing.T) {
 		gang      bool
 		capacity  bool
 		execution bool
+		pending   string
 	}{
-		{"single_fits_elsewhere", false, true, false},
-		{"single_source_occupancy_blocks_same_zone", false, false, false},
-		{"whole_gang_fits", true, true, false},
-		{"partial_gang_capacity_rejected", true, false, false},
-		{"migration_single_fits", false, true, true},
-		{"migration_whole_gang_fits", true, true, true},
-		{"migration_partial_gang_rejected", true, false, true},
+		{name: "single_fits_elsewhere", capacity: true},
+		{name: "single_source_occupancy_blocks_same_zone"},
+		{name: "whole_gang_fits", gang: true, capacity: true},
+		{name: "partial_gang_capacity_rejected", gang: true},
+		{name: "migration_single_fits", capacity: true, execution: true},
+		{name: "migration_whole_gang_fits", gang: true, capacity: true, execution: true},
+		{name: "migration_partial_gang_rejected", gang: true, execution: true},
+		{name: "single_pending_competitor_fits", capacity: true, pending: "fits"},
+		{name: "single_pending_competitor_blocks", capacity: true, pending: "blocks"},
+		{name: "gang_pending_competitor_fits", gang: true, capacity: true, pending: "fits"},
+		{name: "gang_pending_competitor_blocks", gang: true, capacity: true, pending: "blocks"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			objects, source := validSingleSourceObjects()
@@ -54,6 +59,9 @@ func TestWorkerIntegration(t *testing.T) {
 				configName = "ome-scheduler.yaml"
 			}
 			configureWorkerObjects(objects, tc.gang, tc.capacity)
+			if tc.pending != "" {
+				objects = addWorkerPendingCompetitor(objects, tc.gang, tc.pending == "blocks")
+			}
 			config, err := filepath.Abs(filepath.Join("..", "..", "simulator", "examples", configName))
 			if err != nil {
 				t.Fatal(err)
@@ -116,7 +124,7 @@ func TestWorkerIntegration(t *testing.T) {
 			if result.RequestID != request.RequestID || result.SnapshotID != request.SnapshotID || result.Profile != request.Profile || !result.SnapshotTime.Equal(&request.SnapshotTime) {
 				t.Fatal("worker did not preserve request identity")
 			}
-			if tc.capacity {
+			if tc.capacity && tc.pending != "blocks" {
 				if err := scheduling.ValidateResult(request, result); err != nil {
 					t.Fatalf("feasible fixture rejected: %v; result=%+v", err, result)
 				}
@@ -130,6 +138,9 @@ func TestWorkerIntegration(t *testing.T) {
 				for _, placement := range result.Placements {
 					if !strings.HasPrefix(placement.NodeName, "target-") {
 						t.Fatalf("placement violated source occupancy/topology: %+v", placement)
+					}
+					if tc.pending != "" && !tc.gang && placement.NodeName != "target-b" {
+						t.Fatalf("replacement ignored the pending competitor occupying target-a: %+v", placement)
 					}
 				}
 			} else {
@@ -152,6 +163,38 @@ func TestWorkerIntegration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func addWorkerPendingCompetitor(objects []client.Object, gang, blocks bool) []client.Object {
+	scheduler := "default-scheduler"
+	if gang {
+		scheduler = "ome-scheduler"
+	}
+	pending := &corev1.Pod{ObjectMeta: captureMeta("pending-competitor"), Spec: sourcePodSpec(scheduler), Status: corev1.PodStatus{Phase: corev1.PodPending}}
+	priority := int32(200)
+	pending.Spec.Priority = &priority
+	pending.Spec.NodeSelector[corev1.LabelHostname] = "target-a"
+	pending.Spec.Containers[0].Resources.Requests["nvidia.com/gpu"] = resource.MustParse("1")
+	pending.Spec.Containers[0].Resources.Limits["nvidia.com/gpu"] = resource.MustParse("1")
+	for _, object := range objects {
+		node, ok := object.(*corev1.Node)
+		if !ok {
+			continue
+		}
+		if blocks && !gang && node.Name == "target-b" {
+			// target-a is the only replacement slot until the competitor takes it.
+			node.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("1")
+			node.Status.Capacity[corev1.ResourceCPU] = resource.MustParse("1")
+		}
+		if !blocks && gang && node.Name == "target-a" {
+			// The competitor and both gang members have three slots in total.
+			node.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("4")
+			node.Status.Capacity[corev1.ResourceCPU] = resource.MustParse("4")
+			node.Status.Allocatable["nvidia.com/gpu"] = resource.MustParse("2")
+			node.Status.Capacity["nvidia.com/gpu"] = resource.MustParse("2")
+		}
+	}
+	return append(objects, pending)
 }
 
 func runWorker(t *testing.T, binary string, args []string, input []byte) []byte {

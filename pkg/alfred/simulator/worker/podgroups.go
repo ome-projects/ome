@@ -135,9 +135,6 @@ func validateGroups(r protocol.Request, s *protocol.Snapshot, gang bool) error {
 		}
 	}
 	for _, p := range s.Pods {
-		if p.Spec.NodeName == "" {
-			return fmt.Errorf("snapshot contains pending non-request Pod %s/%s", p.Namespace, p.Name)
-		}
 		schedulerName := strings.TrimSpace(p.Spec.SchedulerName)
 		if schedulerName == "" {
 			schedulerName = "default-scheduler"

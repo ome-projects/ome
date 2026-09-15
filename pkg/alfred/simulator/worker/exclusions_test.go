@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -52,8 +53,15 @@ func TestPrivateExclusionsKeepSourceOccupancyAndInputImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !node.Spec.Unschedulable {
-		t.Fatal("excluded source must be unavailable to private domain planning")
+	if node.Spec.Unschedulable {
+		t.Fatal("replacement exclusion changed the shared node view")
+	}
+	replacement, err := client.CoreV1().Pods("test").Get(context.Background(), r.ReplacementPods[0].Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(replacement.Spec, r.ReplacementPods[0].Spec) {
+		t.Fatal("exclusion changed replacement scheduling constraints")
 	}
 	if snap.Nodes["source"].Spec.Unschedulable {
 		t.Fatal("changed original snapshot node")
@@ -64,5 +72,36 @@ func TestPrivateExclusionsKeepSourceOccupancyAndInputImmutable(t *testing.T) {
 	}
 	if pod.UID != r.SourcePods[0].UID || pod.Spec.NodeName != "source" || pod.Spec.Containers[0].Resources.Requests.Name("example.com/gpu", resource.DecimalSI).Value() != 1 {
 		t.Fatal("private exclusion lost source occupancy")
+	}
+}
+
+func TestReplacementExclusionsPreserveRequiredAffinityTerms(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		selector        *v1.NodeSelector
+		fitsDestination bool
+	}{
+		{"no affinity", nil, true},
+		{"zero terms", &v1.NodeSelector{}, false},
+		{"empty term", &v1.NodeSelector{NodeSelectorTerms: []v1.NodeSelectorTerm{{}}}, false},
+		{"OR terms", &v1.NodeSelector{NodeSelectorTerms: []v1.NodeSelectorTerm{
+			{MatchExpressions: []v1.NodeSelectorRequirement{{Key: v1.LabelHostname, Operator: v1.NodeSelectorOpIn, Values: []string{"source"}}}},
+			{MatchExpressions: []v1.NodeSelectorRequirement{{Key: v1.LabelHostname, Operator: v1.NodeSelectorOpIn, Values: []string{"destination"}}}},
+		}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProfile(t, defaultConfig)
+			r := testRequest(t, p)
+			r.ReplacementPods[0].Spec.Affinity = &v1.Affinity{NodeAffinity: &v1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: tc.selector}}
+			got := evaluateTest(t, p, r)
+			if (got.Decision == protocol.DecisionFeasible) != tc.fitsDestination {
+				t.Fatalf("fitsDestination=%t: %+v", tc.fitsDestination, got)
+			}
+			for _, placement := range got.Placements {
+				if placement.NodeName != "destination" {
+					t.Fatalf("excluded source accepted: %+v", got)
+				}
+			}
+		})
 	}
 }

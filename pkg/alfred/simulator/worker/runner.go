@@ -71,7 +71,20 @@ func (p *Profile) Evaluate(ctx context.Context, r protocol.Request) (protocol.Re
 		scheduler.WithKubeConfig(kubeconfig), scheduler.WithProfiles(configuration.Profiles...), scheduler.WithComponentConfigVersion(configuration.APIVersion),
 		scheduler.WithParallelism(configuration.Parallelism), scheduler.WithPercentageOfNodesToScore(configuration.PercentageOfNodesToScore),
 		scheduler.WithPodInitialBackoffSeconds(configuration.PodInitialBackoffSeconds), scheduler.WithPodMaxBackoffSeconds(configuration.PodMaxBackoffSeconds),
-		scheduler.WithFrameworkOutOfTreeRegistry(frameworkruntime.Registry{gangpack.Name: gangpack.New, exclusionPlugin: func(context.Context, runtime.Object, fwk.Handle) (fwk.Plugin, error) { return state.excluded, nil }}))
+		scheduler.WithFrameworkOutOfTreeRegistry(frameworkruntime.Registry{
+			gangpack.Name: func(ctx context.Context, args runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+				plugin, err := gangpack.New(ctx, args, handle)
+				if err != nil {
+					return nil, err
+				}
+				gang, ok := plugin.(*gangpack.GangPack)
+				if !ok {
+					return nil, fmt.Errorf("unexpected OMEGangPack plugin type %T", plugin)
+				}
+				return &excludedGangPack{GangPack: gang, excluded: state.excluded}, nil
+			},
+			exclusionPlugin: func(context.Context, runtime.Object, fwk.Handle) (fwk.Plugin, error) { return state.excluded, nil },
+		}))
 	if err != nil {
 		if ctx.Err() != nil {
 			return unsupported, nil
@@ -98,7 +111,8 @@ func (p *Profile) Evaluate(ctx context.Context, r protocol.Request) (protocol.Re
 		}
 		// Gang rejection is not terminal: OME uses subsequent queue activations to
 		// retry another domain. Single-Pod failure is conservatively Unsupported.
-		if len(r.ReplacementPods) == 1 && !p.gang {
+		key := types.NamespacedName{Namespace: info.Pod.Namespace, Name: info.Pod.Name}
+		if state.replacements[key] && len(r.ReplacementPods) == 1 && !p.gang {
 			state.deny(fmt.Errorf("single Pod scheduling did not complete: %s", status.Message()))
 		}
 	}
@@ -166,8 +180,9 @@ func (f *observedFramework) RunPostBindPlugins(ctx context.Context, cycle fwk.Cy
 	f.Framework.RunPostBindPlugins(ctx, cycle, pod, node)
 	f.state.mu.Lock()
 	defer f.state.mu.Unlock()
-	if !f.state.sealed {
-		f.state.completed[types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}] = true
+	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+	if !f.state.sealed && f.state.replacements[key] {
+		f.state.completed[key] = true
 		f.state.signal()
 	}
 }

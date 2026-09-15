@@ -41,6 +41,7 @@ type sourceState struct {
 	layout  runnerLayout
 	members []podMember
 	groups  []*unstructured.Unstructured
+	pending []corev1.Pod
 }
 
 // BuildRequest constructs a closed scheduling prediction from one validated
@@ -77,6 +78,19 @@ func BuildRequest(s *Snapshot, source Source, profiles scheduling.Config, reques
 	initial := scheduling.Select(profiles, prospective, requireGang)
 	if initial.Status != scheduling.SelectionReady {
 		return scheduling.Request{}, fmt.Errorf("scheduling profile unavailable: %s", initial.Reason)
+	}
+	for i := range state.pending {
+		pod := &state.pending[i]
+		schedulerName := pod.Spec.SchedulerName
+		if schedulerName == "" {
+			schedulerName = corev1.DefaultSchedulerName
+		}
+		if schedulerName != initial.ProfileIdentity().SchedulerName || pod.Labels[labelPodGroup] != "" {
+			return scheduling.Request{}, fmt.Errorf("pending Pod %s/%s requires unsupported scheduler or gang competition", pod.Namespace, pod.Name)
+		}
+		if err := rejectUnsupportedPodInputs(pod); err != nil {
+			return scheduling.Request{}, fmt.Errorf("pending competitor %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
 	}
 
 	replacements, identity, err := cloneMembers(s, source, state.members, requestID)
@@ -336,7 +350,7 @@ func (state *sourceState) readObservedObjects(objects []runtime.RawExtension, so
 				}
 			}
 			if pod.Spec.NodeName == "" {
-				return fmt.Errorf("snapshot contains pending non-request Pod %s/%s", pod.Namespace, pod.Name)
+				state.pending = append(state.pending, pod)
 			}
 		case header.APIVersion == "scheduling.x-k8s.io/v1alpha1" && header.Kind == "PodGroup":
 			var object map[string]any
