@@ -193,7 +193,7 @@ func TestActionReadConfigPreservesOwnershipTimeoutWrapperAndCancellation(t *test
 	require.ErrorIs(t, err, context.Canceled)
 	_, err = f.KubeClientForAction(ctx)
 	require.ErrorIs(t, err, context.Canceled)
-	_, _, err = f.actionConfigAndClient(nil)
+	_, _, err = f.actionConfigAndClient(nil) //nolint:staticcheck // Deliberately test the nil-context refusal boundary.
 	require.Error(t, err)
 	for _, timeout := range []time.Duration{0, 30 * time.Second} {
 		owned, client, err = (&defaultFactory{rest: &rest.Config{Host: "http://example.invalid", Timeout: timeout}}).actionConfigAndClient(context.Background())
