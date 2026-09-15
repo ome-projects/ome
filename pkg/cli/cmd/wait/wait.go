@@ -23,6 +23,7 @@ import (
 )
 
 var (
+	errFlags     = errors.New("InvalidWaitFlags")
 	errPredicate = errors.New("InvalidWaitPredicate: require --for=condition=Ready[=True|False|Unknown]")
 	errName      = errors.New("InvalidInferenceServiceName")
 	errNamespace = errors.New("InvalidNamespace")
@@ -77,6 +78,7 @@ One final typed report is emitted; no raw conditions or API objects are printed.
 			return o.run(cmd.Context(), f, args[0])
 		},
 	}
+	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errFlags })
 	cmd.Flags().StringVar(&o.forValue, "for", "", "Required predicate: condition=Ready[=True|False|Unknown]")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 60*time.Second, "Positive wait timeout, at most 24h")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")

@@ -101,6 +101,31 @@ func TestInvalidArgumentsDoNotResolveConfig(t *testing.T) {
 		require.Zero(t, f.calls.Load())
 	}
 }
+
+func TestFlagParsingErrorsAreClosedAndDoNotResolveConfig(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, tc := range []struct {
+		name string
+		flag string
+	}{
+		{name: "malformed timeout", flag: "--timeout=" + credential},
+		{name: "missing timeout", flag: "--timeout"},
+		{name: "unknown flag", flag: "--" + credential},
+		{name: "malformed help", flag: "--help=" + credential},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &waitFactory{Static: factory.Static{NS: "work"}}
+			out, stderr, err := execute(t, f, "service", "--for=condition=Ready", tc.flag)
+			require.Error(t, err)
+			require.Equal(t, 1, exitcode.FromError(err))
+			require.Empty(t, out)
+			require.Empty(t, stderr)
+			require.NotContains(t, err.Error(), credential)
+			require.EqualError(t, err, "InvalidWaitFlags")
+			require.Zero(t, f.calls.Load())
+		})
+	}
+}
 func TestNotFoundUnmetAndAcquisitionFailureNoReport(t *testing.T) {
 	for _, status := range []int{404, 401, 403, 429, 500} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

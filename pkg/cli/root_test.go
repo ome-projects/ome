@@ -11,9 +11,55 @@ import (
 	"github.com/spf13/pflag"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/rest"
 
 	"sigs.k8s.io/ome/pkg/cli/factory"
 )
+
+type waitFlagFactory struct {
+	factory.Static
+	calls int
+}
+
+func (f *waitFlagFactory) Namespace() (string, bool, error) {
+	f.calls++
+	return "work", false, nil
+}
+
+func (f *waitFlagFactory) RESTConfig() (*rest.Config, error) {
+	f.calls++
+	return nil, nil
+}
+
+func TestRootWaitRejectedFlagsHavePrivateDiagnosticsWithoutAcquisition(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, tc := range []struct {
+		name string
+		flag string
+	}{
+		{name: "malformed timeout", flag: "--timeout=" + credential},
+		{name: "missing timeout", flag: "--timeout"},
+		{name: "unknown flag", flag: "--" + credential},
+		{name: "malformed inherited flag", flag: "--insecure-skip-tls-verify=" + credential},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			f := &waitFlagFactory{}
+			root := NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+			root.SetArgs([]string{"wait", "service", "--for=condition=Ready", tc.flag})
+			code := ExecuteCommand(root, &stderr)
+			if code != 1 || out.Len() != 0 || f.calls != 0 {
+				t.Fatalf("invalid flags acquired config or emitted report: code=%d stdout=%q acquisitions=%d", code, out.String(), f.calls)
+			}
+			if strings.Contains(stderr.String(), credential) {
+				t.Fatalf("rejected flag leaked into stderr: %s", stderr.String())
+			}
+			if stderr.String() != "error: InvalidWaitFlags\n" {
+				t.Fatalf("diagnostic is not closed: %q", stderr.String())
+			}
+		})
+	}
+}
 
 func TestRootCommandTree(t *testing.T) {
 	t.Parallel()
