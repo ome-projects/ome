@@ -101,7 +101,9 @@ func TestRootCommandTree(t *testing.T) {
 		"ome rollout explain",
 		"ome rollout history",
 		"ome rollout pause",
+		"ome rollout promote",
 		"ome rollout resume",
+		"ome rollout rollback",
 		"ome rollout status",
 		"ome rollout validate",
 		"ome runtime",
@@ -267,6 +269,24 @@ func TestRootHelpListsAutoscaleEvidenceCommand(t *testing.T) {
 	}
 	if !bytes.Contains(output.Bytes(), []byte("  autoscale   Inspect autoscaling configuration and evidence\n")) {
 		t.Fatalf("root help does not list autoscale command:\n%s", output.String())
+	}
+}
+
+func TestRootCanaryActionsRegistrationAndClosedParser(t *testing.T) {
+	for _, action := range []string{"promote", "rollback"} {
+		var out, stderr bytes.Buffer
+		root := NewRootCmdWithFactory(factory.Static{}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+		command, _, err := root.Find([]string{"rollout", action})
+		if err != nil || command.Use != action+" INFERENCESERVICE" {
+			t.Fatalf("canary action %s is not registered", action)
+		}
+		if (command.Flags().Lookup("override-analysis") != nil) != (action == "promote") {
+			t.Fatalf("analysis override exposed on wrong action %s", action)
+		}
+		root.SetArgs([]string{"rollout", action, "chat", "--yes=sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"})
+		if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || stderr.String() != "error: invalid rollout action flags; use --help\n" {
+			t.Fatalf("root canary parser: code=%d stdout=%s stderr=%s", code, &out, &stderr)
+		}
 	}
 }
 
