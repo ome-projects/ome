@@ -411,24 +411,24 @@ func (r InstanceStatusReport) Table() report.Table {
 		table.Rows = append(table.Rows, []string{printers.BoundedCell(field, 12), printers.BoundedCell(value, 64)})
 	}
 	add("state", fmt.Sprintf("%s %s[%d] evidence=%s", c.Content.Summary.State, c.Content.Summary.Component, c.Content.Summary.Index, c.Content.Summary.Evidence))
-	add("deployment", fmt.Sprintf("mode=%s source=%s origin=%s evidence=%s", dash(string(c.Content.Deployment.Mode)), dash(string(c.Content.Deployment.Source)), dash(c.Content.Deployment.Origin), c.Content.Deployment.Evidence))
-	add("encoding", fmt.Sprintf("name=%s evidence=%s reason=%s", dash(c.Content.Encoding.Name), c.Content.Encoding.Evidence, dash(string(c.Content.Encoding.UnavailableReason))))
+	add("deployment", fmt.Sprintf("mode=%s source=%s origin=%s evidence=%s", instanceStatusDash(string(c.Content.Deployment.Mode)), instanceStatusDash(string(c.Content.Deployment.Source)), instanceStatusDash(c.Content.Deployment.Origin), c.Content.Deployment.Evidence))
+	add("encoding", fmt.Sprintf("name=%s evidence=%s reason=%s", instanceStatusDash(c.Content.Encoding.Name), c.Content.Encoding.Evidence, instanceStatusDash(string(c.Content.Encoding.UnavailableReason))))
 	if instance := c.Content.Instance; instance != nil {
 		add("instance", fmt.Sprintf("%s inc=%d phase=%s admitted=%t", instance.InferenceReplica, instance.Incarnation, instance.Phase, instance.Admitted))
-		add("revisions", fmt.Sprintf("running=%s target=%s", dash(instance.RunningRevision), dash(instance.TargetRevision)))
+		add("revisions", fmt.Sprintf("running=%s target=%s", instanceStatusDash(instance.RunningRevision), instanceStatusDash(instance.TargetRevision)))
 		add("persisted", fmt.Sprintf("pods=%d serving=%d available=%d", instance.Pods.Total, instance.Pods.Serving, instance.Pods.Available))
 		add("lifecycle", fmt.Sprintf("activeOrdinal=%s readySince=%s", statusInt32(instance.ActiveOrdinal), statusTime(instance.ReadySince)))
 		for _, condition := range instance.Conditions {
-			add("condition", fmt.Sprintf("%s=%s gen=%d evidence=%s reason=%s", condition.Type, condition.Status, condition.ObservedGeneration, condition.Evidence, dash(condition.Reason)))
+			add("condition", fmt.Sprintf("%s=%s gen=%d evidence=%s reason=%s", condition.Type, condition.Status, condition.ObservedGeneration, condition.Evidence, instanceStatusDash(condition.Reason)))
 		}
 		if operation := instance.Operation; operation != nil {
 			add("operation", fmt.Sprintf("%s id=%s step=%s retry=%d", operation.Type, operation.ID, operation.Step, operation.RetryCount))
-			add("op target", fmt.Sprintf("revision=%s reason=%s", dash(operation.TargetRevision), dash(operation.Reason)))
+			add("op target", fmt.Sprintf("revision=%s reason=%s", instanceStatusDash(operation.TargetRevision), instanceStatusDash(operation.Reason)))
 			add("op timing", fmt.Sprintf("start=%s progress=%s deadline=%s", statusTime(operation.StartedAt), statusTime(operation.LastProgressAt), statusTime(operation.Deadline)))
-			add("op nodes", fmt.Sprintf("from=%s surge=%s hints=%s", dash(operation.FromNode), statusInt32(operation.SurgeIndex), dash(strings.Join(operation.TargetNodeHints, ","))))
+			add("op nodes", fmt.Sprintf("from=%s surge=%s hints=%s", instanceStatusDash(operation.FromNode), statusInt32(operation.SurgeIndex), instanceStatusDash(strings.Join(operation.TargetNodeHints, ","))))
 		}
 		if failure := instance.LastFailure; failure != nil {
-			add("failure", fmt.Sprintf("pod=%s container=%s reason=%s exit=%s", failure.PodName, dash(failure.ContainerName), dash(failure.Reason), statusInt32(failure.ExitCode)))
+			add("failure", fmt.Sprintf("pod=%s container=%s reason=%s exit=%s", failure.PodName, instanceStatusDash(failure.ContainerName), instanceStatusDash(failure.Reason), statusInt32(failure.ExitCode)))
 			add("fail time", statusTime(failure.Time))
 		}
 		for _, migration := range instance.Migrations {
@@ -436,7 +436,7 @@ func (r InstanceStatusReport) Table() report.Table {
 		}
 	}
 	for _, pod := range c.Content.Pods {
-		add("pod", fmt.Sprintf("%s %s/%s ready=%s serving=%s restarts=%d node=%s deleting=%t", pod.Name, pod.Runner, pod.Phase, pod.Ready, pod.ServingReady, pod.RestartCount, dash(pod.Node), pod.Deleting))
+		add("pod", fmt.Sprintf("%s %s/%s ready=%s serving=%s restarts=%d node=%s deleting=%t", pod.Name, pod.Runner, pod.Phase, pod.Ready, pod.ServingReady, pod.RestartCount, instanceStatusDash(pod.Node), pod.Deleting))
 	}
 	for _, event := range c.Content.Events {
 		add("event", fmt.Sprintf("%s/%s reason=%s count=%d", event.TargetKind, event.TargetName, event.Reason, event.Count))
@@ -461,40 +461,40 @@ func (r InstanceStatusReport) WideTable() report.Table {
 	}
 	add("apiVersion", c.APIVersion)
 	add("kind", c.Kind)
-	add("metadata namespace", dash(c.Metadata.Namespace))
-	add("metadata name", dash(c.Metadata.Name))
+	add("metadata namespace", instanceStatusDash(c.Metadata.Namespace))
+	add("metadata name", instanceStatusDash(c.Metadata.Name))
 	add("collected at", statusTime(&c.CollectedAt))
 	for index, source := range c.Sources {
 		prefix := fmt.Sprintf("source[%d] ", index)
 		add(prefix+"kind", source.Kind)
-		add(prefix+"namespace", dash(source.Namespace))
+		add(prefix+"namespace", instanceStatusDash(source.Namespace))
 		add(prefix+"name", source.Name)
-		add(prefix+"uid", dash(source.UID))
+		add(prefix+"uid", instanceStatusDash(source.UID))
 		add(prefix+"generation", strconv.FormatInt(source.Generation, 10))
 		add(prefix+"evidence", string(source.Evidence))
 		add(prefix+"collected at", statusTime(&source.CollectedAt))
-		add(prefix+"unavailable", dash(string(source.UnavailableReason)))
+		add(prefix+"unavailable", instanceStatusDash(string(source.UnavailableReason)))
 	}
 	add("state", string(c.Content.Summary.State))
 	add("component", string(c.Content.Summary.Component))
 	add("index", strconv.FormatInt(int64(c.Content.Summary.Index), 10))
 	add("evidence", string(c.Content.Summary.Evidence))
 	add("truncated", strconv.FormatBool(c.Content.Summary.Truncated))
-	add("deployment mode", dash(string(c.Content.Deployment.Mode)))
-	add("deployment source", dash(string(c.Content.Deployment.Source)))
-	add("deployment origin", dash(c.Content.Deployment.Origin))
+	add("deployment mode", instanceStatusDash(string(c.Content.Deployment.Mode)))
+	add("deployment source", instanceStatusDash(string(c.Content.Deployment.Source)))
+	add("deployment origin", instanceStatusDash(c.Content.Deployment.Origin))
 	add("deployment evidence", string(c.Content.Deployment.Evidence))
-	add("deployment unavailable", dash(string(c.Content.Deployment.UnavailableReason)))
-	add("encoding name", dash(c.Content.Encoding.Name))
+	add("deployment unavailable", instanceStatusDash(string(c.Content.Deployment.UnavailableReason)))
+	add("encoding name", instanceStatusDash(c.Content.Encoding.Name))
 	add("encoding evidence", string(c.Content.Encoding.Evidence))
-	add("encoding unavailable", dash(string(c.Content.Encoding.UnavailableReason)))
+	add("encoding unavailable", instanceStatusDash(string(c.Content.Encoding.UnavailableReason)))
 	if instance := c.Content.Instance; instance != nil {
 		add("inference replica", instance.InferenceReplica)
 		add("instance index", strconv.FormatInt(int64(instance.Index), 10))
 		add("incarnation", strconv.FormatInt(instance.Incarnation, 10))
 		add("phase", string(instance.Phase))
-		add("running revision", dash(instance.RunningRevision))
-		add("target revision", dash(instance.TargetRevision))
+		add("running revision", instanceStatusDash(instance.RunningRevision))
+		add("target revision", instanceStatusDash(instance.TargetRevision))
 		add("admitted", strconv.FormatBool(instance.Admitted))
 		add("persisted pods", strconv.FormatInt(int64(instance.Pods.Total), 10))
 		add("persisted serving", strconv.FormatInt(int64(instance.Pods.Serving), 10))
@@ -507,33 +507,33 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add(prefix+"status", condition.Status)
 			add(prefix+"generation", strconv.FormatInt(condition.ObservedGeneration, 10))
 			add(prefix+"evidence", string(condition.Evidence))
-			add(prefix+"reason", dash(condition.Reason))
+			add(prefix+"reason", instanceStatusDash(condition.Reason))
 			add(prefix+"transition", statusTime(condition.LastTransitionTime))
 		}
 		if operation := instance.Operation; operation != nil {
 			add("operation id", operation.ID)
 			add("operation type", operation.Type)
 			add("operation step", operation.Step)
-			add("operation revision", dash(operation.TargetRevision))
-			add("operation reason", dash(operation.Reason))
+			add("operation revision", instanceStatusDash(operation.TargetRevision))
+			add("operation reason", instanceStatusDash(operation.Reason))
 			add("operation retries", strconv.FormatInt(int64(operation.RetryCount), 10))
 			add("operation surge index", statusInt32(operation.SurgeIndex))
-			add("operation from node", dash(operation.FromNode))
+			add("operation from node", instanceStatusDash(operation.FromNode))
 			if len(operation.TargetNodeHints) == 0 {
 				add("operation target node", "-")
 			}
 			for _, node := range operation.TargetNodeHints {
 				add("operation target node", node)
 			}
-			add("operation request UUID", dash(operation.RequestUUID))
+			add("operation request UUID", instanceStatusDash(operation.RequestUUID))
 			add("operation started", statusTime(operation.StartedAt))
 			add("operation progress", statusTime(operation.LastProgressAt))
 			add("operation deadline", statusTime(operation.Deadline))
 		}
 		if failure := instance.LastFailure; failure != nil {
 			add("failure pod", failure.PodName)
-			add("failure container", dash(failure.ContainerName))
-			add("failure reason", dash(failure.Reason))
+			add("failure container", instanceStatusDash(failure.ContainerName))
+			add("failure reason", instanceStatusDash(failure.Reason))
 			add("failure exit code", statusInt32(failure.ExitCode))
 			add("failure time", statusTime(failure.Time))
 		}
@@ -546,15 +546,15 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add(prefix+"surge index", statusInt32(migration.SurgeInstance))
 			add(prefix+"phase", migration.Phase)
 			add(prefix+"attempt", strconv.FormatInt(int64(migration.Attempt), 10))
-			add(prefix+"from node", dash(migration.FromNode))
+			add(prefix+"from node", instanceStatusDash(migration.FromNode))
 			if len(migration.TargetNodeHints) == 0 {
 				add(prefix+"target node", "-")
 			}
 			for _, node := range migration.TargetNodeHints {
 				add(prefix+"target node", node)
 			}
-			add(prefix+"reason", dash(migration.Reason))
-			add(prefix+"message", dash(migration.Message))
+			add(prefix+"reason", instanceStatusDash(migration.Reason))
+			add(prefix+"message", instanceStatusDash(migration.Message))
 			add(prefix+"started", statusTime(migration.StartedAt))
 			add(prefix+"allocated", statusTime(migration.AllocatedAt))
 			add(prefix+"deadline", statusTime(migration.Deadline))
@@ -565,13 +565,13 @@ func (r InstanceStatusReport) WideTable() report.Table {
 	for index, pod := range c.Content.Pods {
 		prefix := fmt.Sprintf("pod[%d] ", index)
 		add(prefix+"name", pod.Name)
-		add(prefix+"runner", dash(pod.Runner))
-		add(prefix+"revision", dash(pod.Revision))
+		add(prefix+"runner", instanceStatusDash(pod.Runner))
+		add(prefix+"revision", instanceStatusDash(pod.Revision))
 		add(prefix+"incarnation", strconv.FormatInt(pod.Incarnation, 10))
 		add(prefix+"phase", pod.Phase)
 		add(prefix+"ready", pod.Ready)
 		add(prefix+"serving ready", pod.ServingReady)
-		add(prefix+"node", dash(pod.Node))
+		add(prefix+"node", instanceStatusDash(pod.Node))
 		add(prefix+"restarts", strconv.FormatInt(int64(pod.RestartCount), 10))
 		add(prefix+"deleting", strconv.FormatBool(pod.Deleting))
 	}
@@ -587,7 +587,7 @@ func (r InstanceStatusReport) WideTable() report.Table {
 	for index, issue := range c.Content.Issues {
 		prefix := fmt.Sprintf("issue[%d] ", index)
 		add(prefix+"code", string(issue.Code))
-		add(prefix+"unavailable", dash(string(issue.UnavailableReason)))
+		add(prefix+"unavailable", instanceStatusDash(string(issue.UnavailableReason)))
 	}
 	for index, warning := range c.Warnings {
 		add(fmt.Sprintf("warning[%d] code", index), string(warning.Code))
@@ -672,7 +672,7 @@ func copyInstanceStatusBool(value *bool) *bool {
 	return &copy
 }
 
-func dash(value string) string {
+func instanceStatusDash(value string) string {
 	if value == "" {
 		return "-"
 	}
