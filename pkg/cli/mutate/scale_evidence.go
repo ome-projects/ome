@@ -17,9 +17,10 @@ var ErrScaleWork = errors.New("manual scale refused: selected lifecycle, migrati
 // ScaleEvidence can only be minted after full selected-replica and Scale
 // inspection. It carries no externally settable safety booleans.
 type ScaleEvidence struct {
-	parent  *v1beta1.InferenceService
-	replica *v1beta1.InferenceReplica
-	source  effective.ManualScaleSource
+	parent   *v1beta1.InferenceService
+	replica  *v1beta1.InferenceReplica
+	source   effective.ManualScaleSource
+	replicas map[v1beta1.ComponentType]*v1beta1.InferenceReplica
 }
 
 func (ScaleEvidence) MarshalJSON() ([]byte, error) { return nil, ErrScaleEvidence }
@@ -55,7 +56,7 @@ func InspectScaleEvidence(parent *v1beta1.InferenceService, replica *v1beta1.Inf
 	if row.active || scaleLifecycleWork(replica) {
 		return ScaleEvidence{}, ErrScaleWork
 	}
-	return ScaleEvidence{parent: parent.DeepCopy(), replica: replica.DeepCopy(), source: source}, nil
+	return ScaleEvidence{parent: parent.DeepCopy(), replica: replica.DeepCopy(), source: source, replicas: map[v1beta1.ComponentType]*v1beta1.InferenceReplica{replica.Spec.Component: replica.DeepCopy()}}, nil
 }
 
 func scaleLifecycleWork(replica *v1beta1.InferenceReplica) bool {

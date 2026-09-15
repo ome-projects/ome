@@ -18,8 +18,10 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/paging"
+	"sigs.k8s.io/ome/pkg/cli/pinnedevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/rolloutprojection"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
 func scaleFixture(t *testing.T) (*v1beta1.InferenceService, *effective.RuntimeState, *v1beta1.InferenceReplica, *autoscalingv1.Scale, effective.ManualScaleSource) {
@@ -215,4 +217,48 @@ func TestScalePacingRollbackMailboxRefuses(t *testing.T) {
 	r.Spec.Pacing = &v1beta1.InferenceReplicaPacing{RollbackToRevision: ptr.To("chat-engine-aaaaaaaa")}
 	_, err := InspectScaleEvidence(p, r, s, source, testClock)
 	require.Error(t, err)
+}
+
+func TestScaleCompletedPinnedMultiComponentPlanIsNotActiveWork(t *testing.T) {
+	p, _, r, _, _ := scaleFixture(t)
+	p.Spec.Decoder = &v1beta1.DecoderSpec{}
+	pinnedCanary(t, p)
+	group := &p.Status.Rollout.ActiveRun.Plan.Groups[0]
+	group.Group.Components = append(group.Group.Components, v1beta1.DecoderComponent)
+	digest, err := rolloutpolicy.ProgressionDigest(&group.Group)
+	require.NoError(t, err)
+	group.PortableDigest = digest
+	p.Status.Rollout.ActiveRun.TargetRevisions = append(p.Status.Rollout.ActiveRun.TargetRevisions, v1beta1.RolloutRunTarget{Component: v1beta1.DecoderComponent, Revision: "bbbbbbbb"})
+	engine := p.Status.Components[v1beta1.EngineComponent]
+	engine.RolloutPhase = v1beta1.RolloutPhaseStable
+	engine.LatestRolledoutRevision = "chat-engine-rev-bbbbbbbb"
+	engine.Traffic = []v1beta1.ComponentTrafficTarget{{RevisionName: "chat-engine-rev-bbbbbbbb", Percent: 100}}
+	p.Status.Components[v1beta1.EngineComponent] = engine
+	p.Status.Components[v1beta1.DecoderComponent] = v1beta1.ComponentStatusSpec{RolloutPhase: v1beta1.RolloutPhaseStable, LatestRolledoutRevision: "chat-decoder-rev-bbbbbbbb", LatestReadyRevision: "chat-decoder-rev-bbbbbbbb", Traffic: []v1beta1.ComponentTrafficTarget{{RevisionName: "chat-decoder-rev-bbbbbbbb", Percent: 100}}}
+	p.Status.Canary.CurrentStep = 2
+	p.Status.Canary.ObservedTrafficWeight = 100
+	p.Status.Canary.StableRevisionHash = ""
+	p.Status.Canary.TargetID = "ct1:" + rolloutpolicy.ShortHash([]byte("decoder=bbbbbbbb;engine=bbbbbbbb"))
+	require.True(t, pinnedevidence.ValidActiveRun(p), "fixture must satisfy the real pure pinned-plan validator")
+	projection, err := rolloutprojection.Project(p, testClock)
+	require.NoError(t, err)
+	for _, issue := range projection.Content.Issues {
+		require.Equal(t, reportv1alpha1.RolloutIssueEpochUnverifiable, issue.Code, "fixture must have no malformed applicable rollout evidence")
+	}
+	for _, observed := range projection.Content.Groups {
+		require.Equal(t, reportv1alpha1.RolloutPhaseStable, observed.Phase)
+	}
+	sibling := r.DeepCopy()
+	sibling.Name = "chat-decoder"
+	sibling.UID = "uid-decoder"
+	sibling.ResourceVersion = "91"
+	sibling.Spec.Component = v1beta1.DecoderComponent
+	sibling.Status.CurrentRevision = "chat-decoder-bbbbbbbb"
+	sibling.Status.UpdateRevision = sibling.Status.CurrentRevision
+	require.NoError(t, inspectScaleTargetReplica(p, r, v1beta1.EngineComponent, r.Name, testClock))
+	require.NoError(t, inspectScaleTargetReplica(p, sibling, v1beta1.DecoderComponent, sibling.Name, testClock))
+	evidence := ScaleEvidence{parent: p, replica: r, replicas: map[v1beta1.ComponentType]*v1beta1.InferenceReplica{v1beta1.EngineComponent: r.DeepCopy(), v1beta1.DecoderComponent: sibling.DeepCopy()}}
+	require.NoError(t, requireScaleStable(p, evidence, v1beta1.EngineComponent, testClock))
+	delete(evidence.replicas, v1beta1.DecoderComponent)
+	require.ErrorIs(t, requireScaleStable(p, evidence, v1beta1.EngineComponent, testClock), ErrStale, "the other target must retain authoritative IR evidence")
 }

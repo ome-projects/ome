@@ -21,6 +21,7 @@ import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes"
@@ -29,27 +30,35 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/exitcode"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/pinnedevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 	"sigs.k8s.io/yaml"
 )
 
 const privateSentinel = "private-scale-credential-sentinel"
 
 type nativeAPI struct {
-	mu                sync.Mutex
-	parent            *v1beta1.InferenceService
-	runtime           *v1beta1.ServingRuntime
-	replica           *v1beta1.InferenceReplica
-	scale             *autoscalingv1.Scale
-	paths             []string
-	patches           int
-	patchStatus       int
-	patchResponse     string
-	patchDelay        time.Duration
-	changeFinalParent bool
-	parentReads       int
+	mu                 sync.Mutex
+	parent             *v1beta1.InferenceService
+	runtime            *v1beta1.ServingRuntime
+	replica            *v1beta1.InferenceReplica
+	scale              *autoscalingv1.Scale
+	paths              []string
+	patches            int
+	patchStatus        int
+	patchResponse      string
+	patchDelay         time.Duration
+	changeFinalParent  bool
+	parentReads        int
+	sibling            *v1beta1.InferenceReplica
+	siblingReads       int
+	replicaReads       int
+	changeFinalSibling bool
+	finalSibling       func(*v1beta1.InferenceReplica) *v1beta1.InferenceReplica
+	changeFinalReplica bool
 }
 
 func nativeFixture() *nativeAPI {
@@ -61,7 +70,41 @@ func nativeFixture() *nativeAPI {
 	rt := &v1beta1.ServingRuntime{TypeMeta: metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "ServingRuntime"}, ObjectMeta: metav1.ObjectMeta{Name: "simple", Namespace: "prod", UID: "uid-runtime", ResourceVersion: "99", Generation: 1}, Spec: v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Image: "busybox:1.36", Env: []corev1.EnvVar{{Name: "SYNTHETIC_SECRET", Value: privateSentinel}}}}}}}
 	r := &v1beta1.InferenceReplica{TypeMeta: metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceReplica"}, ObjectMeta: metav1.ObjectMeta{Name: "chat-engine", Namespace: "prod", UID: "uid-ir", ResourceVersion: "81", Generation: 2, Annotations: map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "7"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: p.UID, Controller: ptr.To(true)}}}, Spec: v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: "chat"}, Component: v1beta1.EngineComponent, Replicas: ptr.To[int32](1), Autoscaler: p.Spec.Engine.Autoscaler.DeepCopy()}, Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 2, Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1, AvailableReplicas: 1, CurrentRevision: "chat-engine-aaaaaaaa", UpdateRevision: "chat-engine-aaaaaaaa", InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}}}
 	s := &autoscalingv1.Scale{TypeMeta: metav1.TypeMeta{APIVersion: "autoscaling/v1", Kind: "Scale"}, ObjectMeta: metav1.ObjectMeta{Name: r.Name, Namespace: r.Namespace, UID: r.UID, ResourceVersion: r.ResourceVersion}, Spec: autoscalingv1.ScaleSpec{Replicas: 1}, Status: autoscalingv1.ScaleStatus{Replicas: 1, Selector: privateSentinel}}
+	r.Spec.Runners = []v1beta1.Runner{{Name: "default", Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "busybox:1.36", Env: []corev1.EnvVar{{Name: "SYNTHETIC_SECRET", Value: privateSentinel}}}}}}}}
 	return &nativeAPI{parent: p, runtime: rt, replica: r, scale: s}
+}
+
+func completedNativeFixture(t *testing.T) *nativeAPI {
+	t.Helper()
+	a := nativeFixture()
+	a.parent.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: a.parent.Spec.Engine.ComponentExtensionSpec}
+	group := v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, Canary: &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{{Capacity: intstr.FromString("50%"), Traffic: 50}, {Capacity: intstr.FromString("100%"), Traffic: 100}}}}
+	digest, err := rolloutpolicy.ProgressionDigest(&group)
+	require.NoError(t, err)
+	pinned := metav1.NewTime(time.Date(2026, 9, 15, 20, 59, 0, 0, time.UTC))
+	a.parent.Status.Rollout = &v1beta1.RolloutStatus{ActiveRun: &v1beta1.RolloutRun{RunID: "chat-0123456789ab", OpenedAt: pinned, PinnedAt: pinned, Plan: v1beta1.RolloutRunPlan{Groups: []v1beta1.RolloutRunGroup{{Group: group, Source: v1beta1.RolloutPlanSourceInline, PortableDigest: digest}}}, TargetRevisions: []v1beta1.RolloutRunTarget{{Component: v1beta1.EngineComponent, Revision: "bbbbbbbb"}, {Component: v1beta1.DecoderComponent, Revision: "bbbbbbbb"}}}}
+	a.parent.Status.Canary = &v1beta1.CanaryStatus{TargetID: "ct1:" + rolloutpolicy.ShortHash([]byte("decoder=bbbbbbbb;engine=bbbbbbbb")), CanaryRevisionHash: "bbbbbbbb", CurrentStep: 2, ObservedTrafficWeight: 100}
+	for _, component := range group.Components {
+		name := "chat-" + string(component)
+		status := a.parent.Status.Components[v1beta1.EngineComponent]
+		status.ScaleTargetRef = &v1beta1.ScaleTargetRef{APIVersion: "ome.io/v1beta1", Kind: "InferenceReplica", Name: name}
+		status.LatestReadyRevision = name + "-rev-bbbbbbbb"
+		status.LatestRolledoutRevision = name + "-rev-bbbbbbbb"
+		status.Traffic = []v1beta1.ComponentTrafficTarget{{RevisionName: name + "-rev-bbbbbbbb", Percent: 100}}
+		status.Lifecycle = &v1beta1.LifecycleStatus{CurrentRevision: name + "-bbbbbbbb", UpdateRevision: name + "-bbbbbbbb"}
+		a.parent.Status.Components[component] = status
+	}
+	a.replica.Status.CurrentRevision = "chat-engine-bbbbbbbb"
+	a.replica.Status.UpdateRevision = a.replica.Status.CurrentRevision
+	a.sibling = a.replica.DeepCopy()
+	a.sibling.Name = "chat-decoder"
+	a.sibling.UID = "uid-decoder"
+	a.sibling.ResourceVersion = "91"
+	a.sibling.Spec.Component = v1beta1.DecoderComponent
+	a.sibling.Status.CurrentRevision = "chat-decoder-bbbbbbbb"
+	a.sibling.Status.UpdateRevision = a.sibling.Status.CurrentRevision
+	require.True(t, pinnedevidence.ValidActiveRun(a.parent))
+	return a
 }
 
 func (a *nativeAPI) handler(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +133,32 @@ func (a *nativeAPI) handler(w http.ResponseWriter, r *http.Request) {
 	case "/apis/ome.io/v1beta1/namespaces/prod/servingruntimes/simple":
 		write(a.runtime)
 	case "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine":
-		write(a.replica)
+		a.replicaReads++
+		replica := a.replica.DeepCopy()
+		if a.changeFinalReplica && a.replicaReads > 1 {
+			replica.ResourceVersion = "changed"
+		}
+		write(replica)
+	case "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-decoder":
+		a.siblingReads++
+		if a.sibling == nil {
+			w.WriteHeader(http.StatusNotFound)
+			write(metav1.Status{Status: "Failure", Reason: metav1.StatusReasonNotFound, Code: 404})
+			return
+		}
+		sibling := a.sibling.DeepCopy()
+		if a.changeFinalSibling && a.siblingReads > 1 {
+			sibling.ResourceVersion = "changed"
+		}
+		if a.finalSibling != nil && a.siblingReads > 1 {
+			sibling = a.finalSibling(sibling)
+			if sibling == nil {
+				w.WriteHeader(http.StatusNotFound)
+				write(metav1.Status{Status: "Failure", Reason: metav1.StatusReasonNotFound, Message: privateSentinel, Code: 404})
+				return
+			}
+		}
+		write(sibling)
 	case "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine/scale":
 		if r.Method == "GET" {
 			write(a.scale)
@@ -205,6 +273,8 @@ func TestScaleRealLocalhostFourFormatsAndThreeDryModes(t *testing.T) {
 				require.Zero(t, f.cachedCalls)
 				require.Equal(t, map[bool]int{true: 0, false: 1}[dry == "client"], api.patches)
 				require.GreaterOrEqual(t, api.parentReads, 2)
+				require.Zero(t, api.siblingReads, "no ActiveRun must not acquire another IR")
+				require.Equal(t, 2, api.replicaReads, "selected IR is revalidated even without a pinned run")
 				require.Contains(t, stderr, "ALPHA guarded scale preview")
 				require.NotContains(t, out+stderr, privateSentinel)
 				require.NotContains(t, out+stderr, "synthetic-kubeconfig")
@@ -254,6 +324,131 @@ func TestScaleRealLocalhostFinalSourceDriftAndDefaultRefusal(t *testing.T) {
 	}
 }
 
+func TestScaleRealLocalhostCompletedPinnedPlan(t *testing.T) {
+	for _, mode := range []string{"completed", "contradictory", "sibling drift"} {
+		t.Run(mode, func(t *testing.T) {
+			a := completedNativeFixture(t)
+			if mode == "contradictory" {
+				a.sibling.Status.UpdateRevision = "chat-decoder-cccccccc"
+				a.sibling.Status.CurrentRevision = a.sibling.Status.UpdateRevision
+			}
+			a.changeFinalSibling = mode == "sibling drift"
+			out, stderr, err, _ := runNativeCommand(t, a, []string{"chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", "-o=json"})
+			if mode == "completed" {
+				require.NoError(t, err)
+				require.Contains(t, out, `"accepted": true`)
+				require.Equal(t, 1, a.patches)
+				require.Equal(t, 2, a.siblingReads)
+				require.Contains(t, stderr, "pinned sibling proof")
+				require.Contains(t, out, "ConditionalPinnedIRReads")
+			} else {
+				require.Error(t, err)
+				require.Empty(t, out)
+				require.Zero(t, a.patches)
+				require.NotContains(t, stderr+err.Error(), privateSentinel)
+			}
+			for _, path := range a.paths {
+				require.NotContains(t, path, "chat-decoder/scale")
+				require.NotContains(t, path, "LIST")
+				require.NotContains(t, path, "secrets")
+			}
+		})
+	}
+}
+
+func TestScaleRealLocalhostPinnedSiblingRefusals(t *testing.T) {
+	changes := []struct {
+		name string
+		edit func(*nativeAPI)
+	}{
+		{"missing status ref", func(a *nativeAPI) {
+			s := a.parent.Status.Components[v1beta1.DecoderComponent]
+			s.ScaleTargetRef = nil
+			a.parent.Status.Components[v1beta1.DecoderComponent] = s
+		}},
+		{"wrong ref kind", func(a *nativeAPI) {
+			a.parent.Status.Components[v1beta1.DecoderComponent].ScaleTargetRef.Kind = "Deployment"
+		}},
+		{"wrong ref version", func(a *nativeAPI) {
+			a.parent.Status.Components[v1beta1.DecoderComponent].ScaleTargetRef.APIVersion = "apps/v1"
+		}},
+		{"unsafe ref path", func(a *nativeAPI) {
+			a.parent.Status.Components[v1beta1.DecoderComponent].ScaleTargetRef.Name = "../../secrets/" + privateSentinel
+		}},
+		{"missing sibling", func(a *nativeAPI) { a.sibling = nil }},
+		{"wrong key", func(a *nativeAPI) { a.sibling.Name = "other" }},
+		{"wrong namespace", func(a *nativeAPI) { a.sibling.Namespace = "other" }},
+		{"wrong component", func(a *nativeAPI) { a.sibling.Spec.Component = v1beta1.EngineComponent }},
+		{"wrong parent owner", func(a *nativeAPI) { a.sibling.OwnerReferences[0].UID = "other" }},
+		{"missing UID", func(a *nativeAPI) { a.sibling.UID = "" }},
+		{"missing RV", func(a *nativeAPI) { a.sibling.ResourceVersion = "" }},
+		{"missing own generation", func(a *nativeAPI) { a.sibling.Generation = 0 }},
+		{"stale own status", func(a *nativeAPI) { a.sibling.Status.ObservedGeneration-- }},
+		{"future own status", func(a *nativeAPI) { a.sibling.Status.ObservedGeneration++ }},
+		{"wrong parent stamp", func(a *nativeAPI) {
+			a.sibling.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "6"
+		}},
+		{"negative count", func(a *nativeAPI) { a.sibling.Status.Replicas = -1 }},
+		{"unknown phase", func(a *nativeAPI) { a.sibling.Status.InstanceStatuses[0].Phase = "Unknown" }},
+		{"oversize private payload", func(a *nativeAPI) {
+			a.sibling.Spec.Runners[0].Template.Spec.Containers[0].Env[0].Value = strings.Repeat("x", 1<<20)
+		}},
+		{"invalid run provenance", func(a *nativeAPI) { a.parent.Status.Rollout.ActiveRun.Plan.Groups[0].PortableDigest = "other" }},
+		{"selected final drift", func(a *nativeAPI) { a.changeFinalReplica = true }},
+	}
+	for _, tc := range changes {
+		t.Run(tc.name, func(t *testing.T) {
+			a := completedNativeFixture(t)
+			tc.edit(a)
+			out, stderr, err, _ := runNativeCommand(t, a, []string{"chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", "-o=json"})
+			require.Error(t, err)
+			require.Empty(t, out)
+			require.Zero(t, a.patches)
+			require.NotContains(t, stderr+err.Error(), privateSentinel)
+			for _, path := range a.paths {
+				require.NotContains(t, path, "secrets")
+				require.NotContains(t, path, "chat-decoder/scale")
+			}
+		})
+	}
+}
+
+func TestScaleRealLocalhostFinalSiblingProofDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*v1beta1.InferenceReplica) *v1beta1.InferenceReplica
+	}{
+		{"missing", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica { return nil }},
+		{"UID", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica { r.UID = "changed"; return r }},
+		{"RV", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica { r.ResourceVersion = "changed"; return r }},
+		{"generation", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica {
+			r.Generation++
+			r.Status.ObservedGeneration++
+			return r
+		}},
+		{"private spec", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica {
+			r.Spec.Runners[0].Template.Spec.Containers[0].Image = privateSentinel
+			return r
+		}},
+		{"status", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica { r.Status.ReadyReplicas = 0; return r }},
+		{"deletion", func(r *v1beta1.InferenceReplica) *v1beta1.InferenceReplica {
+			r.DeletionTimestamp = ptr.To(metav1.Now())
+			return r
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := completedNativeFixture(t)
+			a.finalSibling = tc.edit
+			out, stderr, err, _ := runNativeCommand(t, a, []string{"chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", "--dry-run=client", "-o=json"})
+			require.Error(t, err)
+			require.Empty(t, out)
+			require.Zero(t, a.patches)
+			require.Equal(t, 2, a.siblingReads)
+			require.NotContains(t, stderr+err.Error(), privateSentinel)
+		})
+	}
+}
+
 // Root supplies the built actual CLI after registration. This test never
 // reaches a cluster and exercises the native process against the same API.
 func TestScaleActualBinaryLocalhostMatrix(t *testing.T) {
@@ -279,6 +474,87 @@ func TestScaleActualBinaryLocalhostMatrix(t *testing.T) {
 				require.Equal(t, map[bool]int{true: 0, false: 1}[dry == "client"], api.patches)
 			})
 		}
+	}
+}
+
+func TestScaleActualBinaryLocalhostCompletedPlanMatrix(t *testing.T) {
+	binary := os.Getenv("OME_SCALE_BINARY")
+	if binary == "" {
+		t.Skip("root must supply the final corrected actual CLI through OME_SCALE_BINARY")
+	}
+	for _, format := range []string{"table", "wide", "json", "yaml"} {
+		for _, dry := range []string{"none", "client", "server"} {
+			t.Run(format+"/"+dry, func(t *testing.T) {
+				a := completedNativeFixture(t)
+				server := httptest.NewServer(http.HandlerFunc(a.handler))
+				defer server.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, binary, "--kubeconfig", nativeConfig(t, server.URL), "scale", "chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", "--dry-run="+dry, "-o", format)
+				var out, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &out, &stderr
+				require.NoError(t, cmd.Run(), stderr.String())
+				require.NotContains(t, out.String()+stderr.String(), privateSentinel)
+				require.Contains(t, stderr.String(), "pinned sibling proof")
+				require.Equal(t, 2, a.siblingReads)
+				require.Equal(t, map[bool]int{true: 0, false: 1}[dry == "client"], a.patches)
+				for _, path := range a.paths {
+					require.NotContains(t, path, "chat-decoder/scale")
+					require.NotContains(t, path, "secrets")
+				}
+			})
+		}
+	}
+}
+
+type privateErrorWriter struct{}
+
+func (privateErrorWriter) Write([]byte) (int, error) { return 0, errors.New(privateSentinel) }
+
+func TestScaleRealLocalhostOutputFailureTimeoutAndCancellation(t *testing.T) {
+	for _, mode := range []string{"preview writer", "result writer", "patch timeout", "cancelled"} {
+		t.Run(mode, func(t *testing.T) {
+			a := nativeFixture()
+			if mode == "patch timeout" {
+				a.patchDelay = time.Second
+			}
+			server := httptest.NewServer(http.HandlerFunc(a.handler))
+			defer server.Close()
+			flags := genericclioptions.NewConfigFlags(true)
+			config := nativeConfig(t, server.URL)
+			flags.KubeConfig = &config
+			timeout := "200ms"
+			flags.Timeout = &timeout
+			var out, stderr bytes.Buffer
+			streams := genericiooptions.IOStreams{In: bytes.NewBuffer(nil), Out: &out, ErrOut: &stderr}
+			if mode == "preview writer" {
+				streams.ErrOut = privateErrorWriter{}
+			}
+			if mode == "result writer" {
+				streams.Out = privateErrorWriter{}
+			}
+			cmd := NewCmd(factory.New(flags), streams)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if mode == "cancelled" {
+				cancel()
+			}
+			cmd.SetContext(ctx)
+			cmd.SetArgs([]string{"chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", "-o=json"})
+			err := cmd.Execute()
+			require.Error(t, err)
+			require.Empty(t, out.String())
+			require.NotContains(t, stderr.String()+err.Error(), privateSentinel)
+			patches, _, paths := a.observed()
+			require.Equal(t, map[bool]int{true: 1, false: 0}[mode == "result writer" || mode == "patch timeout"], patches)
+			if mode == "cancelled" {
+				require.Empty(t, paths)
+			}
+			for _, path := range paths {
+				require.NotContains(t, path, "PUT")
+				require.NotContains(t, path, "secrets")
+			}
+		})
 	}
 }
 

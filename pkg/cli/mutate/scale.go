@@ -3,7 +3,6 @@ package mutate
 import (
 	"encoding/json"
 	"errors"
-	"strings"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -61,7 +60,7 @@ func PrepareScale(parent *v1beta1.InferenceService, state *effective.RuntimeStat
 			return ScalePlan{}, ErrPending
 		}
 	}
-	if err := requireScaleStable(parent, evidence.replica, component, clock); err != nil {
+	if err := requireScaleStable(parent, evidence, component, clock); err != nil {
 		return ScalePlan{}, err
 	}
 	details := reportv1alpha1.ScaleActionDetails{Component: string(component), Subresource: "/scale", Field: "spec.replicas",
@@ -78,6 +77,15 @@ func PrepareScale(parent *v1beta1.InferenceService, state *effective.RuntimeStat
 			return ScalePlan{}, ErrUnsafeValue
 		}
 		details.Sources = append(details.Sources, scaleSourceIdentity(source))
+	}
+	for component, replica := range evidence.replicas {
+		if component == evidence.replica.Spec.Component {
+			continue
+		}
+		details.Sources = append(details.Sources, reportv1alpha1.ScaleSourceIdentity{Kind: "InferenceReplica", Namespace: replica.Namespace, Name: replica.Name, UID: string(replica.UID), Generation: replica.Generation})
+	}
+	if len(evidence.replicas) > 1 {
+		details.Warnings = append(details.Warnings, "ConditionalPinnedIRReads")
 	}
 	patch, err := json.Marshal([]patchOperation{{Op: "test", Path: "/metadata/uid", Value: string(evidence.replica.UID)}, {Op: "test", Path: "/metadata/resourceVersion", Value: evidence.replica.ResourceVersion}, {Op: "replace", Path: "/spec/replicas", Value: replicas}})
 	if err != nil {
@@ -105,6 +113,13 @@ func scalePartitionAllows(replica *v1beta1.InferenceReplica, replicas int32) boo
 		partitions = append(partitions, replica.Spec.Pacing.Partition)
 	}
 	if lifecycle := replica.Spec.Lifecycle; lifecycle != nil {
+		if strategy := lifecycle.UpdateStrategy; strategy != nil {
+			switch strategy.Type {
+			case "", v1beta1.UpdateStrategySurgeThenDrain, v1beta1.UpdateStrategyRecreatePod, v1beta1.UpdateStrategyInPlaceIfPossible, v1beta1.UpdateStrategyInPlaceOnly:
+			default:
+				return false
+			}
+		}
 		if omevalidation.ValidateLifecycle(&v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{Lifecycle: lifecycle}}}) != nil {
 			return false
 		}
@@ -120,7 +135,8 @@ func scalePartitionAllows(replica *v1beta1.InferenceReplica, replicas int32) boo
 	return true
 }
 
-func requireScaleStable(parent *v1beta1.InferenceService, replica *v1beta1.InferenceReplica, component v1beta1.ComponentType, clock reportv1alpha1.Clock) error {
+func requireScaleStable(parent *v1beta1.InferenceService, evidence ScaleEvidence, component v1beta1.ComponentType, clock reportv1alpha1.Clock) error {
+	replica := evidence.replica
 	projection, err := rolloutprojection.Project(parent, clock)
 	if err != nil {
 		return ErrStale
@@ -156,8 +172,7 @@ func requireScaleStable(parent *v1beta1.InferenceService, replica *v1beta1.Infer
 		}
 	}
 	if parent.Status.Rollout != nil && parent.Status.Rollout.ActiveRun != nil {
-		sources := map[v1beta1.ComponentType]string{component: strings.TrimPrefix(replica.Status.UpdateRevision, replica.Name+"-")}
-		_, err := pinnedWorkActive(parent, ReplicaEvidence{sources: sources}, clock)
+		_, err := pinnedWorkActive(parent, evidence.pinnedSources(), clock)
 		if err != nil {
 			return err
 		}

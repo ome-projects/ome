@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 
@@ -25,11 +26,10 @@ func decodeScaleResponse(raw []byte) (*autoscalingv1.Scale, error) {
 	}
 	var envelope map[string]json.RawMessage
 	if json.Unmarshal(raw, &envelope) != nil ||
-		!identityObject(envelope["spec"], []string{"replicas"}, false) {
+		!identityObject(envelope["spec"], []string{"replicas"}, false) || !explicitScaleCount(envelope["spec"]) {
 		return nil, ErrResponseIdentity
 	}
-	if status, found := envelope["status"]; found &&
-		!identityObject(status, []string{"replicas", "selector"}, false) {
+	if !identityObject(envelope["status"], []string{"replicas", "selector"}, false) || !explicitScaleCount(envelope["status"]) {
 		return nil, ErrResponseIdentity
 	}
 	var scale autoscalingv1.Scale
@@ -37,4 +37,17 @@ func decodeScaleResponse(raw []byte) (*autoscalingv1.Scale, error) {
 		return nil, ErrResponseIdentity
 	}
 	return &scale, nil
+}
+
+func explicitScaleCount(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	value, found := fields["replicas"]
+	if !found || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return false
+	}
+	var count int32
+	return json.Unmarshal(value, &count) == nil && count >= 0
 }

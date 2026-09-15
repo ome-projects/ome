@@ -27,6 +27,14 @@ func (p ScalePlan) WritePreview(out io.Writer, contextName, omeNamespace string,
 		{"parent stamp", strconv.FormatInt(d.ParentGenerationStamp, 10)}, {"component", d.Component}, {"/scale spec.replicas", fmt.Sprintf("%d -> %d", d.PriorReplicas, d.RequestedReplicas)},
 		{"bounds", fmt.Sprintf("%d..%d", d.MinReplicas, d.MaxReplicas)}, {"verified ownership", d.Class + " / " + d.ManagedBy}, {"verified source", string(d.SpecSource)},
 		{"override / transient", "true / true"}, {"dry-run", string(dryRun)}, {"reported Instances", fmt.Sprintf("%d total; %d ready; %d serving; %d available", d.Instances.Replicas, d.Instances.Ready, d.Instances.Serving, d.Instances.Available)}, {"lifecycle / canary", "No observed selected active work"}, {"parent freshness", "Unverifiable (advisory)"}}
+	proofs := 1
+	for _, source := range d.Sources {
+		if source.Kind == "InferenceReplica" {
+			proofs++
+			rows = append(rows, []string{"pinned sibling proof", source.Namespace + "/" + source.Name})
+		}
+	}
+	rows = append(rows, []string{"IR proofs revalidated", strconv.Itoa(proofs)})
 	bounded := make([][]string, 0, len(rows))
 	for _, row := range rows {
 		for len(row[1]) > 54 {
@@ -40,6 +48,9 @@ func (p ScalePlan) WritePreview(out io.Writer, contextName, omeNamespace string,
 		return errorsPreviewWrite
 	}
 	warnings := []string{"This is a transient /scale request, not a change to parent replica intent.", scaleOwnerWarning(d.Class), "Scale-down may drain/delete logical Instances; pause does not freeze teardown.", "IR UID/resourceVersion CAS is not a multi-object transaction."}
+	if proofs > 1 {
+		warnings = append(warnings, "Pinned target proofs require conditional exact sibling IR reads and best-effort revalidation.")
+	}
 	for _, warning := range warnings {
 		if err := writeScaleWarning(out, warning); err != nil {
 			return err

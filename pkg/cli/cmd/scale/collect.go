@@ -19,6 +19,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/transport"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 )
 
 type collected struct {
@@ -30,6 +31,7 @@ type collected struct {
 	reader       ctrlclient.Reader
 	context      string
 	omeNamespace string
+	ome          omeclient.OmeV1beta1Interface
 }
 
 func collect(ctx context.Context, f factory.Factory, omeOptions *namespace.Options, name string, component v1beta1.ComponentType, clock reportv1alpha1.Clock) (*collected, error) {
@@ -143,7 +145,11 @@ func collect(ctx context.Context, f factory.Factory, omeOptions *namespace.Optio
 	if err != nil {
 		return nil, err
 	}
-	return &collected{parent: parent, state: state, source: source, scale: evidence, transport: client, reader: reader, context: contextName, omeNamespace: resolved.OMENamespace}, nil
+	evidence, err = mutate.CollectScalePinnedTargets(ctx, ome.OmeV1beta1(), evidence, clock)
+	if err != nil {
+		return nil, err
+	}
+	return &collected{parent: parent, state: state, source: source, scale: evidence, transport: client, reader: reader, context: contextName, omeNamespace: resolved.OMENamespace, ome: ome.OmeV1beta1()}, nil
 }
 
 func errOrMissing(err error) error {

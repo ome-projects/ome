@@ -54,6 +54,8 @@ Every ownership class, including None, requires --override-autoscaler --yes.
 OMENative does not preserve zero replicas. Scale-down may drain/delete Instances;
 pause does not freeze teardown. Policies, scalers and other components are never changed.
 The action has a 45-second deadline; each request is capped at ten seconds.
+Pinned plans may require up to two additional exact status-selected sibling IR reads.
+Every used IR is revalidated; these reads are best-effort, not a multi-object transaction.
 Credential plugins/custom transports may not honor cancellation.`,
 		SilenceUsage: true, SilenceErrors: true,
 		Args: func(_ *cobra.Command, args []string) error {
@@ -170,6 +172,9 @@ func (o *options) run(ctx context.Context, f factory.Factory, name string, repli
 		return err
 	}
 	if err := evidence.source.Revalidate(ctx, evidence.reader); err != nil {
+		return err
+	}
+	if err := evidence.scale.Revalidate(ctx, evidence.ome, o.clock); err != nil {
 		return err
 	}
 	result := reportv1alpha1.NewActionResult("scale", plan.Target(), reportv1alpha1.DryRunMode(o.dryRun), o.clock)
