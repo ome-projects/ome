@@ -16,12 +16,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	omev1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	r "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
-	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
 
 var fixturePaths = []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta1"}
@@ -81,15 +79,11 @@ func fixtureClients(t *testing.T, override func(http.ResponseWriter, *http.Reque
 	}))
 	t.Cleanup(server.Close)
 	cfg := &rest.Config{Host: server.URL}
-	kube, err := kubernetes.NewForConfig(cfg)
+	clients, err := NewClients(cfg, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ome, err := omeclient.NewForConfig(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return Clients{Discovery: kube.Discovery().RESTClient(), Apps: kube.AppsV1().RESTClient(), OME: ome.OmeV1beta1().RESTClient()}, &paths, mu
+	return clients, &paths, mu
 }
 
 func TestCollectFixedGETsAndNoInventedWorkloadPermissions(t *testing.T) {

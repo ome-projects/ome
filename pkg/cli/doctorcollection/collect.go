@@ -28,7 +28,6 @@ const (
 )
 
 type Selection struct{ ContextName, WorkloadNamespace, OMENamespace, ISVCName string }
-type Clients struct{ Discovery, Apps, OME rest.Interface }
 
 // Snapshot owns only safe facts. Raw API objects/errors never cross this seam.
 type Snapshot struct {
@@ -55,7 +54,7 @@ func Collect(ctx context.Context, clients Clients, selected Selection, timeout t
 	if len(validation.IsDNS1123Label(selected.WorkloadNamespace)) != 0 || len(validation.IsDNS1123Label(selected.OMENamespace)) != 0 || selected.ISVCName != "" && len(validation.IsDNS1123Subdomain(selected.ISVCName)) != 0 {
 		return s, errors.New("invalid doctor source selection")
 	}
-	if clients.Discovery == nil || clients.Apps == nil || selected.ISVCName != "" && clients.OME == nil {
+	if !clients.valid(selected.ISVCName != "") {
 		return s, errors.New("doctor API clients unavailable")
 	}
 	safeContext := (r.DoctorContent{Context: r.DoctorContext{Name: selected.ContextName, WorkloadNamespace: selected.WorkloadNamespace, OMENamespace: selected.OMENamespace}}).Canonical().Context
@@ -67,7 +66,7 @@ func Collect(ctx context.Context, clients Clients, selected Selection, timeout t
 			return s, err
 		}
 		document := &metav1.APIResourceList{}
-		reason := read(collection, timeout, clients.Discovery.Get().AbsPath(group.path).SetHeader("Accept", "application/json"), document)
+		reason := read(collection, timeout, clients.discovery.Get().AbsPath(group.path).SetHeader("Accept", "application/json"), document)
 		if err := collection.Err(); err != nil {
 			return s, err
 		}
@@ -98,7 +97,7 @@ func Collect(ctx context.Context, clients Clients, selected Selection, timeout t
 		return s, err
 	}
 	dep := &appsv1.Deployment{}
-	reason := read(collection, timeout, clients.Apps.Get().Namespace(selected.OMENamespace).Resource("deployments").Name("ome-controller-manager"), dep)
+	reason := read(collection, timeout, clients.apps.Get().Namespace(selected.OMENamespace).Resource("deployments").Name("ome-controller-manager"), dep)
 	if err := collection.Err(); err != nil {
 		return s, err
 	}
@@ -106,17 +105,19 @@ func Collect(ctx context.Context, clients Clients, selected Selection, timeout t
 		reason = r.DoctorMalformed
 	}
 	managerRead := r.DoctorRead{ID: r.DoctorReadManager, Method: "GET", GroupVersion: "apps/v1", Resource: "deployments", Namespace: selected.OMENamespace, Name: "ome-controller-manager", Outcome: r.DoctorAvailable, Evidence: r.EvidenceObserved}
+	var managerGeneration int64
 	if reason != "" {
 		managerRead.Outcome, managerRead.Reason, managerRead.Evidence = r.DoctorUnavailable, reason, r.EvidenceUnavailable
 		s.Warnings = append(s.Warnings, r.Warning{Code: r.WarningSourceUnavailable})
 	} else {
+		managerGeneration = nonnegative(dep.Generation)
 		s.Manager = managerEvidence(dep)
 		if len(dep.Spec.Template.Spec.Containers) > MaxManagerContainers {
 			s.Warnings = append(s.Warnings, r.Warning{Code: r.WarningTruncated})
 		}
 	}
 	s.Reads = append(s.Reads, managerRead)
-	s.Sources = append(s.Sources, r.SourceReference{Kind: "Deployment", Namespace: selected.OMENamespace, Name: "ome-controller-manager", Generation: nonnegative(dep.Generation), Evidence: managerRead.Evidence, UnavailableReason: unavailable(reason)})
+	s.Sources = append(s.Sources, r.SourceReference{Kind: "Deployment", Namespace: selected.OMENamespace, Name: "ome-controller-manager", Generation: managerGeneration, Evidence: managerRead.Evidence, UnavailableReason: unavailable(reason)})
 	isvcRead := r.DoctorRead{ID: r.DoctorReadISVC, Method: "GET", GroupVersion: "ome.io/v1beta1", Resource: "inferenceservices", Namespace: selected.WorkloadNamespace, Name: selected.ISVCName, Outcome: r.DoctorNotRequested, Evidence: r.EvidenceUnavailable}
 	if selected.ISVCName == "" {
 		s.Reads = append(s.Reads, isvcRead)
@@ -127,7 +128,7 @@ func Collect(ctx context.Context, clients Clients, selected Selection, timeout t
 		return s, err
 	}
 	isvc := &omev1.InferenceService{}
-	reason = read(collection, timeout, clients.OME.Get().Namespace(selected.WorkloadNamespace).Resource("inferenceservices").Name(selected.ISVCName), isvc)
+	reason = read(collection, timeout, clients.ome.Get().Namespace(selected.WorkloadNamespace).Resource("inferenceservices").Name(selected.ISVCName), isvc)
 	if err := collection.Err(); err != nil {
 		return s, err
 	}

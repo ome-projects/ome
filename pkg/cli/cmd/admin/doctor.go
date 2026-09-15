@@ -121,17 +121,9 @@ prove an API missing and does not by itself cause exit 2.`,
 			if config.Timeout > 0 && config.Timeout < timeout {
 				timeout = config.Timeout
 			}
-			kube, err := f.KubeClient()
-			if err != nil || kube == nil {
-				return errors.New("doctor Kubernetes client is unavailable")
-			}
-			clients := doctorcollection.Clients{Discovery: kube.Discovery().RESTClient(), Apps: kube.AppsV1().RESTClient()}
-			if isvc != "" {
-				ome, err := f.OMEClient()
-				if err != nil || ome == nil {
-					return errors.New("doctor OME client is unavailable")
-				}
-				clients.OME = ome.OmeV1beta1().RESTClient()
+			clients, err := doctorcollection.NewClients(config, isvc != "")
+			if err != nil {
+				return errors.New("doctor API clients are unavailable")
 			}
 			if ctx.Err() != nil {
 				return errors.New("doctor canceled or timed out")

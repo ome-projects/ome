@@ -177,10 +177,7 @@ func TestDoctorSelectionTimeoutAndLazyOMEClient(t *testing.T) {
 			if err := cmd.Execute(); err != nil || !seen {
 				t.Fatalf("selection failed: %v", err)
 			}
-			wantCalls := []string{"Namespace", "ContextName", "RESTConfig", "KubeClient"}
-			if selected != "" {
-				wantCalls = append(wantCalls, "OMEClient")
-			}
+			wantCalls := []string{"Namespace", "ContextName", "RESTConfig"}
 			if !reflect.DeepEqual(f.calls, wantCalls) {
 				t.Fatalf("unexpected acquisition: %v", f.calls)
 			}
@@ -194,7 +191,7 @@ func TestDoctorSelectionTimeoutAndLazyOMEClient(t *testing.T) {
 }
 
 func TestDoctorPrimaryFailuresAreSafeAndProduceNoReport(t *testing.T) {
-	for _, fail := range []string{"Namespace", "ContextName", "RESTConfig", "KubeClient", "OMEClient", "collection", "contextless", "empty namespace", "empty context", "nil config", "nil kube", "nil ome"} {
+	for _, fail := range []string{"Namespace", "ContextName", "RESTConfig", "collection", "contextless", "empty namespace", "empty context", "nil config", "invalid host", "invalid TLS"} {
 		t.Run(fail, func(t *testing.T) {
 			f := newDoctorFactory()
 			f.fail = fail
@@ -213,10 +210,11 @@ func TestDoctorPrimaryFailuresAreSafeAndProduceNoReport(t *testing.T) {
 				f.Context = ""
 			case "nil config":
 				f.config = nil
-			case "nil kube":
-				f.Kube = nil
-			case "nil ome":
-				f.OME = nil
+			case "invalid host":
+				f.config.Host = "https://SECRET.invalid/%zz"
+			case "invalid TLS":
+				f.config.Host = "https://never-contact.invalid"
+				f.config.CAData = []byte("SECRET invalid certificate")
 			}
 			var out, errOut bytes.Buffer
 			cmd := doctorCommand(injected, &out, &errOut, deps)
@@ -470,16 +468,8 @@ func TestDoctorProductionCollectorEmitsOnlyFixedExactGETs(t *testing.T) {
 					return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(bytes.NewReader(data)), Request: req}, nil
 				})
 			}
-			kube, err := kubernetes.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			client, err := omeclient.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
 			f := newDoctorFactory()
-			f.Kube, f.OME, f.NS, f.Context, f.config = kube, client, workload, "sk-dddddddddddddddddddd", config
+			f.NS, f.Context, f.config = workload, "sk-dddddddddddddddddddd", config
 			deps := doctorDeps("complete")
 			deps.collect = doctorcollection.Collect
 			var out bytes.Buffer
@@ -522,6 +512,7 @@ func TestDoctorProductionCollectorEmitsOnlyFixedExactGETs(t *testing.T) {
 				continue
 			}
 			data := out.Bytes()
+			var err error
 			if format == "yaml" {
 				data, err = yaml.YAMLToJSON(data)
 				if err != nil {
