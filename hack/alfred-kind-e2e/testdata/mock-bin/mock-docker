@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+[[ "$1" == --context && "$2" == colima-alfred-e2e ]] || {
+  echo "mock docker: missing explicit context: $*" >&2
+  exit 1
+}
+shift 2
+[[ "$1" == exec && "$2" == alfred-e2e-control-plane ]] || {
+  echo "mock docker: unexpected node arguments: $*" >&2
+  exit 1
+}
+shift 2
+
+if [[ "$1" == crictl && "$2" == inspecti ]]; then
+  [[ "$3" == docker.io/library/import-2026-09-14@sha256:8feb800000000000000000000000000000000000000000000000000000000000 ]] || {
+    echo "mock docker: unexpected CRI image ID: $3" >&2
+    exit 1
+  }
+  # Reproduce kind load: the Pod imageID is immutable content, but its import
+  # alias has disappeared from CRI's named-image store.
+  exit 1
+fi
+
+[[ "$1" == ctr && "$2" == -n && "$3" == k8s.io && "$4" == content && "$5" == get ]] || {
+  echo "mock docker: unexpected content arguments: $*" >&2
+  exit 1
+}
+case "$6" in
+  sha256:8feb800000000000000000000000000000000000000000000000000000000000)
+    if [[ "${MOCK_AMBIGUOUS_IMAGE:-}" == true ]]; then
+      printf '%s\n' '{"schemaVersion":2,"manifests":[{"digest":"sha256:aee4000000000000000000000000000000000000000000000000000000000000","annotations":{"io.containerd.image.name":"docker.io/alfred-e2e/manager:local"}},{"digest":"sha256:dddd000000000000000000000000000000000000000000000000000000000000","annotations":{"io.containerd.image.name":"docker.io/alfred-e2e/manager:local"}}]}'
+    else
+      printf '%s\n' '{"schemaVersion":2,"manifests":[{"digest":"sha256:aee4000000000000000000000000000000000000000000000000000000000000","annotations":{"io.containerd.image.name":"docker.io/alfred-e2e/manager:local"}},{"digest":"sha256:eeee000000000000000000000000000000000000000000000000000000000000","annotations":{"io.containerd.image.name":"docker.io/alfred-e2e/alfred:local"}}]}'
+    fi
+    ;;
+  sha256:aee4000000000000000000000000000000000000000000000000000000000000)
+    printf '%s\n' '{"schemaVersion":2,"manifests":[{"digest":"sha256:bbbb000000000000000000000000000000000000000000000000000000000000","platform":{"os":"linux","architecture":"arm64"}},{"digest":"sha256:cccc000000000000000000000000000000000000000000000000000000000000","platform":{"os":"linux","architecture":"amd64"}}]}'
+    ;;
+  sha256:bbbb000000000000000000000000000000000000000000000000000000000000)
+    printf '{"schemaVersion":2,"config":{"digest":"%s"}}\n' "${MOCK_CONFIG_ID:-sha256:3aa6200000000000000000000000000000000000000000000000000000000000}"
+    ;;
+  *)
+    echo "mock docker: unexpected content digest: $6" >&2
+    exit 1
+    ;;
+esac

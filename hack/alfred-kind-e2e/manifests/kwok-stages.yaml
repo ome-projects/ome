@@ -1,0 +1,618 @@
+# These stages deliberately target only the four KWOK nodes used by this E2E.
+# Pod status templates are strategic-merge patches in KWOK, so conditions not
+# named below (most importantly the controller-owned ome.io/serving gate) are
+# preserved.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-node-initialize
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Node
+  selector:
+    matchExpressions:
+    - key: .metadata.name
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: '.metadata.annotations["alfred-e2e.ome.io/internal-ip"]'
+      operator: Exists
+    - key: '.status.conditions[] | select(.type == "Ready") | .status'
+      operator: NotIn
+      values:
+      - "True"
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $lastTransitionTime := or .metadata.creationTimestamp $now }}
+      conditions:
+      {{ range NodeConditions }}
+      - lastHeartbeatTime: {{ $now | Quote }}
+        lastTransitionTime: {{ $lastTransitionTime | Quote }}
+        message: {{ .message | Quote }}
+        reason: {{ .reason | Quote }}
+        status: {{ .status | Quote }}
+        type: {{ .type | Quote }}
+      {{ end }}
+      addresses:
+      - address: {{ index .metadata.annotations "alfred-e2e.ome.io/internal-ip" | Quote }}
+        type: InternalIP
+      - address: {{ .metadata.name | Quote }}
+        type: Hostname
+      allocatable:
+        cpu: "64"
+        ephemeral-storage: 1Ti
+        memory: 256Gi
+        nvidia.com/gpu: "8"
+        pods: "110"
+      capacity:
+        cpu: "64"
+        ephemeral-storage: 1Ti
+        memory: 256Gi
+        nvidia.com/gpu: "8"
+        pods: "110"
+      daemonEndpoints:
+        kubeletEndpoint:
+          Port: 10247
+      nodeInfo:
+        architecture: arm64
+        bootID: ""
+        containerRuntimeVersion: kwok-v0.8.0
+        kernelVersion: kwok-v0.8.0
+        kubeProxyVersion: kwok-v0.8.0
+        kubeletVersion: kwok-v0.8.0
+        machineID: ""
+        operatingSystem: linux
+        osImage: KWOK
+        systemUUID: ""
+      phase: Running
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-node-heartbeat
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Node
+  selector:
+    matchExpressions:
+    - key: .metadata.name
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: '.status.conditions[] | select(.type == "Ready") | .status'
+      operator: In
+      values:
+      - "True"
+  delay:
+    durationMilliseconds: 10000
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      {{ range .status.conditions }}
+      - lastHeartbeatTime: {{ $now | Quote }}
+        lastTransitionTime: {{ .lastTransitionTime | Quote }}
+        message: {{ .message | Quote }}
+        reason: {{ .reason | Quote }}
+        status: {{ .status | Quote }}
+        type: {{ .type | Quote }}
+      {{ end }}
+---
+# Health-signal stages are inert until a scenario explicitly annotates one
+# virtual node. They merge only GpuUnhealthy, leaving Ready and every other
+# condition unchanged. Because each stage stops matching after its transition,
+# lastTransitionTime remains stable while the heartbeat stage continues.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-node-gpu-unhealthy
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Node
+  selector:
+    matchAnnotations:
+      alfred-e2e.ome.io/gpu-health: unhealthy
+    matchExpressions:
+    - key: .metadata.name
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: '.status.conditions[] | select(.type == "GpuUnhealthy") | .status'
+      operator: NotIn
+      values:
+      - "True"
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      - lastHeartbeatTime: {{ $now | Quote }}
+        lastTransitionTime: {{ $now | Quote }}
+        message: Synthetic GPU health signal requested by the Alfred E2E scenario
+        reason: AlfredE2EGpuUnhealthy
+        status: "True"
+        type: GpuUnhealthy
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-node-gpu-healthy
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Node
+  selector:
+    matchAnnotations:
+      alfred-e2e.ome.io/gpu-health: healthy
+    matchExpressions:
+    - key: .metadata.name
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: '.status.conditions[] | select(.type == "GpuUnhealthy") | .status'
+      operator: NotIn
+      values:
+      - "False"
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      - lastHeartbeatTime: {{ $now | Quote }}
+        lastTransitionTime: {{ $now | Quote }}
+        message: Synthetic GPU health signal cleared by the Alfred E2E scenario
+        reason: AlfredE2EGpuHealthy
+        status: "False"
+        type: GpuUnhealthy
+---
+# A bound pod first acquires its sandbox/IP and running containers, while the
+# containers remain unready. PodScheduled and all custom readiness-gate
+# conditions are left untouched by the strategic merge.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-start
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: .status.podIP
+      operator: DoesNotExist
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "True"
+        type: Initialized
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "True"
+        type: PodReadyToStartContainers
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: Containers are starting
+        reason: ContainersNotReady
+        status: "False"
+        type: ContainersReady
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: Containers are not ready
+        reason: ContainersNotReady
+        status: "False"
+        type: Ready
+      containerStatuses:
+      {{ range .spec.containers }}
+      - image: {{ .image | Quote }}
+        name: {{ .name | Quote }}
+        ready: false
+        restartCount: 0
+        started: true
+        state:
+          running:
+            startedAt: {{ $now | Quote }}
+      {{ end }}
+      initContainerStatuses:
+      {{ range .spec.initContainers }}
+      - image: {{ .image | Quote }}
+        name: {{ .name | Quote }}
+        ready: true
+        restartCount: 0
+        {{ if eq .restartPolicy "Always" }}
+        started: true
+        state:
+          running:
+            startedAt: {{ $now | Quote }}
+        {{ else }}
+        state:
+          terminated:
+            exitCode: 0
+            finishedAt: {{ $now | Quote }}
+            reason: Completed
+            startedAt: {{ $now | Quote }}
+        {{ end }}
+      {{ end }}
+      {{ $hostIPs := NodeIPsWith .spec.nodeName }}
+      {{ with $hostIPs }}
+      hostIP: {{ index . 0 | Quote }}
+      hostIPs:
+      {{ range . }}
+      - ip: {{ . | Quote }}
+      {{ end }}
+      {{ end }}
+      {{ $podIPs := PodIPsWith .spec.nodeName (or .spec.hostNetwork false) (or .metadata.uid "") (or .metadata.name "") (or .metadata.namespace "") }}
+      {{ with $podIPs }}
+      podIP: {{ index . 0 | Quote }}
+      podIPs:
+      {{ range . }}
+      - ip: {{ . | Quote }}
+      {{ end }}
+      {{ end }}
+      phase: Running
+      startTime: {{ $now | Quote }}
+---
+# Missing/immediate readiness mode becomes ContainersReady on the next watch.
+# A "never" pod intentionally has no matching ContainersReady stage.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-containers-ready
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: .status.phase
+      operator: In
+      values:
+      - Running
+    - key: '.status.conditions[] | select(.type == "ContainersReady") | .status'
+      operator: NotIn
+      values:
+      - "True"
+    - key: '.metadata.annotations["alfred-e2e.ome.io/readiness"]'
+      operator: NotIn
+      values:
+      - delayed
+      - hold-nonzero
+      - never
+  immediateNextStage: true
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $root := . }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: ""
+        reason: ""
+        status: "True"
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      {{ $origin := index $root.status.containerStatuses $index }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: true
+        restartCount: 0
+        started: true
+        state:
+          running:
+            startedAt: {{ or $origin.state.running.startedAt $now | Quote }}
+      {{ end }}
+---
+# hold-nonzero is inherited by every Pod in a workload template. The source
+# Instance (index 0) still becomes healthy, while future/surge Instances stay
+# held until the scenario changes that individual Pod's mode to "immediate".
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-containers-ready-source
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchAnnotations:
+      alfred-e2e.ome.io/readiness: hold-nonzero
+    matchLabels:
+      ome.io/instance-index: "0"
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: .status.phase
+      operator: In
+      values:
+      - Running
+    - key: '.status.conditions[] | select(.type == "ContainersReady") | .status'
+      operator: NotIn
+      values:
+      - "True"
+  immediateNextStage: true
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $root := . }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: ""
+        reason: ""
+        status: "True"
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      {{ $origin := index $root.status.containerStatuses $index }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: true
+        restartCount: 0
+        started: true
+        state:
+          running:
+            startedAt: {{ or $origin.state.running.startedAt $now | Quote }}
+      {{ end }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-containers-ready-delayed
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchAnnotations:
+      alfred-e2e.ome.io/readiness: delayed
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: .status.phase
+      operator: In
+      values:
+      - Running
+    - key: '.status.conditions[] | select(.type == "ContainersReady") | .status'
+      operator: NotIn
+      values:
+      - "True"
+  delay:
+    durationMilliseconds: 5000
+    durationFrom:
+      jq:
+        expression: '.metadata.annotations["alfred-e2e.ome.io/readiness-delay"]'
+  immediateNextStage: true
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $root := . }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: ""
+        reason: ""
+        status: "True"
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      {{ $origin := index $root.status.containerStatuses $index }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: true
+        restartCount: 0
+        started: true
+        state:
+          running:
+            startedAt: {{ or $origin.state.running.startedAt $now | Quote }}
+      {{ end }}
+---
+# Kubelet's Ready condition is ContainersReady AND every declared readiness
+# gate. The set difference treats an absent gate condition as False.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-ready
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: '.status.conditions[] | select(.type == "Ready") | .status'
+      operator: NotIn
+      values:
+      - "True"
+    - key: '.status.conditions[] | select(.type == "ContainersReady") | .status'
+      operator: In
+      values:
+      - "True"
+    - key: >-
+        [.spec.readinessGates[]?.conditionType] -
+        [.status.conditions[]? | select(.status == "True") | .type] |
+        length
+      operator: In
+      values:
+      - "0"
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: ""
+        reason: ""
+        status: "True"
+        type: Ready
+---
+# Re-evaluate an already Ready pod when a controller flips any readiness gate
+# False. This is what makes EndpointSlice readiness follow ome.io/serving.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-not-ready
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: '.status.conditions[] | select(.type == "Ready") | .status'
+      operator: In
+      values:
+      - "True"
+    - key: >-
+        [.spec.readinessGates[]?.conditionType] -
+        [.status.conditions[]? | select(.status == "True") | .type] |
+        length
+      operator: NotIn
+      values:
+      - "0"
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: One or more readiness gates are not True
+        reason: ReadinessGatesNotReady
+        status: "False"
+        type: Ready
+---
+# ContainersReady is also part of kubelet's Ready calculation. It does not
+# normally regress in these fixtures, but keeping this edge closes the state
+# machine if a future acceptance case simulates a container readiness failure.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-not-ready-containers
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: DoesNotExist
+    - key: '.status.conditions[] | select(.type == "Ready") | .status'
+      operator: In
+      values:
+      - "True"
+    - key: '.status.conditions[] | select(.type == "ContainersReady") | .status'
+      operator: NotIn
+      values:
+      - "True"
+  next:
+    statusTemplate: |
+      {{ $now := Now }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        message: Containers are not ready
+        reason: ContainersNotReady
+        status: "False"
+        type: Ready
+---
+# deletionTimestamp is the end of the requested Kubernetes grace period. KWOK
+# waits until that instant and asks the API server to delete the pod. It never
+# empties or removes finalizers, so an owner/controller finalizer still blocks
+# deletion exactly as it would on a real node.
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: alfred-e2e-pod-delete-after-grace
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: .spec.nodeName
+      operator: In
+      values:
+      - alfred-kwok-gpu-a
+      - alfred-kwok-gpu-b
+      - alfred-kwok-gpu-c
+      - alfred-kwok-gpu-d
+    - key: .metadata.deletionTimestamp
+      operator: Exists
+  delay:
+    durationMilliseconds: 0
+    durationFrom:
+      jq:
+        expression: .metadata.deletionTimestamp
+  next:
+    delete: true

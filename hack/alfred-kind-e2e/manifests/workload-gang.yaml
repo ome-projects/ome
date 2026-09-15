@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alfred-e2e
+---
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: alfred-e2e-gang-runtime
+spec:
+  disabled: false
+  supportedModelFormats:
+  - name: alfred-e2e-gang-safetensors
+    modelFormat:
+      name: safetensors
+    modelFramework:
+      name: transformers
+    modelArchitecture: LlamaForCausalLM
+    autoSelect: true
+  engineConfig:
+    leader:
+      terminationGracePeriodSeconds: 3
+      nodeSelector:
+        alfred-e2e/virtual: "true"
+      tolerations:
+      - key: alfred-e2e/virtual
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      runner:
+        name: ome-container
+        image: registry.k8s.io/pause:3.10
+        ports:
+        - name: http1
+          containerPort: 8080
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+            nvidia.com/gpu: "8"
+          limits:
+            cpu: 10m
+            memory: 16Mi
+            nvidia.com/gpu: "8"
+    worker:
+      size: 1
+      terminationGracePeriodSeconds: 3
+      nodeSelector:
+        alfred-e2e/virtual: "true"
+      tolerations:
+      - key: alfred-e2e/virtual
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      runner:
+        name: ome-container
+        image: registry.k8s.io/pause:3.10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+            nvidia.com/gpu: "8"
+          limits:
+            cpu: 10m
+            memory: 16Mi
+            nvidia.com/gpu: "8"
+---
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: gang
+  namespace: alfred-e2e
+  annotations:
+    alfred.ome.io/movable: "true"
+spec:
+  deploymentMode: OMENative
+  runtime:
+    name: alfred-e2e-gang-runtime
+  engine:
+    terminationGracePeriodSeconds: 3
+    minReplicas: 1
+    maxReplicas: 1
+    schedulerName: ome-scheduler
+    topologyKey: topology.kubernetes.io/zone
+    annotations:
+      # Instance 0 starts normally. A migration surge is held until the
+      # scenario annotates only its pods readiness=immediate, leaving the
+      # ISVC template and ControllerRevision unchanged.
+      alfred-e2e.ome.io/readiness: hold-nonzero
+    leader:
+      runner:
+        name: ome-container
+    worker:
+      size: 1
+      runner:
+        name: ome-container
+    lifecycle:
+      instanceReadyTimeout: 2m0s
+      migrationPolicy:
+        mode: Auto
+      readyPolicy: AllPodReady
+      restartPolicy: RecreateInstanceOnPodRestart
+      updateStrategy:
+        type: SurgeThenDrain
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 0
+        inPlaceUpdateStrategy:
+          gracePeriodSeconds: 0
+          markNotReadyDuringLifecycle: true

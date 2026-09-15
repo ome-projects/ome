@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euo pipefail
+
+[[ "$*" == *'--kubeconfig /dev/null --context kind-alfred-e2e'* ]] || {
+  echo "mock kubectl: missing explicit kubeconfig/context: $*" >&2
+  exit 1
+}
+
+case "$*" in
+  *'get deployment ome-controller-manager -o json')
+    printf '%s\n' '{"spec":{"selector":{"matchLabels":{"control-plane":"ome-controller-manager"}}}}'
+    ;;
+  *'get pods -l control-plane=ome-controller-manager -o json')
+    printf '%s\n' '{"items":[{"metadata":{"name":"manager-new"},"spec":{"nodeName":"alfred-e2e-control-plane"},"status":{"containerStatuses":[{"name":"manager","ready":true,"image":"docker.io/alfred-e2e/manager:local","imageID":"docker.io/library/import-2026-09-14@sha256:8feb800000000000000000000000000000000000000000000000000000000000"}]}}]}'
+    ;;
+  *'get node alfred-e2e-control-plane -o json')
+    printf '%s\n' '{"status":{"nodeInfo":{"operatingSystem":"linux","architecture":"arm64"}}}'
+    ;;
+  *)
+    echo "mock kubectl: unexpected arguments: $*" >&2
+    exit 1
+    ;;
+esac

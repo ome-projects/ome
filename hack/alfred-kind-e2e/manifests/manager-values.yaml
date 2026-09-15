@@ -1,0 +1,41 @@
+global:
+  hub: ""
+  imagePullSecrets: []
+
+ome:
+  multiclusterAccess:
+    enabled: false
+  multicluster:
+    enabled: false
+  controller:
+    replicaCount: 1
+    # The manager accepts RawDeployment as the cluster default; the acceptance
+    # fixture opts into OMENative explicitly on its InferenceService.
+    deploymentMode: RawDeployment
+    image: alfred-e2e/manager
+    tag: local
+    nodeSelector:
+      alfred-e2e/infrastructure: "true"
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+modelAgent:
+  enabled: false
+
+prometheus:
+  enabled: false
+
+prometheusRule:
+  enabled: false
+
+podMonitor:
+  enabled: false
