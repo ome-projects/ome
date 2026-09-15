@@ -32,7 +32,7 @@ func discoveryFixture(path string) metav1.APIResourceList {
 	resources := map[string][]string{
 		"v1":                           {"pods:Pod", "events:Event", "configmaps:ConfigMap"},
 		"apps/v1":                      {"deployments:Deployment", "controllerrevisions:ControllerRevision"},
-		"ome.io/v1beta1":               {"inferenceservices:InferenceService", "basemodels:BaseModel", "servingruntimes:ServingRuntime", "clusterbasemodels:ClusterBaseModel:cluster", "clusterservingruntimes:ClusterServingRuntime:cluster", "inferencereplicas:InferenceReplica", "autoscalerpolicies:AutoscalerPolicy", "trafficmaps:TrafficMap", "benchmarkjobs:BenchmarkJob", "finetunedweights:FineTunedWeight", "acceleratorclasses:AcceleratorClass:cluster", "acceleratorquotas:AcceleratorQuota:cluster", "workloadclusters:WorkloadCluster:cluster"},
+		"ome.io/v1beta1":               {"inferenceservices:InferenceService", "basemodels:BaseModel", "servingruntimes:ServingRuntime", "clusterbasemodels:ClusterBaseModel:cluster", "clusterservingruntimes:ClusterServingRuntime:cluster", "inferencereplicas:InferenceReplica", "autoscalerpolicies:AutoscalerPolicy", "trafficmaps:TrafficMap", "benchmarkjobs:BenchmarkJob", "finetunedweights:FineTunedWeight:cluster", "acceleratorclasses:AcceleratorClass:cluster", "acceleratorquotas:AcceleratorQuota:cluster", "workloadclusters:WorkloadCluster:cluster"},
 		"autoscaling/v2":               {"horizontalpodautoscalers:HorizontalPodAutoscaler"},
 		"keda.sh/v1alpha1":             {"scaledobjects:ScaledObject"},
 		"gateway.networking.k8s.io/v1": {"httproutes:HTTPRoute", "gateways:Gateway", "gatewayclasses:GatewayClass:cluster"},

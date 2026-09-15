@@ -176,7 +176,7 @@ func DoctorAPICatalog() []DoctorAPI {
 	add("ome.io/v1beta1", "autoscalerpolicies", "AutoscalerPolicy", true, false)
 	add("ome.io/v1beta1", "trafficmaps", "TrafficMap", true, false)
 	add("ome.io/v1beta1", "benchmarkjobs", "BenchmarkJob", true, false)
-	add("ome.io/v1beta1", "finetunedweights", "FineTunedWeight", true, false)
+	add("ome.io/v1beta1", "finetunedweights", "FineTunedWeight", false, false)
 	add("ome.io/v1beta1", "acceleratorclasses", "AcceleratorClass", false, false)
 	add("ome.io/v1beta1", "acceleratorquotas", "AcceleratorQuota", false, false)
 	add("ome.io/v1beta1", "workloadclusters", "WorkloadCluster", false, false)
@@ -405,7 +405,13 @@ func (c DoctorContent) table(wide bool) report.Table {
 	c = c.Canonical()
 	t := report.Table{Headers: []string{"SUBJECT", "EVIDENCE", "DETAIL"}, Rows: [][]string{}}
 	add := func(a, b, d string) {
-		if !wide {
+		if wide {
+			// Keep full evidence states while bounding physical buffered output.
+			// Three columns plus padding total at most 80 display cells.
+			a = printers.BoundedCell(a, 23)
+			b = printers.BoundedCell(b, 24)
+			d = printers.BoundedCell(d, 27)
+		} else {
 			a = printers.BoundedCell(a, 24)
 			b = printers.BoundedCell(b, 19)
 			d = printers.BoundedCell(d, 29)
@@ -440,6 +446,9 @@ func (c DoctorContent) table(wide bool) report.Table {
 	add("Image-tag comparison", string(c.Version.ImageTagComparison), "Computed; not compatibility")
 	for _, f := range c.Features {
 		add(f.ID, string(f.Availability), "Generation unverifiable")
+	}
+	if wide {
+		add("Full values", "", "Use -o json or -o yaml")
 	}
 	return t
 }
