@@ -26,6 +26,104 @@ const (
 	testIRUID   = types.UID("ir-uid")
 )
 
+func TestBuildRequestPreservesSnapshotTimeAcrossJSON(t *testing.T) {
+	for _, execution := range []bool{false, true} {
+		name := "prediction"
+		if execution {
+			name = "execution"
+		}
+		t.Run(name, func(t *testing.T) {
+			objects, source := validSingleSourceObjects()
+			for _, object := range objects {
+				if node, ok := object.(*corev1.Node); ok {
+					node.Labels[corev1.LabelHostname] = node.Name
+				}
+			}
+			started := time.Date(2026, 9, 14, 5, 0, 0, 123456789, time.FixedZone("capture", -7*60*60))
+			completed := time.Date(2026, 9, 14, 5, 0, 0, 987654321, started.Location())
+			calls := 0
+			snap, err := Capture(context.Background(), captureReader(t, objects...), func() time.Time {
+				calls++
+				if calls == 1 {
+					return started
+				}
+				return completed
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := json.Marshal(snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var request scheduling.Request
+			if execution {
+				request, err = BuildExecutionRequest(snap, source, testProfiles(false), "fractional-clock", []string{"target-a"}, completed.Add(time.Second), time.Minute)
+			} else {
+				request, err = BuildRequest(snap, source, testProfiles(false), "fractional-clock", completed.Add(time.Second), time.Minute)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestJSON, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wireRequest scheduling.Request
+			if err := json.Unmarshal(requestJSON, &wireRequest); err != nil {
+				t.Fatal(err)
+			}
+			pod := wireRequest.ReplacementPods[0]
+			response := scheduling.Result{
+				SchemaVersion: wireRequest.SchemaVersion, RequestID: wireRequest.RequestID,
+				SnapshotID: wireRequest.SnapshotID, SnapshotTime: wireRequest.SnapshotTime, Profile: wireRequest.Profile,
+				Decision: scheduling.DecisionFeasible, Reason: scheduling.SimulationReasonPlacementFound,
+				Placements: []scheduling.Placement{{Pod: scheduling.PodIdentity{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID}, NodeName: "target-a"}},
+			}
+			responseJSON, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result scheduling.Result
+			if err := json.Unmarshal(responseJSON, &result); err != nil {
+				t.Fatal(err)
+			}
+			for _, validate := range []struct {
+				name string
+				fn   func(scheduling.Request, scheduling.Result) error
+			}{{"ValidateResponse", scheduling.ValidateResponse}, {"ValidateResult", scheduling.ValidateResult}} {
+				if err := validate.fn(request, result); err != nil {
+					t.Fatalf("%s rejected JSON-roundtripped feasible result: %v", validate.name, err)
+				}
+				for _, seconds := range []int{-1, 1} {
+					changed := result
+					changed.SnapshotTime = metav1.NewTime(time.Date(2026, 9, 14, 12, 0, seconds, 0, time.UTC))
+					if err := validate.fn(request, changed); err == nil || !strings.Contains(err.Error(), "snapshot time") {
+						t.Fatalf("%s accepted changed timestamp second %d: %v", validate.name, seconds, err)
+					}
+				}
+			}
+			want := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+			if !request.SnapshotTime.Time.Equal(want) || request.SnapshotTime.Time.Location() != time.UTC || !wireRequest.SnapshotTime.Time.Equal(want) {
+				t.Fatalf("request timestamp = %v, wire timestamp = %v, want %v", request.SnapshotTime.Time, wireRequest.SnapshotTime.Time, want)
+			}
+			after, err := json.Marshal(snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(before) != string(after) || !snap.StartedAt.Equal(started) || !snap.CompletedAt.Equal(completed) || request.SnapshotID != snap.ID {
+				t.Fatal("request construction changed full-precision snapshot identity or times")
+			}
+			if err := snap.Validate(started.Add(time.Second), time.Second); err != nil {
+				t.Fatalf("full-precision freshness boundary rejected: %v", err)
+			}
+			if err := snap.Validate(started.Add(time.Second+time.Nanosecond), time.Second); err == nil {
+				t.Fatal("full-precision freshness boundary was weakened")
+			}
+		})
+	}
+}
+
 func TestBuildRequestClonesLivePodWithoutLosingSchedulingInputs(t *testing.T) {
 	objects, source := validSingleSourceObjects()
 	snap := captureSourceFixture(t, objects)

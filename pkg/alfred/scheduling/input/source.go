@@ -116,6 +116,8 @@ func BuildRequest(s *Snapshot, source Source, profiles scheduling.Config, reques
 	}
 	sort.Strings(excluded)
 
+	// metav1.Time JSON has second precision; keep the original request
+	// identical to the envelope returned through the simulator's wire.
 	return scheduling.Request{
 		SchemaVersion:   scheduling.SimulationSchemaV1,
 		RequestID:       requestID,
@@ -124,7 +126,7 @@ func BuildRequest(s *Snapshot, source Source, profiles scheduling.Config, reques
 		SourcePods:      sourcePods,
 		ClusterObjects:  clusterObjects,
 		SnapshotID:      s.ID,
-		SnapshotTime:    metav1.NewTime(s.CompletedAt),
+		SnapshotTime:    metav1.NewTime(s.CompletedAt.UTC().Truncate(time.Second)),
 		RequireGang:     requireGang,
 		ExcludedNodes:   excluded,
 	}, nil
