@@ -196,12 +196,17 @@ func doctorReason(value DoctorReason) DoctorReason {
 }
 
 func doctorName(value string, namespace bool) string {
+	// These public markers must survive the repeated canonicalization used by
+	// envelope and human rendering. They are never valid collector selections.
+	if value == "[REDACTED]" || value == "[OMITTED]" {
+		return value
+	}
 	if namespace {
 		if len(validation.IsDNS1123Label(value)) == 0 {
-			return value
+			return safetext.Sanitize(value, 63)
 		}
 	} else if len(validation.IsDNS1123Subdomain(value)) == 0 {
-		return value
+		return safetext.Sanitize(value, 253)
 	}
 	return ""
 }

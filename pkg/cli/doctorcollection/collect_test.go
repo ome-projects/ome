@@ -298,3 +298,37 @@ func TestCollectDecodedDiscoveryLimitIncludesItsBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectCredentialShapedIdentitiesStayExactForPrivateGETs(t *testing.T) {
+	// These are legal DNS identities; public redaction must not change requests
+	// or the returned object's exact identity checks.
+	name := "sk-aaaaaaaaaaaaaaaaaaaa"
+	workload := "sk-bbbbbbbbbbbbbbbbbbbb"
+	ome := "sk-cccccccccccccccccccc"
+	clients, paths, _ := fixtureClients(t, func(w http.ResponseWriter, req *http.Request) bool {
+		switch req.URL.Path {
+		case "/apis/apps/v1/namespaces/sk-cccccccccccccccccccc/deployments/ome-controller-manager":
+			json.NewEncoder(w).Encode(appsv1.Deployment{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}, ObjectMeta: metav1.ObjectMeta{Name: "ome-controller-manager", Namespace: ome}})
+			return true
+		case "/apis/ome.io/v1beta1/namespaces/sk-bbbbbbbbbbbbbbbbbbbb/inferenceservices/sk-aaaaaaaaaaaaaaaaaaaa":
+			json.NewEncoder(w).Encode(omev1.InferenceService{TypeMeta: metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceService"}, ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: workload, UID: "uid"}})
+			return true
+		default:
+			return false
+		}
+	})
+	s, err := Collect(context.Background(), clients, Selection{ContextName: "local", WorkloadNamespace: workload, OMENamespace: ome, ISVCName: name}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]string{}, fixturePaths...), "/apis/apps/v1/namespaces/sk-cccccccccccccccccccc/deployments/ome-controller-manager", "/apis/ome.io/v1beta1/namespaces/sk-bbbbbbbbbbbbbbbbbbbb/inferenceservices/sk-aaaaaaaaaaaaaaaaaaaa")
+	if !reflect.DeepEqual(*paths, want) {
+		t.Fatalf("GET identities changed: %v", *paths)
+	}
+	if s.Selection.ISVCName != name || s.Selection.WorkloadNamespace != workload || s.Selection.OMENamespace != ome {
+		t.Fatal("private selected identities were redacted before validation")
+	}
+	if s.Reads[1].Outcome != r.DoctorAvailable {
+		t.Fatal("exact private GET identity validation failed")
+	}
+}

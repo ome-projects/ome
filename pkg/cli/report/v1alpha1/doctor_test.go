@@ -136,3 +136,77 @@ func TestDoctorUnavailableCompatibilityCannotSummarizeComplete(t *testing.T) {
 		t.Fatalf("unknown running compatibility summarized as complete: %+v", got)
 	}
 }
+
+func TestDoctorLegalCredentialIdentitiesArePubliclyRedacted(t *testing.T) {
+	// DNS syntax permits these literal credential shapes. Output must not.
+	name := "sk-aaaaaaaaaaaaaaaaaaaa"
+	workload := "sk-bbbbbbbbbbbbbbbbbbbb"
+	ome := "sk-cccccccccccccccccccc"
+	contextName := "sk-dddddddddddddddddddd"
+	r := DoctorReport{Envelope: NewEnvelope("DoctorReport", Metadata{Name: "doctor", Namespace: workload}, DoctorContent{
+		Context: DoctorContext{Name: contextName, WorkloadNamespace: workload, OMENamespace: ome},
+		Reads:   []DoctorRead{{ID: DoctorReadISVC, Namespace: workload, Name: name, Outcome: DoctorAvailable}, {ID: DoctorReadManager, Namespace: ome, Outcome: DoctorAvailable}},
+	}, ClockFunc(func() time.Time { return time.Time{} }))}
+	r.Sources = []SourceReference{{Kind: "InferenceService", Name: name, Namespace: workload, Evidence: EvidenceObserved}, {Kind: "Deployment", Name: "ome-controller-manager", Namespace: ome, Evidence: EvidenceObserved}}
+	before, _ := json.Marshal(r)
+	canonical := r.Canonical()
+	after, _ := json.Marshal(r)
+	if !bytes.Equal(before, after) {
+		t.Fatal("Canonical changed private input identities")
+	}
+	if !reflect.DeepEqual(canonical, canonical.Canonical()) {
+		t.Fatal("redacted representation is not idempotent")
+	}
+	for _, format := range []string{"table", "wide", "json", "yaml"} {
+		t.Run(format, func(t *testing.T) {
+			var out bytes.Buffer
+			if format == "wide" {
+				if err := canonical.Content.WideTable().Write(&out); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := report.Write(&out, report.Format(format), canonical); err != nil {
+				t.Fatal(err)
+			}
+			for _, credential := range []string{name, workload, ome, contextName} {
+				if strings.Contains(out.String(), credential) {
+					t.Fatal("legal credential-shaped identity leaked")
+				}
+			}
+			if !strings.Contains(out.String(), "[REDACTED]") {
+				t.Fatal("missing bounded redaction marker")
+			}
+		})
+	}
+	if canonical.Metadata.Namespace != "[REDACTED]" || canonical.Content.Context.WorkloadNamespace != "[REDACTED]" || canonical.Content.Context.OMENamespace != "[REDACTED]" {
+		t.Fatal("context/envelope namespace boundary not redacted")
+	}
+	for _, read := range canonical.Content.Reads {
+		if read.Namespace != "[REDACTED]" {
+			t.Fatal("read namespace boundary not redacted")
+		}
+		if read.ID == DoctorReadISVC && read.Name != "[REDACTED]" {
+			t.Fatal("read name boundary not redacted")
+		}
+	}
+	for _, source := range canonical.Sources {
+		if source.Namespace != "[REDACTED]" {
+			t.Fatal("source namespace boundary not redacted")
+		}
+		if source.Kind == "InferenceService" && source.Name != "[REDACTED]" {
+			t.Fatal("source name boundary not redacted")
+		}
+	}
+}
+
+func TestDoctorPublicIdentityCanonicalPreservesSafeValuesAndMarkers(t *testing.T) {
+	for _, value := range []string{"team-a", "chat.example", "[REDACTED]", "[OMITTED]"} {
+		row := DoctorRead{ID: DoctorReadISVC, Namespace: "team-a", Name: value, Outcome: DoctorAvailable}
+		c := (DoctorContent{Context: DoctorContext{Name: "[OMITTED]", WorkloadNamespace: "team-a", OMENamespace: "ome"}, Reads: []DoctorRead{row}}).Canonical()
+		if c.Reads[0].Name != value || c.Context.WorkloadNamespace != "team-a" || c.Context.OMENamespace != "ome" || c.Context.Name != "[OMITTED]" {
+			t.Fatalf("changed safe public identity %q", value)
+		}
+		if !reflect.DeepEqual(c, c.Canonical()) {
+			t.Fatal("public identity canonicalization not idempotent")
+		}
+	}
+}
