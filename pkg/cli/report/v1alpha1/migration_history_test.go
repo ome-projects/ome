@@ -63,9 +63,10 @@ func TestMigrationHistoryReportCanonicalIsDeterministicAndOwned(t *testing.T) {
 	assert.Equal(t, []string{"node-a", "node-b"}, canonical.Content.Records[1].TargetNodeHints)
 	assert.Equal(t, []MigrationHistoryIssue{{Code: MigrationHistoryIssueAuditMalformed}}, canonical.Content.Issues)
 	assert.Equal(t, []MigrationHistoryWarning{{Code: MigrationHistoryWarningPartial}}, canonical.Warnings)
-	assert.LessOrEqual(t, printers.CellDisplayWidth(canonical.Content.Records[1].Message), MigrationHistoryMessageMaxDisplayWidth)
-	assert.NotContains(t, canonical.Content.Records[1].Message, "\n")
-	assert.NotContains(t, canonical.Content.Records[1].Message, "\x1b")
+	assert.NotEmpty(t, canonical.Content.Records[0].Message)
+	assert.LessOrEqual(t, printers.CellDisplayWidth(canonical.Content.Records[0].Message), MigrationHistoryMessageMaxDisplayWidth)
+	assert.NotContains(t, canonical.Content.Records[0].Message, "\n")
+	assert.NotContains(t, canonical.Content.Records[0].Message, "\x1b")
 
 	// Canonicalization never mutates caller-owned slices or timestamps.
 	assert.Equal(t, "bbbbbbbb-bbbb", records[0].RequestID)
