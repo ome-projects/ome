@@ -62,6 +62,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome traffic explain",
 		"ome traffic status",
 		"ome version",
+		"ome wait",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("command tree = %v, want %v", got, want)

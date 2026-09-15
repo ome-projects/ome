@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/cmd/status"
 	"sigs.k8s.io/ome/pkg/cli/cmd/traffic"
 	"sigs.k8s.io/ome/pkg/cli/cmd/version"
+	"sigs.k8s.io/ome/pkg/cli/cmd/wait"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 )
 
@@ -72,6 +73,7 @@ explanations, accelerator-selection evidence, and component-aware log streaming.
 	cmd.AddCommand(status.NewCmd(f, streams))
 	cmd.AddCommand(traffic.NewCmd(f, streams))
 	cmd.AddCommand(version.NewCmd(f, streams))
+	cmd.AddCommand(wait.NewCmd(f, streams))
 
 	return cmd
 }
