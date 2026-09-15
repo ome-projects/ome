@@ -11,7 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
-	"k8s.io/client-go/rest"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -200,7 +199,8 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 			if config == nil {
 				return errors.New("action REST configuration is unavailable")
 			}
-			config = rest.CopyConfig(config)
+			localConfig := *config
+			config = &localConfig
 			if config.Timeout <= 0 || config.Timeout > 10*time.Second {
 				config.Timeout = 10 * time.Second
 			}
