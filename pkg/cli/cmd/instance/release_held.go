@@ -227,7 +227,7 @@ func (o *releaseHeldOptions) run(parent context.Context, f factory.Factory, name
 		if e != nil {
 			classified := mutate.GuardedPatchError(e)
 			if exitcode.FromError(classified) == exitcode.MutationConflict {
-				return classified
+				return &exitcode.PreconditionError{Err: errors.New("guarded held-release rejected; inspect instance retry-blocks")}
 			}
 			return errors.New("held-release request outcome unknown; inspect instance retry-blocks before another explicit request")
 		}
