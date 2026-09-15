@@ -19,6 +19,10 @@ type ScaleSourceIdentity struct {
 	Generation int64  `json:"generation"`
 }
 
+func (s ScaleSourceIdentity) displayName() string {
+	return (ActionTarget{Kind: s.Kind, Namespace: s.Namespace, Name: s.Name}).displayName()
+}
+
 type ScaleInstanceCounts struct {
 	Replicas  int32 `json:"replicas"`
 	Ready     int32 `json:"ready"`
@@ -81,9 +85,9 @@ func (r ActionResult) scaleTable(wide bool) report.Table {
 	if wide {
 		rows = append(rows, []string{"IR UID", r.Target.UID}, []string{"IR RV", r.Target.ResourceVersion},
 			[]string{"IR generation", strconv.FormatInt(s.ReplicaGeneration, 10)}, []string{"parent stamp", strconv.FormatInt(s.ParentGenerationStamp, 10)},
-			[]string{"parent", s.Parent.Kind + "/" + s.Parent.Namespace + "/" + s.Parent.Name}, []string{"parent UID", s.Parent.UID})
+			[]string{"parent", s.Parent.displayName()}, []string{"parent UID", s.Parent.UID})
 		for _, source := range s.Sources {
-			rows = append(rows, []string{"source identity", source.Kind + "/" + source.Namespace + "/" + source.Name}, []string{"source UID", source.UID}, []string{"source generation", strconv.FormatInt(source.Generation, 10)})
+			rows = append(rows, []string{"source identity", source.displayName()}, []string{"source UID", source.UID}, []string{"source generation", strconv.FormatInt(source.Generation, 10)})
 		}
 		for _, issue := range s.Issues {
 			rows = append(rows, []string{"issue", issue})

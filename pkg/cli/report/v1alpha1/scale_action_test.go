@@ -18,6 +18,36 @@ func TestActionResultProvidesBoundedWideScaleView(t *testing.T) {
 	require.True(t, ok, "scale action requires a typed wide view")
 }
 
+func TestScaleWideSourceIdentityRespectsResourceScope(t *testing.T) {
+	result := NewActionResult("scale", ActionTarget{Kind: "InferenceReplica", Namespace: "prod", Name: "chat-engine"}, DryRunClient, SystemClock{})
+	result.Scale = &ScaleActionDetails{
+		Parent: ScaleSourceIdentity{Kind: "InferenceService", Namespace: "prod", Name: "chat"},
+		Sources: []ScaleSourceIdentity{
+			{Kind: "ClusterBaseModel", Name: "model"},
+			{Kind: "ClusterServingRuntime", Name: "runtime"},
+			{Kind: "ServingRuntime", Namespace: "prod", Name: "runtime"},
+		},
+	}
+	var identities []string
+	for _, row := range result.WideTable().Rows {
+		if row[0] == "parent" || row[0] == "source identity" {
+			identities = append(identities, row[1])
+		}
+	}
+	require.Equal(t, []string{
+		"InferenceService/prod/chat",
+		"ClusterBaseModel/model",
+		"ClusterServingRuntime/runtime",
+		"ServingRuntime/prod/runtime",
+	}, identities)
+	result.Scale.Parent = ScaleSourceIdentity{Kind: "ClusterServingRuntime", Name: "runtime"}
+	for _, row := range result.WideTable().Rows {
+		if row[0] == "parent" {
+			require.Equal(t, "ClusterServingRuntime/runtime", row[1])
+		}
+	}
+}
+
 func TestScaleActionCanonicalFourViewsAndUnicodeWidth(t *testing.T) {
 	result := NewActionResult("scale", ActionTarget{Kind: "InferenceReplica", Namespace: "prod", Name: "chat-engine", UID: "uid-ir", ResourceVersion: "81"}, DryRunNone, ClockFunc(func() time.Time { return time.Unix(1, 0) }))
 	result.Accepted = true
