@@ -1,0 +1,14 @@
+{
+  "apiVersion": "ome.io/v1beta1",
+  "kind": "WorkloadCluster",
+  "metadata": {"name": "gpu", "generation": 2},
+  "spec": {"clusterSource": {"clusterProfileRef": {"name": "profile"}}},
+  "status": {"conditions": [{
+    "type": "Ready",
+    "status": "False",
+    "observedGeneration": 1,
+    "reason": "PRIVATE-REASON",
+    "message": "PRIVATE-MESSAGE",
+    "lastTransitionTime": "2020-01-02T03:04:05Z"
+  }]}
+}

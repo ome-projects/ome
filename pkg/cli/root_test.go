@@ -30,6 +30,8 @@ func TestRootCommandTree(t *testing.T) {
 		"ome autoscale",
 		"ome autoscale explain",
 		"ome autoscale status",
+		"ome cluster",
+		"ome cluster status",
 		"ome get",
 		"ome instance",
 		"ome instance list",

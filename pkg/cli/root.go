@@ -7,6 +7,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/cli/cmd/accelerator"
 	"sigs.k8s.io/ome/pkg/cli/cmd/autoscale"
+	"sigs.k8s.io/ome/pkg/cli/cmd/cluster"
 	"sigs.k8s.io/ome/pkg/cli/cmd/get"
 	"sigs.k8s.io/ome/pkg/cli/cmd/instance"
 	"sigs.k8s.io/ome/pkg/cli/cmd/logs"
@@ -58,6 +59,7 @@ explanations, accelerator-selection evidence, and component-aware log streaming.
 	// Command families. Keep alphabetical.
 	cmd.AddCommand(accelerator.NewCmd(f, streams))
 	cmd.AddCommand(autoscale.NewCmd(f, streams))
+	cmd.AddCommand(cluster.NewCmd(f, streams))
 	cmd.AddCommand(get.NewCmd(f, streams))
 	cmd.AddCommand(instance.NewCmd(f, streams))
 	cmd.AddCommand(logs.NewCmd(f, streams))
