@@ -7,6 +7,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
+	"sigs.k8s.io/ome/pkg/cli/safetext"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
 )
@@ -47,8 +48,8 @@ func NewWaitReport(metadata Metadata, content WaitContent, clock Clock) WaitRepo
 func (r WaitReport) Canonical() WaitReport {
 	r = WaitReport(Envelope[WaitContent](r).Canonical())
 	r.Kind = WaitReportKind
-	r.Metadata.Name = printers.BoundedCell(r.Metadata.Name, 253)
-	r.Metadata.Namespace = printers.BoundedCell(r.Metadata.Namespace, 63)
+	r.Metadata.Name = safetext.Sanitize(r.Metadata.Name, 253)
+	r.Metadata.Namespace = safetext.Sanitize(r.Metadata.Namespace, 63)
 	// This report intentionally has no generic source identities/warning text.
 	// Its single source and whole-inspection diagnostics are concrete content.
 	r.Sources = []SourceReference{}
@@ -108,7 +109,7 @@ func (c WaitContent) Canonical() WaitContent {
 	if c.Observed.Validity == "Unavailable" {
 		c.Evidence = EvidenceUnavailable
 	}
-	c.ElapsedMilliseconds = max(int64(0), min(c.ElapsedMilliseconds, int64(24*60*60*1000)))
+	c.ElapsedMilliseconds = max(int64(0), c.ElapsedMilliseconds)
 	c.Counts.Gets = max(0, min(c.Counts.Gets, 17282))
 	c.Counts.Watches = max(0, min(c.Counts.Watches, 2))
 	c.Counts.Polls = max(0, min(c.Counts.Polls, 17280))

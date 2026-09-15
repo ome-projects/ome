@@ -257,3 +257,24 @@ func TestConfigurationAndIdentityErrorsStayGeneralAndPrivate(t *testing.T) {
 		require.NotContains(t, err.Error(), "PRIVATE")
 	}
 }
+
+func TestRealWireCredentialShapedMetadataNeverReachesOutput(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, format := range []string{"table", "wide", "json", "yaml"} {
+		t.Run(format, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, "GET", r.Method)
+				require.Equal(t, "/apis/ome.io/v1beta1/namespaces/"+credential+"/inferenceservices/"+credential, r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"apiVersion":"ome.io/v1beta1","kind":"InferenceService","metadata":{"name":"`+credential+`","namespace":"`+credential+`","uid":"uid","resourceVersion":"rv"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`)
+			}))
+			defer server.Close()
+			f := &waitFactory{Static: factory.Static{NS: credential}, config: &rest.Config{Host: server.URL}}
+			out, stderr, err := execute(t, f, credential, "--for=condition=Ready", "-o", format)
+			require.NoError(t, err)
+			require.Empty(t, stderr)
+			require.NotContains(t, out, credential)
+			require.Contains(t, out, "[REDACTED]")
+		})
+	}
+}

@@ -73,3 +73,30 @@ func TestWaitCanonicalDetachesWarningsAndSanitizesUnknownEnums(t *testing.T) {
 	require.NoError(t, report.Write(&output, report.FormatJSON, r))
 	require.NotContains(t, output.String(), "PRIVATE")
 }
+
+func TestWaitElapsedPreservesMeasuredCooperativeOverrun(t *testing.T) {
+	r := waitFixture()
+	r.Content.ElapsedMilliseconds = 86400001
+	require.Equal(t, int64(86400001), r.Canonical().Content.ElapsedMilliseconds)
+	var output bytes.Buffer
+	require.NoError(t, report.Write(&output, report.FormatJSON, r))
+	require.Contains(t, output.String(), `"elapsedMilliseconds": 86400001`)
+	r.Content.ElapsedMilliseconds = -1
+	require.Zero(t, r.Canonical().Content.ElapsedMilliseconds)
+}
+
+func TestWaitCredentialShapedMetadataIsRedactedInEveryView(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	r := waitFixture()
+	r.Metadata = Metadata{Name: credential, Namespace: credential}
+	for _, format := range []report.Format{report.FormatTable, report.FormatJSON, report.FormatYAML} {
+		var output bytes.Buffer
+		require.NoError(t, report.Write(&output, format, r))
+		require.NotContains(t, output.String(), credential)
+		require.Contains(t, output.String(), "[REDACTED]")
+	}
+	var wide bytes.Buffer
+	require.NoError(t, r.WideTable().Write(&wide))
+	require.NotContains(t, wide.String(), credential)
+	require.Contains(t, wide.String(), "[REDACTED]")
+}
