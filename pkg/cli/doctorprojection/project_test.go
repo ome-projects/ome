@@ -82,7 +82,18 @@ func TestProjectUsesOneClockAndSafeImmutableInputs(t *testing.T) {
 		t.Fatal("wide leaked")
 	}
 	s.APIs[0].Availability = r.DoctorAvailable
-	if result.Content.APIs[0].Availability == r.DoctorAvailable && result.Content.APIs[0].Required {
-		t.Fatal("report aliases input")
+	found := false
+	for _, api := range result.Content.APIs {
+		if api.ID != "ome.io/v1beta1/inferenceservices" {
+			continue
+		}
+		found = true
+		if !api.Required || api.Availability != r.DoctorNotDiscoverable {
+			t.Fatal("report aliases input or changed the required API row")
+		}
+		break
+	}
+	if !found {
+		t.Fatal("report omitted inferenceservices")
 	}
 }
