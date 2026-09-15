@@ -130,6 +130,9 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
+	if client == nil {
+		return errors.New("migration action OME client is unavailable")
+	}
 	readCtx, stopRead := context.WithTimeout(ctx, 10*time.Second)
 	v, err := client.OmeV1beta1().InferenceServices(resolved.WorkloadNamespace).Get(readCtx, name, metav1.GetOptions{})
 	readErr := readCtx.Err()
@@ -154,6 +157,9 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 	}
 	if err != nil {
 		return mutate.SafeAPIError(err)
+	}
+	if kube == nil {
+		return errors.New("migration action Kubernetes client is unavailable")
 	}
 	var runtimeClient ctrlclient.Client
 	if bounded, ok := f.(factory.ActionRuntimeResolver); ok {

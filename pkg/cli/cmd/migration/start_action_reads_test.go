@@ -42,6 +42,9 @@ func (f *actionReadStartFactory) OMEClientForAction(ctx context.Context) (versio
 	if f.actionFailure == "OME" {
 		return nil, errors.New("PRIVATE_ACTION_CLIENT")
 	}
+	if f.actionFailure == "nil OME" {
+		return nil, nil
+	}
 	return f.actionOME, ctx.Err()
 }
 
@@ -50,11 +53,14 @@ func (f *actionReadStartFactory) KubeClientForAction(ctx context.Context) (kuber
 	if f.actionFailure == "Kube" {
 		return nil, errors.New("PRIVATE_ACTION_CLIENT")
 	}
+	if f.actionFailure == "nil Kube" {
+		return nil, nil
+	}
 	return f.actionKube, ctx.Err()
 }
 
 func TestStartPrefersActionOwnedReadClientsAndFailsClosed(t *testing.T) {
-	for _, failure := range []string{"", "OME", "Kube"} {
+	for _, failure := range []string{"", "OME", "Kube", "nil OME", "nil Kube"} {
 		t.Run(failure, func(t *testing.T) {
 			fixture := newStartFixture()
 			scheme := runtime.NewScheme()
@@ -79,7 +85,7 @@ func TestStartPrefersActionOwnedReadClientsAndFailsClosed(t *testing.T) {
 			}
 			require.Equal(t, 1, f.omeCalls)
 			wantKube := 1
-			if failure == "OME" {
+			if failure == "OME" || failure == "nil OME" {
 				wantKube = 0
 			}
 			require.Equal(t, wantKube, f.kubeCalls)
