@@ -65,6 +65,39 @@ func TestQuotaReportWriterFailures(t *testing.T) {
 	require.Error(t, QuotaTreeWideTable(value).Write(quotaShortWriter{}))
 }
 
+// The indentation cap must not make successive deep descendants look like
+// siblings. Actual depth stays visible before even a clipped node identity.
+func TestQuotaCompactLabelsCompressedDepth(t *testing.T) {
+	content := QuotaTreeContent{
+		Snapshot:  QuotaTreeSnapshot{Completeness: "Complete", ObservedItems: 3, ObservedPages: 1},
+		Structure: "NoProblemsDetected",
+		Nodes: []QuotaTreeNode{
+			{Name: "node-08", Role: "Cohort", Depth: 8},
+			{Name: "node-09", Role: "Cohort", Depth: 9},
+			{Name: "node-10", Role: "Cohort", Depth: 10},
+		},
+	}
+	var output bytes.Buffer
+	require.NoError(t, content.Table().Write(&output))
+	assert.Equal(t, "QUOTA TREE (advisory)\n"+
+		"Declared budgets; computed ancestry; advisory only.\n"+
+		"No admission, enforcement, controller, Kueue, or capacity claim.\n"+
+		"Snapshot: Complete; 3 items / 1 pages; NoProblemsDetected\n"+
+		"                node-08 [Cohort]\n"+
+		"                depth=9 node-09 [Cohort]\n"+
+		"                depth=10 node-10 [Cohort]\n", output.String())
+	for _, line := range strings.Split(output.String(), "\n") {
+		assert.LessOrEqual(t, printers.CellDisplayWidth(line), 80)
+	}
+	content.Nodes = []QuotaTreeNode{{Name: strings.Repeat("n", 63), Role: "Cohort", Depth: 999}}
+	output.Reset()
+	require.NoError(t, content.Table().Write(&output))
+	assert.Contains(t, output.String(), "                depth=999 ")
+	for _, line := range strings.Split(output.String(), "\n") {
+		assert.LessOrEqual(t, printers.CellDisplayWidth(line), 80)
+	}
+}
+
 type quotaShortWriter struct{}
 
 func (quotaShortWriter) Write(b []byte) (int, error) { return len(b) - 1, nil }

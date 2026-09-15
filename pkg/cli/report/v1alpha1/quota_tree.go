@@ -131,6 +131,9 @@ func (c QuotaTreeContent) Table() report.Table {
 		}
 		prefix := strings.Repeat("  ", depth)
 		identity := n.Name + " [" + n.Role + "]"
+		if n.Depth > 8 {
+			identity = fmt.Sprintf("depth=%d %s", n.Depth, identity)
+		}
 		if n.Tenant != "" {
 			identity += " tenant=" + n.Tenant
 		}

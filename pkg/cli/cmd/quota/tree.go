@@ -39,6 +39,8 @@ installation, Kueue integration, materialization, or available capacity.
 Collection reads at most 1000 objects in 2 pages within a 10-second deadline.
 Incomplete snapshots cannot establish topology and return an error.
 Compact output fits 80 columns; -o wide retains complete safe fields.
+Indentation is capped at depth 8; deeper nodes show their actual depth=N.
+Use -o wide for full computed paths and depths.
 It never prints labels, annotations, status messages, UIDs, or resource versions.`,
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) > 1 {
