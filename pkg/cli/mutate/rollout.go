@@ -46,6 +46,8 @@ type RolloutPlan struct {
 	previousPause string
 	removed       []annotationValue
 	work          ReplicaEvidence
+	revisionHash  string
+	canary        *canaryPreview
 }
 type annotationValue struct {
 	key   string
@@ -58,6 +60,9 @@ type patchOperation struct {
 }
 
 func (p RolloutPlan) Patch() []byte { return append([]byte{}, p.patch...) }
+
+// RevisionHash identifies the exact primary canary target, not convergence.
+func (p RolloutPlan) RevisionHash() string { return p.revisionHash }
 func PrepareRollout(v *v1beta1.InferenceService, state *effective.RuntimeState, work ReplicaEvidence, action string, discard, yes bool, clock reportv1alpha1.Clock) (RolloutPlan, error) {
 	if err := ValidateTarget(v); err != nil {
 		return RolloutPlan{}, err

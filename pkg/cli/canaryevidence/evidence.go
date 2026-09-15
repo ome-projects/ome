@@ -5,6 +5,7 @@ package canaryevidence
 import (
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/pinnedevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 	omevalidation "sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -280,7 +282,7 @@ func ValidRepinBoundary(
 		!pinnedevidence.ValidCanaryRepin(
 			isvc, primary, steps, status.CanaryRevisionHash,
 		) ||
-		!ActiveTrafficMatches(isvc.Name, primary, phase, status, traffic) {
+		!ActivePinnedTrafficMatches(isvc, primary, phase, status, traffic) {
 		return false
 	}
 	if status.PreStepHold {
@@ -427,6 +429,76 @@ func ActiveTrafficMatches(
 		}
 	}
 	return true
+}
+
+// ActivePinnedTrafficMatches additionally recognizes an unchanged primary
+// when a different canary member changed. Equality is never sufficient alone:
+// the complete frozen group and its target ID must prove that actor shape.
+// This pure helper cannot prove owned IR freshness; mutation callers must also
+// collect and bind every current IR target before submitting a mailbox.
+func ActivePinnedTrafficMatches(
+	isvc *omev1beta1.InferenceService,
+	primary omev1beta1.ComponentType,
+	phase reportv1alpha1.RolloutPhase,
+	status *omev1beta1.CanaryStatus,
+	traffic []omev1beta1.ComponentTrafficTarget,
+) bool {
+	if isvc == nil || status == nil {
+		return false
+	}
+	if status.StableRevisionHash != status.CanaryRevisionHash {
+		return ActiveTrafficMatches(isvc.Name, primary, phase, status, traffic)
+	}
+	if !SafeRevisionHash(status.CanaryRevisionHash) || status.ObservedTrafficWeight < 0 || status.ObservedTrafficWeight > 100 || !pinnedevidence.ValidActiveRun(isvc) {
+		return false
+	}
+	if phase == reportv1alpha1.RolloutPhaseRollingBack || phase == reportv1alpha1.RolloutPhaseRolledBack {
+		if status.RolledBackRevisionHash != status.CanaryRevisionHash || status.ObservedTrafficWeight != 0 {
+			return false
+		}
+	} else if status.RolledBackRevisionHash != "" {
+		return false
+	}
+	run := isvc.Status.Rollout.ActiveRun
+	var canary *omev1beta1.RolloutGroup
+	for i := range run.Plan.Groups {
+		if run.Plan.Groups[i].Group.Canary != nil {
+			if canary != nil {
+				return false
+			}
+			canary = &run.Plan.Groups[i].Group
+		}
+	}
+	if canary == nil {
+		return false
+	}
+	groupPrimary, valid := Primary(canary.Components)
+	if !valid || groupPrimary != primary {
+		return false
+	}
+	targets := make(map[omev1beta1.ComponentType]omev1beta1.RolloutRunTarget, len(run.TargetRevisions))
+	for _, target := range run.TargetRevisions {
+		targets[target.Component] = target
+	}
+	parts := make([]string, 0, len(canary.Components))
+	changedSecondary := false
+	for _, component := range canary.Components {
+		target := targets[component]
+		if !SafeRevisionHash(target.StableRevision) {
+			return false
+		}
+		parts = append(parts, string(component)+"="+target.Revision)
+		if component == primary {
+			if target.Revision != status.CanaryRevisionHash || target.StableRevision != target.Revision {
+				return false
+			}
+		} else if target.StableRevision != target.Revision {
+			changedSecondary = true
+		}
+	}
+	sort.Strings(parts)
+	return changedSecondary && status.TargetID == "ct1:"+rolloutpolicy.ShortHash([]byte(strings.Join(parts, ";"))) &&
+		CompletedTrafficMatches(isvc.Name, primary, status.CanaryRevisionHash, traffic)
 }
 
 // CompletedTrafficMatches validates the single 100% target promised by a

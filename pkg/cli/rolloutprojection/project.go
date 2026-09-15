@@ -452,7 +452,7 @@ func (b *projector) activeCanaryTrafficMatches(
 	if !found {
 		return false
 	}
-	return canaryevidence.ActiveTrafficMatches(b.isvc.Name, primary, phase, status, component.Traffic)
+	return canaryevidence.ActivePinnedTrafficMatches(b.isvc, primary, phase, status, component.Traffic)
 }
 
 func (b *projector) applyCoordinationStatus(

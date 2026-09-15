@@ -43,6 +43,54 @@ func TestPrimaryUsesControllerPriorityAndRejectsAmbiguity(t *testing.T) {
 	}
 }
 
+func TestActivePinnedTrafficMatchesSecondaryOnlyNotForgedEqualPrimary(t *testing.T) {
+	mode := constants.OMENative
+	group := omev1beta1.RolloutGroup{Components: []omev1beta1.ComponentType{omev1beta1.RouterComponent, omev1beta1.EngineComponent}, Canary: &omev1beta1.GroupCanary{Steps: []omev1beta1.RolloutGroupStep{{Capacity: intstr.FromString("50%"), Traffic: 50}, {Capacity: intstr.FromString("100%"), Traffic: 100}}}}
+	digest, err := rolloutpolicy.ProgressionDigest(&group)
+	require.NoError(t, err)
+	now := metav1.NewTime(time.Date(2026, 9, 15, 20, 0, 0, 0, time.UTC))
+	v := &omev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "chat"}, Spec: omev1beta1.InferenceServiceSpec{DeploymentMode: &mode, Engine: &omev1beta1.EngineSpec{}, Router: &omev1beta1.RouterSpec{}}, Status: omev1beta1.InferenceServiceStatus{Rollout: &omev1beta1.RolloutStatus{ActiveRun: &omev1beta1.RolloutRun{RunID: "chat-0123456789ab", OpenedAt: now, PinnedAt: now, Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: digest, Group: group}}}, TargetRevisions: []omev1beta1.RolloutRunTarget{{Component: omev1beta1.RouterComponent, Revision: "aaaaaaaa", StableRevision: "aaaaaaaa"}, {Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb", StableRevision: "cccccccc"}}}}}}
+	status := &omev1beta1.CanaryStatus{StableRevisionHash: "aaaaaaaa", CanaryRevisionHash: "aaaaaaaa", ObservedTrafficWeight: 50, TargetID: "ct1:" + rolloutpolicy.ShortHash([]byte("engine=bbbbbbbb;router=aaaaaaaa"))}
+	traffic := []omev1beta1.ComponentTrafficTarget{{RevisionName: "chat-router-rev-aaaaaaaa", Percent: 100}}
+	assert.False(t, canaryevidence.ActiveTrafficMatches("chat", omev1beta1.RouterComponent, reportv1alpha1.RolloutPhasePaused, status, traffic), "unbound primitive must still reject equality")
+	assert.True(t, canaryevidence.ActivePinnedTrafficMatches(v, omev1beta1.RouterComponent, reportv1alpha1.RolloutPhasePaused, status, traffic))
+	for _, edit := range []func(*omev1beta1.InferenceService, *omev1beta1.CanaryStatus, *[]omev1beta1.ComponentTrafficTarget){
+		func(v *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ *[]omev1beta1.ComponentTrafficTarget) {
+			v.Status.Rollout = nil
+		},
+		func(v *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ *[]omev1beta1.ComponentTrafficTarget) {
+			v.Status.Rollout.ActiveRun.TargetRevisions[1].StableRevision = "bbbbbbbb"
+		},
+		func(v *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ *[]omev1beta1.ComponentTrafficTarget) {
+			v.Status.Rollout.ActiveRun.TargetRevisions[1].StableRevision = "bad"
+		},
+		func(v *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, _ *[]omev1beta1.ComponentTrafficTarget) {
+			v.Status.Rollout.ActiveRun.Plan.Groups[0].PortableDigest = "bad"
+		},
+		func(_ *omev1beta1.InferenceService, s *omev1beta1.CanaryStatus, _ *[]omev1beta1.ComponentTrafficTarget) {
+			s.TargetID = "ct1:000000000000"
+		},
+		func(_ *omev1beta1.InferenceService, s *omev1beta1.CanaryStatus, _ *[]omev1beta1.ComponentTrafficTarget) {
+			s.ObservedTrafficWeight = 101
+		},
+		func(_ *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, ts *[]omev1beta1.ComponentTrafficTarget) {
+			(*ts)[0].Percent = 50
+		},
+		func(_ *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, ts *[]omev1beta1.ComponentTrafficTarget) {
+			(*ts)[0].RevisionName = "chat-router-rev-bbbbbbbb"
+		},
+		func(_ *omev1beta1.InferenceService, _ *omev1beta1.CanaryStatus, ts *[]omev1beta1.ComponentTrafficTarget) {
+			*ts = append(*ts, (*ts)[0])
+		},
+	} {
+		copy := v.DeepCopy()
+		s := status.DeepCopy()
+		ts := append([]omev1beta1.ComponentTrafficTarget{}, traffic...)
+		edit(copy, s, &ts)
+		assert.False(t, canaryevidence.ActivePinnedTrafficMatches(copy, omev1beta1.RouterComponent, reportv1alpha1.RolloutPhasePaused, s, ts))
+	}
+}
+
 func TestProjectPhaseAndBindingsAreClosed(t *testing.T) {
 	tests := []struct {
 		api          omev1beta1.RolloutPhase

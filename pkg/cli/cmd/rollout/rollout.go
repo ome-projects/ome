@@ -52,6 +52,8 @@ func newCmdWithClock(
 	cmd.AddCommand(newValidateCmd(f, streams, clock))
 	cmd.AddCommand(newActionCmd(f, streams, clock, "pause"))
 	cmd.AddCommand(newActionCmd(f, streams, clock, "resume"))
+	cmd.AddCommand(newActionCmd(f, streams, clock, "promote"))
+	cmd.AddCommand(newActionCmd(f, streams, clock, "rollback"))
 	return cmd
 }
 

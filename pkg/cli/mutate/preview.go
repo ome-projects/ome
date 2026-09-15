@@ -37,11 +37,22 @@ func (p RolloutPlan) WritePreview(out io.Writer, contextName, omeNamespace strin
 	add("ResourceVersion", p.target.ResourceVersion)
 	add("Dry-run", string(dryRun))
 	add("Affected", strings.Join(p.components, ", "))
-	add("Pause depth", p.previousPause)
-	if p.action == "pause" {
+	if p.canary != nil {
+		for _, row := range p.canary.rows {
+			add(row[0], row[1])
+		}
+		key, value := constants.RolloutPromoteAnnotation, p.revisionHash
+		if p.action == "rollback" {
+			key, value = constants.RolloutRollbackAnnotation, "true"
+		}
+		add("Set annotation", key)
+		add("Value", value)
+	} else if p.action == "pause" {
+		add("Pause depth", p.previousPause)
 		add("Set annotation", constants.PausedRolloutAnnotation)
 		add("Value", "true")
 	} else {
+		add("Pause depth", p.previousPause)
 		add("Remove annotation", constants.PausedRolloutAnnotation)
 		add("Value", strconv.Quote(p.previousPause))
 		for _, value := range p.removed {
@@ -56,14 +67,28 @@ func (p RolloutPlan) WritePreview(out io.Writer, contextName, omeNamespace strin
 	if err := (report.Table{Headers: []string{"FIELD", "VALUE"}, Rows: rows}).Write(out); err != nil {
 		return errors.New("write action preview failed")
 	}
-	for _, warning := range []string{
+	warnings := []string{
 		"Scope: service-wide OMENative lifecycle, not a full workload freeze.",
 		"true holds Update/Create/Migration; RestartPolicy repair continues.",
 		"freeze also holds existing-instance repair; resume clears either depth.",
 		"Canary timed gates continue aging and may advance immediately on resume.",
 		"Deliberate scale-down and deletion teardown can still proceed.",
 		"Parent UID/resourceVersion CAS is not a multi-object transaction.",
-	} {
+	}
+	if p.canary != nil {
+		warnings = []string{"A request is not controller convergence.", "Parent UID/resourceVersion CAS is not a multi-object transaction."}
+		if p.canary.override {
+			warnings = append([]string{"ANALYSIS OVERRIDE: bypasses health checks, warm-up and bake", "for this exact pinned step."}, warnings...)
+		}
+		if p.action == "rollback" {
+			warnings = append(warnings, "Abort all canary members to their own Reported stable revisions.", "The rejected target is held; this is not a retry or spec rollback.")
+		} else if p.canary.final {
+			warnings = append(warnings, "Final gate acceptance does not prove drain or completion.")
+		} else {
+			warnings = append(warnings, "One request advances one step; no automatic replay.")
+		}
+	}
+	for _, warning := range warnings {
 		if _, err := fmt.Fprintln(out, warning); err != nil {
 			return errors.New("write action preview failed")
 		}

@@ -26,14 +26,15 @@ import (
 )
 
 type actionOptions struct {
-	streams    genericiooptions.IOStreams
-	clock      reportv1alpha1.Clock
-	namespaces *namespace.Options
-	action     string
-	output     string
-	dryRun     string
-	yes        bool
-	discard    bool
+	streams          genericiooptions.IOStreams
+	clock            reportv1alpha1.Clock
+	namespaces       *namespace.Options
+	action           string
+	output           string
+	dryRun           string
+	yes              bool
+	discard          bool
+	overrideAnalysis bool
 }
 
 func newActionCmd(f factory.Factory, streams genericiooptions.IOStreams, clock reportv1alpha1.Clock, action string) *cobra.Command {
@@ -65,8 +66,30 @@ stale or malformed safety evidence refuses instead of accepting a prefix.`, Args
 		if o.discard && !o.yes {
 			return mutate.ErrStrongConfirmation
 		}
+		if o.overrideAnalysis && !o.yes {
+			return mutate.ErrAnalysisOverrideConfirmation
+		}
 		return o.run(cmd.Context(), f, args[0], format, mode)
 	}}
+	if action == "promote" || action == "rollback" {
+		cmd.Short = "Alpha: guarded canary rollout " + action
+		cmd.Long = `Alpha guarded canary mailbox action on the current pinned run and step.
+Promote advances an active indefinite manual gate. Analysis is never bypassed
+by ordinary promote: --override-analysis --yes is required for an active
+analysis gate and bypasses its health checks, warm-up and bake for this step.
+Rollback aborts every canary member to its own reported stable revision and
+holds the rejected target; it is not retry, redeploy or a rollout-spec edit.
+Globally paused, placement-owned, pending or unbound targets are refused.
+Acceptance is not controller convergence; no automatic replay or wait.
+
+Client dry-run validates, previews and confirms without a patch. Server dry-run
+sends the identical UID/resourceVersion-guarded JSON Patch with dryRun=All.
+Preview and prompt use stderr; stdout is one ActionResult. The action context
+is 45 seconds and each request is capped at 10 seconds, preserving shorter
+--request-timeout settings. External credential plugins/custom transports may
+not honor cancellation. Inspection caps 32 related IRs / two pages, 2048
+instances and 256 migrations per IR; incomplete or malformed evidence refuses.`
+	}
 	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error {
 		return errors.New("invalid rollout action flags; use --help")
 	})
@@ -76,6 +99,9 @@ stale or malformed safety evidence refuses instead of accepting a prefix.`, Args
 	o.namespaces.AddOMEFlags(cmd.Flags())
 	if action == "resume" {
 		cmd.Flags().BoolVar(&o.discard, "discard-pending-actions", false, "Atomically discard pending promote/rollback mailboxes; requires --yes")
+	}
+	if action == "promote" {
+		cmd.Flags().BoolVar(&o.overrideAnalysis, "override-analysis", false, "Bypass only this active analysis gate, including warm-up and bake; requires --yes")
 	}
 	return cmd
 }
@@ -148,13 +174,18 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 		return err
 	}
 	var work mutate.ReplicaEvidence
-	if o.action == "pause" {
+	if o.action == "pause" || o.action == "promote" || o.action == "rollback" {
 		work, err = mutate.CollectReplicaEvidence(ctx, client.OmeV1beta1(), v, components, o.clock)
 		if err != nil {
 			return err
 		}
 	}
-	plan, err := mutate.PrepareRollout(v, state, work, o.action, o.discard, o.yes, o.clock)
+	var plan mutate.RolloutPlan
+	if o.action == "promote" || o.action == "rollback" {
+		plan, err = mutate.PrepareCanaryRollout(v, state, work, o.action, o.overrideAnalysis, o.yes, o.clock)
+	} else {
+		plan, err = mutate.PrepareRollout(v, state, work, o.action, o.discard, o.yes, o.clock)
+	}
 	if err != nil {
 		return err
 	}
@@ -184,6 +215,7 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	}
 	result := reportv1alpha1.NewActionResult("rollout "+o.action, reportv1alpha1.ActionTarget{Kind: "InferenceService", Namespace: v.Namespace, Name: v.Name, UID: string(v.UID), ResourceVersion: v.ResourceVersion}, dryRun, o.clock)
 	result.FollowUp = "kubectl ome rollout status " + name + " -n " + resolved.WorkloadNamespace + " --context=" + contextName
+	result.RevisionHash = plan.RevisionHash()
 	result.Message = "Validated locally; no patch sent."
 	if dryRun != reportv1alpha1.DryRunClient {
 		body, e := patchClient.JSONPatch(ctx, transport.Resource{Namespace: v.Namespace, Resource: "inferenceservices", Name: v.Name}, plan.Patch(), transport.JSONPatchOptions{DryRun: dryRun == reportv1alpha1.DryRunServer})
@@ -215,6 +247,9 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 		if dryRun == reportv1alpha1.DryRunServer {
 			result.Message = "API dry-run accepted; no changes persisted."
 		}
+	}
+	if o.overrideAnalysis {
+		result.Message = "Analysis override: " + result.Message
 	}
 	if err := report.Write(o.streams.Out, format, result); err != nil {
 		return errors.New("write action result failed; check rollout status")
