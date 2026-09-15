@@ -2,14 +2,15 @@ package factory
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"sync"
-	"time"
 
-	"k8s.io/client-go/rest"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
 // ActionRuntimeResolver optionally bounds background discovery for actions.
@@ -18,26 +19,19 @@ type ActionRuntimeResolver interface {
 }
 
 func (f *defaultFactory) RuntimeClientForAction(ctx context.Context) (ctrlclient.Client, error) {
-	if f == nil || ctx == nil || f.flags == nil && f.rest == nil {
-		return nil, errors.New("action runtime configuration is unavailable")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	config, err := f.RESTConfig()
+	config, httpClient, err := f.actionConfigAndClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	config = rest.CopyConfig(config)
-	if config.Timeout <= 0 || config.Timeout > 10*time.Second {
-		config.Timeout = 10 * time.Second
-	}
-	config.Wrap(func(inner http.RoundTripper) http.RoundTripper {
-		return &actionContextTransport{inner: inner, ctx: ctx}
-	})
 	// This client is deliberately not cached: background discovery must be
 	// canceled with this action, without poisoning future read commands.
-	return newRuntimeClient(config)
+	// controller-runtime supplies Options.HTTPClient to both its dynamic
+	// discovery mapper and object clients (NewDynamicRESTMapper uses the public
+	// discovery ConfigAndClient constructor).
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1beta1.AddToScheme(scheme))
+	return ctrlclient.New(config, ctrlclient.Options{Scheme: scheme, HTTPClient: httpClient})
 }
 
 type actionContextTransport struct {
