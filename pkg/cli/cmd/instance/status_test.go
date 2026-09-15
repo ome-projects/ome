@@ -186,6 +186,37 @@ func TestStatusEffectiveRuntimeComponentModeOverridesServiceSpecBothWays(t *test
 	}
 }
 
+func TestStatusEffectiveRuntimeComponentModeOverridesTypedVirtualServiceSpec(t *testing.T) {
+	t.Parallel()
+	isvc := commandISVC()
+	kind := "ServingRuntime"
+	mode := constants.VirtualDeployment
+	isvc.Spec.Runtime = &omev1beta1.ServingRuntimeRef{Name: "runtime", Kind: &kind}
+	isvc.Spec.DeploymentMode = &mode
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+	ir := commandIR(isvc)
+	pod := commandStatusPod(isvc, ir, "selected")
+	scheme := runtime.NewScheme()
+	require.NoError(t, omev1beta1.AddToScheme(scheme))
+	runtimeObject := &omev1beta1.ServingRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "runtime", Namespace: "prod", UID: "runtime-uid", ResourceVersion: "1"},
+		Spec:       statusRuntimeSpec(string(constants.OMENative)),
+	}
+	ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(runtimeObject).Build()
+	ome := omefake.NewSimpleClientset(isvc, ir)
+	kube := kubefake.NewSimpleClientset(&pod)
+
+	out, err := executeStatus(t, factory.Static{OME: ome, Kube: kube, Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+
+	require.NoError(t, err)
+	assert.Contains(t, out, `"state": "Reported"`)
+	assert.Contains(t, out, `"mode": "OMENative"`)
+	assert.Contains(t, out, `"source": "ComponentAnnotation"`)
+	assert.Contains(t, out, `"name": "`+pod.Name+`"`)
+	require.Len(t, ome.Actions(), 2)
+	assert.Equal(t, "list", ome.Actions()[1].GetVerb())
+}
+
 func TestStatusUsesPinnedRuntimeAndExplicitControlPlaneNamespace(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -335,7 +366,8 @@ func TestStatusWideOutputAndWriterFailure(t *testing.T) {
 	isvc := commandISVC()
 	isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(constants.OMENative)}}}
 	ir := commandIR(isvc)
-	ir.Status.InstanceStatuses[0].Operation = &omev1beta1.InstanceOperation{ID: "wide-operation", Type: omev1beta1.InstanceOperationMigrate, Step: "Move", FromNode: "node-old"}
+	operationTime := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	ir.Status.InstanceStatuses[0].Operation = &omev1beta1.InstanceOperation{ID: "wide-operation", Type: omev1beta1.InstanceOperationMigrate, Step: "Move", FromNode: "node-old", StartedAt: operationTime, LastProgressAt: operationTime}
 	out, err := executeStatus(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "wide")
 	require.NoError(t, err)
 	assert.Contains(t, out, "wide-operation")
@@ -572,10 +604,10 @@ func TestStatusDefinitiveDeploymentModeResolutionIsFailClosed(t *testing.T) {
 	}{
 		{name: "typed raw requires runtime merge", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &raw }, want: false},
 		{name: "typed native", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &native }, want: false},
-		{name: "typed virtual", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
+		{name: "typed virtual requires runtime merge", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
 			mode := constants.VirtualDeployment
 			isvc.Spec.DeploymentMode = &mode
-		}, want: true},
+		}, want: false},
 		{name: "engine annotation raw", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(raw)}}}
 		}, want: true},

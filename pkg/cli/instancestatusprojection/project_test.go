@@ -36,7 +36,8 @@ func TestProjectJoinsNormalMultiPodInstanceWithAuthoritativeDetails(t *testing.T
 	row := &input.Collection.Items[0].Status.InstanceStatuses[0]
 	row.PodCount, row.ServingPodCount, row.AvailablePodCount = 2, 1, 1
 	row.Conditions = []metav1.Condition{{Type: "AllPodsReady", Status: metav1.ConditionFalse, ObservedGeneration: 2, Reason: "WorkerPending"}}
-	row.Operation = &omev1beta1.InstanceOperation{ID: "op-1", Type: omev1beta1.InstanceOperationUpdate, Step: "WaitReady", Reason: "rolling", RetryCount: 2}
+	operationTime := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	row.Operation = &omev1beta1.InstanceOperation{ID: "op-1", Type: omev1beta1.InstanceOperationUpdate, Step: "WaitReady", Reason: "rolling", RetryCount: 2, StartedAt: operationTime, LastProgressAt: operationTime}
 	exit := int32(137)
 	row.LastFailure = &omev1beta1.InstanceTermination{PodName: "chat-engine-2-worker", ContainerName: "runner", Reason: "OOMKilled", ExitCode: &exit, Message: "never emit"}
 	input.Pods.Items = []corev1.Pod{
@@ -753,6 +754,65 @@ func TestProjectRejectsMalformedAuthoritativeDetails(t *testing.T) {
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationInvalid)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueLastFailureInvalid)
+}
+
+func TestProjectRejectsOperationMissingRequiredOrImpossibleTimes(t *testing.T) {
+	t.Parallel()
+	started := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	progress := metav1.NewTime(started.Add(5 * time.Minute))
+	deadline := metav1.NewTime(started.Add(time.Hour))
+	earlier := metav1.NewTime(started.Add(-time.Second))
+	valid := omev1beta1.InstanceOperation{
+		ID: "op", Type: omev1beta1.InstanceOperationUpdate, Step: "WaitReady",
+		StartedAt: started, LastProgressAt: progress, Deadline: deadline,
+	}
+	tests := map[string]func(*omev1beta1.InstanceOperation){
+		"missing started at": func(operation *omev1beta1.InstanceOperation) {
+			operation.StartedAt = metav1.Time{}
+		},
+		"missing last progress at": func(operation *omev1beta1.InstanceOperation) {
+			operation.LastProgressAt = metav1.Time{}
+		},
+		"last progress before start": func(operation *omev1beta1.InstanceOperation) {
+			operation.LastProgressAt = earlier
+		},
+		"deadline before start": func(operation *omev1beta1.InstanceOperation) {
+			operation.Deadline = earlier
+		},
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			input := statusInput()
+			operation := valid
+			mutate(&operation)
+			input.Collection.Items[0].Status.InstanceStatuses[0].Operation = &operation
+
+			got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+
+			require.NoError(t, err)
+			require.NotNil(t, got.Content.Instance)
+			assert.Nil(t, got.Content.Instance.Operation)
+			assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationInvalid)
+		})
+	}
+
+	t.Run("parked deadline remains valid", func(t *testing.T) {
+		t.Parallel()
+		input := statusInput()
+		operation := valid
+		operation.Deadline = metav1.Time{}
+		input.Collection.Items[0].Status.InstanceStatuses[0].Operation = &operation
+
+		got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+
+		require.NoError(t, err)
+		require.NotNil(t, got.Content.Instance)
+		require.NotNil(t, got.Content.Instance.Operation)
+		assert.Nil(t, got.Content.Instance.Operation.Deadline)
+		assert.NotContains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationInvalid)
+	})
 }
 
 func TestProjectRejectsContradictoryConditionsAndMarksOldConditionGenerationStale(t *testing.T) {
