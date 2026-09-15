@@ -36,11 +36,8 @@ func TestProjectExplainHealthyIntentSupportAndRealization(t *testing.T) {
 		},
 	}
 	isvc.Annotations = map[string]string{
-		constants.CircuitBreakerMaxConnectionsAnnotation: "SECRET_VALUE_1024",
+		constants.CircuitBreakerMaxConnectionsAnnotation: "1024",
 	}
-	// Use a valid value for the healthy projection; the raw value still must
-	// never be copied into the report.
-	isvc.Annotations[constants.CircuitBreakerMaxConnectionsAnnotation] = "1024"
 	isvc.Status.Traffic.Conditions = []metav1.Condition{
 		trafficCondition(omev1beta1.TrafficConditionBackendPolicyReady,
 			metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7),
@@ -76,7 +73,7 @@ func TestProjectExplainHealthyIntentSupportAndRealization(t *testing.T) {
 		var out bytes.Buffer
 		require.NoError(t, report.Write(&out, format, got))
 		for _, forbidden := range []string{
-			"uid-chat", "X-SESSION-TOKEN", "SECRET_VALUE", "annotations",
+			"uid-chat", "X-SESSION-TOKEN", "1024", "annotations",
 			"resourceVersion", "message",
 		} {
 			assert.NotContains(t, strings.ToLower(out.String()),
