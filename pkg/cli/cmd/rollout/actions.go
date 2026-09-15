@@ -67,6 +67,9 @@ stale or malformed safety evidence refuses instead of accepting a prefix.`, Args
 		}
 		return o.run(cmd.Context(), f, args[0], format, mode)
 	}}
+	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error {
+		return errors.New("invalid rollout action flags; use --help")
+	})
 	cmd.Flags().BoolVar(&o.yes, "yes", false, "Confirm the exact preview without an interactive prompt")
 	cmd.Flags().StringVar(&o.dryRun, "dry-run", "none", "Dry-run mode: none, client or server")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output: table, wide (bounded), json or yaml")

@@ -22,8 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
 
@@ -39,6 +41,88 @@ import (
 type actionFactory struct {
 	factory.Static
 	config *rest.Config
+}
+
+type actionParserFactory struct{ calls []string }
+
+func (f *actionParserFactory) called(method string) error {
+	f.calls = append(f.calls, method)
+	return errors.New("unexpected factory acquisition")
+}
+
+func (f *actionParserFactory) Namespace() (string, bool, error) {
+	return "", false, f.called("Namespace")
+}
+
+func (f *actionParserFactory) RESTConfig() (*rest.Config, error) {
+	return nil, f.called("RESTConfig")
+}
+
+func (f *actionParserFactory) ContextName() (string, error) {
+	return "", f.called("ContextName")
+}
+
+func (f *actionParserFactory) KubeClient() (kubernetes.Interface, error) {
+	return nil, f.called("KubeClient")
+}
+
+func (f *actionParserFactory) OMEClient() (versioned.Interface, error) {
+	return nil, f.called("OMEClient")
+}
+
+func (f *actionParserFactory) RuntimeClient() (ctrlclient.Client, error) {
+	return nil, f.called("RuntimeClient")
+}
+
+func (f *actionParserFactory) RuntimeClientForAction(context.Context) (ctrlclient.Client, error) {
+	return nil, f.called("RuntimeClientForAction")
+}
+
+func TestActionParserPrivacyBeforeAnyFactoryAcquisition(t *testing.T) {
+	const private = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, action := range []string{"pause", "resume"} {
+		cases := []struct {
+			name   string
+			suffix []string
+		}{
+			{"malformed confirmation", []string{"--yes=" + private}},
+			{"long control value", []string{"--yes=" + private + "\x1b[2J\n" + strings.Repeat("x", 4096)}},
+			{"unknown private flag", []string{"--unknown-" + private + "=value"}},
+			{"missing output", []string{"--output"}},
+			{"missing dry-run", []string{"--dry-run"}},
+			{"missing inherited context", []string{"--context"}},
+			{"malformed inherited boolean", []string{"--insecure-skip-tls-verify=" + private}},
+		}
+		if action == "resume" {
+			cases = append(cases, struct {
+				name   string
+				suffix []string
+			}{"malformed discard", []string{"--discard-pending-actions=" + private}})
+		}
+		for _, tc := range cases {
+			t.Run(action+" "+tc.name, func(t *testing.T) {
+				var stdout, stderr bytes.Buffer
+				f := &actionParserFactory{}
+				streams := genericiooptions.IOStreams{Out: &stdout, ErrOut: &stderr}
+				cmd := NewCmd(f, streams)
+				cmd.SilenceErrors, cmd.SilenceUsage = true, true
+				cmd.SetOut(&stdout)
+				cmd.SetErr(&stderr)
+				cmd.PersistentFlags().Bool("insecure-skip-tls-verify", false, "Inherited parser fixture")
+				cmd.PersistentFlags().String("context", "", "Inherited parser fixture")
+				cmd.SetArgs(append([]string{action, "example"}, tc.suffix...))
+				err := cmd.Execute()
+				require.Error(t, err)
+				require.Equal(t, 1, exitcode.FromError(err))
+				require.Empty(t, stdout.String())
+				require.Empty(t, f.calls)
+				require.Empty(t, stderr.String())
+				if strings.Contains(err.Error(), private) || err.Error() != "invalid rollout action flags; use --help" {
+					t.Fatal("parser diagnostic disclosed private input or was not closed/bounded")
+				}
+			})
+		}
+	}
 }
 
 func newWireFactory(t *testing.T, server *httptest.Server, rt *v1beta1.ServingRuntime) actionFactory {
