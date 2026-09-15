@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,9 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/util/flowcontrol"
 )
 
@@ -78,6 +81,23 @@ func TestNewClientsDoesNotMutateDefaultHTTPClient(t *testing.T) {
 	}
 	if http.DefaultClient != original || !reflect.DeepEqual(before.Transport, original.Transport) || !reflect.DeepEqual(before.Jar, original.Jar) || before.Timeout != original.Timeout || redirectPointer(before.CheckRedirect) != redirectPointer(original.CheckRedirect) {
 		t.Fatal("global default HTTP client mutated")
+	}
+}
+
+func TestNewClientsDoesNotMutateCallerOwnedExecConfiguration(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		t.Run(fmt.Sprint(selected), func(t *testing.T) {
+			original := &runtime.Unknown{Raw: []byte(`{"private":"PRIVATE_SENTINEL"}`)}
+			provider := &clientcmdapi.ExecConfig{Command: "never-executed", APIVersion: "client.authentication.k8s.io/v1beta1", InteractiveMode: clientcmdapi.NeverExecInteractiveMode, Config: original}
+			config := &rest.Config{Host: "https://never-contact.invalid", ExecProvider: provider}
+			clients, err := NewClients(config, selected)
+			if err != nil || !clients.valid(selected) {
+				t.Fatalf("valid exec configuration constructor failed: %v", err)
+			}
+			if config.ExecProvider != provider || provider.Config != original || string(original.Raw) != `{"private":"PRIVATE_SENTINEL"}` {
+				t.Fatal("constructor mutated caller-owned exec configuration")
+			}
+		})
 	}
 }
 

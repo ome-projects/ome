@@ -27,7 +27,13 @@ func NewClients(config *rest.Config, selectedISVC bool) (Clients, error) {
 	if config == nil {
 		return Clients{}, failure
 	}
-	copied := rest.CopyConfig(config)
+	local := *config
+	if local.ExecProvider != nil {
+		// CopyConfig replaces ExecProvider.Config through its provider pointer.
+		// Detach the provider before that first copy to preserve caller ownership.
+		local.ExecProvider = local.ExecProvider.DeepCopy()
+	}
+	copied := rest.CopyConfig(&local)
 	inherited, err := rest.HTTPClientFor(copied)
 	if err != nil {
 		return Clients{}, failure
