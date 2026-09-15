@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -501,5 +502,53 @@ func TestActionClientOutputAndLeadingDashContextHintParse(t *testing.T) {
 		require.Equal(t, "-prod", *selected)
 		require.False(t, result.Accepted)
 		require.False(t, result.Applied)
+	}
+}
+
+func TestGuardedPatchPreservesNarrowerConfiguredTimeout(t *testing.T) {
+	v, rt, ir := actionFixture()
+	var patches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "PATCH" {
+			patches.Add(1)
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(300 * time.Millisecond):
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(v))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/inferenceservices/chat") {
+			require.NoError(t, json.NewEncoder(w).Encode(v))
+		} else {
+			require.NoError(t, json.NewEncoder(w).Encode(&v1beta1.InferenceReplicaList{Items: []v1beta1.InferenceReplica{*ir}}))
+		}
+	}))
+	defer server.Close()
+	f := newWireFactory(t, server, rt)
+	f.config.Timeout = 20 * time.Millisecond
+	var out, stderr bytes.Buffer
+	cmd := NewCmd(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+	cmd.SetArgs([]string{"pause", "chat", "--yes", "-o", "json"})
+	started := time.Now()
+	err := cmd.Execute()
+	require.Error(t, err, "the configured request timeout must apply to the guarded PATCH")
+	require.Less(t, time.Since(started), 200*time.Millisecond)
+	require.Empty(t, out.String())
+	require.EqualValues(t, 1, patches.Load())
+	require.Equal(t, 20*time.Millisecond, f.config.Timeout)
+}
+
+func TestGuardedActionTimeoutHelpIsQualified(t *testing.T) {
+	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{Out: io.Discard, ErrOut: io.Discard})
+	for _, action := range []string{"pause", "resume"} {
+		child, _, err := cmd.Find([]string{action})
+		require.NoError(t, err)
+		require.Contains(t, child.Long, "45-second action context")
+		require.Contains(t, child.Long, "shorter --request-timeout")
+		require.Contains(t, child.Long, "credential plugins/custom transports")
+		require.NotContains(t, child.Long, "total deadline")
 	}
 }

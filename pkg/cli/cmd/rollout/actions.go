@@ -48,7 +48,10 @@ scale-down and deletion may proceed. Acceptance is not controller convergence.
 
 Client dry-run validates and confirms but sends no patch; server dry-run sends
 the identical guarded JSON Patch with dryRun=All. Preview and prompt use stderr.
-Reads and confirmation share a 45-second total deadline. Safety inspection caps
+API requests and confirmation use a 45-second action context. Each request is
+capped at 10 seconds, preserving shorter --request-timeout settings. External
+credential plugins/custom transports may not honor cancellation.
+Safety inspection caps
 32 related IRs / two pages, 2048 instances and 256 migrations per IR; incomplete,
 stale or malformed safety evidence refuses instead of accepting a prefix.`, Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		format, _, err := parseRolloutOutput(o.output)
@@ -160,7 +163,9 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 		return errors.New("action REST configuration is unavailable")
 	}
 	config = rest.CopyConfig(config)
-	config.Timeout = 10 * time.Second
+	if config.Timeout <= 0 || config.Timeout > 10*time.Second {
+		config.Timeout = 10 * time.Second
+	}
 	patchClient, err := transport.NewBounded(config, 1024*1024)
 	if err != nil {
 		return errors.New("construct guarded action transport failed")

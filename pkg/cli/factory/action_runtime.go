@@ -29,7 +29,9 @@ func (f *defaultFactory) RuntimeClientForAction(ctx context.Context) (ctrlclient
 		return nil, err
 	}
 	config = rest.CopyConfig(config)
-	config.Timeout = 10 * time.Second
+	if config.Timeout <= 0 || config.Timeout > 10*time.Second {
+		config.Timeout = 10 * time.Second
+	}
 	config.Wrap(func(inner http.RoundTripper) http.RoundTripper {
 		return &actionContextTransport{inner: inner, ctx: ctx}
 	})

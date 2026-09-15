@@ -68,6 +68,32 @@ func TestActionRuntimeBackgroundDiscoveryHonorsCommandDeadline(t *testing.T) {
 	require.Positive(t, reads.Load(), "exercise real discovery, not local validation")
 }
 
+func TestActionRuntimePreservesNarrowerConfiguredTimeoutDuringDiscovery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(300 * time.Millisecond):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api" {
+			_ = json.NewEncoder(w).Encode(metav1.APIVersions{})
+		} else {
+			_ = json.NewEncoder(w).Encode(metav1.APIGroupList{})
+		}
+	}))
+	defer server.Close()
+	config := &rest.Config{Host: server.URL, Timeout: 20 * time.Millisecond}
+	f := &defaultFactory{rest: config}
+	client, err := f.RuntimeClientForAction(context.Background())
+	require.NoError(t, err)
+	started := time.Now()
+	err = client.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "simple"}, &v1beta1.ServingRuntime{})
+	require.Error(t, err)
+	require.Less(t, time.Since(started), 200*time.Millisecond, "the action must not lengthen an explicit request timeout")
+	require.Equal(t, 20*time.Millisecond, config.Timeout)
+}
+
 type actionRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f actionRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
