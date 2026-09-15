@@ -89,6 +89,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome logs",
 		"ome migration",
 		"ome migration history",
+		"ome migration start",
 		"ome migration status",
 		"ome placement",
 		"ome placement endpoint",
@@ -222,7 +223,7 @@ func TestRootHelpListsLogicalInstanceInspection(t *testing.T) {
 	}
 }
 
-func TestRootHelpListsMigrationStatus(t *testing.T) {
+func TestRootHelpListsMigrationStatusAndStart(t *testing.T) {
 	t.Parallel()
 
 	var output bytes.Buffer
@@ -234,8 +235,32 @@ func TestRootHelpListsMigrationStatus(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !strings.Contains(output.String(), "migration") || !strings.Contains(output.String(), "Inspect OMENative migrations") {
+	if !strings.Contains(output.String(), "migration") || !strings.Contains(output.String(), "Inspect and request OMENative migrations") {
 		t.Fatalf("root help does not list migration status:\n%s", output.String())
+	}
+}
+
+func TestRootMigrationStartRegistrationAndClosedParser(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, flag := range []string{"--yes=" + credential, "--insecure-skip-tls-verify=" + credential, "--" + credential, "--dry-run"} {
+		t.Run(flag, func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			f := &waitFlagFactory{}
+			root := NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+			command, _, err := root.Find([]string{"migration", "start"})
+			if err != nil || command.Use != "start INFERENCESERVICE" || !strings.Contains(command.Long, "Acceptance is not scheduling") {
+				t.Fatal("migration start registration or acceptance contract changed")
+			}
+			for _, name := range []string{"component", "instance", "request-id", "from-node", "hint-node", "reason", "requested-by", "dry-run", "yes", "output"} {
+				if command.Flags().Lookup(name) == nil {
+					t.Fatalf("migration start flag %s is missing", name)
+				}
+			}
+			root.SetArgs([]string{"migration", "start", "chat", "--component=engine", "--instance=0", flag})
+			if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || f.calls != 0 || stderr.String() != "error: invalid migration action flags; use --help\n" {
+				t.Fatalf("closed migration parser: code=%d acquisitions=%d stdout=%q stderr=%q", code, f.calls, out.String(), stderr.String())
+			}
+		})
 	}
 }
 
