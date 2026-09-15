@@ -95,6 +95,46 @@ decoder   MostCapable   nvidia-h100-80gb   Reported   nvidia.com/gpu=1   0
 	}
 }
 
+func TestAcceleratorExplainCanonicalComponentOrderIsTotal(t *testing.T) {
+	componentA := AcceleratorExplainComponent{
+		Type: RuntimeComponentType("unknown-b"),
+		Intent: AcceleratorIntent{
+			State: AcceleratorIntentClass, DeclaredClass: "class-b",
+		},
+		Selection: AcceleratorSelectionObservation{
+			State:  AcceleratorSelectionNotReported,
+			Reason: AcceleratorReason{State: AcceleratorReasonNotReported},
+		},
+		Class: AcceleratorClassObservation{State: AcceleratorClassNotRequested},
+		Requests: AcceleratorRequestObservation{
+			BaseState:      AcceleratorBaseRequestsAvailable,
+			Base:           []AcceleratorResourceRequest{{Name: "memory", Quantity: "2Gi"}},
+			EffectiveState: AcceleratorRequestsNotReported,
+		},
+		Issues: []AcceleratorExplainIssueCode{AcceleratorIssueSelectionNotReported},
+	}
+	componentB := componentA
+	componentB.Type = RuntimeComponentType("unknown-a")
+	componentB.Intent.DeclaredClass = "class-a"
+	componentB.Requests.Base = []AcceleratorResourceRequest{{Name: "cpu", Quantity: "2"}}
+	componentC := componentA
+	componentC.Intent.DeclaredClass = "class-a"
+	componentC.Requests.Base = []AcceleratorResourceRequest{{Name: "cpu", Quantity: "1"}}
+
+	forward := AcceleratorExplainContent{Components: []AcceleratorExplainComponent{
+		componentA, componentB, componentC,
+	}}.Canonical()
+	reversed := AcceleratorExplainContent{Components: []AcceleratorExplainComponent{
+		componentC, componentB, componentA,
+	}}.Canonical()
+
+	assert.Equal(t, forward.Components, reversed.Components)
+	require.Len(t, forward.Components, 3)
+	assert.Equal(t, RuntimeComponentType("unknown-a"), forward.Components[0].Type)
+	assert.Equal(t, "class-a", forward.Components[1].Intent.DeclaredClass)
+	assert.Equal(t, "class-b", forward.Components[2].Intent.DeclaredClass)
+}
+
 func TestAcceleratorExplainMachineSchemaNeverCarriesRawReason(t *testing.T) {
 	const secret = "ghp_secret-controller-reason"
 	reportValue := NewAcceleratorExplainReport(Metadata{Name: "chat"}, AcceleratorExplainContent{

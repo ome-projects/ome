@@ -245,13 +245,13 @@ func acceleratorBaseComponent(
 			return AcceleratorBaseComponent{}, ErrAcceleratorEvidenceInvalid
 		}
 		podSpec, runner = engineServingTemplate(component.engine)
-		mergeRuntimeResources = runnerResourcesUnspecified(isvc.Spec.Engine.Runner)
+		mergeRuntimeResources = runnerResourcesUnspecified(declaredEngineRunner(isvc.Spec.Engine))
 	case v1beta1.DecoderComponent:
 		if component.decoder == nil || isvc.Spec.Decoder == nil {
 			return AcceleratorBaseComponent{}, ErrAcceleratorEvidenceInvalid
 		}
 		podSpec, runner = decoderServingTemplate(component.decoder)
-		mergeRuntimeResources = runnerResourcesUnspecified(isvc.Spec.Decoder.Runner)
+		mergeRuntimeResources = runnerResourcesUnspecified(declaredDecoderRunner(isvc.Spec.Decoder))
 	default:
 		return AcceleratorBaseComponent{}, ErrAcceleratorEvidenceInvalid
 	}
@@ -288,6 +288,20 @@ func decoderServingTemplate(spec *v1beta1.DecoderSpec) (*v1beta1.PodSpec, *v1bet
 		return &spec.Leader.PodSpec, spec.Leader.Runner
 	}
 	return &spec.PodSpec, spec.Runner
+}
+
+func declaredEngineRunner(spec *v1beta1.EngineSpec) *v1beta1.RunnerSpec {
+	if spec.Leader != nil {
+		return spec.Leader.Runner
+	}
+	return spec.Runner
+}
+
+func declaredDecoderRunner(spec *v1beta1.DecoderSpec) *v1beta1.RunnerSpec {
+	if spec.Leader != nil {
+		return spec.Leader.Runner
+	}
+	return spec.Runner
 }
 
 func runnerResourcesUnspecified(runner *v1beta1.RunnerSpec) bool {
