@@ -397,7 +397,7 @@ func TestMigrationRunnerShapeAndInvalidDependencies(t *testing.T) {
 		require.False(t, validMigrationRunners(&v1beta1.InferenceReplica{Spec: v1beta1.InferenceReplicaSpec{Runners: runners}}))
 	}
 	v, _ := nativeTarget(t)
-	_, err := CollectMigrationEvidence(nil, nil, nil, v, []string{"engine"}, MigrationOptions{Component: v1beta1.EngineComponent}, nil)
+	_, err := CollectMigrationEvidence(nil, nil, nil, v, []string{"engine"}, MigrationOptions{Component: v1beta1.EngineComponent}, nil) //nolint:staticcheck // Deliberately test the nil-context refusal boundary.
 	require.Error(t, err)
 	_, err = CollectMigrationEvidence(context.Background(), nil, nil, nil, nil, MigrationOptions{}, nil)
 	require.Error(t, err)

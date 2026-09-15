@@ -236,7 +236,7 @@ func (o *startOptions) run(parent context.Context, f factory.Factory, name strin
 				}
 				classified := mutate.GuardedPatchError(err)
 				if exitcode.FromError(classified) == exitcode.MutationConflict {
-					return classified
+					return &exitcode.PreconditionError{Err: errors.New("guarded migration rejected; inspect migration status using preview UUID")}
 				}
 				return fmt.Errorf("migration request failed or outcome unknown; inspect migration status using the preview UUID: %w", classified)
 			}
