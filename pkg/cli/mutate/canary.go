@@ -141,13 +141,16 @@ func PrepareCanaryRollout(v *v1beta1.InferenceService, state *effective.RuntimeS
 			return RolloutPlan{}, ErrStale
 		}
 	}
-	if cs.LastEvaluationTime != nil && cs.StepEnteredTime != nil && cs.LastEvaluationTime.Before(cs.StepEnteredTime) {
-		return RolloutPlan{}, ErrStale
-	}
 	if cs.LastConclusiveEvaluationTime != nil && (cs.LastEvaluationTime == nil || cs.LastConclusiveEvaluationTime.After(cs.LastEvaluationTime.Time)) {
 		return RolloutPlan{}, ErrStale
 	}
 	if cs.CurrentStep < 0 || int(cs.CurrentStep) >= len(group.Group.Canary.Steps) {
+		return RolloutPlan{}, ErrStale
+	}
+	step := &group.Group.Canary.Steps[cs.CurrentStep]
+	// Analysis samples survive capacity dips and recovery, both of which
+	// restamp entry. Entry is not immutable sample/run identity evidence.
+	if step.Analysis == nil && cs.LastEvaluationTime != nil && cs.StepEnteredTime != nil && cs.LastEvaluationTime.Before(cs.StepEnteredTime) {
 		return RolloutPlan{}, ErrStale
 	}
 	projection, err := rolloutprojection.Project(v, clock)
@@ -171,7 +174,6 @@ func PrepareCanaryRollout(v *v1beta1.InferenceService, state *effective.RuntimeS
 	if cs.RolledBackRevisionHash != "" {
 		return RolloutPlan{}, ErrIdle
 	}
-	step := &group.Group.Canary.Steps[cs.CurrentStep]
 	final := int(cs.CurrentStep) == len(group.Group.Canary.Steps)-1
 	if action == "promote" {
 		if cs.PreStepHold || cs.PromotedThrough != "" || cs.StepEnteredTime == nil || cs.ObservedTrafficWeight != step.Traffic ||
@@ -239,6 +241,9 @@ func prepareCanaryPreview(run *v1beta1.RolloutRun, index int, primary v1beta1.Co
 	}
 	add("Analysis", string(observed.Step.Analysis))
 	add("Evaluated", previewTime(cs.LastEvaluationTime))
+	if cs.LastEvaluationTime != nil && cs.StepEnteredTime != nil && cs.LastEvaluationTime.Before(cs.StepEnteredTime) {
+		add("Sample provenance", "Retained (before current entry)")
+	}
 	add("Conclusive", previewTime(cs.LastConclusiveEvaluationTime))
 	add("Failed checks", fmt.Sprintf("%d / %d", cs.AnalysisFailedChecks, step.Analysis.FailureLimit))
 	add("Interval", step.Analysis.Interval.Duration.String())
