@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/cmd/instance"
 	"sigs.k8s.io/ome/pkg/cli/cmd/logs"
 	"sigs.k8s.io/ome/pkg/cli/cmd/migration"
+	"sigs.k8s.io/ome/pkg/cli/cmd/quota"
 	"sigs.k8s.io/ome/pkg/cli/cmd/rollout"
 	runtimecmd "sigs.k8s.io/ome/pkg/cli/cmd/runtime"
 	"sigs.k8s.io/ome/pkg/cli/cmd/status"
@@ -61,6 +62,7 @@ explanations, accelerator-selection evidence, and component-aware log streaming.
 	cmd.AddCommand(instance.NewCmd(f, streams))
 	cmd.AddCommand(logs.NewCmd(f, streams))
 	cmd.AddCommand(migration.NewCmd(f, streams))
+	cmd.AddCommand(quota.NewCmd(f, streams))
 	cmd.AddCommand(rollout.NewCmd(f, streams))
 	cmd.AddCommand(runtimecmd.NewCmd(f, streams))
 	cmd.AddCommand(status.NewCmd(f, streams))

@@ -37,6 +37,8 @@ func TestRootCommandTree(t *testing.T) {
 		"ome logs",
 		"ome migration",
 		"ome migration status",
+		"ome quota",
+		"ome quota tree",
 		"ome rollout",
 		"ome rollout explain",
 		"ome rollout history",
