@@ -104,11 +104,17 @@ content:
   summary:
     intent: Declared
     realization: Reported
+    realizationSource:
+      evidence: Reported
+      freshness: Unverifiable
     source:
       evidence: Computed
       freshness: Unverifiable
     state: Consistent
     support: Honored
+    supportSource:
+      evidence: Computed
+      freshness: Current
 kind: TrafficExplainReport
 metadata:
   name: chat

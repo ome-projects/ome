@@ -393,11 +393,15 @@ func (c TrafficStatusContent) WideTable() report.Table {
 }
 
 func canaryStepCell(canary *TrafficCanary) string {
+	return fmt.Sprintf("%d/%d @ %d%%", canaryDisplayStep(canary), canary.TotalSteps, canary.ObservedTraffic)
+}
+
+func canaryDisplayStep(canary *TrafficCanary) int32 {
 	displayStep := canary.CurrentStep + 1
 	if canary.CurrentStep >= canary.TotalSteps {
 		displayStep = canary.TotalSteps
 	}
-	return fmt.Sprintf("%d/%d @ %d%%", displayStep, canary.TotalSteps, canary.ObservedTraffic)
+	return displayStep
 }
 
 func trafficSummaryRows(c TrafficStatusContent) [][]string {

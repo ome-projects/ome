@@ -25,6 +25,14 @@
       "source": {
         "evidence": "Computed",
         "freshness": "Unverifiable"
+      },
+      "supportSource": {
+        "evidence": "Computed",
+        "freshness": "Current"
+      },
+      "realizationSource": {
+        "evidence": "Reported",
+        "freshness": "Unverifiable"
       }
     },
     "intent": {
@@ -48,14 +56,14 @@
     },
     "reported": {
       "summary": {
-        "state": "Reported",
-        "translator": "envoy-gateway",
-        "algorithm": "RoundRobin",
+        "state": "Unavailable",
+        "translator": "Unavailable",
+        "algorithm": "Unknown",
         "policyReady": {
-          "status": "True",
-          "reason": "AcceptedByGateway"
+          "status": "Unknown",
+          "reason": "NotReported"
         },
-        "unsupported": "None",
+        "unsupported": "Unknown",
         "source": {
           "state": {
             "evidence": "Computed",
@@ -63,41 +71,23 @@
           },
           "translator": {
             "evidence": "Computed",
-            "freshness": "Current"
+            "freshness": "Unavailable"
           },
           "algorithm": {
             "evidence": "Reported",
-            "freshness": "Current"
+            "freshness": "Unavailable"
           },
           "policyReady": {
             "evidence": "Reported",
-            "freshness": "Current"
+            "freshness": "Unavailable"
           },
           "unsupported": {
             "evidence": "Reported",
-            "freshness": "Current"
+            "freshness": "Unavailable"
           }
         }
       },
-      "policy": {
-        "apiVersion": "gateway.envoyproxy.io/v1alpha1",
-        "kind": "BackendTrafficPolicy",
-        "namespace": "prod",
-        "name": "chat",
-        "source": {
-          "evidence": "Reported",
-          "freshness": "Current"
-        }
-      },
-      "routes": [
-        {
-          "name": "chat",
-          "source": {
-            "evidence": "Reported",
-            "freshness": "Current"
-          }
-        }
-      ],
+      "routes": [],
       "endpoints": [],
       "canary": {
         "component": "engine",
@@ -124,20 +114,12 @@
           }
         }
       ],
-      "conditions": [
+      "conditions": [],
+      "issues": [
         {
-          "type": "BackendPolicyReady",
-          "status": "True",
-          "reason": "AcceptedByGateway",
-          "observedGeneration": 7,
-          "lastTransitionTime": "2026-09-14T16:59:00Z",
-          "source": {
-            "evidence": "Reported",
-            "freshness": "Current"
-          }
+          "code": "TrafficStatusMissing"
         }
-      ],
-      "issues": []
+      ]
     },
     "comparisons": [
       {

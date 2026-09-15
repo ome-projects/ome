@@ -1,7 +1,7 @@
 LAYER       STATE           VALUE                    SOURCE
 SUMMARY     Pending         -                        Computed/Unavailable
 INTENT      Declared        RoundRobin               Declared/Current
-SUPPORT     Pending         -                        Reported/Current
+SUPPORT     Pending         -                        Computed/Current
 TRANSLATE   Computed        Unavailable              Computed/Unavailable
 REALIZE     Unavailable     r=0 e=0 w=0              Unavailable/Unavailable
 CHECK       Match           algorithm                Computed/Current

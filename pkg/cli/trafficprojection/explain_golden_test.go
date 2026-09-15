@@ -25,7 +25,7 @@ func TestProjectExplainExactOutputMatrix(t *testing.T) {
 	for _, scenario := range []string{
 		"healthy", "partial", "unavailable", "unsupported", "mismatch",
 		"stale", "stale-unsupported", "malformed", "absent-translator",
-		"noop-translator", "hostile-secret", "canary100", "canary-only",
+		"noop-translator", "hostile-secret", "canary100", "canary-only", "completed-canary",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			base := filepath.Join("testdata", "explain", scenario)

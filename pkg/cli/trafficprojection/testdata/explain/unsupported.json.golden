@@ -21,9 +21,17 @@
       "state": "Unsupported",
       "intent": "Declared",
       "support": "Partial",
-      "realization": "Partial",
+      "realization": "Reported",
       "source": {
         "evidence": "Computed",
+        "freshness": "Current"
+      },
+      "supportSource": {
+        "evidence": "Computed",
+        "freshness": "Current"
+      },
+      "realizationSource": {
+        "evidence": "Reported",
         "freshness": "Current"
       }
     },

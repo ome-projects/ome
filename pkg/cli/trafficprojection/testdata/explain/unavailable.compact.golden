@@ -1,7 +1,7 @@
 LAYER       STATE           VALUE                    SOURCE
 SUMMARY     Unavailable     -                        Computed/Unavailable
 INTENT      Declared        RoundRobin               Declared/Current
-SUPPORT     Unavailable     -                        Reported/Unavailable
+SUPPORT     Unavailable     -                        Computed/Unavailable
 TRANSLATE   Computed        Unavailable              Computed/Unavailable
 REALIZE     Unavailable     r=0 e=0 w=0              Unavailable/Unavailable
 CHECK       Unverifiable    algorithm                Computed/Unavailable

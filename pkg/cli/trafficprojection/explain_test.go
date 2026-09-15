@@ -2,8 +2,11 @@ package trafficprojection_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -592,6 +595,80 @@ func TestProjectExplainConflictingConditionsRemainInvalid(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, reportv1alpha1.TrafficSupportInvalid, got.Content.Summary.Support)
 	assert.Equal(t, reportv1alpha1.TrafficComparisonInvalid, explainComparison(t, got, reportv1alpha1.TrafficComparisonPolicy).State)
+}
+
+func TestProjectExplainLayerEvidenceBoundaries(t *testing.T) {
+	for _, scenario := range []struct {
+		name, support, supportSource, realization, realizationSource, algorithm, comparison string
+	}{
+		{"stale-unsupported", "Partial", "Computed/Stale", "Reported", "Reported/Current", "Reported", "Match"},
+		{"hostile-secret", "Honored", "Computed/Current", "Invalid", "Computed/Unverifiable", "Reported", "Match"},
+		{"malformed", "Invalid", "Computed/Unverifiable", "Reported", "Reported/Current", "Reported", "Match"},
+		{"canary-only", "NotApplicable", "Computed/Current", "Reported", "Reported/Unverifiable", "Unavailable", "NotApplicable"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "explain", scenario.name+".input.json"))
+			require.NoError(t, err)
+			var isvc omev1beta1.InferenceService
+			require.NoError(t, json.Unmarshal(data, &isvc))
+			if scenario.name == "canary-only" {
+				isvc.Status.Traffic = nil
+			}
+			got, err := trafficprojection.ProjectExplain(&isvc, projectionClock)
+			require.NoError(t, err)
+			assert.Equal(t, scenario.realization, string(got.Content.Summary.Realization))
+			assert.Equal(t, scenario.comparison, string(explainComparison(t, got, reportv1alpha1.TrafficComparisonAlgorithm).State))
+			compact := got.Table().Rows
+			assert.Equal(t, []string{"SUPPORT", scenario.support, "-", scenario.supportSource}, compact[2])
+			assert.Equal(t, scenario.realizationSource, compact[4][3])
+			var machine bytes.Buffer
+			require.NoError(t, report.Write(&machine, report.FormatJSON, got))
+			var document map[string]any
+			require.NoError(t, json.Unmarshal(machine.Bytes(), &document))
+			summary := document["content"].(map[string]any)["summary"].(map[string]any)
+			for field, want := range map[string]string{"supportSource": scenario.supportSource, "realizationSource": scenario.realizationSource} {
+				parts := strings.Split(want, "/")
+				assert.Equal(t, map[string]any{"evidence": parts[0], "freshness": parts[1]}, summary[field])
+			}
+			for _, row := range got.WideTable().Rows {
+				if row[0] == "SUMMARY" && row[1] == "support" {
+					assert.Equal(t, scenario.supportSource, row[4])
+				}
+				if row[0] == "SUMMARY" && row[1] == "realization" {
+					assert.Equal(t, scenario.realizationSource, row[4])
+				}
+				if row[0] == "REPORTED" && row[1] == "algorithm" {
+					assert.Equal(t, scenario.algorithm, row[2])
+				}
+			}
+			if scenario.name == "hostile-secret" || scenario.name == "malformed" {
+				assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable, got.Content.Summary.Source.Freshness)
+			}
+			if scenario.name == "malformed" {
+				assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable,
+					explainComparison(t, got, reportv1alpha1.TrafficComparisonPolicy).Source.Freshness)
+			}
+		})
+	}
+}
+
+func TestProjectExplainCompletedCanaryUsesTerminalDisplay(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	isvc.Status.Canary.CurrentStep = 2
+	isvc.Status.Canary.ObservedTrafficWeight = 100
+	isvc.Status.Canary.StableRevisionHash = ""
+	component := isvc.Status.Components[omev1beta1.EngineComponent]
+	component.RolloutPhase = omev1beta1.RolloutPhaseStable
+	component.Traffic = component.Traffic[:1]
+	component.Traffic[0].Percent = 100
+	isvc.Status.Components[omev1beta1.EngineComponent] = component
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Reported.Canary)
+	assert.Contains(t, got.WideTable().Rows, []string{"OBSERVED", "canary", "Reported", "engine step=2/2 traffic=100%", "Reported/Unverifiable"})
+	assert.Contains(t, got.WideTable().Rows, []string{"OBSERVED", "stable-revision", "Reported", "-", "Reported/Unverifiable"})
+	require.Len(t, got.Content.Reported.Allocations, 1)
+	assert.Equal(t, int32(100), got.Content.Reported.Allocations[0].Percent)
 }
 
 func explainComparison(

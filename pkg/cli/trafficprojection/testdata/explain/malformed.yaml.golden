@@ -6,11 +6,11 @@ content:
     source:
       evidence: Computed
       freshness: Current
-    state: Invalid
+    state: Match
   - field: policy
     source:
       evidence: Computed
-      freshness: Current
+      freshness: Unverifiable
     state: Invalid
   - field: canary-weight
     source:
@@ -80,12 +80,18 @@ content:
       unsupported: None
   summary:
     intent: Declared
-    realization: Invalid
+    realization: Reported
+    realizationSource:
+      evidence: Reported
+      freshness: Current
     source:
       evidence: Computed
-      freshness: Current
+      freshness: Unverifiable
     state: Invalid
     support: Invalid
+    supportSource:
+      evidence: Computed
+      freshness: Unverifiable
 kind: TrafficExplainReport
 metadata:
   name: chat

@@ -7,12 +7,12 @@ REPORT           collected-at        -               2026-09-14T17:00:00Z       
 SOURCE           InferenceService    Reported        prod/chat gen=7 at=2026-09-14T17:00:00Z                         Reported/Current
 SUMMARY          state               Partial         -                                                               Computed/Unavailable
 SUMMARY          intent              Declared        -                                                               Declared/Current
-SUMMARY          support             Partial         -                                                               Reported/Unavailable
+SUMMARY          support             Partial         -                                                               Computed/Unavailable
 SUMMARY          realization         Reported        routes=1 endpoints=0 targets=0                                  Reported/Unverifiable
 INTENT           algorithm           Declared        RoundRobin                                                      Declared/Current
 INTENT           consistent-hash     Absent          -                                                               Declared/Current
 INTENT           endpoint-override   Absent          -                                                               Declared/Current
-REPORTED         algorithm           Unavailable     RoundRobin                                                      Reported/Unverifiable
+REPORTED         algorithm           Reported        RoundRobin                                                      Reported/Unverifiable
 REPORTED         translator          Computed        envoy-gateway                                                   Computed/Unverifiable
 REPORTED         policy-ready        Unknown         NotReported                                                     Reported/Unavailable
 REPORTED         unsupported         Unknown         -                                                               Reported/Unavailable

@@ -94,12 +94,18 @@ content:
       unsupported: Present
   summary:
     intent: Declared
-    realization: Partial
+    realization: Reported
+    realizationSource:
+      evidence: Reported
+      freshness: Current
     source:
       evidence: Computed
       freshness: Current
     state: Unsupported
     support: Partial
+    supportSource:
+      evidence: Computed
+      freshness: Current
 kind: TrafficExplainReport
 metadata:
   name: chat

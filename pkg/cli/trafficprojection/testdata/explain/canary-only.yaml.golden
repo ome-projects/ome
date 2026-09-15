@@ -53,62 +53,49 @@ content:
         freshness: Unverifiable
       stableRevisionHash: a1b2c3d4
       totalSteps: 2
-    conditions:
-    - lastTransitionTime: "2026-09-14T16:59:00Z"
-      observedGeneration: 7
-      reason: AcceptedByGateway
-      source:
-        evidence: Reported
-        freshness: Current
-      status: "True"
-      type: BackendPolicyReady
+    conditions: []
     endpoints: []
-    issues: []
-    policy:
-      apiVersion: gateway.envoyproxy.io/v1alpha1
-      kind: BackendTrafficPolicy
-      name: chat
-      namespace: prod
-      source:
-        evidence: Reported
-        freshness: Current
-    routes:
-    - name: chat
-      source:
-        evidence: Reported
-        freshness: Current
+    issues:
+    - code: TrafficStatusMissing
+    routes: []
     summary:
-      algorithm: RoundRobin
+      algorithm: Unknown
       policyReady:
-        reason: AcceptedByGateway
-        status: "True"
+        reason: NotReported
+        status: Unknown
       source:
         algorithm:
           evidence: Reported
-          freshness: Current
+          freshness: Unavailable
         policyReady:
           evidence: Reported
-          freshness: Current
+          freshness: Unavailable
         state:
           evidence: Computed
           freshness: Unverifiable
         translator:
           evidence: Computed
-          freshness: Current
+          freshness: Unavailable
         unsupported:
           evidence: Reported
-          freshness: Current
-      state: Reported
-      translator: envoy-gateway
-      unsupported: None
+          freshness: Unavailable
+      state: Unavailable
+      translator: Unavailable
+      unsupported: Unknown
   summary:
     intent: Declared
     realization: Reported
+    realizationSource:
+      evidence: Reported
+      freshness: Unverifiable
     source:
       evidence: Computed
       freshness: Unverifiable
     state: Consistent
     support: NotApplicable
+    supportSource:
+      evidence: Computed
+      freshness: Current
 kind: TrafficExplainReport
 metadata:
   name: chat

@@ -21,10 +21,18 @@
       "state": "Partial",
       "intent": "Declared",
       "support": "Partial",
-      "realization": "Partial",
+      "realization": "Reported",
       "source": {
         "evidence": "Computed",
         "freshness": "Stale"
+      },
+      "supportSource": {
+        "evidence": "Computed",
+        "freshness": "Stale"
+      },
+      "realizationSource": {
+        "evidence": "Reported",
+        "freshness": "Current"
       }
     },
     "intent": {

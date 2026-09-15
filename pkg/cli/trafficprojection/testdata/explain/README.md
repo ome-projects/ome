@@ -27,7 +27,16 @@ part of that snapshot:
   and a declared header name; none may appear in any output format.
 - `canary100`: promoting at 100%, with only a canary allocation; the stable
   revision remains visible in the separate wide canary identity rows.
-- `canary-only`: the same rollout without declared backend-policy intent.
+- `canary-only`: the same rollout without declared backend-policy intent and
+  with the documented nil TrafficStatus shape.
+- `completed-canary`: the terminal step sentinel, no stable revision hash,
+  and exactly the single stable allocation reported by the controller.
+
+Support and realization sources are explicit in machine summaries. Historical
+unsupported evidence makes computed support Stale while a current route remains
+Reported/Current. A discarded hostile endpoint makes realization
+Computed/Unverifiable; a malformed policy instead invalidates support and its
+comparison, preserving the independent algorithm and route evidence.
 
 When intentional public output changes require editing these contracts,
 review all four formats and retain the independent evidence/freshness labels.

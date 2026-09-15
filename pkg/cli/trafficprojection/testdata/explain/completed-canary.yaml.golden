@@ -5,18 +5,18 @@ content:
   - field: algorithm
     source:
       evidence: Computed
-      freshness: Stale
-    state: Unverifiable
+      freshness: Current
+    state: Match
   - field: policy
     source:
       evidence: Computed
-      freshness: Stale
-    state: Unverifiable
+      freshness: Current
+    state: Match
   - field: canary-weight
     source:
       evidence: Computed
-      freshness: Current
-    state: NotApplicable
+      freshness: Unverifiable
+    state: Match
   intent:
     algorithm: RoundRobin
     consistentHash:
@@ -32,17 +32,34 @@ content:
       evidence: Declared
       freshness: Current
     state: Declared
-  issues:
-  - code: ReportedEvidenceStale
+  issues: []
   reported:
-    allocations: []
+    allocations:
+    - component: engine
+      percent: 100
+      revisionHash: e5f6a7b8
+      revisionName: chat-engine-rev-e5f6a7b8
+      role: stable
+      source:
+        evidence: Reported
+        freshness: Unverifiable
+    canary:
+      canaryRevisionHash: e5f6a7b8
+      component: engine
+      currentStep: 2
+      observedTraffic: 100
+      source:
+        evidence: Reported
+        freshness: Unverifiable
+      stableRevisionHash: ""
+      totalSteps: 2
     conditions:
     - lastTransitionTime: "2026-09-14T16:59:00Z"
-      observedGeneration: 6
+      observedGeneration: 7
       reason: AcceptedByGateway
       source:
         evidence: Reported
-        freshness: Stale
+        freshness: Current
       status: "True"
       type: BackendPolicyReady
     endpoints: []
@@ -54,12 +71,12 @@ content:
       namespace: prod
       source:
         evidence: Reported
-        freshness: Stale
+        freshness: Current
     routes:
     - name: chat
       source:
         evidence: Reported
-        freshness: Stale
+        freshness: Current
     summary:
       algorithm: RoundRobin
       policyReady:
@@ -68,36 +85,36 @@ content:
       source:
         algorithm:
           evidence: Reported
-          freshness: Stale
+          freshness: Current
         policyReady:
           evidence: Reported
-          freshness: Stale
+          freshness: Current
         state:
           evidence: Computed
           freshness: Unverifiable
         translator:
           evidence: Computed
-          freshness: Stale
+          freshness: Current
         unsupported:
           evidence: Reported
-          freshness: Stale
-      state: Partial
+          freshness: Current
+      state: Reported
       translator: envoy-gateway
-      unsupported: Unknown
+      unsupported: None
   summary:
     intent: Declared
     realization: Reported
     realizationSource:
       evidence: Reported
-      freshness: Stale
+      freshness: Unverifiable
     source:
       evidence: Computed
-      freshness: Stale
-    state: Partial
-    support: Partial
+      freshness: Unverifiable
+    state: Consistent
+    support: Honored
     supportSource:
       evidence: Computed
-      freshness: Stale
+      freshness: Current
 kind: TrafficExplainReport
 metadata:
   name: chat
@@ -109,6 +126,4 @@ sources:
   kind: InferenceService
   name: chat
   namespace: prod
-warnings:
-- code: PartialData
-- code: StaleEvidence
+warnings: []

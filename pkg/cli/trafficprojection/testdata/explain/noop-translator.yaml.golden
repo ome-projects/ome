@@ -76,11 +76,17 @@ content:
   summary:
     intent: Declared
     realization: Unavailable
+    realizationSource:
+      evidence: Unavailable
+      freshness: Unavailable
     source:
       evidence: Computed
       freshness: Unavailable
     state: Unsupported
     support: Rejected
+    supportSource:
+      evidence: Computed
+      freshness: Current
 kind: TrafficExplainReport
 metadata:
   name: chat

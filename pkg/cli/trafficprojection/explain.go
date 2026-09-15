@@ -63,13 +63,12 @@ func ProjectExplain(
 		Summary: reportv1alpha1.TrafficExplainSummary{
 			State: state, Intent: intent.State, Support: support,
 			Realization: realization,
-			Source: trafficExplainSummarySource(
-				intent.State, support, statusReport.Content, comparisons,
-			),
 		},
 		Intent: intent, Reported: statusReport.Content,
 		Comparisons: comparisons, Issues: issues,
 	}
+	content = content.Canonical()
+	content.Summary.Source = trafficExplainSummarySource(content)
 	// Project sampled the caller's clock. Reuse that timestamp so one report
 	// represents one collection instant even when a stateful test clock is used.
 	reportValue := reportv1alpha1.NewTrafficExplainReport(
@@ -324,8 +323,16 @@ func projectTrafficSupport(
 }
 
 func projectTrafficRealization(status reportv1alpha1.TrafficStatusContent) reportv1alpha1.TrafficRealizationState {
-	if status.Summary.State == reportv1alpha1.TrafficStateInvalid {
-		return reportv1alpha1.TrafficRealizationInvalid
+	for _, issue := range status.Issues {
+		switch issue.Code {
+		case reportv1alpha1.TrafficIssueRouteInvalid,
+			reportv1alpha1.TrafficIssueEndpointInvalid,
+			reportv1alpha1.TrafficIssueCanaryInvalid,
+			reportv1alpha1.TrafficIssueAllocationInvalid,
+			reportv1alpha1.TrafficIssueAllocationConflict,
+			reportv1alpha1.TrafficIssueUnknownComponentStatus:
+			return reportv1alpha1.TrafficRealizationInvalid
+		}
 	}
 	count := len(status.Routes) + len(status.Endpoints) + len(status.Allocations)
 	if status.Canary != nil {
@@ -334,8 +341,7 @@ func projectTrafficRealization(status reportv1alpha1.TrafficStatusContent) repor
 	if count == 0 {
 		return reportv1alpha1.TrafficRealizationUnavailable
 	}
-	if status.Summary.State == reportv1alpha1.TrafficStatePartial ||
-		hasPartialTrafficIssue(status.Issues) {
+	if hasPartialTrafficIssue(status.Issues) {
 		return reportv1alpha1.TrafficRealizationPartial
 	}
 	return reportv1alpha1.TrafficRealizationReported
@@ -354,8 +360,9 @@ func projectTrafficComparisons(
 		algorithm = reportv1alpha1.TrafficComparisonNotApplicable
 		algorithmFreshness = reportv1alpha1.TrafficFreshnessCurrent
 	case intent.State == reportv1alpha1.TrafficIntentInvalid ||
-		trafficPolicyEvidenceInvalid(status):
+		hasTrafficIssue(status.Issues, reportv1alpha1.TrafficIssueAlgorithmInvalid):
 		algorithm = reportv1alpha1.TrafficComparisonInvalid
+		algorithmFreshness = reportv1alpha1.TrafficFreshnessUnverifiable
 	case status.Summary.Source.Algorithm.Freshness != reportv1alpha1.TrafficFreshnessCurrent:
 		algorithm = reportv1alpha1.TrafficComparisonUnverifiable
 	case intent.Algorithm == status.Summary.Algorithm:
@@ -372,14 +379,20 @@ func projectTrafficComparisons(
 		policyFreshness = reportv1alpha1.TrafficFreshnessCurrent
 	case intent.State == reportv1alpha1.TrafficIntentInvalid:
 		policy = reportv1alpha1.TrafficComparisonInvalid
+		policyFreshness = reportv1alpha1.TrafficFreshnessUnverifiable
 	case policyFreshness != reportv1alpha1.TrafficFreshnessCurrent:
 		policy = reportv1alpha1.TrafficComparisonUnverifiable
 	case support == reportv1alpha1.TrafficSupportInvalid:
 		policy = reportv1alpha1.TrafficComparisonInvalid
+		policyFreshness = reportv1alpha1.TrafficFreshnessUnverifiable
 	case support == reportv1alpha1.TrafficSupportHonored ||
 		support == reportv1alpha1.TrafficSupportPartial:
 		if status.Policy != nil && status.Policy.Source.Freshness == reportv1alpha1.TrafficFreshnessCurrent {
 			policy = reportv1alpha1.TrafficComparisonMatch
+		} else if status.Policy != nil {
+			policyFreshness = status.Policy.Source.Freshness
+		} else {
+			policyFreshness = reportv1alpha1.TrafficFreshnessUnavailable
 		}
 	case support == reportv1alpha1.TrafficSupportRejected:
 		policy = reportv1alpha1.TrafficComparisonMismatch
@@ -505,13 +518,8 @@ func projectTrafficExplainState(
 	return reportv1alpha1.TrafficExplainConsistent
 }
 
-func trafficExplainSummarySource(
-	intent reportv1alpha1.TrafficIntentState,
-	support reportv1alpha1.TrafficSupportState,
-	status reportv1alpha1.TrafficStatusContent,
-	comparisons []reportv1alpha1.TrafficExplainComparison,
-) reportv1alpha1.TrafficValueSource {
-	if intent == reportv1alpha1.TrafficIntentAbsent {
+func trafficExplainSummarySource(content reportv1alpha1.TrafficExplainContent) reportv1alpha1.TrafficValueSource {
+	if content.Summary.State == reportv1alpha1.TrafficExplainNoIntent {
 		return computedTrafficSource(reportv1alpha1.TrafficFreshnessCurrent)
 	}
 	freshness := reportv1alpha1.TrafficFreshnessCurrent
@@ -520,16 +528,9 @@ func trafficExplainSummarySource(
 			freshness = candidate.Freshness
 		}
 	}
-	if support != reportv1alpha1.TrafficSupportNotApplicable {
-		consider(status.Summary.Source.PolicyReady)
-		consider(status.Summary.Source.Unsupported)
-		consider(status.Summary.Source.Algorithm)
-		if status.Policy != nil {
-			consider(status.Policy.Source)
-		}
-	}
-	consider(explainRealizationSource(status))
-	for _, comparison := range comparisons {
+	consider(content.Summary.SupportSource)
+	consider(content.Summary.RealizationSource)
+	for _, comparison := range content.Comparisons {
 		consider(comparison.Source)
 	}
 	return computedTrafficSource(freshness)
@@ -555,32 +556,6 @@ func trafficPolicyEvidenceInvalid(status reportv1alpha1.TrafficStatusContent) bo
 		}
 	}
 	return false
-}
-
-func explainRealizationSource(content reportv1alpha1.TrafficStatusContent) reportv1alpha1.TrafficValueSource {
-	result := reportv1alpha1.TrafficValueSource{
-		Evidence:  reportv1alpha1.EvidenceUnavailable,
-		Freshness: reportv1alpha1.TrafficFreshnessUnavailable,
-	}
-	consider := func(candidate reportv1alpha1.TrafficValueSource) {
-		if result.Evidence == reportv1alpha1.EvidenceUnavailable ||
-			explainFreshnessRank(candidate.Freshness) > explainFreshnessRank(result.Freshness) {
-			result = candidate
-		}
-	}
-	for _, route := range content.Routes {
-		consider(route.Source)
-	}
-	for _, endpoint := range content.Endpoints {
-		consider(endpoint.Source)
-	}
-	for _, allocation := range content.Allocations {
-		consider(allocation.Source)
-	}
-	if content.Canary != nil {
-		consider(content.Canary.Source)
-	}
-	return result
 }
 
 func computedTrafficSource(freshness reportv1alpha1.TrafficFreshness) reportv1alpha1.TrafficValueSource {

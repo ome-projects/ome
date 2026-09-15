@@ -80,7 +80,7 @@ func TestTrafficExplainCompactAndWideTables(t *testing.T) {
 		Rows: [][]string{
 			{"SUMMARY", "Consistent", "-", "Computed/Unverifiable"},
 			{"INTENT", "Declared", "RoundRobin", "Declared/Current"},
-			{"SUPPORT", "Honored", "-", "Reported/Current"},
+			{"SUPPORT", "Honored", "-", "Computed/Current"},
 			{"TRANSLATE", "Computed", "envoy-gateway", "Computed/Current"},
 			{"REALIZE", "Reported", "r=2 e=1 w=2", "Reported/Unverifiable"},
 			{"CHECK", "Match", "algorithm", "Computed/Current"},

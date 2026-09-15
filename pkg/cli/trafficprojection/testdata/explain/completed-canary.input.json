@@ -6,6 +6,9 @@
     "generation": 7
   },
   "spec": {
+    "traffic": {
+      "algorithm": "RoundRobin"
+    },
     "rollout": {
       "groups": [
         {
@@ -29,15 +32,34 @@
     }
   },
   "status": {
+    "traffic": {
+      "algorithm": "RoundRobin",
+      "backendPolicyResource": {
+        "apiVersion": "gateway.envoyproxy.io/v1alpha1",
+        "kind": "BackendTrafficPolicy",
+        "name": "chat"
+      },
+      "targetedHTTPRoutes": [
+        "chat"
+      ],
+      "conditions": [
+        {
+          "type": "BackendPolicyReady",
+          "status": "True",
+          "reason": "AcceptedByGateway",
+          "observedGeneration": 7,
+          "lastTransitionTime": "2026-09-14T16:59:00Z"
+        }
+      ]
+    },
     "canary": {
-      "currentStep": 1,
+      "currentStep": 2,
       "observedTrafficWeight": 100,
-      "stableRevisionHash": "a1b2c3d4",
       "canaryRevisionHash": "e5f6a7b8"
     },
     "components": {
       "engine": {
-        "rolloutPhase": "Promoting",
+        "rolloutPhase": "Stable",
         "traffic": [
           {
             "revisionName": "chat-engine-rev-e5f6a7b8",

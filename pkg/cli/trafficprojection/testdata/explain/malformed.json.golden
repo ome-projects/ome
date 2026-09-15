@@ -21,9 +21,17 @@
       "state": "Invalid",
       "intent": "Declared",
       "support": "Invalid",
-      "realization": "Invalid",
+      "realization": "Reported",
       "source": {
         "evidence": "Computed",
+        "freshness": "Unverifiable"
+      },
+      "supportSource": {
+        "evidence": "Computed",
+        "freshness": "Unverifiable"
+      },
+      "realizationSource": {
+        "evidence": "Reported",
         "freshness": "Current"
       }
     },
@@ -115,7 +123,7 @@
     "comparisons": [
       {
         "field": "algorithm",
-        "state": "Invalid",
+        "state": "Match",
         "source": {
           "evidence": "Computed",
           "freshness": "Current"
@@ -126,7 +134,7 @@
         "state": "Invalid",
         "source": {
           "evidence": "Computed",
-          "freshness": "Current"
+          "freshness": "Unverifiable"
         }
       },
       {

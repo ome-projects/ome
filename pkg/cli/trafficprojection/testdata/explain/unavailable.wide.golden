@@ -7,7 +7,7 @@ REPORT           collected-at        -               2026-09-14T17:00:00Z       
 SOURCE           InferenceService    Reported        prod/chat gen=7 at=2026-09-14T17:00:00Z   Reported/Current
 SUMMARY          state               Unavailable     -                                         Computed/Unavailable
 SUMMARY          intent              Declared        -                                         Declared/Current
-SUMMARY          support             Unavailable     -                                         Reported/Unavailable
+SUMMARY          support             Unavailable     -                                         Computed/Unavailable
 SUMMARY          realization         Unavailable     routes=0 endpoints=0 targets=0            Unavailable/Unavailable
 INTENT           algorithm           Declared        RoundRobin                                Declared/Current
 INTENT           consistent-hash     Absent          -                                         Declared/Current

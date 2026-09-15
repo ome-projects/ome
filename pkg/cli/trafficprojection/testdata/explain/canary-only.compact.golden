@@ -1,9 +1,9 @@
 LAYER       STATE           VALUE           SOURCE
 SUMMARY     Consistent      -               Computed/Unverifiable
 INTENT      Declared        Default         Declared/Current
-SUPPORT     NotApplicable   -               Reported/Current
-TRANSLATE   Computed        envoy-gateway   Computed/Current
-REALIZE     Reported        r=1 e=0 w=1     Reported/Unverifiable
+SUPPORT     NotApplicable   -               Computed/Current
+TRANSLATE   Computed        Unavailable     Computed/Unavailable
+REALIZE     Reported        r=0 e=0 w=1     Reported/Unverifiable
 CHECK       NotApplicable   algorithm       Computed/Current
 CHECK       NotApplicable   policy          Computed/Current
 CHECK       Match           canary-weight   Computed/Unverifiable

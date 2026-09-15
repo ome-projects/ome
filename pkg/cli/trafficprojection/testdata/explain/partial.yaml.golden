@@ -79,11 +79,17 @@ content:
   summary:
     intent: Declared
     realization: Reported
+    realizationSource:
+      evidence: Reported
+      freshness: Unverifiable
     source:
       evidence: Computed
       freshness: Unavailable
     state: Partial
     support: Partial
+    supportSource:
+      evidence: Computed
+      freshness: Unavailable
 kind: TrafficExplainReport
 metadata:
   name: chat

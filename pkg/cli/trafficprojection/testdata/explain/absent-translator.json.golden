@@ -25,6 +25,14 @@
       "source": {
         "evidence": "Computed",
         "freshness": "Unavailable"
+      },
+      "supportSource": {
+        "evidence": "Computed",
+        "freshness": "Current"
+      },
+      "realizationSource": {
+        "evidence": "Unavailable",
+        "freshness": "Unavailable"
       }
     },
     "intent": {

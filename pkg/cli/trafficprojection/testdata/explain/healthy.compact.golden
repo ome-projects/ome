@@ -1,7 +1,7 @@
 LAYER       STATE           VALUE           SOURCE
 SUMMARY     Consistent      -               Computed/Current
 INTENT      Declared        RoundRobin      Declared/Current
-SUPPORT     Honored         -               Reported/Current
+SUPPORT     Honored         -               Computed/Current
 TRANSLATE   Computed        envoy-gateway   Computed/Current
 REALIZE     Reported        r=1 e=0 w=0     Reported/Current
 CHECK       Match           algorithm       Computed/Current

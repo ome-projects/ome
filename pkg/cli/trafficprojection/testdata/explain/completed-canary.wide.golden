@@ -19,9 +19,9 @@ REPORTED   unsupported         None         -                                   
 REPORTED   policy              Reported     gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy/prod/chat             Reported/Current
 REPORTED   route               Reported     chat                                                                      Reported/Current
 OBSERVED   canary              Reported     engine step=2/2 traffic=100%                                              Reported/Unverifiable
-OBSERVED   stable-revision     Reported     a1b2c3d4                                                                  Reported/Unverifiable
+OBSERVED   stable-revision     Reported     -                                                                         Reported/Unverifiable
 OBSERVED   canary-revision     Reported     e5f6a7b8                                                                  Reported/Unverifiable
-OBSERVED   target              Reported     engine/canary/chat-engine-rev-e5f6a7b8=100%                               Reported/Unverifiable
+OBSERVED   target              Reported     engine/stable/chat-engine-rev-e5f6a7b8=100%                               Reported/Unverifiable
 REPORTED   condition           Reported     BackendPolicyReady=True/AcceptedByGateway gen=7 at=2026-09-14T16:59:00Z   Reported/Current
 CHECK      algorithm           Match        -                                                                         Computed/Current
 CHECK      policy              Match        -                                                                         Computed/Current

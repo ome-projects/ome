@@ -87,11 +87,17 @@ content:
   summary:
     intent: Declared
     realization: Reported
+    realizationSource:
+      evidence: Reported
+      freshness: Current
     source:
       evidence: Computed
       freshness: Current
     state: Mismatch
     support: Honored
+    supportSource:
+      evidence: Computed
+      freshness: Current
 kind: TrafficExplainReport
 metadata:
   name: chat

@@ -18,10 +18,10 @@
   ],
   "content": {
     "summary": {
-      "state": "Invalid",
+      "state": "Consistent",
       "intent": "Declared",
       "support": "Honored",
-      "realization": "Invalid",
+      "realization": "Reported",
       "source": {
         "evidence": "Computed",
         "freshness": "Unverifiable"
@@ -31,7 +31,7 @@
         "freshness": "Current"
       },
       "realizationSource": {
-        "evidence": "Computed",
+        "evidence": "Reported",
         "freshness": "Unverifiable"
       }
     },
@@ -44,9 +44,9 @@
         "inputCount": 0
       },
       "endpointOverride": {
-        "state": "Declared",
-        "variant": "Header",
-        "inputCount": 1
+        "state": "Absent",
+        "variant": "Unavailable",
+        "inputCount": 0
       },
       "extensions": [],
       "source": {
@@ -56,7 +56,7 @@
     },
     "reported": {
       "summary": {
-        "state": "Invalid",
+        "state": "Reported",
         "translator": "envoy-gateway",
         "algorithm": "RoundRobin",
         "policyReady": {
@@ -107,7 +107,31 @@
         }
       ],
       "endpoints": [],
-      "allocations": [],
+      "canary": {
+        "component": "engine",
+        "currentStep": 2,
+        "totalSteps": 2,
+        "observedTraffic": 100,
+        "stableRevisionHash": "",
+        "canaryRevisionHash": "e5f6a7b8",
+        "source": {
+          "evidence": "Reported",
+          "freshness": "Unverifiable"
+        }
+      },
+      "allocations": [
+        {
+          "component": "engine",
+          "role": "stable",
+          "revisionName": "chat-engine-rev-e5f6a7b8",
+          "revisionHash": "e5f6a7b8",
+          "percent": 100,
+          "source": {
+            "evidence": "Reported",
+            "freshness": "Unverifiable"
+          }
+        }
+      ],
       "conditions": [
         {
           "type": "BackendPolicyReady",
@@ -121,11 +145,7 @@
           }
         }
       ],
-      "issues": [
-        {
-          "code": "EndpointInvalid"
-        }
-      ]
+      "issues": []
     },
     "comparisons": [
       {
@@ -146,22 +166,14 @@
       },
       {
         "field": "canary-weight",
-        "state": "NotApplicable",
+        "state": "Match",
         "source": {
           "evidence": "Computed",
-          "freshness": "Current"
+          "freshness": "Unverifiable"
         }
       }
     ],
-    "issues": [
-      {
-        "code": "ReportedEvidenceInvalid"
-      }
-    ]
+    "issues": []
   },
-  "warnings": [
-    {
-      "code": "PartialData"
-    }
-  ]
+  "warnings": []
 }

@@ -155,11 +155,13 @@ type TrafficDeclaredIntent struct {
 }
 
 type TrafficExplainSummary struct {
-	State       TrafficExplainState     `json:"state"`
-	Intent      TrafficIntentState      `json:"intent"`
-	Support     TrafficSupportState     `json:"support"`
-	Realization TrafficRealizationState `json:"realization"`
-	Source      TrafficValueSource      `json:"source"`
+	State             TrafficExplainState     `json:"state"`
+	Intent            TrafficIntentState      `json:"intent"`
+	Support           TrafficSupportState     `json:"support"`
+	Realization       TrafficRealizationState `json:"realization"`
+	Source            TrafficValueSource      `json:"source"`
+	SupportSource     TrafficValueSource      `json:"supportSource"`
+	RealizationSource TrafficValueSource      `json:"realizationSource"`
 }
 
 type TrafficExplainComparison struct {
@@ -282,6 +284,8 @@ func (c TrafficExplainContent) Canonical() TrafficExplainContent {
 	})
 	result.Intent.Extensions = slices.Compact(result.Intent.Extensions)
 	result.Reported = c.Reported.Canonical()
+	result.Summary.SupportSource = trafficExplainSupportSource(result.Summary.Support, result.Reported)
+	result.Summary.RealizationSource = trafficExplainRealizationSource(result.Summary.Realization, result.Reported)
 	result.Comparisons = append([]TrafficExplainComparison{}, c.Comparisons...)
 	sort.Slice(result.Comparisons, func(i, j int) bool {
 		a, b := result.Comparisons[i], result.Comparisons[j]
@@ -314,9 +318,9 @@ func (c TrafficExplainContent) Table() report.Table {
 	rows := [][]string{
 		{"SUMMARY", string(c.Summary.State), "-", trafficSourceCell(c.Summary.Source)},
 		{"INTENT", string(c.Intent.State), string(c.Intent.Algorithm), trafficSourceCell(c.Intent.Source)},
-		{"SUPPORT", string(c.Summary.Support), "-", trafficSourceCell(c.Reported.Summary.Source.PolicyReady)},
+		{"SUPPORT", string(c.Summary.Support), "-", trafficSourceCell(c.Summary.SupportSource)},
 		{"TRANSLATE", string(c.Reported.Summary.Source.Translator.Evidence), string(c.Reported.Summary.Translator), trafficSourceCell(c.Reported.Summary.Source.Translator)},
-		{"REALIZE", string(c.Summary.Realization), trafficCompactRealizationCell(c.Reported), trafficSourceCell(trafficRealizationSource(c.Reported))},
+		{"REALIZE", string(c.Summary.Realization), trafficCompactRealizationCell(c.Reported), trafficSourceCell(c.Summary.RealizationSource)},
 	}
 	for _, comparison := range c.Comparisons {
 		rows = append(rows, []string{
@@ -339,8 +343,8 @@ func (c TrafficExplainContent) WideTable() report.Table {
 	rows := [][]string{
 		{"SUMMARY", "state", string(c.Summary.State), "-", trafficSourceCell(c.Summary.Source)},
 		{"SUMMARY", "intent", string(c.Summary.Intent), "-", trafficSourceCell(c.Intent.Source)},
-		{"SUMMARY", "support", string(c.Summary.Support), "-", trafficSourceCell(c.Reported.Summary.Source.PolicyReady)},
-		{"SUMMARY", "realization", string(c.Summary.Realization), trafficRealizationCell(c.Reported), trafficSourceCell(trafficRealizationSource(c.Reported))},
+		{"SUMMARY", "support", string(c.Summary.Support), "-", trafficSourceCell(c.Summary.SupportSource)},
+		{"SUMMARY", "realization", string(c.Summary.Realization), trafficRealizationCell(c.Reported), trafficSourceCell(c.Summary.RealizationSource)},
 		{"INTENT", "algorithm", string(c.Intent.State), string(c.Intent.Algorithm), trafficSourceCell(c.Intent.Source)},
 		{"INTENT", "consistent-hash", string(c.Intent.ConsistentHash.State), trafficFeatureCell(c.Intent.ConsistentHash), trafficSourceCell(c.Intent.Source)},
 		{"INTENT", "endpoint-override", string(c.Intent.EndpointOverride.State), trafficFeatureCell(c.Intent.EndpointOverride), trafficSourceCell(c.Intent.Source)},
@@ -376,7 +380,7 @@ func (c TrafficExplainContent) WideTable() report.Table {
 
 func trafficExplainReportedRows(c TrafficStatusContent) [][]string {
 	rows := [][]string{
-		{"REPORTED", "algorithm", string(c.Summary.State), string(c.Summary.Algorithm), trafficSourceCell(c.Summary.Source.Algorithm)},
+		{"REPORTED", "algorithm", trafficExplainAlgorithmState(c.Summary), string(c.Summary.Algorithm), trafficSourceCell(c.Summary.Source.Algorithm)},
 		{"REPORTED", "translator", "Computed", string(c.Summary.Translator), trafficSourceCell(c.Summary.Source.Translator)},
 		{"REPORTED", "policy-ready", string(c.Summary.PolicyReady.Status), string(c.Summary.PolicyReady.Reason), trafficSourceCell(c.Summary.Source.PolicyReady)},
 		{"REPORTED", "unsupported", string(c.Summary.Unsupported), "-", trafficSourceCell(c.Summary.Source.Unsupported)},
@@ -397,13 +401,13 @@ func trafficExplainReportedRows(c TrafficStatusContent) [][]string {
 	if c.Canary != nil {
 		rows = append(rows, []string{
 			"OBSERVED", "canary", "Reported",
-			fmt.Sprintf("%s step=%d/%d traffic=%d%%", c.Canary.Component, c.Canary.CurrentStep+1, c.Canary.TotalSteps, c.Canary.ObservedTraffic),
+			fmt.Sprintf("%s step=%d/%d traffic=%d%%", c.Canary.Component, canaryDisplayStep(c.Canary), c.Canary.TotalSteps, c.Canary.ObservedTraffic),
 			trafficSourceCell(c.Canary.Source),
 		}, []string{
-			"OBSERVED", "stable-revision", "Reported", c.Canary.StableRevisionHash,
+			"OBSERVED", "stable-revision", "Reported", trafficOptionalCell(c.Canary.StableRevisionHash),
 			trafficSourceCell(c.Canary.Source),
 		}, []string{
-			"OBSERVED", "canary-revision", "Reported", c.Canary.CanaryRevisionHash,
+			"OBSERVED", "canary-revision", "Reported", trafficOptionalCell(c.Canary.CanaryRevisionHash),
 			trafficSourceCell(c.Canary.Source),
 		})
 	}
@@ -432,6 +436,57 @@ func trafficExplainReportedRows(c TrafficStatusContent) [][]string {
 		})
 	}
 	return rows
+}
+
+func trafficExplainAlgorithmState(summary TrafficSummary) string {
+	if summary.Source.Algorithm.Freshness == TrafficFreshnessUnavailable {
+		return "Unavailable"
+	}
+	if summary.Algorithm == TrafficAlgorithmUnknown {
+		return "Invalid"
+	}
+	return "Reported"
+}
+
+func trafficOptionalCell(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+// Support is a computed interpretation of independent controller fields.
+func trafficExplainSupportSource(state TrafficSupportState, content TrafficStatusContent) TrafficValueSource {
+	result := TrafficValueSource{Evidence: EvidenceComputed, Freshness: TrafficFreshnessCurrent}
+	if state == TrafficSupportNotApplicable {
+		return result
+	}
+	if state == TrafficSupportInvalid {
+		result.Freshness = TrafficFreshnessUnverifiable
+	}
+	sources := []TrafficValueSource{content.Summary.Source.PolicyReady, content.Summary.Source.Unsupported}
+	if content.Policy != nil {
+		sources = append(sources, content.Policy.Source)
+	}
+	for _, source := range sources {
+		if trafficFreshnessRank(source.Freshness) > trafficFreshnessRank(result.Freshness) {
+			result.Freshness = source.Freshness
+		}
+	}
+	return result
+}
+
+func trafficExplainRealizationSource(state TrafficRealizationState, content TrafficStatusContent) TrafficValueSource {
+	result := trafficRealizationSource(content)
+	if state == TrafficRealizationInvalid || state == TrafficRealizationPartial {
+		// Dropped or truncated inputs also contribute evidence; retained current
+		// routes cannot make the computed invalid/partial conclusion current.
+		if result.Evidence == EvidenceUnavailable || trafficFreshnessRank(result.Freshness) < trafficFreshnessRank(TrafficFreshnessUnverifiable) {
+			result.Freshness = TrafficFreshnessUnverifiable
+		}
+		result.Evidence = EvidenceComputed
+	}
+	return result
 }
 
 func trafficFeatureCell(feature TrafficDeclaredFeature) string {
