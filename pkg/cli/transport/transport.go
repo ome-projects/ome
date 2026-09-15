@@ -116,6 +116,7 @@ func (c *Client) JSONPatch(ctx context.Context, resource Resource, patch []byte,
 		Name(resource.Name).
 		VersionedParams(&patchOptions, transportParameterCodec).
 		Body(patch).
+		WarningHandlerWithContext(rest.NoWarnings{}).
 		MaxRetries(0).
 		Do(ctx)
 	if err := result.Error(); err != nil {
