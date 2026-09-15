@@ -1,0 +1,95 @@
+global:
+  hub: ""
+  imagePullSecrets: []
+
+replicaCount: 1
+
+image:
+  repository: alfred-e2e/alfred
+  tag: local
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  alfred-e2e/infrastructure: "true"
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+affinity: {}
+topologySpreadConstraints: []
+
+simulation:
+  configMapName: alfred-simulation
+  timeout: 10s
+
+migration:
+  apiVersion: v1
+  # Delayed-mailbox tests restart the real consumer after Alfred submits.
+  acknowledgementTimeout: 3m
+  failureBackoff: 1m
+
+alfredConfig:
+  schemaVersion: 1
+  mode: execute
+  decisionLoopInterval: 2s
+  observationLoopInterval: 1s
+  earlyTickOn: [NodeConditionChange, NodeMaintenanceChange]
+
+  scheduling:
+    profiles: {}
+
+  policies:
+    defragmentation:
+      enabled: false
+      fragmentationThreshold: 0.25
+      aggressiveness: balanced
+      scoring:
+        sizeLadder: [1, 2, 4, 8]
+        demandBlendLambda: 0.3
+        sizePrior:
+          "1": 0.1
+          "2": 0.1
+          "4": 0.2
+          "8": 0.6
+        pendingUrgencyTauMinutes: 1
+    nodeHealth:
+      enabled: true
+      aggressiveness: balanced
+      triggerConditions: [GpuUnhealthy]
+      signalOnly: false
+      healthCooldownFloorMinutes: 1
+      nodeSuspicionWindowMinutes: 1
+      maintenance:
+        triggers:
+          - name: patching
+            label:
+              key: maintenance.example.com/state
+              value: patching
+
+  defaultMovable: true
+  recentPlacementCooldownMinutes: 1
+  perWorkloadCooldownMinutes: 1
+  perNodeCooldownMinutes: 1
+
+  rawDeploymentMigrationEnabled: false
+  omenativeMigrationEnabled: true
+  lwsRecommendationsEnabled: true
+
+  recommendationsConfigMapEnabled: true
+  recommendationsConfigMapName: alfred-recommendations
+
+  maxInFlightMigrations: 3
+  maxMigrationsPerHour: 10
+  emergencyPendingAgeMinutes: 1
+  maintenanceWindows: []
+
+  spotPolicy:
+    avoidAsTarget: true
+    preferAsSource: true
+    preemptibleLabels:
+      - node.kubernetes.io/preemptible
+      - cloud.google.com/gke-preemptible
+
+  allowCrossTenantOptimization: true
+  logLevel: info
+  structuredLogging: true
