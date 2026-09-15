@@ -18,10 +18,12 @@ import (
 	v "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 )
 
-// NewCmd builds the read-only quota family. Validation/status are separate work.
+// NewCmd builds the read-only quota family.
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{Use: "quota", Short: "Inspect declared accelerator quota topology"}
 	cmd.AddCommand(newTreeCmd(f, streams, v.SystemClock{}, paging.Limits{PageSize: paging.ChunkSize, MaxItems: 1000, MaxPages: 2, RequestTimeout: 10 * time.Second}))
+	limits := paging.Limits{PageSize: paging.ChunkSize, MaxItems: 1000, MaxPages: 2, RequestTimeout: 10 * time.Second}
+	cmd.AddCommand(newDiagnosticCmd(f, streams, v.SystemClock{}, limits, true), newDiagnosticCmd(f, streams, v.SystemClock{}, limits, false))
 	return cmd
 }
 
