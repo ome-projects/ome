@@ -80,6 +80,7 @@ type Gopher struct {
 	startupReadyModelKeys map[string]struct{}
 	hfArtifactHandlerOnce sync.Once
 	hfArtifactHandler     *hfArtifactTaskHandler
+	hfArtifactStartup     *hfArtifactStartup
 }
 
 const (
@@ -139,6 +140,12 @@ func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int, numHighPriorityWorke
 	startupSnapshotCtx, cancelStartupSnapshot := context.WithTimeout(context.Background(), defaultStartupReadySnapshotTimeout)
 	defer cancelStartupSnapshot()
 	s.captureStartupReadyModels(startupSnapshotCtx)
+	if s.configMapReconciler != nil && s.hasSharedArtifactTasks() {
+		s.sharedHfArtifactHandler()
+		if err := s.hfArtifactStartup.recover(startupSnapshotCtx); err != nil {
+			s.logger.Warnf("Shared artifact startup recovery deferred until a task retries: %v", err)
+		}
+	}
 
 	// Start the ConfigMap reconciliation service
 	s.configMapReconciler.StartReconciliation()

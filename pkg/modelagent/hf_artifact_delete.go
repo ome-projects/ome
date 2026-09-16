@@ -13,6 +13,9 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 	}
 	defer unlock()
+	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
@@ -32,7 +35,14 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 	if parent.Status == HfArtifactStatusUpdating {
-		return newHfArtifactRetryResult(parent.Key, nil), nil
+		if !h.files.ParentReadyMarkerMatchesLock(parent) {
+			return newHfArtifactRetryResult(parent.Key, nil), nil
+		}
+		if err := h.markParentReady(ctx, parent); err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
+		parent.Status = HfArtifactStatusReady
+		parent.LockID = ""
 	}
 	// Validate the scan root before removing references: that removal may grant
 	// this task the parent deletion lock, which it must be able to finish.
