@@ -95,7 +95,7 @@ func (q *gopherTaskQueue) len() int {
 }
 
 func shouldUseHighPriorityQueue(task *GopherTask) bool {
-	return task.TaskType == Delete || isObjectStorageDownloadTask(task) || (!task.NormalPriorityOnly && !task.SamePathWaitStartedAt.IsZero())
+	return task.TaskType == Delete || isObjectStorageDownloadTask(task) || (!task.NormalPriorityOnly && !task.RevalidationReplay && !task.SamePathWaitStartedAt.IsZero())
 }
 
 func isObjectStorageDownloadTask(task *GopherTask) bool {
@@ -122,7 +122,8 @@ func removeSupersededTasks(tasks []*GopherTask, deleteTask *GopherTask) []*Gophe
 	}
 	kept := tasks[:0]
 	for _, task := range tasks {
-		if task.TaskType != Delete && getModelUID(task) == modelUID {
+		if task.TaskType != Delete && getModelUID(task) == modelUID &&
+			(!deleteTask.SharedArtifact || deleteTask.Sequence == 0 || task.Sequence == 0 || task.Sequence <= deleteTask.Sequence) {
 			continue
 		}
 		kept = append(kept, task)
