@@ -38,6 +38,18 @@ func newHfArtifactTaskInputForOCI(task *GopherTask, storageSpec *v1beta1.Storage
 		!hfOCIArtifactPrefixMatches(objectURI.Prefix, identity) {
 		return hfArtifactTaskInput{}, false, nil
 	}
+	return newHfArtifactTaskInput(task, storageSpec, modelRootDir, identity)
+}
+
+// newHfArtifactTaskInput builds the same parent/child layout for OCI-origin and
+// direct HF sources after the source adapter has established immutable identity.
+func newHfArtifactTaskInput(task *GopherTask, storageSpec *v1beta1.StorageSpec, modelRootDir string, identity HfArtifactIdentity) (hfArtifactTaskInput, bool, error) {
+	if task == nil || (task.BaseModel == nil) == (task.ClusterBaseModel == nil) || storageSpec == nil {
+		return hfArtifactTaskInput{}, false, fmt.Errorf("shared artifact task requires one model and storage")
+	}
+	if filter := task.TensorRTLLMShapeFilter; filter != nil && filter.IsTensorrtLLMModel && filter.ModelType == string(constants.ServingBaseModel) {
+		return hfArtifactTaskInput{}, false, nil
+	}
 	if storageSpec.Path == nil {
 		return hfArtifactTaskInput{}, false, fmt.Errorf("shared Hugging Face artifact child path is required")
 	}

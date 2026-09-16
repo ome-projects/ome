@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -51,6 +50,8 @@ type GopherTask struct {
 	Sequence uint64
 	// SharedArtifact selects ownership-aware handling; ordinary tasks keep the legacy path.
 	SharedArtifact bool
+	// Pin direct-HF moving refs across queue retries within this logical task.
+	HfResolvedRevision string
 }
 
 type Gopher struct {
@@ -509,16 +510,19 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		case storage.StorageTypeVendor:
 			s.logger.Infof("Skipping download for model %s", modelInfo)
 		case storage.StorageTypeHuggingFace:
-			waiting, err := s.detachHfArtifactForDefaultDownload(ctx, task, baseModelSpec, allowFallbackDownload)
-			if err != nil || waiting {
+			s.logger.Infof("Starting Hugging Face download for model %s", modelInfo)
+			waiting, err := s.processDirectHfModel(ctx, task, baseModelSpec, allowFallbackDownload)
+			if err != nil {
+				if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+					s.logger.Warnf("Rate limited while downloading Hugging Face model %s: %v", modelInfo, err)
+					s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second) // Preserve the existing estimated wait.
+				}
+				s.metrics.RecordFailedDownload(modelType, namespace, name, "download_error")
+				s.markModelOnNodeFailed(task)
 				return err
 			}
-			s.logger.Infof("Starting Hugging Face download for model %s", modelInfo)
-
-			// Handle Hugging Face model download
-			if err := s.processHuggingFaceModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
-				// Error is already logged and metrics recorded in the method
-				return err
+			if waiting {
+				return nil
 			}
 		case storage.StorageTypePVC:
 			s.logger.Infof("Skipping PVC storage type for model %s (handled by BaseModel controller)", modelInfo)
@@ -1435,259 +1439,6 @@ func (s *Gopher) isReservingModelArtifact(task *GopherTask) bool {
 	return false
 }
 
-// processHuggingFaceModel handles downloading models from Hugging Face Hub.
-// It extracts model information from the URI, configures the download with proper authentication,
-// performs the download using the hub client, and updates model configuration.
-func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
-	modelInfo, modelType, namespace, name string) error {
-	// Parse the Hugging Face URI to get modelID and branch
-	hfComponents, err := storage.ParseHuggingFaceStorageURI(*baseModelSpec.Storage.StorageUri)
-	if err != nil {
-		s.logger.Errorf("Failed to parse Hugging Face URI for model %s: %v", modelInfo, err)
-		s.metrics.RecordFailedDownload(modelType, namespace, name, "invalid_hf_uri")
-		s.markModelOnNodeFailed(task)
-		return err
-	}
-
-	// Create destination path
-	destPath := getDestPath(&baseModelSpec, s.modelRootDir)
-
-	// fetch sha value based on model ID from Huggingface model API
-	shaStr, isShaAvailable := s.fetchSha(ctx, hfComponents.ModelID, name)
-	isReuseEligible, matchedModelTypeAndModeName, parentPath := s.isEligibleForOptimization(ctx, task, baseModelSpec, modelType, namespace, isShaAvailable, shaStr, name)
-
-	var artifact *Artifact
-	if isReuseEligible {
-		// create symbolic link
-		err := utils.CreateSymbolicLink(destPath, parentPath)
-		if err != nil {
-			s.logger.Errorf("failed to create symbolic link from %s to %s for model %s: %s", destPath, parentPath, name, err)
-			return err
-		}
-		s.logger.Infof("successfully create symbolic link from %s to %s for model: %s", destPath, parentPath, name)
-		// add path to childrenPaths in configmap
-		err = s.configMapReconciler.updateConfigMapWithUpdatedChildrenPaths(ctx, matchedModelTypeAndModeName, destPath)
-		if err != nil {
-			s.logger.Errorf("fail to update configmap to add new path to childrenPaths: %s", err)
-			return err
-		}
-		s.logger.Infof("successfully add the new path to childrenPath for model: %s", name)
-
-		childrenPaths, _, _, _ := s.parseModelConfigDataEntry(ctx, s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel))
-		artifact = s.modelConfigParser.BuildArtifactAttribute(shaStr, matchedModelTypeAndModeName, parentPath, childrenPaths)
-	} else {
-		childrenPaths := make([]string, 0)
-		// handle the case when download Policy is updated from ReuseIfExists to AlwaysDownload
-		isSymlink, symbolicLinkErr := utils.IsSymbolicLink(destPath)
-		s.logger.Infof("directory %s is symbolic link :%v and error is %v", destPath, isSymlink, symbolicLinkErr)
-		if symbolicLinkErr != nil {
-			s.logger.Warnf("failed to determine if %s is a symbolic link: %v", destPath, symbolicLinkErr)
-		}
-		currentModelTypeAndNodeName := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
-		currentChildren, parentName, _, parseErr := s.parseModelConfigDataEntry(ctx, currentModelTypeAndNodeName)
-		hasChildren := hasChildrenPaths(childrenPaths, parseErr)
-		if isSymlink {
-			if removalErr := utils.RemoveSymbolicLink(destPath); removalErr != nil {
-				s.logger.Errorf("failed to remove existing symbolic link at %s: %v", destPath, removalErr)
-			}
-			s.logger.Infof("removed existing symbolic link at %s", destPath)
-			if parentName != "" {
-				s.removeChildPathFromParentConfigMapIfNecessary(ctx, hasChildren, parentName, currentModelTypeAndNodeName, destPath)
-			}
-		}
-		childrenPaths = currentChildren
-
-		// Get Hugging Face token from storage key or parameters
-		hfToken := s.getHuggingFaceToken(task, baseModelSpec, modelInfo)
-
-		s.logger.Infof("Downloading HuggingFace model %s (revision: %s) to %s",
-			hfComponents.ModelID, hfComponents.Branch, destPath)
-
-		// Init xet HF download config
-		config := s.xetConfig.ToDownloadConfig()
-		config.LocalDir = destPath
-		config.RepoID = hfComponents.ModelID
-
-		// Set revision if specified
-		if hfComponents.Branch != "" {
-			config.Revision = hfComponents.Branch
-		}
-
-		// If we have a token, pass it as a download option
-		if hfToken != "" {
-			s.logger.Infof("Using authentication token for HuggingFace model %s", modelInfo)
-			config.Token = hfToken
-		}
-
-		// Create progress handler for tracking download progress
-		// Uses single worker with atomic pointer to avoid fire-and-forget goroutines
-		// that can cause race conditions and "context canceled" errors
-		var lastBytes atomic.Uint64
-		var lastTimeNano atomic.Int64
-		lastTimeNano.Store(time.Now().UnixNano())
-		progressThrottle := 30 * time.Second // Update ConfigMap every 30 seconds
-		const progressFlushTimeout = 5 * time.Second
-
-		// Atomic pointer to store latest progress - lock-free, instant updates
-		var latestProgress atomic.Pointer[DownloadProgress]
-		stopWorker := make(chan struct{})
-		workerDone := make(chan struct{})
-
-		// flushProgress is a helper to flush progress to ConfigMap
-		flushProgress := func(p *DownloadProgress, timeout time.Duration) {
-			if p == nil {
-				return
-			}
-			progressOp := &ConfigMapProgressOp{
-				Progress:         p,
-				BaseModel:        task.BaseModel,
-				ClusterBaseModel: task.ClusterBaseModel,
-			}
-			flushCtx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-			if err := s.configMapReconciler.ReconcileModelProgress(flushCtx, progressOp); err != nil {
-				s.logger.Warnf("Failed to update download progress for %s: %v", modelInfo, err)
-			}
-		}
-
-		// Single background worker - updates ConfigMap periodically
-		// This eliminates fire-and-forget goroutines that caused race conditions
-		go func() {
-			defer close(workerDone)
-			ticker := time.NewTicker(progressThrottle)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					flushProgress(latestProgress.Swap(nil), progressThrottle)
-				case <-stopWorker:
-					// Final flush before exit
-					flushProgress(latestProgress.Swap(nil), progressFlushTimeout)
-					return
-				}
-			}
-		}()
-
-		// Ensure worker stops before we set Ready status
-		// This guarantees no race condition between progress updates and status updates
-		defer func() {
-			close(stopWorker) // Signal worker to stop
-			<-workerDone      // Wait for worker to finish
-			s.logger.Debugf("Progress worker stopped for %s", modelInfo)
-		}()
-
-		progressHandler := func(update xet.ProgressUpdate) {
-			now := time.Now()
-
-			// Calculate speed (bytes per second) using atomic variables for thread safety
-			prevBytes := lastBytes.Load()
-			prevTimeNano := lastTimeNano.Load()
-			var speedBytesPerSec float64
-			elapsed := float64(now.UnixNano()-prevTimeNano) / float64(time.Second)
-			if elapsed > 0 && update.CompletedBytes > prevBytes {
-				speedBytesPerSec = float64(update.CompletedBytes-prevBytes) / elapsed
-			}
-			lastBytes.Store(update.CompletedBytes)
-			lastTimeNano.Store(now.UnixNano())
-
-			// Store latest progress atomically (non-blocking, lock-free)
-			// Worker will periodically flush this to ConfigMap
-			latestProgress.Store(&DownloadProgress{
-				Phase:            update.Phase.String(),
-				TotalBytes:       update.TotalBytes,
-				CompletedBytes:   update.CompletedBytes,
-				TotalFiles:       update.TotalFiles,
-				CompletedFiles:   update.CompletedFiles,
-				SpeedBytesPerSec: speedBytesPerSec,
-				LastUpdated:      now.Format(time.RFC3339),
-			})
-		}
-
-		// Perform snapshot download with progress tracking
-		// Note: Progress is cleared atomically with status update in ReconcileModelStatus
-		// when status becomes Ready/Failed, ensuring the controller sees the final progress
-		downloadPath, err := xet.SnapshotDownloadWithProgress(ctx, config, progressHandler, progressThrottle)
-
-		if err != nil {
-			// Check error type for better handling
-			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit") {
-				s.logger.Warnf("Rate limited while downloading HuggingFace model %s: %v", modelInfo, err)
-				s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second) // Estimate
-				s.metrics.RecordFailedDownload(modelType, namespace, name, "rate_limit_error")
-			} else {
-				s.logger.Errorf("Failed to download HuggingFace model %s: %v", modelInfo, err)
-				s.metrics.RecordFailedDownload(modelType, namespace, name, "hf_download_error")
-			}
-
-			s.markModelOnNodeFailed(task)
-			return err
-		}
-
-		s.logger.Infof("Successfully downloaded HuggingFace model %s to %s",
-			modelInfo, downloadPath)
-		artifact = s.modelConfigParser.BuildArtifactAttribute(shaStr, s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel), destPath, childrenPaths)
-	}
-
-	// Parse model config and update ConfigMap
-	var baseModel *v1beta1.BaseModel
-	var clusterBaseModel *v1beta1.ClusterBaseModel
-
-	if task.BaseModel != nil {
-		baseModel = task.BaseModel
-		s.logger.Debugf("Using BaseModel %s/%s for config parsing", baseModel.Namespace, baseModel.Name)
-	} else if task.ClusterBaseModel != nil {
-		clusterBaseModel = task.ClusterBaseModel
-		s.logger.Debugf("Using ClusterBaseModel %s for config parsing", clusterBaseModel.Name)
-	}
-
-	if err := s.safeParseAndUpdateModelConfig(destPath, baseModel, clusterBaseModel, artifact); err != nil {
-		s.logger.Errorf("Failed to parse and update model config: %v", err)
-	}
-	return nil
-}
-
-/*
-handelReuseArtifactIfNecessary determines whether to reuse an existing model artifact
-based on the BaseModel's download policy and artifacts previously recorded in the
-node-scoped ConfigMap.
-
-any error thrown in the process of searching for matched parent model, will be ignored, the process will proceed
-to download artifact. Will let model cr reconciliation process handle searching for matched model to avoid impact
-model creation process
-
-Returns:
-  - matchedKey: the matched ConfigMap data key
-  - matchedParentPath: the value of config.artifact.parentPath extracted from the matched entry
-*/
-func (s *Gopher) handelReuseArtifactIfNecessary(ctx context.Context, baseModelSpec v1beta1.BaseModelSpec,
-	modelType string, modelName string, namespace string, shaStr string, currentModelTypeAndNodeName string) (string, string) {
-	// check whether identical artifact is already existing if model specified with ReuseIfExists
-	if baseModelSpec.Storage.DownloadPolicy != nil && *baseModelSpec.Storage.DownloadPolicy == v1beta1.ReuseIfExists {
-		var matchedModelTypeAndModelName string
-		var matchedParentPath string
-		var err error
-		// prioritize searching parent path in ClusterBaseModel
-		// with hoping different basemodel in different namespaces could be linked to the same parent path to lower the chance of downloading artifact
-		if strings.EqualFold(modelType, constants.ClusterBaseModel) || strings.EqualFold(modelType, constants.BaseModel) {
-			matchedModelTypeAndModelName, matchedParentPath, err = s.configMapReconciler.getModelDataByArtifactSha(ctx, shaStr, constants.LowerCaseClusterBaseModel, currentModelTypeAndNodeName)
-			if err != nil {
-				s.logger.Warnf("get error when finding matched model in configmap for model : %s: %s", modelName, err)
-			}
-		}
-		if strings.EqualFold(modelType, constants.BaseModel) && matchedModelTypeAndModelName == "" {
-			// build namespaced model type
-			namespacedModelType := fmt.Sprintf("%s.%s", namespace, constants.LowerCaseBaseModel)
-			matchedModelTypeAndModelName, matchedParentPath, err = s.configMapReconciler.getModelDataByArtifactSha(ctx, shaStr, namespacedModelType, currentModelTypeAndNodeName)
-			if err != nil {
-				s.logger.Warnf("get error when finding matched model in configmap for model : %s: %s", modelName, err)
-			}
-		}
-		return matchedModelTypeAndModelName, matchedParentPath
-	}
-	return "", ""
-}
-
 // processLocalStorageModel handles local filesystem models.
 // For local storage:
 //   - Download: validates that the path exists and parses model configuration (no actual download)
@@ -1747,52 +1498,6 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 
 	s.logger.Infof("Successfully processed local model %s at path %s", modelInfo, modelPath)
 	return nil
-}
-
-// for unit test
-var fetchAttributeFromHfModelMetaData = FetchAttributeFromHfModelMetaData
-
-// fetchSha retrieves the git commit SHA associated with a Hugging Face model ID.
-// It queries the Hugging Face model metadata API for the "sha" attribute and returns:
-// - the SHA string if available, along with true
-// - an empty string and false if the API call fails, or the attribute is missing/non-string/empty.
-func (s *Gopher) fetchSha(ctx context.Context, modelId string, modelName string) (string, bool) {
-	var isShaAvailable = true
-	sha, err := fetchAttributeFromHfModelMetaData(ctx, modelId, Sha)
-	if err != nil {
-		s.logger.Errorf("Failed to retrieve sha from Hugging Face endpoint for model %s: %s", modelName, err)
-		isShaAvailable = false
-	}
-	shaStr, ok := sha.(string)
-	if !ok || shaStr == "" {
-		s.logger.Warnf("Could not get a valid sha string for model %s, proceeding with download without artifact reuse.", modelName)
-		isShaAvailable = false
-	}
-	if isShaAvailable {
-		s.logger.Infof("fetched sha of model %s is %s", modelName, shaStr)
-	}
-	return shaStr, isShaAvailable
-}
-
-/*
-isEligibleForOptimization determines whether a Hugging Face model can reuse an existing artifact.
-
-Returns:
-  - eligible: true if reuse is possible; false otherwise
-  - matchedModelTypeAndModeName: ConfigMap key of the matched entry (empty if no match)
-  - parentPath: artifact parent path from the matched entry (empty if no match)
-*/
-func (s *Gopher) isEligibleForOptimization(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
-	modelType string, namespace string, isShaAvailable bool, shaStr, modelName string) (bool, string, string) {
-	if !isShaAvailable {
-		return false, "", ""
-	}
-
-	currentModelTypeAndNodeName := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
-	matchedModelTypeAndModeName, parentPath := s.handelReuseArtifactIfNecessary(ctx, baseModelSpec, modelType, modelName, namespace, shaStr, currentModelTypeAndNodeName)
-	isEligible := matchedModelTypeAndModeName != ""
-	s.logger.Infof("found matched matchedModelTypeAndModeName %s for model %s, parentPath is %s, isEligible %t", matchedModelTypeAndModeName, modelName, parentPath, isEligible)
-	return isEligible, matchedModelTypeAndModeName, parentPath
 }
 
 /*

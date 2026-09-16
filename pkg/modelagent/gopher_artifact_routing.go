@@ -10,6 +10,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -97,6 +98,9 @@ func (s *Gopher) routeArtifactTaskLocked(task *GopherTask) {
 	_, eligible, err := newHfArtifactTaskInputForOCI(&probe, spec.Storage, s.modelRootDir)
 	task.SharedArtifact = task.SharedArtifact || eligible || err != nil ||
 		isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir))
+	if strings.HasPrefix(*spec.Storage.StorageUri, "hf://") && spec.Storage.DownloadPolicy != nil && *spec.Storage.DownloadPolicy == v1beta1.ReuseIfExists {
+		task.SharedArtifact = true
+	}
 	if task.SharedArtifact {
 		if s.artifactRouting.children == nil {
 			s.artifactRouting.children = make(map[string]bool)
