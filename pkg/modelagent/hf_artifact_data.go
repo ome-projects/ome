@@ -25,6 +25,9 @@ type HfArtifactEntry struct {
 	// Children maps a model ConfigMap key to its child symlink path.
 	Children map[string]string `json:"children,omitempty"`
 	LockID   string            `json:"lockId,omitempty"`
+	// ChildStatusesBeforeRepair survives failed repairs so a later completion
+	// restores only the statuses that repair temporarily replaced with Failed.
+	ChildStatusesBeforeRepair map[string]ModelStatus `json:"childStatusesBeforeRepair,omitempty"`
 	// LastCompletedLockID keeps terminal status updates safe to retry. MarkReady
 	// and MarkFailed clear LockID after the parent reaches a terminal state; if
 	// Kubernetes accepts that update but the response is lost, the same caller

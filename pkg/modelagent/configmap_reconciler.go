@@ -53,6 +53,7 @@ type ConfigMapReconciler struct {
 	// does not invalidate the new UID.
 	invalidatedModelUIDs map[string]map[types.UID]struct{}
 	cacheMutex           sync.RWMutex  // Mutex to protect concurrent access to the cache
+	hfArtifactOperations sync.Map      // Parent key -> *sync.Mutex; serializes handler side effects.
 	reconcileInterval    time.Duration // Interval for periodic reconciliation
 	isReconciling        bool          // Flag to prevent concurrent reconciliations
 	stopCh               chan struct{} // Channel to signal reconciliation goroutine to stop

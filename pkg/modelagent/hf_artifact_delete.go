@@ -8,6 +8,11 @@ import (
 // handleDelete removes this child's references and symlink. Only the final
 // recorded child acquires the lock needed to delete parent files.
 func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifactTaskInput) (hfArtifactTaskResult, error) {
+	unlock, acquired := h.tryParentOperation(input.Parent.Key)
+	if !acquired {
+		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
+	}
+	defer unlock()
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
@@ -17,6 +22,11 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 	}
 	if !found {
 		return h.removeUnreferencedChildSymlink(ctx, input)
+	}
+	if parent.Key != input.Parent.Key {
+		// The caller must rebuild its input before acting on a different parent.
+		// We hold only the expected parent's operation lock, not this new one.
+		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("child model %s parent reference changed", input.ChildModelKey)), nil
 	}
 	if err := input.validateStoredChildPath(parent); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
