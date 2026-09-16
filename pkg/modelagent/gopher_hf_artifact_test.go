@@ -113,6 +113,60 @@ func TestGopherHfArtifactSourceTransitionClearsSharedReference(t *testing.T) {
 	assert.False(t, handled, "ordinary HF files must use ordinary deletion")
 }
 
+func TestGopherHfArtifactPendingDeletePreservesLocalConsumer(t *testing.T) {
+	s, task, input := newTestHfArtifactGopher(t)
+	h := s.sharedHfArtifactHandler()
+	require.NoError(t, runTestHfArtifactDownload(h, input))
+	_, err := h.repository.removeModelReference(context.Background(), input.Parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath, true)
+	require.NoError(t, err)
+	// A different local-storage CR adopts the path after reference removal,
+	// without adding itself to the shared-parent index.
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	uri := "local://" + input.ChildModelPath
+	consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "local-consumer", Namespace: "default"}, Spec: v1beta1.BaseModelSpec{
+		Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &input.ChildModelPath},
+	}}
+	require.NoError(t, indexer.Add(consumer))
+	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
+	task.TaskType = Delete
+	waiting, err := s.resumeHfArtifactChildDeletion(context.Background(), task, true)
+	require.NoError(t, err)
+	assert.False(t, waiting)
+	assert.True(t, h.files.IsChildLinkedToParent(input.ChildModelPath, input.Parent.LocalPath))
+	assert.DirExists(t, input.Parent.LocalPath)
+	parent, found, err := h.repository.Get(context.Background(), input.Parent.Identity)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Empty(t, parent.LockID)
+	pending, err := h.repository.pendingDeletion(context.Background(), input.ChildModelKey)
+	require.NoError(t, err)
+	assert.Nil(t, pending)
+}
+
+func TestGopherHfArtifactPathUsersAcceptCanonicalAliases(t *testing.T) {
+	for _, cluster := range []bool{false, true} {
+		t.Run(map[bool]string{false: "BaseModel", true: "ClusterBaseModel"}[cluster], func(t *testing.T) {
+			s, _, input := newTestHfArtifactGopher(t)
+			models := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			clusterModels := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			require.NoError(t, models.Add(&v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "no-storage", Namespace: "default"}}))
+			require.NoError(t, clusterModels.Add(&v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "no-storage"}}))
+			path := input.ChildModelPath + "/"
+			spec := v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{Path: &path}}
+			if cluster {
+				require.NoError(t, clusterModels.Add(&v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "consumer"}, Spec: spec}))
+			} else {
+				require.NoError(t, models.Add(&v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default"}, Spec: spec}))
+			}
+			s.baseModelLister = modelslister.NewBaseModelLister(models)
+			s.clusterBaseModelLister = modelslister.NewClusterBaseModelLister(clusterModels)
+			found, err := s.hfArtifactHasOtherPathUsers(input)
+			require.NoError(t, err)
+			assert.True(t, found)
+		})
+	}
+}
+
 func newTestHfArtifactGopher(t *testing.T) (*Gopher, *GopherTask, hfArtifactTaskInput) {
 	t.Helper()
 	repository, _ := newTestHfArtifactRepository(t, map[string]string{})

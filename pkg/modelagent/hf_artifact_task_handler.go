@@ -78,6 +78,12 @@ type hfArtifactTaskHandler struct {
 	// repair calls it before file writes and before publishing parent Ready,
 	// including retries of marker-backed completion.
 	updateChildStatuses func(context.Context, map[string]ModelStatus) error
+	// hasOtherPathUsers covers consumers outside the shared-parent index, such
+	// as local-storage CRs. Cleanup calls it while holding both filesystem locks.
+	hasOtherPathUsers func(hfArtifactTaskInput) (bool, error)
+	// isCurrentChildUID verifies same-name replacement against the CR lister,
+	// independently of the status cache that still belongs to the old UID.
+	isCurrentChildUID func(hfArtifactTaskInput) (bool, error)
 }
 
 func newHfArtifactTaskHandler(repository *HfArtifactRepository) *hfArtifactTaskHandler {
@@ -85,8 +91,8 @@ func newHfArtifactTaskHandler(repository *HfArtifactRepository) *hfArtifactTaskH
 }
 
 // tryParentOperation covers filesystem and label side effects as well as the
-// ConfigMap transition. LockID fences durable writes; this process-local lock
-// prevents a late completion callback from racing the next parent operation.
+// ConfigMap transition. This local guard is retained for label callbacks; file
+// operations also acquire advisory locks through tryParentFileOperation.
 // Contenders return to the queue instead of blocking a worker on a download.
 func (h *hfArtifactTaskHandler) tryParentOperation(key string) (func(), bool) {
 	value, _ := h.repository.configMaps.hfArtifactOperations.LoadOrStore(key, &sync.Mutex{})

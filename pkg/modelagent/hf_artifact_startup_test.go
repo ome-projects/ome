@@ -144,6 +144,55 @@ func TestHfArtifactStartupMissingConfigMapIsColdStart(t *testing.T) {
 	assert.Empty(t, startup.pending)
 }
 
+func TestHfArtifactStartupWaitsForOldProcessBeforeRecovery(t *testing.T) {
+	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+	h := newHfArtifactTaskHandler(repository)
+	input := testHfArtifactTaskInput(t, t.TempDir(), "model-1")
+	parent, acquired, err := repository.TryAcquireLock(context.Background(), input.Parent)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	lock, acquired, err := tryHfArtifactParentFileLock(parent, input.ModelStoreRoot)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	t.Cleanup(func() { _ = lock.Close() })
+	startup := newHfArtifactStartup(h)
+	require.NoError(t, startup.recover(context.Background()))
+	assert.True(t, startup.recovered, "one active owner must not block unrelated parents")
+	require.ErrorContains(t, startup.recoverDeferred(context.Background(), parent.Key), "active owner")
+	stored, _, err := repository.Get(context.Background(), parent.Identity)
+	require.NoError(t, err)
+	assert.Equal(t, parent.LockID, stored.LockID)
+	// Simulate the older process exiting without finishing its ConfigMap state.
+	require.NoError(t, lock.Close())
+	require.NoError(t, startup.recoverDeferred(context.Background(), parent.Key))
+	stored, _, err = repository.Get(context.Background(), parent.Identity)
+	require.NoError(t, err)
+	assert.Equal(t, HfArtifactStatusFailed, stored.Status)
+	assert.Empty(t, stored.LockID)
+}
+
+func TestHfArtifactStartupLockErrorRetainsValidation(t *testing.T) {
+	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+	h := newHfArtifactTaskHandler(repository)
+	input := testHfArtifactTaskInput(t, t.TempDir(), "model-1")
+	parent, acquired, err := repository.TryAcquireLock(context.Background(), input.Parent)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, writeTestHfArtifactFiles(parent.LocalPath))
+	require.NoError(t, h.files.WriteParentReadyMarker(parent))
+	lockDirectory := filepath.Join(input.ModelStoreRoot, hfArtifactLockDirectory)
+	require.NoError(t, os.WriteFile(lockDirectory, []byte("unavailable lock directory"), 0o644))
+	startup := newHfArtifactStartup(h)
+	require.NoError(t, startup.recover(context.Background()))
+	require.Contains(t, startup.deferred, parent.Key)
+	require.NoError(t, os.Remove(lockDirectory))
+	require.NoError(t, startup.recoverDeferred(context.Background(), parent.Key))
+	stored, _, err := repository.Get(context.Background(), parent.Identity)
+	require.NoError(t, err)
+	assert.Equal(t, HfArtifactStatusReady, stored.Status)
+	assert.True(t, startup.needsValidation(parent.Key), "successful recovery must still validate bytes after startup")
+}
+
 func TestHfArtifactStartupCorruptForeignRecordDoesNotBlockRecovery(t *testing.T) {
 	h, first, _ := newTestHfArtifactRepair(t)
 	c := h.repository.configMaps

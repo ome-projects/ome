@@ -304,7 +304,7 @@ func TestHfArtifactDownloadRetriesWhenChildPathChanged(t *testing.T) {
 	})
 }
 
-func TestHfArtifactDownloadKeepsSymlinkWhenChildIsSuperseded(t *testing.T) {
+func TestHfArtifactDownloadRemovesNewSymlinkWhenChildIsSuperseded(t *testing.T) {
 	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
 	handler := newHfArtifactTaskHandler(repository)
 	input := testHfArtifactTaskInput(t, t.TempDir(), "model-1")
@@ -329,7 +329,7 @@ func TestHfArtifactDownloadKeepsSymlinkWhenChildIsSuperseded(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, hfArtifactTaskDone, result.Outcome)
-	assertChildSymlinkTarget(t, second.ChildModelPath, input.Parent.LocalPath)
+	assertChildPathMissing(t, second.ChildModelPath)
 	parent, found, getErr := repository.Get(context.Background(), input.Parent.Identity)
 	require.NoError(t, getErr)
 	require.True(t, found)

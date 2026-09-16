@@ -79,6 +79,13 @@ func (r *HfArtifactRepository) GetParentForChild(ctx context.Context, childModel
 		return HfArtifactEntry{}, false, err
 	}
 	if child.HfArtifactKey == "" {
+		if child.HfArtifactPendingDeletion != nil {
+			parent := child.HfArtifactPendingDeletion.parentForChild(childModelKey)
+			if err := validateHfArtifactIdentityAndPath(parent); err != nil {
+				return HfArtifactEntry{}, false, err
+			}
+			return parent, true, nil
+		}
 		return HfArtifactEntry{}, false, nil
 	}
 	if !isHfArtifactConfigMapKey(child.HfArtifactKey) {
@@ -291,6 +298,9 @@ func (r *HfArtifactRepository) AddModelReference(ctx context.Context, expected H
 		if err != nil {
 			return false, err
 		}
+		if model.HfArtifactPendingDeletion != nil {
+			return false, fmt.Errorf("model %s has unfinished shared artifact deletion", modelKey)
+		}
 		if model.HfArtifactKey != "" && model.HfArtifactKey != stored.Key {
 			return false, fmt.Errorf("model %s already references Hugging Face artifact %s", modelKey, model.HfArtifactKey)
 		}
@@ -333,6 +343,17 @@ func (r *HfArtifactRepository) RemoveModelReference(
 	modelKey string,
 	modelUID types.UID,
 	expectedModelPath string,
+) (RemoveModelReferenceResult, error) {
+	return r.removeModelReference(ctx, expected, modelKey, modelUID, expectedModelPath, false)
+}
+
+func (r *HfArtifactRepository) removeModelReference(
+	ctx context.Context,
+	expected HfArtifactEntry,
+	modelKey string,
+	modelUID types.UID,
+	expectedModelPath string,
+	pendingDeletion bool,
 ) (RemoveModelReferenceResult, error) {
 	if err := validateHfArtifactIdentityAndPath(expected); err != nil {
 		return RemoveModelReferenceResult{}, err
@@ -381,6 +402,9 @@ func (r *HfArtifactRepository) RemoveModelReference(
 			return false, nil
 		}
 		modelReferencesArtifact := model.HfArtifactKey == stored.Key
+		if model.HfArtifactPendingDeletion != nil {
+			return false, fmt.Errorf("model %s has unfinished shared artifact deletion", modelKey)
+		}
 		if model.HfArtifactKey != "" && !modelReferencesArtifact {
 			if artifactReferencesModel {
 				return false, fmt.Errorf("model %s and Hugging Face artifact %s contain conflicting references", modelKey, stored.Key)
@@ -405,6 +429,7 @@ func (r *HfArtifactRepository) RemoveModelReference(
 			)
 		}
 
+		wasReady := stored.Status == HfArtifactStatusReady
 		delete(stored.Children, modelKey)
 		delete(stored.ChildStatusesBeforeRepair, modelKey)
 		model.HfArtifactKey = ""
@@ -415,6 +440,14 @@ func (r *HfArtifactRepository) RemoveModelReference(
 			stored.LastCompletedLockID = ""
 			result.Artifact = stored
 			result.LastReferenceRemoved = true
+		}
+		if pendingDeletion {
+			model.HfArtifactPendingDeletion = &HfArtifactPendingDeletion{
+				Identity: stored.Identity, ParentPath: stored.LocalPath,
+				ChildPath: storedModelPath, ModelUID: modelUID,
+				ParentLockID:   stored.LockID,
+				ParentWasReady: wasReady,
+			}
 		}
 
 		artifactChanged, err := writeHfArtifactEntry(configMap.Data, stored)

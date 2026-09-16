@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -32,6 +33,9 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 	}
 	handler := s.sharedHfArtifactHandler()
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
+	if waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, allowDownload); waiting || err != nil {
+		return true, waiting, err
+	}
 	stored, referenced, lookupErr := handler.repository.GetParentForChild(ctx, key)
 	if lookupErr != nil && !apierrors.IsNotFound(lookupErr) {
 		// Opt-out still needs the old relationship for cleanup, even when the
@@ -114,9 +118,94 @@ func (s *Gopher) sharedHfArtifactHandler() *hfArtifactTaskHandler {
 	s.hfArtifactHandlerOnce.Do(func() {
 		s.hfArtifactHandler = newHfArtifactTaskHandler(newHfArtifactRepository(s.configMapReconciler))
 		s.hfArtifactHandler.updateChildStatuses = s.updateHfArtifactChildLabels
+		s.hfArtifactHandler.hasOtherPathUsers = s.hfArtifactHasOtherPathUsers
+		s.hfArtifactHandler.isCurrentChildUID = s.hfArtifactIsCurrentChildUID
 		s.hfArtifactStartup = newHfArtifactStartup(s.hfArtifactHandler)
 	})
 	return s.hfArtifactHandler
+}
+
+func (s *Gopher) hfArtifactIsCurrentChildUID(input hfArtifactTaskInput) (bool, error) {
+	namespace, name, cluster, valid := constants.ParseModelInfoFromConfigMapKey(input.ChildModelKey)
+	if !valid || input.ChildModelUID == "" {
+		return false, fmt.Errorf("invalid shared artifact child key or UID %q", input.ChildModelKey)
+	}
+	if cluster {
+		if s.clusterBaseModelLister == nil {
+			return false, fmt.Errorf("ClusterBaseModel lister is unavailable for %s", input.ChildModelKey)
+		}
+		model, err := s.clusterBaseModelLister.Get(name)
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return model.UID == input.ChildModelUID, nil
+	}
+	if s.baseModelLister == nil {
+		return false, fmt.Errorf("BaseModel lister is unavailable for %s", input.ChildModelKey)
+	}
+	model, err := s.baseModelLister.BaseModels(namespace).Get(name)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return model.UID == input.ChildModelUID, nil
+}
+
+func (s *Gopher) hfArtifactHasOtherPathUsers(input hfArtifactTaskInput) (bool, error) {
+	namespace, name, cluster, valid := constants.ParseModelInfoFromConfigMapKey(input.ChildModelKey)
+	if !valid {
+		return false, fmt.Errorf("invalid shared artifact child key %q", input.ChildModelKey)
+	}
+	root, err := canonicalHfArtifactStoreRoot(input.ModelStoreRoot)
+	if err != nil {
+		return false, err
+	}
+	childPath, err := hfArtifactPathInRoot(input.ChildModelPath, input.ModelStoreRoot, root)
+	if err != nil {
+		return false, err
+	}
+	// CR paths need not use the canonical spelling stored in the parent index.
+	// Compare under the same root without following the child symlink itself.
+	matches := func(storage *v1beta1.StorageSpec) bool {
+		if storage == nil || storage.Path == nil || *storage.Path == "" {
+			return false
+		}
+		path, err := hfArtifactPathInRoot(filepath.Clean(*storage.Path), input.ModelStoreRoot, root)
+		return err == nil && path == childPath
+	}
+	if s.baseModelLister == nil || s.clusterBaseModelLister == nil {
+		return false, fmt.Errorf("model listers are unavailable for shared artifact cleanup")
+	}
+	models, err := s.baseModelLister.List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+	for _, model := range models {
+		if !cluster && model.Namespace == namespace && model.Name == name {
+			continue
+		}
+		if matches(model.Spec.Storage) {
+			return true, nil
+		}
+	}
+	clusterModels, err := s.clusterBaseModelLister.List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+	for _, model := range clusterModels {
+		if cluster && model.Name == name {
+			continue
+		}
+		if matches(model.Spec.Storage) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // lockHfChildStatus prevents ordinary task progress from publishing Ready or
@@ -143,7 +232,10 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	if err != nil || !found {
 		return noop, err
 	}
-	unlock, acquired := handler.tryParentOperation(parent.Key)
+	unlock, acquired, err := handler.tryParentFileOperation(parent, s.hfArtifactInputForChild(task, parent).ModelStoreRoot)
+	if err != nil {
+		return noop, err
+	}
 	if !acquired {
 		return noop, fmt.Errorf("shared artifact %s has an active operation", parent.Key)
 	}
@@ -215,6 +307,9 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (hfArtifactTaskResult, error) {
 	handler := s.sharedHfArtifactHandler()
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
+	if err := s.hfArtifactStartup.recoverDeferred(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	parent, found, err := handler.repository.Get(ctx, input.Parent.Identity)
@@ -321,6 +416,9 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 		return false, false, nil
 	}
 	handler := s.sharedHfArtifactHandler()
+	if waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, true); waiting || err != nil {
+		return true, waiting, err
+	}
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
 	parent, found, err := handler.repository.GetParentForChild(ctx, key)
 	if apierrors.IsNotFound(err) {
@@ -345,13 +443,61 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 	return true, false, err
 }
 
+// resumeHfArtifactChildDeletion follows the persisted old path even when the
+// current CR has changed identity, source, path, or UID since cleanup began.
+func (s *Gopher) resumeHfArtifactChildDeletion(ctx context.Context, task *GopherTask, allowCleanup bool) (bool, error) {
+	if s.configMapReconciler == nil {
+		return false, nil
+	}
+	handler := s.sharedHfArtifactHandler()
+	key := getModelID(task.BaseModel, task.ClusterBaseModel)
+	pending, err := handler.repository.pendingDeletion(ctx, key)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		// Only never-shared directories can ignore unavailable cleanup state.
+		spec := taskModelSpec(task)
+		_, eligible, _ := newHfArtifactTaskInputForOCI(task, spec.Storage, s.modelRootDir)
+		if !task.SharedArtifact && !eligible && !isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+			return false, nil
+		}
+		return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(key, err))
+	}
+	if pending == nil {
+		return false, nil
+	}
+	if !allowCleanup {
+		s.demoteToNormalPriority(task)
+		return true, nil
+	}
+	input := s.hfArtifactInputForChild(task, pending.parentForChild(key))
+	if err := s.hfArtifactStartup.recover(ctx); err != nil {
+		return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, err))
+	}
+	if err := s.hfArtifactStartup.recoverDeferred(ctx, input.Parent.Key); err != nil {
+		return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, err))
+	}
+	result, err := handler.handleDelete(ctx, input)
+	if err == nil && result.Outcome == hfArtifactTaskRetry {
+		return true, s.requeueHfArtifactTask(task, result)
+	}
+	return false, err
+}
+
 func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTaskInput, preserve bool) (hfArtifactTaskResult, error) {
 	handler := s.sharedHfArtifactHandler()
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
+	if err := s.hfArtifactStartup.recoverDeferred(ctx, input.Parent.Key); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if preserve {
-		unlock, acquired := handler.tryParentOperation(input.Parent.Key)
+		unlock, acquired, err := handler.tryArtifactOperation(input)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
 		if !acquired {
 			return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 		}
@@ -450,7 +596,10 @@ func (s *Gopher) validateHfOCIArtifact(ctx context.Context, task *GopherTask, ur
 		}
 		objectURI := *uri
 		objectURI.ObjectName = *object.Name
-		localPath := filepath.Join(parentPath, strings.TrimPrefix(*object.Name, uri.Prefix))
+		localPath, err := hfArtifactObjectPath(parentPath, uri.Prefix, *object.Name)
+		if err != nil {
+			return false, err
+		}
 		valid, err := store.IsLocalCopyValid(objectURI, localPath)
 		if err != nil || !valid {
 			return false, err
