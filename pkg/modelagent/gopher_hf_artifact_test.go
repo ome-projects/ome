@@ -60,14 +60,28 @@ func TestGopherHfArtifactReadyStatusRequeuesDuringSiblingOperation(t *testing.T)
 	unlock, acquired := handler.tryParentOperation(input.Parent.Key)
 	require.True(t, acquired)
 	op := &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready}
-	require.NoError(t, s.finishDownloadStatus(task, op))
+	require.NoError(t, s.finishDownloadStatus(context.Background(), task, op))
 	unlock()
 	select {
 	case retry := <-s.gopherChan:
-		require.NoError(t, s.finishDownloadStatus(retry, op))
+		require.NoError(t, s.finishDownloadStatus(context.Background(), retry, op))
 	case <-time.After(time.Second):
 		t.Fatal("completed child was not requeued for its Ready update")
 	}
+}
+
+func TestGopherHfArtifactCanceledReadyStatusDoesNotRequeue(t *testing.T) {
+	s, task, input := newTestHfArtifactGopher(t)
+	require.NoError(t, runTestHfArtifactDownload(s.sharedHfArtifactHandler(), input))
+	client := s.configMapReconciler.kubeClient.(*k8sfake.Clientset)
+	client.ClearActions()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	op := &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready}
+
+	require.ErrorIs(t, s.finishDownloadStatus(ctx, task, op), context.Canceled)
+	assert.True(t, task.SamePathWaitStartedAt.IsZero(), "cancellation must not schedule a new retry")
+	assert.Empty(t, client.Actions(), "cancellation must not publish child status")
 }
 
 func TestGopherDeletePreflightErrorReleasesBarrier(t *testing.T) {

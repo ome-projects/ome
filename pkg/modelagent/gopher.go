@@ -259,10 +259,15 @@ func (s *Gopher) runHighPriorityWorker() {
 
 // safeNodeLabelReconciliation executes the NodeLabelReconciler's ReconcileNodeLabels method with mutex protection
 // to ensure thread-safe ConfigMap updates
-func (s *Gopher) safeNodeLabelReconciliation(op *NodeLabelOp) error {
-	ctx := context.Background()
+func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelOp) error {
 	s.configMapMutex.Lock()
 	defer s.configMapMutex.Unlock()
+
+	// Deletion uses this same lock. Check after acquiring it so a canceled
+	// download cannot restore state after node-local cleanup has completed.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Mark the node label
 	unlock, err := s.lockHfChildStatus(ctx, op)
@@ -307,10 +312,15 @@ func (s *Gopher) safeNodeLabelReconciliation(op *NodeLabelOp) error {
 
 // safeParseAndUpdateModelConfig executes the ModelConfigParser's ParseAndUpdateModelConfig method with mutex protection
 // to ensure thread-safe ConfigMap updates
-func (s *Gopher) safeParseAndUpdateModelConfig(modelPath string, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel, artifact *Artifact) error {
-	ctx := context.Background()
+func (s *Gopher) safeParseAndUpdateModelConfig(ctx context.Context, modelPath string, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel, artifact *Artifact) error {
 	s.configMapMutex.Lock()
 	defer s.configMapMutex.Unlock()
+
+	// Deletion uses this same lock. Check after acquiring it so a canceled
+	// download cannot restore state after node-local cleanup has completed.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// First parse the configuration without updating the ConfigMap
 	// This call will return model metadata
@@ -393,11 +403,10 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			ClusterBaseModel: task.ClusterBaseModel,
 		}
 
-		if err := s.safeNodeLabelReconciliation(nodeLabelOp); err != nil {
+		if err := s.safeNodeLabelReconciliation(ctx, nodeLabelOp); err != nil {
 			s.logger.Errorf("Failed to set model %s status to Updating: %v", modelInfo, err)
 			// Continue with download anyway
 		}
-
 	}
 
 	storageType, err := storage.GetStorageType(*baseModelSpec.Storage.StorageUri)
@@ -410,7 +419,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			s.metrics.RecordFailedDownload(modelType, namespace, name, "target_path_error")
 		}
 
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return err
 	}
 
@@ -428,7 +437,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		case storage.StorageTypeOCI:
 			handled, waiting, sharedErr := s.processHfOCIArtifact(ctx, task, baseModelSpec, allowFallbackDownload)
 			if sharedErr != nil {
-				s.markModelOnNodeFailed(task)
+				s.markModelOnNodeFailed(ctx, task)
 				return sharedErr
 			}
 			if waiting {
@@ -457,6 +466,9 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					}
 					return downloadErr
 				})
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				if err != nil {
 					s.logger.Errorf("All download attempts failed for model %s: %v", modelInfo, err)
 
@@ -467,7 +479,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					}
 					s.metrics.RecordFailedDownload(modelType, namespace, name, errorType)
 
-					s.markModelOnNodeFailed(task)
+					s.markModelOnNodeFailed(ctx, task)
 					return err
 				}
 				return nil
@@ -504,7 +516,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				s.logger.Warnf("No model object found in task, skipping config parsing")
 			}
 
-			if err := s.safeParseAndUpdateModelConfig(destPath, baseModel, clusterBaseModel, nil); err != nil {
+			if err := s.safeParseAndUpdateModelConfig(ctx, destPath, baseModel, clusterBaseModel, nil); err != nil {
 				s.logger.Errorf("Failed to parse and update model config: %v", err)
 			}
 		case storage.StorageTypeVendor:
@@ -518,7 +530,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second) // Preserve the existing estimated wait.
 				}
 				s.metrics.RecordFailedDownload(modelType, namespace, name, "download_error")
-				s.markModelOnNodeFailed(task)
+				s.markModelOnNodeFailed(ctx, task)
 				return err
 			}
 			if waiting {
@@ -573,7 +585,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 
 		// This will update both the node label and ConfigMap status
-		if err := s.finishDownloadStatus(task, nodeLabelOp); err != nil {
+		if err := s.finishDownloadStatus(ctx, task, nodeLabelOp); err != nil {
 			return err
 		}
 	case Delete:
@@ -667,7 +679,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			ClusterBaseModel: task.ClusterBaseModel,
 		}
 
-		err = s.safeNodeLabelReconciliation(nodeLabelOp)
+		err = s.safeNodeLabelReconciliation(ctx, nodeLabelOp)
 		if err != nil {
 			s.logger.Errorf("Failed to mark model %s as deleted: %v", modelInfo, err)
 			return err
@@ -893,7 +905,7 @@ func (s *Gopher) isTaskModelReplaced(task *GopherTask) bool {
 	return false
 }
 
-func (s *Gopher) markModelOnNodeFailed(task *GopherTask) {
+func (s *Gopher) markModelOnNodeFailed(ctx context.Context, task *GopherTask) {
 	modelInfo := getModelInfoForLogging(task)
 	s.logger.Infof("Marking model %s as Failed on node", modelInfo)
 
@@ -904,8 +916,10 @@ func (s *Gopher) markModelOnNodeFailed(task *GopherTask) {
 	}
 
 	// This will update both node label and ConfigMap status
-	err := s.safeNodeLabelReconciliation(nodeLabelOp)
-	if err != nil {
+	err := s.safeNodeLabelReconciliation(ctx, nodeLabelOp)
+	if ctx.Err() != nil {
+		s.logger.Infof("Skipping Failed status for canceled model download %s", modelInfo)
+	} else if err != nil {
 		s.logger.Errorf("Failed to mark model %s as Failed on node: %v", modelInfo, err)
 	} else {
 		s.logger.Infof("Successfully marked model %s as Failed on node", modelInfo)
@@ -1220,6 +1234,9 @@ func filterObjectStorageObjectsForTask(objects []objectstorage.ObjectSummary, ta
 }
 
 func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectURI, destPath string, task *GopherTask) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	startTime := time.Now()
 	defer func() {
 		s.logger.Infof("Download process took %v", time.Since(startTime).Round(time.Millisecond))
@@ -1325,10 +1342,17 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Perform final verification of all downloaded files
 	s.logger.Info("Performing final integrity verification of all downloaded files...")
 	verificationStartTime := time.Now()
-	verificationErrors := s.verifyDownloadedFiles(ociOSDataStore, objectUris, destPath, task)
+	verificationErrors := s.verifyDownloadedFiles(ctx, ociOSDataStore, objectUris, destPath, task)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	verificationDuration := time.Since(verificationStartTime)
 
 	// Record verification duration
@@ -1358,9 +1382,12 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	return nil
 }
 
-func (s *Gopher) verifyDownloadedFiles(ociOSDataStore *ociobjectstore.OCIOSDataStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
+func (s *Gopher) verifyDownloadedFiles(ctx context.Context, ociOSDataStore *ociobjectstore.OCIOSDataStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
 	errors := make(map[string]error)
 	for _, obj := range uris {
+		if ctx.Err() != nil {
+			return errors
+		}
 		relativeName := filepath.Join(destPath, ociobjectstore.TrimObjectPrefix(obj.ObjectName, obj.Prefix))
 		// Fallback: if relativeName is empty, use the object name directly
 		if relativeName == "" {
@@ -1375,6 +1402,10 @@ func (s *Gopher) verifyDownloadedFiles(ociOSDataStore *ociobjectstore.OCIOSDataS
 		if !valid {
 			errors[obj.ObjectName] = fmt.Errorf("MD5 or size mismatch for %s", obj.ObjectName)
 		}
+	}
+
+	if ctx.Err() != nil {
+		return errors
 	}
 
 	// Record verification result in metrics
@@ -1452,7 +1483,7 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 	if err != nil {
 		s.logger.Errorf("Failed to parse local storage URI for model %s: %v", modelInfo, err)
 		s.metrics.RecordFailedDownload(modelType, namespace, name, "invalid_local_uri")
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return err
 	}
 
@@ -1473,7 +1504,7 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
 		s.logger.Errorf("Local model path does not exist for model %s: %s", modelInfo, modelPath)
 		s.metrics.RecordFailedDownload(modelType, namespace, name, "local_path_not_found")
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return fmt.Errorf("local model path does not exist: %s", modelPath)
 	}
 
@@ -1491,7 +1522,7 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 		s.logger.Debugf("Using ClusterBaseModel %s for config parsing", clusterBaseModel.Name)
 	}
 
-	if err := s.safeParseAndUpdateModelConfig(modelPath, baseModel, clusterBaseModel, nil); err != nil {
+	if err := s.safeParseAndUpdateModelConfig(ctx, modelPath, baseModel, clusterBaseModel, nil); err != nil {
 		s.logger.Errorf("Failed to parse and update model config for local model: %v", err)
 		// This is not necessarily a failure - the model might still be usable
 	}

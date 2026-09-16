@@ -190,7 +190,7 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 			if !allowDownload && task.NormalPriorityOnly {
 				return true, nil
 			}
-			s.parseDirectHfConfig(task, destination, nil)
+			s.parseDirectHfConfig(ctx, task, destination, nil)
 			return false, nil
 		case hfArtifactTaskUseDefaultDownload:
 			// Real legacy directories remain ordinary directories. In particular
@@ -225,7 +225,7 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if err := source.download(ctx, task, config); err != nil {
 		return false, err
 	}
-	s.parseDirectHfConfig(task, destination, artifact)
+	s.parseDirectHfConfig(ctx, task, destination, artifact)
 	return false, nil
 }
 
@@ -328,7 +328,7 @@ func (source directHfSource) reuseLegacyDescendants(ctx context.Context, s *Goph
 	}
 	// Legacy descendants have no shared-parent repair/status contract. Healthy
 	// reuse is read-only; never adopt or repair their parent directory in place.
-	s.parseDirectHfConfig(task, config.LocalDir, &old)
+	s.parseDirectHfConfig(ctx, task, config.LocalDir, &old)
 	return true, nil
 }
 
@@ -351,9 +351,9 @@ func checkDirectHfDestinationAncestors(destination string) error {
 	}
 }
 
-func (s *Gopher) parseDirectHfConfig(task *GopherTask, destination string, artifact *Artifact) {
+func (s *Gopher) parseDirectHfConfig(ctx context.Context, task *GopherTask, destination string, artifact *Artifact) {
 	if s.modelConfigParser != nil {
-		if err := s.safeParseAndUpdateModelConfig(destination, task.BaseModel, task.ClusterBaseModel, artifact); err != nil {
+		if err := s.safeParseAndUpdateModelConfig(ctx, destination, task.BaseModel, task.ClusterBaseModel, artifact); err != nil {
 			s.logger.Warnf("Failed to parse direct HF model config at %s: %v", destination, err)
 		}
 	}

@@ -104,7 +104,7 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 			return true, true, nil
 		}
 		if s.modelConfigParser != nil {
-			if err := s.safeParseAndUpdateModelConfig(input.ChildModelPath, task.BaseModel, task.ClusterBaseModel, nil); err != nil {
+			if err := s.safeParseAndUpdateModelConfig(ctx, input.ChildModelPath, task.BaseModel, task.ClusterBaseModel, nil); err != nil {
 				s.logger.Errorf("Failed to parse shared artifact model configuration: %v", err)
 			}
 		}
@@ -554,10 +554,14 @@ func (s *Gopher) requeueHfArtifactTask(task *GopherTask, result hfArtifactTaskRe
 	return fmt.Errorf("shared artifact %s retry budget exhausted (last error: %v)", result.RetryParentKey, result.RetryReason)
 }
 
-func (s *Gopher) finishDownloadStatus(task *GopherTask, op *NodeLabelOp) error {
-	err := s.safeNodeLabelReconciliation(op)
+func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op *NodeLabelOp) error {
+	err := s.safeNodeLabelReconciliation(ctx, op)
 	if err == nil {
 		return nil
+	}
+	// A canceled task must not be revived by the shared-parent retry path.
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	s.logger.Errorf("Failed to mark model %s as Ready: %v", getModelInfoForLogging(task), err)
 	spec := taskModelSpec(task)
