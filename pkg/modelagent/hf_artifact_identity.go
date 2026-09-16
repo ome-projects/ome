@@ -97,7 +97,7 @@ func hfArtifactIdentityFromTask(task *GopherTask) (HfArtifactIdentity, bool) {
 
 // For annotation-based artifact reuse, the Model CR producer resolves the
 // Hugging Face revision. This helper only validates the model ID and commit SHA
-// before using them in node-local keys and paths; it performs no remote check.
+// before using them in artifact keys and paths; it performs no remote check.
 func hfArtifactIdentityFromAnnotations(annotations map[string]string) (HfArtifactIdentity, bool) {
 	identity, err := newHfArtifactIdentity(
 		annotations[hfModelIDAnnotationKey],
@@ -143,9 +143,7 @@ func sanitizeConfigMapKeyComponent(value string) string {
 }
 
 // canonicalHfArtifactPath returns the shared artifact directory for a model path.
-// For example, /mnt/data/models/customer-model-store/<model-ocid> and
-// Qwen/Qwen3-8B@<sha> resolve to
-// /mnt/data/models/customer-model-store/_artifacts/Qwen/Qwen3-8B/<sha>.
+// The model ID and commit SHA distinguish parents for different artifact identities.
 func canonicalHfArtifactPath(modelPath string, identity HfArtifactIdentity) string {
 	return filepath.Join(
 		filepath.Dir(modelPath),

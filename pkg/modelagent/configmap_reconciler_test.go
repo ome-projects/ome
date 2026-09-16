@@ -621,10 +621,10 @@ func TestNodeCleanupAllowsSameUIDToWriteAgain(t *testing.T) {
 	assert.NoError(t, reconciler.DeleteModelFromConfigMap(ctx, model, nil))
 	reconciler.cacheMutex.RLock()
 	_, cacheExists := reconciler.modelCache[modelID]
-	_, fenceExists := reconciler.fencedModelUIDs[modelID]
+	_, invalidationExists := reconciler.invalidatedModelUIDs[modelID]
 	reconciler.cacheMutex.RUnlock()
 	assert.False(t, cacheExists)
-	assert.False(t, fenceExists)
+	assert.False(t, invalidationExists)
 
 	assert.NoError(t, reconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
 		BaseModel:   model,
@@ -664,7 +664,7 @@ func TestNodeCleanupBlocksStaleRestoreSnapshot(t *testing.T) {
 	assert.NotContains(t, configMap.Data, modelID)
 }
 
-func TestEmptyUIDEvictsCacheWithoutInstallingFence(t *testing.T) {
+func TestEmptyUIDEvictsCacheWithoutRecordingInvalidation(t *testing.T) {
 	reconciler, kubeClient, _ := setupConfigMapTest(t)
 	ctx := context.Background()
 	model := createTestBaseModelCM()
@@ -677,14 +677,14 @@ func TestEmptyUIDEvictsCacheWithoutInstallingFence(t *testing.T) {
 	}
 	reconciler.cacheMutex.Unlock()
 
-	reconciler.fenceModelUIDAndEvictCache(modelID, "")
+	reconciler.invalidateModelUIDAndEvictCache(modelID, "")
 
 	reconciler.cacheMutex.RLock()
 	_, cacheExists := reconciler.modelCache[modelID]
-	_, fenceExists := reconciler.fencedModelUIDs[modelID]
+	_, invalidationExists := reconciler.invalidatedModelUIDs[modelID]
 	reconciler.cacheMutex.RUnlock()
 	assert.False(t, cacheExists)
-	assert.False(t, fenceExists)
+	assert.False(t, invalidationExists)
 
 	model.UID = types.UID("replacement-model-uid")
 	assert.NoError(t, reconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{

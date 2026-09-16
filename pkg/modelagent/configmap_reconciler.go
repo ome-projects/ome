@@ -43,16 +43,19 @@ type CacheEntry struct {
 // It provides self-healing capabilities through periodic reconciliation to recover from
 // manual ConfigMap deletions or modifications without requiring agent restarts.
 type ConfigMapReconciler struct {
-	kubeClient        kubernetes.Interface              // Kubernetes client for ConfigMap CRUD operations
-	nodeName          string                            // The name of the node (used as ConfigMap name)
-	namespace         string                            // The namespace to store the ConfigMap in
-	logger            *zap.SugaredLogger                // Logger for recording operations
-	modelCache        map[string]*CacheEntry            // In-memory cache of model information
-	fencedModelUIDs   map[string]map[types.UID]struct{} // Model UIDs that must not be restored or updated
-	cacheMutex        sync.RWMutex                      // Mutex to protect concurrent access to the cache
-	reconcileInterval time.Duration                     // Interval for periodic reconciliation
-	isReconciling     bool                              // Flag to prevent concurrent reconciliations
-	stopCh            chan struct{}                     // Channel to signal reconciliation goroutine to stop
+	kubeClient kubernetes.Interface   // Kubernetes client for ConfigMap CRUD operations
+	nodeName   string                 // The name of the node (used as ConfigMap name)
+	namespace  string                 // The namespace to store the ConfigMap in
+	logger     *zap.SugaredLogger     // Logger for recording operations
+	modelCache map[string]*CacheEntry // In-memory cache of model information
+	// invalidatedModelUIDs records CR instances whose deletion has begun. A
+	// model name may later be recreated with a new UID; invalidating the old UID
+	// does not invalidate the new UID.
+	invalidatedModelUIDs map[string]map[types.UID]struct{}
+	cacheMutex           sync.RWMutex  // Mutex to protect concurrent access to the cache
+	reconcileInterval    time.Duration // Interval for periodic reconciliation
+	isReconciling        bool          // Flag to prevent concurrent reconciliations
+	stopCh               chan struct{} // Channel to signal reconciliation goroutine to stop
 }
 
 // ConfigMapStatusOp represents an operation to update model status in ConfigMap.
@@ -92,14 +95,14 @@ type ConfigMapProgressOp struct {
 //   - A configured ConfigMapReconciler ready to use
 func NewConfigMapReconciler(nodeName string, namespace string, kubeClient kubernetes.Interface, logger *zap.SugaredLogger) *ConfigMapReconciler {
 	return &ConfigMapReconciler{
-		kubeClient:        kubeClient,
-		nodeName:          nodeName,
-		namespace:         namespace,
-		logger:            logger,
-		modelCache:        make(map[string]*CacheEntry),
-		fencedModelUIDs:   make(map[string]map[types.UID]struct{}),
-		reconcileInterval: 5 * time.Minute, // Perform reconciliation every 5 minutes by default
-		stopCh:            make(chan struct{}),
+		kubeClient:           kubeClient,
+		nodeName:             nodeName,
+		namespace:            namespace,
+		logger:               logger,
+		modelCache:           make(map[string]*CacheEntry),
+		invalidatedModelUIDs: make(map[string]map[types.UID]struct{}),
+		reconcileInterval:    5 * time.Minute, // Perform reconciliation every 5 minutes by default
+		stopCh:               make(chan struct{}),
 	}
 }
 
@@ -510,8 +513,8 @@ func getModelResourceUID(baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1
 	return ""
 }
 
-// isModelResourceDeleting distinguishes terminal CR deletion from node-local cleanup.
-// Node-local cleanup may later download the same CR generation onto this node again.
+// isModelResourceDeleting distinguishes terminal CR deletion from reversible cleanup.
+// Reversible cleanup may be followed by another download for the same CR instance.
 func isModelResourceDeleting(baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel) bool {
 	if baseModel != nil {
 		return baseModel.DeletionTimestamp != nil
@@ -648,14 +651,14 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 	modelID := c.getModelConfigMapKey(baseModel, clusterBaseModel)
 	modelUID := getModelResourceUID(baseModel, clusterBaseModel)
 	if isModelResourceDeleting(baseModel, clusterBaseModel) {
-		// A deleting CR generation must never be restored or updated again.
-		c.fenceModelUIDAndEvictCache(modelID, modelUID)
+		// A deleting CR instance must never be restored or updated again.
+		c.invalidateModelUIDAndEvictCache(modelID, modelUID)
 	} else {
-		// Node-local cleanup may be reversed by a later selector or affinity update using the same UID.
+		// A later selector or affinity update may require new work using the same UID.
 		c.evictModelCache(modelID)
 	}
 
-	// Delete must bypass any existing fence; retries still operate on the latest ConfigMap.
+	// Delete must bypass its own UID invalidation; retries still operate on the latest ConfigMap.
 	err := c.mutateModelEntryWithRetry(ctx, modelID, modelUID, true, func(data map[string]string) (bool, error) {
 		if _, exists := data[modelID]; !exists {
 			return false, nil
@@ -786,8 +789,10 @@ func (c *ConfigMapReconciler) mutateConfigMapWithRetry(ctx context.Context, muta
 	})
 }
 
-// mutateModelEntryWithRetry applies a per-model mutation unless its UID is fenced by deletion or another generation.
-// allowDeleting lets the delete operation bypass the fence it installs for itself.
+// mutateModelEntryWithRetry applies a per-model mutation unless deletion has
+// invalidated its UID or the model key now belongs to another CR instance.
+// allowDeleting lets the delete operation bypass the invalidation it installs
+// for its own UID.
 func (c *ConfigMapReconciler) mutateModelEntryWithRetry(
 	ctx context.Context,
 	modelID string,
@@ -807,31 +812,36 @@ func (c *ConfigMapReconciler) mutateModelEntryWithRetry(
 	})
 }
 
-// evictModelCache removes the source used by periodic self-healing without permanently fencing the UID.
-// This is used for node-local cleanup because the same CR generation may become eligible for the node again.
+// evictModelCache removes the source used by periodic self-healing without
+// permanently invalidating the UID.
+// This permits new work for the same CR instance after a selector or affinity change.
 func (c *ConfigMapReconciler) evictModelCache(modelID string) {
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 	delete(c.modelCache, modelID)
 }
 
-// fenceModelUIDAndEvictCache atomically fences the model generation and removes its cached entry.
-// Evicting the cache first prevents periodic reconciliation from restoring the ConfigMap entry during deletion.
-func (c *ConfigMapReconciler) fenceModelUIDAndEvictCache(modelID string, modelUID types.UID) {
+// invalidateModelUIDAndEvictCache atomically prevents further mutations from
+// this CR instance and removes its cached entry. Invalidation applies to
+// modelUID, not the reusable model name, so a recreated CR with a new UID
+// remains valid.
+// Evicting the cache prevents periodic reconciliation from restoring the old
+// ConfigMap entry during deletion.
+func (c *ConfigMapReconciler) invalidateModelUIDAndEvictCache(modelID string, modelUID types.UID) {
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 	delete(c.modelCache, modelID)
 	if modelUID == "" {
-		c.logger.Warnf("fenceModelUIDAndEvictCache called with empty UID for %s; skipping fence install", modelID)
+		c.logger.Warnf("invalidateModelUIDAndEvictCache called with empty UID for %s; skipping UID invalidation", modelID)
 		return
 	}
-	if c.fencedModelUIDs == nil {
-		c.fencedModelUIDs = make(map[string]map[types.UID]struct{})
+	if c.invalidatedModelUIDs == nil {
+		c.invalidatedModelUIDs = make(map[string]map[types.UID]struct{})
 	}
-	if c.fencedModelUIDs[modelID] == nil {
-		c.fencedModelUIDs[modelID] = make(map[types.UID]struct{})
+	if c.invalidatedModelUIDs[modelID] == nil {
+		c.invalidatedModelUIDs[modelID] = make(map[types.UID]struct{})
 	}
-	c.fencedModelUIDs[modelID][modelUID] = struct{}{}
+	c.invalidatedModelUIDs[modelID][modelUID] = struct{}{}
 }
 
 func (c *ConfigMapReconciler) isModelMutationBlocked(modelID string, modelUID types.UID) bool {
@@ -852,8 +862,11 @@ func (c *ConfigMapReconciler) isModelRestoreBlocked(modelID string, modelUID typ
 	return !exists
 }
 
+// isModelMutationBlockedLocked rejects a task when deletion invalidated its UID
+// or the cached model key belongs to another CR instance. The caller must hold
+// cacheMutex.
 func (c *ConfigMapReconciler) isModelMutationBlockedLocked(modelID string, modelUID types.UID) bool {
-	if c.isModelUIDFencedLocked(modelID, modelUID) {
+	if c.isModelUIDInvalidatedLocked(modelID, modelUID) {
 		return true
 	}
 	cacheEntry, exists := c.modelCache[modelID]
@@ -862,15 +875,19 @@ func (c *ConfigMapReconciler) isModelMutationBlockedLocked(modelID string, model
 	return exists && cacheEntry.ModelUID != "" && modelUID != "" && cacheEntry.ModelUID != modelUID
 }
 
-func (c *ConfigMapReconciler) isModelUIDFencedLocked(modelID string, modelUID types.UID) bool {
-	fencedUIDs, exists := c.fencedModelUIDs[modelID]
+// isModelUIDInvalidatedLocked reports whether deletion has invalidated this UID.
+// A task without a UID is also blocked when this model key has invalidated UIDs,
+// because it cannot identify which CR instance it belongs to.
+// The caller must hold cacheMutex.
+func (c *ConfigMapReconciler) isModelUIDInvalidatedLocked(modelID string, modelUID types.UID) bool {
+	invalidatedUIDs, exists := c.invalidatedModelUIDs[modelID]
 	if !exists {
 		return false
 	}
 	if modelUID == "" {
 		return true
 	}
-	_, exists = fencedUIDs[modelUID]
+	_, exists = invalidatedUIDs[modelUID]
 	return exists
 }
 
