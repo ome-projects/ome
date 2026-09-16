@@ -62,6 +62,34 @@ func requiredAffinityTo(matchLabels map[string]string) *v1.Affinity {
 	}}
 }
 
+func TestUnconstrainedMemberWaitsForHardSpreadAnchor(t *testing.T) {
+	leader, worker := namedMember("leader"), namedMember("worker")
+	leader.Spec.TopologySpreadConstraints = []v1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       "topology.example/cube",
+		WhenUnsatisfiable: v1.DoNotSchedule,
+	}}
+	g, _, nodes := twoMemberGang(leader, worker)
+
+	workerState := newCycleState()
+	_, status := g.PreFilter(context.Background(), workerState, worker, nodes)
+	if status.Code() != framework.Unschedulable || !strings.Contains(status.Message(), "waiting for gang spread anchor") {
+		t.Fatalf("worker PreFilter = %v, want wait for constrained leader", status)
+	}
+	if pin := readPin(workerState); pin != nil {
+		t.Fatalf("worker wrote premature pin %+v", pin)
+	}
+
+	leaderState := newCycleState()
+	result, status := g.PreFilter(context.Background(), leaderState, leader, nodes)
+	if !status.IsSuccess() || result == nil || result.NodeNames.Len() != 2 {
+		t.Fatalf("leader PreFilter = %v, candidates=%v, want deferred two-node plan", status, result)
+	}
+	if readDeferredPin(leaderState) == nil {
+		t.Fatal("hard-spread leader must defer its pin until Reserve")
+	}
+}
+
 // TestTemplatesCompleteActivatesParkedMembersOnce: a member parked because the
 // live set was short of minMember is activated by the first PreFilter that sees
 // the set complete, and only by that one. The observing member is in flight and

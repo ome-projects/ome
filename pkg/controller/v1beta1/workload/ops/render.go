@@ -224,8 +224,8 @@ const spreadPolicyRequired = "Required"
 // domain and a worker can never anchor the gang into one the leader could
 // not enter. Required renders as DoNotSchedule (maxSkew 1: balanced
 // spreading, enforced by any scheduler that runs PodTopologySpread's Filter
-// — including the OME gang scheduler's packing profile, whose retry loop
-// re-plans a vetoed domain choice); anything else renders as ScheduleAnyway
+// — including the OME gang scheduler's packing profile, which defers the initial
+// gang pin until that filter has narrowed the candidates); anything else renders as ScheduleAnyway
 // (advisory; inert under a profile that disables the spreading Score). The
 // constraint is deliberately not part of the revision hash: toggling the
 // policy shapes future placements (creates, repairs, migrations, rollouts)

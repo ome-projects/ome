@@ -152,6 +152,43 @@ func TestScore_PinnedGangMemberSkipped(t *testing.T) {
 	}
 }
 
+// TestScore_DeferredGangPreservesBestFit verifies that deferring a hard-spread
+// gang's pin does not discard GangPack's packing preference. PreScore sees only
+// domains with nodes that survived the framework filters, then ranks the fuller
+// whole-gang-feasible domain above the emptier one.
+func TestScore_DeferredGangPreservesBestFit(t *testing.T) {
+	g := &GangPack{}
+	pod := gpuPod("4")
+	nodes := []framework.NodeInfo{
+		nodeInfo(gpuNode("a1", "a", "4")),
+		nodeInfo(gpuNode("b1", "b", "4")),
+	}
+	state := newCycleState()
+	writeDeferredPin(state, &deferredPinState{
+		gang: gangInfo{key: "ns/g", topologyKey: testKey},
+		need: 2,
+		free: map[string]int{"a": 2, "b": 3},
+	})
+
+	if status := g.PreScore(context.Background(), state, pod, nodes); !status.IsSuccess() {
+		t.Fatalf("PreScore = %v, want Success", status)
+	}
+	scores := make(framework.NodeScoreList, 0, len(nodes))
+	for _, node := range nodes {
+		score, status := g.Score(context.Background(), state, pod, node)
+		if !status.IsSuccess() {
+			t.Fatalf("Score(%s) = %v", node.Node().Name, status)
+		}
+		scores = append(scores, framework.NodeScore{Name: node.Node().Name, Score: score})
+	}
+	if status := g.NormalizeScore(context.Background(), state, pod, scores); !status.IsSuccess() {
+		t.Fatalf("NormalizeScore = %v", status)
+	}
+	if scores[0].Score != framework.MaxNodeScore || scores[1].Score != 0 {
+		t.Fatalf("deferred gang scores = %+v, want a=%d b=0", scores, framework.MaxNodeScore)
+	}
+}
+
 // TestScore_NodeWithoutDomainLabelNeutral: a node not in any domain scores 0 even
 // while other nodes pack. Uses two real domains so there is a packing gradient
 // (a: 1 free = fullest, b: 2 free) for the domainless node to lose to.
