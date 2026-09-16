@@ -114,6 +114,7 @@ func (s *Gopher) sharedHfArtifactHandler() *hfArtifactTaskHandler {
 	s.hfArtifactHandlerOnce.Do(func() {
 		s.hfArtifactHandler = newHfArtifactTaskHandler(newHfArtifactRepository(s.configMapReconciler))
 		s.hfArtifactHandler.updateChildStatuses = s.updateHfArtifactChildLabels
+		s.hfArtifactStartup = newHfArtifactStartup(s.hfArtifactHandler)
 	})
 	return s.hfArtifactHandler
 }
@@ -213,6 +214,9 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 // A Failed parent with children is repaired in place, never reset as a new copy.
 func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (hfArtifactTaskResult, error) {
 	handler := s.sharedHfArtifactHandler()
+	if err := s.hfArtifactStartup.recover(ctx); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	parent, found, err := handler.repository.Get(ctx, input.Parent.Identity)
 	if err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
@@ -230,9 +234,17 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 	}
 	needsRepair := task.TaskType == DownloadOverride || (found && parent.Status != HfArtifactStatusUpdating &&
 		(parent.Status == HfArtifactStatusFailed || !handler.files.ParentReadyMarkerExists(parent)))
-	if !allowDownload && (needsRepair || !found) {
+	startupValidation := s.hfArtifactStartup.needsValidation(input.Parent.Key)
+	if !allowDownload && (needsRepair || !found || startupValidation) {
 		s.demoteToNormalPriority(task)
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
+	}
+	if startupValidation && task.TaskType != DownloadOverride {
+		result, err := s.hfArtifactStartup.validateOnce(ctx, input, validate, download)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+		return result, nil
 	}
 	if needsRepair {
 		return handler.handleDownloadOverride(ctx, input, validate, download)
@@ -315,7 +327,10 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 		return false, false, nil
 	}
 	if err != nil || !found {
-		return err != nil, false, err
+		if err != nil {
+			return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(key, err))
+		}
+		return false, false, nil
 	}
 	input := s.hfArtifactInputForChild(task, parent)
 	preserve, err := s.isPathReferencedByOtherModels(input.ChildModelPath, task.BaseModel, task.ClusterBaseModel)
@@ -332,12 +347,18 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 
 func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTaskInput, preserve bool) (hfArtifactTaskResult, error) {
 	handler := s.sharedHfArtifactHandler()
+	if err := s.hfArtifactStartup.recover(ctx); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if preserve {
 		unlock, acquired := handler.tryParentOperation(input.Parent.Key)
 		if !acquired {
 			return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 		}
 		defer unlock()
+		if err := handler.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
 		current, found, err := handler.repository.GetParentForChild(ctx, input.ChildModelKey)
 		if err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
@@ -349,6 +370,16 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 			return newHfArtifactRetryResult(current.Key, fmt.Errorf("child parent changed before preserving artifact")), nil
 		}
 		input.Parent = current
+		if current.Status == HfArtifactStatusUpdating {
+			if !handler.files.ParentReadyMarkerMatchesLock(current) {
+				return newHfArtifactRetryResult(current.Key, nil), nil
+			}
+			if err := handler.markParentReady(ctx, current); err != nil {
+				return newHfArtifactRetryResult(current.Key, err), nil
+			}
+			input.Parent.Status = HfArtifactStatusReady
+			input.Parent.LockID = ""
+		}
 		removed, err := handler.repository.RemoveModelReference(ctx, input.Parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath)
 		if err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
