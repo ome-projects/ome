@@ -67,6 +67,8 @@ spec:
         - '2'
         - --num-high-priority-worker
         - '1'
+        - --model-verification-concurrency
+        - {{ .Values.modelAgent.modelVerificationConcurrency | quote }}
         - --same-path-wait-timeout
         - 30m
         env:
