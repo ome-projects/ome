@@ -18,13 +18,16 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 	validate hfArtifactValidateFunc,
 	download hfArtifactDownloadFunc,
 ) (hfArtifactTaskResult, error) {
-	unlock, acquired := h.tryParentOperation(input.Parent.Key)
-	if !acquired {
-		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
+	unlock, acquired, err := h.tryArtifactOperation(input)
+	if err != nil || !acquired {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
+	if result, pending := h.resumeDeletionBeforeDownload(ctx, input); pending {
+		return result, nil
 	}
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
@@ -39,11 +42,18 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 	if !found {
 		parent = input.Parent
 	}
+	if err := input.validateFilesystemPaths(parent); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if h.childPathConflictsWithParent(input.ChildModelPath, parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
 	parent, acquired, err = h.repository.TryAcquireLockForRepair(ctx, parent)
 	if err != nil {
+		if acquired {
+			// A lost response does not prove the repair lock was not committed.
+			h.pendingFailures.Store(parent.Key, &parent)
+		}
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	if !acquired {

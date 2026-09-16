@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -16,15 +17,147 @@ var errHfArtifactChildPathConflict = errors.New("child model path conflicts with
 // child symlinks. It stores no state and does not read or write the ConfigMap.
 type hfArtifactFiles struct{}
 
+func canonicalHfArtifactStoreRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("model store root is required for shared Hugging Face artifacts")
+	}
+	if err := validateHfArtifactCleanPath(root); err != nil {
+		return "", err
+	}
+	if root == string(filepath.Separator) {
+		return "", errors.New("filesystem root is not a model store")
+	}
+	if info, err := os.Lstat(root); err == nil && !info.IsDir() {
+		return "", fmt.Errorf("model store root %s is not a directory", root)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	// Resolve OS aliases above the store (e.g. /var -> /private/var), including
+	// when the store has not been created yet. Links below it are not allowed.
+	base := root
+	for {
+		resolved, err := filepath.EvalSymlinks(base)
+		if err == nil {
+			relative, _ := filepath.Rel(base, root)
+			return filepath.Join(resolved, relative), nil
+		}
+		if !os.IsNotExist(err) || filepath.Dir(base) == base {
+			return "", err
+		}
+		base = filepath.Dir(base)
+	}
+}
+
+func validateHfArtifactCleanPath(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.TrimSpace(path) != path || strings.ContainsRune(path, '\x00') {
+		return fmt.Errorf("expected a canonical absolute artifact path, got %q", path)
+	}
+	return nil
+}
+
+// hfArtifactPathInRoot normalizes only the store prefix, never a symlink within
+// the store. Both spellings of an OS-aliased root refer to the same lock inode.
+func hfArtifactPathInRoot(path, configuredRoot, root string) (string, error) {
+	if err := validateHfArtifactCleanPath(path); err != nil {
+		return "", err
+	}
+	for _, prefix := range []string{configuredRoot, root} {
+		if hfArtifactInputPathWithin(prefix, path) {
+			relative, _ := filepath.Rel(prefix, path)
+			return filepath.Join(root, relative), nil
+		}
+	}
+	for prefix := path; filepath.Dir(prefix) != prefix; prefix = filepath.Dir(prefix) {
+		if resolved, err := filepath.EvalSymlinks(prefix); err == nil && resolved == root {
+			relative, _ := filepath.Rel(prefix, path)
+			return filepath.Join(root, relative), nil
+		}
+	}
+	return "", fmt.Errorf("artifact path %s is outside model store root %s", path, root)
+}
+
+func validateHfArtifactPathAncestors(root, path string, includeLeaf bool) error {
+	if !hfArtifactInputPathWithin(root, path) {
+		return fmt.Errorf("artifact path %s is outside model store root %s", path, root)
+	}
+	if !includeLeaf {
+		path = filepath.Dir(path)
+	}
+	for current := path; hfArtifactInputPathWithin(root, current); current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err == nil && !info.IsDir() {
+			return fmt.Errorf("artifact path ancestor %s is not a real directory", current)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if current == root {
+			break
+		}
+	}
+	return nil
+}
+
+func hfArtifactParentStoreRoot(parent HfArtifactEntry) string {
+	root := parent.LocalPath
+	for i := 0; i < len(strings.Split(parent.Identity.ModelID, "/"))+2; i++ {
+		root = filepath.Dir(root)
+	}
+	return root
+}
+
+func validateHfArtifactParentPath(parent HfArtifactEntry, modelStoreRoot string) (string, string, error) {
+	if err := validateHfArtifactIdentityAndPath(parent); err != nil {
+		return "", "", err
+	}
+	root, err := canonicalHfArtifactStoreRoot(modelStoreRoot)
+	if err != nil {
+		return "", "", err
+	}
+	path, err := hfArtifactPathInRoot(parent.LocalPath, modelStoreRoot, root)
+	if err != nil {
+		return "", "", err
+	}
+	if err := validateHfArtifactPathAncestors(root, path, true); err != nil {
+		return "", "", err
+	}
+	return root, path, nil
+}
+
+func (input hfArtifactTaskInput) validateFilesystemPaths(parent HfArtifactEntry) error {
+	root, parentPath, err := validateHfArtifactParentPath(parent, input.ModelStoreRoot)
+	if err != nil {
+		return err
+	}
+	expectedPath, err := hfArtifactPathInRoot(input.Parent.LocalPath, input.ModelStoreRoot, root)
+	if err != nil || parentPath != expectedPath || parent.Key != input.Parent.Key {
+		return fmt.Errorf("shared artifact parent path changed: %s", parent.LocalPath)
+	}
+	childPath, err := hfArtifactPathInRoot(input.ChildModelPath, input.ModelStoreRoot, root)
+	if err != nil {
+		return err
+	}
+	if childPath == root || hfArtifactInputPathWithin(childPath, parentPath) || hfArtifactInputPathWithin(parentPath, childPath) {
+		return fmt.Errorf("child path %s overlaps the shared artifact or store", childPath)
+	}
+	relative, _ := filepath.Rel(root, childPath)
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == constants.ModelArtifactsDirectory || part == hfArtifactLockDirectory {
+			return fmt.Errorf("child path %s uses a reserved artifact directory", childPath)
+		}
+	}
+	return validateHfArtifactPathAncestors(root, childPath, false)
+}
+
 // ParentReadyMarkerExists checks for a parent directory and a local ready
 // marker. It does not validate model files or their checksums.
 func (hfArtifactFiles) ParentReadyMarkerExists(parent HfArtifactEntry) bool {
-	info, err := os.Stat(parent.LocalPath)
+	info, err := os.Lstat(parent.LocalPath)
 	if err != nil || !info.IsDir() {
 		return false
 	}
-	_, err = os.Stat(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName))
-	return err == nil
+	info, err = os.Lstat(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName))
+	return err == nil && info.Mode().IsRegular()
 }
 
 // ParentReadyMarkerMatchesLock checks whether the active parent lock owner
@@ -48,8 +181,14 @@ func (hfArtifactFiles) ResetParentDirectory(parentPath string) error {
 
 // WriteParentReadyMarker records the LockID after a successful download.
 func (hfArtifactFiles) WriteParentReadyMarker(parent HfArtifactEntry) error {
+	marker := filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName)
+	if info, err := os.Lstat(marker); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("parent ready marker %s is not a regular file", marker)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return os.WriteFile(
-		filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName),
+		marker,
 		[]byte(parent.LockID),
 		0o644,
 	)
@@ -83,22 +222,30 @@ func readChildSymlinkTarget(childModelPath string) (string, error) {
 // CreateChildSymlink creates a relative link or accepts the same link on retry.
 // An existing directory, file, or link to another parent is a conflict.
 func (files hfArtifactFiles) CreateChildSymlink(childModelPath, parentPath string) error {
+	_, err := files.createChildSymlink(childModelPath, parentPath)
+	return err
+}
+
+// createChildSymlink reports ownership of a newly created link for rollback.
+// The caller holds the child path lock through reference publication/cleanup.
+func (files hfArtifactFiles) createChildSymlink(childModelPath, parentPath string) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(childModelPath), 0o755); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := os.Lstat(childModelPath); err == nil {
 		if files.IsChildLinkedToParent(childModelPath, parentPath) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("%w: %s", errHfArtifactChildPathConflict, childModelPath)
+		return false, fmt.Errorf("%w: %s", errHfArtifactChildPathConflict, childModelPath)
 	} else if !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
 	target, err := filepath.Rel(filepath.Dir(childModelPath), parentPath)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return os.Symlink(target, childModelPath)
+	err = os.Symlink(target, childModelPath)
+	return err == nil, err
 }
 
 // RemoveChildSymlink removes only a link to this parent. A missing path is
@@ -121,21 +268,28 @@ func (files hfArtifactFiles) RemoveChildSymlink(childModelPath, parentPath strin
 // WalkDir inspects symlinks without following them. This is a point-in-time
 // filesystem check, not a lock against concurrent child creation.
 func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, error) {
-	cleanParentPath := filepath.Clean(parentPath)
+	root, err := canonicalHfArtifactStoreRoot(modelStoreRoot)
+	if err != nil {
+		return false, err
+	}
+	cleanParentPath, err := hfArtifactPathInRoot(parentPath, modelStoreRoot, root)
+	if err != nil {
+		return false, err
+	}
 	foundChild := false
-	err := filepath.WalkDir(modelStoreRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// A missing root has no children. An error below an existing root
 			// means the scan is incomplete, even if a directory disappeared.
-			if path == modelStoreRoot && os.IsNotExist(walkErr) {
+			if path == root && os.IsNotExist(walkErr) {
 				return nil
 			}
 			return walkErr
 		}
-		if path == modelStoreRoot && !entry.IsDir() {
+		if path == root && !entry.IsDir() {
 			return fmt.Errorf("model store root %s is not a directory", modelStoreRoot)
 		}
-		if filepath.Clean(path) == cleanParentPath && entry.IsDir() {
+		if path != root && entry.IsDir() && (path == cleanParentPath || entry.Name() == hfArtifactLockDirectory) {
 			return filepath.SkipDir
 		}
 		if entry.Type()&os.ModeSymlink == 0 {
@@ -145,7 +299,9 @@ func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, err
 		if err != nil {
 			return err
 		}
-		if target == cleanParentPath {
+		// Absolute targets may use a different OS spelling of the store root.
+		canonicalTarget, err := hfArtifactPathInRoot(target, modelStoreRoot, root)
+		if err == nil && canonicalTarget == cleanParentPath {
 			foundChild = true
 			return filepath.SkipAll
 		}
