@@ -13,6 +13,11 @@ func (h *hfArtifactTaskHandler) handleDownload(
 	input hfArtifactTaskInput,
 	download hfArtifactDownloadFunc,
 ) (hfArtifactTaskResult, error) {
+	unlock, acquired := h.tryParentOperation(input.Parent.Key)
+	if !acquired {
+		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
+	}
+	defer unlock()
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
@@ -66,7 +71,7 @@ func (h *hfArtifactTaskHandler) downloadParentAndAttachChild(
 	// Acquisition returns current state, not the earlier snapshot. Recheck both
 	// recorded and local children before resetting files under this lock.
 	if err := h.validateParentForInitialDownload(parent, root); err != nil {
-		return newHfArtifactRetryResult(parent.Key, errors.Join(err, h.repository.MarkFailed(ctx, parent))), nil
+		return newHfArtifactRetryResult(parent.Key, errors.Join(err, h.markParentFailed(ctx, parent))), nil
 	}
 
 	if download == nil {
@@ -81,7 +86,7 @@ func (h *hfArtifactTaskHandler) downloadParentAndAttachChild(
 	if err := h.files.WriteParentReadyMarker(parent); err != nil {
 		return h.markLockedParentFailed(ctx, parent, err)
 	}
-	if err := h.repository.MarkReady(ctx, parent); err != nil {
+	if err := h.markParentReady(ctx, parent); err != nil {
 		// Keep the marker: a retry can finish this update without downloading again.
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
@@ -117,7 +122,7 @@ func (h *hfArtifactTaskHandler) reuseParent(
 		if !h.files.ParentReadyMarkerMatchesLock(parent) {
 			return newHfArtifactRetryResult(parent.Key, nil), nil
 		}
-		if err := h.repository.MarkReady(ctx, parent); err != nil {
+		if err := h.markParentReady(ctx, parent); err != nil {
 			return newHfArtifactRetryResult(parent.Key, err), nil
 		}
 		parent.Status = HfArtifactStatusReady

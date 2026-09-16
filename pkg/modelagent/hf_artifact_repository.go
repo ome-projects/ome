@@ -206,7 +206,8 @@ func (r *HfArtifactRepository) tryAcquireLock(ctx context.Context, expected HfAr
 }
 
 // MarkReady completes work owned by expected.LockID. It atomically sets the
-// artifact Ready and clears the lock, rejecting stale or non-owner callers.
+// artifact Ready, restores affected child statuses, and clears the lock and
+// repair snapshot, rejecting stale or non-owner callers.
 func (r *HfArtifactRepository) MarkReady(ctx context.Context, expected HfArtifactEntry) error {
 	return r.setStatus(ctx, expected, HfArtifactStatusReady)
 }
@@ -239,6 +240,23 @@ func (r *HfArtifactRepository) setStatus(ctx context.Context, expected HfArtifac
 		}
 		if expected.LockID == "" || stored.LockID != expected.LockID {
 			return false, fmt.Errorf("Hugging Face artifact %s lock ID does not match current owner", stored.Key)
+		}
+		if status == HfArtifactStatusReady {
+			statuses, err := hfArtifactChildStatusesToRestore(configMap.Data, stored, expected)
+			if err != nil {
+				return false, err
+			}
+			for key, childStatus := range statuses {
+				child, err := existingModelEntry(configMap.Data, key)
+				if err != nil {
+					return false, err
+				}
+				child.Status = childStatus
+				if _, err := writeModelEntry(configMap.Data, key, child); err != nil {
+					return false, err
+				}
+			}
+			stored.ChildStatusesBeforeRepair = nil
 		}
 		stored.Status = status
 		stored.LastCompletedLockID = expected.LockID
@@ -394,6 +412,7 @@ func (r *HfArtifactRepository) RemoveModelReference(
 		}
 
 		delete(stored.Children, modelKey)
+		delete(stored.ChildStatusesBeforeRepair, modelKey)
 		model.HfArtifactKey = ""
 		result = RemoveModelReferenceResult{Artifact: stored, ReferenceRemoved: true}
 		if len(stored.Children) == 0 {

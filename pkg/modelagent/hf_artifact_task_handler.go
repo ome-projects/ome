@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -62,15 +64,36 @@ func (input hfArtifactTaskInput) modelStoreRoot() (string, error) {
 // the parent files. The handler trusts that result when writing its ready marker.
 type hfArtifactDownloadFunc func(parentPath string) error
 
+// hfArtifactValidateFunc is read-only. False with no error means files need
+// repair; an error means validation could not determine whether they are valid.
+type hfArtifactValidateFunc func(parentPath string) (bool, error)
+
 // hfArtifactTaskHandler coordinates local files and persisted relationships.
 // Those operations are separate; they are not one filesystem/ConfigMap transaction.
 type hfArtifactTaskHandler struct {
 	repository *HfArtifactRepository
 	files      hfArtifactFiles
+	// updateChildStatuses optionally updates node labels. It must be idempotent:
+	// repair calls it before file writes and before publishing parent Ready,
+	// including retries of marker-backed completion.
+	updateChildStatuses func(context.Context, map[string]ModelStatus) error
 }
 
 func newHfArtifactTaskHandler(repository *HfArtifactRepository) *hfArtifactTaskHandler {
 	return &hfArtifactTaskHandler{repository: repository}
+}
+
+// tryParentOperation covers filesystem and label side effects as well as the
+// ConfigMap transition. LockID fences durable writes; this process-local lock
+// prevents a late completion callback from racing the next parent operation.
+// Contenders return to the queue instead of blocking a worker on a download.
+func (h *hfArtifactTaskHandler) tryParentOperation(key string) (func(), bool) {
+	value, _ := h.repository.configMaps.hfArtifactOperations.LoadOrStore(key, &sync.Mutex{})
+	mutex := value.(*sync.Mutex)
+	if !mutex.TryLock() {
+		return nil, false
+	}
+	return mutex.Unlock, true
 }
 
 // validateChildReference requires an existing child entry before local changes.
@@ -120,10 +143,17 @@ func (h *hfArtifactTaskHandler) markLockedParentFailed(
 	parent HfArtifactEntry,
 	cause error,
 ) (hfArtifactTaskResult, error) {
-	if err := h.repository.MarkFailed(ctx, parent); err != nil {
+	if err := h.markParentFailed(ctx, parent); err != nil {
 		return newHfArtifactRetryResult(parent.Key, errors.Join(cause, err)), nil
 	}
 	return hfArtifactTaskResult{}, cause
+}
+
+// A cancelled download must still release its lock, but cleanup is bounded.
+func (h *hfArtifactTaskHandler) markParentFailed(ctx context.Context, parent HfArtifactEntry) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return h.repository.MarkFailed(cleanupCtx, parent)
 }
 
 func newHfArtifactRetryResult(parentKey string, reason error) hfArtifactTaskResult {
