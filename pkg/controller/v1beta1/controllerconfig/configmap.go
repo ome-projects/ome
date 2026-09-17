@@ -283,6 +283,111 @@ type DeployConfig struct {
 	// unconfigured and the component keeps whatever it authored (unset =
 	// Available as soon as Ready). A configured value must be >= 0.
 	MinReadySeconds *int32 `json:"minReadySeconds,omitempty"`
+	// UpdateStrategy is the admission-time lifecycle.updateStrategy the ISVC
+	// defaulter stamps on OMENative components that do not author one, keyed
+	// by component so a router and an engine can roll differently. Following
+	// the fields above there is no in-code default: an absent block, an
+	// absent component entry, or an absent field means unconfigured and the
+	// component keeps whatever it authored.
+	UpdateStrategy *UpdateStrategyDefaultsConfig `json:"updateStrategy,omitempty"`
+}
+
+// UpdateStrategyDefaultsConfig is the admission-time per-pod-swap defaulting
+// policy loaded from the "deploy.updateStrategy" block of the
+// inferenceservice-config ConfigMap. Each component is independent; a nil
+// entry disables defaulting for that component only.
+//
+// +kubebuilder:object:generate=false
+type UpdateStrategyDefaultsConfig struct {
+	Router  *ComponentUpdateStrategyDefaults `json:"router,omitempty"`
+	Engine  *ComponentUpdateStrategyDefaults `json:"engine,omitempty"`
+	Decoder *ComponentUpdateStrategyDefaults `json:"decoder,omitempty"`
+}
+
+// ComponentUpdateStrategyDefaults carries one component's per-pod-swap
+// defaults. Both budgets may be configured; the defaulter stamps only the one
+// the resolved strategy reads, because a surge strategy never consults
+// MaxUnavailable and a non-surge strategy never consults MaxSurge, and a value
+// that is never read reads as a bound that is doing nothing.
+//
+// +kubebuilder:object:generate=false
+type ComponentUpdateStrategyDefaults struct {
+	// Type is the update strategy, one of the values the UpdateStrategyType
+	// enum accepts.
+	Type string `json:"type,omitempty"`
+	// MaxSurge paces a surge strategy: extra Instances allowed above the
+	// component's replica count during a roll.
+	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
+	// MaxUnavailable paces a non-surge strategy: Instances allowed to be
+	// not-Ready at once during a roll.
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+}
+
+// ForComponent returns the entry for a component, or nil when the block or the
+// entry is unconfigured.
+func (c *UpdateStrategyDefaultsConfig) ForComponent(component workloadtypes.ComponentType) *ComponentUpdateStrategyDefaults {
+	if c == nil {
+		return nil
+	}
+	switch component {
+	case workloadtypes.ComponentRouter:
+		return c.Router
+	case workloadtypes.ComponentEngine:
+		return c.Engine
+	case workloadtypes.ComponentDecoder:
+		return c.Decoder
+	default:
+		return nil
+	}
+}
+
+// validate rejects a malformed block at config-load rather than letting the
+// defaulter stamp a strategy the CRD enum refuses or a budget that deadlocks
+// every rollout.
+func (c *UpdateStrategyDefaultsConfig) validate() error {
+	if c == nil {
+		return nil
+	}
+	for _, entry := range []struct {
+		name  string
+		value *ComponentUpdateStrategyDefaults
+	}{{"router", c.Router}, {"engine", c.Engine}, {"decoder", c.Decoder}} {
+		if entry.value == nil {
+			continue
+		}
+		if err := entry.value.validate(entry.name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *ComponentUpdateStrategyDefaults) validate(component string) error {
+	switch workloadtypes.UpdateStrategyType(e.Type) {
+	case "",
+		workloadtypes.UpdateStrategySurgeThenDrain,
+		workloadtypes.UpdateStrategyRecreatePod,
+		workloadtypes.UpdateStrategyInPlaceIfPossible,
+		workloadtypes.UpdateStrategyInPlaceOnly:
+	default:
+		return fmt.Errorf("invalid deploy config, updateStrategy.%s.type %q is not a supported update strategy", component, e.Type)
+	}
+	for _, budget := range []struct {
+		field string
+		value *intstr.IntOrString
+	}{{"maxSurge", e.MaxSurge}, {"maxUnavailable", e.MaxUnavailable}} {
+		if budget.value == nil {
+			continue
+		}
+		scaled, err := intstr.GetScaledValueFromIntOrPercent(budget.value, 100, true)
+		if err != nil {
+			return fmt.Errorf("invalid deploy config, updateStrategy.%s.%s is not an integer or percentage: %w", component, budget.field, err)
+		}
+		if scaled <= 0 {
+			return fmt.Errorf("invalid deploy config, updateStrategy.%s.%s must be > 0, got %q: a zero budget denies every Instance and the rollout never starts", component, budget.field, budget.value.String())
+		}
+	}
+	return nil
 }
 
 // ReplicasDefaultsConfig is the admission-time replica-defaulting policy
@@ -1307,6 +1412,10 @@ func parseDeployConfig(configMap *v1.ConfigMap) (*DeployConfig, error) {
 
 		if v := deployConfig.MinReadySeconds; v != nil && *v < 0 {
 			return nil, fmt.Errorf("invalid deploy config, minReadySeconds must be >= 0, got %d", *v)
+		}
+
+		if err := deployConfig.UpdateStrategy.validate(); err != nil {
+			return nil, err
 		}
 	}
 	return deployConfig, nil

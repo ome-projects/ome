@@ -35,7 +35,8 @@ data:
       "defaultDeploymentMode": "{{ .Values.ome.controller.deploymentMode }}"{{- with .Values.ome.controller.replicas }},
       "replicas": {{ toJson . }}{{- end }}{{- with .Values.ome.controller.terminationGracePeriodSeconds }},
       "terminationGracePeriodSeconds": {{ . }}{{- end }}{{- if not (kindIs "invalid" .Values.ome.controller.minReadySeconds) }},
-      "minReadySeconds": {{ .Values.ome.controller.minReadySeconds }}{{- end }}
+      "minReadySeconds": {{ .Values.ome.controller.minReadySeconds }}{{- end }}{{- with .Values.ome.controller.updateStrategy }},
+      "updateStrategy": {{ toJson . }}{{- end }}
     }
 {{- with .Values.ome.controller.podDisruptionBudget }}
   podDisruptionBudget: |-

@@ -18,6 +18,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/constants"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 const (
@@ -1244,4 +1245,107 @@ func TestCoordinationConfigDefaultRatioTolerance(t *testing.T) {
 		cfg := load(t, `{"trafficWeightDeadbandPercent":0}`)
 		assert.Nil(t, cfg.DefaultRatioTolerancePercent)
 	})
+}
+
+func TestDeployConfig_UpdateStrategyDefaults(t *testing.T) {
+	tests := []struct {
+		name          string
+		block         string
+		expectedError string
+		validate      func(*testing.T, *DeployConfig)
+	}{
+		{
+			name: "per-component entries parsed",
+			block: `{
+				"defaultDeploymentMode": "RawDeployment",
+				"updateStrategy": {
+					"router":  {"type": "SurgeThenDrain",    "maxSurge": "25%"},
+					"engine":  {"type": "InPlaceIfPossible", "maxUnavailable": "10%"},
+					"decoder": {"type": "InPlaceIfPossible", "maxUnavailable": 2}
+				}
+			}`,
+			validate: func(t *testing.T, cfg *DeployConfig) {
+				router := cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentRouter)
+				require.NotNil(t, router)
+				assert.Equal(t, "SurgeThenDrain", router.Type)
+				assert.Equal(t, intstr.FromString("25%"), *router.MaxSurge)
+				assert.Nil(t, router.MaxUnavailable)
+
+				engine := cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentEngine)
+				require.NotNil(t, engine)
+				assert.Equal(t, "InPlaceIfPossible", engine.Type)
+				assert.Equal(t, intstr.FromString("10%"), *engine.MaxUnavailable)
+
+				decoder := cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentDecoder)
+				require.NotNil(t, decoder)
+				assert.Equal(t, intstr.FromInt(2), *decoder.MaxUnavailable)
+			},
+		},
+		{
+			name:  "absent block is unconfigured",
+			block: `{"defaultDeploymentMode": "RawDeployment"}`,
+			validate: func(t *testing.T, cfg *DeployConfig) {
+				assert.Nil(t, cfg.UpdateStrategy)
+				// Nil-receiver accessor reports unconfigured, never a strategy.
+				assert.Nil(t, cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentEngine))
+			},
+		},
+		{
+			name: "an entry may omit every field",
+			block: `{
+				"defaultDeploymentMode": "RawDeployment",
+				"updateStrategy": {"engine": {}}
+			}`,
+			validate: func(t *testing.T, cfg *DeployConfig) {
+				engine := cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentEngine)
+				require.NotNil(t, engine)
+				assert.Empty(t, engine.Type)
+			},
+		},
+		{
+			name: "unsupported strategy rejected",
+			block: `{
+				"defaultDeploymentMode": "RawDeployment",
+				"updateStrategy": {"engine": {"type": "RollingUpdate"}}
+			}`,
+			expectedError: `updateStrategy.engine.type "RollingUpdate" is not a supported update strategy`,
+		},
+		{
+			name: "zero budget rejected as a rollout deadlock",
+			block: `{
+				"defaultDeploymentMode": "RawDeployment",
+				"updateStrategy": {"engine": {"type": "InPlaceIfPossible", "maxUnavailable": 0}}
+			}`,
+			expectedError: "updateStrategy.engine.maxUnavailable must be > 0",
+		},
+		{
+			name: "zero-percent budget rejected as a rollout deadlock",
+			block: `{
+				"defaultDeploymentMode": "RawDeployment",
+				"updateStrategy": {"router": {"maxSurge": "0%"}}
+			}`,
+			expectedError: "updateStrategy.router.maxSurge must be > 0",
+		},
+		{
+			name: "non-numeric budget rejected",
+			block: `{
+				"defaultDeploymentMode": "RawDeployment",
+				"updateStrategy": {"router": {"maxSurge": "many"}}
+			}`,
+			expectedError: "updateStrategy.router.maxSurge is not an integer or percentage",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := parseDeployConfig(&v1.ConfigMap{Data: map[string]string{DeployConfigName: tt.block}})
+			if tt.expectedError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedError)
+				return
+			}
+			require.NoError(t, err)
+			tt.validate(t, cfg)
+		})
+	}
 }

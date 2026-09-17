@@ -384,11 +384,12 @@ func TestValidateCanary_InvalidComponentRejected(t *testing.T) {
 }
 
 // TestValidateCanary_EntrypointRequired: a canary group must contain the ISVC's
-// external entrypoint (router when present). A router-fronted PD ISVC whose canary
-// group is [engine,decoder] would write the stepped traffic onto engine's internal
-// Service while the router keeps shifting by pod ratio — the steps never reach real
-// traffic — so admission rejects it.
-func TestValidateCanary_EntrypointRequired(t *testing.T) {
+// entrypoint of every unit it covers: the router for the router unit, the engine
+// for the engine unit. A group that stages a secondary without its unit entrypoint
+// has no Component carrying the roll. An engine unit on a router-fronted ISVC is
+// legal — the router discovers engine endpoints by label selector with no revision
+// term, so a capacity step moves roughly that fraction of real requests.
+func TestValidateCanary_UnitEntrypointRequired(t *testing.T) {
 	mode := constants.OMENative
 	final := v1beta1.RolloutGroupStep{Capacity: intstr.FromString("100%"), Traffic: 100}
 	build := func(groupComps ...v1beta1.ComponentType) *v1beta1.InferenceServiceSpec {
@@ -402,11 +403,18 @@ func TestValidateCanary_EntrypointRequired(t *testing.T) {
 			}},
 		}
 	}
-	if err := ValidateCanary(build(v1beta1.EngineComponent, v1beta1.DecoderComponent)); err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) {
-		t.Fatalf("canary group missing the router entrypoint must be rejected, got: %v", err)
+	// The engine unit alone, on a router-fronted ISVC, is a complete unit.
+	if err := ValidateCanary(build(v1beta1.EngineComponent, v1beta1.DecoderComponent)); err != nil {
+		t.Fatalf("engine unit on a router-fronted isvc must pass: %v", err)
 	}
+	// Both units in one group stays valid.
 	if err := ValidateCanary(build(v1beta1.RouterComponent, v1beta1.EngineComponent, v1beta1.DecoderComponent)); err != nil {
-		t.Fatalf("canary group including the router entrypoint must pass: %v", err)
+		t.Fatalf("canary group spanning both units must pass: %v", err)
+	}
+	// A secondary without its unit entrypoint has nothing driving the roll.
+	err := ValidateCanary(build(v1beta1.RouterComponent, v1beta1.DecoderComponent))
+	if err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) {
+		t.Fatalf("decoder without the engine entrypoint must be rejected, got: %v", err)
 	}
 }
 
@@ -430,5 +438,88 @@ func TestValidateCanary_MaintainRatioRejected(t *testing.T) {
 	}
 	if err := ValidateCanary(spec); err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) {
 		t.Fatalf("maintainRatio on a canary group must be rejected, got: %v", err)
+	}
+}
+
+// canaryUnitSpec builds an OMENative spec with the requested Components
+// declared, and the given canary groups.
+func canaryUnitSpec(withRouter, withDecoder bool, groups ...[]v1beta1.ComponentType) *v1beta1.InferenceServiceSpec {
+	mode := constants.OMENative
+	final := v1beta1.RolloutGroupStep{Capacity: intstr.FromString("100%"), Traffic: 100}
+	spec := &v1beta1.InferenceServiceSpec{DeploymentMode: &mode, Engine: &v1beta1.EngineSpec{}}
+	if withRouter {
+		spec.Router = &v1beta1.RouterSpec{}
+	}
+	if withDecoder {
+		spec.Decoder = &v1beta1.DecoderSpec{}
+	}
+	var gs []v1beta1.RolloutGroup
+	for _, comps := range groups {
+		gs = append(gs, v1beta1.RolloutGroup{
+			Components: comps,
+			Canary:     &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{final}},
+		})
+	}
+	spec.Rollout = &v1beta1.RolloutSpec{Groups: gs}
+	return spec
+}
+
+// Independent units may each carry a canary run: a router run and an engine run
+// own disjoint Components, so neither can contend for the other's revision,
+// step counter or traffic entry.
+func TestValidateCanary_TwoUnitsEachGetARun(t *testing.T) {
+	spec := canaryUnitSpec(true, false,
+		[]v1beta1.ComponentType{v1beta1.RouterComponent},
+		[]v1beta1.ComponentType{v1beta1.EngineComponent},
+	)
+	if err := ValidateCanary(spec); err != nil {
+		t.Fatalf("one canary run per unit must be accepted: %v", err)
+	}
+}
+
+// Two runs driving one unit would contend for its revision and traffic entry.
+func TestValidateCanary_SameUnitTwiceRejected(t *testing.T) {
+	spec := canaryUnitSpec(true, true,
+		[]v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
+		[]v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.DecoderComponent},
+	)
+	err := ValidateCanary(spec)
+	if err == nil || !strings.Contains(err.Error(), ReasonMultipleCanaryGroups) {
+		t.Fatalf("two canary runs on the engine unit must be rejected, got: %v", err)
+	}
+}
+
+// An engine-only canary on a router-fronted ISVC is legal: the router discovers
+// engine endpoints by label selector with no revision term, so a capacity step
+// moves roughly that fraction of real requests even though the engine is not
+// the external entrypoint.
+func TestValidateCanary_EngineUnitBehindRouterAccepted(t *testing.T) {
+	spec := canaryUnitSpec(true, false, []v1beta1.ComponentType{v1beta1.EngineComponent})
+	if err := ValidateCanary(spec); err != nil {
+		t.Fatalf("engine-only canary behind a router must be accepted: %v", err)
+	}
+}
+
+// Splitting a declared P/D pair across a canary boundary can leave a
+// new-protocol prefill with no pairable decode, which fails requests outright.
+func TestValidateCanary_SplitPDPairRejected(t *testing.T) {
+	for _, comps := range [][]v1beta1.ComponentType{
+		{v1beta1.EngineComponent},
+		{v1beta1.RouterComponent, v1beta1.EngineComponent},
+	} {
+		spec := canaryUnitSpec(true, true, comps)
+		err := ValidateCanary(spec)
+		if err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) {
+			t.Errorf("%v on a pd isvc must be rejected, got: %v", comps, err)
+		}
+	}
+}
+
+// The single-group shape that spans both units keeps its current semantics.
+func TestValidateCanary_BothUnitsInOneGroupStillValid(t *testing.T) {
+	spec := canaryUnitSpec(true, true,
+		[]v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent, v1beta1.DecoderComponent})
+	if err := ValidateCanary(spec); err != nil {
+		t.Fatalf("a group spanning both units must stay valid: %v", err)
 	}
 }

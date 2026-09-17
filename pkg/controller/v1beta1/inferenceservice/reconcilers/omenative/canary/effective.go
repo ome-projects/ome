@@ -1,6 +1,9 @@
 package canary
 
-import "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+import (
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/rollout"
+)
 
 // EffectivePartition returns the StatefulSet-style RollingUpdate.Partition the
 // controller should apply to a component while a canary is in progress, reading
@@ -22,7 +25,7 @@ import "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 // stable revision and rolls every instance back onto it). A non-zero partition
 // here would fight that revert, so it is forced to 0 for the duration.
 func EffectivePartition(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, desiredReplicas int32) (*int32, bool) {
-	g := v1beta1.EffectiveCanaryGroup(isvc)
+	g := rollout.CanaryGroupFor(isvc, component)
 	if g == nil || g.Canary == nil || len(g.Canary.Steps) == 0 {
 		return nil, false
 	}
@@ -34,13 +37,13 @@ func EffectivePartition(isvc *v1beta1.InferenceService, component v1beta1.Compon
 	// Rolled back: hold NOTHING via partition (0). The component is driven back
 	// onto the stable revision by the IR's RollbackToRevision target, not by the
 	// partition; a non-zero partition here would fight that revert.
-	if isvc.Status.Canary != nil && isvc.Status.Canary.RolledBackRevisionHash != "" {
+	if cs := rollout.CanaryStatusFor(&isvc.Status, component); cs != nil && cs.RolledBackRevisionHash != "" {
 		zero := int32(0)
 		return &zero, true
 	}
 	idx := int32(0)
-	if isvc.Status.Canary != nil {
-		idx = isvc.Status.Canary.CurrentStep
+	if cs := rollout.CanaryStatusFor(&isvc.Status, component); cs != nil {
+		idx = cs.CurrentStep
 	}
 	// Status is an unvalidated subresource: clamp a negative step (an external
 	// write) before it can index plan.Steps.
@@ -113,7 +116,7 @@ func groupHasComponent(g *v1beta1.RolloutGroup, c v1beta1.ComponentType) bool {
 // effective (StampStepPartition owns that) or the Component is not in a
 // canary-kind group.
 func StampPlanGateHold(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, ext *v1beta1.ComponentExtensionSpec) {
-	if ext == nil || isvc.Spec.Rollout == nil || v1beta1.EffectiveCanaryGroup(isvc) != nil {
+	if ext == nil || isvc.Spec.Rollout == nil || rollout.CanaryGroupFor(isvc, component) != nil {
 		return
 	}
 	member := false

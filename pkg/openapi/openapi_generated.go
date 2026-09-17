@@ -3976,6 +3976,12 @@ func schema_pkg_apis_ome_v1beta1_ComponentStatusSpec(ref common.ReferenceCallbac
 							},
 						},
 					},
+					"canary": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Canary tracks the canary step machine for the unit this Component belongs to — the router alone, or engine+decoder together. It is written on the unit's entrypoint Component (the router, or the engine) and is absent on a secondary, so a reader never sees two copies of one run. Absent when the unit has no canary running.\n\nUnits advance independently, which is why the state cannot live in the single InferenceServiceStatus.Canary: two runs would overwrite each other's step counter and revision pair. That field is retained as an alias for the entrypoint unit's run so existing readers keep working.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryStatus"),
+						},
+					},
 					"autoscaler": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Autoscaler reports the per-Component autoscaler state — resolved Class / ManagedBy / SpecSource and (when ManagedBy == \"ome\") live CurrentReplicas / DesiredReplicas / LastScaleTime / Conditions mirrored from the underlying HPA or ScaledObject. Populated by the ISVC status writer for RawDeployment- and OMENative-managed Components. See ComponentAutoscalerStatus for the full field semantics.",
@@ -3992,7 +3998,7 @@ func schema_pkg_apis_ome_v1beta1_ComponentStatusSpec(ref common.ReferenceCallbac
 			},
 		},
 		Dependencies: []string{
-			"knative.dev/pkg/apis.URL", "knative.dev/pkg/apis/duck/v1.Addressable", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelection", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscalerStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentTrafficTarget", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScaleTargetRef"},
+			"knative.dev/pkg/apis.URL", "knative.dev/pkg/apis/duck/v1.Addressable", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelection", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscalerStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentTrafficTarget", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScaleTargetRef"},
 	}
 }
 
@@ -11705,7 +11711,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutSpec(ref common.ReferenceCallback) commo
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "RolloutSpec is the single rollout surface for an InferenceService: an ordered list of rollout groups. There is no coordination-vs-canary fork — sequencing is the list order, and canary is one progression a group may choose.",
+				Description: "RolloutSpec is the single rollout surface for an InferenceService: a list of rollout groups. There is no coordination-vs-canary fork — canary is one progression a group may choose, and whether list order sequences the groups is GroupOrdering.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"groups": {
@@ -11715,7 +11721,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutSpec(ref common.ReferenceCallback) commo
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Groups is the ORDERED list of rollout groups. Sequence is the list position: group N reaches completion before group N+1 begins. Components listed together in one group roll together (a coupled unit); Components not listed in any group roll independently (the default). To roll Components one-at-a-time, put each in its own group, in order — a group needs only its components; the progression may be omitted and defaults to blueGreen.\n\nCross-group sequencing is enforced only for a run of single-Component blueGreen groups (the classic one-at-a-time shape). Admission rejects any other multi-group list — a rollingUpdate, canary, or multi-Component group in an ordered list would run concurrently, and an ordering the engine does not enforce is rejected rather than accepted. The rejection applies on create and on any update that changes spec.rollout, so stored objects keep reconciling until their rollout is next edited.\n\nOnly meaningful for OMENative-managed Components.",
+							Description: "Groups is the ORDERED list of rollout groups. Sequence is the list position: group N reaches completion before group N+1 begins. Components listed together in one group roll together (a coupled unit); Components not listed in any group roll independently (the default). To roll Components one-at-a-time, put each in its own group, in order — a group needs only its components; the progression may be omitted and defaults to blueGreen.\n\nCross-group sequencing is enforced only for a run of single-Component blueGreen groups (the classic one-at-a-time shape). Under the default groupOrdering: Sequential, admission rejects any other multi-group list — a rollingUpdate, canary, or multi-Component group in an ordered list would run concurrently, and an ordering the engine does not enforce is rejected rather than accepted. The rejection applies on create and on any update that changes spec.rollout, so stored objects keep reconciling until their rollout is next edited. Set groupOrdering: Concurrent to declare that the groups are independent and the list order promises nothing.\n\nOnly meaningful for OMENative-managed Components.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -11725,6 +11731,13 @@ func schema_pkg_apis_ome_v1beta1_RolloutSpec(ref common.ReferenceCallback) commo
 									},
 								},
 							},
+						},
+					},
+					"groupOrdering": {
+						SchemaProps: spec.SchemaProps{
+							Description: "GroupOrdering declares what groups[] list order means. Sequential (the default) promises group N completes before group N+1 begins, and is admitted only for the shape that actually enforces it. Concurrent declares the groups independent: they roll at the same time on their disjoint Components, each with its own progression, gates, and rollback. Concurrent is what lets one InferenceService run, say, a router canary and an engine canary as unrelated rollouts.\n\nChanging this does not change how the engine executes a list it could not sequence — that was always concurrent. It changes whether such a list is an error or a declaration of intent.",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 					"pairingProtocol": {

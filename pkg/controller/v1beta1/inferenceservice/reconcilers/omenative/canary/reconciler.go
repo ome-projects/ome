@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // reconcileRequeue is how soon the controller re-checks an in-progress canary
@@ -29,8 +30,11 @@ type ReconcileInputs struct {
 	// Reader is the live API reader for one-off reads of types the manager does
 	// not watch (the analysis auth Secret): reading those through the cached
 	// Client would spin up a cluster-wide informer for the type.
-	Reader             client.Reader
-	ISVC               *v1beta1.InferenceService
+	Reader client.Reader
+	ISVC   *v1beta1.InferenceService
+	// Group is the canary group being dispatched — the unit's own ladder. Nil
+	// resolves it from Component.
+	Group              *v1beta1.RolloutGroup
 	Component          v1beta1.ComponentType
 	CanaryRevisionHash string
 	// StableRevisionHash is the stable revision for the canary's component:
@@ -94,6 +98,50 @@ func readyCapacityCount(readyPods int32, readyInstances *int32) int32 {
 	return readyPods
 }
 
+// unitRetargeted reports whether ANY Component in this canary unit has a
+// target distinct from its stable revision in the active run.
+//
+// It is per-UNIT, not per-Component, because a unit's revision identity is its
+// primary's: a [router, engine] group whose router is unchanged but whose
+// engine retargeted still has work to do, and suppressing it there would skip
+// a real rollout (see TestDispatch_SecondaryOnlyTargetStartsCanary).
+//
+// Conservative on missing information: with no active run, no group, or no
+// recorded targets there is nothing to prove the unit idle, so it reports
+// true and the caller's other guards decide.
+func unitRetargeted(in ReconcileInputs) bool {
+	if in.ISVC == nil || in.ISVC.Status.Rollout == nil || in.ISVC.Status.Rollout.ActiveRun == nil {
+		return true
+	}
+	targets := in.ISVC.Status.Rollout.ActiveRun.TargetRevisions
+	if len(targets) == 0 {
+		return true
+	}
+	members := map[v1beta1.ComponentType]bool{}
+	if in.Group != nil {
+		for _, c := range in.Group.Components {
+			members[c] = true
+		}
+	}
+	if len(members) == 0 {
+		members[in.Component] = true
+	}
+	seen := false
+	for i := range targets {
+		t := &targets[i]
+		if !members[t.Component] {
+			continue
+		}
+		seen = true
+		if t.Revision != t.StableRevision {
+			return true
+		}
+	}
+	// Every member recorded revision == stableRevision: this unit is idle.
+	// If the run recorded none of them, fall back to arming.
+	return !seen
+}
+
 func readyCanaryCapacity(in ReconcileInputs) int32 {
 	return readyCapacityCount(in.PerRevisionPods[in.CanaryRevisionHash], in.ReadyCanaryInstances)
 }
@@ -129,13 +177,21 @@ type Result struct {
 // performs capacity → traffic → pause, advancing on promotion; the final step
 // (TrafficWeight 100) drains and scales the stable revision down.
 func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
-	g := v1beta1.EffectiveCanaryGroup(in.ISVC)
+	// The legacy single-run field is a projection of per-unit state, so it is
+	// re-derived on every exit path rather than written alongside each mutation
+	// — a copy published once would freeze while the run advanced past it.
+	defer rollout.SyncLegacyCanaryAlias(&in.ISVC.Status)
+
+	g := in.Group
+	if g == nil {
+		g = rollout.CanaryGroupFor(in.ISVC, in.Component)
+	}
 	if g == nil || g.Canary == nil || len(g.Canary.Steps) == 0 {
 		return &Result{Active: false}, nil
 	}
 	plan := g.Canary
 
-	cs := in.ISVC.Status.Canary
+	cs := rollout.CanaryStatusFor(&in.ISVC.Status, in.Component)
 	// Status is an unvalidated subresource: clamp a negative step (an external
 	// write) before it can index plan.Steps.
 	if cs != nil && cs.CurrentStep < 0 {
@@ -260,8 +316,19 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// one when the component is already fully converged on the target revision —
 	// or when the target isn't known yet. Without a run identity, adding a canary
 	// to an already-rolled-out ISVC remains a no-op rather than a phantom rollout.
+	//
+	// The unitRetargeted clause is what keeps an IDLE unit out. A run is opened
+	// for the whole ISVC, so every group in the pinned plan is handed a
+	// TargetID even when only one unit retargeted — which disables the
+	// convergence check above for the units that did not. Arming one of those
+	// walks a full ladder, burns the unit's analysis budget on a no-op, and can
+	// reach a rollback (and its sticky reject) for a rollout that never
+	// happened. The unit that was not retargeted must sit the run out
+	// entirely.
 	if cs == nil {
-		if in.CanaryRevisionHash == "" || (in.TargetID == "" && readyCanaryCapacity(in) >= in.DesiredReplicas) {
+		if in.CanaryRevisionHash == "" ||
+			(in.TargetID == "" && readyCanaryCapacity(in) >= in.DesiredReplicas) ||
+			!unitRetargeted(in) {
 			if in.CanaryRevisionHash != "" && in.DesiredReplicas > 0 {
 				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
 			}
@@ -274,14 +341,14 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		if !in.RunActive {
 			return &Result{Active: false}, nil
 		}
-		in.ISVC.Status.Canary = &v1beta1.CanaryStatus{
+		rollout.SetCanaryStatusFor(&in.ISVC.Status, in.Component, &v1beta1.CanaryStatus{
 			TargetID:           in.TargetID,
 			CanaryRevisionHash: in.CanaryRevisionHash,
 			StableRevisionHash: in.StableRevisionHash,
 			CurrentStep:        0,
 			StepEnteredTime:    &metav1.Time{Time: in.Now},
-		}
-		cs = in.ISVC.Status.Canary
+		})
+		cs = rollout.CanaryStatusFor(&in.ISVC.Status, in.Component)
 	}
 
 	// Backfill a missing stable identity from the observed stable revision (a
@@ -554,8 +621,8 @@ func resolveReadyTimeout(in ReconcileInputs, plan *v1beta1.GroupCanary) time.Dur
 
 // effectiveCanaryPlan is the effective canary body for callers that hold only
 // ReconcileInputs (the plan indexing itself stays in Reconcile).
-func effectiveCanaryPlan(isvc *v1beta1.InferenceService) *v1beta1.GroupCanary {
-	g := v1beta1.EffectiveCanaryGroup(isvc)
+func effectiveCanaryPlan(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *v1beta1.GroupCanary {
+	g := rollout.CanaryGroupFor(isvc, component)
 	if g == nil {
 		return nil
 	}

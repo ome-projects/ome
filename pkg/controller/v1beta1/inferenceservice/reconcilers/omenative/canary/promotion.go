@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // isRollbackRequested reports whether the operator requested rollback via
@@ -179,7 +180,7 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 	default: // analysis.Inconclusive
 		if a.OnInconclusive != nil && *a.OnInconclusive == v1beta1.OnInconclusiveRollback {
 			dec = decRollback
-		} else if analysisStalled(cs, resolveReadyTimeout(in, effectiveCanaryPlan(in.ISVC)), in.Now) {
+		} else if analysisStalled(cs, resolveReadyTimeout(in, effectiveCanaryPlan(in.ISVC, in.Component)), in.Now) {
 			// A stall is terminal either way; RollbackOnStall reverts instead of
 			// parking, so an unreadable gate cannot leave the fleet split.
 			dec = decFailed
@@ -246,7 +247,7 @@ func toStatusMetricResults(mrs []analysis.MetricResult, now time.Time) []v1beta1
 // the advance is durable (syncPromotedThrough); until then the recorded value
 // keeps the lingering annotation inert (see shouldAdvanceManual).
 func advanceStep(in ReconcileInputs) {
-	cs := in.ISVC.Status.Canary
+	cs := rollout.CanaryStatusFor(&in.ISVC.Status, in.Component)
 	if v, ok := in.ISVC.Annotations[constants.RolloutPromoteAnnotation]; ok {
 		cs.PromotedThrough = v
 	}

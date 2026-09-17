@@ -2104,6 +2104,10 @@
           "description": "Autoscaler reports the per-Component autoscaler state — resolved Class / ManagedBy / SpecSource and (when ManagedBy == \"ome\") live CurrentReplicas / DesiredReplicas / LastScaleTime / Conditions mirrored from the underlying HPA or ScaledObject. Populated by the ISVC status writer for RawDeployment- and OMENative-managed Components. See ComponentAutoscalerStatus for the full field semantics.",
           "$ref": "#/definitions/v1beta1.ComponentAutoscalerStatus"
         },
+        "canary": {
+          "description": "Canary tracks the canary step machine for the unit this Component belongs to — the router alone, or engine+decoder together. It is written on the unit's entrypoint Component (the router, or the engine) and is absent on a secondary, so a reader never sees two copies of one run. Absent when the unit has no canary running.\n\nUnits advance independently, which is why the state cannot live in the single InferenceServiceStatus.Canary: two runs would overwrite each other's step counter and revision pair. That field is retained as an alias for the entrypoint unit's run so existing readers keep working.",
+          "$ref": "#/definitions/v1beta1.CanaryStatus"
+        },
         "latestReadyRevision": {
           "description": "LatestReadyRevision is the per-revision Service name (`\u003cisvc\u003e-\u003ccomponent\u003e-rev-\u003chash\u003e`) fronting the most recent revision whose pods reached Ready. Equal to LatestRolledoutRevision once the rollout completes; set ahead of it during in-flight rollouts.",
           "type": "string"
@@ -6575,11 +6579,15 @@
       }
     },
     "v1beta1.RolloutSpec": {
-      "description": "RolloutSpec is the single rollout surface for an InferenceService: an ordered list of rollout groups. There is no coordination-vs-canary fork — sequencing is the list order, and canary is one progression a group may choose.",
+      "description": "RolloutSpec is the single rollout surface for an InferenceService: a list of rollout groups. There is no coordination-vs-canary fork — canary is one progression a group may choose, and whether list order sequences the groups is GroupOrdering.",
       "type": "object",
       "properties": {
+        "groupOrdering": {
+          "description": "GroupOrdering declares what groups[] list order means. Sequential (the default) promises group N completes before group N+1 begins, and is admitted only for the shape that actually enforces it. Concurrent declares the groups independent: they roll at the same time on their disjoint Components, each with its own progression, gates, and rollback. Concurrent is what lets one InferenceService run, say, a router canary and an engine canary as unrelated rollouts.\n\nChanging this does not change how the engine executes a list it could not sequence — that was always concurrent. It changes whether such a list is an error or a declaration of intent.",
+          "type": "string"
+        },
         "groups": {
-          "description": "Groups is the ORDERED list of rollout groups. Sequence is the list position: group N reaches completion before group N+1 begins. Components listed together in one group roll together (a coupled unit); Components not listed in any group roll independently (the default). To roll Components one-at-a-time, put each in its own group, in order — a group needs only its components; the progression may be omitted and defaults to blueGreen.\n\nCross-group sequencing is enforced only for a run of single-Component blueGreen groups (the classic one-at-a-time shape). Admission rejects any other multi-group list — a rollingUpdate, canary, or multi-Component group in an ordered list would run concurrently, and an ordering the engine does not enforce is rejected rather than accepted. The rejection applies on create and on any update that changes spec.rollout, so stored objects keep reconciling until their rollout is next edited.\n\nOnly meaningful for OMENative-managed Components.",
+          "description": "Groups is the ORDERED list of rollout groups. Sequence is the list position: group N reaches completion before group N+1 begins. Components listed together in one group roll together (a coupled unit); Components not listed in any group roll independently (the default). To roll Components one-at-a-time, put each in its own group, in order — a group needs only its components; the progression may be omitted and defaults to blueGreen.\n\nCross-group sequencing is enforced only for a run of single-Component blueGreen groups (the classic one-at-a-time shape). Under the default groupOrdering: Sequential, admission rejects any other multi-group list — a rollingUpdate, canary, or multi-Component group in an ordered list would run concurrently, and an ordering the engine does not enforce is rejected rather than accepted. The rejection applies on create and on any update that changes spec.rollout, so stored objects keep reconciling until their rollout is next edited. Set groupOrdering: Concurrent to declare that the groups are independent and the list order promises nothing.\n\nOnly meaningful for OMENative-managed Components.",
           "type": "array",
           "items": {
             "default": {},

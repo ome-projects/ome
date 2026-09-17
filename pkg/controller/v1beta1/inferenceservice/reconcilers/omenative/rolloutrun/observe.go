@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
@@ -103,15 +104,29 @@ func primaryCanaryComponent(isvc *v1beta1.InferenceService) v1beta1.ComponentTyp
 		if groupKind(g) != v1beta1.RolloutProgressionCanary {
 			continue
 		}
-		for _, preferred := range []v1beta1.ComponentType{
-			v1beta1.RouterComponent,
-			v1beta1.EngineComponent,
-			v1beta1.DecoderComponent,
-		} {
-			for _, comp := range g.Components {
-				if comp == preferred {
-					return comp
-				}
+		if p := primaryOfGroup(g); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+// primaryOfGroup is the Component a group's step machine and traffic weight run
+// through: router > engine > decoder among the group's own members. A group
+// owns one canary unit, so this is that unit's entrypoint and the key its run
+// state is stored under.
+func primaryOfGroup(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
+	if g == nil {
+		return ""
+	}
+	for _, preferred := range []v1beta1.ComponentType{
+		v1beta1.RouterComponent,
+		v1beta1.EngineComponent,
+		v1beta1.DecoderComponent,
+	} {
+		for _, comp := range g.Components {
+			if comp == preferred {
+				return comp
 			}
 		}
 	}
@@ -124,17 +139,18 @@ func primaryCanaryComponent(isvc *v1beta1.InferenceService) v1beta1.ComponentTyp
 // current IR targets are still the rejected group; only then is it reconstructed.
 func stickyRejectHashes(isvc *v1beta1.InferenceService, targets map[v1beta1.ComponentType]targetPair) map[v1beta1.ComponentType]string {
 	rejected := map[v1beta1.ComponentType]string{}
-	if isvc.Status.Canary == nil || isvc.Status.Canary.RolledBackRevisionHash == "" {
-		return rejected
-	}
 	primary := primaryCanaryComponent(isvc)
 	if primary == "" {
+		return rejected
+	}
+	canaryStatus := rollout.CanaryStatusFor(&isvc.Status, primary)
+	if canaryStatus == nil || canaryStatus.RolledBackRevisionHash == "" {
 		return rejected
 	}
 	if isvc.Status.Rollout != nil {
 		if active := isvc.Status.Rollout.ActiveRun; active != nil {
 			for _, target := range active.TargetRevisions {
-				if target.Component == primary && target.Revision == isvc.Status.Canary.RolledBackRevisionHash {
+				if target.Component == primary && target.Revision == canaryStatus.RolledBackRevisionHash {
 					for _, member := range active.TargetRevisions {
 						rejected[member.Component] = member.Revision
 					}
@@ -144,7 +160,7 @@ func stickyRejectHashes(isvc *v1beta1.InferenceService, targets map[v1beta1.Comp
 		}
 		if last := isvc.Status.Rollout.LastRun; last != nil && last.Outcome == v1beta1.RolloutRunRolledBack {
 			for _, target := range last.TargetRevisions {
-				if target.Component == primary && target.Revision == isvc.Status.Canary.RolledBackRevisionHash {
+				if target.Component == primary && target.Revision == canaryStatus.RolledBackRevisionHash {
 					for _, member := range last.TargetRevisions {
 						rejected[member.Component] = member.Revision
 					}
@@ -153,8 +169,8 @@ func stickyRejectHashes(isvc *v1beta1.InferenceService, targets map[v1beta1.Comp
 			}
 		}
 	}
-	rejected[primary] = isvc.Status.Canary.RolledBackRevisionHash
-	if targets[primary].target != isvc.Status.Canary.RolledBackRevisionHash {
+	rejected[primary] = canaryStatus.RolledBackRevisionHash
+	if targets[primary].target != canaryStatus.RolledBackRevisionHash {
 		return rejected
 	}
 	for gi := range isvc.Spec.Rollout.Groups {
@@ -214,8 +230,11 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 // opens around an already-done canary just closes Completed on the next
 // pass — harmless).
 func canaryMidFlight(isvc *v1beta1.InferenceService) bool {
-	cs := isvc.Status.Canary
-	if cs == nil || cs.RolledBackRevisionHash != "" || isvc.Spec.Rollout == nil {
+	if isvc == nil || isvc.Spec.Rollout == nil {
+		return false
+	}
+	cs := rollout.CanaryStatusFor(&isvc.Status, primaryCanaryComponent(isvc))
+	if cs == nil || cs.RolledBackRevisionHash != "" {
 		return false
 	}
 	for gi := range isvc.Spec.Rollout.Groups {

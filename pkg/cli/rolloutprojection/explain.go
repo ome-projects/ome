@@ -15,6 +15,7 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	omerollout "sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -280,7 +281,7 @@ func (b *explainProjector) projectEffectiveGroups() {
 		return
 	}
 	effectiveSpec := b.isvc.Spec
-	effectiveSpec.Rollout = omev1beta1.EffectiveRollout(b.isvc)
+	effectiveSpec.Rollout = omerollout.Effective(b.isvc)
 	if !validStoredRolloutSpec(&effectiveSpec) {
 		b.addIssue(
 			reportv1alpha1.RolloutExplainIssueActiveRunMalformed,

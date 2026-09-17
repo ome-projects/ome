@@ -176,6 +176,19 @@ type ComponentStatusSpec struct {
 	// +listMapKey=revisionName
 	Traffic []ComponentTrafficTarget `json:"traffic,omitempty"`
 
+	// Canary tracks the canary step machine for the unit this Component
+	// belongs to — the router alone, or engine+decoder together. It is
+	// written on the unit's entrypoint Component (the router, or the engine)
+	// and is absent on a secondary, so a reader never sees two copies of one
+	// run. Absent when the unit has no canary running.
+	//
+	// Units advance independently, which is why the state cannot live in the
+	// single InferenceServiceStatus.Canary: two runs would overwrite each
+	// other's step counter and revision pair. That field is retained as an
+	// alias for the entrypoint unit's run so existing readers keep working.
+	// +optional
+	Canary *CanaryStatus `json:"canary,omitempty"`
+
 	// Autoscaler reports the per-Component autoscaler state — resolved
 	// Class / ManagedBy / SpecSource and (when ManagedBy == "ome") live
 	// CurrentReplicas / DesiredReplicas / LastScaleTime / Conditions

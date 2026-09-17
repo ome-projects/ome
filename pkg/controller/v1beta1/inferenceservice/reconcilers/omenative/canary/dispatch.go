@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
@@ -59,6 +60,10 @@ type DispatchDeps struct {
 	// The per-revision routing Service publishes the port resolved from this set
 	// so it targets the port the pods actually listen on.
 	ComponentRunnerPorts map[v1beta1.ComponentType][]corev1.ContainerPort
+	// Group is the canary group this dispatch drives. One group owns one canary
+	// unit -- the router, or engine+decoder -- so concurrent dispatches touch
+	// disjoint Components and cannot contend for a revision or step counter.
+	Group *v1beta1.RolloutGroup
 }
 
 // Dispatch runs the canary step machine for an InferenceService, mutating
@@ -70,10 +75,10 @@ type DispatchDeps struct {
 //
 // No-op (requeue 0) when no canary plan is set.
 func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
-	if v1beta1.EffectiveCanaryGroup(d.ISVC) == nil {
+	if d.Group == nil || d.Group.Canary == nil {
 		return 0, nil
 	}
-	primary := primaryComponent(d.ISVC)
+	primary := primaryComponentOf(d.Group)
 	if primary == "" {
 		return 0, nil
 	}
@@ -84,7 +89,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 	// gate; IR runner topology groups those Pods into complete Instances.
 	// d.Reader is the live API reader (no Pod field index) — useIndex=false skips
 	// the doomed MatchingFields probe and goes straight to the label-selector List.
-	perRev, readyRev, routingRev, observedPods, err := coordination.ObservePerRevisionPods(ctx, d.Reader, d.ISVC, configuredComponents(d.ISVC), false)
+	perRev, readyRev, routingRev, observedPods, err := coordination.ObservePerRevisionPods(ctx, d.Reader, d.ISVC, configuredComponents(d.Group), false)
 	if err != nil {
 		return 0, err
 	}
@@ -102,7 +107,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 	// Components, so the canary engine is their sole producer; ensuring only the
 	// primary's would leave a secondary's per-revision Service dangling. Mirrors
 	// coordination's per-Component ensure+GC loop.
-	for _, comp := range configuredComponents(d.ISVC) {
+	for _, comp := range configuredComponents(d.Group) {
 		// Ensure runs EVERY reconcile — it is the self-heal path. A
 		// per-revision Service deleted out-of-band must be recreated even
 		// when the live revision-hash set is unchanged; EnsurePerRevisionServices
@@ -140,7 +145,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 	// new target. Wait for that revision pair so their roles cannot be inverted.
 	if revisions.fromIR && revisions.currentHash != "" && revisions.currentHash == canaryHash &&
 		otherRevision(pods, canaryHash) != "" &&
-		(d.ISVC.Status.Canary == nil || d.ISVC.Status.Canary.StableRevisionHash == "") {
+		(rollout.CanaryStatusFor(&d.ISVC.Status, primary) == nil || rollout.CanaryStatusFor(&d.ISVC.Status, primary).StableRevisionHash == "") {
 		return reconcileRequeue, nil
 	}
 
@@ -149,7 +154,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 		now = time.Now()
 	}
 
-	secondaryReady, secondaryFresh, err := secondaryCapacityReady(ctx, d.Reader, d.ISVC, perRev, readyRev, observedPods, primary)
+	secondaryReady, secondaryFresh, err := secondaryCapacityReady(ctx, d.Reader, d.ISVC, perRev, readyRev, observedPods, primary, d.Group)
 	if err != nil {
 		return 0, err
 	}
@@ -163,7 +168,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 		if revisions.currentHash != canaryHash {
 			stableHash = revisions.currentHash
 		}
-		if sc := d.ISVC.Status.Canary; sc != nil && sc.StableRevisionHash != "" {
+		if sc := rollout.CanaryStatusFor(&d.ISVC.Status, primary); sc != nil && sc.StableRevisionHash != "" {
 			// A distinct authoritative current revision can repair an active canary
 			// whose persisted stable and target identities are the same.
 			if revisions.fromIR && revisions.currentHash != "" && revisions.currentHash != canaryHash && sc.StableRevisionHash == canaryHash {
@@ -189,6 +194,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 		Client:                   d.Client,
 		Reader:                   d.Reader,
 		ISVC:                     d.ISVC,
+		Group:                    d.Group,
 		Component:                primary,
 		CanaryRevisionHash:       canaryHash,
 		StableRevisionHash:       stableHash,
@@ -200,11 +206,11 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 		SecondaryCapacityReady:   secondaryReady,
 		Now:                      now,
 		Sampler:                  samplerOrNil(d.Sampler),
-		Prometheus:               resolveCanarySource(d.ISVC, d.MetricProviders, d.DefaultProvider),
+		Prometheus:               resolveCanarySource(d.Group, d.MetricProviders, d.DefaultProvider),
 		BundledPrometheusAddress: d.BundledPrometheusAddress,
 		QueryTimeout:             d.QueryTimeout,
 		RunActive:                v1beta1.RolloutRunActive(d.ISVC),
-		TargetID:                 activeCanaryTargetID(d.ISVC),
+		TargetID:                 activeCanaryTargetID(d.ISVC, d.Group),
 		DefaultReadyTimeout:      d.DefaultReadyTimeout,
 	})
 	if err != nil {
@@ -218,7 +224,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 	// stages capacity on all group Components, so a PD rollback must revert all of
 	// them — signaling only the primary leaves the engine/decoder serving the
 	// rejected revision behind the rolled-back router.
-	for _, comp := range configuredComponents(d.ISVC) {
+	for _, comp := range configuredComponents(d.Group) {
 		persistedStable := componentStableRevisionHash(d.ISVC, comp, primary)
 		if err := reconcileRollbackSignal(ctx, d.Client, d.Reader, d.ISVC, comp, persistedStable, res.RolledBack); err != nil {
 			return 0, err
@@ -338,8 +344,8 @@ func componentStableRevisionHash(isvc *v1beta1.InferenceService, comp, primary v
 			}
 		}
 	}
-	if comp == primary && isvc.Status.Canary != nil && isvc.Status.Canary.StableRevisionHash != "" {
-		return isvc.Status.Canary.StableRevisionHash
+	if cs := rollout.CanaryStatusFor(&isvc.Status, primary); comp == primary && cs != nil && cs.StableRevisionHash != "" {
+		return cs.StableRevisionHash
 	}
 	if status, ok := isvc.Status.Components[comp]; ok {
 		return query.RevisionFromName(status.LatestRolledoutRevision).Hash()
@@ -371,8 +377,7 @@ func samplerOrNil(s *Sampler) stepSampler {
 // named, else to nil (the sampler's BundledPrometheusAddress fallback). An
 // unbound providerRef mid-run yields an empty source — inconclusive samples,
 // never an un-gated step.
-func resolveCanarySource(isvc *v1beta1.InferenceService, providers map[string]controllerconfig.MetricProviderBinding, defaultProvider string) *v1beta1.AnalysisPrometheus {
-	g := v1beta1.EffectiveCanaryGroup(isvc)
+func resolveCanarySource(g *v1beta1.RolloutGroup, providers map[string]controllerconfig.MetricProviderBinding, defaultProvider string) *v1beta1.AnalysisPrometheus {
 	if g == nil || g.Canary == nil {
 		return nil
 	}
@@ -421,8 +426,7 @@ func bindingSource(b controllerconfig.MetricProviderBinding, overlay *v1beta1.An
 // (router>engine>decoder); the capacity gate observes EVERY Component in the
 // group, so a PD pair stages capacity on engine+decoder together before traffic
 // shifts (the secondaryCapacityReady gate).
-func configuredComponents(isvc *v1beta1.InferenceService) []v1beta1.ComponentType {
-	g := v1beta1.EffectiveCanaryGroup(isvc)
+func configuredComponents(g *v1beta1.RolloutGroup) []v1beta1.ComponentType {
 	if g == nil {
 		return nil
 	}
@@ -445,15 +449,14 @@ func configuredComponents(isvc *v1beta1.InferenceService) []v1beta1.ComponentTyp
 // IR runner topology provides the gang-safe ready Instance count. readyPerRev
 // keeps ready Pods as a required capacity signal. perRev detects a live peer
 // revision while an equal current/target pair settles.
-func secondaryCapacityReady(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, perRev, readyPerRev map[v1beta1.ComponentType]map[string]int32, observedPods map[v1beta1.ComponentType][]*corev1.Pod, primary v1beta1.ComponentType) (bool, bool, error) {
-	g := v1beta1.EffectiveCanaryGroup(isvc)
+func secondaryCapacityReady(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, perRev, readyPerRev map[v1beta1.ComponentType]map[string]int32, observedPods map[v1beta1.ComponentType][]*corev1.Pod, primary v1beta1.ComponentType, g *v1beta1.RolloutGroup) (bool, bool, error) {
 	if g == nil || g.Canary == nil || len(g.Canary.Steps) == 0 {
 		return true, true, nil
 	}
 	plan := g.Canary
 	idx := int32(0)
-	if isvc.Status.Canary != nil {
-		idx = isvc.Status.Canary.CurrentStep
+	if cs := rollout.CanaryStatusFor(&isvc.Status, primary); cs != nil {
+		idx = cs.CurrentStep
 	}
 	if idx < 0 {
 		idx = 0
@@ -462,7 +465,7 @@ func secondaryCapacityReady(ctx context.Context, reads client.Reader, isvc *v1be
 		idx = int32(len(plan.Steps) - 1)
 	}
 	step := plan.Steps[idx]
-	for _, c := range configuredComponents(isvc) {
+	for _, c := range configuredComponents(g) {
 		if c == primary {
 			continue
 		}
@@ -614,8 +617,7 @@ func observeCanaryRevisions(ctx context.Context, reads client.Reader, isvc *v1be
 // step machine + traffic weight through: router > engine > decoder, among the
 // group's Components. Secondary Components (a PD pair's engine/decoder) stage
 // capacity and gate the step but don't carry the external traffic weight.
-func primaryComponent(isvc *v1beta1.InferenceService) v1beta1.ComponentType {
-	g := v1beta1.EffectiveCanaryGroup(isvc)
+func primaryComponentOf(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
 	if g == nil || len(g.Components) == 0 {
 		return ""
 	}

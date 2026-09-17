@@ -6,6 +6,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // GateContext caches the per-(ISVC, Component) prelude work shared by
@@ -121,7 +122,7 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 			Reads:      reads,
 		}
 	}
-	groups := ResolveGroups(v1beta1.EffectiveRollout(isvc), defaults)
+	groups := ResolveGroups(rollout.Effective(isvc), defaults)
 	if len(groups) == 0 {
 		return GateContext{
 			ISVC:         isvc,

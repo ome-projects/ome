@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // ReasonCanaryInvalid is the admission rejection reason for a malformed canary
@@ -20,13 +21,11 @@ const ReasonCanaryInvalid = "CanaryInvalid"
 // constructs — so other deployment modes would silently wedge at Pending.
 const ReasonCanaryRequiresOMENative = "CanaryRequiresOMENative"
 
-// ReasonMultipleCanaryGroups is the rejection reason for a spec.rollout that
-// declares more than one canary group. The canary engine drives a single group
-// (the dispatcher resolves it via GetCanaryGroup, which returns the first);
-// additional canary groups are executed by neither engine and would roll
-// ungated. Sequenced multi-group canary
-// needs the cross-group sequencer that does not exist yet, so admission rejects
-// the shape rather than silently mis-executing all but the first group.
+// ReasonMultipleCanaryGroups is the rejection reason for a spec.rollout whose
+// canary groups overlap on a unit. Independent units may each carry a run, but
+// two runs driving one unit would contend for its revision, step counter and
+// traffic entry, and a duplicate traffic entry fails apiserver validation for
+// the entire status write.
 const ReasonMultipleCanaryGroups = "MultipleCanaryGroups"
 
 // ReasonAnalysisInvalid is the rejection reason for a malformed metric-gated step
@@ -60,15 +59,24 @@ func ValidateCanary(spec *v1beta1.InferenceServiceSpec) error {
 	groups := spec.GetRolloutGroups()
 	modeFor := omenativeDeploymentModeMap(spec)
 	declared := declaredComponents(spec)
-	canaryGroups := 0
+	// One canary run per unit. Two canary groups may coexist — a router run and
+	// an engine run advance independently on disjoint Components — but two runs
+	// driving the same unit would each believe they own its revision and step
+	// counter, and would fight over status.components[c].traffic. A duplicate
+	// entry there fails apiserver validation for the whole status write, which
+	// freezes every subsequent reconcile for the InferenceService.
+	ownerOf := map[v1beta1.ComponentType]int{}
 	for gi := range groups {
-		if rolloutGroupKind(&groups[gi]) == v1beta1.RolloutProgressionCanary {
-			canaryGroups++
+		if rolloutGroupKind(&groups[gi]) != v1beta1.RolloutProgressionCanary {
+			continue
 		}
-	}
-	if canaryGroups > 1 {
-		return fmt.Errorf("spec.rollout.groups declares %d canary groups; only one is supported — the canary engine drives a single group and the others would roll ungated (%s)",
-			canaryGroups, ReasonMultipleCanaryGroups)
+		for _, u := range rollout.CanaryUnitsOf(&groups[gi]) {
+			if prev, taken := ownerOf[u]; taken {
+				return fmt.Errorf("spec.rollout.groups: canary unit %q is driven by both groups[%d] and groups[%d]; a unit may have at most one canary run (%s)",
+					u, prev, gi, ReasonMultipleCanaryGroups)
+			}
+			ownerOf[u] = gi
+		}
 	}
 	for gi := range groups {
 		g := &groups[gi]
@@ -97,23 +105,38 @@ func ValidateCanary(spec *v1beta1.InferenceServiceSpec) error {
 					gi, comp, m, ReasonCanaryRequiresOMENative)
 			}
 		}
-		// A canary group must contain the ISVC's external entrypoint (router if
-		// present, else engine). primaryComponent picks the entrypoint *within the
-		// group* and the engine writes the stepped traffic onto its Service, but
-		// external requests enter through the ISVC entrypoint. A canary group that
-		// omits it shifts traffic on an internal Service only, so the operator's
-		// steps never move real traffic.
-		entry := canaryEntrypoint(spec)
-		hasEntry := false
+		// A canary group must contain the entrypoint of every unit it touches:
+		// the router for the router unit, the engine for the engine unit. The
+		// unit entrypoint is what primaryComponent drives the step machine and
+		// traffic weight through, so a group that stages a secondary without its
+		// entrypoint has no Component carrying the roll.
+		//
+		// An engine unit moves real traffic without owning the external
+		// entrypoint: the router discovers engine endpoints by label selector
+		// with no revision term, so a step that puts a fraction of engine
+		// replicas on the new revision moves roughly that fraction of requests.
+		// The split is capacity-driven and mediated by the router's balancing
+		// rather than exact, which is why capacity — not traffic — is the
+		// contract for a non-entrypoint unit.
+		has := map[v1beta1.ComponentType]bool{}
 		for _, comp := range g.Components {
-			if comp == entry {
-				hasEntry = true
-				break
+			has[comp] = true
+		}
+		for _, u := range rollout.CanaryUnitsOf(g) {
+			if !has[u] {
+				return fmt.Errorf("spec.rollout.groups[%d]: a canary group covering the %q unit must include its entrypoint Component %q — that is what the step machine and traffic weight are driven through (%s)",
+					gi, u, u, ReasonCanaryInvalid)
 			}
 		}
-		if !hasEntry {
-			return fmt.Errorf("spec.rollout.groups[%d]: a canary group must include the entrypoint component %q — external traffic routes through it, so a group without it only shifts traffic on an internal Service (%s)",
-				gi, entry, ReasonCanaryInvalid)
+		// The engine unit is engine+decoder whenever the ISVC declares both.
+		// Splitting the pair across a canary boundary can leave a new-protocol
+		// prefill with no pairable decode, which fails requests outright.
+		_, hasEngineSpec := declared[v1beta1.EngineComponent]
+		_, hasDecoderSpec := declared[v1beta1.DecoderComponent]
+		if hasEngineSpec && hasDecoderSpec &&
+			has[v1beta1.EngineComponent] != has[v1beta1.DecoderComponent] {
+			return fmt.Errorf("spec.rollout.groups[%d]: this InferenceService declares both engine and decoder, so a canary group naming either must name both — they roll as one unit (%s)",
+				gi, ReasonCanaryInvalid)
 		}
 		// MaintainRatio is silently ignored by the canary engine (it gates only
 		// coordination-style pacing). Reject rather than no-op so an operator is not
@@ -267,15 +290,4 @@ func parseCanaryCapacity(c intstr.IntOrString) (value int, isPercent bool, err e
 		return 0, true, fmt.Errorf("capacity %q must not exceed 100%% (capacity is a fraction of desired replicas)", raw)
 	}
 	return n, true, nil
-}
-
-// canaryEntrypoint returns the ISVC's external entrypoint Component, mirroring
-// DetermineEntrypointComponent: the router when declared, else the engine. The
-// canary group must contain it (see ValidateCanary) so the stepped traffic lands
-// on the Service that actually fronts external requests.
-func canaryEntrypoint(spec *v1beta1.InferenceServiceSpec) v1beta1.ComponentType {
-	if spec != nil && spec.Router != nil {
-		return v1beta1.RouterComponent
-	}
-	return v1beta1.EngineComponent
 }

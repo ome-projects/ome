@@ -986,3 +986,146 @@ func omeNativeEngineOnlySpec() *v1beta1.InferenceServiceSpec {
 		},
 	}
 }
+
+// ---------------------------------------------------------------------------
+// groupOrdering: Concurrent — the opt-out from the cross-group ordering promise
+// ---------------------------------------------------------------------------
+
+// The shape this whole field exists for: a router canary and an engine canary
+// on one InferenceService, rolling as unrelated rollouts.
+func TestValidateRolloutOrderingEnforced_ConcurrentAdmitsIndependentCanaryGroups(t *testing.T) {
+	spec := omeNativePDSpec()
+	spec.Router = &v1beta1.RouterSpec{}
+	spec.Rollout = &v1beta1.RolloutSpec{
+		GroupOrdering: ptr.To(v1beta1.RolloutGroupOrderingConcurrent),
+		Groups: []v1beta1.RolloutGroup{
+			{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: &v1beta1.GroupCanary{}},
+			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: &v1beta1.GroupCanary{}},
+		},
+	}
+	if err := ValidateRolloutOrderingEnforced(spec); err != nil {
+		t.Errorf("Concurrent must admit two independent canary groups: %v", err)
+	}
+}
+
+// Every shape Sequential rejects is admitted under Concurrent, because none of
+// them was ever going to be sequenced.
+func TestValidateRolloutOrderingEnforced_ConcurrentAdmitsEveryUnsequenceableShape(t *testing.T) {
+	cases := map[string][]v1beta1.RolloutGroup{
+		"blueGreen then rollingUpdate": {
+			{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
+			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+		},
+		"rollingUpdate then canary": {
+			{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: &v1beta1.GroupCanary{}},
+		},
+		"multi-Component group in list": {
+			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
+			{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
+		},
+	}
+	for name, groups := range cases {
+		spec := omeNativePDSpec()
+		spec.Router = &v1beta1.RouterSpec{}
+		spec.Rollout = &v1beta1.RolloutSpec{GroupOrdering: ptr.To(v1beta1.RolloutGroupOrderingConcurrent), Groups: groups}
+		if err := ValidateRolloutOrderingEnforced(spec); err != nil {
+			t.Errorf("%s under Concurrent: unexpected error %v", name, err)
+		}
+	}
+}
+
+// Concurrent relaxes ONLY the cross-group ordering rule. Order is dead
+// configuration under either value and stays rejected, as do the cross-group
+// structural rules that are not about sequencing.
+func TestValidateRolloutOrderingEnforced_ConcurrentStillRejectsOrder(t *testing.T) {
+	spec := omeNativePDSpec()
+	spec.Router = &v1beta1.RouterSpec{}
+	spec.Rollout = &v1beta1.RolloutSpec{
+		GroupOrdering: ptr.To(v1beta1.RolloutGroupOrderingConcurrent),
+		Groups: []v1beta1.RolloutGroup{
+			{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
+				Order:      []v1beta1.ComponentType{v1beta1.EngineComponent},
+				Canary:     &v1beta1.GroupCanary{},
+			},
+			{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: &v1beta1.GroupCanary{}},
+		},
+	}
+	err := ValidateRolloutOrderingEnforced(spec)
+	if err == nil || !strings.Contains(err.Error(), ReasonOrderNotHonored) {
+		t.Errorf("Concurrent must not excuse order: got %v want %s", err, ReasonOrderNotHonored)
+	}
+}
+
+// Absent and explicit-Sequential must behave identically, so an object stored
+// before the field existed keeps its original meaning.
+func TestValidateRolloutOrderingEnforced_UnsetMatchesSequential(t *testing.T) {
+	groups := []v1beta1.RolloutGroup{
+		{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: &v1beta1.GroupCanary{}},
+		{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: &v1beta1.GroupCanary{}},
+	}
+	for name, ordering := range map[string]*v1beta1.RolloutGroupOrdering{
+		"unset":               nil,
+		"explicit Sequential": ptr.To(v1beta1.RolloutGroupOrderingSequential),
+	} {
+		spec := omeNativePDSpec()
+		spec.Router = &v1beta1.RouterSpec{}
+		spec.Rollout = &v1beta1.RolloutSpec{GroupOrdering: ordering, Groups: groups}
+		err := ValidateRolloutOrderingEnforced(spec)
+		if err == nil || !strings.Contains(err.Error(), ReasonGroupOrderingNotHonored) {
+			t.Errorf("%s: got %v want %s", name, err, ReasonGroupOrderingNotHonored)
+		}
+	}
+}
+
+// The rejection must point at the escape hatch, or an operator has no way to
+// discover it from the error alone.
+func TestValidateRolloutOrderingEnforced_ErrorNamesTheEscapeHatch(t *testing.T) {
+	spec := omeNativePDSpec()
+	spec.Router = &v1beta1.RouterSpec{}
+	spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{
+		{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: &v1beta1.GroupCanary{}},
+		{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: &v1beta1.GroupCanary{}},
+	}}
+	err := ValidateRolloutOrderingEnforced(spec)
+	if err == nil || !strings.Contains(err.Error(), "groupOrdering: Concurrent") {
+		t.Errorf("error must name groupOrdering: Concurrent, got %v", err)
+	}
+}
+
+// The update ratchet must carry the relaxation too: flipping an admitted
+// Sequential list to Concurrent is itself a rollout edit.
+func TestValidateRolloutOrderingEnforcedUpdate_SequentialToConcurrent(t *testing.T) {
+	oldSpec := omeNativePDSpec()
+	oldSpec.Router = &v1beta1.RouterSpec{}
+	oldSpec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{
+		{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
+		{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
+	}}
+	newSpec := omeNativePDSpec()
+	newSpec.Router = &v1beta1.RouterSpec{}
+	newSpec.Rollout = &v1beta1.RolloutSpec{
+		GroupOrdering: ptr.To(v1beta1.RolloutGroupOrderingConcurrent),
+		Groups: []v1beta1.RolloutGroup{
+			{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: &v1beta1.GroupCanary{}},
+			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: &v1beta1.GroupCanary{}},
+		},
+	}
+	if err := ValidateRolloutOrderingEnforcedUpdate(oldSpec, newSpec); err != nil {
+		t.Errorf("Sequential blueGreen -> Concurrent canary must be admitted: %v", err)
+	}
+	// Going back is fine when the groups go back too: a run of single-Component
+	// blueGreen groups is the one shape Sequential really enforces.
+	if err := ValidateRolloutOrderingEnforcedUpdate(newSpec, oldSpec); err != nil {
+		t.Errorf("Concurrent canary -> Sequential blueGreen must be admitted: %v", err)
+	}
+	// Clearing the declaration while KEEPING the canary groups re-imposes a
+	// promise they cannot keep, so it is rejected.
+	regressed := newSpec.DeepCopy()
+	regressed.Rollout.GroupOrdering = nil
+	err := ValidateRolloutOrderingEnforcedUpdate(newSpec, regressed)
+	if err == nil || !strings.Contains(err.Error(), ReasonGroupOrderingNotHonored) {
+		t.Errorf("clearing Concurrent on a canary list must be rejected: got %v", err)
+	}
+}

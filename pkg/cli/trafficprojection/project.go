@@ -20,6 +20,7 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/canaryevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	omerollout "sigs.k8s.io/ome/pkg/rollout"
 )
 
 const (
@@ -376,7 +377,7 @@ func (b *projector) projectEndpoints() {
 }
 
 func (b *projector) projectCanary() {
-	rollout := omev1beta1.EffectiveRollout(b.isvc)
+	rollout := omerollout.Effective(b.isvc)
 	var group *omev1beta1.RolloutGroup
 	if rollout != nil {
 		for i := range rollout.Groups {

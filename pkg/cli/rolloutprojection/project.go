@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/canaryevidence"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	omerollout "sigs.k8s.io/ome/pkg/rollout"
 	omevalidation "sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -56,7 +57,7 @@ func Project(
 	// Validate and project one rollout view: the active run's pinned plan when
 	// present, including an intentionally empty plan, and the live spec otherwise.
 	effectiveSpec := isvc.Spec
-	effectiveSpec.Rollout = omev1beta1.EffectiveRollout(isvc)
+	effectiveSpec.Rollout = omerollout.Effective(isvc)
 	b := projector{
 		isvc:          isvc,
 		effectiveSpec: &effectiveSpec,

@@ -310,7 +310,7 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 			entered := metav1.NewTime(time.Date(2026, time.September, 14, 16, 45, 0, 0, time.UTC))
 			pinned := metav1.NewTime(time.Date(2026, time.September, 14, 16, 50, 0, 0, time.UTC))
 			oldGroup := omev1beta1.RolloutGroup{
-				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent, omev1beta1.DecoderComponent},
 				Canary: &omev1beta1.GroupCanary{Steps: []omev1beta1.RolloutGroupStep{
 					{Capacity: intstr.FromString("25%"), Traffic: 20},
 					{Capacity: intstr.FromString("50%"), Traffic: 50},
@@ -320,7 +320,7 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 			oldDigest, digestErr := rolloutpolicy.ProgressionDigest(&oldGroup)
 			require.NoError(t, digestErr)
 			pinnedGroup := omev1beta1.RolloutGroup{
-				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent, omev1beta1.DecoderComponent},
 				Canary:     &omev1beta1.GroupCanary{Steps: pinnedSteps},
 			}
 			pinnedDigest, digestErr := rolloutpolicy.ProgressionDigest(&pinnedGroup)
@@ -352,9 +352,10 @@ func TestPausedNonRaisingRepinBoundaryRequiresBoundEpoch(t *testing.T) {
 					},
 					Rollout: &omev1beta1.RolloutStatus{ActiveRun: &omev1beta1.RolloutRun{
 						RunID: "chat-" + rolloutpolicy.ShortHash([]byte(runIdentity)), OpenedAt: opened, PinnedAt: pinned,
-						TargetRevisions: []omev1beta1.RolloutRunTarget{{
-							Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb",
-						}},
+						TargetRevisions: []omev1beta1.RolloutRunTarget{
+							{Component: omev1beta1.EngineComponent, Revision: "bbbbbbbb"},
+							{Component: omev1beta1.DecoderComponent, Revision: "cccccccc"},
+						},
 						Plan: omev1beta1.RolloutRunPlan{Groups: []omev1beta1.RolloutRunGroup{{
 							Source:         omev1beta1.RolloutPlanSourceInline,
 							PortableDigest: pinnedDigest,

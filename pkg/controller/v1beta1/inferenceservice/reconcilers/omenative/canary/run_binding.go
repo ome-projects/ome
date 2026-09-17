@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
@@ -14,30 +15,31 @@ const canaryTargetIDPrefix = "ct1:"
 // legacy in-flight state to an adopted run without restarting it. The controller
 // calls this before its immediate run-boundary status write so the pinned plan
 // and the corresponding step state become visible atomically.
-func BindRun(isvc *v1beta1.InferenceService, adopting bool) {
+func BindRun(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, adopting bool) {
 	if isvc == nil || isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
 		return
 	}
-	targetID := activeCanaryTargetID(isvc)
+	targetID := activeCanaryTargetID(isvc, g)
 	if targetID == "" {
 		return
 	}
+	primary := primaryComponentOf(g)
 	if adopting {
-		if isvc.Status.Canary != nil && isvc.Status.Canary.TargetID == "" {
-			isvc.Status.Canary.TargetID = targetID
+		if cs := rollout.CanaryStatusFor(&isvc.Status, primary); cs != nil && cs.TargetID == "" {
+			cs.TargetID = targetID
 		}
 		return
 	}
 
-	primary := primaryComponent(isvc)
 	target, ok := activeRunTarget(isvc, primary)
 	if !ok || target.Revision == "" {
 		return
 	}
-	if isvc.Status.Canary == nil {
-		isvc.Status.Canary = &v1beta1.CanaryStatus{}
+	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
+	if cs == nil {
+		cs = &v1beta1.CanaryStatus{}
 	}
-	cs := isvc.Status.Canary
+	rollout.SetCanaryStatusFor(&isvc.Status, primary, cs)
 	resetCanaryStatus(cs, targetID, target.Revision, isvc.Status.Rollout.ActiveRun.OpenedAt.Time)
 	if target.StableRevision != "" {
 		cs.StableRevisionHash = target.StableRevision
@@ -47,11 +49,10 @@ func BindRun(isvc *v1beta1.InferenceService, adopting bool) {
 // activeCanaryTargetID fingerprints only the canary group's Component targets.
 // The whole-run ID also changes when another group retargets; using it here
 // would violate the per-group reset contract.
-func activeCanaryTargetID(isvc *v1beta1.InferenceService) string {
+func activeCanaryTargetID(isvc *v1beta1.InferenceService, group *v1beta1.RolloutGroup) string {
 	if isvc == nil || isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
 		return ""
 	}
-	group := v1beta1.EffectiveCanaryGroup(isvc)
 	if group == nil {
 		return ""
 	}

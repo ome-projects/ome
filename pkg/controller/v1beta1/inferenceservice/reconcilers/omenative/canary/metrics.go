@@ -11,6 +11,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // Every per-ISVC vector carries both a "namespace" and an "isvc" label so
@@ -151,7 +152,7 @@ func recordDispatch(rec record.EventRecorder, isvc *v1beta1.InferenceService, c 
 	}
 	// A completed canary keeps its status at the done sentinel (CurrentStep ==
 	// len(steps)), so the step/weight gauges + step Event read live status here.
-	cs := isvc.Status.Canary
+	cs := rollout.CanaryStatusFor(&isvc.Status, c)
 	phase := isvc.Status.Components[c].RolloutPhase
 	canaryPhaseTotal.WithLabelValues(isvc.Namespace, isvc.Name, string(phase)).Inc()
 	if cs != nil {

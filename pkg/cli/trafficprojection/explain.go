@@ -7,6 +7,7 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	omerollout "sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -567,7 +568,7 @@ func computedTrafficSource(freshness reportv1alpha1.TrafficFreshness) reportv1al
 }
 
 func hasDeclaredCanary(isvc *omev1beta1.InferenceService) bool {
-	rollout := omev1beta1.EffectiveRollout(isvc)
+	rollout := omerollout.Effective(isvc)
 	if rollout == nil {
 		return false
 	}
@@ -580,7 +581,7 @@ func hasDeclaredCanary(isvc *omev1beta1.InferenceService) bool {
 }
 
 func hasCanaryAllocationIssue(isvc *omev1beta1.InferenceService, issues []reportv1alpha1.TrafficIssue) bool {
-	rollout := omev1beta1.EffectiveRollout(isvc)
+	rollout := omerollout.Effective(isvc)
 	if rollout == nil {
 		return false
 	}

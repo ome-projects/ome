@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 func canaryRunFixture() *v1beta1.InferenceService {
@@ -33,18 +34,18 @@ func canaryRunFixture() *v1beta1.InferenceService {
 
 func TestActiveCanaryTargetIDIsGroupScoped(t *testing.T) {
 	isvc := canaryRunFixture()
-	want := activeCanaryTargetID(isvc)
+	want := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc))
 	if want == "" {
 		t.Fatal("target ID must be populated")
 	}
 
 	isvc.Status.Rollout.ActiveRun.TargetRevisions[2].Revision = "decoder-b"
-	if got := activeCanaryTargetID(isvc); got != want {
+	if got := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc)); got != want {
 		t.Fatalf("unrelated target changed canary identity: %q -> %q", want, got)
 	}
 
 	isvc.Status.Rollout.ActiveRun.TargetRevisions[1].Revision = "engine-c"
-	if got := activeCanaryTargetID(isvc); got == want {
+	if got := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc)); got == want {
 		t.Fatalf("canary-group target change did not change identity: %q", got)
 	}
 }
@@ -59,7 +60,7 @@ func TestBindRunAtomicallyResetsFreshRun(t *testing.T) {
 		RolledBackRevisionHash: "router-rejected",
 	}
 
-	BindRun(isvc, false)
+	BindRun(isvc, rollout.CanaryGroup(isvc), false)
 	cs := isvc.Status.Canary
 	if cs.TargetID == "" || cs.TargetID == "old-target" {
 		t.Fatalf("fresh run target ID was not bound: %+v", cs)
@@ -83,7 +84,7 @@ func TestBindRunAdoptsWithoutRestart(t *testing.T) {
 		CurrentStep:        1,
 	}
 
-	BindRun(isvc, true)
+	BindRun(isvc, rollout.CanaryGroup(isvc), true)
 	cs := isvc.Status.Canary
 	if cs.TargetID == "" {
 		t.Fatal("adopted state must be bound to the canary target set")

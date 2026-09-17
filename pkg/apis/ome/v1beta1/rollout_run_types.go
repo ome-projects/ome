@@ -250,37 +250,6 @@ func RolloutRunActive(isvc *InferenceService) bool {
 	return isvc != nil && isvc.Status.Rollout != nil && isvc.Status.Rollout.ActiveRun != nil
 }
 
-// EffectiveRollout returns the rollout view executors must consume: the
-// pinned active-run plan while a run is open, the live spec otherwise.
-// PairingProtocol is always read live — it is per-service wire-contract
-// state and an operator input, not plan content.
-func EffectiveRollout(isvc *InferenceService) *RolloutSpec {
-	if isvc == nil {
-		return nil
-	}
-	if isvc.Status.Rollout != nil && isvc.Status.Rollout.ActiveRun != nil {
-		return isvc.Status.Rollout.ActiveRun.Plan.AsRolloutSpec(isvc.Spec.Rollout)
-	}
-	return isvc.Spec.Rollout
-}
-
-// EffectiveCanaryGroup returns the first effective rollout group whose
-// progression is canary, or nil. The pinned-plan-aware analogue of
-// InferenceServiceSpec.GetCanaryGroup; executors must use this so a mid-run
-// spec edit cannot change the plan under the persisted step counter.
-func EffectiveCanaryGroup(isvc *InferenceService) *RolloutGroup {
-	spec := EffectiveRollout(isvc)
-	if spec == nil {
-		return nil
-	}
-	for i := range spec.Groups {
-		if spec.Groups[i].Canary != nil {
-			return &spec.Groups[i]
-		}
-	}
-	return nil
-}
-
 // AsRolloutSpec materializes the pinned plan as a RolloutSpec so existing
 // resolution code (coordination.ResolveGroups, the canary executor) consumes
 // it unchanged. live supplies the always-live PairingProtocol.

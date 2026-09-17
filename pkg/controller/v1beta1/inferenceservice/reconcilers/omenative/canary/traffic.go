@@ -3,6 +3,7 @@ package canary
 import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // canaryWeights builds the two-revision external weight split for a step: the
@@ -35,7 +36,7 @@ func applyTraffic(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, canar
 	cs := isvc.Status.Components[c]
 	cs.Traffic = targets
 	isvc.Status.Components[c] = cs
-	if isvc.Status.Canary != nil {
-		isvc.Status.Canary.ObservedTrafficWeight = weight
+	if cs := rollout.CanaryStatusFor(&isvc.Status, c); cs != nil {
+		cs.ObservedTrafficWeight = weight
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -14,6 +13,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 var mutatorLogger = logf.Log.WithName("inferenceservice-v1beta1-mutating-webhook")
@@ -89,22 +89,24 @@ func DefaultInferenceService(ctx context.Context, c client.Client, isvc *v1beta1
 	var replicas *controllerconfig.ReplicasDefaultsConfig
 	var gracePeriod *int64
 	var minReadySeconds *int32
+	var updateStrategy *controllerconfig.UpdateStrategyDefaultsConfig
 	if deployConfig != nil {
 		replicas = deployConfig.Replicas
 		gracePeriod = deployConfig.TerminationGracePeriodSeconds
 		minReadySeconds = deployConfig.MinReadySeconds
+		updateStrategy = deployConfig.UpdateStrategy
 	}
 
 	if isvc.Spec.Engine != nil {
-		defaultEngine(isvc.Spec.Engine, resolvedMode, replicas, gracePeriod)
+		defaultEngine(isvc.Spec.Engine, resolvedMode, replicas, gracePeriod, updateStrategy.ForComponent(workloadtypes.ComponentEngine))
 		defaultOMENativeMinReadySeconds(&isvc.Spec.Engine.ComponentExtensionSpec, resolvedMode, minReadySeconds)
 	}
 	if isvc.Spec.Decoder != nil {
-		defaultDecoder(isvc.Spec.Decoder, resolvedMode, replicas, gracePeriod)
+		defaultDecoder(isvc.Spec.Decoder, resolvedMode, replicas, gracePeriod, updateStrategy.ForComponent(workloadtypes.ComponentDecoder))
 		defaultOMENativeMinReadySeconds(&isvc.Spec.Decoder.ComponentExtensionSpec, resolvedMode, minReadySeconds)
 	}
 	if isvc.Spec.Router != nil {
-		defaultRouter(isvc.Spec.Router, resolvedMode, replicas, gracePeriod)
+		defaultRouter(isvc.Spec.Router, resolvedMode, replicas, gracePeriod, updateStrategy.ForComponent(workloadtypes.ComponentRouter))
 		defaultOMENativeMinReadySeconds(&isvc.Spec.Router.ComponentExtensionSpec, resolvedMode, minReadySeconds)
 	}
 	// Rollout pacing/structure defaults are applied at runtime by the resolve
@@ -112,7 +114,7 @@ func DefaultInferenceService(ctx context.Context, c client.Client, isvc *v1beta1
 	return nil
 }
 
-func defaultEngine(engine *v1beta1.EngineSpec, specMode *constants.DeploymentModeType, replicas *controllerconfig.ReplicasDefaultsConfig, gracePeriod *int64) {
+func defaultEngine(engine *v1beta1.EngineSpec, specMode *constants.DeploymentModeType, replicas *controllerconfig.ReplicasDefaultsConfig, gracePeriod *int64, updateStrategy *controllerconfig.ComponentUpdateStrategyDefaults) {
 	defaultReplicaBounds(&engine.ComponentExtensionSpec, replicas.Min(), replicas.EngineMax())
 	defaultTerminationGracePeriod(&engine.PodSpec, gracePeriod)
 	defaultWorkerSize(engine.Leader, engine.Worker)
@@ -122,10 +124,10 @@ func defaultEngine(engine *v1beta1.EngineSpec, specMode *constants.DeploymentMod
 	if engineIsMultiPod(engine) {
 		shape = podShapeMulti
 	}
-	defaultOMENativeComponent(&engine.ComponentExtensionSpec, shape, specMode)
+	defaultOMENativeComponent(&engine.ComponentExtensionSpec, shape, specMode, updateStrategy)
 }
 
-func defaultDecoder(decoder *v1beta1.DecoderSpec, specMode *constants.DeploymentModeType, replicas *controllerconfig.ReplicasDefaultsConfig, gracePeriod *int64) {
+func defaultDecoder(decoder *v1beta1.DecoderSpec, specMode *constants.DeploymentModeType, replicas *controllerconfig.ReplicasDefaultsConfig, gracePeriod *int64, updateStrategy *controllerconfig.ComponentUpdateStrategyDefaults) {
 	defaultReplicaBounds(&decoder.ComponentExtensionSpec, replicas.Min(), replicas.DecoderMax())
 	defaultTerminationGracePeriod(&decoder.PodSpec, gracePeriod)
 	defaultWorkerSize(decoder.Leader, decoder.Worker)
@@ -135,7 +137,7 @@ func defaultDecoder(decoder *v1beta1.DecoderSpec, specMode *constants.Deployment
 	if decoderIsMultiPod(decoder) {
 		shape = podShapeMulti
 	}
-	defaultOMENativeComponent(&decoder.ComponentExtensionSpec, shape, specMode)
+	defaultOMENativeComponent(&decoder.ComponentExtensionSpec, shape, specMode, updateStrategy)
 }
 
 // defaultReplicaBounds fills unset replica bounds from the configured
@@ -219,11 +221,11 @@ func defaultWorkerSize(leader *v1beta1.LeaderSpec, worker *v1beta1.WorkerSpec) {
 	worker.Size = &size
 }
 
-func defaultRouter(router *v1beta1.RouterSpec, specMode *constants.DeploymentModeType, replicas *controllerconfig.ReplicasDefaultsConfig, gracePeriod *int64) {
+func defaultRouter(router *v1beta1.RouterSpec, specMode *constants.DeploymentModeType, replicas *controllerconfig.ReplicasDefaultsConfig, gracePeriod *int64, updateStrategy *controllerconfig.ComponentUpdateStrategyDefaults) {
 	defaultReplicaBounds(&router.ComponentExtensionSpec, replicas.Min(), replicas.RouterMax())
 	defaultTerminationGracePeriod(&router.PodSpec, gracePeriod)
 	// Router has no Leader/Worker; always single-pod.
-	defaultOMENativeComponent(&router.ComponentExtensionSpec, podShapeSingle, specMode)
+	defaultOMENativeComponent(&router.ComponentExtensionSpec, podShapeSingle, specMode, updateStrategy)
 }
 
 // engineIsMultiPod reports whether Engine declares a complete Leader+Worker
@@ -255,7 +257,7 @@ const (
 // defaultOMENativeComponent fills lifecycle defaults for an OMENative Component.
 // Shape-dependent policies remain unset when runtime resolution may change
 // the shape.
-func defaultOMENativeComponent(ext *v1beta1.ComponentExtensionSpec, shape componentPodShape, specMode *constants.DeploymentModeType) {
+func defaultOMENativeComponent(ext *v1beta1.ComponentExtensionSpec, shape componentPodShape, specMode *constants.DeploymentModeType, defaults *controllerconfig.ComponentUpdateStrategyDefaults) {
 	if ext == nil {
 		return
 	}
@@ -278,14 +280,8 @@ func defaultOMENativeComponent(ext *v1beta1.ComponentExtensionSpec, shape compon
 	if spec.UpdateStrategy == nil {
 		spec.UpdateStrategy = &v1beta1.UpdateStrategy{}
 	}
-	if spec.UpdateStrategy.Type == "" {
-		// SurgeThenDrain is the default. Single-pod Instances get a real
-		// zero-downtime surge (new pod at the alternate ordinal, drain
-		// the old, promote); multi-pod gangs surge a whole replacement
-		// gang at a fresh surge index before the source drains. Either
-		// way it is safer than in-place because the MaxUnavailable gate
-		// throttles drains.
-		spec.UpdateStrategy.Type = v1beta1.UpdateStrategySurgeThenDrain
+	if spec.UpdateStrategy.Type == "" && defaults != nil && defaults.Type != "" {
+		spec.UpdateStrategy.Type = v1beta1.UpdateStrategyType(defaults.Type)
 	}
 	if spec.UpdateStrategy.InPlaceUpdateStrategy == nil {
 		spec.UpdateStrategy.InPlaceUpdateStrategy = &v1beta1.InPlaceUpdateStrategy{}
@@ -299,24 +295,33 @@ func defaultOMENativeComponent(ext *v1beta1.ComponentExtensionSpec, shape compon
 		spec.UpdateStrategy.InPlaceUpdateStrategy.MarkNotReadyDuringLifecycle = &mark
 	}
 
-	// Default the per-Component rollout budgets so an unset RollingUpdate
-	// never resolves to the uncapped BudgetNoLimit. Without a cap the
-	// dispatcher can start every Instance's surge/drain in a single
-	// reconcile pass, draining an entire fleet at once on a spec bump.
-	// 25% mirrors the upstream appsv1.Deployment RollingUpdate defaults and
-	// paces both the surge path (gated on MaxSurge) and the recreate path
-	// (gated on MaxUnavailable). Percent values scale with replica count at
-	// reconcile time, so this is safe from tiny to large Components.
-	if spec.UpdateStrategy.RollingUpdate == nil {
-		spec.UpdateStrategy.RollingUpdate = &v1beta1.RollingUpdate{}
-	}
-	if spec.UpdateStrategy.RollingUpdate.MaxSurge == nil {
-		ms := intstr.FromString("25%")
-		spec.UpdateStrategy.RollingUpdate.MaxSurge = &ms
-	}
-	if spec.UpdateStrategy.RollingUpdate.MaxUnavailable == nil {
-		mu := intstr.FromString("25%")
-		spec.UpdateStrategy.RollingUpdate.MaxUnavailable = &mu
+	// Stamp the configured rollout budget so an unset RollingUpdate does not
+	// resolve to the uncapped BudgetNoLimit: without a cap the dispatcher can
+	// start every Instance's surge/drain in a single reconcile pass, draining
+	// a whole Component at once on a spec bump. Only the budget the resolved
+	// strategy reads is stamped — a surge strategy never consults
+	// MaxUnavailable and a non-surge strategy never consults MaxSurge, and a
+	// field that is never read reads as a bound that is doing nothing.
+	if defaults != nil {
+		// An unset Type dispatches as SurgeThenDrain, so it takes the surge budget.
+		surges := spec.UpdateStrategy.Type == v1beta1.UpdateStrategySurgeThenDrain || spec.UpdateStrategy.Type == ""
+		budget := defaults.MaxUnavailable
+		if surges {
+			budget = defaults.MaxSurge
+		}
+		if budget != nil {
+			if spec.UpdateStrategy.RollingUpdate == nil {
+				spec.UpdateStrategy.RollingUpdate = &v1beta1.RollingUpdate{}
+			}
+			rollingUpdate := spec.UpdateStrategy.RollingUpdate
+			value := *budget
+			switch {
+			case surges && rollingUpdate.MaxSurge == nil:
+				rollingUpdate.MaxSurge = &value
+			case !surges && rollingUpdate.MaxUnavailable == nil:
+				rollingUpdate.MaxUnavailable = &value
+			}
+		}
 	}
 
 	if shape != podShapeUnresolved && spec.ReadyPolicy == nil {

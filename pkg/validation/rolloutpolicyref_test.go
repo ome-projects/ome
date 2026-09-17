@@ -92,7 +92,7 @@ func TestValidateCanary_DeclaredCanaryRefRequiresEntrypoint(t *testing.T) {
 // A well-shaped declared-canary ref admits: the shape rules pass and there
 // is no inline body to plan-validate.
 func TestValidateCanary_DeclaredCanaryRefValidShapeAccepted(t *testing.T) {
-	spec := omeNativeSpecWithGroups(refGroup(v1beta1.RolloutProgressionCanary, v1beta1.EngineComponent))
+	spec := omeNativeSpecWithGroups(refGroup(v1beta1.RolloutProgressionCanary, v1beta1.EngineComponent, v1beta1.DecoderComponent))
 	if err := ValidateCanary(spec); err != nil {
 		t.Errorf("valid declared-canary ref rejected: %v", err)
 	}
@@ -125,11 +125,11 @@ func TestValidateCanary_DeclaredCanaryRefRequiresOMENative(t *testing.T) {
 
 // A group carrying both an inline arm and a ref validates as the INLINE
 // kind: an inline blueGreen beside a declared-canary ref is not a canary
-// group, so neither the one-canary-max nor the entrypoint rule sees it.
+// group, so neither the one-run-per-unit nor the unit-entrypoint rule sees it.
 func TestValidateCanary_InlineArmOutranksDeclaredCanaryRef(t *testing.T) {
 	spec := omeNativeSpecWithGroups(
 		v1beta1.RolloutGroup{
-			Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
 			Canary: &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{
 				{Capacity: intstr.FromString("100%"), Traffic: 100},
 			}},

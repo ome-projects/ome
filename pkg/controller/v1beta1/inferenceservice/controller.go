@@ -64,6 +64,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
+	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
@@ -575,7 +576,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			// Bind/reset the canary state before persisting the run boundary so
 			// activeRun and its step state become visible atomically. Adoption is
 			// the exception: preserve the in-flight step and attach its target ID.
-			canary.BindRun(isvc, runOutcome.Adopted)
+			for _, g := range rollout.CanaryGroups(isvc) {
+				canary.BindRun(isvc, g, runOutcome.Adopted)
+			}
 		}
 		// A run boundary (open/close/repin) is persisted IMMEDIATELY: the pin
 		// is load-bearing for the update gates and the partition stamp, and a
@@ -595,7 +598,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// before the Component reconcilers run, so the standard
 	// spec→IR→plan→HeldByPartition path holds the staged old/new split. The
 	// step machine + traffic run in Step 6a below.
-	if v1beta1.EffectiveCanaryGroup(isvc) != nil {
+	if len(rollout.CanaryGroups(isvc)) > 0 {
 		if mergedEngine != nil {
 			canary.StampStepPartition(isvc, v1beta1.EngineComponent, &mergedEngine.ComponentExtensionSpec)
 		}
@@ -785,7 +788,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if rolloutRunRequeue > pendingRequeue.RequeueAfter {
 		pendingRequeue.RequeueAfter = rolloutRunRequeue
 	}
-	if v1beta1.EffectiveCanaryGroup(isvc) != nil {
+	if canaryGroups := rollout.CanaryGroups(isvc); len(canaryGroups) > 0 {
 		// Resolve the metrics source + query timeout per-reconcile from the
 		// canaryAnalysis operator config (so ConfigMap edits take effect without a
 		// restart); the sampler's structural tuning is fixed at startup. Only
@@ -799,25 +802,32 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if rolloutConfig != nil {
 			defaultReadyTimeout = rolloutConfig.DefaultReadyTimeout
 		}
-		ra, err := canary.Dispatch(ctx, canary.DispatchDeps{
-			ISVC:                     isvc,
-			Client:                   r.Client,
-			Reader:                   r.APIReader,
-			Recorder:                 r.Recorder,
-			Sampler:                  r.CanarySampler,
-			BundledPrometheusAddress: analysisConfig.BundledPrometheusAddress,
-			QueryTimeout:             analysisConfig.QueryTimeoutDuration(),
-			DefaultReadyTimeout:      defaultReadyTimeout,
-			MetricProviders:          metricProviders,
-			DefaultProvider:          analysisConfig.DefaultProvider,
-			ComponentRunnerPorts:     componentRunnerPorts,
-		})
-		if err != nil {
-			log.Error(err, "Failed to reconcile canary rollout")
-			return reconcile.Result{}, errors.Wrapf(err, "fails to reconcile canary")
-		}
-		if ra > pendingRequeue.RequeueAfter {
-			pendingRequeue.RequeueAfter = ra
+		// One dispatch per canary group. A group owns one unit, so the runs
+		// touch disjoint Components: neither can see the other's step counter,
+		// and the soonest requeue wins so the faster unit is not slowed to the
+		// pace of the slower one.
+		for _, g := range canaryGroups {
+			ra, err := canary.Dispatch(ctx, canary.DispatchDeps{
+				ISVC:                     isvc,
+				Client:                   r.Client,
+				Reader:                   r.APIReader,
+				Recorder:                 r.Recorder,
+				Sampler:                  r.CanarySampler,
+				BundledPrometheusAddress: analysisConfig.BundledPrometheusAddress,
+				QueryTimeout:             analysisConfig.QueryTimeoutDuration(),
+				DefaultReadyTimeout:      defaultReadyTimeout,
+				MetricProviders:          metricProviders,
+				DefaultProvider:          analysisConfig.DefaultProvider,
+				ComponentRunnerPorts:     componentRunnerPorts,
+				Group:                    g,
+			})
+			if err != nil {
+				log.Error(err, "Failed to reconcile canary rollout")
+				return reconcile.Result{}, errors.Wrapf(err, "fails to reconcile canary")
+			}
+			if ra > pendingRequeue.RequeueAfter {
+				pendingRequeue.RequeueAfter = ra
+			}
 		}
 	}
 	// Load the coordination tuning per-reconcile from the operator config so
@@ -1181,7 +1191,19 @@ func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.Infere
 		// subtree any more than it owns Lifecycle when another pass's write
 		// is newer.
 		liveRollout := latest.Status.Rollout.DeepCopy()
-		livePreStepHold := latest.Status.Canary != nil && latest.Status.Canary.PreStepHold
+		// Any unit holding pre-step is enough: the hold exists so a repin
+		// cannot raise traffic before the operator sees the new ladder, and
+		// that is true whichever unit armed it.
+		livePreStepHold := false
+		for _, cs := range latest.Status.Components {
+			if cs.Canary != nil && cs.Canary.PreStepHold {
+				livePreStepHold = true
+				break
+			}
+		}
+		if !livePreStepHold && latest.Status.Canary != nil {
+			livePreStepHold = latest.Status.Canary.PreStepHold
+		}
 		latest.Status = desiredService.Status
 		mergeLifecycleStatus(&latest.Status, preserved)
 		rolloutrun.PreserveNewerRun(&latest.Status, liveRollout, livePreStepHold)

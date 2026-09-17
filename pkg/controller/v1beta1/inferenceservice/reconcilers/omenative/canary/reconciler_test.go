@@ -46,7 +46,7 @@ func twoStep() []v1beta1.RolloutGroupStep {
 
 // pinActiveRun pins the ISVC's current spec.rollout as its active rollout run
 // (the state the run layer produces at run open), so Dispatch derives
-// RunActive=true and EffectiveCanaryGroup reads the pinned plan. A pinned plan
+// RunActive=true and rollout.CanaryGroups reads the pinned plan. A pinned plan
 // is inert to later spec edits — re-pin after mutating spec.rollout when the
 // edit should take effect.
 func pinActiveRun(isvc *v1beta1.InferenceService) *v1beta1.InferenceService {
@@ -519,6 +519,9 @@ func TestReconcile_NewRunRearmsRollbackWithUnchangedPrimary(t *testing.T) {
 
 func TestReconcile_UnchangedPrimaryRollbackCompletes(t *testing.T) {
 	isvc := canaryISVC(twoStep(), nil)
+	// The primary under test is the router, so its unit must be the one the
+	// group drives — a plan is resolved per unit.
+	isvc.Spec.Rollout.Groups[0].Components = []v1beta1.ComponentType{v1beta1.RouterComponent}
 	isvc.Status.Canary = &v1beta1.CanaryStatus{
 		TargetID:               "target-1",
 		CanaryRevisionHash:     "router",
@@ -1769,5 +1772,111 @@ func TestReconcile_PinnedPlanInertToSpecEdits(t *testing.T) {
 	}
 	if p, ok := EffectivePartition(isvc, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 2 {
 		t.Fatalf("EffectivePartition must read the pinned plan, got %v ok=%v", p, ok)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Idle units. A run is opened for the whole ISVC, so a unit that did NOT
+// retarget is still handed a TargetID. It must not arm on that alone.
+// ---------------------------------------------------------------------------
+
+// runWithTargets pins the spec as an active run (so the executor resolves a
+// group at all) and records exactly the TargetRevisions given.
+func runWithTargets(isvc *v1beta1.InferenceService, targets ...v1beta1.RolloutRunTarget) {
+	pinActiveRun(isvc)
+	isvc.Status.Rollout.ActiveRun.RunID = "run-1"
+	isvc.Status.Rollout.ActiveRun.TargetRevisions = targets
+}
+
+// The bug: a router-only bounce opens a run, the engine unit is handed that
+// run's TargetID, and it armed a full no-op ladder on a revision it already
+// serves -- burning its analysis budget and able to reach a rollback for a
+// rollout that never happened.
+func TestReconcile_IdleUnitDoesNotArm(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	runWithTargets(isvc,
+		v1beta1.RolloutRunTarget{Component: v1beta1.RouterComponent, Revision: "rnew", StableRevision: "rold"},
+		v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "same", StableRevision: "same"},
+	)
+	in := baseInputs(isvc, map[string]int32{"same": 4})
+	in.CanaryRevisionHash = "same"
+	in.StableRevisionHash = "same"
+	in.TargetID = "target-from-the-router-run"
+
+	res, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Active {
+		t.Fatal("the engine unit did not retarget; it must sit the run out")
+	}
+	if isvc.Status.Canary != nil {
+		t.Fatalf("no canary status should be written for an idle unit, got %+v", isvc.Status.Canary)
+	}
+	if phaseOf(isvc) != v1beta1.RolloutPhaseStable {
+		t.Fatalf("an idle converged unit should read Stable, got %q", phaseOf(isvc))
+	}
+}
+
+// The unit that DID retarget must still arm, in the same run.
+func TestReconcile_RetargetedUnitStillArms(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	runWithTargets(isvc,
+		v1beta1.RolloutRunTarget{Component: v1beta1.RouterComponent, Revision: "rsame", StableRevision: "rsame"},
+		v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"},
+	)
+	in := baseInputs(isvc, map[string]int32{"new": 0, "old": 4})
+	in.TargetID = "engine-target"
+
+	res, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Active {
+		t.Fatal("the engine retargeted; its canary must arm")
+	}
+	if isvc.Status.Canary == nil {
+		t.Fatal("expected canary status for the retargeted unit")
+	}
+}
+
+// Per-UNIT, not per-Component: a group whose primary is unchanged but whose
+// secondary retargeted has real work. Guarding on the primary's hashes alone
+// would skip it (regression guard for TestDispatch_SecondaryOnlyTargetStartsCanary).
+func TestReconcile_SecondaryOnlyRetargetArms(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	runWithTargets(isvc,
+		v1beta1.RolloutRunTarget{Component: v1beta1.RouterComponent, Revision: "same", StableRevision: "same"},
+		v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "e-new", StableRevision: "e-old"},
+	)
+	in := baseInputs(isvc, map[string]int32{"same": 4})
+	in.Component = v1beta1.RouterComponent
+	in.CanaryRevisionHash = "same"
+	in.StableRevisionHash = "same"
+	in.TargetID = "pair-target"
+	in.Group = &v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent},
+	}
+
+	if !unitRetargeted(in) {
+		t.Fatal("a unit whose secondary retargeted must count as retargeted")
+	}
+}
+
+// Missing information must never suppress a rollout.
+func TestUnitRetargeted_ConservativeWhenUnknown(t *testing.T) {
+	isvc := canaryISVC(twoStep(), nil)
+	in := baseInputs(isvc, nil)
+
+	if !unitRetargeted(in) {
+		t.Error("no active run: must not suppress")
+	}
+	runWithTargets(isvc)
+	if !unitRetargeted(in) {
+		t.Error("run with no recorded targets: must not suppress")
+	}
+	runWithTargets(isvc, v1beta1.RolloutRunTarget{Component: v1beta1.DecoderComponent, Revision: "a", StableRevision: "a"})
+	if !unitRetargeted(in) {
+		t.Error("run recording no member of this unit: must not suppress")
 	}
 }

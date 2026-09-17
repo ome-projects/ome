@@ -5,7 +5,7 @@
 // status.rollout.activeRun in the same in-memory status the executors' step
 // state lives in — one status flush carries both, so the pinned plan and the
 // step counters can never be observed out of sync. Executors consume the
-// pinned plan (v1beta1.EffectiveRollout); spec and policy edits are inert
+// pinned plan (rollout.Effective); spec and policy edits are inert
 // mid-run and take effect at the next open. Failure to resolve a plan PARKS
 // the rollout (condition + held update gates) — it never falls back to the
 // default progression, because silently removing a declared gate is the
@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 	"sigs.k8s.io/ome/pkg/validation"
 )
@@ -193,7 +194,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		return Outcome{Parked: true, RequeueAfter: parkRequeue}, nil
 	}
 
-	adopting := !retargeting && isvc.Status.Canary != nil && canaryMidFlight(isvc)
+	adopting := !retargeting && canaryMidFlight(isvc)
 	openRun(isvc, plan, targets, stableOverrides, adopting, now)
 	recordRunOpened(isvc, plan, adopting)
 	setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonPinned,
@@ -374,8 +375,8 @@ func componentStableRevision(isvc *v1beta1.InferenceService, comp v1beta1.Compon
 	if target.current != "" && target.current != pinnedRevision {
 		return target.current
 	}
-	if comp == primaryCanaryComponent(isvc) && isvc.Status.Canary != nil && isvc.Status.Canary.StableRevisionHash != "" {
-		return isvc.Status.Canary.StableRevisionHash
+	if cs := rollout.CanaryStatusFor(&isvc.Status, comp); comp == rollout.CanaryUnit(comp) && cs != nil && cs.StableRevisionHash != "" {
+		return cs.StableRevisionHash
 	}
 	if status, ok := isvc.Status.Components[comp]; ok {
 		if hash := query.RevisionFromName(status.LatestRolledoutRevision).Hash(); hash != "" {
@@ -424,11 +425,11 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 	}
 	pinnedSpec := active.Plan.AsRolloutSpec(isvc.Spec.Rollout)
 	resolved := coordination.ResolveGroups(pinnedSpec, coordination.GroupDefaults{})
-	cs := isvc.Status.Canary
 
 	for i := range active.Plan.Groups {
 		g := &active.Plan.Groups[i].Group
 		if g.Canary != nil {
+			cs := rollout.CanaryStatusFor(&isvc.Status, primaryOfGroup(g))
 			if cs == nil {
 				return "", false
 			}
@@ -641,13 +642,14 @@ func handleRepin(ctx context.Context, in Inputs, active *v1beta1.RolloutRun, now
 // when a shorter ladder clamps onto the final 100% step) would be immediate
 // exposure, not a hold.
 func clampCanary(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, oldStepCount int) {
-	cs := isvc.Status.Canary
-	if cs == nil {
-		return
-	}
 	for i := range active.Plan.Groups {
-		c := active.Plan.Groups[i].Group.Canary
+		g := &active.Plan.Groups[i].Group
+		c := g.Canary
 		if c == nil {
+			continue
+		}
+		cs := rollout.CanaryStatusFor(&isvc.Status, primaryOfGroup(g))
+		if cs == nil {
 			continue
 		}
 		// Done stays done: a canary that finished under the OLD ladder must

@@ -109,6 +109,16 @@ func (s *InferenceServiceSpec) GetRolloutGroups() []RolloutGroup {
 	return s.Rollout.Groups
 }
 
+// GetRolloutGroupOrdering returns spec.rollout.groupOrdering, defaulting to
+// Sequential when the rollout block or the field is unset — an object written
+// before the field existed keeps its original meaning. Nil-safe.
+func (s *InferenceServiceSpec) GetRolloutGroupOrdering() RolloutGroupOrdering {
+	if s == nil || s.Rollout == nil || s.Rollout.GroupOrdering == nil {
+		return RolloutGroupOrderingSequential
+	}
+	return *s.Rollout.GroupOrdering
+}
+
 // RolloutPairingProtocol returns spec.rollout.pairingProtocol, or "" when the
 // rollout block or the field is unset. Nil-safe on a nil receiver.
 func (s *InferenceServiceSpec) RolloutPairingProtocol() string {

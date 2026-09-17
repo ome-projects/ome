@@ -264,6 +264,35 @@ ome:
     # Available as soon as they are Ready; an authored component value
     # always wins. Uncomment to pace every OMENative rollout in the cluster.
     # minReadySeconds: 30
+    # Admission-time lifecycle.updateStrategy stamped by the same webhook on
+    # OMENative components that do not author one: how each Instance is
+    # physically replaced, and how many may move at once. The binary has no
+    # built-in default; an authored component value always wins.
+    #
+    # Only the budget the resolved strategy reads is stamped. OME gates
+    # SurgeThenDrain on maxSurge and every non-surge strategy (RecreatePod,
+    # InPlaceIfPossible, InPlaceOnly) on maxUnavailable, and never consults
+    # the other, so a field that is never read would sit in the spec looking
+    # like a bound that is doing nothing. Both are set here so overriding a
+    # component's type does not also require supplying its budget.
+    #
+    # Percentages scale with replica count at reconcile time and round up, so
+    # they hold from one replica to thousands. A budget resolving to zero is
+    # rejected at config-load: it denies every Instance and the rollout never
+    # starts.
+    updateStrategy:
+      router:
+        type: SurgeThenDrain
+        maxSurge: 25%
+        maxUnavailable: 25%
+      engine:
+        type: SurgeThenDrain
+        maxSurge: 25%
+        maxUnavailable: 25%
+      decoder:
+        type: SurgeThenDrain
+        maxSurge: 25%
+        maxUnavailable: 25%
     # Max reconciles each controller runs in parallel (distinct objects only —
     # controller-runtime serializes per object key, so independent objects
     # reconcile concurrently). Source of truth for these values (the OME binary

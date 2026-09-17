@@ -471,11 +471,17 @@ func validateSoakOnlyWhenSequenced(groups []v1beta1.RolloutGroup) error {
 //
 //   - A non-empty groups[i].order is rejected on every group — no current
 //     progression applies Order as a surge sequence.
-//   - A multi-group list is accepted only when it is a pure run of
-//     single-Component blueGreen groups (the shape that collapses to the
-//     Sequential state machine, the one path that enforces cross-group
-//     order). Any other multi-group list — a rollingUpdate, canary, or
-//     multi-Component group in the mix — runs concurrently.
+//   - Under groupOrdering: Sequential (the default), a multi-group list is
+//     accepted only when it is a pure run of single-Component blueGreen
+//     groups (the shape that collapses to the Sequential state machine, the
+//     one path that enforces cross-group order). Any other multi-group list —
+//     a rollingUpdate, canary, or multi-Component group in the mix — runs
+//     concurrently. Under groupOrdering: Concurrent the caller has declared
+//     the groups independent, so there is no ordering promise left to drop
+//     and the shape rule does not apply.
+//
+// The order rule is unconditional: Order is not applied by any progression,
+// so it is dead configuration under either ordering.
 //
 // Runs on create; updates apply it through the
 // ValidateRolloutOrderingEnforcedUpdate ratchet.
@@ -493,6 +499,9 @@ func ValidateRolloutOrderingEnforced(spec *v1beta1.InferenceServiceSpec) error {
 	if len(groups) < 2 {
 		return nil // a single group makes no cross-group ordering promise
 	}
+	if spec.GetRolloutGroupOrdering() == v1beta1.RolloutGroupOrderingConcurrent {
+		return nil // no promise was made, so none can be dropped
+	}
 	for i := range groups {
 		g := &groups[i]
 		kind := rolloutGroupKind(g)
@@ -507,7 +516,7 @@ func ValidateRolloutOrderingEnforced(spec *v1beta1.InferenceServiceSpec) error {
 		default:
 			continue
 		}
-		return fmt.Errorf("spec.rollout.groups: groups[] is ordered (group N completes before group N+1 begins), but that is enforced only for a run of single-Component blueGreen groups; groups[%d] is %s, so the groups would run concurrently and the declared order would be dropped (%s)",
+		return fmt.Errorf("spec.rollout.groups: groups[] is ordered (group N completes before group N+1 begins), but that is enforced only for a run of single-Component blueGreen groups; groups[%d] is %s, so the groups would run concurrently and the declared order would be dropped — set spec.rollout.groupOrdering: Concurrent if the groups are independent and running them at the same time is what you want (%s)",
 			i, shape, ReasonGroupOrderingNotHonored)
 	}
 	return nil

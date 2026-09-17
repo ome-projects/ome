@@ -26829,6 +26829,11 @@ spec:
                   type: object
                 rollout:
                   properties:
+                    groupOrdering:
+                      enum:
+                        - Sequential
+                        - Concurrent
+                      type: string
                     groups:
                       items:
                         properties:
@@ -31695,6 +31700,68 @@ spec:
                             type: object
                           specSource:
                             type: string
+                        type: object
+                      canary:
+                        properties:
+                          analysisFailedChecks:
+                            format: int32
+                            type: integer
+                          canaryRevisionHash:
+                            type: string
+                          currentStep:
+                            format: int32
+                            type: integer
+                          lastConclusiveEvaluationTime:
+                            format: date-time
+                            type: string
+                          lastEvaluationTime:
+                            format: date-time
+                            type: string
+                          metricResults:
+                            items:
+                              properties:
+                                message:
+                                  type: string
+                                name:
+                                  type: string
+                                operator:
+                                  type: string
+                                passed:
+                                  type: boolean
+                                threshold:
+                                  type: string
+                                time:
+                                  format: date-time
+                                  type: string
+                                value:
+                                  type: string
+                              required:
+                                - name
+                                - passed
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                              - name
+                            x-kubernetes-list-type: map
+                          observedTrafficWeight:
+                            format: int32
+                            type: integer
+                          preStepHold:
+                            type: boolean
+                          promotedThrough:
+                            type: string
+                          rolledBackRevisionHash:
+                            type: string
+                          stableRevisionHash:
+                            type: string
+                          stepEnteredTime:
+                            format: date-time
+                            type: string
+                          targetID:
+                            type: string
+                        required:
+                          - currentStep
+                          - observedTrafficWeight
                         type: object
                       latestReadyRevision:
                         type: string
