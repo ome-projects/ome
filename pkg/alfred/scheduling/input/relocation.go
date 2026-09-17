@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
@@ -132,8 +133,12 @@ func occupiedInstanceIndexes(s *Snapshot, source Source) (map[string]bool, error
 		if ir.Namespace != source.Namespace || ir.Spec.ParentRef.Name != source.InferenceService || ir.Spec.Component != source.Component {
 			continue
 		}
-		for j := range ir.Status.InstanceStatuses {
-			occupied[strconv.FormatInt(int64(ir.Status.InstanceStatuses[j].Index), 10)] = true
+		rows, err := alfredstatus.Rows(&ir.Status)
+		if err != nil {
+			return nil, fmt.Errorf("inference replica %s/%s instance status: %w", ir.Namespace, ir.Name, err)
+		}
+		for j := range rows {
+			occupied[strconv.FormatInt(int64(rows[j].Index), 10)] = true
 		}
 	}
 	for i := range s.Objects {

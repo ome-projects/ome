@@ -19,7 +19,64 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	codec "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
+
+func TestBuildRequestSelectsColumnarSourceWithoutChangingCapture(t *testing.T) {
+	// Catches the source resolver ignoring compact logical rows.
+	objects, source := validSingleSourceObjects()
+	ir := sourceIR(objects)
+	columns, err := codec.EncodeColumns(ir.Status.InstanceStatuses, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatuses = nil
+	ir.Status.InstanceStatusEncoding = &marker
+	ir.Status.InstanceStatusColumns = columns
+	snap := captureSourceFixture(t, objects)
+	before, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := BuildRequest(snap, source, testProfiles(false), "compact-source", captureTime.Add(time.Second), time.Minute)
+	if err != nil || len(request.SourcePods) != 1 || len(request.ReplacementPods) != 1 {
+		t.Fatalf("compact source request = %+v, %v", request, err)
+	}
+	after, err := json.Marshal(snap)
+	if err != nil || !reflect.DeepEqual(after, before) {
+		t.Fatal("BuildRequest changed the lossless capture")
+	}
+}
+
+func TestSyntheticIdentityAvoidsColumnarStatusOnlyIndex(t *testing.T) {
+	// Catches a synthetic identity colliding with a compact status-only member.
+	_, source := validSingleSourceObjects()
+	members := []podMember{{pod: *readySourcePod("source", "source-uid", "source-a", v1beta1.RunnerNameDefault, 0, "default-scheduler"), incarnation: 7}}
+	snap := &Snapshot{ID: "fixed-snapshot", InferenceReplicas: []v1beta1.InferenceReplica{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: source.Namespace},
+		Spec:       v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: source.InferenceService}, Component: source.Component},
+	}}}
+	first, err := newSyntheticIdentity(snap, source, members, "request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := strconv.ParseInt(first.index, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns, err := codec.EncodeColumns([]v1beta1.OMENativeInstanceStatus{{Index: int32(index), Phase: v1beta1.OMENativeInstancePending}}, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	snap.InferenceReplicas[0].Status.InstanceStatusEncoding = &marker
+	snap.InferenceReplicas[0].Status.InstanceStatusColumns = columns
+	second, err := newSyntheticIdentity(snap, source, members, "request")
+	if err != nil || second.index == first.index {
+		t.Fatalf("synthetic index collided with compact status-only member: first=%q second=%q err=%v", first.index, second.index, err)
+	}
+}
 
 const (
 	testISVCUID = types.UID("isvc-uid")

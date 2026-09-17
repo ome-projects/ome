@@ -41,6 +41,7 @@ func TestRemovableObservationFieldsHaveNoUnauditedDirectProductionAccess(t *test
 	readWrite := removableFieldAccessCounts{reads: 1, writes: 1}
 	allFields := []string{"ReadyPodCount", "ScheduledPodCount", "NodesOccupied"}
 
+	approve("pkg/alfred/engine/dispatch_preflight.go", "dispatchSourceFingerprint", write, "clear non-persisted Pod observations on an independent logical row before fingerprinting", allFields...)
 	approve("pkg/controller/v1beta1/workload/observation.go", "overlayInlineV1", readWrite, "publication materialization", allFields...)
 	approve("pkg/controller/v1beta1/workload/observation.go", "cloneInstanceStatus", removableFieldAccessCounts{reads: 2, writes: 1}, "isolated status copy", "NodesOccupied")
 	approve("pkg/controller/v1beta1/workload/status_aggregate.go", "TakeInlineV1Publication", removableFieldAccessCounts{reads: 2}, "current Pod observation", "ReadyPodCount")

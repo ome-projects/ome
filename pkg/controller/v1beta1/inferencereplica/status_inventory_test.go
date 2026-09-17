@@ -93,7 +93,7 @@ const (
 	// representation; the stored payload is replaced, not consumed.
 	breakGlassRepairRead = "pass-through: break-glass repair live read (resourceVersion and unrelated status)"
 	// rawReaderOutsideManager: a reader outside the manager (the kubectl-ome
-	// CLI, alfred) fetches the object raw and consumes the stored dense rows
+	// CLI) fetches the object raw and consumes the stored dense rows
 	// directly, so a ColumnarV2 object presents no rows to it until it reads
 	// through the decoded accessor.
 	rawReaderOutsideManager = "raw reader outside the manager: stored dense rows only; a ColumnarV2 object presents no rows"
@@ -178,13 +178,10 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/placement/admission.go", "componentHasAdmittedInstance", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/failed.go", "IsTerminallyFailed", read(1), decodedObjectRows, rows)
 
-	// Readers outside the manager: the kubectl-ome CLI and alfred fetch the
-	// object raw (see the fetch inventory) and read the stored dense rows.
-	approve("pkg/alfred/engine/dispatch_preflight.go", "dispatchSourceFingerprint", accessCounts{reads: 2, readWrites: 1}, rawReaderOutsideManager, rows)
-	approve("pkg/alfred/engine/prediction_source.go", "predictionOwnersMatch", read(1), rawReaderOutsideManager, rows)
-	approve("pkg/alfred/scheduling/input/relocation.go", "occupiedInstanceIndexes", accessCounts{reads: 1, readWrites: 1}, rawReaderOutsideManager, rows)
-	approve("pkg/alfred/scheduling/input/source.go", "resolveSource", accessCounts{reads: 1, readWrites: 1}, rawReaderOutsideManager, rows)
-	approve("pkg/alfred/snapshot/omenative.go", "buildOMENativeComponent", read(1), rawReaderOutsideManager, rows)
+	// The kubectl-ome CLI still reads stored dense rows directly. Alfred has
+	// no direct representation-field readers: its bounded adapter calls the
+	// shared codec and returns independent logical rows without changing the
+	// raw captured object.
 	approve("pkg/cli/instancecollection/collect.go", "CollectRelated", read(2), rawReaderOutsideManager, rows)
 	approve("pkg/cli/instancecollection/collect.go", "boundedReplicaCopy", accessCounts{reads: 2, writes: 1, readWrites: 2}, rawReaderOutsideManager, rows)
 	approve("pkg/cli/instanceprojection/project.go", "Project", read(8), rawReaderOutsideManager, rows)
@@ -261,10 +258,11 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	// through this cache.
 	approve("pkg/client/informers/externalversions/ome/v1beta1/inferencereplica.go", "NewFilteredInferenceReplicaInformer", "List", 2, passThroughSpecMetadata+" (generated informer list/watch)")
 
-	// Readers outside the manager: the kubectl-ome CLI and alfred fetch the
-	// object raw; the rows they consume are listed in the read inventory.
-	approve("pkg/alfred/engine/dispatch_reconcile.go", "Dispatcher.reconcileDispatch", "Get", 1, rawReaderOutsideManager)
-	approve("pkg/alfred/snapshot/builder.go", "Build", "List", 1, rawReaderOutsideManager)
+	// Alfred preserves the raw object; logical-row consumers use its bounded
+	// codec adapter. Dispatch reconciliation reads only migration records.
+	approve("pkg/alfred/engine/dispatch_reconcile.go", "Dispatcher.reconcileDispatch", "Get", 1, passThroughTopLevelStatus+" (migration records)")
+	approve("pkg/alfred/snapshot/builder.go", "Build", "List", 1, "raw capture; per-instance rows decoded through Alfred's bounded codec adapter")
+	// CLI readers below still consume stored dense rows directly.
 	approve("pkg/cli/cmd/get/registry.go", "<package>", "Get", 1, rawReaderOutsideManager)
 	approve("pkg/cli/cmd/get/registry.go", "<package>", "List", 1, rawReaderOutsideManager)
 	approve("pkg/cli/cmd/scale/collect.go", "collect", "Get", 1, rawReaderOutsideManager)

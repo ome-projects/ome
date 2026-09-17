@@ -22,10 +22,42 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
+	"sigs.k8s.io/ome/pkg/alfred/scheduling/input"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	codec "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
+
+func TestPredictionOwnersMatchColumnarLogicalIdentity(t *testing.T) {
+	// Catches comparing only the stored dense slice instead of the logical row.
+	observed, reader, candidate := predictionFixture(t)
+	fresh, err := input.Capture(context.Background(), reader, func() time.Time { return testNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ir := &fresh.InferenceReplicas[0]
+	columns, err := codec.EncodeColumns(ir.Status.InstanceStatuses, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatuses = nil
+	ir.Status.InstanceStatusEncoding = &marker
+	ir.Status.InstanceStatusColumns = columns
+	if !predictionOwnersMatch(observed, fresh, candidate) {
+		t.Fatal("equivalent compact source was rejected")
+	}
+	ir.Status.InstanceStatusColumns.RunningRevisions = nil
+	if predictionOwnersMatch(observed, fresh, candidate) {
+		t.Fatal("changed logical source was accepted")
+	}
+	unknown := v1beta1.InstanceStatusEncoding("Future")
+	ir.Status.InstanceStatusEncoding = &unknown
+	if predictionOwnersMatch(observed, fresh, candidate) {
+		t.Fatal("undecodable compact source was accepted")
+	}
+}
 
 type simulationFunc func(context.Context, scheduling.Request) (scheduling.Result, error)
 

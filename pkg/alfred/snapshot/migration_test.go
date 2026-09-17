@@ -10,7 +10,41 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	codec "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
+
+func TestCompactedIRPreservesMigrationEvidence(t *testing.T) {
+	// Catches row decoding that drops the independently stored migration status.
+	fixture := newOMENativeFixture()
+	started := time.Date(2026, 9, 17, 9, 0, 0, 0, time.UTC)
+	fixture.ir.Status.Migrations = []v1beta1.MigrationStatus{migrationStatus("active-compact", v1beta1.MigrationTriggerManual, 3, v1beta1.MigrationPhaseAccepted, started)}
+	columns, err := codec.EncodeColumns(fixture.ir.Status.InstanceStatuses, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	fixture.ir.Status.InstanceStatuses = nil
+	fixture.ir.Status.InstanceStatusEncoding = &marker
+	fixture.ir.Status.InstanceStatusColumns = columns
+	workload := buildOMENativeFixtureWorkload(t, fixture)
+	if !workload.MigrationStateValid || len(workload.ActiveMigrations) != 1 || workload.ActiveMigrations[0].UUID != "active-compact" || workload.ActiveMigrations[0].Instance != 3 {
+		t.Fatalf("compact migration evidence = valid:%t active:%+v", workload.MigrationStateValid, workload.ActiveMigrations)
+	}
+}
+
+func TestMalformedCompactUnionCannotCreateMigrationSource(t *testing.T) {
+	// Catches an undecodable status accidentally authorizing an annotated request.
+	fixture := newOMENativeFixture()
+	fixture.pods = nil
+	fixture.isvc.Annotations = map[string]string{migrationAnnotationKey("pending"): `{"schemaVersion":"v1","component":"engine","instance":3,"from_node":"node-a","requested_at":"2026-09-17T09:00:00Z"}`}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	fixture.ir.Status.InstanceStatusEncoding = &marker // mixed with the existing dense row
+	fixture.ir.Status.InstanceStatusColumns = &v1beta1.InstanceStatusColumns{Members: "3"}
+	workload := buildOMENativeFixtureWorkload(t, fixture)
+	if workload.Components[v1beta1.EngineComponent].ObservationValid || len(workload.ActiveMigrations) != 0 || workload.MigrationStateValid {
+		t.Fatalf("malformed union created usable migration state: %+v", workload)
+	}
+}
 
 func migrationTestWorkload() *Workload {
 	return &Workload{Components: map[v1beta1.ComponentType]*Component{

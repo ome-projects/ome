@@ -20,7 +20,46 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	codec "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
+
+func TestBuildOMENativeObservesColumnarRowsWithoutChangingCapture(t *testing.T) {
+	// Catches an observation that treats compact status as empty.
+	fixture := newOMENativeFixture()
+	columns, err := codec.EncodeColumns(fixture.ir.Status.InstanceStatuses, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	fixture.ir.Status.InstanceStatuses = nil
+	fixture.ir.Status.InstanceStatusEncoding = &marker
+	fixture.ir.Status.InstanceStatusColumns = columns
+	before := fixture.ir.DeepCopy()
+	component := buildOMENativeFixture(t, fixture)
+	if !component.ObservationValid || len(component.Instances) != 1 || component.Instances[0].Index != 3 || !component.Instances[0].ObservationValid {
+		t.Fatalf("compact observation = %+v", component)
+	}
+	if !reflect.DeepEqual(fixture.ir.Status.InstanceStatusColumns, before.Status.InstanceStatusColumns) ||
+		component.IR.Status.InstanceStatusEncoding == nil ||
+		*component.IR.Status.InstanceStatusEncoding != marker || component.IR.Status.InstanceStatusColumns == nil ||
+		len(component.IR.Status.InstanceStatuses) != 0 {
+		t.Fatal("observation changed the stored IR representation")
+	}
+}
+
+func TestBuildOMENativeRejectsMalformedCompactStatusWithNoPods(t *testing.T) {
+	// Catches a decode error accidentally becoming a valid empty inventory.
+	fixture := newOMENativeFixture()
+	fixture.pods = nil
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	fixture.ir.Status.InstanceStatuses = nil
+	fixture.ir.Status.InstanceStatusEncoding = &marker
+	fixture.ir.Status.InstanceStatusColumns = &v1beta1.InstanceStatusColumns{Members: "0-2147483647"}
+	component := buildOMENativeFixture(t, fixture)
+	if component.ObservationValid || component.ObservationReason != observationReasonIRStatus {
+		t.Fatalf("malformed compact status accepted: %+v", component)
+	}
+}
 
 func TestBuildOMENativeCopiesDenseStatus(t *testing.T) {
 	fixture := newOMENativeFixture()

@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -283,7 +284,12 @@ func buildOMENativeComponent(
 		invalidateComponent(component, observationReasonRunnerLayout)
 		return component
 	}
-	rows, ok := validatedDenseInstanceStatuses(ir.Status.InstanceStatuses)
+	logicalRows, err := alfredstatus.Rows(&ir.Status)
+	if err != nil {
+		invalidateComponent(component, observationReasonIRStatus)
+		return component
+	}
+	rows, ok := validatedDenseInstanceStatuses(logicalRows)
 	if !ok {
 		invalidateComponent(component, observationReasonIRStatus)
 		return component

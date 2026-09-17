@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/ome/pkg/alfred/config"
+	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling/input"
@@ -96,7 +98,10 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	}
 	owner := fresh.Workloads[current.Workload].ISVC
 	ir := fresh.Workloads[current.Workload].Components[current.Component].IR
-	fingerprint := dispatchSourceFingerprint(owner, ir, request.SourcePods, current.Instance)
+	fingerprint, err := dispatchSourceFingerprint(owner, ir, request.SourcePods, current.Instance)
+	if err != nil {
+		return empty, "SourceChanged"
+	}
 	if existing != nil && (fingerprint != existing.SourceFingerprint || owner.UID != existing.WorkloadUID || ir.UID != existing.IRUID || ir.Name != existing.IRName) {
 		return empty, "SourceChanged"
 	}
@@ -131,7 +136,8 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	}
 	finalOwner := final.Workloads[current.Workload].ISVC
 	finalIR := final.Workloads[current.Workload].Components[current.Component].IR
-	if dispatchSourceFingerprint(finalOwner, finalIR, finalRequest.SourcePods, current.Instance) != fingerprint {
+	finalFingerprint, err := dispatchSourceFingerprint(finalOwner, finalIR, finalRequest.SourcePods, current.Instance)
+	if err != nil || finalFingerprint != fingerprint {
 		return empty, "SourceChanged"
 	}
 	if !input.SameSchedulingState(captured, finalCapture) {
@@ -183,7 +189,7 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 
 // Retain scheduling identity/spec and semantic incarnation, but not resource
 // versions or changing readiness timestamps, in the durable retry fence.
-func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.InferenceReplica, pods []corev1.Pod, instance int32) string {
+func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.InferenceReplica, pods []corev1.Pod, instance int32) (string, error) {
 	normalized := make([]corev1.Pod, len(pods))
 	for i := range pods {
 		normalized[i] = *pods[i].DeepCopy()
@@ -192,14 +198,25 @@ func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.Infe
 		normalized[i].Status = corev1.PodStatus{}
 	}
 	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
+	rows, err := alfredstatus.Rows(&ir.Status)
+	if err != nil {
+		return "", fmt.Errorf("source status: %w", err)
+	}
 	var row *v1beta1.OMENativeInstanceStatus
-	for i := range ir.Status.InstanceStatuses {
-		if ir.Status.InstanceStatuses[i].Index == instance {
-			row = &ir.Status.InstanceStatuses[i]
+	for i := range rows {
+		if rows[i].Index == instance {
+			row = &rows[i]
 			break
 		}
 	}
-	raw, _ := json.Marshal(struct {
+	if row == nil {
+		return "", fmt.Errorf("source instance %d has no status row", instance)
+	}
+	// These Pod-derived observations are not part of either stored encoding.
+	row.ReadyPodCount = 0
+	row.ScheduledPodCount = 0
+	row.NodesOccupied = nil
+	raw, err := json.Marshal(struct {
 		OwnerUID        string
 		OwnerGeneration int64
 		IRUID           string
@@ -208,8 +225,11 @@ func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.Infe
 		Row             *v1beta1.OMENativeInstanceStatus
 		Pods            []corev1.Pod
 	}{string(owner.UID), owner.Generation, string(ir.UID), ir.Generation, ir.Status.CurrentRevision, row, normalized})
+	if err != nil {
+		return "", fmt.Errorf("source fingerprint: %w", err)
+	}
 	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func capturedNodeReady(s *input.Snapshot, name string) bool {

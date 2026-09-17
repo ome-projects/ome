@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -239,8 +240,12 @@ func resolveSource(s *Snapshot, source Source) (*sourceState, error) {
 		return nil, err
 	}
 	state.layout = layout
-	for i := range state.ir.Status.InstanceStatuses {
-		row := &state.ir.Status.InstanceStatuses[i]
+	rows, err := alfredstatus.Rows(&state.ir.Status)
+	if err != nil {
+		return nil, fmt.Errorf("source instance status: %w", err)
+	}
+	for i := range rows {
+		row := &rows[i]
 		if row.Index != source.Instance {
 			continue
 		}

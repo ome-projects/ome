@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling/input"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
@@ -57,7 +58,11 @@ func predictionOwnersMatch(observed *snapshot.ClusterSnapshot, fresh *input.Snap
 	if instance == nil {
 		return false
 	}
-	for _, row := range ir.Status.InstanceStatuses {
+	rows, err := alfredstatus.Rows(&ir.Status)
+	if err != nil {
+		return false
+	}
+	for _, row := range rows {
 		if row.Index == c.Instance {
 			return row.Incarnation == instance.Incarnation && row.RunningRevision == instance.RunningRevision && row.TargetRevision == instance.TargetRevision
 		}

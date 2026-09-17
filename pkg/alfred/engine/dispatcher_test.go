@@ -22,7 +22,74 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	codec "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
+
+func TestDispatchFingerprintUsesLogicalSourceAcrossEncodings(t *testing.T) {
+	// Catches hash parity that ignores the row entirely or hashes only dense storage.
+	owner := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{UID: "owner", Generation: 2}}
+	ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{UID: "replica", Generation: 3}, Status: v1beta1.InferenceReplicaStatus{
+		CurrentRevision: "rev", InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 7, Phase: v1beta1.OMENativeInstanceReady,
+			Incarnation: 2, RunningRevision: "rev", PodCount: 1, ServingPodCount: 1, AvailablePodCount: 1, Admitted: true}},
+	}}
+	dense, err := dispatchSourceFingerprint(owner, ir, nil, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns, err := codec.EncodeColumns(ir.Status.InstanceStatuses, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatuses = nil
+	ir.Status.InstanceStatusEncoding = &marker
+	ir.Status.InstanceStatusColumns = columns
+	compact, err := dispatchSourceFingerprint(owner, ir, nil, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dense != compact {
+		t.Fatalf("equivalent logical source changed fingerprint: dense=%s compact=%s", dense, compact)
+	}
+	ir.Status.InstanceStatusColumns.RunningRevisions = nil
+	changed, err := dispatchSourceFingerprint(owner, ir, nil, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == dense {
+		t.Fatal("changed logical source retained fingerprint")
+	}
+	unknown := v1beta1.InstanceStatusEncoding("Future")
+	ir.Status.InstanceStatusEncoding = &unknown
+	if fingerprint, err := dispatchSourceFingerprint(owner, ir, nil, 7); err == nil || fingerprint != "" {
+		t.Fatalf("undecodable source fingerprint = %q, %v; want error", fingerprint, err)
+	}
+}
+
+func TestDispatcherSubmitsColumnarSourceWithDenseObservation(t *testing.T) {
+	// Catches a representation-only change blocking otherwise safe dispatch.
+	d, cl, observed, candidate, cfg, arbiter := dispatchFixture(t, false)
+	var ir v1beta1.InferenceReplica
+	if err := cl.Client.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "a-engine"}, &ir); err != nil {
+		t.Fatal(err)
+	}
+	columns, err := codec.EncodeColumns(ir.Status.InstanceStatuses, 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := v1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatuses = nil
+	ir.Status.InstanceStatusEncoding = &marker
+	ir.Status.InstanceStatusColumns = columns
+	if err := cl.Client.Update(context.Background(), &ir); err != nil {
+		t.Fatal(err)
+	}
+	_, decisions := d.Execute(context.Background(), observed, []policy.Candidate{candidate}, cfg, arbiter)
+	got := decisionFor(t, decisions, "prod/a")
+	if got.DispatchStatus != "submitted" || cl.patches != 1 {
+		t.Fatalf("compact source not dispatched once: %+v patches=%d", got, cl.patches)
+	}
+}
 
 type dispatchClient struct {
 	client.Client
