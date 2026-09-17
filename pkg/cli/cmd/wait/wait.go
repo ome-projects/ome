@@ -27,29 +27,35 @@ import (
 )
 
 var (
-	errFlags     = errors.New("InvalidWaitFlags")
-	errPredicate = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, or migration=terminal")
-	errRequestID = errors.New("InvalidMigrationRequestID: require canonical UUID only with migration=terminal")
-	errName      = errors.New("InvalidInferenceServiceName")
-	errNamespace = errors.New("InvalidNamespace")
-	errTimeout   = errors.New("InvalidWaitTimeout: require positive duration no greater than 24h")
-	errFormat    = errors.New("InvalidOutputFormat: supported table, wide, json, yaml")
-	errConfig    = errors.New("WaitConfigurationUnavailable")
-	errOutput    = errors.New("WaitOutputFailed")
-	errUnmet     = errors.New("RequestedConditionUnmet")
+	errFlags      = errors.New("InvalidWaitFlags")
+	errPredicate  = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, or replicas=ready")
+	errRequestID  = errors.New("InvalidMigrationRequestID: require canonical UUID only with migration=terminal")
+	errCountFlags = errors.New("InvalidReadyReplicaFlags: require --component=engine|decoder|router and --replicas=N only with replicas=ready; N must be nonnegative")
+	errName       = errors.New("InvalidInferenceServiceName")
+	errNamespace  = errors.New("InvalidNamespace")
+	errTimeout    = errors.New("InvalidWaitTimeout: require positive duration no greater than 24h")
+	errFormat     = errors.New("InvalidOutputFormat: supported table, wide, json, yaml")
+	errConfig     = errors.New("WaitConfigurationUnavailable")
+	errOutput     = errors.New("WaitOutputFailed")
+	errUnmet      = errors.New("RequestedConditionUnmet")
 )
 
 type options struct {
-	streams            genericiooptions.IOStreams
-	forValue, output   string
-	timeout            time.Duration
-	requested          corev1.ConditionStatus
-	requestedRollout   reportv1alpha1.WaitRequested
-	requestedMigration bool
-	requestID          string
-	format             report.Format
-	wide               bool
-	clock              clock.Clock
+	streams                genericiooptions.IOStreams
+	forValue, output       string
+	timeout                time.Duration
+	requested              corev1.ConditionStatus
+	requestedRollout       reportv1alpha1.WaitRequested
+	requestedMigration     bool
+	requestedReadyReplicas bool
+	requestID              string
+	component              string
+	replicas               int32
+	componentSet           bool
+	replicasSet            bool
+	format                 report.Format
+	wide                   bool
+	clock                  clock.Clock
 }
 
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -59,8 +65,8 @@ func newCmd(f factory.Factory, streams genericiooptions.IOStreams, clock clock.C
 	o := options{streams: streams, clock: clock}
 	cmd := &cobra.Command{
 		Use:   "wait INFERENCESERVICE --for=PREDICATE",
-		Short: "Wait for a reported service condition, rollout, or migration",
-		Long: `Wait for a reported condition, rollout, or migration on one bound service.
+		Short: "Wait for a reported service condition, rollout, migration, or IR ready count",
+		Long: `Wait for a reported condition, rollout, migration, or exact IR ready count on one bound service.
 --for is required; omitted condition status means True. Missing Ready is
 NotRecorded, not the explicit Unknown status. The timeout defaults to 60s
 and must be positive and no greater than 24h.
@@ -72,6 +78,14 @@ snapshot. Completed, Failed, and Relocated are all terminal outcomes; a match
 does not imply success. Missing, invalid, partial, or stale evidence does not
 match. The migration path polls bounded parent/IR reads every 5s because a
 parent watch need not observe IR-only status updates.
+Use replicas=ready with --component=engine|decoder|router and --replicas=N
+for an exact, nonnegative status.readyReplicas count on one current owned IR.
+A verified zero needs a positive matching status.observedGeneration; an
+unobserved omitted zero does not match. Ready count is not serving,
+availability, /scale convergence, or attribution to a preceding action.
+Like migration, this path polls bounded parent/IR reads every 5s.
+Reads admit at most 32 related IRs and 2,048 status rows; incomplete
+snapshots never satisfy an exact count.
 Rollout assertions use qualified canonical aggregate ReportedState:
 stable means Succeeded, not NotConfigured or Staged; failed means Failed;
 rolled-back means RolledBack. Missing or invalid evidence never matches.
@@ -84,7 +98,7 @@ Generation freshness is Unverifiable: reported Ready is not proof of
 current-spec or rollout convergence. No controller algorithms are reproduced.
 
 Ready and rollout use a named GET and exact-name WATCH with bounded named-GET
-polling fallback. Migration uses a named parent GET plus bounded related-IR
+polling fallback. Migration and IR count use a named parent GET plus bounded related-IR
 reads; it does not claim parent-watch observation of IR-only changes.
 Cancellation/deadlines are cooperative;
 external credential plugins or custom transports may ignore cancellation.
@@ -94,9 +108,12 @@ One final typed report is emitted; no raw conditions or API objects are printed.
   kubectl ome wait chat --for=condition=Ready=Unknown -o wide
   kubectl ome wait chat --for=rollout=stable --timeout=2m -o json
   kubectl ome wait chat --for=rollout=failed -o wide
-  kubectl ome wait chat --for=migration=terminal --request-id=12345678-1234-4234-8234-123456789abc -n prod`,
+  kubectl ome wait chat --for=migration=terminal --request-id=12345678-1234-4234-8234-123456789abc -n prod
+  kubectl ome wait chat --for=replicas=ready --component=engine --replicas=2 -n prod`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			o.componentSet = cmd.Flags().Changed("component")
+			o.replicasSet = cmd.Flags().Changed("replicas")
 			if err := o.validate(args[0]); err != nil {
 				return err
 			}
@@ -104,8 +121,10 @@ One final typed report is emitted; no raw conditions or API objects are printed.
 		},
 	}
 	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errFlags })
-	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, or migration=terminal")
+	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, or replicas=ready")
 	cmd.Flags().StringVar(&o.requestID, "request-id", "", "Canonical migration UUID, required only for migration=terminal")
+	cmd.Flags().StringVar(&o.component, "component", "", "IR component, required only for replicas=ready: engine, decoder, router")
+	cmd.Flags().Int32Var(&o.replicas, "replicas", 0, "Exact nonnegative ready-replica count, required only for replicas=ready")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 60*time.Second, "Positive wait timeout, at most 24h")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
@@ -117,6 +136,7 @@ func (o *options) validate(name string) error {
 	o.requested = ""
 	o.requestedRollout = ""
 	o.requestedMigration = false
+	o.requestedReadyReplicas = false
 	o.wide = false
 	switch o.forValue {
 	case "condition=Ready", "condition=Ready=True":
@@ -133,6 +153,8 @@ func (o *options) validate(name string) error {
 		o.requestedRollout = reportv1alpha1.WaitRequestedRolloutRolledBack
 	case "migration=terminal":
 		o.requestedMigration = true
+	case "replicas=ready":
+		o.requestedReadyReplicas = true
 	default:
 		return errPredicate
 	}
@@ -143,6 +165,14 @@ func (o *options) validate(name string) error {
 		}
 	} else if o.requestID != "" {
 		return errRequestID
+	}
+	if o.requestedReadyReplicas {
+		if !o.componentSet || !o.replicasSet || o.replicas < 0 ||
+			(o.component != "engine" && o.component != "decoder" && o.component != "router") {
+			return errCountFlags
+		}
+	} else if o.componentSet || o.replicasSet {
+		return errCountFlags
 	}
 	if o.timeout <= 0 || o.timeout > 24*time.Hour {
 		return errTimeout
@@ -172,6 +202,9 @@ func (o *options) run(ctx context.Context, f factory.Factory, name string) error
 	}
 	if o.requestedMigration {
 		return o.runMigration(ctx, f, name, namespace)
+	}
+	if o.requestedReadyReplicas {
+		return o.runReadyReplicas(ctx, f, name, namespace)
 	}
 	config, err := f.RESTConfig()
 	if err != nil {

@@ -24,6 +24,7 @@ const (
 	WaitRequestedRolloutFailed     WaitRequested = "Rollout=Failed"
 	WaitRequestedRolloutRolledBack WaitRequested = "Rollout=RolledBack"
 	WaitRequestedMigrationTerminal WaitRequested = "Migration=Terminal"
+	WaitRequestedReadyReplicas     WaitRequested = "Replicas=Ready"
 )
 
 type WaitCounts struct {
@@ -34,17 +35,18 @@ type WaitCounts struct {
 	Observations int `json:"observations"`
 }
 type WaitContent struct {
-	Requested           WaitRequested             `json:"requested"`
-	Outcome             waitengine.Outcome        `json:"outcome"`
-	Reason              waitengine.Reason         `json:"reason"`
-	Observed            waitpredicate.Observation `json:"observed"`
-	Rollout             *WaitRolloutObservation   `json:"rollout,omitempty"`
-	Migration           *WaitMigrationObservation `json:"migration,omitempty"`
-	Evidence            EvidenceLevel             `json:"evidence"`
-	ElapsedMilliseconds int64                     `json:"elapsedMilliseconds"`
-	Counts              WaitCounts                `json:"counts"`
-	Method              waitengine.Method         `json:"sourceMethod"`
-	Fallback            bool                      `json:"pollingFallback"`
+	Requested           WaitRequested                 `json:"requested"`
+	Outcome             waitengine.Outcome            `json:"outcome"`
+	Reason              waitengine.Reason             `json:"reason"`
+	Observed            waitpredicate.Observation     `json:"observed"`
+	Rollout             *WaitRolloutObservation       `json:"rollout,omitempty"`
+	Migration           *WaitMigrationObservation     `json:"migration,omitempty"`
+	ReadyReplicas       *WaitReadyReplicasObservation `json:"readyReplicas,omitempty"`
+	Evidence            EvidenceLevel                 `json:"evidence"`
+	ElapsedMilliseconds int64                         `json:"elapsedMilliseconds"`
+	Counts              WaitCounts                    `json:"counts"`
+	Method              waitengine.Method             `json:"sourceMethod"`
+	Fallback            bool                          `json:"pollingFallback"`
 }
 type WaitReport Envelope[WaitContent]
 
@@ -63,7 +65,7 @@ func (r WaitReport) Canonical() WaitReport {
 	return r
 }
 func (c WaitContent) Canonical() WaitContent {
-	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() {
+	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() {
 		c.Requested = "Unknown"
 	}
 	switch c.Outcome {
@@ -73,7 +75,7 @@ func (c WaitContent) Canonical() WaitContent {
 	}
 	switch c.Reason {
 	case waitengine.ReasonMatched, waitengine.ReasonNotRecorded, waitengine.ReasonNotMatched, waitengine.ReasonInvalidCondition:
-		if c.Requested.IsMigration() {
+		if c.Requested.IsMigration() || c.Requested.IsReadyReplicas() {
 			c.Reason = "PredicateUnmet"
 		}
 	case waitengine.ReasonRolloutMatched, waitengine.ReasonRolloutNotMatched, waitengine.ReasonRolloutNotRecorded, waitengine.ReasonInvalidRollout:
@@ -82,6 +84,10 @@ func (c WaitContent) Canonical() WaitContent {
 		}
 	case waitengine.ReasonMigrationMatched, waitengine.ReasonMigrationNotRecorded, waitengine.ReasonMigrationInProgress, waitengine.ReasonInvalidMigration:
 		if !c.Requested.IsMigration() {
+			c.Reason = "PredicateUnmet"
+		}
+	case waitengine.ReasonReplicaReadyMatched, waitengine.ReasonReplicaReadyNotMatched, waitengine.ReasonReplicaReadyNotRecorded, waitengine.ReasonInvalidReplicaReady:
+		if !c.Requested.IsReadyReplicas() {
 			c.Reason = "PredicateUnmet"
 		}
 	default:
@@ -169,6 +175,27 @@ func (c WaitContent) Canonical() WaitContent {
 	} else {
 		c.Migration = nil
 	}
+	if c.Requested.IsReadyReplicas() {
+		if c.ReadyReplicas == nil {
+			c.ReadyReplicas = &WaitReadyReplicasObservation{Validity: "Unavailable"}
+		}
+		ready := c.ReadyReplicas.Canonical()
+		if c.Outcome == waitengine.OutcomeMatched &&
+			(ready.Validity != "Valid" || ready.Observed == nil || *ready.Observed != ready.Requested || c.Reason != waitengine.ReasonReplicaReadyMatched) {
+			ready.Validity = "Invalid"
+			ready.Observed = nil
+			c.Outcome = "Unknown"
+			c.Reason = waitengine.ReasonInvalidReplicaReady
+		}
+		c.ReadyReplicas = &ready
+		c.Observed = waitpredicate.Observation{Status: "NotRecorded", Validity: "Unavailable", GenerationFreshness: "Unverifiable", Inspection: waitpredicate.Inspection{State: "NotInspected", Warnings: []waitpredicate.Warning{}}}
+		c.Evidence = EvidenceUnavailable
+		if ready.Validity == "Valid" {
+			c.Evidence = EvidenceReported
+		}
+	} else {
+		c.ReadyReplicas = nil
+	}
 	return c
 }
 func (r WaitReport) Table() report.Table {
@@ -182,6 +209,9 @@ func (r WaitReport) WideTable() report.Table {
 func (c WaitContent) Table() report.Table { return WaitReport{Content: c.Canonical()}.table(false) }
 func (r WaitReport) table(wide bool) report.Table {
 	c := r.Content
+	if c.ReadyReplicas != nil {
+		return r.readyReplicasTable(wide)
+	}
 	if c.Migration != nil {
 		migration := c.Migration
 		attribution := "Exact request ID in live IR status"
