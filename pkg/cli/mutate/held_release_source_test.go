@@ -93,6 +93,57 @@ func TestHeldReleaseRelationshipAndBoundedIdentityRefusals(t *testing.T) {
 	}
 }
 
+func TestHeldReleaseRefusesInvalidColumnarStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*v1beta1.InferenceReplica)
+	}{
+		{name: "unknown encoding", edit: func(ir *v1beta1.InferenceReplica) {
+			unknown := v1beta1.InstanceStatusEncoding("PrivateV3")
+			ir.Status.InstanceStatusEncoding = &unknown
+		}},
+		{name: "missing columns", edit: func(ir *v1beta1.InferenceReplica) { ir.Status.InstanceStatusColumns = nil }},
+		{name: "mixed dense and columnar", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+		}},
+		{name: "incomplete phase coverage", edit: func(ir *v1beta1.InferenceReplica) { ir.Status.InstanceStatusColumns.Members = "0-1" }},
+		{name: "over row limit", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Members = "0-2048"
+			ir.Status.InstanceStatusColumns.Phases[0].Indexes = "0-2048"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, _ := nativeTarget(t)
+			ir := heldReplica(parent)
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+			storeColumnarReplica(t, ir)
+			tc.edit(ir)
+			before := ir.DeepCopy()
+			evidence, err := CollectHeldReleaseEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), parent, "engine", testClock)
+			require.Error(t, err)
+			require.Empty(t, evidence.items)
+			require.NotContains(t, err.Error(), "PrivateV3")
+			require.Equal(t, before, ir)
+		})
+	}
+}
+
+func TestHeldReleaseKeepsValidColumnarRawEvidence(t *testing.T) {
+	parent, state := nativeTarget(t)
+	ir := heldReplica(parent)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+	storeColumnarReplica(t, ir)
+	stored := ir.DeepCopy()
+	evidence, err := CollectHeldReleaseEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), parent, "engine", testClock)
+	require.NoError(t, err)
+	require.Len(t, evidence.items, 1)
+	require.Equal(t, stored.Status, evidence.items[0].Status)
+	plan, err := PrepareHeldRelease(parent, state, evidence, "engine", "aaaaaaaa", testClock)
+	require.NoError(t, err)
+	require.Equal(t, "81", plan.Target().ResourceVersion)
+	require.Equal(t, stored, ir)
+}
+
 func TestHeldReleaseCollectNeverAcceptsUncheckedTailOrContinuation(t *testing.T) {
 	for _, scenario := range []string{"two pages", "duplicate tail", "duplicate UID", "mismatched selector", "oversized page", "truncated", "loop token", "wrong list GVK", "nil list", "private list error", "private exact error", "exact changed", "aggregate bytes"} {
 		t.Run(scenario, func(t *testing.T) {

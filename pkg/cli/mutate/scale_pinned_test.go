@@ -90,6 +90,64 @@ func TestCollectScalePinnedTargetsExactPrivateSnapshots(t *testing.T) {
 	require.ErrorIs(t, err, ErrStale, "missing sibling authority must never pass")
 }
 
+func TestColumnarSelectedScaleRevalidationUsesRawSnapshot(t *testing.T) {
+	parent, _, replica, scale, source := scaleFixture(t)
+	replica.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+	storeColumnarReplica(t, replica)
+	stored := replica.DeepCopy()
+	evidence, err := InspectScaleEvidence(parent, replica, scale, source, testClock)
+	require.NoError(t, err)
+	require.Equal(t, stored, evidence.replica)
+	client := omefake.NewSimpleClientset(replica)
+	require.NoError(t, evidence.Revalidate(context.Background(), client.OmeV1beta1(), testClock))
+
+	changed := replica.DeepCopy()
+	changed.Status.InstanceStatusColumns.Phases[0].Value = v1beta1.OMENativeInstancePending
+	client.PrependReactor("get", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, changed, nil
+	})
+	require.ErrorIs(t, evidence.Revalidate(context.Background(), client.OmeV1beta1(), testClock), ErrStale)
+	require.Equal(t, stored, replica)
+}
+
+func TestColumnarScaleRevalidationRejectsEquivalentDenseSnapshot(t *testing.T) {
+	parent, _, replica, scale, source := scaleFixture(t)
+	replica.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+	storeColumnarReplica(t, replica)
+	evidence, err := InspectScaleEvidence(parent, replica, scale, source, testClock)
+	require.NoError(t, err)
+
+	dense := replica.DeepCopy()
+	dense.Status.InstanceStatusEncoding = nil
+	dense.Status.InstanceStatusColumns = nil
+	dense.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+	client := omefake.NewSimpleClientset(dense)
+	require.ErrorIs(t, evidence.Revalidate(context.Background(), client.OmeV1beta1(), testClock), ErrStale)
+}
+
+func TestColumnarPinnedSiblingScaleRevalidationUsesRawSnapshot(t *testing.T) {
+	evidence, _, sibling := completedScaleEvidenceFixture(t)
+	sibling.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+	storeColumnarReplica(t, sibling)
+	stored := sibling.DeepCopy()
+	client := omefake.NewSimpleClientset(evidence.replica, sibling)
+	collected, err := CollectScalePinnedTargets(context.Background(), client.OmeV1beta1(), evidence, testClock)
+	require.NoError(t, err)
+	require.Equal(t, stored, collected.replicas[v1beta1.DecoderComponent])
+	require.NoError(t, collected.Revalidate(context.Background(), client.OmeV1beta1(), testClock))
+
+	changed := sibling.DeepCopy()
+	changed.Status.InstanceStatusColumns.Phases[0].Value = v1beta1.OMENativeInstancePending
+	client.PrependReactor("get", "inferencereplicas", func(action ktesting.Action) (bool, runtime.Object, error) {
+		if action.(ktesting.GetAction).GetName() == sibling.Name {
+			return true, changed, nil
+		}
+		return false, nil, nil
+	})
+	require.ErrorIs(t, collected.Revalidate(context.Background(), client.OmeV1beta1(), testClock), ErrStale)
+	require.Equal(t, stored, sibling)
+}
+
 func TestCollectScalePinnedTargetsAndRevalidationFailureMatrix(t *testing.T) {
 	for _, mode := range []string{"none", "get error", "wrong component", "wrong key", "missing replicas", "invalid generation", "invalid ref", "invalid pinned run", "final drift", "final error"} {
 		t.Run(mode, func(t *testing.T) {

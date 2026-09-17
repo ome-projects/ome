@@ -212,6 +212,26 @@ func TestScaleTransientPhaseWithoutOperationRefuses(t *testing.T) {
 	}
 }
 
+func TestColumnarScaleRefusesLifecycleWork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  v1beta1.OMENativeInstanceStatus
+	}{
+		{name: "deleting operation", row: v1beta1.OMENativeInstanceStatus{Index: 0, Phase: v1beta1.OMENativeInstanceDeleting, Operation: &v1beta1.InstanceOperation{ID: "delete-0", Type: v1beta1.InstanceOperationDelete, Step: "Drain", StartedAt: metav1.NewTime(testNow.Add(-2e9)), LastProgressAt: metav1.NewTime(testNow.Add(-1e9))}}},
+		{name: "updating without operation", row: v1beta1.OMENativeInstanceStatus{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, _, replica, scale, source := scaleFixture(t)
+			replica.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{tc.row}
+			storeColumnarReplica(t, replica)
+			stored := replica.DeepCopy()
+			_, err := InspectScaleEvidence(parent, replica, scale, source, testClock)
+			require.ErrorIs(t, err, ErrScaleWork)
+			require.Equal(t, stored, replica)
+		})
+	}
+}
+
 func TestScalePacingRollbackMailboxRefuses(t *testing.T) {
 	p, _, r, s, source := scaleFixture(t)
 	r.Spec.Pacing = &v1beta1.InferenceReplicaPacing{RollbackToRevision: ptr.To("chat-engine-aaaaaaaa")}

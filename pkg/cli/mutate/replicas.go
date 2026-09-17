@@ -17,6 +17,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 var revisionHash = regexp.MustCompile(`^[0-9a-f]{8}$`)
@@ -88,7 +89,13 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 		}
 		seen[ir.Spec.Component] = true
 		if collected != nil {
-			*collected = append(*collected, *ir.DeepCopy())
+			copy := ir.DeepCopy()
+			if ir.Status.InstanceStatusEncoding != nil {
+				copy.Status.InstanceStatuses = evidence.rows
+				copy.Status.InstanceStatusEncoding = nil
+				copy.Status.InstanceStatusColumns = nil
+			}
+			*collected = append(*collected, *copy)
 		}
 		if slices.Contains(components, string(ir.Spec.Component)) {
 			revision := ir.Status.UpdateRevision
@@ -114,14 +121,12 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 	if ir.Kind != "" && ir.Kind != "InferenceReplica" || ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1" {
 		return ReplicaEvidence{}, ErrStale
 	}
-	if len(ir.OwnerReferences) > 16 || len(ir.Annotations) > 256 || len(ir.Status.InstanceStatuses) > 2048 || len(ir.Status.Migrations) > 256 || len(ir.Status.Conditions) > 64 {
+	if len(ir.OwnerReferences) > 16 || len(ir.Annotations) > 256 || len(ir.Status.Migrations) > 256 || len(ir.Status.Conditions) > 64 {
 		return ReplicaEvidence{}, ErrBounds
 	}
-	if !replicaPayloadBounded(ir) {
-		return ReplicaEvidence{}, ErrBounds
-	}
-	if !boundedPrivatePayload(ir) {
-		return ReplicaEvidence{}, ErrBounds
+	rows, err := actionLogicalRows(ir)
+	if err != nil {
+		return ReplicaEvidence{}, err
 	}
 	controllers := 0
 	for _, ref := range ir.OwnerReferences {
@@ -142,7 +147,7 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 		return ReplicaEvidence{}, ErrStale
 	}
 	if !slices.Contains(components, string(ir.Spec.Component)) {
-		return ReplicaEvidence{complete: true}, nil
+		return ReplicaEvidence{complete: true, rows: rows}, nil
 	}
 	validRevision := func(value string) bool {
 		return value == "" || strings.HasPrefix(value, ir.Name+"-") && len(value) == len(ir.Name)+9 && revisionHash.MatchString(strings.TrimPrefix(value, ir.Name+"-"))
@@ -158,7 +163,7 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 	if ir.Status.UpdatedReadyReplicas > ir.Status.UpdatedReplicas {
 		return ReplicaEvidence{}, ErrStale
 	}
-	result := ReplicaEvidence{complete: true, active: ir.Status.UpdateRevision != "" && ir.Status.CurrentRevision != ir.Status.UpdateRevision}
+	result := ReplicaEvidence{complete: true, active: ir.Status.UpdateRevision != "" && ir.Status.CurrentRevision != ir.Status.UpdateRevision, rows: rows}
 	indices := map[int32]bool{}
 	type migrationOperation struct {
 		index, sibling int32
@@ -166,7 +171,7 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 		phase          v1beta1.OMENativeInstancePhase
 	}
 	migrationOps := []migrationOperation{}
-	for _, row := range ir.Status.InstanceStatuses {
+	for _, row := range rows {
 		if row.Index < 0 || indices[row.Index] || row.Incarnation < 0 || !validRevision(row.RunningRevision) || !validRevision(row.TargetRevision) || len(row.Conditions) > 64 {
 			return ReplicaEvidence{}, ErrStale
 		}
@@ -248,6 +253,33 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 		}
 	}
 	return result, nil
+}
+
+// actionLogicalRows validates both stored representations without changing the
+// fetched object. Raw snapshots remain available for exact revalidation.
+func actionLogicalRows(ir *v1beta1.InferenceReplica) ([]v1beta1.OMENativeInstanceStatus, error) {
+	if ir == nil {
+		return nil, ErrStale
+	}
+	if len(ir.Status.InstanceStatuses) > 2048 || !replicaPayloadBounded(ir) || !boundedPrivatePayload(ir) {
+		return nil, ErrBounds
+	}
+	rows, _, err := irstatus.DecodeStatus(&ir.Status, 2048)
+	if err != nil {
+		if reason, ok := irstatus.ErrorReasonOf(err); ok && reason == irstatus.ErrorReasonCardinalityLimit {
+			return nil, ErrBounds
+		}
+		return nil, ErrStale
+	}
+	logical := *ir
+	logical.Status = ir.Status
+	logical.Status.InstanceStatuses = rows
+	logical.Status.InstanceStatusEncoding = nil
+	logical.Status.InstanceStatusColumns = nil
+	if !replicaPayloadBounded(&logical) || !boundedPrivatePayload(&logical) {
+		return nil, ErrBounds
+	}
+	return rows, nil
 }
 
 func validOperationPhase(kind v1beta1.InstanceOperationType, phase v1beta1.OMENativeInstancePhase) bool {

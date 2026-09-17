@@ -34,6 +34,7 @@ type ReplicaEvidence struct {
 	active          bool
 	operations      int
 	migrations      int
+	rows            []v1beta1.OMENativeInstanceStatus
 	uid             string
 	resourceVersion string
 	sources         map[v1beta1.ComponentType]string

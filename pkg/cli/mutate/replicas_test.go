@@ -15,7 +15,111 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
+
+func storeColumnarReplica(t *testing.T, ir *v1beta1.InferenceReplica) {
+	t.Helper()
+	columns, err := irstatus.EncodeColumns(ir.Status.InstanceStatuses, 2048)
+	require.NoError(t, err)
+	encoding := v1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatuses = nil
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = columns
+}
+
+func TestColumnarReplicaEvidenceRecognizesActiveRestart(t *testing.T) {
+	v := safeTarget()
+	ir := replicaFor(v)
+	ir.Status.UpdateRevision = ir.Status.CurrentRevision
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceRestarting, Operation: &v1beta1.InstanceOperation{ID: "restart-0-123", Type: v1beta1.InstanceOperationRestart, Step: "Drain", StartedAt: metav1.NewTime(testNow.Add(-2e9)), LastProgressAt: metav1.NewTime(testNow.Add(-1e9))}}}
+	storeColumnarReplica(t, ir)
+	stored := ir.DeepCopy()
+
+	evidence, err := CollectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), v, []string{"engine"}, testClock)
+	require.NoError(t, err)
+	require.True(t, evidence.complete)
+	require.True(t, evidence.active)
+	require.Equal(t, 1, evidence.operations)
+	require.Equal(t, stored, ir)
+}
+
+func TestColumnarReplicaCollectionRetainsUnselectedRows(t *testing.T) {
+	parent := safeTarget()
+	engine := replicaFor(parent)
+	decoder := replicaFor(parent)
+	decoder.Name = "chat-decoder"
+	decoder.Spec.Component = v1beta1.DecoderComponent
+	decoder.Status.CurrentRevision = "chat-decoder-aaaaaaaa"
+	decoder.Status.UpdateRevision = "chat-decoder-aaaaaaaa"
+	decoder.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 7, Phase: v1beta1.OMENativeInstanceReady}}
+	storeColumnarReplica(t, decoder)
+	stored := decoder.DeepCopy()
+	var collected []v1beta1.InferenceReplica
+
+	_, err := collectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(engine, decoder).OmeV1beta1(), parent, []string{"engine"}, testClock, &collected)
+	require.NoError(t, err)
+	require.Len(t, collected, 2)
+	for i := range collected {
+		if collected[i].Spec.Component == v1beta1.DecoderComponent {
+			require.Nil(t, collected[i].Status.InstanceStatusEncoding)
+			require.Nil(t, collected[i].Status.InstanceStatusColumns)
+			require.Equal(t, []v1beta1.OMENativeInstanceStatus{{Index: 7, Phase: v1beta1.OMENativeInstanceReady}}, collected[i].Status.InstanceStatuses)
+		}
+	}
+	require.Equal(t, stored, decoder)
+}
+
+func TestColumnarPauseRecognizesActiveOperation(t *testing.T) {
+	parent, state := nativeTarget(t)
+	ir := replicaFor(parent)
+	ir.Status.UpdateRevision = ir.Status.CurrentRevision
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceRestarting, Operation: &v1beta1.InstanceOperation{ID: "restart-0-123", Type: v1beta1.InstanceOperationRestart, Step: "Drain", StartedAt: metav1.NewTime(testNow.Add(-2e9)), LastProgressAt: metav1.NewTime(testNow.Add(-1e9))}}}
+	storeColumnarReplica(t, ir)
+
+	evidence, err := CollectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), parent, []string{"engine"}, testClock)
+	require.NoError(t, err)
+	plan, err := PrepareRollout(parent, state, evidence, "pause", false, true, testClock)
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"op":"test","path":"/metadata/uid","value":"uid-chat"},{"op":"test","path":"/metadata/resourceVersion","value":"42"},{"op":"add","path":"/metadata/annotations","value":{}},{"op":"add","path":"/metadata/annotations/ome.io~1rollout-paused","value":"true"}]`, string(plan.Patch()))
+}
+
+func TestColumnarReplicaEvidenceRefusesInvalidRepresentation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*v1beta1.InferenceReplica)
+		want error
+	}{
+		{name: "unknown encoding", edit: func(ir *v1beta1.InferenceReplica) {
+			unknown := v1beta1.InstanceStatusEncoding("PRIVATE_V3")
+			ir.Status.InstanceStatusEncoding = &unknown
+		}, want: ErrStale},
+		{name: "missing columns", edit: func(ir *v1beta1.InferenceReplica) { ir.Status.InstanceStatusColumns = nil }, want: ErrStale},
+		{name: "mixed rows", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+		}, want: ErrStale},
+		{name: "incomplete coverage", edit: func(ir *v1beta1.InferenceReplica) { ir.Status.InstanceStatusColumns.Members = "0-1" }, want: ErrStale},
+		{name: "over row cap", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Members = "0-2048"
+			ir.Status.InstanceStatusColumns.Phases[0].Indexes = "0-2048"
+		}, want: ErrBounds},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := safeTarget()
+			ir := replicaFor(parent)
+			ir.Status.UpdateRevision = ir.Status.CurrentRevision
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+			storeColumnarReplica(t, ir)
+			tc.edit(ir)
+			before := ir.DeepCopy()
+			evidence, err := CollectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(ir).OmeV1beta1(), parent, []string{"engine"}, testClock)
+			require.ErrorIs(t, err, tc.want)
+			require.False(t, evidence.complete)
+			require.NotContains(t, err.Error(), "PRIVATE_V3")
+			require.Equal(t, before, ir)
+		})
+	}
+}
 
 func replicaFor(v *v1beta1.InferenceService) *v1beta1.InferenceReplica {
 	controller := true

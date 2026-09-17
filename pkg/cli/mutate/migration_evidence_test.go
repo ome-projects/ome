@@ -52,6 +52,33 @@ func migrationKube(pods []corev1.Pod, cr *appsv1.ControllerRevision, extra ...ru
 	return kubefake.NewClientset(objects...)
 }
 
+func TestColumnarMigrationUsesReadyLogicalSource(t *testing.T) {
+	parent, state := nativeTarget(t)
+	ir, pods, cr := migrationSources(parent)
+	storeColumnarReplica(t, ir)
+	stored := ir.DeepCopy()
+	options := MigrationOptions{Component: v1beta1.EngineComponent, Instance: 3, RequestedBy: "kubectl-ome"}
+	ome := omefake.NewSimpleClientset(ir)
+	kube := migrationKube(pods, cr)
+
+	evidence, err := CollectMigrationEvidence(context.Background(), ome.OmeV1beta1(), kube, parent, []string{"engine"}, options, testClock)
+	require.NoError(t, err)
+	require.True(t, evidence.complete)
+	require.Equal(t, int32(3), evidence.source.Index)
+	require.Equal(t, "node-a", evidence.fromNode)
+	plan, err := PrepareMigration(parent, state, evidence, options, func() (string, error) { return migrationTestID, nil }, testClock)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Patch())
+	require.NoError(t, RecheckMigration(context.Background(), ome.OmeV1beta1(), kube, parent, plan, testClock))
+	ome.PrependReactor("get", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
+		changed := ir.DeepCopy()
+		changed.ResourceVersion = "82"
+		return true, changed, nil
+	})
+	require.Error(t, RecheckMigration(context.Background(), ome.OmeV1beta1(), kube, parent, plan, testClock))
+	require.Equal(t, stored, ir)
+}
+
 func TestMigrationSourceMembershipAndWholeBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name string
