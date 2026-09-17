@@ -43,7 +43,9 @@ lists or history. If a model is referenced, this path makes at most two exact
 model GETs to preserve controller validation. Auto-selection is not probed.
 Accelerator class checks use at most two exact GETs for current Engine/Decoder
 selections. Optional read failures remain typed Unavailable/Partial; use the
-dedicated commands for detail.`,
+dedicated commands for detail. Placement is parent-reported and
+freshness is unverifiable; candidate and Split-count summaries do not prove
+capacity, routing, or serving health. Use placement status for detail.`,
 		SilenceErrors: true, SilenceUsage: true,
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) != 1 {

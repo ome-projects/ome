@@ -119,6 +119,7 @@ func projectStatus(snapshot *report, clock r.Clock) (r.StatusReport, error) {
 	c.Traffic = projectStatusTraffic(v, r.ClockFunc(func() time.Time { return now }))
 	c.RuntimeSummary = projectStatusRuntime(snapshot, r.ClockFunc(func() time.Time { return now }))
 	c.Accelerator = projectStatusAccelerator(snapshot, r.ClockFunc(func() time.Time { return now }))
+	c.Placement = projectStatusPlacement(v, r.ClockFunc(func() time.Time { return now }))
 	result := r.NewStatusReport(r.Metadata{Name: v.Name, Namespace: v.Namespace}, c, r.ClockFunc(func() time.Time { return now }))
 	result.Sources = []r.SourceReference{{Kind: "InferenceService", Name: v.Name, Namespace: v.Namespace, Generation: v.Generation, Evidence: r.EvidenceObserved}}
 	return result.Canonical(), nil

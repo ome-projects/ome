@@ -49,12 +49,14 @@ func TestStatusDefaultsToCompactReport(t *testing.T) {
 			"Rollout              NotConfigured reported=NotConfigured\n"+
 			"Rollout evidence     Declared / NotApplicable\n"+
 			"Autoscaling          Unavailable / Unavailable parent status\n"+
+			"Placement            NotConfigured / NotApplicable / NotRecorded\n"+
 			"Traffic              Unavailable / Unavailable parent status\n"+
 			"Runtime active       NotConfigured / Unavailable\n"+
 			"Accelerator          NotConfigured / Unavailable\n"+
 			"Full safe values     Use -o json or -o yaml\n"+
 			"Rollout detail       kubectl ome rollout status NAME\n"+
 			"Autoscale detail     kubectl ome autoscale status NAME\n"+
+			"Placement detail     kubectl ome placement status NAME\n"+
 			"Traffic detail       kubectl ome traffic status NAME\n"+
 			"Runtime detail       kubectl ome runtime effective NAME\n"+
 			"Accelerator detail   kubectl ome accelerator explain NAME\n",
@@ -93,12 +95,16 @@ func TestStatusWidePreservesDetailedReport(t *testing.T) {
 			"Rollout evidence       Declared / NotApplicable\n"+
 			"Coordination Ready     NotApplicable\n"+
 			"Autoscaling            Unavailable / Unavailable parent status\n"+
+			"Placement              NotConfigured / NotApplicable / NotRecorded\n"+
+			"Placement evidence     Unavailable / NotApplicable\n"+
+			"Placement mode         NotApplicable\n"+
 			"Traffic                Unavailable / Unavailable parent status\n"+
 			"Runtime active         NotConfigured / Unavailable\n"+
 			"Accelerator            NotConfigured / Unavailable\n"+
 			"Full safe values       Use -o json or -o yaml\n"+
 			"Rollout detail         kubectl ome rollout status NAME\n"+
 			"Autoscale detail       kubectl ome autoscale status NAME\n"+
+			"Placement detail       kubectl ome placement status NAME\n"+
 			"Traffic detail         kubectl ome traffic status NAME\n"+
 			"Runtime detail         kubectl ome runtime effective NAME\n"+
 			"Accelerator detail     kubectl ome accelerator explain NAME\n"+

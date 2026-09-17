@@ -84,6 +84,7 @@ type StatusContent struct {
 	RecentEvents        []StatusEvent        `json:"recentEvents"`
 	Rollout             StatusRollout        `json:"rollout"`
 	Autoscale           StatusAutoscale      `json:"autoscale"`
+	Placement           StatusPlacement      `json:"placement"`
 	Traffic             StatusTraffic        `json:"traffic"`
 	RuntimeSummary      StatusRuntimeSummary `json:"runtimeSummary"`
 	Accelerator         StatusAccelerator    `json:"accelerator"`
@@ -205,6 +206,9 @@ func (c StatusContent) Canonical() StatusContent {
 	var autoscaleIssues []StatusIssueCode
 	c.Autoscale, autoscaleIssues = statusAutoscaleCanonical(c.Autoscale)
 	issues = append(issues, autoscaleIssues...)
+	var placementIssues []StatusIssueCode
+	c.Placement, placementIssues = statusPlacementCanonical(c.Placement)
+	issues = append(issues, placementIssues...)
 	c.Traffic = statusTrafficCanonical(c.Traffic)
 	c.RuntimeSummary = statusRuntimeCanonical(c.RuntimeSummary)
 	c.Accelerator = statusAcceleratorCanonical(c.Accelerator)
@@ -269,7 +273,7 @@ func statusIssues(values []StatusIssueCode) []StatusIssueCode {
 		return []StatusIssueCode{"CollectionLimitExceeded"}
 	}
 	for _, code := range values {
-		result = append(result, clusterEnum(code, StatusIssueCode("UnsupportedData"), "UnsupportedData", "UnsupportedComponent", "PodIdentityRejected", "PodMalformed", "EventIdentityRejected", "EventMalformed", "CollectionLimitExceeded", "RolloutUnavailable", "AutoscaleUnavailable", "InvalidGeneration", "OversizedConditionRecord", "InvalidConditionRecord", "FutureConditionTimestamp", "ConflictingReadyConditions", "DuplicateReadyConditions"))
+		result = append(result, clusterEnum(code, StatusIssueCode("UnsupportedData"), "UnsupportedData", "UnsupportedComponent", "PodIdentityRejected", "PodMalformed", "EventIdentityRejected", "EventMalformed", "CollectionLimitExceeded", "RolloutUnavailable", "AutoscaleUnavailable", "PlacementUnavailable", "InvalidGeneration", "OversizedConditionRecord", "InvalidConditionRecord", "FutureConditionTimestamp", "ConflictingReadyConditions", "DuplicateReadyConditions"))
 	}
 	slices.Sort(result)
 	return slices.Compact(result)
@@ -387,6 +391,21 @@ func (c StatusContent) table(wide bool) report.Table {
 			add("Autoscale issue", string(issue.Component)+" / "+string(issue.Code))
 		}
 	}
+	add("Placement", string(c.Placement.State)+" / "+string(c.Placement.Mode)+" / "+string(c.Placement.Phase))
+	if c.Placement.State == "Reported" || c.Placement.State == "Partial" {
+		add("Placement homes", fmt.Sprintf("%s %d/%d truncated=%t", c.Placement.Candidates.State, c.Placement.Candidates.Kept, c.Placement.Candidates.Total, c.Placement.Candidates.Truncated))
+		if c.Placement.ReportedCluster != "" {
+			add("Reported cluster", c.Placement.ReportedCluster)
+		}
+		add("Placement endpoint", string(c.Placement.EndpointState)+" (reported; not probed)")
+		if c.Placement.Mode == "Split" {
+			add("Placement replicas", "admitted="+statusPlacementCountCell(c.Placement.AdmittedReplicas)+" ready="+statusPlacementCountCell(c.Placement.ReadyReplicas)+" (reported)")
+		}
+	}
+	if wide {
+		add("Placement evidence", string(c.Placement.Evidence)+" / "+string(c.Placement.Freshness))
+		add("Placement mode", string(c.Placement.ModeEvidence))
+	}
 	add("Traffic", string(c.Traffic.State)+" / "+string(c.Traffic.Evidence)+" parent status")
 	if wide && c.Traffic.State != TrafficStateUnavailable {
 		add("Traffic policy Ready", string(c.Traffic.PolicyReady)+" / "+string(c.Traffic.PolicyFreshness))
@@ -434,6 +453,7 @@ func (c StatusContent) table(wide bool) report.Table {
 	add("Full safe values", "Use -o json or -o yaml")
 	add("Rollout detail", "kubectl ome rollout status NAME")
 	add("Autoscale detail", "kubectl ome autoscale status NAME")
+	add("Placement detail", "kubectl ome placement status NAME")
 	add("Traffic detail", "kubectl ome traffic status NAME")
 	add("Runtime detail", "kubectl ome runtime effective NAME")
 	add("Accelerator detail", "kubectl ome accelerator explain NAME")
