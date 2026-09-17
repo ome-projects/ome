@@ -98,11 +98,14 @@ data:
             action: drop
           {{- end }}
           # Address: replace the discovered port with prometheus.io/port
-          # when set on the pod.
+          # when set on the pod. The host is an IPv4 or a bracketed IPv6
+          # literal, so it is matched lazily up to the optional port rather
+          # than as a colon-free token; otherwise IPv6 pods keep every
+          # declared container port as a target, not just the annotated one.
           - source_labels:
               - __address__
               - __meta_kubernetes_pod_annotation_prometheus_io_port
-            regex: ([^:]+)(?::\d+)?;(\d+)
+            regex: (.+?)(?::\d+)?;(\d+)
             replacement: $1:$2
             target_label: __address__
             action: replace
@@ -152,10 +155,13 @@ data:
           - source_labels: [__meta_kubernetes_namespace]
             regex: {{ .Release.Namespace }}
             action: keep
+          # Same IPv4/IPv6-safe host match as the InferenceService job: the
+          # controller also exposes its webhook port, and an unrewritten
+          # address would scrape that HTTPS port with plain HTTP.
           - source_labels:
               - __address__
               - __meta_kubernetes_pod_annotation_prometheus_io_port
-            regex: ([^:]+)(?::\d+)?;(\d+)
+            regex: (.+?)(?::\d+)?;(\d+)
             replacement: $1:$2
             target_label: __address__
             action: replace

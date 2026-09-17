@@ -197,6 +197,16 @@ grep -Fq 'regex: "true;.*|.*;true"' <<<"${opt_in_scrape_config}" ||
 grep -Fq 'target_label: revision_hash' <<<"${prometheus_config}" ||
   fail "Prometheus revision_hash relabel was not rendered"
 
+# Pod addresses are IPv4 or bracketed IPv6 literals. A host pattern that
+# excludes colons never rewrites an IPv6 address to the annotated port, so
+# every declared container port stays a scrape target. Both pod jobs carry
+# the rewrite.
+[[ "$(grep -Fc 'regex: (.+?)(?::\d+)?;(\d+)' <<<"${prometheus_config}")" -eq 2 ]] ||
+  fail "Prometheus annotated-port relabel does not accept IPv6 addresses in both pod jobs"
+if grep -Fq 'regex: ([^:]+)(?::\d+)?;(\d+)' <<<"${prometheus_config}"; then
+  fail "Prometheus annotated-port relabel excludes IPv6 addresses"
+fi
+
 if grep -Fq -- '- job_name: extra-probe' <<<"${prometheus_config}"; then
   fail "extra scrape configs were rendered when unset"
 fi
