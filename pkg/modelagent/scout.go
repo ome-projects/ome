@@ -267,27 +267,33 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 			return
 		}
 
-		w.logger.Infof("Downloading BaseModel: %s in namespace %s", baseModel.Name, baseModel.Namespace)
-
-		IsTensorrtLLMModel := baseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-		modelType := string(constants.ServingBaseModel)
-		if modelTypeFromMetadata, ok := baseModel.Spec.AdditionalMetadata["type"]; ok {
-			modelType = modelTypeFromMetadata
-		}
-
-		gopherTask := &GopherTask{
-			TaskType:  Download,
-			BaseModel: baseModel,
-			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-				IsTensorrtLLMModel: IsTensorrtLLMModel,
-				ShapeAlias:         w.nodeShapeAlias,
-				ModelType:          modelType,
-			},
-		}
-
-		w.gopherChan <- gopherTask
+		w.enqueueBaseModelDownload(baseModel)
 	}
+}
+
+// enqueueBaseModelDownload uses the caller's eligibility decision without
+// adding a Node API request that could drop an otherwise valid update event.
+func (w *Scout) enqueueBaseModelDownload(baseModel *v1beta1.BaseModel) {
+	w.logger.Infof("Downloading BaseModel: %s in namespace %s", baseModel.Name, baseModel.Namespace)
+
+	IsTensorrtLLMModel := baseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
+
+	modelType := string(constants.ServingBaseModel)
+	if modelTypeFromMetadata, ok := baseModel.Spec.AdditionalMetadata["type"]; ok {
+		modelType = modelTypeFromMetadata
+	}
+
+	gopherTask := &GopherTask{
+		TaskType:  Download,
+		BaseModel: baseModel,
+		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
+			IsTensorrtLLMModel: IsTensorrtLLMModel,
+			ShapeAlias:         w.nodeShapeAlias,
+			ModelType:          modelType,
+		},
+	}
+
+	w.gopherChan <- gopherTask
 }
 
 func (w *Scout) downloadClusterBaseModel(obj interface{}) {
@@ -312,27 +318,33 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 			return
 		}
 
-		w.logger.Infof("Downloading ClusterBaseModel: %s", clusterBaseModel.Name)
-
-		IsTensorrtLLMModel := clusterBaseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-		modelType := string(constants.ServingBaseModel)
-		if modelTypeFromMetadata, ok := clusterBaseModel.Spec.AdditionalMetadata["type"]; ok {
-			modelType = modelTypeFromMetadata
-		}
-
-		gopherTask := &GopherTask{
-			TaskType:         Download,
-			ClusterBaseModel: clusterBaseModel,
-			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-				IsTensorrtLLMModel: IsTensorrtLLMModel,
-				ShapeAlias:         w.nodeShapeAlias,
-				ModelType:          modelType,
-			},
-		}
-
-		w.gopherChan <- gopherTask
+		w.enqueueClusterBaseModelDownload(clusterBaseModel)
 	}
+}
+
+// enqueueClusterBaseModelDownload shares normal task construction between add
+// events and newly eligible updates, which already checked node eligibility.
+func (w *Scout) enqueueClusterBaseModelDownload(clusterBaseModel *v1beta1.ClusterBaseModel) {
+	w.logger.Infof("Downloading ClusterBaseModel: %s", clusterBaseModel.Name)
+
+	IsTensorrtLLMModel := clusterBaseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
+
+	modelType := string(constants.ServingBaseModel)
+	if modelTypeFromMetadata, ok := clusterBaseModel.Spec.AdditionalMetadata["type"]; ok {
+		modelType = modelTypeFromMetadata
+	}
+
+	gopherTask := &GopherTask{
+		TaskType:         Download,
+		ClusterBaseModel: clusterBaseModel,
+		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
+			IsTensorrtLLMModel: IsTensorrtLLMModel,
+			ShapeAlias:         w.nodeShapeAlias,
+			ModelType:          modelType,
+		},
+	}
+
+	w.gopherChan <- gopherTask
 }
 
 func (w *Scout) updateBaseModel(old, new interface{}) {
@@ -343,37 +355,45 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	}
 	newBaseModel := new.(*v1beta1.BaseModel)
 
-	if w.shouldDownloadModel(oldBaseModel.Spec.Storage) &&
-		!w.shouldDownloadModel(newBaseModel.Spec.Storage) {
-		// shape config changed, delete it from the current node
-		w.logger.Infof("Target shapes excluded BaseModel update: %s in namespace %s, deleting", newBaseModel.GetName(), newBaseModel.GetNamespace())
-		w.deleteBaseModel(new)
-		return
-	}
-
 	if !newBaseModel.ObjectMeta.DeletionTimestamp.IsZero() {
 		w.logger.Infof("Resource has deletion timestamp: BaseModel '%s', processing delete", newBaseModel.Name)
 		w.deleteBaseModel(newBaseModel)
 		return
 	}
 
+	// Placement changes add or remove this node without refreshing an artifact
+	// on a node that remains eligible.
+	wasEligible := w.shouldDownloadModel(oldBaseModel.Spec.Storage)
+	isEligible := w.shouldDownloadModel(newBaseModel.Spec.Storage)
+	switch {
+	case wasEligible && !isEligible:
+		w.logger.Infof("BaseModel %s in namespace %s no longer matches this node, deleting", newBaseModel.Name, newBaseModel.Namespace)
+		w.deleteBaseModel(newBaseModel)
+		return
+	case !wasEligible && isEligible:
+		w.enqueueBaseModelDownload(newBaseModel)
+		return
+	case !isEligible:
+		return
+	}
+
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnBM(oldBaseModel, newBaseModel)
 
-	// Exclude DownloadPolicy from Spec diff — policy changes are detected separately above.
-	ignoreDownloadPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy")
+	// Placement and download policy are handled separately above.
+	ignorePlacementAndPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy", "NodeAffinity", "NodeSelector")
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
 		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
-	}, ignoreDownloadPolicy)
+	}, ignorePlacementAndPolicy)
 	if err != nil {
 		w.logger.Errorf("Failed to diff BaseModel %s in namespace %s: %v",
 			newBaseModel.Name, newBaseModel.Namespace, err)
 		return
 	}
 
-	if (policyChanged || hasChanges) && w.shouldDownloadModel(newBaseModel.Spec.Storage) {
+	if policyChanged || hasChanges {
 		w.logger.Infof("BaseModel %s needs refresh in namespace %s", newBaseModel.GetName(), newBaseModel.GetNamespace())
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
 	}
@@ -392,36 +412,44 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		return
 	}
 
-	if w.shouldDownloadModel(oldClusterBaseModel.Spec.Storage) &&
-		!w.shouldDownloadModel(newClusterBaseModel.Spec.Storage) {
-		// shape config changed, delete it from the current node
-		w.logger.Infof("Target shapes excluded ClusterBaseModel %s, deleting", newClusterBaseModel.GetName())
-		w.deleteClusterBaseModel(new)
-		return
-	}
-
 	if !newClusterBaseModel.ObjectMeta.DeletionTimestamp.IsZero() {
 		w.logger.Infof("Resource has deletion timestamp: ClusterBaseModel '%s', processing delete", newClusterBaseModel.Name)
 		w.deleteClusterBaseModel(newClusterBaseModel)
 		return
 	}
 
+	// Placement changes add or remove this node without refreshing an artifact
+	// on a node that remains eligible.
+	wasEligible := w.shouldDownloadModel(oldClusterBaseModel.Spec.Storage)
+	isEligible := w.shouldDownloadModel(newClusterBaseModel.Spec.Storage)
+	switch {
+	case wasEligible && !isEligible:
+		w.logger.Infof("ClusterBaseModel %s no longer matches this node, deleting", newClusterBaseModel.Name)
+		w.deleteClusterBaseModel(newClusterBaseModel)
+		return
+	case !wasEligible && isEligible:
+		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
+		return
+	case !isEligible:
+		return
+	}
+
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel)
 
-	// Exclude DownloadPolicy from Spec diff — policy changes are detected separately above.
-	ignoreDownloadPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy")
+	// Placement and download policy are handled separately above.
+	ignorePlacementAndPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy", "NodeAffinity", "NodeSelector")
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
 		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
-	}, ignoreDownloadPolicy)
+	}, ignorePlacementAndPolicy)
 	if err != nil {
 		w.logger.Errorf("Failed to diff ClusterBaseModel %s: %v", newClusterBaseModel.Name, err)
 		return
 	}
 
-	if (policyChanged || hasChanges) && w.shouldDownloadModel(newClusterBaseModel.Spec.Storage) {
+	if policyChanged || hasChanges {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
 	}
