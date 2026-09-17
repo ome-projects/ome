@@ -43,6 +43,10 @@ const (
 	ReasonRolloutNotRecorded     Reason = "RolloutNotRecorded"
 	ReasonInvalidRollout         Reason = "InvalidRollout"
 	ReasonRolloutInspectionLimit Reason = "RolloutInspectionLimit"
+	ReasonMigrationMatched       Reason = "MigrationMatched"
+	ReasonMigrationNotRecorded   Reason = "MigrationNotRecorded"
+	ReasonMigrationInProgress    Reason = "MigrationInProgress"
+	ReasonInvalidMigration       Reason = "InvalidMigration"
 )
 
 type Error struct{ Reason Reason }
@@ -77,6 +81,7 @@ type Counts struct{ Gets, Watches, Polls, Events, Observations int }
 type Options struct {
 	Timeout, PollInterval time.Duration
 	EventBudget           int
+	PollOnly              bool
 	Clock                 clock.Clock
 }
 type Result[T any] struct {
@@ -222,6 +227,9 @@ func (s *runState[T]) run() error {
 	if stop, err := s.get(); stop {
 		return err
 	}
+	if s.options.PollOnly {
+		return s.poll()
+	}
 	for endings := 0; endings < 2; endings++ {
 		if stop, err := s.canceled(); stop {
 			return err
@@ -318,7 +326,7 @@ func (s *runState[T]) consume(w watch.Interface) (stop, poll bool, err error) {
 }
 
 func (s *runState[T]) poll() error {
-	s.result.Fallback = true
+	s.result.Fallback = !s.options.PollOnly
 	for {
 		timer := s.options.Clock.NewTimer(s.options.PollInterval)
 		select {

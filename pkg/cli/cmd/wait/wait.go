@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
@@ -18,14 +19,17 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
+	"sigs.k8s.io/ome/pkg/cli/waitmigration"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
 	"sigs.k8s.io/ome/pkg/cli/waitrollout"
 	"sigs.k8s.io/ome/pkg/cli/waitsource"
+	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
 
 var (
 	errFlags     = errors.New("InvalidWaitFlags")
-	errPredicate = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown] or rollout=stable|failed|rolled-back")
+	errPredicate = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, or migration=terminal")
+	errRequestID = errors.New("InvalidMigrationRequestID: require canonical UUID only with migration=terminal")
 	errName      = errors.New("InvalidInferenceServiceName")
 	errNamespace = errors.New("InvalidNamespace")
 	errTimeout   = errors.New("InvalidWaitTimeout: require positive duration no greater than 24h")
@@ -36,14 +40,16 @@ var (
 )
 
 type options struct {
-	streams          genericiooptions.IOStreams
-	forValue, output string
-	timeout          time.Duration
-	requested        corev1.ConditionStatus
-	requestedRollout reportv1alpha1.WaitRequested
-	format           report.Format
-	wide             bool
-	clock            clock.Clock
+	streams            genericiooptions.IOStreams
+	forValue, output   string
+	timeout            time.Duration
+	requested          corev1.ConditionStatus
+	requestedRollout   reportv1alpha1.WaitRequested
+	requestedMigration bool
+	requestID          string
+	format             report.Format
+	wide               bool
+	clock              clock.Clock
 }
 
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -53,13 +59,19 @@ func newCmd(f factory.Factory, streams genericiooptions.IOStreams, clock clock.C
 	o := options{streams: streams, clock: clock}
 	cmd := &cobra.Command{
 		Use:   "wait INFERENCESERVICE --for=PREDICATE",
-		Short: "Wait for an explicit reported service condition or rollout state",
-		Long: `Wait for the requested reported Ready condition or rollout on one bound service.
+		Short: "Wait for a reported service condition, rollout, or migration",
+		Long: `Wait for a reported condition, rollout, or migration on one bound service.
 --for is required; omitted condition status means True. Missing Ready is
 NotRecorded, not the explicit Unknown status. The timeout defaults to 60s
 and must be positive and no greater than 24h.
 
-Use condition=Ready[=True|False|Unknown] or rollout=stable|failed|rolled-back.
+Use condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back,
+or migration=terminal with a canonical --request-id UUID. Migration matches
+only that exact request in a complete, current, owned InferenceReplica status
+snapshot. Completed, Failed, and Relocated are all terminal outcomes; a match
+does not imply success. Missing, invalid, partial, or stale evidence does not
+match. The migration path polls bounded parent/IR reads every 5s because a
+parent watch need not observe IR-only status updates.
 Rollout assertions use qualified canonical aggregate ReportedState:
 stable means Succeeded, not NotConfigured or Staged; failed means Failed;
 rolled-back means RolledBack. Missing or invalid evidence never matches.
@@ -71,15 +83,18 @@ API/configuration/output failures and parent cancellation return exit 1.
 Generation freshness is Unverifiable: reported Ready is not proof of
 current-spec or rollout convergence. No controller algorithms are reproduced.
 
-The command uses only a named GET and an exact-name WATCH, with bounded
-named-GET polling fallback. Cancellation/deadlines are cooperative;
+Ready and rollout use a named GET and exact-name WATCH with bounded named-GET
+polling fallback. Migration uses a named parent GET plus bounded related-IR
+reads; it does not claim parent-watch observation of IR-only changes.
+Cancellation/deadlines are cooperative;
 external credential plugins or custom transports may ignore cancellation.
 One final typed report is emitted; no raw conditions or API objects are printed.`,
 		Example: `  kubectl ome wait chat --for=condition=Ready -n prod
   kubectl ome wait chat --for=condition=Ready=False --timeout=2m -o json
   kubectl ome wait chat --for=condition=Ready=Unknown -o wide
   kubectl ome wait chat --for=rollout=stable --timeout=2m -o json
-  kubectl ome wait chat --for=rollout=failed -o wide`,
+  kubectl ome wait chat --for=rollout=failed -o wide
+  kubectl ome wait chat --for=migration=terminal --request-id=12345678-1234-4234-8234-123456789abc -n prod`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := o.validate(args[0]); err != nil {
@@ -89,7 +104,8 @@ One final typed report is emitted; no raw conditions or API objects are printed.
 		},
 	}
 	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errFlags })
-	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown] or rollout=stable|failed|rolled-back")
+	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, or migration=terminal")
+	cmd.Flags().StringVar(&o.requestID, "request-id", "", "Canonical migration UUID, required only for migration=terminal")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 60*time.Second, "Positive wait timeout, at most 24h")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
@@ -100,6 +116,7 @@ func (o *options) validate(name string) error {
 	}
 	o.requested = ""
 	o.requestedRollout = ""
+	o.requestedMigration = false
 	o.wide = false
 	switch o.forValue {
 	case "condition=Ready", "condition=Ready=True":
@@ -114,8 +131,18 @@ func (o *options) validate(name string) error {
 		o.requestedRollout = reportv1alpha1.WaitRequestedRolloutFailed
 	case "rollout=rolled-back":
 		o.requestedRollout = reportv1alpha1.WaitRequestedRolloutRolledBack
+	case "migration=terminal":
+		o.requestedMigration = true
 	default:
 		return errPredicate
+	}
+	if o.requestedMigration {
+		parsed, err := uuid.Parse(o.requestID)
+		if err != nil || parsed.String() != o.requestID || parsed.Variant() != uuid.RFC4122 || parsed.Version() < 1 || parsed.Version() > 8 {
+			return errRequestID
+		}
+	} else if o.requestID != "" {
+		return errRequestID
 	}
 	if o.timeout <= 0 || o.timeout > 24*time.Hour {
 		return errTimeout
@@ -142,6 +169,9 @@ func (o *options) run(ctx context.Context, f factory.Factory, name string) error
 	}
 	if len(utilvalidation.IsDNS1123Label(namespace)) > 0 {
 		return errNamespace
+	}
+	if o.requestedMigration {
+		return o.runMigration(ctx, f, name, namespace)
 	}
 	config, err := f.RESTConfig()
 	if err != nil {
@@ -181,6 +211,68 @@ func (o *options) run(ctx context.Context, f factory.Factory, name string) error
 		err = reportValue.WideTable().Write(o.streams.Out)
 	} else {
 		err = report.Write(o.streams.Out, o.format, reportValue)
+	}
+	if err != nil {
+		return errOutput
+	}
+	if ctx.Err() != nil {
+		return &waitengine.Error{Reason: waitengine.ReasonCanceled}
+	}
+	if result.Outcome != waitengine.OutcomeMatched {
+		return &exitcode.UnmetAssertionError{Err: errUnmet}
+	}
+	return nil
+}
+
+func (o *options) runMigration(ctx context.Context, f factory.Factory, name, namespace string) error {
+	var client versioned.Interface
+	var err error
+	if scoped, ok := f.(factory.ActionReadClientsResolver); ok {
+		client, err = scoped.OMEClientForAction(ctx)
+	} else {
+		client, err = f.OMEClient()
+	}
+	if err != nil || client == nil {
+		return errConfig
+	}
+	source := waitmigration.NewSource(client.OmeV1beta1(), namespace, name, o.clock.Now)
+	evaluator := &waitmigration.Evaluator{}
+	observed := reportv1alpha1.WaitMigrationObservation{
+		RequestID: o.requestID, Phase: reportv1alpha1.MigrationPhaseUnknown,
+		Outcome: reportv1alpha1.MigrationOutcomeUnknown, Validity: "Unavailable",
+	}
+	predicate := func(v reportv1alpha1.MigrationStatusReport) (waitengine.Decision, error) {
+		decision, observation := evaluator.Evaluate(v, o.requestID)
+		observed = observation
+		return decision, nil
+	}
+	result, err := waitengine.Run(ctx, source, predicate, waitengine.Options{Timeout: o.timeout, Clock: o.clock, PollOnly: true})
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return &waitengine.Error{Reason: waitengine.ReasonCanceled}
+	}
+	// Replacement, deletion, and absence end the parent binding before another
+	// predicate evaluation. The previous IR record is no longer live evidence.
+	if result.Outcome == waitengine.OutcomeReplaced || result.Outcome == waitengine.OutcomeDeleted || result.Outcome == waitengine.OutcomeNotFound {
+		observed = reportv1alpha1.WaitMigrationObservation{
+			RequestID: o.requestID, Phase: reportv1alpha1.MigrationPhaseUnknown,
+			Outcome: reportv1alpha1.MigrationOutcomeUnknown, Validity: "Unavailable",
+		}
+		result.Reason = waitengine.ReasonMigrationNotRecorded
+	}
+	content := reportv1alpha1.WaitContent{
+		Requested: reportv1alpha1.WaitRequestedMigrationTerminal, Outcome: result.Outcome, Reason: result.Reason,
+		Migration: &observed, ElapsedMilliseconds: result.Elapsed.Milliseconds(),
+		Counts: reportv1alpha1.WaitCounts{Gets: result.Counts.Gets, Watches: result.Counts.Watches, Polls: result.Counts.Polls, Events: result.Counts.Events, Observations: result.Counts.Observations},
+		Method: result.Method, Fallback: result.Fallback,
+	}
+	value := reportv1alpha1.NewWaitReport(reportv1alpha1.Metadata{Namespace: namespace, Name: name}, content, reportv1alpha1.ClockFunc(o.clock.Now))
+	if o.wide {
+		err = value.WideTable().Write(o.streams.Out)
+	} else {
+		err = report.Write(o.streams.Out, o.format, value)
 	}
 	if err != nil {
 		return errOutput

@@ -220,6 +220,28 @@ func TestForbiddenWatchFallsBackToBoundedPolling(t *testing.T) {
 	require.Equal(t, MethodPoll, c.result.Method)
 	require.Equal(t, 1, c.result.Counts.Polls)
 }
+func TestPollOnlySkipsWatchAndKeepsFallbackFalse(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	snap := falseSnapshot()
+	ready := snap
+	ready.Value = true
+	s := sourceFor(response{snapshot: snap}, response{snapshot: ready})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk, PollOnly: true})
+	request(t, s, "get")
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	clk.Step(5 * time.Second)
+	request(t, s, "get")
+	c := finish(t, done)
+	require.NoError(t, c.err)
+	require.Equal(t, OutcomeMatched, c.result.Outcome)
+	require.Equal(t, MethodPoll, c.result.Method)
+	require.False(t, c.result.Fallback)
+	require.Equal(t, 0, c.result.Counts.Watches)
+	require.Equal(t, 1, c.result.Counts.Polls)
+	require.Empty(t, s.requests)
+}
 func TestInitialAndLaterNotFound(t *testing.T) {
 	nf := apierrors.NewNotFound(schema.GroupResource{Resource: "inferenceservices"}, "private")
 	s := sourceFor(response{err: nf})

@@ -23,6 +23,7 @@ const (
 	WaitRequestedRolloutStable     WaitRequested = "Rollout=Stable"
 	WaitRequestedRolloutFailed     WaitRequested = "Rollout=Failed"
 	WaitRequestedRolloutRolledBack WaitRequested = "Rollout=RolledBack"
+	WaitRequestedMigrationTerminal WaitRequested = "Migration=Terminal"
 )
 
 type WaitCounts struct {
@@ -38,6 +39,7 @@ type WaitContent struct {
 	Reason              waitengine.Reason         `json:"reason"`
 	Observed            waitpredicate.Observation `json:"observed"`
 	Rollout             *WaitRolloutObservation   `json:"rollout,omitempty"`
+	Migration           *WaitMigrationObservation `json:"migration,omitempty"`
 	Evidence            EvidenceLevel             `json:"evidence"`
 	ElapsedMilliseconds int64                     `json:"elapsedMilliseconds"`
 	Counts              WaitCounts                `json:"counts"`
@@ -61,7 +63,7 @@ func (r WaitReport) Canonical() WaitReport {
 	return r
 }
 func (c WaitContent) Canonical() WaitContent {
-	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() {
+	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() {
 		c.Requested = "Unknown"
 	}
 	switch c.Outcome {
@@ -71,8 +73,15 @@ func (c WaitContent) Canonical() WaitContent {
 	}
 	switch c.Reason {
 	case waitengine.ReasonMatched, waitengine.ReasonNotRecorded, waitengine.ReasonNotMatched, waitengine.ReasonInvalidCondition:
+		if c.Requested.IsMigration() {
+			c.Reason = "PredicateUnmet"
+		}
 	case waitengine.ReasonRolloutMatched, waitengine.ReasonRolloutNotMatched, waitengine.ReasonRolloutNotRecorded, waitengine.ReasonInvalidRollout:
 		if !c.Requested.IsRollout() {
+			c.Reason = "PredicateUnmet"
+		}
+	case waitengine.ReasonMigrationMatched, waitengine.ReasonMigrationNotRecorded, waitengine.ReasonMigrationInProgress, waitengine.ReasonInvalidMigration:
+		if !c.Requested.IsMigration() {
 			c.Reason = "PredicateUnmet"
 		}
 	default:
@@ -137,6 +146,29 @@ func (c WaitContent) Canonical() WaitContent {
 	} else {
 		c.Rollout = nil
 	}
+	if c.Requested.IsMigration() {
+		if c.Migration == nil {
+			c.Migration = &WaitMigrationObservation{Phase: MigrationPhaseUnknown, Outcome: MigrationOutcomeUnknown, Validity: "Unavailable"}
+		}
+		migration := c.Migration.Canonical()
+		if c.Outcome == waitengine.OutcomeMatched &&
+			(migration.Validity != "Valid" ||
+				migration.Phase != MigrationPhaseCompleted && migration.Phase != MigrationPhaseFailed && migration.Phase != MigrationPhaseRelocated) {
+			// A terminal assertion cannot be matched by malformed or active
+			// evidence, even if a caller constructs this report directly.
+			migration.Validity = "Invalid"
+			c.Outcome = "Unknown"
+			c.Reason = waitengine.ReasonInvalidMigration
+		}
+		c.Migration = &migration
+		c.Observed = waitpredicate.Observation{Status: "NotRecorded", Validity: "Unavailable", GenerationFreshness: "Unverifiable", Inspection: waitpredicate.Inspection{State: "NotInspected", Warnings: []waitpredicate.Warning{}}}
+		c.Evidence = EvidenceUnavailable
+		if migration.Validity == "Valid" {
+			c.Evidence = EvidenceReported
+		}
+	} else {
+		c.Migration = nil
+	}
 	return c
 }
 func (r WaitReport) Table() report.Table {
@@ -150,6 +182,38 @@ func (r WaitReport) WideTable() report.Table {
 func (c WaitContent) Table() report.Table { return WaitReport{Content: c.Canonical()}.table(false) }
 func (r WaitReport) table(wide bool) report.Table {
 	c := r.Content
+	if c.Migration != nil {
+		migration := c.Migration
+		attribution := "Exact request ID in live IR status"
+		if migration.Validity == "Unavailable" {
+			attribution = "No verified matching IR record"
+		} else if migration.Validity != "Valid" {
+			attribution = "Unverifiable; incomplete IR evidence"
+		} else if c.Outcome == waitengine.OutcomeTimedOut {
+			attribution = "Last observed exact IR record; terminal unverified"
+		}
+		rows := [][]string{
+			{"Service", r.Metadata.Namespace + "/" + r.Metadata.Name},
+			{"Requested", string(c.Requested)}, {"Request ID", migration.RequestID},
+			{"Outcome", string(c.Outcome)}, {"Migration phase", string(migration.Phase)},
+			{"Migration outcome", string(migration.Outcome)}, {"Component", string(migration.Component)},
+			{"Migration validity", migration.Validity}, {"Reason", string(c.Reason)},
+			{"Evidence", string(c.Evidence)}, {"Attribution", attribution},
+			{"Source method", string(c.Method)}, {"Polling fallback", strconv.FormatBool(c.Fallback)},
+			{"Elapsed milliseconds", strconv.FormatInt(c.ElapsedMilliseconds, 10)},
+			{"GET / WATCH / polls", fmt.Sprintf("%d / %d / %d", c.Counts.Gets, c.Counts.Watches, c.Counts.Polls)},
+		}
+		if wide {
+			rows = append(rows, []string{"Inspected IR sources", strconv.Itoa(migration.InspectedSources)},
+				[]string{"Inspected records", strconv.Itoa(migration.InspectedRecords)},
+				[]string{"Cancellation", "Cooperative requests; plugins may ignore it"})
+		}
+		for i := range rows {
+			rows[i][0] = printers.BoundedCell(rows[i][0], 22)
+			rows[i][1] = printers.BoundedCell(rows[i][1], 54)
+		}
+		return report.Table{Headers: []string{"FIELD", "VALUE"}, Rows: rows}
+	}
 	rows := [][]string{
 		{"Service", r.Metadata.Namespace + "/" + r.Metadata.Name},
 		{"Requested", string(c.Requested)},
