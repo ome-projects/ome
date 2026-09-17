@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/cli/printers"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 type listFunc func(ctx context.Context, f factory.Factory, ns string, opts metav1.ListOptions) ([]runtime.Object, error)
@@ -708,6 +709,7 @@ var inferenceReplicasEntry = &entry{
 		{Name: "REASON", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return inferenceReplicaLifecycle(r).reason })},
 		{Name: "SERVING", Wide: true, Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return fmt.Sprintf("%d", r.Status.ServingReplicas) })},
 		{Name: "UPDATED", Wide: true, Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return fmt.Sprintf("%d", r.Status.UpdatedReplicas) })},
+		{Name: "ENCODING", Wide: true, Extract: safeCol(inferenceReplicaEncoding)},
 		{Name: "CURRENT-REVISION", Wide: true, Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return printers.OrDash(r.Status.CurrentRevision) })},
 		{Name: "UPDATE-REVISION", Wide: true, Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return printers.OrDash(r.Status.UpdateRevision) })},
 		{Name: "MIGRATIONS", Wide: true, Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return fmt.Sprintf("%d", len(r.Status.Migrations)) })},
@@ -748,6 +750,20 @@ func int32OrDash(value *int32) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", *value)
+}
+
+// inferenceReplicaEncoding reports only the stored representation, not the
+// validity of individual rows. The shared codec's union guard prevents an
+// unmarked status carrying columns from being mistaken for DenseV1.
+func inferenceReplicaEncoding(replica *v1beta1.InferenceReplica) string {
+	encoding, err := irstatus.ObservedEncoding(&replica.Status)
+	if err != nil {
+		if reason, ok := irstatus.ErrorReasonOf(err); ok && reason == irstatus.ErrorReasonUnknownEncoding {
+			return "Unknown"
+		}
+		return "Invalid"
+	}
+	return string(encoding)
 }
 
 type inferenceReplicaLifecycleValue struct {
