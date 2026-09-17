@@ -83,6 +83,7 @@ type StatusContent struct {
 	Events              StatusCollection  `json:"events"`
 	RecentEvents        []StatusEvent     `json:"recentEvents"`
 	Rollout             StatusRollout     `json:"rollout"`
+	Autoscale           StatusAutoscale   `json:"autoscale"`
 	Issues              []StatusIssueCode `json:"issues"`
 }
 type StatusReport struct{ Envelope[StatusContent] }
@@ -198,6 +199,9 @@ func (c StatusContent) Canonical() StatusContent {
 	}
 	slices.Sort(rolloutWarnings)
 	c.Rollout.Warnings = slices.Compact(rolloutWarnings)
+	var autoscaleIssues []StatusIssueCode
+	c.Autoscale, autoscaleIssues = statusAutoscaleCanonical(c.Autoscale)
+	issues = append(issues, autoscaleIssues...)
 	c.Issues = statusIssues(issues)
 	return c
 }
@@ -259,7 +263,7 @@ func statusIssues(values []StatusIssueCode) []StatusIssueCode {
 		return []StatusIssueCode{"CollectionLimitExceeded"}
 	}
 	for _, code := range values {
-		result = append(result, clusterEnum(code, StatusIssueCode("UnsupportedData"), "UnsupportedData", "UnsupportedComponent", "PodIdentityRejected", "PodMalformed", "EventIdentityRejected", "EventMalformed", "CollectionLimitExceeded", "RolloutUnavailable", "InvalidGeneration", "OversizedConditionRecord", "InvalidConditionRecord", "FutureConditionTimestamp", "ConflictingReadyConditions", "DuplicateReadyConditions"))
+		result = append(result, clusterEnum(code, StatusIssueCode("UnsupportedData"), "UnsupportedData", "UnsupportedComponent", "PodIdentityRejected", "PodMalformed", "EventIdentityRejected", "EventMalformed", "CollectionLimitExceeded", "RolloutUnavailable", "AutoscaleUnavailable", "InvalidGeneration", "OversizedConditionRecord", "InvalidConditionRecord", "FutureConditionTimestamp", "ConflictingReadyConditions", "DuplicateReadyConditions"))
 	}
 	slices.Sort(result)
 	return slices.Compact(result)
@@ -356,6 +360,23 @@ func (c StatusContent) table(wide bool) report.Table {
 			add("Rollout warning", string(code))
 		}
 	}
+	add("Autoscaling", string(c.Autoscale.Summary.State)+" / "+string(c.Autoscale.Evidence)+" parent status")
+	for _, component := range c.Autoscale.Components {
+		counts := "-"
+		if component.CurrentReplicas != nil && component.DesiredReplicas != nil {
+			counts = fmt.Sprintf("%d->%d", *component.CurrentReplicas, *component.DesiredReplicas)
+		}
+		add("Scale "+string(component.Type), fmt.Sprintf("%s %s/%s %s (%s)", component.State, component.Class, component.ManagedBy, counts, component.ReplicaEvidence))
+		if wide {
+			add("Scale target", string(component.Type)+" / "+string(component.TargetEvidence))
+			add("Scale conditions", string(component.Type)+" / "+string(component.ConditionEvidence))
+		}
+	}
+	if wide {
+		for _, issue := range c.Autoscale.Issues {
+			add("Autoscale issue", string(issue.Component)+" / "+string(issue.Code))
+		}
+	}
 	for _, event := range c.RecentEvents {
 		add("Warning "+event.Kind, event.Name+" "+event.Reason)
 		if wide {
@@ -371,5 +392,6 @@ func (c StatusContent) table(wide bool) report.Table {
 	}
 	add("Full safe values", "Use -o json or -o yaml")
 	add("Rollout detail", "kubectl ome rollout status NAME")
+	add("Autoscale detail", "kubectl ome autoscale status NAME")
 	return t
 }

@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"knative.dev/pkg/apis"
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/autoscaleprojection"
 	r "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/rolloutprojection"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
@@ -85,9 +86,54 @@ func projectStatus(snapshot *report, clock r.Clock) (r.StatusReport, error) {
 	} else {
 		c.Issues = append(c.Issues, "CollectionLimitExceeded", "RolloutUnavailable")
 	}
+	if statusAutoscaleWithinBounds(v) {
+		autoscale, projectionErr := autoscaleprojection.Project(v, r.ClockFunc(func() time.Time { return now }))
+		if projectionErr != nil {
+			return r.StatusReport{}, errStatusSource
+		}
+		c.Autoscale.Summary = autoscale.Content.Summary
+		c.Autoscale.Evidence = r.EvidenceReported
+		if len(autoscale.Content.Components) == 0 && autoscale.Content.Summary.State == r.AutoscaleStateUnavailable {
+			c.Autoscale.Evidence = r.EvidenceUnavailable
+		}
+		for _, component := range autoscale.Content.Components {
+			c.Autoscale.Components = append(c.Autoscale.Components, r.StatusAutoscaleComponent{
+				Type: component.Type, State: component.State, Class: component.Class,
+				ManagedBy: component.ManagedBy, TargetEvidence: component.Target.State,
+				ReplicaEvidence:   component.Replicas.State,
+				ConditionEvidence: component.Conditions.State,
+				CurrentReplicas:   component.Replicas.CurrentReplicas,
+				DesiredReplicas:   component.Replicas.DesiredReplicas,
+			})
+		}
+		c.Autoscale.Issues = autoscale.Content.Issues
+	} else {
+		c.Autoscale.Summary.State = r.AutoscaleStateUnavailable
+		c.Autoscale.Evidence = r.EvidenceUnavailable
+		c.Issues = append(c.Issues, "CollectionLimitExceeded", "AutoscaleUnavailable")
+	}
 	result := r.NewStatusReport(r.Metadata{Name: v.Name, Namespace: v.Namespace}, c, r.ClockFunc(func() time.Time { return now }))
 	result.Sources = []r.SourceReference{{Kind: "InferenceService", Name: v.Name, Namespace: v.Namespace, Generation: v.Generation, Evidence: r.EvidenceObserved}}
 	return result.Canonical(), nil
+}
+
+func statusAutoscaleWithinBounds(v *ome.InferenceService) bool {
+	if len(v.Status.Components) > 3 {
+		return false
+	}
+	for _, component := range v.Status.Components {
+		if component.Autoscaler != nil {
+			if len(component.Autoscaler.Conditions) > 64 {
+				return false
+			}
+			for _, condition := range component.Autoscaler.Conditions {
+				if len(condition.Type) > 256 || len(condition.Reason) > 1024 || len(condition.Message) > 4096 {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // Only exact labelled, namespace-bound, unambiguous Pod identities may

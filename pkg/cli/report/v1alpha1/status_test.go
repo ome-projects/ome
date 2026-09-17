@@ -169,3 +169,96 @@ func TestStatusCountsRejectOverflowShapedCanonicalInput(t *testing.T) {
 		require.Contains(t, value.Issues, StatusIssueCode("PodMalformed"))
 	}
 }
+
+func TestStatusAutoscaleCanonicalCannotClaimReportedOnInvalidReplicaEvidence(t *testing.T) {
+	current, negativeDesired := int32(2), int32(-1)
+	value := NewStatusReport(Metadata{Name: "chat", Namespace: "prod"}, StatusContent{
+		Autoscale: StatusAutoscale{
+			Summary: AutoscaleSummary{State: AutoscaleStateReported}, Evidence: EvidenceReported,
+			Components: []StatusAutoscaleComponent{{Type: RuntimeComponentEngine,
+				State: AutoscaleComponentReported, Class: AutoscaleClassHPA,
+				ManagedBy: AutoscaleManagedByOME, TargetEvidence: AutoscaleTargetReported,
+				ReplicaEvidence: AutoscaleReplicasReported,
+				CurrentReplicas: &current, DesiredReplicas: &negativeDesired}},
+		},
+	}, nil)
+	require.Equal(t, AutoscaleStateInvalid, value.Content.Autoscale.Summary.State)
+	require.Equal(t, AutoscaleComponentInvalid, value.Content.Autoscale.Components[0].State)
+	require.Equal(t, AutoscaleReplicasInvalid, value.Content.Autoscale.Components[0].ReplicaEvidence)
+	require.Nil(t, value.Content.Autoscale.Components[0].CurrentReplicas)
+	require.Nil(t, value.Content.Autoscale.Components[0].DesiredReplicas)
+	require.Contains(t, value.Content.Issues, StatusIssueCode("AutoscaleUnavailable"))
+	value.Content.Autoscale.Summary.State = AutoscaleStatePartial
+	value.Content.Autoscale.Components[0].State = AutoscaleComponentInvalid
+	value = value.Canonical()
+	require.Equal(t, AutoscaleStateInvalid, value.Content.Autoscale.Summary.State)
+}
+
+func TestStatusAutoscaleCanonicalDropsUnknownIssueWithoutHealthyClaim(t *testing.T) {
+	current, desired := int32(2), int32(3)
+	value := NewStatusReport(Metadata{Name: "chat", Namespace: "prod"}, StatusContent{
+		Autoscale: StatusAutoscale{Summary: AutoscaleSummary{State: AutoscaleStateReported}, Evidence: EvidenceReported,
+			Components: []StatusAutoscaleComponent{{Type: RuntimeComponentEngine,
+				State: AutoscaleComponentReported, Class: AutoscaleClassHPA, ManagedBy: AutoscaleManagedByOME,
+				TargetEvidence: AutoscaleTargetReported, ReplicaEvidence: AutoscaleReplicasReported,
+				CurrentReplicas: &current, DesiredReplicas: &desired}},
+			Issues: []AutoscaleIssue{{Code: "private-dynamic-issue", Component: RuntimeComponentEngine}}},
+	}, nil)
+	require.Equal(t, AutoscaleStateInvalid, value.Content.Autoscale.Summary.State)
+	require.Empty(t, value.Content.Autoscale.Issues)
+	require.Contains(t, value.Content.Issues, StatusIssueCode("UnsupportedData"))
+	current = 99
+	require.Equal(t, int32(2), *value.Content.Autoscale.Components[0].CurrentReplicas)
+	data, err := json.Marshal(value)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "private-dynamic-issue")
+}
+
+func TestStatusAutoscaleCanonicalRejectsUnknownConditionEvidence(t *testing.T) {
+	current, desired := int32(2), int32(3)
+	value := NewStatusReport(Metadata{Name: "chat", Namespace: "prod"}, StatusContent{
+		Autoscale: StatusAutoscale{Summary: AutoscaleSummary{State: AutoscaleStateReported}, Evidence: EvidenceReported,
+			Components: []StatusAutoscaleComponent{{Type: RuntimeComponentEngine,
+				State: AutoscaleComponentReported, Class: AutoscaleClassHPA, ManagedBy: AutoscaleManagedByOME,
+				TargetEvidence: AutoscaleTargetReported, ReplicaEvidence: AutoscaleReplicasReported,
+				ConditionEvidence: "private-condition", CurrentReplicas: &current, DesiredReplicas: &desired}}},
+	}, nil)
+	require.Equal(t, AutoscaleStateInvalid, value.Content.Autoscale.Summary.State)
+	require.Equal(t, AutoscaleComponentInvalid, value.Content.Autoscale.Components[0].State)
+	data, err := json.Marshal(value)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "private-condition")
+}
+
+func TestStatusAutoscaleCanonicalRejectsUnavailableOrUnknownEvidenceWithReportedData(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		evidence EvidenceLevel
+		summary  AutoscaleState
+		state    AutoscaleComponentState
+	}{
+		{name: "unknown", evidence: "PRIVATE-EVIDENCE", summary: AutoscaleStateReported, state: AutoscaleComponentReported},
+		{name: "unavailable reported", evidence: EvidenceUnavailable, summary: AutoscaleStateReported, state: AutoscaleComponentReported},
+		{name: "unavailable partial", evidence: EvidenceUnavailable, summary: AutoscaleStatePartial, state: AutoscaleComponentPartial},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current, desired := int32(2), int32(3)
+			value := NewStatusReport(Metadata{Name: "chat", Namespace: "prod"}, StatusContent{
+				Autoscale: StatusAutoscale{
+					Summary: AutoscaleSummary{State: tc.summary}, Evidence: tc.evidence,
+					Components: []StatusAutoscaleComponent{{Type: RuntimeComponentEngine,
+						State: tc.state, Class: AutoscaleClassHPA,
+						ManagedBy: AutoscaleManagedByOME, TargetEvidence: AutoscaleTargetReported,
+						ReplicaEvidence: AutoscaleReplicasReported, ConditionEvidence: AutoscaleConditionsReported,
+						CurrentReplicas: &current, DesiredReplicas: &desired}},
+				},
+			}, nil)
+			require.Equal(t, AutoscaleStateInvalid, value.Content.Autoscale.Summary.State)
+			require.Equal(t, EvidenceUnavailable, value.Content.Autoscale.Evidence)
+			require.Contains(t, value.Content.Issues, StatusIssueCode("UnsupportedData"))
+			data, err := json.Marshal(value)
+			require.NoError(t, err)
+			require.NotContains(t, string(data), "PRIVATE-EVIDENCE")
+		})
+	}
+}

@@ -33,7 +33,9 @@ Observation windows are post-decode: 1000 Pods/two pages and 100 Warning Events
 across at most 16 object targets. Wide expands safe facts; phase counters
 R/P/F/S/U mean Running/Pending/Failed/Succeeded/Unknown, and deleting counts
 terminating Pods. JSON/YAML retain bounded values. Rollout summary uses canonical
-rollout evidence; use rollout status for detail.`,
+rollout evidence; use rollout status for detail. Autoscaling uses only
+controller-reported parent status, not live HPA, KEDA, or InferenceReplica
+reads; use autoscale status for detail.`,
 		SilenceErrors: true, SilenceUsage: true,
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) != 1 {

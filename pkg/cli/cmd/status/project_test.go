@@ -1,6 +1,7 @@
 package status
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -149,6 +150,96 @@ func TestProjectStatusReusesCanonicalRolloutSummary(t *testing.T) {
 		for _, private := range []string{"private-uid", "private-rv", "StepEnteredTime", "annotations"} {
 			require.NotContains(t, string(encoded), private)
 		}
+	}
+}
+
+func TestProjectStatusComposesParentReportedAutoscaling(t *testing.T) {
+	v := typedISVC()
+	v.Spec.Engine = &ome.EngineSpec{}
+	v.Status.Components = map[ome.ComponentType]ome.ComponentStatusSpec{
+		ome.EngineComponent: {
+			Autoscaler: &ome.ComponentAutoscalerStatus{
+				Class: ome.AutoscalerHPA, ManagedBy: ome.AutoscalerManagedByOME,
+				SpecSource: "isvc", CurrentReplicas: 2, DesiredReplicas: 3,
+				Conditions: []metav1.Condition{{Type: "ScalingActive", Status: metav1.ConditionTrue,
+					Reason: "Active", Message: "secret scaler message", LastTransitionTime: metav1.NewTime(statusClock.Now())}},
+			},
+			ScaleTargetRef: &ome.ScaleTargetRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "chat-engine"},
+		},
+	}
+	got, err := projectStatus(observedReport(v), statusClock)
+	require.NoError(t, err)
+	data, err := json.Marshal(got)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"autoscale"`)
+	require.NotContains(t, string(data), "secret scaler message")
+	var table bytes.Buffer
+	require.NoError(t, got.Table().Write(&table))
+	require.Contains(t, table.String(), "Autoscaling")
+	require.Contains(t, table.String(), "2->3")
+	require.Equal(t, r.AutoscaleStateReported, got.Content.Autoscale.Summary.State)
+	require.Equal(t, r.EvidenceReported, got.Content.Autoscale.Evidence)
+	require.Equal(t, r.AutoscaleClassHPA, got.Content.Autoscale.Components[0].Class)
+	require.Equal(t, r.AutoscaleReplicasReported, got.Content.Autoscale.Components[0].ReplicaEvidence)
+}
+
+func TestProjectStatusAutoscaleUnavailableAndPartialAreDistinct(t *testing.T) {
+	v := typedISVC()
+	got, err := projectStatus(observedReport(v), statusClock)
+	require.NoError(t, err)
+	require.Equal(t, r.AutoscaleStateUnavailable, got.Content.Autoscale.Summary.State)
+	require.Equal(t, r.EvidenceUnavailable, got.Content.Autoscale.Evidence)
+	require.Empty(t, got.Content.Autoscale.Components)
+
+	v.Status.Components = map[ome.ComponentType]ome.ComponentStatusSpec{ome.EngineComponent: {
+		Autoscaler: &ome.ComponentAutoscalerStatus{Class: ome.AutoscalerHPA,
+			ManagedBy: ome.AutoscalerManagedByOME, SpecSource: "isvc", CurrentReplicas: 2},
+		ScaleTargetRef: &ome.ScaleTargetRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "chat-engine"},
+	}}
+	got, err = projectStatus(observedReport(v), statusClock)
+	require.NoError(t, err)
+	require.Equal(t, r.AutoscaleStatePartial, got.Content.Autoscale.Summary.State)
+	require.Equal(t, r.EvidenceReported, got.Content.Autoscale.Evidence)
+	require.Equal(t, r.AutoscaleReplicasAmbiguous, got.Content.Autoscale.Components[0].ReplicaEvidence)
+	require.Contains(t, got.Content.Autoscale.Issues, r.AutoscaleIssue{Code: r.AutoscaleIssueReplicaEvidenceAmbiguous, Component: r.RuntimeComponentEngine})
+	var wide bytes.Buffer
+	require.NoError(t, got.WideTable().Write(&wide))
+	require.Contains(t, wide.String(), "Scale conditions")
+	require.Contains(t, wide.String(), "engine / NotReported")
+}
+
+func TestProjectStatusAutoscaleConditionPreflightRejectsHugePayload(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*ome.InferenceService)
+	}{
+		{"huge condition message", func(v *ome.InferenceService) {
+			v.Status.Components = map[ome.ComponentType]ome.ComponentStatusSpec{ome.EngineComponent: {
+				Autoscaler: &ome.ComponentAutoscalerStatus{Conditions: []metav1.Condition{{Type: "ScalingActive", Message: strings.Repeat("x", 4097)}}},
+			}}
+		}},
+		{"too many conditions", func(v *ome.InferenceService) {
+			v.Status.Components = map[ome.ComponentType]ome.ComponentStatusSpec{ome.EngineComponent: {
+				Autoscaler: &ome.ComponentAutoscalerStatus{Conditions: make([]metav1.Condition, 65)},
+			}}
+		}},
+		{"too many components", func(v *ome.InferenceService) {
+			v.Status.Components = map[ome.ComponentType]ome.ComponentStatusSpec{
+				ome.EngineComponent: {}, ome.DecoderComponent: {}, ome.RouterComponent: {}, "unknown": {},
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := typedISVC()
+			tc.set(v)
+			got, err := projectStatus(observedReport(v), statusClock)
+			require.NoError(t, err)
+			require.Equal(t, r.AutoscaleStateUnavailable, got.Content.Autoscale.Summary.State)
+			require.Equal(t, r.EvidenceUnavailable, got.Content.Autoscale.Evidence)
+			require.Empty(t, got.Content.Autoscale.Components)
+			require.Contains(t, got.Content.Issues, r.StatusIssueCode("AutoscaleUnavailable"))
+			require.Contains(t, got.Content.Issues, r.StatusIssueCode("CollectionLimitExceeded"))
+		})
 	}
 }
 

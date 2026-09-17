@@ -48,8 +48,10 @@ func TestStatusDefaultsToCompactReport(t *testing.T) {
 			"Event observation   Reported count=0 truncated=false \n"+
 			"Rollout             NotConfigured reported=NotConfigured\n"+
 			"Rollout evidence    Declared / NotApplicable\n"+
+			"Autoscaling         Unavailable / Unavailable parent status\n"+
 			"Full safe values    Use -o json or -o yaml\n"+
-			"Rollout detail      kubectl ome rollout status NAME\n",
+			"Rollout detail      kubectl ome rollout status NAME\n"+
+			"Autoscale detail    kubectl ome autoscale status NAME\n",
 		out,
 	)
 }
@@ -84,8 +86,10 @@ func TestStatusWidePreservesDetailedReport(t *testing.T) {
 			"Rollout                NotConfigured reported=NotConfigured\n"+
 			"Rollout evidence       Declared / NotApplicable\n"+
 			"Coordination Ready     NotApplicable\n"+
+			"Autoscaling            Unavailable / Unavailable parent status\n"+
 			"Full safe values       Use -o json or -o yaml\n"+
 			"Rollout detail         kubectl ome rollout status NAME\n"+
+			"Autoscale detail       kubectl ome autoscale status NAME\n"+
 			"Collected at           2026-09-15T12:00:00Z\n"+
 			"Source generation      0\n"+
 			"Source evidence        Observed\n",

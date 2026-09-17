@@ -314,7 +314,7 @@ func TestTypedStatusUnsupportedPodComponentsRemainPartial(t *testing.T) {
 }
 
 func TestTypedStatusJSONYAMLLiteralCanonicalDocument(t *testing.T) {
-	const expected = `{"apiVersion":"cli.ome.io/v1alpha1","kind":"StatusReport","metadata":{"namespace":"prod","name":"chat"},"collectedAt":"2026-09-15T12:00:00Z","sources":[{"kind":"InferenceService","namespace":"prod","name":"chat","generation":4,"evidence":"Observed","collectedAt":"2026-09-15T12:00:00Z"}],"content":{"ready":{"status":"NotRecorded","validity":"Unavailable","inspection":{"state":"Complete","total":0,"inspected":0,"warnings":[]}},"generation":4,"observedGeneration":0,"generationFreshness":"Unverifiable","components":[],"pods":{"state":"Reported","observed":0,"truncated":false,"skippedTargets":0},"events":{"state":"Reported","observed":0,"truncated":false,"skippedTargets":0},"recentEvents":[],"rollout":{"summary":{"state":"NotConfigured","reportedState":"NotConfigured","evidence":"Declared","epoch":"NotApplicable","coordinationReady":"NotApplicable"},"issues":[],"warnings":[]},"issues":[]},"warnings":[]}`
+	const expected = `{"apiVersion":"cli.ome.io/v1alpha1","kind":"StatusReport","metadata":{"namespace":"prod","name":"chat"},"collectedAt":"2026-09-15T12:00:00Z","sources":[{"kind":"InferenceService","namespace":"prod","name":"chat","generation":4,"evidence":"Observed","collectedAt":"2026-09-15T12:00:00Z"}],"content":{"ready":{"status":"NotRecorded","validity":"Unavailable","inspection":{"state":"Complete","total":0,"inspected":0,"warnings":[]}},"generation":4,"observedGeneration":0,"generationFreshness":"Unverifiable","components":[],"pods":{"state":"Reported","observed":0,"truncated":false,"skippedTargets":0},"events":{"state":"Reported","observed":0,"truncated":false,"skippedTargets":0},"recentEvents":[],"rollout":{"summary":{"state":"NotConfigured","reportedState":"NotConfigured","evidence":"Declared","epoch":"NotApplicable","coordinationReady":"NotApplicable"},"issues":[],"warnings":[]},"autoscale":{"summary":{"state":"Unavailable"},"evidence":"Unavailable","components":[],"issues":[]},"issues":[]},"warnings":[]}`
 	var reference r.StatusReport
 	require.NoError(t, json.Unmarshal([]byte(expected), &reference))
 	for _, format := range []string{"json", "yaml"} {
@@ -333,5 +333,56 @@ func TestTypedStatusJSONYAMLLiteralCanonicalDocument(t *testing.T) {
 			require.NotContains(t, out, "---")
 		}
 		require.Equal(t, reference, got)
+	}
+}
+
+func TestTypedStatusAutoscaleFixtureAllFormatsAndReads(t *testing.T) {
+	v := typedISVC()
+	v.Spec.Engine = &ome.EngineSpec{}
+	v.Status.Components = map[ome.ComponentType]ome.ComponentStatusSpec{
+		ome.EngineComponent: {
+			Autoscaler: &ome.ComponentAutoscalerStatus{
+				Class: ome.AutoscalerHPA, ManagedBy: ome.AutoscalerManagedByOME,
+				SpecSource: "isvc", CurrentReplicas: 2, DesiredReplicas: 3,
+				Conditions: []metav1.Condition{{Type: "ScalingActive", Status: metav1.ConditionTrue,
+					Reason: "Active", Message: "private scaler detail", LastTransitionTime: metav1.NewTime(statusClock.Now())}},
+			},
+			ScaleTargetRef: &ome.ScaleTargetRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "chat-engine"},
+		},
+	}
+	omeClient := omefake.NewSimpleClientset(v)
+	kubeClient := kubefake.NewSimpleClientset()
+	f := factory.Static{OME: omeClient, Kube: kubeClient, NS: "prod"}
+	var canonical r.StatusReport
+	for _, format := range []string{"table", "wide", "json", "yaml"} {
+		out, err := execute(t, f, "chat", "-o", format)
+		require.NoError(t, err)
+		require.NotContains(t, out, "private scaler detail")
+		switch format {
+		case "table", "wide":
+			require.Contains(t, out, "Autoscaling")
+			require.Contains(t, out, "Reported / Reported parent status")
+			require.Contains(t, out, "2->3 (Reported)")
+			for _, line := range strings.Split(out, "\n") {
+				require.LessOrEqual(t, printers.CellDisplayWidth(line), 80)
+			}
+			if format == "table" {
+				t.Logf("fixture-rendered kubectl ome status chat:\n%s", out)
+			}
+		case "json":
+			require.NoError(t, json.Unmarshal([]byte(out), &canonical))
+			require.Equal(t, r.AutoscaleStateReported, canonical.Content.Autoscale.Summary.State)
+			require.Equal(t, r.EvidenceReported, canonical.Content.Autoscale.Evidence)
+			require.Len(t, canonical.Content.Autoscale.Components, 1)
+		case "yaml":
+			var document r.StatusReport
+			require.NoError(t, yaml.Unmarshal([]byte(out), &document))
+			require.Equal(t, canonical, document)
+		}
+	}
+	require.Len(t, omeClient.Actions(), 4)
+	for _, action := range omeClient.Actions() {
+		require.Equal(t, "get", action.GetVerb())
+		require.Equal(t, "inferenceservices", action.GetResource().Resource)
 	}
 }
