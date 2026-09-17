@@ -242,6 +242,67 @@ func TestPollOnlySkipsWatchAndKeepsFallbackFalse(t *testing.T) {
 	require.Equal(t, 1, c.result.Counts.Polls)
 	require.Empty(t, s.requests)
 }
+
+func TestPollOnlyRetriesSourceLocalDeadline(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	ready := falseSnapshot()
+	ready.Value = true
+	s := sourceFor(response{err: context.DeadlineExceeded}, response{snapshot: ready})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk, PollOnly: true})
+	request(t, s, "get")
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	clk.Step(5 * time.Second)
+	request(t, s, "get")
+	result := finish(t, done)
+	require.NoError(t, result.err)
+	require.Equal(t, OutcomeMatched, result.result.Outcome)
+	require.Equal(t, MethodPoll, result.result.Method)
+	require.Equal(t, 2, result.result.Counts.Gets)
+	require.Equal(t, 1, result.result.Counts.Polls)
+	require.Zero(t, result.result.Counts.Watches)
+	require.False(t, result.result.Fallback)
+}
+
+func TestPollOnlyParentCancellationStillStopsAfterSourceDeadline(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	s := sourceFor(response{err: context.DeadlineExceeded})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk, PollOnly: true})
+	request(t, s, "get")
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	cancel()
+	result := finish(t, done)
+	require.Error(t, result.err)
+	require.Equal(t, ReasonCanceled, result.err.(*Error).Reason)
+	require.Equal(t, 1, result.result.Counts.Gets)
+}
+
+func TestPollOnlySourceDeadlineStopsAtOverallTimeout(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	s := sourceFor(response{err: context.DeadlineExceeded})
+	done := startEngine(t, s, context.Background(), Options{Timeout: time.Minute, Clock: clk, PollOnly: true})
+	request(t, s, "get")
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	clk.Step(time.Minute)
+	result := finish(t, done)
+	require.NoError(t, result.err)
+	require.Equal(t, OutcomeTimedOut, result.result.Outcome)
+	// The poll and overall timers may fire together at this fake-clock step.
+	require.GreaterOrEqual(t, result.result.Counts.Gets, 1)
+	require.LessOrEqual(t, result.result.Counts.Gets, 2)
+}
+
+func TestWatchModeSourceDeadlineStillFailsClosed(t *testing.T) {
+	s := sourceFor(response{err: context.DeadlineExceeded})
+	result, err := Run(context.Background(), s, boolPredicate, Options{Timeout: time.Minute})
+	require.Error(t, err)
+	require.Equal(t, ReasonAcquisitionFailed, err.(*Error).Reason)
+	require.Empty(t, result.Outcome)
+	require.Equal(t, 1, result.Counts.Gets)
+}
+
 func TestInitialAndLaterNotFound(t *testing.T) {
 	nf := apierrors.NewNotFound(schema.GroupResource{Resource: "inferenceservices"}, "private")
 	s := sourceFor(response{err: nf})

@@ -214,6 +214,13 @@ func (s *runState[T]) get() (bool, error) {
 		return true, cancelErr
 	}
 	if err != nil {
+		// Poll-only sources bound each named GET independently. A source-local
+		// deadline does not exhaust the overall wait; the next poll may succeed.
+		// canceled above still makes the overall deadline or parent cancel
+		// terminal, and every other acquisition error remains fail-closed.
+		if s.options.PollOnly && errors.Is(err, context.DeadlineExceeded) {
+			return false, nil
+		}
 		if apierrors.IsNotFound(err) {
 			if s.uid == "" {
 				s.result.Outcome = OutcomeNotFound

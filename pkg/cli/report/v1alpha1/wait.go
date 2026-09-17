@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	"sigs.k8s.io/ome/pkg/cli/safetext"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
+	"sigs.k8s.io/ome/pkg/cli/waitheld"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
 	"sigs.k8s.io/ome/pkg/cli/waitruntime"
 )
@@ -27,6 +29,7 @@ const (
 	WaitRequestedMigrationTerminal       WaitRequested = "Migration=Terminal"
 	WaitRequestedReadyReplicas           WaitRequested = "Replicas=Ready"
 	WaitRequestedRuntimeSyncAcknowledged WaitRequested = "RuntimeSync=Acknowledged"
+	WaitRequestedHeldRevisionUnheld      WaitRequested = "HeldRevision=Unheld"
 )
 
 type WaitCounts struct {
@@ -45,6 +48,7 @@ type WaitContent struct {
 	Migration           *WaitMigrationObservation     `json:"migration,omitempty"`
 	ReadyReplicas       *WaitReadyReplicasObservation `json:"readyReplicas,omitempty"`
 	RuntimeSync         *WaitRuntimeSyncObservation   `json:"runtimeSync,omitempty"`
+	HeldRevision        *WaitHeldRevisionObservation  `json:"heldRevision,omitempty"`
 	Evidence            EvidenceLevel                 `json:"evidence"`
 	ElapsedMilliseconds int64                         `json:"elapsedMilliseconds"`
 	Counts              WaitCounts                    `json:"counts"`
@@ -61,6 +65,19 @@ func (r WaitReport) Canonical() WaitReport {
 	r.Kind = WaitReportKind
 	r.Metadata.Name = safetext.Sanitize(r.Metadata.Name, 253)
 	r.Metadata.Namespace = safetext.Sanitize(r.Metadata.Namespace, 63)
+	if r.Content.Requested.IsHeldRevision() && r.Content.Outcome == waitengine.OutcomeMatched && r.Content.HeldRevision != nil {
+		observed := r.Content.HeldRevision
+		bound := r.Metadata.Name == "[REDACTED]" && observed.Revision == "[REDACTED]" ||
+			r.Metadata.Name != "" && r.Metadata.Name != "[REDACTED]" &&
+				strings.HasPrefix(observed.Revision, r.Metadata.Name+"-"+observed.Component+"-")
+		if !bound {
+			observed.Matched = false
+			observed.Validity = waitheld.ValidityInvalid
+			r.Content.Outcome = "Unknown"
+			r.Content.Reason = waitengine.ReasonInvalidCondition
+			r.Content.Evidence = EvidenceUnavailable
+		}
+	}
 	// This report intentionally has no generic source identities/warning text.
 	// Its single source and whole-inspection diagnostics are concrete content.
 	r.Sources = []SourceReference{}
@@ -68,7 +85,7 @@ func (r WaitReport) Canonical() WaitReport {
 	return r
 }
 func (c WaitContent) Canonical() WaitContent {
-	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() && !c.Requested.IsRuntimeSync() {
+	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() && !c.Requested.IsRuntimeSync() && !c.Requested.IsHeldRevision() {
 		c.Requested = "Unknown"
 	}
 	switch c.Outcome {
@@ -93,9 +110,22 @@ func (c WaitContent) Canonical() WaitContent {
 		if !c.Requested.IsReadyReplicas() {
 			c.Reason = "PredicateUnmet"
 		}
-	case waitruntime.ReasonObserved, waitruntime.ReasonNotAcknowledged,
-		waitruntime.ReasonNotRecorded, waitruntime.ReasonUnsupportedPlacement:
+	case waitruntime.ReasonObserved, waitruntime.ReasonNotAcknowledged, waitruntime.ReasonNotRecorded:
 		if !c.Requested.IsRuntimeSync() {
+			c.Reason = "PredicateUnmet"
+		}
+	case waitruntime.ReasonUnsupportedPlacement:
+		if !c.Requested.IsRuntimeSync() && !c.Requested.IsHeldRevision() {
+			c.Reason = "PredicateUnmet"
+		}
+	case waitengine.Reason(waitheld.ReasonUnheld), waitengine.Reason(waitheld.ReasonHeld),
+		waitengine.Reason(waitheld.ReasonInvalidTarget), waitengine.Reason(waitheld.ReasonSourceIncomplete),
+		waitengine.Reason(waitheld.ReasonReplicaMissing), waitengine.Reason(waitheld.ReasonReplicaReplaced),
+		waitengine.Reason(waitheld.ReasonDeleting),
+		waitengine.Reason(waitheld.ReasonSourceStale), waitengine.Reason(waitheld.ReasonSourceInvalid),
+		waitengine.Reason(waitheld.ReasonMailboxPending), waitengine.Reason(waitheld.ReasonMailboxSuperseded),
+		waitengine.Reason(waitheld.ReasonInvalidRetryBlocks), waitengine.Reason(waitheld.ReasonInvalidStatus):
+		if !c.Requested.IsHeldRevision() {
 			c.Reason = "PredicateUnmet"
 		}
 	default:
@@ -230,6 +260,30 @@ func (c WaitContent) Canonical() WaitContent {
 	} else {
 		c.RuntimeSync = nil
 	}
+	if c.Requested.IsHeldRevision() {
+		if c.HeldRevision == nil {
+			c.HeldRevision = &WaitHeldRevisionObservation{Reason: waitheld.ReasonSourceIncomplete,
+				Validity: waitheld.ValidityUnavailable, TargetState: waitheld.TargetUnknown,
+				MailboxState: waitheld.MailboxUnknown, Attribution: waitheld.AttributionUnverifiable}
+		}
+		observed := c.HeldRevision.Canonical()
+		if c.Outcome == waitengine.OutcomeMatched && (!observed.Matched || observed.Validity != waitheld.ValidityValid ||
+			observed.Reason != waitheld.ReasonUnheld || observed.MailboxState != waitheld.MailboxAbsent ||
+			c.Reason != waitengine.Reason(waitheld.ReasonUnheld)) {
+			observed.Matched = false
+			observed.Validity = waitheld.ValidityInvalid
+			c.Outcome = "Unknown"
+			c.Reason = waitengine.ReasonInvalidCondition
+		}
+		c.HeldRevision = &observed
+		c.Observed = waitpredicate.Observation{Status: "NotRecorded", Validity: "Unavailable", GenerationFreshness: "Unverifiable", Inspection: waitpredicate.Inspection{State: "NotInspected", Warnings: []waitpredicate.Warning{}}}
+		c.Evidence = EvidenceUnavailable
+		if observed.Validity == waitheld.ValidityValid {
+			c.Evidence = EvidenceReported
+		}
+	} else {
+		c.HeldRevision = nil
+	}
 	return c
 }
 func (r WaitReport) Table() report.Table {
@@ -245,6 +299,9 @@ func (r WaitReport) table(wide bool) report.Table {
 	c := r.Content
 	if c.RuntimeSync != nil {
 		return r.runtimeSyncTable(wide)
+	}
+	if c.HeldRevision != nil {
+		return r.heldRevisionTable(wide)
 	}
 	if c.ReadyReplicas != nil {
 		return r.readyReplicasTable(wide)

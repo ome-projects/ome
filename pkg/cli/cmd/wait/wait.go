@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
+	"sigs.k8s.io/ome/pkg/cli/waitheld"
 	"sigs.k8s.io/ome/pkg/cli/waitmigration"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
 	"sigs.k8s.io/ome/pkg/cli/waitrollout"
@@ -28,10 +29,11 @@ import (
 
 var (
 	errFlags                = errors.New("InvalidWaitFlags")
-	errPredicate            = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready, or runtime-sync=acknowledged")
+	errPredicate            = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready, runtime-sync=acknowledged, or held-revision=unheld")
 	errRequestID            = errors.New("InvalidMigrationRequestID: require canonical UUID only with migration=terminal")
 	errRuntimeSyncRequestID = errors.New("InvalidRuntimeSyncRequestID: require canonical v4 UUID with runtime-sync=acknowledged")
 	errCountFlags           = errors.New("InvalidReadyReplicaFlags: require --component=engine|decoder|router and --replicas=N only with replicas=ready; N must be nonnegative")
+	errHeldTarget           = errors.New("InvalidHeldRevisionTarget: require --component, full --revision, --ir-name and --ir-uid only with held-revision=unheld")
 	errName                 = errors.New("InvalidInferenceServiceName")
 	errNamespace            = errors.New("InvalidNamespace")
 	errTimeout              = errors.New("InvalidWaitTimeout: require positive duration no greater than 24h")
@@ -42,22 +44,27 @@ var (
 )
 
 type options struct {
-	streams                genericiooptions.IOStreams
-	forValue, output       string
-	timeout                time.Duration
-	requested              corev1.ConditionStatus
-	requestedRollout       reportv1alpha1.WaitRequested
-	requestedMigration     bool
-	requestedReadyReplicas bool
-	requestedRuntimeSync   bool
-	requestID              string
-	component              string
-	replicas               int32
-	componentSet           bool
-	replicasSet            bool
-	format                 report.Format
-	wide                   bool
-	clock                  clock.Clock
+	streams                 genericiooptions.IOStreams
+	forValue, output        string
+	timeout                 time.Duration
+	requested               corev1.ConditionStatus
+	requestedRollout        reportv1alpha1.WaitRequested
+	requestedMigration      bool
+	requestedReadyReplicas  bool
+	requestedRuntimeSync    bool
+	requestedHeldRevision   bool
+	requestID               string
+	component               string
+	revision, irName, irUID string
+	replicas                int32
+	componentSet            bool
+	replicasSet             bool
+	revisionSet             bool
+	irNameSet               bool
+	irUIDSet                bool
+	format                  report.Format
+	wide                    bool
+	clock                   clock.Clock
 }
 
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -96,6 +103,15 @@ RuntimeDrifted condition. This is state-oriented: token acknowledgment is
 not live-runtime convergence, serving readiness, or action attribution.
 This path polls bounded named parent GETs every 5s; it does not read
 runtime objects, IRs, Secrets, or raw controller messages.
+Use held-revision=unheld with --component and the full scoped --revision,
+formed as ISVC-COMPONENT-REVISIONHASH from the release-held ActionResult's
+revisionHash (or copied from instance retry-blocks). Copy --ir-name and
+--ir-uid from that ActionResult's target.name and target.uid. Only the
+original, current, owned IR can match
+when that exact revision is no longer Held and the mailbox is absent.
+This is state-oriented, not proof the release request caused the state:
+natural pruning or a later re-Held can race. The first poll may match.
+It polls named parent and exact IR GETs every 5s, with no sibling LIST or WATCH.
 Rollout assertions use qualified canonical aggregate ReportedState:
 stable means Succeeded, not NotConfigured or Staged; failed means Failed;
 rolled-back means RolledBack. Missing or invalid evidence never matches.
@@ -120,11 +136,15 @@ One final typed report is emitted; no raw conditions or API objects are printed.
   kubectl ome wait chat --for=rollout=failed -o wide
   kubectl ome wait chat --for=migration=terminal --request-id=12345678-1234-4234-8234-123456789abc -n prod
   kubectl ome wait chat --for=replicas=ready --component=engine --replicas=2 -n prod
-  kubectl ome wait chat --for=runtime-sync=acknowledged --request-id=123e4567-e89b-42d3-a456-426614174000 -n prod`,
+  kubectl ome wait chat --for=runtime-sync=acknowledged --request-id=123e4567-e89b-42d3-a456-426614174000 -n prod
+  kubectl ome wait chat --for=held-revision=unheld --component=engine --revision=chat-engine-aaaaaaaa --ir-name=chat-engine --ir-uid=original-uid -n prod`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.componentSet = cmd.Flags().Changed("component")
 			o.replicasSet = cmd.Flags().Changed("replicas")
+			o.revisionSet = cmd.Flags().Changed("revision")
+			o.irNameSet = cmd.Flags().Changed("ir-name")
+			o.irUIDSet = cmd.Flags().Changed("ir-uid")
 			if err := o.validate(args[0]); err != nil {
 				return err
 			}
@@ -132,10 +152,13 @@ One final typed report is emitted; no raw conditions or API objects are printed.
 		},
 	}
 	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errFlags })
-	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready, or runtime-sync=acknowledged")
+	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready, runtime-sync=acknowledged, or held-revision=unheld")
 	cmd.Flags().StringVar(&o.requestID, "request-id", "", "Canonical UUID for migration=terminal; canonical v4 UUID for runtime-sync=acknowledged")
-	cmd.Flags().StringVar(&o.component, "component", "", "IR component, required only for replicas=ready: engine, decoder, router")
+	cmd.Flags().StringVar(&o.component, "component", "", "IR component, required for replicas=ready or held-revision=unheld: engine, decoder, router")
 	cmd.Flags().Int32Var(&o.replicas, "replicas", 0, "Exact nonnegative ready-replica count, required only for replicas=ready")
+	cmd.Flags().StringVar(&o.revision, "revision", "", "Full ISVC-COMPONENT-REVISIONHASH, required only for held-revision=unheld")
+	cmd.Flags().StringVar(&o.irName, "ir-name", "", "Exact ActionResult target.name, required only for held-revision=unheld")
+	cmd.Flags().StringVar(&o.irUID, "ir-uid", "", "Exact ActionResult target.uid, required only for held-revision=unheld")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 60*time.Second, "Positive wait timeout, at most 24h")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
@@ -149,6 +172,7 @@ func (o *options) validate(name string) error {
 	o.requestedMigration = false
 	o.requestedReadyReplicas = false
 	o.requestedRuntimeSync = false
+	o.requestedHeldRevision = false
 	o.wide = false
 	switch o.forValue {
 	case "condition=Ready", "condition=Ready=True":
@@ -169,6 +193,8 @@ func (o *options) validate(name string) error {
 		o.requestedReadyReplicas = true
 	case "runtime-sync=acknowledged":
 		o.requestedRuntimeSync = true
+	case "held-revision=unheld":
+		o.requestedHeldRevision = true
 	default:
 		return errPredicate
 	}
@@ -190,8 +216,17 @@ func (o *options) validate(name string) error {
 			(o.component != "engine" && o.component != "decoder" && o.component != "router") {
 			return errCountFlags
 		}
+	} else if o.requestedHeldRevision {
+		if !o.componentSet || o.replicasSet || !o.revisionSet || !o.irNameSet || !o.irUIDSet ||
+			!waitheld.ValidTarget(waitheld.Target{Namespace: "default", ParentName: name, Component: o.component,
+				IRName: o.irName, Revision: o.revision, IRUID: o.irUID}) {
+			return errHeldTarget
+		}
 	} else if o.componentSet || o.replicasSet {
 		return errCountFlags
+	}
+	if !o.requestedHeldRevision && (o.revisionSet || o.irNameSet || o.irUIDSet) {
+		return errHeldTarget
 	}
 	if o.timeout <= 0 || o.timeout > 24*time.Hour {
 		return errTimeout
@@ -227,6 +262,9 @@ func (o *options) run(ctx context.Context, f factory.Factory, name string) error
 	}
 	if o.requestedRuntimeSync {
 		return o.runRuntimeSync(ctx, f, name, namespace)
+	}
+	if o.requestedHeldRevision {
+		return o.runHeldRevision(ctx, f, name, namespace)
 	}
 	config, err := f.RESTConfig()
 	if err != nil {
