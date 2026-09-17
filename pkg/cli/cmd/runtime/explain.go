@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/namespace"
 	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
@@ -22,19 +23,28 @@ import (
 
 type explainOptions struct {
 	genericiooptions.IOStreams
-	Model string
-	ISVC  string
+	Model            string
+	ISVC             string
+	WithEffective    bool
+	namespaceOptions *namespace.Options
 }
 
 func newExplainCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
-	o := &explainOptions{IOStreams: streams}
+	o := &explainOptions{IOStreams: streams, namespaceOptions: namespace.NewOptions()}
 	cmd := &cobra.Command{
 		Use:   "explain (--model NAME | --isvc NAME)",
 		Short: "Explain which serving runtimes match a model and why",
 		Long: `Runs the operator's own runtime-selection engine (pkg/runtimeselector)
 against the live cluster and prints every namespace-scoped and cluster-scoped
 serving runtime it considered, whether each is compatible with the model, and
-why -- including runtimes that were rejected.`,
+why -- including runtimes that were rejected.
+
+With --isvc --with-effective, append independent live and active runtime
+evidence. This does not change the selector verdict or imply rollout
+convergence. Named runtime reads are bounded; an auto-selected runtime may
+require an additional candidate scan limited to 1,000 items across 2 pages
+with a 10-second request timeout. Unavailable effective evidence is shown
+without hiding the selector result.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := o.Validate(); err != nil {
@@ -45,12 +55,17 @@ why -- including runtimes that were rejected.`,
 	}
 	cmd.Flags().StringVar(&o.Model, "model", "", "Explain runtime selection for this BaseModel/ClusterBaseModel")
 	cmd.Flags().StringVar(&o.ISVC, "isvc", "", "Explain runtime selection for this InferenceService's model")
+	cmd.Flags().BoolVar(&o.WithEffective, "with-effective", false, "Append bounded effective context for --isvc (auto scan: 1,000 items/2 pages)")
+	o.namespaceOptions.AddOMEFlags(cmd.Flags())
 	return cmd
 }
 
 func (o *explainOptions) Validate() error {
 	if (o.Model == "") == (o.ISVC == "") {
 		return fmt.Errorf("exactly one of --model or --isvc is required")
+	}
+	if o.WithEffective && o.ISVC == "" {
+		return fmt.Errorf("--with-effective requires --isvc")
 	}
 	return nil
 }
@@ -65,7 +80,11 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 		return err
 	}
 	if o.ISVC != "" && isvc.Spec.Runtime != nil {
-		fmt.Fprintf(o.ErrOut, "Note: InferenceService %q pins spec.runtime=%q; the table below shows what automatic selection would choose, which may differ from what is currently deployed.\n", o.ISVC, isvc.Spec.Runtime.Name)
+		if o.WithEffective {
+			fmt.Fprintln(o.ErrOut, "Note: spec.runtime is explicit; selector verdict is hypothetical.")
+		} else {
+			fmt.Fprintf(o.ErrOut, "Note: InferenceService %q pins spec.runtime=%q; the table below shows what automatic selection would choose, which may differ from what is currently deployed.\n", o.ISVC, isvc.Spec.Runtime.Name)
+		}
 	}
 
 	ctrl, err := f.RuntimeClient()
@@ -100,7 +119,14 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 		return apierror.Friendly(err)
 	}
 	if len(matches) == 0 && len(candidates) == 0 {
-		fmt.Fprintf(o.ErrOut, "No serving runtimes found in namespace %q or at cluster scope.\n", ns)
+		if o.WithEffective {
+			fmt.Fprintln(o.ErrOut, "No serving runtimes found for selector.")
+		} else {
+			fmt.Fprintf(o.ErrOut, "No serving runtimes found in namespace %q or at cluster scope.\n", ns)
+		}
+		if o.WithEffective {
+			return o.writeEffectiveContext(ctx, f, ctrl, ns, isvc)
+		}
 		return nil
 	}
 
@@ -126,7 +152,13 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 		table.Rows = append(table.Rows, []string{c.name, scopeLabel(c.isCluster), "No", "-", "-", reason})
 	}
 
-	return table.Write(o.Out)
+	if err := o.writeSelectorTable(table); err != nil {
+		return err
+	}
+	if o.WithEffective {
+		return o.writeEffectiveContext(ctx, f, ctrl, ns, isvc)
+	}
+	return nil
 }
 
 // resolveTarget loads the model spec (and, for --isvc, the service) using the
