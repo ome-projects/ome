@@ -57,7 +57,7 @@ func TestColumnarReplicaCollectionRetainsUnselectedRows(t *testing.T) {
 	stored := decoder.DeepCopy()
 	var collected []v1beta1.InferenceReplica
 
-	_, err := collectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(engine, decoder).OmeV1beta1(), parent, []string{"engine"}, testClock, &collected)
+	_, err := collectReplicaEvidence(context.Background(), omefake.NewSimpleClientset(engine, decoder).OmeV1beta1(), parent, []string{"engine"}, testClock, &collected, nil)
 	require.NoError(t, err)
 	require.Len(t, collected, 2)
 	for i := range collected {

@@ -85,7 +85,7 @@ func CollectMigrationEvidence(ctx context.Context, ome omeclient.OmeV1beta1Inter
 	}
 	e := MigrationEvidence{uid: string(parent.UID), rv: parent.ResourceVersion, options: migrationOptionKey(o), pending: map[string]migrationRequest{}, known: map[string]bool{}, conflicting: map[string]bool{}}
 	var replicas []v1beta1.InferenceReplica
-	_, err := collectReplicaEvidence(ctx, ome, parent, native, clock, &replicas)
+	_, err := collectReplicaEvidence(ctx, ome, parent, native, clock, &replicas, nil)
 	if err != nil {
 		if errors.Is(err, ErrStale) {
 			return MigrationEvidence{}, migrationConflict()

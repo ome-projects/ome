@@ -32,6 +32,7 @@ var (
 type ReplicaEvidence struct {
 	complete        bool
 	active          bool
+	transient       bool
 	operations      int
 	migrations      int
 	logicalReplica  *v1beta1.InferenceReplica

@@ -17,5 +17,6 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 	cmd.AddCommand(newEffectiveCmd(f, streams))
 	cmd.AddCommand(newHistoryCmd(f, streams))
 	cmd.AddCommand(newTreeCmd(f, streams))
+	cmd.AddCommand(newSyncCmd(f, streams))
 	return cmd
 }

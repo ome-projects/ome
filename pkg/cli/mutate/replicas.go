@@ -26,12 +26,12 @@ var requestUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 // CollectReplicaEvidence reads only current-context related IRs. Every source
 // and every bounded relevant record is checked before any positive conclusion.
 func CollectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Interface, v *v1beta1.InferenceService, components []string, clock reportv1alpha1.Clock) (ReplicaEvidence, error) {
-	return collectReplicaEvidence(ctx, client, v, components, clock, nil)
+	return collectReplicaEvidence(ctx, client, v, components, clock, nil, nil)
 }
 
 // collected is private action evidence, copied only after whole-source bounds
 // and identity validation. An error never grants authority to its prefix.
-func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Interface, v *v1beta1.InferenceService, components []string, clock reportv1alpha1.Clock, collected *[]v1beta1.InferenceReplica) (ReplicaEvidence, error) {
+func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Interface, v *v1beta1.InferenceService, components []string, clock reportv1alpha1.Clock, collected, rawCollected *[]v1beta1.InferenceReplica) (ReplicaEvidence, error) {
 	if err := ValidateTarget(v); err != nil {
 		return ReplicaEvidence{}, err
 	}
@@ -55,6 +55,14 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 		}
 		if e = requestCtx.Err(); e != nil {
 			return paging.Page[v1beta1.InferenceReplica]{}, e
+		}
+		if len(value.Items) > 16 {
+			return paging.Page[v1beta1.InferenceReplica]{}, ErrBounds
+		}
+		for i := range value.Items {
+			if !boundedPrivatePayload(&value.Items[i]) || !replicaPayloadBounded(&value.Items[i]) {
+				return paging.Page[v1beta1.InferenceReplica]{}, ErrBounds
+			}
 		}
 		return paging.Page[v1beta1.InferenceReplica]{Items: value.Items, Continue: value.Continue}, nil
 	})
@@ -91,6 +99,9 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 		if collected != nil {
 			*collected = append(*collected, *evidence.logicalReplica)
 		}
+		if rawCollected != nil {
+			*rawCollected = append(*rawCollected, *ir.DeepCopy())
+		}
 		if slices.Contains(components, string(ir.Spec.Component)) {
 			revision := ir.Status.UpdateRevision
 			if revision == "" {
@@ -99,6 +110,7 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 			result.sources[ir.Spec.Component] = strings.TrimPrefix(revision, ir.Name+"-")
 		}
 		result.active = result.active || evidence.active
+		result.transient = result.transient || evidence.transient
 		result.operations += evidence.operations
 		result.migrations += evidence.migrations
 	}
@@ -178,6 +190,10 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 		case v1beta1.OMENativeInstancePending, v1beta1.OMENativeInstanceCreating, v1beta1.OMENativeInstanceReady, v1beta1.OMENativeInstanceUpdating, v1beta1.OMENativeInstanceRestarting, v1beta1.OMENativeInstanceMigrating, v1beta1.OMENativeInstanceFailed, v1beta1.OMENativeInstanceDeleting:
 		default:
 			return ReplicaEvidence{}, ErrStale
+		}
+		switch row.Phase {
+		case v1beta1.OMENativeInstancePending, v1beta1.OMENativeInstanceCreating, v1beta1.OMENativeInstanceUpdating, v1beta1.OMENativeInstanceRestarting, v1beta1.OMENativeInstanceMigrating, v1beta1.OMENativeInstanceDeleting:
+			result.transient = true
 		}
 		op := row.Operation
 		if op == nil {

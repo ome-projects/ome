@@ -113,6 +113,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome runtime effective",
 		"ome runtime explain",
 		"ome runtime history",
+		"ome runtime sync",
 		"ome runtime tree",
 		"ome scale",
 		"ome status",
@@ -367,6 +368,35 @@ func TestRootCanaryActionsRegistrationAndClosedParser(t *testing.T) {
 		root.SetArgs([]string{"rollout", action, "chat", "--yes=sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"})
 		if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || stderr.String() != "error: invalid rollout action flags; use --help\n" {
 			t.Fatalf("root canary parser: code=%d stdout=%s stderr=%s", code, &out, &stderr)
+		}
+	}
+}
+
+func TestRootRuntimeSyncRegistrationAndClosedParser(t *testing.T) {
+	var out, stderr bytes.Buffer
+	f := &waitFlagFactory{}
+	root := NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+	command, _, err := root.Find([]string{"runtime", "sync"})
+	if err != nil || command.Use != "sync INFERENCESERVICE" || !strings.Contains(command.Long, "Acceptance is not convergence") {
+		t.Fatal("runtime sync is not registered with guarded acceptance semantics")
+	}
+	for _, flag := range []string{"yes", "dry-run", "output", "ome-namespace"} {
+		if command.Flags().Lookup(flag) == nil {
+			t.Fatalf("runtime sync flag %s is missing", flag)
+		}
+	}
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, flag := range []string{"--ome-namespace=", "--ome-namespace=Bad_PRIVATE", "--dry-run=" + credential, "--output=" + credential, "--yes=" + credential, "--insecure-skip-tls-verify=" + credential} {
+		out.Reset()
+		stderr.Reset()
+		f = &waitFlagFactory{}
+		root = NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+		root.SetArgs([]string{"runtime", "sync", "chat", "--yes", "--dry-run=client", flag})
+		if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || f.calls != 0 {
+			t.Fatalf("invalid runtime sync flags acquired clients or emitted a report: code=%d acquisitions=%d", code, f.calls)
+		}
+		if strings.Contains(stderr.String(), credential) || strings.Contains(stderr.String(), "PRIVATE") {
+			t.Fatal("invalid runtime sync flags disclosed their value")
 		}
 	}
 }
