@@ -98,6 +98,42 @@ func TestScaleNativeColumnarLifecycleRefusesWithoutPatch(t *testing.T) {
 	t.Logf("columnar active-work refusal (exit error %q):\n%s", err.Error(), stderr)
 }
 
+func TestScaleNativeColumnarInvalidOrTransientStatusNeverPatches(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*v1beta1.InferenceReplica)
+	}{
+		{name: "malformed columns", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Members = "0-1"
+		}},
+		{name: "unsupported encoding", edit: func(ir *v1beta1.InferenceReplica) {
+			encoding := v1beta1.InstanceStatusEncoding("private-next-version")
+			ir.Status.InstanceStatusEncoding = &encoding
+		}},
+		{name: "over row limit", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Members = "0-2048"
+			ir.Status.InstanceStatusColumns.Phases[0].Indexes = "0-2048"
+		}},
+		{name: "transient without operation", edit: func(ir *v1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Phases[0].Value = v1beta1.OMENativeInstanceUpdating
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := nativeFixture()
+			storeNativeColumnar(t, api.replica)
+			tc.edit(api.replica)
+			stored := api.replica.DeepCopy()
+			out, stderr, err, _ := runNativeCommand(t, api, []string{"chat", "--component=engine", "--replicas=3", "--override-autoscaler", "--yes", "-o=json"})
+			require.Error(t, err)
+			require.Empty(t, out)
+			require.Zero(t, api.patches)
+			require.Equal(t, stored, api.replica)
+			require.NotContains(t, stderr+err.Error(), privateSentinel)
+			require.NotContains(t, stderr+err.Error(), "private-next-version")
+		})
+	}
+}
+
 func TestScaleNativeColumnarIdleUsesGuardedPatch(t *testing.T) {
 	api := nativeFixture()
 	storeNativeColumnar(t, api.replica)

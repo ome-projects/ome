@@ -162,7 +162,7 @@ func validateHeldReplicaIdentity(ir *v1beta1.InferenceReplica, parent *v1beta1.I
 	if len(ir.Annotations) > 256 || len(ir.Labels) > 256 || len(ir.Finalizers) > 64 || len(ir.OwnerReferences) > 16 || len(ir.Status.Conditions) > 64 || len(ir.Status.InstanceStatuses) > 2048 || len(ir.Status.Migrations) > 256 || !replicaPayloadBounded(ir) {
 		return ErrBounds
 	}
-	if _, err := actionLogicalRows(ir); err != nil {
+	if _, err := normalizedActionReplica(ir); err != nil {
 		return err
 	}
 	for _, key := range []string{"ome.io/accelerator-requirements", "ome.io/cluster-selector", constants.PlacementOrigin, constants.PlacementOriginUID, constants.PlacementControlPlane} {

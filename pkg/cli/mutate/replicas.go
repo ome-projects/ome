@@ -89,13 +89,7 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 		}
 		seen[ir.Spec.Component] = true
 		if collected != nil {
-			copy := ir.DeepCopy()
-			if ir.Status.InstanceStatusEncoding != nil {
-				copy.Status.InstanceStatuses = evidence.rows
-				copy.Status.InstanceStatusEncoding = nil
-				copy.Status.InstanceStatusColumns = nil
-			}
-			*collected = append(*collected, *copy)
+			*collected = append(*collected, *evidence.logicalReplica)
 		}
 		if slices.Contains(components, string(ir.Spec.Component)) {
 			revision := ir.Status.UpdateRevision
@@ -124,9 +118,13 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 	if len(ir.OwnerReferences) > 16 || len(ir.Annotations) > 256 || len(ir.Status.Migrations) > 256 || len(ir.Status.Conditions) > 64 {
 		return ReplicaEvidence{}, ErrBounds
 	}
-	rows, err := actionLogicalRows(ir)
+	logical, err := normalizedActionReplica(ir)
 	if err != nil {
 		return ReplicaEvidence{}, err
+	}
+	ir = logical
+	if len(ir.Status.InstanceStatuses) > 2048 {
+		return ReplicaEvidence{}, ErrBounds
 	}
 	controllers := 0
 	for _, ref := range ir.OwnerReferences {
@@ -147,7 +145,7 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 		return ReplicaEvidence{}, ErrStale
 	}
 	if !slices.Contains(components, string(ir.Spec.Component)) {
-		return ReplicaEvidence{complete: true, rows: rows}, nil
+		return ReplicaEvidence{complete: true, logicalReplica: ir}, nil
 	}
 	validRevision := func(value string) bool {
 		return value == "" || strings.HasPrefix(value, ir.Name+"-") && len(value) == len(ir.Name)+9 && revisionHash.MatchString(strings.TrimPrefix(value, ir.Name+"-"))
@@ -163,7 +161,7 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 	if ir.Status.UpdatedReadyReplicas > ir.Status.UpdatedReplicas {
 		return ReplicaEvidence{}, ErrStale
 	}
-	result := ReplicaEvidence{complete: true, active: ir.Status.UpdateRevision != "" && ir.Status.CurrentRevision != ir.Status.UpdateRevision, rows: rows}
+	result := ReplicaEvidence{complete: true, active: ir.Status.UpdateRevision != "" && ir.Status.CurrentRevision != ir.Status.UpdateRevision, logicalReplica: ir}
 	indices := map[int32]bool{}
 	type migrationOperation struct {
 		index, sibling int32
@@ -171,7 +169,7 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 		phase          v1beta1.OMENativeInstancePhase
 	}
 	migrationOps := []migrationOperation{}
-	for _, row := range rows {
+	for _, row := range ir.Status.InstanceStatuses {
 		if row.Index < 0 || indices[row.Index] || row.Incarnation < 0 || !validRevision(row.RunningRevision) || !validRevision(row.TargetRevision) || len(row.Conditions) > 64 {
 			return ReplicaEvidence{}, ErrStale
 		}
@@ -255,31 +253,27 @@ func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, c
 	return result, nil
 }
 
-// actionLogicalRows validates both stored representations without changing the
-// fetched object. Raw snapshots remain available for exact revalidation.
-func actionLogicalRows(ir *v1beta1.InferenceReplica) ([]v1beta1.OMENativeInstanceStatus, error) {
+// normalizedActionReplica validates and decodes only a private bounded copy.
+// The raw fetched object remains available for exact CAS revalidation.
+func normalizedActionReplica(ir *v1beta1.InferenceReplica) (*v1beta1.InferenceReplica, error) {
 	if ir == nil {
 		return nil, ErrStale
 	}
-	if len(ir.Status.InstanceStatuses) > 2048 || !replicaPayloadBounded(ir) || !boundedPrivatePayload(ir) {
+	if !boundedPrivatePayload(ir) || !replicaPayloadBounded(ir) {
 		return nil, ErrBounds
 	}
-	rows, _, err := irstatus.DecodeStatus(&ir.Status, 2048)
+	logical := ir.DeepCopy()
+	_, err := irstatus.NewDecoder(2048).Decode(logical)
 	if err != nil {
 		if reason, ok := irstatus.ErrorReasonOf(err); ok && reason == irstatus.ErrorReasonCardinalityLimit {
 			return nil, ErrBounds
 		}
 		return nil, ErrStale
 	}
-	logical := *ir
-	logical.Status = ir.Status
-	logical.Status.InstanceStatuses = rows
-	logical.Status.InstanceStatusEncoding = nil
-	logical.Status.InstanceStatusColumns = nil
-	if !replicaPayloadBounded(&logical) || !boundedPrivatePayload(&logical) {
+	if !replicaPayloadBounded(logical) || !boundedPrivatePayload(logical) {
 		return nil, ErrBounds
 	}
-	return rows, nil
+	return logical, nil
 }
 
 func validOperationPhase(kind v1beta1.InstanceOperationType, phase v1beta1.OMENativeInstancePhase) bool {

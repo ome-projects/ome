@@ -53,17 +53,17 @@ func InspectScaleEvidence(parent *v1beta1.InferenceService, replica *v1beta1.Inf
 		scale.Spec.Replicas != *replica.Spec.Replicas || scale.Status.Replicas != replica.Status.Replicas {
 		return ScaleEvidence{}, ErrScaleEvidence
 	}
-	if row.active || scaleLifecycleWork(replica, row.rows) {
+	if row.active || scaleLifecycleWork(row.logicalReplica) {
 		return ScaleEvidence{}, ErrScaleWork
 	}
 	return ScaleEvidence{parent: parent.DeepCopy(), replica: replica.DeepCopy(), source: source, replicas: map[v1beta1.ComponentType]*v1beta1.InferenceReplica{replica.Spec.Component: replica.DeepCopy()}}, nil
 }
 
-func scaleLifecycleWork(replica *v1beta1.InferenceReplica, rows []v1beta1.OMENativeInstanceStatus) bool {
+func scaleLifecycleWork(replica *v1beta1.InferenceReplica) bool {
 	if replica.Spec.Pacing != nil && replica.Spec.Pacing.RollbackToRevision != nil {
 		return true
 	}
-	for _, instance := range rows {
+	for _, instance := range replica.Status.InstanceStatuses {
 		if instance.Phase == v1beta1.OMENativeInstanceDeleting || instance.Operation != nil && instance.Operation.Type == v1beta1.InstanceOperationDelete {
 			return true
 		}
