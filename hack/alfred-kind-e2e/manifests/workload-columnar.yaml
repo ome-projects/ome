@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alfred-e2e
+---
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: alfred-e2e-runtime
+spec:
+  disabled: false
+  supportedModelFormats:
+  - name: alfred-e2e-safetensors
+    modelFormat:
+      name: safetensors
+    modelFramework:
+      name: transformers
+    modelArchitecture: LlamaForCausalLM
+    autoSelect: true
+  engineConfig:
+    terminationGracePeriodSeconds: 3
+    nodeSelector:
+      alfred-e2e/virtual: "true"
+    tolerations:
+    - key: alfred-e2e/virtual
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    runner:
+      name: ome-container
+      image: registry.k8s.io/pause:3.10
+      ports:
+      - name: http1
+        containerPort: 8080
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: 10m
+          memory: 16Mi
+          nvidia.com/gpu: "1"
+---
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: single
+  namespace: alfred-e2e
+  annotations:
+    alfred.ome.io/movable: "true"
+spec:
+  deploymentMode: OMENative
+  runtime:
+    name: alfred-e2e-runtime
+  engine:
+    terminationGracePeriodSeconds: 3
+    minReplicas: 4
+    maxReplicas: 4
+    schedulerName: alfred-default-scheduler
+    # Soft spread gives the four initial Instances distinct source nodes
+    # while still allowing a migration surge beside one healthy Instance.
+    topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          ome.io/inferenceservice: single
+          ome.io/managed-by: OMENative
+    annotations:
+      # scenario.sh releases only initial indices 1..3 during startup.
+      # Every migration surge remains held until the continuity proof.
+      alfred-e2e.ome.io/readiness: hold-nonzero
+    lifecycle:
+      instanceReadyTimeout: 2m0s
+      migrationPolicy:
+        mode: Auto
+      readyPolicy: AllPodReady
+      restartPolicy: RecreateInstanceOnPodRestart
+      updateStrategy:
+        type: SurgeThenDrain
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 0
+        inPlaceUpdateStrategy:
+          gracePeriodSeconds: 0
+          markNotReadyDuringLifecycle: true

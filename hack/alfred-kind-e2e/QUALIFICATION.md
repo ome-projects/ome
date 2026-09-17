@@ -1,8 +1,10 @@
 # Alfred control-plane qualification
 
-Production code under test: `ec58fc07fc2cc3ea354cfdd927d16bfea3050aa6`
-(merged main, PR #924). The qualification branch changes only tests and their
-harness/documentation. The preserved dedicated kind control plane was reused
+Original production code under test: `ec58fc07fc2cc3ea354cfdd927d16bfea3050aa6`
+(merged main, PR #924). The September 15 qualification changed only tests and
+their harness/documentation. These historical results do not qualify later
+upstream changes or the subsequent Alfred compact-status compatibility fix.
+The preserved dedicated kind control plane was reused
 with no inference workloads; all four production processes were rebuilt,
 redeployed and verified against loaded image identities. Both workload scheduler
 profiles were probed against their mounted configuration.
@@ -132,3 +134,63 @@ fixtures; they are not live-apiserver source recreation or cache-race evidence.
 Follow-up production/API proposals should cite reproduced failures or explicit
 missing guarantees from this qualification, not infer safety from passing unit
 tests or these bounded local scenarios.
+
+## September 17: compact-status compatibility
+
+The branch was rebased onto main `f6e1f7f7f47cb8ce58e2cd4f4e55bddfdc63e4a8`
+(including the ColumnarV2 codec and default). Production compatibility commit:
+`2a6d4647` (the tested binaries were built from the same source before commit).
+The compatibility patch adds one
+Alfred-owned read-only adapter around the shared IR wire codec and updates five
+Alfred readers. Both stored encodings retain Alfred's 10,000-row limit; malformed,
+mixed, unknown or oversized representations fail closed. Raw captured objects
+are not rewritten. The dependency guard permits only the shared codec package,
+not controller or migration implementations. Outside Alfred, changes are harness
+and audit/characterization tests; no workload, OMENative, API, status-writer or
+scheduler production behavior is changed.
+
+The preserved isolated cluster was empty of inference workloads before this
+run. The manager, scheduler and simulator were rebuilt from current main; Alfred
+was built before and after the patch. Loaded and running image identities were
+verified, and both live scheduler profiles were probed. The manager and scheduler
+images were identical across the comparison. CRI image IDs:
+
+| Process | Image ID |
+| --- | --- |
+| OME manager | `sha256:3e10ec2a89236e323426ea48d8441deca90fb7fac676c4c83a2b1008448d5bf9` |
+| OME scheduler | `sha256:b3cc94adce9d8bc6cef23f68ca6c551efbe33a1edb9da6b7adcb257daef5e73c` |
+| Alfred before patch | `sha256:b3220fe8e72efa001b2b575819dfcfae332baa2a9f9e8ebaeba54f99ac0c5a2d` |
+| Alfred with patch | `sha256:ac6f3a17a9b80d67b8c06f7219d9744246bf6f5af31b21e5f9a4e01d169f2ef3` |
+
+The new `maintenance-columnar` fixture has four instances spread across four
+virtual nodes. It requires actual controller-written ColumnarV2 without a dense
+field before triggering maintenance; selecting the default alone is insufficient
+because the controller retains dense encoding when it is smaller. Raw IRs and
+separate decoded views are retained before the trigger and at completion.
+
+| Case | Observed result | Artifact directory |
+| --- | --- | --- |
+| Pre-fix compact negative control | EXPECTED FAILURE: four Ready/Serving instances, raw ColumnarV2 members `0-3`; maintenance produced `OMENativeObservationInvalid` and no migration request within 30 seconds. | `maintenance-columnar-20260917T194322Z-7757` |
+| Fixed compact migration | PASS: source instance 0 on c remained healthy/routed during a three-second held surge; replacement instance 4 bound on a. One request, OME Completed and Alfred completed/drained, eight safe handoff samples. Raw status remained ColumnarV2, members changed from `0-3` to `1-4`. | `maintenance-columnar-20260917T194704Z-23909` |
+| Dense fallback migration | PASS: one dense row with no encoding marker before and after; source on c, replacement on d, held-source protection and eight safe handoff samples, OME and Alfred completion. | `maintenance-single-20260917T194855Z-30402` |
+| Whole gang, real OME scheduler | PASS: both 8-GPU members replaced as a gang, held source remained healthy/routed, and OME plus Alfred recorded completion and drain. | `maintenance-gang-20260917T195019Z-34018` |
+| Useful defragmentation | PASS: the 1-GPU source moved from a to b; the same initially unschedulable 8-GPU beneficiary became Ready on a, and OME recorded Completed. | `useful-defrag-20260917T195139Z-30400` |
+
+The fixed compact request UUID was `be78bb95-0f60-46ad-adff-cbf778d312d7`.
+The watch is checked throughout observation and before sealing evidence; an
+early exit invalidates request-count evidence. This remains sampled control-plane
+evidence, not a claim of uninterrupted inference traffic or production readiness.
+The September 15 migration-v1 limitations above are not fixed by this patch.
+
+Fresh verification on the compatibility source passed: full `make test`
+(including Xet/envtest; unchanged tests may be cached), `make ci-lint`,
+pre-commit, all harness shell regressions, and race runs for Alfred, the two Go
+harness helpers, the nested simulator, and the migration source-identity
+characterization tests. New semantic regressions failed before the fix for
+compact observation, malformed empty inventory, source selection, sparse
+occupied indexes, prediction identity and representation-independent dispatch
+fingerprints. Upstream reader/field audit tables were updated without relaxing
+their scope, access-count or stale-approval checks.
+
+Only cases listed in this September 17 section were rerun on the compact-status
+compatibility source. The other September 15 cases remain historical results.

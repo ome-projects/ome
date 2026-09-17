@@ -4,6 +4,8 @@ def uuid:
 
 def nonempty: type == "string" and length > 0;
 
+def expected_replicas: if .scenario == "maintenance-columnar" then 4 else 1 end;
+
 # Keep seconds and nanoseconds separate: epoch floating-point addition would
 # lose sub-microsecond ordering. Accept Go RFC3339/RFC3339Nano and UTC offsets.
 def instant:
@@ -15,6 +17,7 @@ def instant:
     ((($t.fraction // "") + "000000000")[0:9] | tonumber)];
 
 def source_healthy:
+  expected_replicas as $expected |
   (.source.name | nonempty) and
   (.source.uid | nonempty) and
   (.source.node | nonempty) and
@@ -24,9 +27,9 @@ def source_healthy:
   .source.serving == true and
   .source.endpointReady == true and
   .preTrigger.migrationRequestCount == 0 and
-  .preTrigger.irReadyReplicas == 1 and
-  .preTrigger.irServingReplicas == 1 and
-  .preTrigger.irAvailableReplicas == 1;
+  .preTrigger.irReadyReplicas == $expected and
+  .preTrigger.irServingReplicas == $expected and
+  .preTrigger.irAvailableReplicas == $expected;
 
 def request_is_real:
   (.request.uuid | uuid) and
@@ -58,6 +61,7 @@ def surge_preserved_source:
   .surge.replacement.incarnation >= 1;
 
 def migration_completed:
+  expected_replicas as $expected |
   .completed.migration.requestUUID == .request.uuid and
   .completed.migration.trigger == "Manual" and
   .completed.migration.sourceInstance == .source.instance and
@@ -73,9 +77,30 @@ def migration_completed:
   .completed.replacementReady == true and
   .completed.replacementServing == true and
   .completed.replacementEndpointReady == true and
-  .completed.irReadyReplicas == 1 and
-  .completed.irServingReplicas == 1 and
-  .completed.irAvailableReplicas == 1;
+  .completed.irReadyReplicas == $expected and
+  .completed.irServingReplicas == $expected and
+  .completed.irAvailableReplicas == $expected;
+
+def raw_columnar:
+  .status.instanceStatusEncoding == "ColumnarV2" and
+  (.status.instanceStatusColumns | type == "object") and
+  (.status | has("instanceStatuses") | not) and
+  .status.readyReplicas == 4 and .status.servingReplicas == 4 and
+  .status.availableReplicas == 4;
+
+def columnar_proven:
+  .source.uid as $sourceUID | .source.node as $sourceNode |
+  .source.instance as $sourceIndex | .surge.replacement.uid as $replacementUID |
+  .columnar.initialCount == 4 and .columnar.uniqueRequestCount == 1 and
+  (.columnar.baselineUIDs | length == 4 and (unique | length) == 4 and
+    index($sourceUID) != null and index($replacementUID) == null) and
+  (.columnar.baselineNodes | length == 4 and (unique | length) == 4 and index($sourceNode) != null) and
+  (.columnar.rawBeforeTrigger | raw_columnar) and
+  (.columnar.rawCompleted | raw_columnar) and
+  all(.columnar.decodedBeforeTrigger, .columnar.decodedCompleted;
+    .rawEncoding == "ColumnarV2" and (.rows | length) == 4 and
+    all(.rows[]; .phase == "Ready")) and
+  any(.columnar.decodedBeforeTrigger.rows[]; .index == $sourceIndex);
 
 def handoff_preserved_routing:
   .source.uid as $sourceUID | .surge.replacement.uid as $replacementUID |
@@ -135,7 +160,7 @@ def restart_recovered_same_request:
   .restart.uniqueRequestCount == 1 and .restart.workloadDispatchCount == 1 and
   .restart.migrationCount == 1;
 
-(.scenario == "maintenance-single" or .scenario == "unhealthy-single" or .scenario == "restart-single") and
+(.scenario == "maintenance-single" or .scenario == "maintenance-columnar" or .scenario == "unhealthy-single" or .scenario == "restart-single") and
 source_healthy and
 request_is_real and
 surge_preserved_source and
@@ -144,4 +169,5 @@ migration_completed and
 alfred_observed_drain and
 (if .scenario == "unhealthy-single" then health_window_observed
  elif .scenario == "restart-single" then restart_recovered_same_request
+ elif .scenario == "maintenance-columnar" then columnar_proven
  else true end)

@@ -48,6 +48,7 @@ bash hack/alfred-kind-e2e/build.sh
 bash hack/alfred-kind-e2e/kwok.sh
 bash hack/alfred-kind-e2e/deploy.sh
 bash hack/alfred-kind-e2e/scenario.sh maintenance-single
+bash hack/alfred-kind-e2e/scenario.sh maintenance-columnar
 bash hack/alfred-kind-e2e/scenario.sh restart-single
 bash hack/alfred-kind-e2e/scenario.sh unhealthy-single
 ```
@@ -79,6 +80,23 @@ bash hack/alfred-kind-e2e/gang.sh
   -l ome.io/inferenceservice=gang --timeout=90s
 bash hack/alfred-kind-e2e/no-capacity.sh
 ```
+
+`maintenance-columnar` uses four initial Instances and soft topology spread
+across the four virtual nodes. It refuses to trigger maintenance unless those
+Instances occupy distinct nodes and the real InferenceReplica stores
+`ColumnarV2` with columns and no dense status list. KWOK holds nonzero indices;
+the runner releases only initial indices 1–3, then holds the migration surge
+until the same source/readiness/routing checks used by `maintenance-single`
+pass. Replacement detection excludes every baseline Pod UID. Both the healthy
+baseline and completed migration must report four ready, serving, available
+replicas, and the annotation watch must observe exactly one request UUID.
+
+The runner builds `ir-status` once per scenario into `${STATE_DIR}` for the host
+platform. It uses Alfred's bounded status decoder and stops on decode errors.
+`ir-before-trigger.raw.json` and `ir-completed.raw.json` retain the API wire
+representations; separate `.decoded.json` files hold logical rows and the raw
+encoding marker. The evidence verifier requires actual ColumnarV2 at both
+snapshots, even when the manager's configured target permits dense fallback.
 
 The gang fixture has a leader and worker, each requesting eight GPUs, scheduled
 by the real OME scheduler into one zone. Migration must replace both members in
@@ -164,5 +182,5 @@ Run offline harness checks with:
 
 ```bash
 for test in hack/alfred-kind-e2e/*_test.sh; do bash "$test" || exit; done
-go test ./hack/alfred-kind-e2e/worker-result
+go test ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/ir-status
 ```

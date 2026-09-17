@@ -83,7 +83,7 @@ jq -n --slurpfile nodes "${art}/nodes-before.json" --slurpfile pods "${art}/pods
   [$nodes[0].items[] | . as $node | {name:.metadata.name,free:((.status.allocatable["nvidia.com/gpu"]|tonumber)-
     ([$pods[0].items[] | select(.spec.nodeName==$node.metadata.name and .status.phase!="Succeeded" and .status.phase!="Failed") | .spec.containers[] | (.resources.requests["nvidia.com/gpu"]//"0"|tonumber)]|add//0))}]' >"${art}/capacity-before.json"
 jq -e '(map(.free)|sort)==[0,0,1,7]' "${art}/capacity-before.json" >/dev/null
-"${k[@]}" -n "${ns}" get inferenceservice single --watch --request-timeout=240s -o json >"${art}/requests.jsonl" 2>"${art}/watch.stderr" &
+"${k[@]}" -n "${ns}" get inferenceservice single --watch --request-timeout=420s -o json >"${art}/requests.jsonl" 2>"${art}/watch.stderr" &
 watch_pid=$!
 configured=true
 "${h[@]}" upgrade ome-alfred "${repo}/charts/ome-alfred" -n ome --reuse-values --set alfredConfig.policies.defragmentation.enabled=true --set-json alfredConfig.policies.defragmentation.fragmentationThreshold=0.1 --wait --timeout=120s >"${art}/enable-defrag.log" 2>&1
@@ -92,6 +92,10 @@ jq -e '.alfredConfig.policies.defragmentation.enabled == true and .alfredConfig.
 echo 'Waiting for Alfred defragmentation request and real replacement placement'
 deadline=$((SECONDS+180)); request=''; replacement_uid=''
 while ((SECONDS<deadline)); do
+  if ! kill -0 "${watch_pid}" 2>/dev/null; then
+    echo 'InferenceService watch exited before defragmentation observation completed' >&2
+    exit 1
+  fi
   request="$(jq -cs '[.[]|.metadata.annotations//{}|to_entries[]|select(.key|startswith("ome.io/migration-request-v1-"))|{uuid:(.key|sub("^ome.io/migration-request-v1-";"")),payload:(.value|fromjson)}]|unique_by(.uuid)|if length==1 then .[0] else empty end' "${art}/requests.jsonl" 2>/dev/null || true)"
   "${k[@]}" -n "${ns}" get pods -l ome.io/inferenceservice=single -o json >"${art}/current-pods.json"
   "${k[@]}" -n "${ns}" get endpointslices -l "kubernetes.io/service-name=${service}" -o json >"${art}/current-endpoints.json"
@@ -115,6 +119,7 @@ while ((SECONDS<deadline)); do
     "${k[@]}" -n "${ns}" get pod beneficiary -o json >"${art}/beneficiary-after.json"
     if jq -e --arg uuid "$(jq -r '.uuid' <<<"${request}")" '(.status.migrations|length)==1 and .status.migrations[0].requestUUID==$uuid and .status.migrations[0].phase=="Completed"' "${art}/current-ir.json" >/dev/null &&
       jq -e '.spec.nodeName=="alfred-kwok-gpu-a" and any(.status.conditions[]?;.type=="Ready" and .status=="True")' "${art}/beneficiary-after.json" >/dev/null; then
+      "${k[@]}" -n "${ns}" get pods -l ome.io/inferenceservice=single -o json >"${art}/current-pods.json"
       jq -e --arg uid "${source_uid}" 'all(.items[];.metadata.uid!=$uid)' "${art}/current-pods.json" >/dev/null
       jq -n --slurpfile before "${art}/beneficiary-before.json" --slurpfile after "${art}/beneficiary-after.json" --slurpfile capacity "${art}/capacity-before.json" --slurpfile request "${art}/request.json" --slurpfile ir "${art}/current-ir.json" --slurpfile handoff "${art}/handoff.jsonl" \
         '{scenario:"useful-defrag",before:$before[0],after:$after[0],capacityBefore:$capacity[0],request:$request[0],migration:$ir[0].status.migrations[0],handoff:$handoff}' >"${art}/evidence.json"

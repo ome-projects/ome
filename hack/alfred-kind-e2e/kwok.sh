@@ -5,12 +5,18 @@ set -euo pipefail
 readonly KWOK_VERSION="v0.8.0"
 readonly KWOK_IMAGE="registry.k8s.io/kwok/kwok:${KWOK_VERSION}"
 readonly KWOK_MANIFEST_URL="https://github.com/kubernetes-sigs/kwok/releases/download/${KWOK_VERSION}/kwok.yaml"
-readonly CLUSTER_CONTEXT="kind-alfred-e2e"
 
 die() {
   echo "kwok.sh: $*" >&2
   exit 1
 }
+
+readonly CLUSTER_NAME="${CLUSTER_NAME:-alfred-e2e}"
+case "${CLUSTER_NAME}" in
+  alfred-e2e | alfred-e2e-*) ;;
+  *) die "Cluster name must start with alfred-e2e" ;;
+esac
+readonly CLUSTER_CONTEXT="kind-${CLUSTER_NAME}"
 
 [[ -n "${STATE_DIR:-}" ]] || die "STATE_DIR is required"
 [[ "${STATE_DIR}" = /* ]] || die "STATE_DIR must be an absolute path"

@@ -29,6 +29,47 @@ require_fail() {
 }
 
 require_pass valid "${valid}"
+
+# Four healthy, distinct initial Instances must actually use columns on the
+# wire. Relabeling the old dense evidence is not a ColumnarV2 qualification.
+jq '.scenario = "maintenance-columnar" |
+  .preTrigger.irReadyReplicas = 4 | .preTrigger.irServingReplicas = 4 |
+  .preTrigger.irAvailableReplicas = 4 | .completed.irReadyReplicas = 4 |
+  .completed.irServingReplicas = 4 | .completed.irAvailableReplicas = 4 |
+  .surge.replacement.instance = 4 | .completed.migration.surgeInstance = 4 |
+  .columnar = {initialCount:4, baselineUIDs:[.source.uid,"baseline-1","baseline-2","baseline-3"],
+    baselineNodes:[.source.node,"alfred-gpu-b","alfred-gpu-c","alfred-gpu-d"],
+    uniqueRequestCount:1,
+    rawBeforeTrigger:{status:{readyReplicas:4,servingReplicas:4,availableReplicas:4,
+      instanceStatusEncoding:"ColumnarV2",instanceStatusColumns:{members:"0-3",phases:[{value:"Ready",indexes:"0-3"}]}}},
+    rawCompleted:{status:{readyReplicas:4,servingReplicas:4,availableReplicas:4,
+      instanceStatusEncoding:"ColumnarV2",instanceStatusColumns:{members:"1-4",phases:[{value:"Ready",indexes:"1-4"}]}}},
+    decodedBeforeTrigger:{rawEncoding:"ColumnarV2",rows:[range(0;4)|{index:.,phase:"Ready"}]},
+    decodedCompleted:{rawEncoding:"ColumnarV2",rows:[range(1;5)|{index:.,phase:"Ready"}]}}
+  ' "${valid}" >"${tmp_dir}/columnar.json"
+require_pass maintenance-columnar "${tmp_dir}/columnar.json"
+for mutation in \
+  '.columnar.rawBeforeTrigger.status.instanceStatusEncoding = "DenseV1"' \
+  '.columnar.rawCompleted.status.instanceStatusEncoding = "DenseV1"' \
+  '.columnar.rawBeforeTrigger.status.instanceStatuses = [{index:0,phase:"Ready"}]' \
+  '.columnar.rawCompleted.status.instanceStatuses = []' \
+  'del(.columnar.rawBeforeTrigger.status.instanceStatusColumns)' \
+  '.columnar.rawCompleted.status.instanceStatusColumns = null' \
+  '.columnar.rawBeforeTrigger.status.readyReplicas = 1' \
+  '.columnar.rawCompleted.status.availableReplicas = 1' \
+  '.preTrigger.irReadyReplicas = 1' '.completed.irServingReplicas = 1' \
+  '.columnar.initialCount = 1' '.columnar.uniqueRequestCount = 2' \
+  '.columnar.baselineUIDs[1] = .surge.replacement.uid' \
+  '.columnar.baselineNodes[1] = .source.node' \
+  '.columnar.decodedBeforeTrigger.rows[0].phase = "Pending"' \
+  '.columnar.decodedCompleted.rows |= .[0:1]'; do
+  jq "${mutation}" "${tmp_dir}/columnar.json" >"${tmp_dir}/bad-columnar.json"
+  if jq -e -f "${verifier}" "${tmp_dir}/bad-columnar.json" >/dev/null 2>&1; then
+    echo "verifier falsely accepted columnar mutation: ${mutation}" >&2
+    exit 1
+  fi
+done
+require_fail single-replica-count-change '.preTrigger.irReadyReplicas = 4 | .completed.irReadyReplicas = 4'
 require_fail pretrigger-already-migrating '.preTrigger.migrationRequestCount = 1'
 require_fail source-not-serving '.source.serving = false'
 require_fail source-not-in-endpoints '.source.endpointReady = false'
