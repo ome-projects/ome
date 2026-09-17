@@ -109,21 +109,6 @@ func loadPodBatchSizes(clientset kubernetes.Interface) (controllerconfig.PodBatc
 	return controllerconfig.LoadPodBatchSizes(clientset)
 }
 
-// validateInstanceStatusWriteTarget rejects a configured status write target
-// this binary cannot honor. Its status writer persists DenseV1 only, so a
-// ColumnarV2 target would be silently downgraded; refusing to start keeps the
-// configured policy and the written representation identical.
-func validateInstanceStatusWriteTarget(cfg *controllerconfig.OMENativeStatusConfig) error {
-	if cfg == nil {
-		return fmt.Errorf("omenativeStatus configuration is missing")
-	}
-	if cfg.InstanceStatusEncoding != irstatus.EncodingDenseV1 {
-		return fmt.Errorf("omenativeStatus.instanceStatusEncoding %q is not a write target this manager supports; it writes %s only",
-			cfg.InstanceStatusEncoding, irstatus.EncodingDenseV1)
-	}
-	return nil
-}
-
 func managerProbeChecker(enableWebhook bool, webhookServer func() webhook.Server) healthz.Checker {
 	if !enableWebhook {
 		return healthz.Ping
@@ -351,10 +336,6 @@ func main() {
 	omenativeStatusConfig, err := controllerconfig.NewOMENativeStatusConfig(clientSet)
 	if err != nil {
 		setupLog.Error(err, "Failed to initialize OMENative status configuration")
-		os.Exit(1)
-	}
-	if err := validateInstanceStatusWriteTarget(omenativeStatusConfig); err != nil {
-		setupLog.Error(err, "Unsupported OMENative status configuration")
 		os.Exit(1)
 	}
 	if err := schemapreflight.Verify(clientSet.Discovery().OpenAPIV3()); err != nil {
@@ -664,6 +645,7 @@ func main() {
 			Log:                      ctrl.Log.WithName("InferenceReplica"),
 			APIReader:                mgr.GetAPIReader(),
 			InstanceStatusDecoder:    instanceStatusDecoder,
+			InstanceStatusTarget:     omenativeStatusConfig.InstanceStatusEncoding,
 			Recorder:                 eventBroadcaster.NewRecorder(mgr.GetScheme(), v1.EventSource{Component: "v1beta1Controllers"}),
 			MaxConcurrentReconciles:  options.irMaxConcurrentReconciles,
 			ConfigCacheTTL:           options.configCacheTTL,

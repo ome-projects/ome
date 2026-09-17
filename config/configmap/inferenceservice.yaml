@@ -27,13 +27,17 @@ data:
 
   # How the manager stores InferenceReplica per-Instance status. Read once at
   # manager startup and required: a missing or unknown instanceStatusEncoding
-  # prevents startup. DenseV1 writes the dense instanceStatuses list.
+  # prevents startup. ColumnarV2 writes grouped columns when they are strictly
+  # smaller than the dense instanceStatuses list and the dense list otherwise;
+  # DenseV1 always writes the dense list and is the rollback target.
   # maxDecodedInstances bounds how many rows a stored ColumnarV2 payload may
-  # expand to; it must be a positive integer, is required for ColumnarV2, and
-  # may be omitted for DenseV1 (any ColumnarV2 object then fails closed).
+  # expand to: a positive integer, required for ColumnarV2, sized as the
+  # deployment profile's ceiling on transient rows per InferenceReplica and
+  # never lowered below the largest stored ColumnarV2 row count.
   omenativeStatus: |-
     {
-      "instanceStatusEncoding": "DenseV1"
+      "instanceStatusEncoding": "ColumnarV2",
+      "maxDecodedInstances": 20000
     }
 
   modelInit: |-

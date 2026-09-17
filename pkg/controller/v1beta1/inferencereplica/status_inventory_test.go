@@ -31,6 +31,12 @@ import (
 //   - status writes: every InferenceReplica status write must be the single
 //     writer.
 //
+// The field-read sweep also covers every file under tests/, test files
+// included: integration specs read rows only through the shared helper that
+// decodes either stored representation, so a spec cannot silently observe an
+// empty dense list on a ColumnarV2 object. The qualification suites that
+// inspect the stored representation on purpose are classified as such.
+//
 // A new site anywhere fails until it is classified here; a stale entry fails
 // so the table never drifts from the code. An import-graph check keeps the
 // shared test-fixture package out of every production package, which is what
@@ -42,6 +48,9 @@ const (
 	fixturePackagePath = codecPackagePath + "/irstatustest"
 	decodedAccessor    = "GetDecoded"
 	singleWriter       = "persistInferenceReplicaStatus"
+
+	projectorPackagePath               = "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	controllerRuntimeClientPackagePath = "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var representationFields = map[string]struct{}{
@@ -75,6 +84,14 @@ const (
 	// and qualification suites to measure; its package is test support that
 	// no production package imports (TestIRStatusFixturePackageImportInventory).
 	testFixtureBuilder = "test-fixture builder constructing logical statuses; imported only by tests"
+	// breakGlassRepair: the operator-side repair installs an independently
+	// validated replacement on a copy of the raw live object and writes it
+	// through the single writer; the stored payload is never decoded.
+	breakGlassRepair = "break-glass repair through the single writer"
+	// breakGlassRepairRead: the repair's raw live read supplies the
+	// resourceVersion precondition and the status outside the per-Instance
+	// representation; the stored payload is replaced, not consumed.
+	breakGlassRepairRead = "pass-through: break-glass repair live read (resourceVersion and unrelated status)"
 	// rawReaderOutsideManager: a reader outside the manager (the kubectl-ome
 	// CLI, alfred) fetches the object raw and consumes the stored dense rows
 	// directly, so a ColumnarV2 object presents no rows to it until it reads
@@ -144,6 +161,12 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/retention.go", "Reconciler.sweepRevisions", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status_transition.go", "Reconciler.convertStoredRepresentation", read(1), decodedObjectRows, rows)
 
+	// Break-glass repair: the only writer entry point registered with no
+	// reconciler. It installs validated replacement rows on a deep copy of
+	// the raw live object and clears the marker and columns on that copy.
+	approve("pkg/controller/v1beta1/inferencereplica/status_repair.go", "RepairInstanceStatus", accessCounts{writes: 1}, breakGlassRepair, rows, "InstanceStatusEncoding", "InstanceStatusColumns")
+	approve("pkg/controller/v1beta1/inferencereplica/status_repair.go", "validateRepairReplacement", accessCounts{writes: 1}, breakGlassRepair, rows)
+
 	// Remote readers: coordination and placement consume the object that
 	// irprojector.DecodedComponentIR(Status) returned.
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "GateContext.CheckPairing", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
@@ -186,6 +209,9 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 		}
 		collectRepresentationFieldUses(pkg, file, relative, actual)
 	})
+	loadTestInventory(t).eachTestFile(func(pkg *packages.Package, file *ast.File, relative string) {
+		collectRepresentationFieldUses(pkg, file, relative, actual)
+	})
 
 	for use, got := range actual {
 		want, ok := approved[use]
@@ -212,6 +238,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 
 	approve("pkg/controller/v1beta1/irstatus/reader.go", decodedAccessor, "Get", 1, decodedBoundary)
 	approve("pkg/controller/v1beta1/irstatus/transitionpreflight/preflight.go", "checkReplicas", "List", 1, administrativeCensus)
+	approve("pkg/controller/v1beta1/irstatus/statusrepair/repair.go", "Run", "Get", 1, breakGlassRepairRead)
 
 	// InferenceReplica reconciler pass-through reads.
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.Reconcile", "Get", 1, passThroughSpecMetadata+" (finalizer add rejected: re-read DeletionTimestamp)")
@@ -272,6 +299,63 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 			t.Errorf("stale fetch approval for %s in %s:%s (%s)", site.method, site.file, site.function, want.reason)
 		}
 	}
+}
+
+// A decoded read carries its row decoder on the reader it receives. A bare
+// client.Client carries the zero Decoder and fails closed on every ColumnarV2
+// object, so a decoded accessor may receive only the codec's Reader or a
+// client.Reader parameter that a caller filled under this same rule.
+func TestInferenceReplicaDecodedReadsCarryADecoder(t *testing.T) {
+	decodedAccessors := map[string]map[string]bool{
+		codecPackagePath:     {decodedAccessor: true},
+		projectorPackagePath: {"DecodedComponentIR": true, "DecodedComponentIRStatus": true},
+	}
+	inv := loadStatusInventory(t)
+	calls := 0
+	inv.eachProductionFile(func(pkg *packages.Package, file *ast.File, relative string) {
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			fn, ok := pkg.TypesInfo.Uses[selector.Sel].(*types.Func)
+			if !ok || fn.Pkg() == nil || !decodedAccessors[fn.Pkg().Path()][fn.Name()] || len(call.Args) < 2 {
+				return true
+			}
+			calls++
+			typ := pkg.TypesInfo.TypeOf(call.Args[1])
+			if typ == nil || readerCarriesDecoder(typ) {
+				return true
+			}
+			t.Errorf("%s:%s passes a %s to %s: wrap it with irstatus.NewReader so the read carries the row decoder",
+				relative, enclosingFunction(file, call.Pos()), types.TypeString(typ, nil), fn.Name())
+			return true
+		})
+	})
+	if calls == 0 {
+		t.Fatal("no decoded-accessor call found; the rule would pass vacuously")
+	}
+}
+
+// readerCarriesDecoder accepts the codec's Reader, which carries a Decoder by
+// construction, and the client.Reader interface, which reaches a decoded
+// accessor only as a parameter whose caller is checked by the same rule.
+func readerCarriesDecoder(typ types.Type) bool {
+	named, ok := typ.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return false
+	}
+	switch named.Obj().Pkg().Path() {
+	case codecPackagePath:
+		return named.Obj().Name() == "Reader"
+	case controllerRuntimeClientPackagePath:
+		return named.Obj().Name() == "Reader"
+	}
+	return false
 }
 
 // The shared fixture package writes the dense representation directly, so its
@@ -406,6 +490,73 @@ func (inv *statusInventory) eachProductionFile(visit func(pkg *packages.Package,
 			if strings.HasPrefix(base, "zz_generated.") || base == "openapi_generated.go" || strings.HasSuffix(base, "_test.go") {
 				continue
 			}
+			relative, err := filepath.Rel(inv.repoRoot, path)
+			if err != nil || strings.HasPrefix(relative, "..") {
+				continue
+			}
+			visit(pkg, file, filepath.ToSlash(relative))
+		}
+	}
+}
+
+var (
+	testInventoryOnce sync.Once
+	testInventoryPkgs []*packages.Package
+	testInventoryRoot string
+	testInventoryErr  error
+)
+
+// loadTestInventory loads every package under tests/ together with its test
+// files, which is where the integration specs live.
+func loadTestInventory(t *testing.T) *statusInventory {
+	t.Helper()
+	testInventoryOnce.Do(func() {
+		testInventoryRoot = inventoryRepositoryRoot()
+		if testInventoryRoot == "" {
+			testInventoryErr = fmt.Errorf("resolve repository root")
+			return
+		}
+		if _, err := os.Stat(filepath.Join(testInventoryRoot, "tests")); err != nil {
+			testInventoryErr = fmt.Errorf("locate tests root: %w", err)
+			return
+		}
+		cfg := &packages.Config{
+			Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports,
+			Dir:   testInventoryRoot,
+			Tests: true,
+		}
+		testInventoryPkgs, testInventoryErr = packages.Load(cfg, "./tests/...")
+	})
+	if testInventoryErr != nil {
+		t.Fatalf("load test packages: %v", testInventoryErr)
+	}
+	for _, pkg := range testInventoryPkgs {
+		if len(pkg.Errors) == 0 {
+			continue
+		}
+		if _, usesAPI := pkg.Imports[omeAPIPackagePath]; usesAPI {
+			t.Fatalf("package %s did not type-check: %v", pkg.PkgPath, pkg.Errors[0])
+		}
+		t.Logf("skipping %s (does not import the OME API and did not load: %v)", pkg.PkgPath, pkg.Errors[0])
+	}
+	return &statusInventory{repoRoot: testInventoryRoot, pkgs: testInventoryPkgs}
+}
+
+// eachTestFile visits every repository file of the loaded test packages once,
+// test files included. A package's test variants share its non-test files, so
+// files are deduplicated by path.
+func (inv *statusInventory) eachTestFile(visit func(pkg *packages.Package, file *ast.File, relative string)) {
+	seen := map[string]struct{}{}
+	for _, pkg := range inv.pkgs {
+		if len(pkg.Errors) > 0 || pkg.TypesInfo == nil || pkg.Fset == nil {
+			continue
+		}
+		for _, file := range pkg.Syntax {
+			path := pkg.Fset.Position(file.Pos()).Filename
+			if _, visited := seen[path]; visited {
+				continue
+			}
+			seen[path] = struct{}{}
 			relative, err := filepath.Rel(inv.repoRoot, path)
 			if err != nil || strings.HasPrefix(relative, "..") {
 				continue

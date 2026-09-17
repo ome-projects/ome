@@ -365,7 +365,7 @@ kubectl-ome-cross: ## 🔌 Cross-compile kubectl-ome for all release platforms (
 	done
 
 .PHONY: ome-status-preflight
-ome-status-preflight: ## 🔍 Build the read-only InferenceReplica status transition preflight.
+ome-status-preflight: ## 🔍 Build the InferenceReplica status transition preflight (read-only checks plus the dry-run-by-default repair subcommand).
 	@echo "🔍 Building ome-status-preflight..."
 	@# No xet dependency: the command only reads the API, so it stays a pure-Go
 	@# binary that builds anywhere without a Rust toolchain.

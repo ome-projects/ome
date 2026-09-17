@@ -26,6 +26,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -894,7 +895,7 @@ func TestAggregateAndWriteStatusReusesPublicationReadsAcrossConflictRetry(t *tes
 		WithIndex(&corev1.Pod{}, query.OMENativePodIndexField, query.OMENativePodIndexExtractor).
 		WithInterceptorFuncs(funcs).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workload.NewExpectations()}
+	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 	plan := workload.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
@@ -951,10 +952,11 @@ func TestAggregateAndWriteStatus_RebasesAfterAdjacentLifecycleWrite(t *testing.T
 		WithStatusSubresource(&v1beta1.InferenceReplica{}).
 		Build()
 	r := &Reconciler{
-		Client:       &staleReadingClient{Client: apiClient, reader: staleCache},
-		APIReader:    apiClient,
-		Log:          logf.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
+		Client:               &staleReadingClient{Client: apiClient, reader: staleCache},
+		APIReader:            apiClient,
+		Log:                  logf.Log.WithName("test"),
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	plan := workload.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
@@ -987,10 +989,11 @@ func TestAggregateAndWriteStatus_SameNameReplacementIsUntouched(t *testing.T) {
 	wantStatus := replacement.Status.DeepCopy()
 	live, writes := newCountingStatusClient(t, 0, replacement)
 	r := &Reconciler{
-		Client:       live,
-		APIReader:    live,
-		Log:          logf.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
+		Client:               live,
+		APIReader:            live,
+		Log:                  logf.Log.WithName("test"),
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	plan := workload.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(stale.Spec.Component),
@@ -1018,10 +1021,11 @@ func TestAggregateAndWriteStatus_GenerationChangeAborts(t *testing.T) {
 	wantStatus := liveObject.Status.DeepCopy()
 	live, writes := newCountingStatusClient(t, 0, liveObject)
 	r := &Reconciler{
-		Client:       live,
-		APIReader:    live,
-		Log:          logf.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
+		Client:               live,
+		APIReader:            live,
+		Log:                  logf.Log.WithName("test"),
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	plan := workload.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(stale.Spec.Component),
@@ -1174,7 +1178,7 @@ func TestAggregateAndWriteStatus_ConflictSurfacesAsConflict(t *testing.T) {
 		WithStatusSubresource(&v1beta1.InferenceReplica{}).
 		WithInterceptorFuncs(conflict).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workload.NewExpectations()}
+	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	plan := workload.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),

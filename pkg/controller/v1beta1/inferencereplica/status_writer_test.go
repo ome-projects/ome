@@ -92,11 +92,23 @@ var transientInstanceObservationFields = map[string]struct{}{
 	"NodesOccupied":     {},
 }
 
-// testStatusWriter is the persistence boundary over a bare fake client: no
-// row bound (every object under test is DenseV1) and no recorder.
+// testStatusWriter is the persistence boundary over a bare fake client under
+// the DenseV1 target: no row bound (every object under test is DenseV1) and
+// no recorder.
 func testStatusWriter(c client.Client) statusWriter {
-	return statusWriter{Client: c}
+	return statusWriter{Client: c, target: irstatus.EncodingDenseV1}
 }
+
+// columnarStatusWriter is the persistence boundary under the ColumnarV2
+// target with a row bound large enough for every fixture in this package.
+func columnarStatusWriter(c client.Client) statusWriter {
+	return statusWriter{Client: c, decoder: irstatus.NewDecoder(testColumnarBound), target: irstatus.EncodingColumnarV2}
+}
+
+// testColumnarBound is the ColumnarV2 decode bound the ColumnarV2-target
+// fixtures in this package run under; it exceeds the largest fixture row
+// count so the bound never decides a selection here.
+const testColumnarBound = 8192
 
 func TestClearPodDerivedInstanceObservations(t *testing.T) {
 	original := populatedInstanceStatus()
@@ -162,9 +174,10 @@ func TestUpdateInferenceReplicaStatusPersistsCompactedStatus(t *testing.T) {
 	}
 }
 
-// TestUpdateInferenceReplicaStatusRefusesColumnarV2 pins the slice boundary:
-// the writer persists DenseV1 only, so an object read from ColumnarV2 is
-// refused with a typed error and nothing reaches the API server.
+// TestUpdateInferenceReplicaStatusRefusesColumnarV2 pins the DenseV1-target
+// boundary: an object read from ColumnarV2, or a write copy still carrying
+// the ColumnarV2 marker, is refused with a typed error and nothing reaches
+// the API server.
 func TestUpdateInferenceReplicaStatusRefusesColumnarV2(t *testing.T) {
 	ctx := context.Background()
 	ir := &v1beta1.InferenceReplica{
@@ -191,8 +204,8 @@ func TestUpdateInferenceReplicaStatusRefusesColumnarV2(t *testing.T) {
 	if !errors.Is(err, ErrColumnarV2StatusWrite) {
 		t.Fatalf("ColumnarV2 source must be refused with ErrColumnarV2StatusWrite, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "default/model-engine") || !strings.Contains(err.Error(), "DenseV1 only") {
-		t.Fatalf("refusal must name the object and the supported target: %v", err)
+	if !strings.Contains(err.Error(), "default/model-engine") || !strings.Contains(err.Error(), `target "DenseV1"`) {
+		t.Fatalf("refusal must name the object and the configured target: %v", err)
 	}
 
 	marked := before.DeepCopy()
@@ -395,7 +408,7 @@ func TestUpdateInferenceReplicaStatusSizeRejection(t *testing.T) {
 			live := before.DeepCopy()
 			live.Status.Replicas = 2
 			recorder := &capturingRecorder{}
-			writer := statusWriter{Client: c, recorder: recorder}
+			writer := statusWriter{Client: c, target: irstatus.EncodingDenseV1, recorder: recorder}
 			resultBefore := irStatusMetric(t, "ome_omenative_ir_status_writes_total", writeResultLabels(tc.wantResult))
 
 			err := updateInferenceReplicaStatus(ctx, writer, live, irstatus.EncodingDenseV1)
@@ -454,15 +467,26 @@ func TestInferenceReplicaStatusUpdatesUseWriterBoundary(t *testing.T) {
 		t.Fatalf("read package directory: %v", err)
 	}
 
-	// Two typed entry points share one raw write: logical mutations enter
+	// Three typed entry points share one raw write: logical mutations enter
 	// through the mutation writer, the transition gate through the
-	// conversion writer, and only the persist function touches Status().
+	// conversion writer, the operator-side break-glass repair through the
+	// repair entry, and only the persist function touches Status().
 	const (
 		writer     = "updateInferenceReplicaStatus"
 		conversion = "convertInferenceReplicaStatus"
+		repair     = "RepairInstanceStatus"
 		persist    = "persistInferenceReplicaStatus"
 	)
+	// persistCallers is the approval list of functions that may call the
+	// single raw write; the repair entry is the one classified break-glass
+	// writer, and it is registered with no reconciler.
+	persistCallers := map[string]string{
+		writer:     "status_writer.go",
+		conversion: "status_writer.go",
+		repair:     "status_repair.go",
+	}
 	var writerCalls, conversionCalls, statusAccesses, statusSubresources, rawUpdates []string
+	persistCalls := map[string][]string{}
 	fset := token.NewFileSet()
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
@@ -490,6 +514,8 @@ func TestInferenceReplicaStatusUpdatesUseWriterBoundary(t *testing.T) {
 						writerCalls = append(writerCalls, site)
 					case conversion:
 						conversionCalls = append(conversionCalls, site)
+					case persist:
+						persistCalls[fn.Name.Name] = append(persistCalls[fn.Name.Name], entry.Name())
 					}
 				}
 				if selectorCallNamed(call, "Status") {
@@ -511,6 +537,16 @@ func TestInferenceReplicaStatusUpdatesUseWriterBoundary(t *testing.T) {
 	}
 	if len(conversionCalls) != 1 || !strings.Contains(conversionCalls[0], "status_transition.go") {
 		t.Fatalf("conversion writes through %s must come from the transition gate alone: %v", conversion, conversionCalls)
+	}
+	for caller, file := range persistCallers {
+		if files := persistCalls[caller]; len(files) != 1 || files[0] != file {
+			t.Fatalf("%s must call %s exactly once from %s, got %v", caller, persist, file, files)
+		}
+	}
+	for caller, files := range persistCalls {
+		if _, approved := persistCallers[caller]; !approved {
+			t.Fatalf("%s calls %s from %v; only the approved entry points may reach the single writer: %v", caller, persist, files, persistCallers)
+		}
 	}
 	if len(statusAccesses) != 1 || !strings.Contains(statusAccesses[0], "status_writer.go") || !strings.Contains(statusAccesses[0], "("+persist+")") {
 		t.Fatalf("raw Status() access must exist only in %s: %v", persist, statusAccesses)

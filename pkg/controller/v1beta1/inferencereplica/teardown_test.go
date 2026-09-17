@@ -27,6 +27,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -531,7 +532,7 @@ func TestTeardown_LedgerClose_RetriesOnConflict(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations()}
+	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
@@ -616,7 +617,7 @@ func TestTeardown_LedgerClose_RebasesOverPeerComponentWrite(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations()}
+	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
@@ -679,7 +680,7 @@ func TestTeardown_StaleParentNotFound_ClosesParentLedger(t *testing.T) {
 		WithScheme(testScheme(t)).
 		WithObjects(parent, liveLedgerCM, ir).
 		Build()
-	r := &Reconciler{Client: c, APIReader: reader, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations()}
+	r := &Reconciler{Client: c, APIReader: reader, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
@@ -737,10 +738,11 @@ func TestReconcile_FinalizerAddDeletionRace_NoError(t *testing.T) {
 	live.DeletionTimestamp = &now
 	live.Finalizers = []string{"test.ome.io/hold"}
 	r := &Reconciler{
-		Client:       newStaleClient(t),
-		APIReader:    fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(live).Build(),
-		Log:          ctrl.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
+		Client:               newStaleClient(t),
+		APIReader:            fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(live).Build(),
+		Log:                  ctrl.Log.WithName("test"),
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	result, err := r.Reconcile(context.Background(), req)
 	if err != nil {
@@ -752,10 +754,11 @@ func TestReconcile_FinalizerAddDeletionRace_NoError(t *testing.T) {
 
 	// Live view NOT Terminating → the rejection is a real failure.
 	r = &Reconciler{
-		Client:       newStaleClient(t),
-		APIReader:    fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(baselineIR("llama-engine", "prod", 1)).Build(),
-		Log:          ctrl.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
+		Client:               newStaleClient(t),
+		APIReader:            fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(baselineIR("llama-engine", "prod", 1)).Build(),
+		Log:                  ctrl.Log.WithName("test"),
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	if _, err := r.Reconcile(context.Background(), req); err == nil {
 		t.Errorf("finalizer-add rejection with a non-Terminating live view must surface an error")
@@ -873,6 +876,7 @@ func TestTeardown_StatuslessPodGroupsDeleteInBoundedWaves(t *testing.T) {
 		Log:                      ctrl.Log.WithName("test"),
 		Recorder:                 recorder,
 		Expectations:             workload.NewExpectations(),
+		InstanceStatusTarget:     irstatus.EncodingDenseV1,
 		GangSchedulingAvailable:  true,
 		ScaleDownPodBatchSize:    &budget,
 		ScaleDownRequeueInterval: testScaleDownRequeueInterval,
@@ -1099,7 +1103,7 @@ func TestTeardown_CleansMetricSeriesBeforeFinalizerRelease(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &Reconciler{Client: base, APIReader: base, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations()}
+	r := &Reconciler{Client: base, APIReader: base, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)})
 	if err == nil || !strings.Contains(err.Error(), "injected finalizer update failure") {
@@ -1305,11 +1309,12 @@ func TestTeardown_ForceDeleteEscalation_UnwedgesDeadNodePod(t *testing.T) {
 		}).
 		Build()
 	r := &Reconciler{
-		Client:       c,
-		APIReader:    c,
-		Log:          ctrl.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
-		Clock:        clocktesting.NewFakeClock(base),
+		Client:               c,
+		APIReader:            c,
+		Log:                  ctrl.Log.WithName("test"),
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
+		Clock:                clocktesting.NewFakeClock(base),
 	}
 	withLifecycleConfig(r, `{"forceDelete":{"overdueSlack":"2m","nodeUnreachableThreshold":"5m"}}`)
 	rec := record.NewFakeRecorder(32)

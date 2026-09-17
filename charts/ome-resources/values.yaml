@@ -413,18 +413,27 @@ ome:
     # omenativeStatus selects how the manager stores InferenceReplica
     # per-Instance status. It is read once at manager startup and is
     # required: a manager with no value, or an unknown one, refuses to start.
-    # Changing either key is a stopped-fleet operation, never a rolling one.
+    # The manager converts each object to the configured target as it
+    # reconciles it. Rolling back to DenseV1 is a flip of the target followed
+    # by waiting for the conversions to finish (the conversions counter and
+    # the preflight report show completion); the manager image must never be
+    # rolled back to a build without the ColumnarV2 schema while any object is
+    # still stored as ColumnarV2.
     omenativeStatus:
-      # Status write target: DenseV1 (the dense instanceStatuses list) or
-      # ColumnarV2 (grouped columns, chosen only when strictly smaller).
-      # ColumnarV2 additionally requires maxDecodedInstances.
-      instanceStatusEncoding: DenseV1
-      # Largest number of per-Instance rows a stored ColumnarV2 payload may
-      # expand to; a positive integer sized to the deployment's supported
-      # ceiling of transient rows per InferenceReplica. Required under
-      # ColumnarV2. Leave unset under DenseV1 unless ColumnarV2 objects can be
-      # observed; without it any ColumnarV2 object fails closed.
-      # maxDecodedInstances: 5000
+      # Status write target: ColumnarV2 (grouped columns, written only when
+      # strictly smaller than the dense list, the dense list otherwise) or
+      # DenseV1 (always the dense instanceStatuses list; the rollback target).
+      instanceStatusEncoding: ColumnarV2
+      # The deployment profile's ceiling on transient per-Instance rows in one
+      # InferenceReplica: desired replicas plus surge, migration, replacement,
+      # and retained terminal rows. A stored ColumnarV2 payload above it fails
+      # closed, so raise it deliberately before any InferenceReplica can reach
+      # it, and never lower it below the largest stored ColumnarV2 row count
+      # (the preflight reports that number). Required under ColumnarV2. 20000
+      # is four times the 5,000-row fixtures this repository qualifies the
+      # codec against: a full surge of the largest one, with room for
+      # retained rows.
+      maxDecodedInstances: 20000
     # podDisruptionBudget configures pod-level availability policies by mode.
     # Explicit per-Component policies take precedence over these defaults. Set
     # either mode to null to disable its default.

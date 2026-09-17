@@ -19,6 +19,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
@@ -75,12 +76,13 @@ func newConsumeFixture(t *testing.T, ir *v1beta1.InferenceReplica, parent *v1bet
 		Build()
 	rec := record.NewFakeRecorder(16)
 	r := &Reconciler{
-		Client:       c,
-		APIReader:    c,
-		Log:          logf.Log.WithName("test"),
-		Recorder:     rec,
-		Expectations: workload.NewExpectations(),
-		Clock:        clocktesting.NewFakeClock(migrationTestNow),
+		Client:               c,
+		APIReader:            c,
+		Log:                  logf.Log.WithName("test"),
+		Recorder:             rec,
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
+		Clock:                clocktesting.NewFakeClock(migrationTestNow),
 	}
 	freshIR := &v1beta1.InferenceReplica{}
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), freshIR); err != nil {

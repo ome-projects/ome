@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -268,12 +269,17 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		return nil, fmt.Errorf("update traffic status: %w", err)
 	}
 
+	// The cached client carries no row decoder; the group observation reads
+	// InferenceReplicas through it paired with the decoder the live reader
+	// carries, so a ColumnarV2-stored object decodes on this path as well.
+	cachedDecoded := irstatus.NewReader(in.Client, irstatus.DecoderOf(in.Reader))
+
 	// Drive the per-group state machine.
 	for _, g := range groups {
 		if err := ValidateGroupShape(g); err != nil {
 			return nil, fmt.Errorf("invalid coordination group shape: %w", err)
 		}
-		obs, err := buildGroupObservation(ctx, in.Client, in.ISVC, g, perRevisionPods)
+		obs, err := buildGroupObservation(ctx, cachedDecoded, in.ISVC, g, perRevisionPods)
 		if err != nil {
 			return nil, fmt.Errorf("build observation for group %s: %w", g.Name, err)
 		}

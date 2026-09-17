@@ -120,6 +120,13 @@ type Reconciler struct {
 	// travels with the reader into the status-mutation closures.
 	InstanceStatusDecoder irstatus.Decoder
 
+	// InstanceStatusTarget is the operator-configured representation every
+	// status write of this reconciler targets, DenseV1 or ColumnarV2, loaded
+	// once at startup from the same omenativeStatus configuration as the
+	// decoder bound. It has no default: SetupWithManager rejects an unset
+	// value and the writer refuses every write until it is set.
+	InstanceStatusTarget irstatus.Encoding
+
 	// Expectations is the create/delete bookkeeping cache the
 	// workload pipeline uses to avoid re-issuing batches before the
 	// controller-runtime watch has confirmed prior writes. Optional;
@@ -239,11 +246,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 	r.rememberScaleDownSeries(ir)
 
-	// Transition gate: this manager writes DenseV1, so an object still stored
-	// as ColumnarV2 is rewritten before any pass, including teardown, mutates
-	// it. A DenseV1 object takes the fast path with no extra serialization.
-	if source == irstatus.EncodingColumnarV2 {
-		return r.convertStoredRepresentation(ctx, log, ir)
+	// Transition gate: an object stored in a representation other than the
+	// configured target is re-selected before any pass, including teardown,
+	// mutates it. An object stored in the target representation takes the
+	// fast path with no extra serialization.
+	if handled, result, err := r.reconcileStoredRepresentation(ctx, log, ir, source); handled {
+		return result, err
 	}
 
 	// Bind structured logging context for the remainder of this
@@ -301,6 +309,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				return ctrl.Result{}, nil
 			}
 			return ctrl.Result{}, err
+		}
+		// The update response carries the stored status, so the in-memory
+		// object holds the raw per-Instance representation again; decode it
+		// so the rest of the pass keeps observing logical rows.
+		if _, err := r.InstanceStatusDecoder.Decode(ir); err != nil {
+			return ctrl.Result{}, r.instanceStatusDecodeError(ir, err)
 		}
 	}
 

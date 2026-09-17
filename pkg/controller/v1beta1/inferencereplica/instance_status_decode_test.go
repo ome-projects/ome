@@ -178,3 +178,58 @@ func TestReconcileDenseV1IsUnchangedByTheDecoder(t *testing.T) {
 		t.Fatalf("published DenseV1 status differs with a configured bound:\n plain:   %+v\n bounded: %+v", storedPlain.Status, storedBounded.Status)
 	}
 }
+
+// TestReconcileMetadataWriteKeepsDecodedRows pins the in-memory object after
+// the entry pass's finalizer write: the API response carries the stored
+// representation, so a ColumnarV2 object must be decoded again before the
+// lifecycle observes it. A ColumnarV2-stored object under the ColumnarV2
+// target must plan exactly what its DenseV1 twin plans; observing an empty
+// row set would recreate every Instance.
+func TestReconcileMetadataWriteKeepsDecodedRows(t *testing.T) {
+	ctx := context.Background()
+	dense := fixtureIRWithRows("llama-engine", uniformFixtureRows(64))
+	if len(dense.Finalizers) != 0 {
+		t.Fatal("fixture must start without the teardown finalizer")
+	}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(dense)}
+
+	rDense, cDense := newReconciler(t, dense.DeepCopy())
+	denseResult, err := rDense.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("dense reconcile: %v", err)
+	}
+	rColumnar, cColumnar := newColumnarReconciler(t, columnarTwin(t, dense))
+	columnarResult, err := rColumnar.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("columnar reconcile: %v", err)
+	}
+	if columnarResult != denseResult {
+		t.Fatalf("results differ by stored encoding: dense %+v, columnar %+v", denseResult, columnarResult)
+	}
+
+	rowsOf := func(r *Reconciler) ([]v1beta1.OMENativeInstanceStatus, []string) {
+		ir := &v1beta1.InferenceReplica{}
+		if _, err := irstatus.GetDecoded(ctx, r.cachedReader(), req.NamespacedName, ir); err != nil {
+			t.Fatalf("decoded read: %v", err)
+		}
+		return ir.Status.InstanceStatuses, ir.Finalizers
+	}
+	denseRows, denseFinalizers := rowsOf(rDense)
+	columnarRows, columnarFinalizers := rowsOf(rColumnar)
+	if len(denseFinalizers) != 1 || !reflect.DeepEqual(denseFinalizers, columnarFinalizers) {
+		t.Fatalf("finalizer write differs: dense %v, columnar %v", denseFinalizers, columnarFinalizers)
+	}
+	if len(columnarRows) != len(denseRows) {
+		t.Fatalf("row count differs: dense %d, columnar %d", len(denseRows), len(columnarRows))
+	}
+	for i := range denseRows {
+		want, got := denseRows[i], columnarRows[i]
+		if want.Index != got.Index || want.Phase != got.Phase || (want.Operation == nil) != (got.Operation == nil) ||
+			(want.Operation != nil && want.Operation.Type != got.Operation.Type) {
+			t.Fatalf("lifecycle decision differs at row %d: dense phase %s op %+v, columnar phase %s op %+v", i, want.Phase, want.Operation, got.Phase, got.Operation)
+		}
+	}
+	if got, want := len(listPods(t, cColumnar, dense.Namespace)), len(listPods(t, cDense, dense.Namespace)); got != want {
+		t.Fatalf("Pod effect differs: dense %d, columnar %d", want, got)
+	}
+}

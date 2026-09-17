@@ -27,6 +27,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -52,11 +53,12 @@ func newResetFixture(t *testing.T, ir *v1beta1.InferenceReplica, pods []*corev1.
 	c := b.Build()
 	rec := record.NewFakeRecorder(16)
 	r := &Reconciler{
-		Client:       c,
-		APIReader:    c,
-		Log:          logf.Log.WithName("test"),
-		Recorder:     rec,
-		Expectations: workload.NewExpectations(),
+		Client:               c,
+		APIReader:            c,
+		Log:                  logf.Log.WithName("test"),
+		Recorder:             rec,
+		Expectations:         workload.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	fresh := &v1beta1.InferenceReplica{}
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh); err != nil {

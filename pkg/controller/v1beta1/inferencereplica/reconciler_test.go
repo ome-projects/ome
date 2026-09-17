@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -130,6 +131,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Cli
 		Client:                   c,
 		APIReader:                c,
 		Log:                      logf.Log.WithName("test"),
+		InstanceStatusTarget:     irstatus.EncodingDenseV1,
 		Expectations:             workload.NewExpectations(),
 		ScaleDownRequeueInterval: testScaleDownRequeueInterval,
 	}, c
@@ -1541,6 +1543,7 @@ func TestReconcile_MultiToSinglePodGroupSkipsStaleDeleteOwnedRebound(t *testing.
 		Client:                  &staleReadingClient{Client: liveClient, reader: staleReader},
 		APIReader:               liveClient,
 		Log:                     logf.Log.WithName("test"),
+		InstanceStatusTarget:    irstatus.EncodingDenseV1,
 		Expectations:            workload.NewExpectations(),
 		GangSchedulingAvailable: true,
 	}
@@ -1829,10 +1832,11 @@ func TestReconcile_StatusWriteFailureStillSweepsRevisions(t *testing.T) {
 		}).
 		Build()
 	r := &Reconciler{
-		Client:       c,
-		APIReader:    c,
-		Log:          logf.Log.WithName("test"),
-		Expectations: workload.NewExpectations(),
+		Client:               c,
+		APIReader:            c,
+		Log:                  logf.Log.WithName("test"),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
+		Expectations:         workload.NewExpectations(),
 	}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
