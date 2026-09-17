@@ -10,6 +10,7 @@ import (
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/namespace"
 	publicreport "sigs.k8s.io/ome/pkg/cli/report"
 	r "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 )
@@ -19,6 +20,7 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 }
 func newCmd(f factory.Factory, streams genericiooptions.IOStreams, clock r.Clock) *cobra.Command {
 	output := "table"
+	namespaceOptions := namespace.NewOptions()
 	cmd := &cobra.Command{
 		Use:   "status INFERENCESERVICE",
 		Short: "Show the full readiness story of an InferenceService",
@@ -35,7 +37,13 @@ R/P/F/S/U mean Running/Pending/Failed/Succeeded/Unknown, and deleting counts
 terminating Pods. JSON/YAML retain bounded values. Rollout summary uses canonical
 rollout evidence; use rollout status for detail. Autoscaling uses only
 controller-reported parent status, not live HPA, KEDA, or InferenceReplica
-reads; use autoscale status for detail.`,
+reads; use autoscale status for detail. Traffic uses that same parent snapshot.
+Runtime active summarizes an exact named runtime and its pin without candidate
+lists or history. If a model is referenced, this path makes at most two exact
+model GETs to preserve controller validation. Auto-selection is not probed.
+Accelerator class checks use at most two exact GETs for current Engine/Decoder
+selections. Optional read failures remain typed Unavailable/Partial; use the
+dedicated commands for detail.`,
 		SilenceErrors: true, SilenceUsage: true,
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) != 1 {
@@ -58,9 +66,13 @@ reads; use autoscale status for detail.`,
 			if len(validation.IsDNS1123Label(ns)) != 0 {
 				return errors.New("status requires a valid namespace")
 			}
+			resolved, err := namespaceOptions.Resolve(ns)
+			if err != nil {
+				return errors.New("status requires a valid OME namespace")
+			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 			defer cancel()
-			snapshot, err := gatherTyped(ctx, f, ns, args[0])
+			snapshot, err := gatherTypedWithOMENamespace(ctx, f, ns, args[0], resolved.OMENamespace)
 			if err != nil {
 				return err
 			}
@@ -87,6 +99,7 @@ reads; use autoscale status for detail.`,
 	cmd.SetOut(streams.Out)
 	cmd.SetErr(streams.ErrOut)
 	cmd.Flags().StringVarP(&output, "output", "o", "table", "Output format: table, wide, json, or yaml")
+	namespaceOptions.AddOMEFlags(cmd.Flags())
 	return cmd
 }
 

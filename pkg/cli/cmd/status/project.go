@@ -10,9 +10,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"knative.dev/pkg/apis"
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/acceleratorprojection"
 	"sigs.k8s.io/ome/pkg/cli/autoscaleprojection"
+	"sigs.k8s.io/ome/pkg/cli/effective"
 	r "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/rolloutprojection"
+	"sigs.k8s.io/ome/pkg/cli/runtimeprojection"
+	"sigs.k8s.io/ome/pkg/cli/trafficprojection"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -112,9 +116,134 @@ func projectStatus(snapshot *report, clock r.Clock) (r.StatusReport, error) {
 		c.Autoscale.Evidence = r.EvidenceUnavailable
 		c.Issues = append(c.Issues, "CollectionLimitExceeded", "AutoscaleUnavailable")
 	}
+	c.Traffic = projectStatusTraffic(v, r.ClockFunc(func() time.Time { return now }))
+	c.RuntimeSummary = projectStatusRuntime(snapshot, r.ClockFunc(func() time.Time { return now }))
+	c.Accelerator = projectStatusAccelerator(snapshot, r.ClockFunc(func() time.Time { return now }))
 	result := r.NewStatusReport(r.Metadata{Name: v.Name, Namespace: v.Namespace}, c, r.ClockFunc(func() time.Time { return now }))
 	result.Sources = []r.SourceReference{{Kind: "InferenceService", Name: v.Name, Namespace: v.Namespace, Generation: v.Generation, Evidence: r.EvidenceObserved}}
 	return result.Canonical(), nil
+}
+
+func projectStatusTraffic(v *ome.InferenceService, clock r.Clock) r.StatusTraffic {
+	if !statusTrafficWithinBounds(v) {
+		return r.StatusTraffic{State: r.TrafficStateUnavailable, Evidence: r.EvidenceUnavailable}
+	}
+	projected, err := trafficprojection.Project(v, clock)
+	if err != nil {
+		return r.StatusTraffic{State: r.TrafficStateUnavailable, Evidence: r.EvidenceUnavailable}
+	}
+	summary := projected.Content.Summary
+	evidence := r.EvidenceReported
+	if summary.State == r.TrafficStateUnavailable {
+		evidence = r.EvidenceUnavailable
+	}
+	return r.StatusTraffic{
+		State: summary.State, Translator: summary.Translator,
+		Algorithm: summary.Algorithm, PolicyReady: summary.PolicyReady.Status,
+		PolicyFreshness: summary.Source.PolicyReady.Freshness, Evidence: evidence,
+	}
+}
+
+func statusTrafficWithinBounds(v *ome.InferenceService) bool {
+	if v.Status.Traffic == nil {
+		return true
+	}
+	status := v.Status.Traffic
+	if len(status.Conditions) > 64 || len(status.Algorithm) > 256 {
+		return false
+	}
+	for _, condition := range status.Conditions {
+		if len(condition.Type) > 256 || len(condition.Reason) > 1024 || len(condition.Message) > 4096 {
+			return false
+		}
+	}
+	return true
+}
+
+func projectStatusRuntime(snapshot *report, clock r.Clock) r.StatusRuntimeSummary {
+	v := snapshot.ISVC
+	if effective.IsServiceVirtualDeployment(v) {
+		return r.StatusRuntimeSummary{State: r.StatusSummaryUnavailable, Reason: r.StatusReasonVirtualDeployment}
+	}
+	if v.Spec.Runtime == nil || v.Spec.Runtime.Name == "" {
+		if v.Spec.Model == nil || v.Spec.Model.Name == "" {
+			return r.StatusRuntimeSummary{State: r.StatusSummaryNotConfigured}
+		}
+		return r.StatusRuntimeSummary{State: r.StatusSummaryUnavailable, Reason: r.StatusReasonAutoSelectionNotProbed}
+	}
+	if snapshot.RuntimeState == nil {
+		reason := snapshot.RuntimeReason
+		if reason == "" {
+			reason = r.StatusReasonReadFailed
+		}
+		return r.StatusRuntimeSummary{State: r.StatusSummaryUnavailable, Reason: reason}
+	}
+	projected, err := runtimeprojection.ProjectEffective(v, snapshot.RuntimeState, clock)
+	if err != nil {
+		return r.StatusRuntimeSummary{State: r.StatusSummaryUnavailable, Reason: r.StatusReasonProjectionInvalid}
+	}
+	content := projected.Content
+	state := r.StatusSummaryReported
+	if content.Live.State != r.ConfigurationStateAvailable || content.Active.State != r.ConfigurationStateAvailable || len(content.Issues) != 0 {
+		state = r.StatusSummaryPartial
+	}
+	summary := r.StatusRuntimeSummary{
+		State: state, ActiveState: content.Active.State,
+		PinState: content.Pin.State, Freshness: content.Pin.Status.Freshness,
+		Evidence: r.EvidenceComputed,
+	}
+	if content.Active.State == r.ConfigurationStateAvailable && content.Active.Source != nil {
+		summary.ActiveName = content.Active.Source.Name
+		summary.ActiveKind = content.Active.Source.Kind
+		summary.ActiveOrigin = content.Active.Origin
+	}
+	return summary
+}
+
+func projectStatusAccelerator(snapshot *report, clock r.Clock) r.StatusAccelerator {
+	v := snapshot.ISVC
+	if v.Spec.Engine == nil && v.Spec.Decoder == nil {
+		return r.StatusAccelerator{State: r.StatusSummaryNotConfigured}
+	}
+	var base effective.AcceleratorBaseResolution
+	var reason r.StatusSummaryReason
+	if effective.IsServiceVirtualDeployment(v) {
+		resolved, err := effective.ResolveVirtualAcceleratorBase(v)
+		if err != nil {
+			return r.StatusAccelerator{State: r.StatusSummaryUnavailable, Reason: r.StatusReasonProjectionInvalid}
+		}
+		base, reason = resolved, r.StatusReasonVirtualDeployment
+	} else {
+		if v.Spec.Runtime == nil || v.Spec.Runtime.Name == "" {
+			return r.StatusAccelerator{State: r.StatusSummaryUnavailable, Reason: r.StatusReasonAutoSelectionNotProbed}
+		}
+		if snapshot.AcceleratorBase == nil {
+			reason := snapshot.AcceleratorReason
+			if reason == "" {
+				reason = r.StatusReasonReadFailed
+			}
+			return r.StatusAccelerator{State: r.StatusSummaryUnavailable, Reason: reason}
+		}
+		base = *snapshot.AcceleratorBase
+	}
+	projected, err := acceleratorprojection.Project(v, base, snapshot.AcceleratorClasses, clock)
+	if err != nil {
+		return r.StatusAccelerator{State: r.StatusSummaryUnavailable, Reason: r.StatusReasonProjectionInvalid}
+	}
+	summary := r.StatusAccelerator{
+		State:  r.StatusSummaryState(projected.Content.Summary.State),
+		Reason: reason, Freshness: projected.Content.Summary.StatusFreshness,
+		Evidence: r.EvidenceComputed, Components: []r.StatusAcceleratorComponent{},
+	}
+	for _, component := range projected.Content.Components {
+		summary.Components = append(summary.Components, r.StatusAcceleratorComponent{
+			Type: component.Type, Intent: component.Intent.State,
+			DeclaredClass: component.Intent.DeclaredClass,
+			Selection:     component.Selection.State, SelectedClass: component.Selection.Class,
+			Class: component.Class.State,
+		})
+	}
+	return summary
 }
 
 func statusAutoscaleWithinBounds(v *ome.InferenceService) bool {

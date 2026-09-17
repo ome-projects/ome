@@ -36,22 +36,28 @@ func TestStatusDefaultsToCompactReport(t *testing.T) {
 	out, err := execute(t, f, "demo-isvc")
 	require.NoError(t, err)
 	assert.Equal(t,
-		"FIELD               VALUE\n"+
-			"Name                demo-isvc\n"+
-			"Namespace           team-a\n"+
-			"Ready               NotRecorded / Unavailable\n"+
+		"FIELD                VALUE\n"+
+			"Name                 demo-isvc\n"+
+			"Namespace            team-a\n"+
+			"Ready                NotRecorded / Unavailable\n"+
 			"Ready reason\n"+
-			"Runtime\n"+
+			"Declared runtime\n"+
 			"Model\n"+
-			"Generation          0 observed=0; advisory Unverifiable\n"+
-			"Pod observation     Reported count=0 truncated=false \n"+
-			"Event observation   Reported count=0 truncated=false \n"+
-			"Rollout             NotConfigured reported=NotConfigured\n"+
-			"Rollout evidence    Declared / NotApplicable\n"+
-			"Autoscaling         Unavailable / Unavailable parent status\n"+
-			"Full safe values    Use -o json or -o yaml\n"+
-			"Rollout detail      kubectl ome rollout status NAME\n"+
-			"Autoscale detail    kubectl ome autoscale status NAME\n",
+			"Generation           0 observed=0; advisory Unverifiable\n"+
+			"Pod observation      Reported count=0 truncated=false \n"+
+			"Event observation    Reported count=0 truncated=false \n"+
+			"Rollout              NotConfigured reported=NotConfigured\n"+
+			"Rollout evidence     Declared / NotApplicable\n"+
+			"Autoscaling          Unavailable / Unavailable parent status\n"+
+			"Traffic              Unavailable / Unavailable parent status\n"+
+			"Runtime active       NotConfigured / Unavailable\n"+
+			"Accelerator          NotConfigured / Unavailable\n"+
+			"Full safe values     Use -o json or -o yaml\n"+
+			"Rollout detail       kubectl ome rollout status NAME\n"+
+			"Autoscale detail     kubectl ome autoscale status NAME\n"+
+			"Traffic detail       kubectl ome traffic status NAME\n"+
+			"Runtime detail       kubectl ome runtime effective NAME\n"+
+			"Accelerator detail   kubectl ome accelerator explain NAME\n",
 		out,
 	)
 }
@@ -76,7 +82,7 @@ func TestStatusWidePreservesDetailedReport(t *testing.T) {
 			"Ready reason\n"+
 			"Ready message\n"+
 			"Condition inspection   Complete 0/0\n"+
-			"Runtime\n"+
+			"Declared runtime\n"+
 			"Model\n"+
 			"Generation             0 observed=0; advisory Unverifiable\n"+
 			"Pod observation        Reported count=0 truncated=false \n"+
@@ -87,9 +93,15 @@ func TestStatusWidePreservesDetailedReport(t *testing.T) {
 			"Rollout evidence       Declared / NotApplicable\n"+
 			"Coordination Ready     NotApplicable\n"+
 			"Autoscaling            Unavailable / Unavailable parent status\n"+
+			"Traffic                Unavailable / Unavailable parent status\n"+
+			"Runtime active         NotConfigured / Unavailable\n"+
+			"Accelerator            NotConfigured / Unavailable\n"+
 			"Full safe values       Use -o json or -o yaml\n"+
 			"Rollout detail         kubectl ome rollout status NAME\n"+
 			"Autoscale detail       kubectl ome autoscale status NAME\n"+
+			"Traffic detail         kubectl ome traffic status NAME\n"+
+			"Runtime detail         kubectl ome runtime effective NAME\n"+
+			"Accelerator detail     kubectl ome accelerator explain NAME\n"+
 			"Collected at           2026-09-15T12:00:00Z\n"+
 			"Source generation      0\n"+
 			"Source evidence        Observed\n",

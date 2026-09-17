@@ -72,19 +72,22 @@ type StatusRollout struct {
 	Warnings []WarningCode      `json:"warnings"`
 }
 type StatusContent struct {
-	Ready               StatusReady       `json:"ready"`
-	Runtime             string            `json:"runtime,omitempty"`
-	Model               string            `json:"model,omitempty"`
-	Generation          int64             `json:"generation"`
-	ObservedGeneration  int64             `json:"observedGeneration"`
-	GenerationFreshness string            `json:"generationFreshness"`
-	Components          []StatusComponent `json:"components"`
-	Pods                StatusCollection  `json:"pods"`
-	Events              StatusCollection  `json:"events"`
-	RecentEvents        []StatusEvent     `json:"recentEvents"`
-	Rollout             StatusRollout     `json:"rollout"`
-	Autoscale           StatusAutoscale   `json:"autoscale"`
-	Issues              []StatusIssueCode `json:"issues"`
+	Ready               StatusReady          `json:"ready"`
+	Runtime             string               `json:"runtime,omitempty"`
+	Model               string               `json:"model,omitempty"`
+	Generation          int64                `json:"generation"`
+	ObservedGeneration  int64                `json:"observedGeneration"`
+	GenerationFreshness string               `json:"generationFreshness"`
+	Components          []StatusComponent    `json:"components"`
+	Pods                StatusCollection     `json:"pods"`
+	Events              StatusCollection     `json:"events"`
+	RecentEvents        []StatusEvent        `json:"recentEvents"`
+	Rollout             StatusRollout        `json:"rollout"`
+	Autoscale           StatusAutoscale      `json:"autoscale"`
+	Traffic             StatusTraffic        `json:"traffic"`
+	RuntimeSummary      StatusRuntimeSummary `json:"runtimeSummary"`
+	Accelerator         StatusAccelerator    `json:"accelerator"`
+	Issues              []StatusIssueCode    `json:"issues"`
 }
 type StatusReport struct{ Envelope[StatusContent] }
 
@@ -202,6 +205,9 @@ func (c StatusContent) Canonical() StatusContent {
 	var autoscaleIssues []StatusIssueCode
 	c.Autoscale, autoscaleIssues = statusAutoscaleCanonical(c.Autoscale)
 	issues = append(issues, autoscaleIssues...)
+	c.Traffic = statusTrafficCanonical(c.Traffic)
+	c.RuntimeSummary = statusRuntimeCanonical(c.RuntimeSummary)
+	c.Accelerator = statusAcceleratorCanonical(c.Accelerator)
 	c.Issues = statusIssues(issues)
 	return c
 }
@@ -330,7 +336,7 @@ func (c StatusContent) table(wide bool) report.Table {
 			add("Condition warning", string(code))
 		}
 	}
-	add("Runtime", c.Runtime)
+	add("Declared runtime", c.Runtime)
 	add("Model", c.Model)
 	add("Generation", fmt.Sprintf("%d observed=%d; advisory Unverifiable", c.Generation, c.ObservedGeneration))
 	add("Pod observation", fmt.Sprintf("%s count=%d truncated=%t %s", c.Pods.State, c.Pods.Observed, c.Pods.Truncated, c.Pods.Reason))
@@ -360,7 +366,11 @@ func (c StatusContent) table(wide bool) report.Table {
 			add("Rollout warning", string(code))
 		}
 	}
-	add("Autoscaling", string(c.Autoscale.Summary.State)+" / "+string(c.Autoscale.Evidence)+" parent status")
+	autoscaleCell := string(c.Autoscale.Summary.State) + " / " + string(c.Autoscale.Evidence) + " parent status"
+	if c.Autoscale.Summary.State == AutoscaleStateUnavailable && c.Autoscale.Evidence == EvidenceReported {
+		autoscaleCell = "Unavailable; parent read, no usable scaler status"
+	}
+	add("Autoscaling", autoscaleCell)
 	for _, component := range c.Autoscale.Components {
 		counts := "-"
 		if component.CurrentReplicas != nil && component.DesiredReplicas != nil {
@@ -375,6 +385,37 @@ func (c StatusContent) table(wide bool) report.Table {
 	if wide {
 		for _, issue := range c.Autoscale.Issues {
 			add("Autoscale issue", string(issue.Component)+" / "+string(issue.Code))
+		}
+	}
+	add("Traffic", string(c.Traffic.State)+" / "+string(c.Traffic.Evidence)+" parent status")
+	if wide && c.Traffic.State != TrafficStateUnavailable {
+		add("Traffic policy Ready", string(c.Traffic.PolicyReady)+" / "+string(c.Traffic.PolicyFreshness))
+		add("Traffic translator", string(c.Traffic.Translator))
+		add("Traffic algorithm", string(c.Traffic.Algorithm))
+	}
+	add("Runtime active", strings.TrimSpace(string(c.RuntimeSummary.State)+" / "+string(c.RuntimeSummary.ActiveState)+" "+string(c.RuntimeSummary.Reason)))
+	if wide {
+		if c.RuntimeSummary.ActiveName != "" {
+			add("Active runtime name", c.RuntimeSummary.ActiveName)
+			add("Active runtime kind", string(c.RuntimeSummary.ActiveKind))
+			add("Active origin", string(c.RuntimeSummary.ActiveOrigin))
+		}
+		if c.RuntimeSummary.PinState != "" {
+			add("Runtime pin", string(c.RuntimeSummary.PinState))
+		}
+		if c.RuntimeSummary.Freshness != "" {
+			add("Runtime freshness", string(c.RuntimeSummary.Freshness))
+		}
+	}
+	add("Accelerator", strings.TrimSpace(string(c.Accelerator.State)+" / "+string(c.Accelerator.Evidence)+" "+string(c.Accelerator.Reason)))
+	for _, component := range c.Accelerator.Components {
+		selected := string(component.Selection) + " (" + string(component.Class) + ")"
+		if component.SelectedClass != "" {
+			selected = string(component.Selection) + " class=" + component.SelectedClass + " (" + string(component.Class) + ")"
+		}
+		add("Accelerator "+string(component.Type), selected)
+		if wide {
+			add("Declared class", string(component.Type)+" / "+component.DeclaredClass+" ("+string(component.Intent)+")")
 		}
 	}
 	for _, event := range c.RecentEvents {
@@ -393,5 +434,8 @@ func (c StatusContent) table(wide bool) report.Table {
 	add("Full safe values", "Use -o json or -o yaml")
 	add("Rollout detail", "kubectl ome rollout status NAME")
 	add("Autoscale detail", "kubectl ome autoscale status NAME")
+	add("Traffic detail", "kubectl ome traffic status NAME")
+	add("Runtime detail", "kubectl ome runtime effective NAME")
+	add("Accelerator detail", "kubectl ome accelerator explain NAME")
 	return t
 }

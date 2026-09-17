@@ -16,8 +16,11 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/acceleratorprojection"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
+	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/namespace"
 	"sigs.k8s.io/ome/pkg/cli/observation"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
@@ -44,6 +47,10 @@ var errStatusCancelled = errors.New("status read was cancelled or timed out")
 // gatherTyped is the command's bounded read-only acquisition path. Legacy pure
 // gather/render helpers remain available to their existing compatibility tests.
 func gatherTyped(ctx context.Context, f factory.Factory, ns, name string) (*report, error) {
+	return gatherTypedWithOMENamespace(ctx, f, ns, name, namespace.DefaultOMENamespace)
+}
+
+func gatherTypedWithOMENamespace(ctx context.Context, f factory.Factory, ns, name, omeNamespace string) (*report, error) {
 	if ctx.Err() != nil {
 		return nil, errStatusCancelled
 	}
@@ -152,6 +159,9 @@ func gatherTyped(ctx context.Context, f factory.Factory, ns, name string) (*repo
 	}
 	r.Events = events.Items[:min(len(events.Items), limits.maxEvents)]
 	r.EventObservation.Observed = len(r.Events)
+	if err := gatherStatusIntegrations(ctx, f, ome, kube, r, omeNamespace); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 
@@ -178,13 +188,18 @@ func defaultGatherLimits() gatherLimits {
 }
 
 type report struct {
-	ISVC             *v1beta1.InferenceService
-	Pods             map[v1beta1.ComponentType][]corev1.Pod
-	Events           []corev1.Event
-	Warnings         []string
-	PodObservation   reportv1alpha1.StatusCollection
-	EventObservation reportv1alpha1.StatusCollection
-	PodIssues        []reportv1alpha1.StatusIssueCode
+	ISVC               *v1beta1.InferenceService
+	RuntimeState       *effective.RuntimeState
+	RuntimeReason      reportv1alpha1.StatusSummaryReason
+	AcceleratorBase    *effective.AcceleratorBaseResolution
+	AcceleratorClasses map[string]acceleratorprojection.AcceleratorClassEvidence
+	AcceleratorReason  reportv1alpha1.StatusSummaryReason
+	Pods               map[v1beta1.ComponentType][]corev1.Pod
+	Events             []corev1.Event
+	Warnings           []string
+	PodObservation     reportv1alpha1.StatusCollection
+	EventObservation   reportv1alpha1.StatusCollection
+	PodIssues          []reportv1alpha1.StatusIssueCode
 }
 
 func gather(ctx context.Context, f factory.Factory, ns, name string) (*report, error) {
