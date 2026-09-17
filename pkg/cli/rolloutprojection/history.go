@@ -181,7 +181,7 @@ func projectActiveHistory(
 	}
 	effective := isvc.Spec
 	effective.Rollout = active.Plan.AsRolloutSpec(isvc.Spec.Rollout)
-	if !validStoredRolloutSpec(&effective) || len(invalidPinnedPlanGroups(active.Plan.Groups)) > 0 {
+	if !validEffectiveRolloutSpec(isvc, &effective) || len(invalidPinnedPlanGroups(active.Plan.Groups)) > 0 {
 		return reportv1alpha1.RolloutHistoryRun{}, nil, nil, false
 	}
 

@@ -462,18 +462,22 @@ func ActivePinnedTrafficMatches(
 	run := isvc.Status.Rollout.ActiveRun
 	var canary *omev1beta1.RolloutGroup
 	for i := range run.Plan.Groups {
-		if run.Plan.Groups[i].Group.Canary != nil {
+		group := &run.Plan.Groups[i].Group
+		if group.Canary == nil {
+			continue
+		}
+		groupPrimary, valid := Primary(group.Components)
+		if !valid {
+			return false
+		}
+		if groupPrimary == primary {
 			if canary != nil {
 				return false
 			}
-			canary = &run.Plan.Groups[i].Group
+			canary = group
 		}
 	}
 	if canary == nil {
-		return false
-	}
-	groupPrimary, valid := Primary(canary.Components)
-	if !valid || groupPrimary != primary {
 		return false
 	}
 	targets := make(map[omev1beta1.ComponentType]omev1beta1.RolloutRunTarget, len(run.TargetRevisions))

@@ -400,7 +400,7 @@ func TestPrepareCanaryEqualPrimaryCannotForgePendingOrFailedRollback(t *testing.
 	}
 }
 
-func TestPrepareCanaryRuntimeAndAlphaShapesFailClosed(t *testing.T) {
+func TestPrepareCanaryRuntimeShapesFailClosed(t *testing.T) {
 	for _, edit := range []func(*v1beta1.InferenceService, *effective.RuntimeState){
 		func(v *v1beta1.InferenceService, _ *effective.RuntimeState) { v.ResourceVersion = "43" },
 		func(v *v1beta1.InferenceService, _ *effective.RuntimeState) { v.UID = "recreated" },
@@ -422,13 +422,22 @@ func TestPrepareCanaryRuntimeAndAlphaShapesFailClosed(t *testing.T) {
 		require.ErrorIs(t, err, ErrRuntime)
 		require.Empty(t, plan.Patch())
 	}
+}
+
+func TestPrepareCanaryRollbackOnStallRequiresExplicitOverride(t *testing.T) {
 	v, state, work := analysisActionTarget(t)
 	policy := v1beta1.OnInconclusiveRollbackOnStall
 	v.Status.Rollout.ActiveRun.Plan.Groups[0].Group.Canary.Steps[0].Analysis.OnInconclusive = &policy
 	rehashCanary(t, v)
-	plan, err := PrepareCanaryRollout(v, state, work, "promote", true, true, testClock)
-	require.Error(t, err)
+	plan, err := PrepareCanaryRollout(v, state, work, "promote", false, true, testClock)
+	require.ErrorIs(t, err, ErrCanaryGate)
 	require.Empty(t, plan.Patch())
+	plan, err = PrepareCanaryRollout(v, state, work, "promote", true, false, testClock)
+	require.ErrorIs(t, err, ErrAnalysisOverrideConfirmation)
+	require.Empty(t, plan.Patch())
+	plan, err = PrepareCanaryRollout(v, state, work, "promote", true, true, testClock)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.Patch())
 }
 
 func TestPrepareCanaryRollbackMayAbortProvedRepinExposureHold(t *testing.T) {

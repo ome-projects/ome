@@ -162,6 +162,38 @@ func TestValidActiveRunAcceptsControllerShapes(t *testing.T) {
 	assert.True(t, pinnedevidence.ValidActiveRun(isvc))
 }
 
+func TestValidActiveRunAcceptsPinnedConcurrentCanaryUnits(t *testing.T) {
+	isvc, steps, _ := validConcurrentRepinISVC(t)
+
+	assert.True(t, pinnedevidence.ValidActiveRun(isvc))
+	assert.True(t, pinnedevidence.ValidCanaryRepin(
+		isvc, omev1beta1.EngineComponent, steps, "bbbbbbbb",
+	))
+}
+
+func TestValidActiveRunRejectsPinnedConcurrentPlanWithoutLiveDeclaration(t *testing.T) {
+	isvc, _, _ := validConcurrentRepinISVC(t)
+	isvc.Spec.Rollout.GroupOrdering = nil
+
+	assert.False(t, pinnedevidence.ValidActiveRun(isvc))
+}
+
+func TestValidActiveRunAcceptsRollbackOnStallAnalysis(t *testing.T) {
+	isvc, _, _ := validRepinISVC(t)
+	onInconclusive := omev1beta1.OnInconclusiveRollbackOnStall
+	pinned := &isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+	pinned.Group.Canary.Steps[0].Analysis = &omev1beta1.RolloutAnalysis{
+		Interval: metav1.Duration{Duration: time.Minute}, FailureLimit: 1,
+		OnInconclusive: &onInconclusive,
+		Metrics: []omev1beta1.AnalysisMetric{{
+			Name: "latency", Query: "rate(requests[5m])", Threshold: "1", Operator: omev1beta1.ComparisonLTE,
+		}},
+	}
+	refreshDigest(t, pinned)
+
+	assert.True(t, pinnedevidence.ValidActiveRun(isvc))
+}
+
 func TestValidActiveRunRejectsIncompleteAndBoundedEvidence(t *testing.T) {
 	badOnInconclusive := omev1beta1.OnInconclusive("Ignore")
 	tests := []struct {
@@ -365,6 +397,35 @@ func validRepinISVC(
 			}},
 		},
 	}
+	return isvc, steps, entered
+}
+
+func validConcurrentRepinISVC(t *testing.T) (*omev1beta1.InferenceService, []omev1beta1.RolloutGroupStep, metav1.Time) {
+	t.Helper()
+	isvc, steps, entered := validRepinISVC(t)
+	isvc.Spec.Router = &omev1beta1.RouterSpec{}
+	ordering := omev1beta1.RolloutGroupOrderingConcurrent
+	isvc.Spec.Rollout = &omev1beta1.RolloutSpec{GroupOrdering: &ordering}
+	router := omev1beta1.RolloutGroup{
+		Components: []omev1beta1.ComponentType{omev1beta1.RouterComponent},
+		Canary: &omev1beta1.GroupCanary{Steps: []omev1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("50%"), Traffic: 50},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		}},
+	}
+	digest, err := rolloutpolicy.ProgressionDigest(&router)
+	require.NoError(t, err)
+	isvc.Status.Rollout.ActiveRun.Plan.Groups = append(
+		[]omev1beta1.RolloutRunGroup{{
+			Source: omev1beta1.RolloutPlanSourceInline, PortableDigest: digest, Group: router,
+		}},
+		isvc.Status.Rollout.ActiveRun.Plan.Groups...,
+	)
+	isvc.Status.Rollout.ActiveRun.TargetRevisions = append(
+		isvc.Status.Rollout.ActiveRun.TargetRevisions,
+		omev1beta1.RolloutRunTarget{Component: omev1beta1.RouterComponent, Revision: "dddddddd"},
+	)
+	isvc.Spec.Rollout.Groups = []omev1beta1.RolloutGroup{router, isvc.Status.Rollout.ActiveRun.Plan.Groups[1].Group}
 	return isvc, steps, entered
 }
 

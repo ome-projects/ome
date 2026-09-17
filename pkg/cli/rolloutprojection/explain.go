@@ -282,7 +282,7 @@ func (b *explainProjector) projectEffectiveGroups() {
 	}
 	effectiveSpec := b.isvc.Spec
 	effectiveSpec.Rollout = omerollout.Effective(b.isvc)
-	if !validStoredRolloutSpec(&effectiveSpec) {
+	if !validEffectiveRolloutSpec(b.isvc, &effectiveSpec) {
 		b.addIssue(
 			reportv1alpha1.RolloutExplainIssueActiveRunMalformed,
 			reportv1alpha1.RolloutPlanViewEffective, nil,
@@ -516,14 +516,21 @@ func validPinnedPolicyBody(group *omev1beta1.RolloutGroup) bool {
 func invalidPinnedPlanGroups(groups []omev1beta1.RolloutRunGroup) map[int]bool {
 	invalid := map[int]bool{}
 	componentOwner := map[omev1beta1.ComponentType]int{}
-	canaryGroups := []int{}
+	canaryUnitOwner := map[omev1beta1.ComponentType]int{}
 	coordinationGroups := 0
 	collapsesToSequential := true
 	for index := range groups {
 		group := &groups[index].Group
 		strategy, strategyValid := pinnedGroupStrategy(group)
 		if strategy == reportv1alpha1.RolloutStrategyCanary {
-			canaryGroups = append(canaryGroups, index)
+			for _, unit := range omerollout.CanaryUnitsOf(group) {
+				if previous, exists := canaryUnitOwner[unit]; exists {
+					invalid[previous] = true
+					invalid[index] = true
+				} else {
+					canaryUnitOwner[unit] = index
+				}
+			}
 		} else {
 			coordinationGroups++
 			if !strategyValid || strategy != reportv1alpha1.RolloutStrategyBlueGreen ||
@@ -540,11 +547,6 @@ func invalidPinnedPlanGroups(groups []omev1beta1.RolloutRunGroup) map[int]bool {
 			}
 		}
 	}
-	if len(canaryGroups) > 1 {
-		for _, index := range canaryGroups {
-			invalid[index] = true
-		}
-	}
 	if coordinationGroups < 2 {
 		collapsesToSequential = false
 	}
@@ -553,10 +555,6 @@ func invalidPinnedPlanGroups(groups []omev1beta1.RolloutRunGroup) map[int]bool {
 		strategy, _ := pinnedGroupStrategy(group)
 		if group.Soak != nil &&
 			(strategy == reportv1alpha1.RolloutStrategyCanary || !collapsesToSequential) {
-			invalid[index] = true
-		}
-		if len(groups) > 1 &&
-			(strategy != reportv1alpha1.RolloutStrategyBlueGreen || len(group.Components) != 1) {
 			invalid[index] = true
 		}
 	}
@@ -1039,19 +1037,21 @@ func (b *explainProjector) projectHolds() {
 			Kind: reportv1alpha1.RolloutHoldPlanParked, Evidence: reportv1alpha1.EvidenceReported,
 		})
 	}
-	activeCanaryGroupIndex := -1
-	for _, group := range b.content.EffectiveGroups {
-		if group.Strategy == reportv1alpha1.RolloutStrategyCanary {
-			activeCanaryGroupIndex = group.Index
-			break
-		}
-	}
-	if activeCanaryGroupIndex >= 0 && b.isvc.Status.Canary != nil {
-		if b.isvc.Status.Canary.PreStepHold {
-			b.content.Holds = append(b.content.Holds, reportv1alpha1.RolloutExplainHold{
-				Kind: reportv1alpha1.RolloutHoldCanaryPreStep, Evidence: reportv1alpha1.EvidenceReported,
-				Group: ptrInt(activeCanaryGroupIndex),
-			})
+	if effective := omerollout.Effective(b.isvc); effective != nil {
+		for index, group := range effective.Groups {
+			if index >= maxExplainGroups {
+				break
+			}
+			if group.Canary == nil {
+				continue
+			}
+			primary := canaryPrimary(group.Components)
+			if status := canaryStatusForGroup(b.isvc, effective.Groups, primary); status != nil && status.PreStepHold {
+				b.content.Holds = append(b.content.Holds, reportv1alpha1.RolloutExplainHold{
+					Kind: reportv1alpha1.RolloutHoldCanaryPreStep, Evidence: reportv1alpha1.EvidenceReported,
+					Group: ptrInt(index),
+				})
+			}
 		}
 	}
 	for _, group := range b.content.Observed.Groups {

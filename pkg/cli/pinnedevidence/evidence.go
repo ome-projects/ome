@@ -87,6 +87,13 @@ func validateActiveRun(isvc *omev1beta1.InferenceService) (activeRunEvidence, bo
 
 	copy := isvc.DeepCopy()
 	copy.Spec.Rollout = run.Plan.AsRolloutSpec(copy.Spec.Rollout)
+	// The pinned plan stores groups but not their ordering declaration.
+	// Actions require the current live declaration to corroborate a concurrent
+	// pinned shape; if it changed to Sequential, its original intent is no
+	// longer provable from the retained run alone.
+	if isvc.Spec.Rollout != nil {
+		copy.Spec.Rollout.GroupOrdering = isvc.Spec.Rollout.GroupOrdering
+	}
 	if !validStoredPlan(&copy.Spec) ||
 		validation.ValidateRolloutOrderingEnforced(&copy.Spec) != nil {
 		return activeRunEvidence{}, false
@@ -156,7 +163,8 @@ func validStoredPlan(spec *omev1beta1.InferenceServiceSpec) bool {
 			}
 			if analysis.OnInconclusive != nil &&
 				*analysis.OnInconclusive != omev1beta1.OnInconclusiveHold &&
-				*analysis.OnInconclusive != omev1beta1.OnInconclusiveRollback {
+				*analysis.OnInconclusive != omev1beta1.OnInconclusiveRollback &&
+				*analysis.OnInconclusive != omev1beta1.OnInconclusiveRollbackOnStall {
 				return false
 			}
 		}

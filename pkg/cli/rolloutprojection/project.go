@@ -66,7 +66,7 @@ func Project(
 		issueKeys:     make(map[string]struct{}),
 		warningCodes:  make(map[reportv1alpha1.WarningCode]struct{}),
 	}
-	if !validStoredRolloutSpec(b.effectiveSpec) {
+	if !validEffectiveRolloutSpec(isvc, b.effectiveSpec) {
 		b.markMalformed(reportv1alpha1.RolloutIssueSpecMalformed, nil, "")
 	}
 	b.projectGroups()
@@ -99,6 +99,25 @@ func Project(
 // report diagnostics are code-only and must never copy arbitrary input.
 func validStoredRolloutSpec(spec *omev1beta1.InferenceServiceSpec) bool {
 	return validStoredRolloutPlan(spec) && omevalidation.ValidateRolloutOrderingEnforced(spec) == nil
+}
+
+// The pinned plan records its resolved groups, but not groupOrdering.
+// AsRolloutSpec therefore defaults to Sequential even for an admitted
+// concurrent run. Validate the pinned groups and their own order fields
+// without asserting a cross-group promise that was not persisted.
+func validEffectiveRolloutSpec(isvc *omev1beta1.InferenceService, spec *omev1beta1.InferenceServiceSpec) bool {
+	if !omev1beta1.RolloutRunActive(isvc) {
+		return validStoredRolloutSpec(spec)
+	}
+	if !validStoredRolloutPlan(spec) {
+		return false
+	}
+	for _, group := range spec.GetRolloutGroups() {
+		if len(group.Order) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // validStoredRolloutPlan mirrors CRD-only bounds and every pure rollout-body
@@ -179,30 +198,42 @@ func (b *projector) projectGroups() {
 		if b.isvc.Status.Canary != nil {
 			b.markMalformed(reportv1alpha1.RolloutIssueCanaryStatusUnexpected, nil, "")
 		}
+		for _, component := range b.isvc.Status.Components {
+			if component.Canary != nil {
+				b.markMalformed(reportv1alpha1.RolloutIssueCanaryStatusUnexpected, nil, "")
+				break
+			}
+		}
 		b.flagUnexpectedCoordination(nil)
 		return
 	}
-	canaryGroups := 0
-	for i := range groups {
-		if groups[i].Canary != nil {
-			canaryGroups++
-		}
-	}
-	if canaryGroups > 1 {
-		b.markMalformed(reportv1alpha1.RolloutIssueSpecMalformed, nil, "")
-	}
+	b.rejectUnexpectedCanaryStatuses(groups)
 
 	if b.canCollapseSequential(groups) {
 		b.projectSequential(groups)
 	} else {
-		if len(groups) > 1 {
-			b.markMalformed(reportv1alpha1.RolloutIssueSpecMalformed, nil, "")
-		}
 		for index := range groups {
 			b.projectGroup(index, &groups[index])
 		}
 	}
 	b.flagUnexpectedCoordination(groups)
+}
+
+func (b *projector) rejectUnexpectedCanaryStatuses(groups []omev1beta1.RolloutGroup) {
+	primaries := make(map[omev1beta1.ComponentType]struct{})
+	for _, group := range groups {
+		if group.Canary != nil {
+			primaries[canaryPrimary(group.Components)] = struct{}{}
+		}
+	}
+	for component, status := range b.isvc.Status.Components {
+		if status.Canary == nil {
+			continue
+		}
+		if _, expected := primaries[component]; !expected {
+			b.markMalformed(reportv1alpha1.RolloutIssueCanaryStatusUnexpected, nil, projectComponent(component))
+		}
+	}
 }
 
 func (b *projector) rejectUnexpectedComponentPhaseResidue() {
@@ -344,7 +375,7 @@ func (b *projector) applyCanaryStatus(
 	if projected.Phase == reportv1alpha1.RolloutPhaseBlueGreenStandby {
 		b.markMalformed(reportv1alpha1.RolloutIssueStatusMalformed, ptrInt(projected.Index), "")
 	}
-	status := b.isvc.Status.Canary
+	status := canaryStatusForGroup(b.isvc, b.effectiveSpec.GetRolloutGroups(), primary)
 	if status == nil {
 		if canaryPhaseNeedsStatus(projected.Phase) {
 			b.addIssue(reportv1alpha1.RolloutIssueCanaryStatusMissing, ptrInt(projected.Index), "")
@@ -421,6 +452,33 @@ func (b *projector) applyCanaryStatus(
 		}
 	}
 	projected.Step = &step
+}
+
+func canaryStatusForGroup(
+	isvc *omev1beta1.InferenceService,
+	groups []omev1beta1.RolloutGroup,
+	primary omev1beta1.ComponentType,
+) *omev1beta1.CanaryStatus {
+	if status := isvc.Status.Components[primary].Canary; status != nil {
+		return status
+	}
+	for _, component := range isvc.Status.Components {
+		if component.Canary != nil {
+			return nil
+		}
+	}
+	// Only a single canary group can safely use the pre-per-unit alias. When
+	// multiple groups exist, that alias does not identify which run it belongs to.
+	canaryGroups := 0
+	for _, group := range groups {
+		if group.Canary != nil {
+			canaryGroups++
+		}
+	}
+	if canaryGroups == 1 {
+		return isvc.Status.Canary
+	}
+	return nil
 }
 
 func (b *projector) applyCompletedCanaryStatus(
