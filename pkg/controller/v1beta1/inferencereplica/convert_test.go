@@ -33,7 +33,7 @@ func TestBuildRemoveInstance_ForgetsParentKeyedExpectations(t *testing.T) {
 	g.Expect(exp.Satisfied(key.Namespace, key.OwnerName, key.Component, 0)).To(gomega.BeFalse(),
 		"an in-flight create must block the bucket before removal")
 
-	removed, err := buildRemoveInstance(c, c, ir, exp)(context.Background(), 0)
+	removed, err := buildRemoveInstance(testStatusWriter(c), c, ir, exp)(context.Background(), 0)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(removed).To(gomega.BeTrue())
 

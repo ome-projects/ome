@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	omenativecore "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/core"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -110,6 +111,14 @@ type Reconciler struct {
 	// gang across domains. Required: SetupWithManager defaults it to
 	// mgr.GetAPIReader() and rejects a reconciler still missing it.
 	APIReader client.Reader
+
+	// InstanceStatusDecoder decodes the per-Instance representation of every
+	// InferenceReplica this reconciler reads, under the operator-configured
+	// ColumnarV2 row bound. The zero value carries no bound: DenseV1 objects
+	// decode unchanged and any ColumnarV2 object fails closed. Every IR read
+	// that inspects rows goes through liveReader or cachedReader so the bound
+	// travels with the reader into the status-mutation closures.
+	InstanceStatusDecoder irstatus.Decoder
 
 	// Expectations is the create/delete bookkeeping cache the
 	// workload pipeline uses to avoid re-issuing batches before the
@@ -210,9 +219,13 @@ type scaleDownSeriesIdentity struct {
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	log := r.Log.WithValues("inferencereplica", req.NamespacedName)
 
+	// The entry read decodes the stored per-Instance representation into the
+	// dense logical shape; a payload that cannot be decoded stops the
+	// reconcile here, before any lifecycle effect.
 	ir := &v1beta1.InferenceReplica{}
-	if err := r.Get(ctx, req.NamespacedName, ir); err != nil {
-		if apierrors.IsNotFound(err) {
+	source, readErr := irstatus.GetDecoded(ctx, r.cachedReader(), req.NamespacedName, ir)
+	if readErr != nil {
+		if apierrors.IsNotFound(readErr) {
 			// IR deleted between enqueue and reconcile. Owner-ref
 			// cascade GC handles the children (pods, ControllerRevisions).
 			// Drop the memoized revision hash so the cache doesn't retain
@@ -221,10 +234,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			r.deleteRememberedScaleDownSeries(req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "Failed to get InferenceReplica")
-		return ctrl.Result{}, err
+		log.Error(readErr, "Failed to get InferenceReplica")
+		return ctrl.Result{}, r.instanceStatusDecodeError(ir, readErr)
 	}
 	r.rememberScaleDownSeries(ir)
+
+	// Transition gate: this manager writes DenseV1, so an object still stored
+	// as ColumnarV2 is rewritten before any pass, including teardown, mutates
+	// it. A DenseV1 object takes the fast path with no extra serialization.
+	if source == irstatus.EncodingColumnarV2 {
+		return r.convertStoredRepresentation(ctx, log, ir)
+	}
 
 	// Bind structured logging context for the remainder of this
 	// reconcile so every downstream callback inherits the same
@@ -480,7 +500,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// so the Ready condition below observes the promoted value. Conflict
 		// tolerance matches the aggregator: requeue, don't error.
 		if specTarget != nil {
-			if perr := buildPromoteCurrentRevision(r.Client, r.APIReader, ir)(ctx, specTarget.Name); perr != nil {
+			if perr := buildPromoteCurrentRevision(r.statusWriter(), r.liveReader(), ir)(ctx, specTarget.Name); perr != nil {
 				if errors.Is(perr, workload.ErrStatusMutationPrecondition) {
 					result, err = ctrl.Result{Requeue: true}, nil
 					return
@@ -1158,7 +1178,8 @@ func (r *Reconciler) stampAutoRelocationSuccess(ctx context.Context, ir *v1beta1
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		wrote = false
 		fresh := &v1beta1.InferenceReplica{}
-		if err := r.APIReader.Get(ctx, key, fresh); err != nil {
+		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}
@@ -1182,7 +1203,7 @@ func (r *Reconciler) stampAutoRelocationSuccess(ctx context.Context, ir *v1beta1
 		if !changed {
 			return nil
 		}
-		if err := updateInferenceReplicaStatus(ctx, r.Client, fresh); err != nil {
+		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}
@@ -1534,6 +1555,7 @@ func (r *Reconciler) rememberScaleDownSeries(ir *v1beta1.InferenceReplica) {
 	r.scaleDownSeriesMu.Unlock()
 	if found && previous != identity {
 		obsmetrics.DeleteScaleDownSeries(previous.namespace, previous.isvc, previous.component)
+		obsmetrics.DeleteIRStatusSeries(key.Namespace, key.Name, previous.component)
 	}
 }
 
@@ -1544,6 +1566,7 @@ func (r *Reconciler) deleteRememberedScaleDownSeries(key types.NamespacedName) {
 	r.scaleDownSeriesMu.Unlock()
 	if found {
 		obsmetrics.DeleteScaleDownSeries(identity.namespace, identity.isvc, identity.component)
+		obsmetrics.DeleteIRStatusSeries(key.Namespace, key.Name, identity.component)
 	}
 }
 
@@ -1552,6 +1575,7 @@ func (r *Reconciler) deleteScaleDownSeries(ir *v1beta1.InferenceReplica) {
 		return
 	}
 	obsmetrics.DeleteScaleDownSeries(ir.Namespace, ir.Spec.ParentRef.Name, string(ir.Spec.Component))
+	obsmetrics.DeleteIRStatusSeries(ir.Namespace, ir.Name, string(ir.Spec.Component))
 	key := client.ObjectKeyFromObject(ir)
 	r.scaleDownSeriesMu.Lock()
 	if identity, found := r.scaleDownSeriesCache[key]; found && identity.uid == ir.UID {
@@ -1575,7 +1599,8 @@ func (r *Reconciler) bumpCollisionCount(ctx context.Context, ir *v1beta1.Inferen
 	var next int32
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &v1beta1.InferenceReplica{}
-		if err := r.APIReader.Get(ctx, key, fresh); err != nil {
+		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}
@@ -1589,7 +1614,7 @@ func (r *Reconciler) bumpCollisionCount(ctx context.Context, ir *v1beta1.Inferen
 			next = *fresh.Status.CollisionCount + 1
 		}
 		fresh.Status.CollisionCount = &next
-		if err := updateInferenceReplicaStatus(ctx, r.Client, fresh); err != nil {
+		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}

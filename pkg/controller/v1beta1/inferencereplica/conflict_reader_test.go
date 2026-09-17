@@ -51,7 +51,7 @@ func TestRetryClosuresReReadThroughLiveReader(t *testing.T) {
 
 	t.Run("MutateInstance", func(t *testing.T) {
 		r, live, ir := newFixture(t)
-		err := buildMutateInstance(r.Client, r.APIReader, ir)(ctx, 0, func(s *workload.InstanceStatus) bool {
+		err := buildMutateInstance(r.statusWriter(), r.APIReader, ir)(ctx, 0, func(s *workload.InstanceStatus) bool {
 			s.Phase = workload.InstancePhaseReady
 			return true
 		})
@@ -65,7 +65,7 @@ func TestRetryClosuresReReadThroughLiveReader(t *testing.T) {
 
 	t.Run("PromoteCurrentRevision", func(t *testing.T) {
 		r, live, ir := newFixture(t)
-		if err := buildPromoteCurrentRevision(r.Client, r.APIReader, ir)(ctx, "llama-engine-abc123"); err != nil {
+		if err := buildPromoteCurrentRevision(r.statusWriter(), r.APIReader, ir)(ctx, "llama-engine-abc123"); err != nil {
 			t.Fatalf("promote: %v", err)
 		}
 		if live.gets == 0 {
@@ -75,7 +75,7 @@ func TestRetryClosuresReReadThroughLiveReader(t *testing.T) {
 
 	t.Run("WriteAggregateCondition", func(t *testing.T) {
 		r, live, ir := newFixture(t)
-		err := buildWriteAggregateCondition(r.Client, r.APIReader, ir)(ctx, metav1.Condition{
+		err := buildWriteAggregateCondition(r.statusWriter(), r.APIReader, ir)(ctx, metav1.Condition{
 			Type:    InferenceReplicaConditionReady,
 			Status:  metav1.ConditionTrue,
 			Reason:  ReasonAllInstancesReady,
@@ -91,7 +91,7 @@ func TestRetryClosuresReReadThroughLiveReader(t *testing.T) {
 
 	t.Run("MutateRetryBlock", func(t *testing.T) {
 		r, live, ir := newFixture(t)
-		err := buildMutateRetryBlock(r.Client, r.APIReader, ir)(ctx, "llama-engine-abc123",
+		err := buildMutateRetryBlock(r.statusWriter(), r.APIReader, ir)(ctx, "llama-engine-abc123",
 			func(*workload.RetryBlock) workload.RetryBlockDisposition {
 				return workload.RetryBlockRemove
 			})
@@ -105,7 +105,7 @@ func TestRetryClosuresReReadThroughLiveReader(t *testing.T) {
 
 	t.Run("RemoveInstance", func(t *testing.T) {
 		r, live, ir := newFixture(t)
-		if _, err := buildRemoveInstance(r.Client, r.APIReader, ir, r.Expectations)(ctx, 0); err != nil {
+		if _, err := buildRemoveInstance(r.statusWriter(), r.APIReader, ir, r.Expectations)(ctx, 0); err != nil {
 			t.Fatalf("remove instance: %v", err)
 		}
 		if live.gets == 0 {

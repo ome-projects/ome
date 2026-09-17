@@ -68,7 +68,7 @@ func (r *Reconciler) consumeReleaseHeldRequest(ctx context.Context, log logr.Log
 		}
 	default:
 		rev := match.TargetRevision
-		if rerr := buildMutateRetryBlock(r.Client, r.APIReader, ir)(ctx, rev, func(*workload.RetryBlock) workload.RetryBlockDisposition {
+		if rerr := buildMutateRetryBlock(r.statusWriter(), r.liveReader(), ir)(ctx, rev, func(*workload.RetryBlock) workload.RetryBlockDisposition {
 			return workload.RetryBlockRemove
 		}); rerr != nil {
 			// Annotation NOT consumed: the request re-drives the removal

@@ -54,6 +54,36 @@ const (
 	DeployKindUpdate = "update"
 )
 
+// Encoding label values for the InferenceReplica status write-boundary
+// metrics. Fixed vocabulary: a representation name never appears as a label
+// in any other spelling.
+const (
+	// IRStatusEncodingDenseV1 tags the dense instanceStatuses list.
+	IRStatusEncodingDenseV1 = "dense_v1"
+	// IRStatusEncodingColumnarV2 tags the instanceStatusColumns payload.
+	IRStatusEncodingColumnarV2 = "columnar_v2"
+)
+
+// Result label values for RecordIRStatusWrite. Every attempt records
+// IRStatusWriteAttempt and then exactly one terminal result.
+const (
+	// IRStatusWriteAttempt is recorded before each status update request.
+	IRStatusWriteAttempt = "attempt"
+	// IRStatusWriteCommitted is recorded when the update succeeded.
+	IRStatusWriteCommitted = "committed"
+	// IRStatusWriteConfirmed is recorded when the update returned an error
+	// but a live read proved the intended state was committed.
+	IRStatusWriteConfirmed = "confirmed"
+	// IRStatusWriteConflict is recorded for a 409; the caller re-reads and
+	// retries from the fresh object.
+	IRStatusWriteConflict = "conflict"
+	// IRStatusWriteRejected is recorded when the API server refused the
+	// request as too large.
+	IRStatusWriteRejected = "rejected"
+	// IRStatusWriteError is recorded for every other failure.
+	IRStatusWriteError = "error"
+)
+
 var (
 	// Histogram buckets affect exported measurement resolution only; they do
 	// not tune controller behavior. Pod-cost buckets cover large fleet changes,
@@ -168,6 +198,42 @@ var (
 		},
 		[]string{"component"},
 	)
+
+	// irStatusBytes is the serialized size of the status carried by the most
+	// recent InferenceReplica status write attempt. It is per IR so an object
+	// approaching the API request limit can be located before a write is
+	// rejected; the encoding label separates the two representations.
+	irStatusBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ome_omenative_ir_status_bytes",
+			Help: "Serialized bytes of the InferenceReplica status in the most recent status write attempt, labeled by namespace, IR name, component, and encoding (dense_v1|columnar_v2).",
+		},
+		[]string{"namespace", "name", "component", "encoding"},
+	)
+
+	irStatusWritesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ome_omenative_ir_status_writes_total",
+			Help: "Count of InferenceReplica status write attempts and their terminal results (attempt|committed|confirmed|conflict|rejected|error), labeled by the written encoding.",
+		},
+		[]string{"encoding", "result"},
+	)
+
+	irStatusCodecErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ome_omenative_ir_status_codec_errors_total",
+			Help: "Count of InferenceReplica per-Instance status codec failures by fixed-catalog reason.",
+		},
+		[]string{"reason"},
+	)
+
+	irStatusConversionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ome_omenative_ir_status_conversions_total",
+			Help: "Count of committed representation-only InferenceReplica status writes, labeled by the source and target encoding.",
+		},
+		[]string{"from", "to"},
+	)
 )
 
 func init() {
@@ -181,7 +247,81 @@ func init() {
 		scaleDownDeferredInstances,
 		scaleDownInstanceDurationSeconds,
 		scaleDownOversizedBatchTotal,
+		irStatusBytes,
+		irStatusWritesTotal,
+		irStatusCodecErrorsTotal,
+		irStatusConversionsTotal,
 	)
+}
+
+// SetIRStatusBytes publishes the serialized status size of one InferenceReplica
+// status write attempt. An IR carries one representation at a time, so the
+// series for the other encoding is dropped rather than left at its last
+// value. Incomplete identity, an unknown encoding, and negative sizes are
+// dropped.
+func SetIRStatusBytes(namespace, name, component, encoding string, bytes int) {
+	if !validScaleDownIdentity(namespace, name, component) || bytes < 0 {
+		return
+	}
+	var other string
+	switch encoding {
+	case IRStatusEncodingDenseV1:
+		other = IRStatusEncodingColumnarV2
+	case IRStatusEncodingColumnarV2:
+		other = IRStatusEncodingDenseV1
+	default:
+		return
+	}
+	irStatusBytes.DeleteLabelValues(namespace, name, component, other)
+	irStatusBytes.WithLabelValues(namespace, name, component, encoding).Set(float64(bytes))
+}
+
+// DeleteIRStatusSeries removes the per-IR status size series when the IR
+// disappears, for both encodings.
+func DeleteIRStatusSeries(namespace, name, component string) {
+	if !validScaleDownIdentity(namespace, name, component) {
+		return
+	}
+	irStatusBytes.DeleteLabelValues(namespace, name, component, IRStatusEncodingDenseV1)
+	irStatusBytes.DeleteLabelValues(namespace, name, component, IRStatusEncodingColumnarV2)
+}
+
+// RecordIRStatusWrite counts one status write attempt or terminal result.
+// Unknown encodings and results are dropped so the label vocabulary stays
+// fixed.
+func RecordIRStatusWrite(encoding, result string) {
+	if !validIRStatusEncoding(encoding) {
+		return
+	}
+	switch result {
+	case IRStatusWriteAttempt, IRStatusWriteCommitted, IRStatusWriteConfirmed,
+		IRStatusWriteConflict, IRStatusWriteRejected, IRStatusWriteError:
+	default:
+		return
+	}
+	irStatusWritesTotal.WithLabelValues(encoding, result).Inc()
+}
+
+// RecordIRStatusCodecError counts one codec failure by its fixed-catalog
+// reason. Empty reasons are dropped.
+func RecordIRStatusCodecError(reason string) {
+	if reason == "" {
+		return
+	}
+	irStatusCodecErrorsTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordIRStatusConversion counts one committed representation-only write
+// from one encoding to another. Unknown or equal encodings are dropped.
+func RecordIRStatusConversion(from, to string) {
+	if !validIRStatusEncoding(from) || !validIRStatusEncoding(to) || from == to {
+		return
+	}
+	irStatusConversionsTotal.WithLabelValues(from, to).Inc()
+}
+
+func validIRStatusEncoding(encoding string) bool {
+	return encoding == IRStatusEncodingDenseV1 || encoding == IRStatusEncodingColumnarV2
 }
 
 // RecordStatusUpdate increments the status-update result counter for one

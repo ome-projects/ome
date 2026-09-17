@@ -631,7 +631,7 @@ func (ctx GateContext) CheckRatio(inFlightSurge, inFlightUnavail, projDelta int3
 		// transient apiserver blip feeds a phantom zero-serving peer into
 		// EvaluateSurge and disables the ratio band exactly when the
 		// cluster is unhealthy.
-		ir, err := irprojector.ComponentIR(ctx.Ctx, ctx.Reads, isvc.Namespace, isvc.Name, c)
+		ir, _, err := irprojector.DecodedComponentIR(ctx.Ctx, ctx.Reads, isvc.Namespace, isvc.Name, c)
 		if err != nil {
 			return false, fmt.Sprintf("cannot read %s IR status, failing closed: %v", c, err)
 		}
@@ -815,7 +815,7 @@ func (ctx GateContext) CheckSurge(inFlightDelta int32) (allowed bool, reason str
 	// "no observation yet" (allow); a read error fails closed so a
 	// transient apiserver blip can't erase the in-flight surge count and
 	// blow the surge budget.
-	summary, err := irprojector.ComponentIRStatus(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, ctx.Component)
+	summary, err := irprojector.DecodedComponentIRStatus(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, ctx.Component)
 	if err != nil {
 		return false, fmt.Sprintf("cannot read %s IR status, failing closed: %v", ctx.Component, err)
 	}

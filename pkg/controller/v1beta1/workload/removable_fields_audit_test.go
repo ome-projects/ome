@@ -52,7 +52,7 @@ func TestRemovableObservationFieldsHaveNoUnauditedDirectProductionAccess(t *test
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "aggregateAndWriteStatus", readWrite, "transient publication materialization", allFields...)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", readWrite, "transient same-pass mirror", "ReadyPodCount", "ScheduledPodCount")
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", removableFieldAccessCounts{reads: 2, writes: 2}, "transient same-pass mirror", "NodesOccupied")
-	approve("pkg/controller/v1beta1/inferencereplica/status_writer.go", "clearPodDerivedInstanceObservations", write, "status persistence boundary", allFields...)
+	approve("pkg/controller/v1beta1/irstatus/encoding.go", "ClearPodDerivedObservations", write, "status persistence boundary", allFields...)
 	approve("pkg/controller/v1beta1/workload/ops/update_status.go", "cloneTerminalStatusValue", readWrite, "isolated status copy", "NodesOccupied")
 	approve("pkg/controller/v1beta1/workload/ops/create.go", "sameCreateTransitionOwnerState", removableFieldAccessCounts{writes: 2}, "rollback comparison normalization", allFields...)
 	approve("pkg/controller/v1beta1/workload/ops/create.go", "restoreCreateTransitionState", readWrite, "transient rollback observation preservation", "ReadyPodCount", "ScheduledPodCount")

@@ -111,6 +111,12 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceServiceSpec":             schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceServiceStatus":           schema_pkg_apis_ome_v1beta1_InferenceServiceStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceOperation":                schema_pkg_apis_ome_v1beta1_InstanceOperation(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusColumns":            schema_pkg_apis_ome_v1beta1_InstanceStatusColumns(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusCountGroup":         schema_pkg_apis_ome_v1beta1_InstanceStatusCountGroup(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusEntry":              schema_pkg_apis_ome_v1beta1_InstanceStatusEntry(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusIncarnationGroup":   schema_pkg_apis_ome_v1beta1_InstanceStatusIncarnationGroup(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusPhaseGroup":         schema_pkg_apis_ome_v1beta1_InstanceStatusPhaseGroup(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusRevisionGroup":      schema_pkg_apis_ome_v1beta1_InstanceStatusRevisionGroup(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceTermination":              schema_pkg_apis_ome_v1beta1_InstanceTermination(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KedaAutoscaler":                   schema_pkg_apis_ome_v1beta1_KedaAutoscaler(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KedaConfig":                       schema_pkg_apis_ome_v1beta1_KedaConfig(ref),
@@ -6371,7 +6377,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaStatus(ref common.ReferenceCall
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InferenceReplicaStatus is the observed state of one InferenceReplica. The InferenceReplica controller is the sole writer. Fields mirror the LifecycleStatus shape so the ISVC's aggregated per-Component status is a verbatim projection of this block.",
+				Description: "InferenceReplicaStatus is the observed state of one InferenceReplica. The InferenceReplica controller is the sole writer. Fields mirror the LifecycleStatus shape so the ISVC's aggregated per-Component status is a verbatim projection of this block.\n\nThe per-Instance rows have exactly one representation on a committed object. Without instanceStatusEncoding the rows are the DenseV1 list in instanceStatuses; with instanceStatusEncoding: ColumnarV2 the same rows live in instanceStatusColumns and instanceStatuses is absent. The rules below reject every mixed spelling of that union.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"observedGeneration": {
@@ -6461,7 +6467,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaStatus(ref common.ReferenceCall
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "InstanceStatuses is the per-Instance status, one row per Instance.",
+							Description: "InstanceStatuses is the DenseV1 representation of the per-Instance status, one row per Instance. Absent when instanceStatusEncoding is ColumnarV2, in which case instanceStatusColumns carries the same rows.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -6471,6 +6477,19 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaStatus(ref common.ReferenceCall
 									},
 								},
 							},
+						},
+					},
+					"instanceStatusEncoding": {
+						SchemaProps: spec.SchemaProps{
+							Description: "InstanceStatusEncoding names the representation that carries the per-Instance rows. Absent means DenseV1 (instanceStatuses). The only accepted value is ColumnarV2, which requires instanceStatusColumns and forbids instanceStatuses.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"instanceStatusColumns": {
+						SchemaProps: spec.SchemaProps{
+							Description: "InstanceStatusColumns is the ColumnarV2 representation of the per-Instance rows. Present exactly when instanceStatusEncoding is ColumnarV2; it decodes to the same rows, in the same order, that instanceStatuses would carry.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusColumns"),
 						},
 					},
 					"retryBlocks": {
@@ -6580,7 +6599,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaStatus(ref common.ReferenceCall
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentTrafficTarget", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.MigrationStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.OMENativeInstanceStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RetryBlock", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutHold"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentTrafficTarget", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusColumns", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.MigrationStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.OMENativeInstanceStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RetryBlock", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutHold"},
 	}
 }
 
@@ -7112,6 +7131,400 @@ func schema_pkg_apis_ome_v1beta1_InstanceOperation(ref common.ReferenceCallback)
 		},
 		Dependencies: []string{
 			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_InstanceStatusColumns(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "InstanceStatusColumns is the ColumnarV2 representation of the per-Instance rows. A value shared by many Instances is stored once against the index set of the Instances that carry it; records that are rare or unique per Instance stay keyed by index in entries.\n\nAn index set is a string of comma-separated decimal terms, each a single index or a closed \"first-last\" range, for example \"0-8,10-114,116\". The canonical form is the only accepted one: terms are strictly ascending, disjoint, and nonadjacent (adjacent terms are merged), a range has first < last, indices are nonnegative int32 values without leading zeros, and there is no whitespace, sign, empty term, or trailing comma.\n\nMembers is the complete row set; every other index set is a subset of it. Within one column the group index sets are pairwise disjoint and the groups are in canonical value order: bytewise for phases and revisions, signed numeric for incarnations and counts. A member absent from every group of an optional column takes that column's documented default.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"members": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Members is the index set of every Instance that has a row.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"rowOrder": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "RowOrder is the dense row order when it is not the ascending Members order: every member exactly once, in the order the DenseV1 list would carry. Absent means ascending Members order.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: 0,
+										Type:    []string{"integer"},
+										Format:  "int32",
+									},
+								},
+							},
+						},
+					},
+					"phases": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Phases groups Instances by lifecycle phase. Every member appears in exactly one group; there is no default phase.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusPhaseGroup"),
+									},
+								},
+							},
+						},
+					},
+					"runningRevisions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "RunningRevisions groups Instances by nonempty running revision. A member absent from every group has an empty running revision.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusRevisionGroup"),
+									},
+								},
+							},
+						},
+					},
+					"targetRevisions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "TargetRevisions groups Instances by nonempty target revision. A member absent from every group has an empty target revision.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusRevisionGroup"),
+									},
+								},
+							},
+						},
+					},
+					"incarnations": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Incarnations groups Instances by nonzero incarnation. A member absent from every group has incarnation 0.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusIncarnationGroup"),
+									},
+								},
+							},
+						},
+					},
+					"podCounts": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "PodCounts groups Instances by positive podCount. A member absent from every group has podCount 0.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusCountGroup"),
+									},
+								},
+							},
+						},
+					},
+					"servingPodCounts": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "ServingPodCounts groups Instances by positive servingPodCount. A member absent from every group has servingPodCount 0.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusCountGroup"),
+									},
+								},
+							},
+						},
+					},
+					"availablePodCounts": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "AvailablePodCounts groups Instances by positive availablePodCount. A member absent from every group has availablePodCount 0.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusCountGroup"),
+									},
+								},
+							},
+						},
+					},
+					"admitted": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Admitted is the index set of Instances whose admitted is true. Absent means no Instance is admitted.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"activeOrdinalOne": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ActiveOrdinalOne is the index set of Instances whose activeOrdinal is 1. Absent means every activeOrdinal is 0.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"entries": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Entries carries the per-Instance records that are not grouped: conditions, readySince, operation, and lastFailure. At most one entry per member, in ascending index order, each carrying at least one of those records. A member without an entry has none of them.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusEntry"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"members", "phases"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusCountGroup", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusEntry", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusIncarnationGroup", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusPhaseGroup", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusRevisionGroup"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_InstanceStatusCountGroup(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "InstanceStatusCountGroup is one positive pod count and the Instances that carry it. Zero is the absent default and is never grouped.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"value": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Value is the shared positive count.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"indexes": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Indexes is the canonical index set of the Instances with this value.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"value", "indexes"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_InstanceStatusEntry(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "InstanceStatusEntry carries the records of one Instance that are not grouped into columns. Each record is the dense row's value, unchanged.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"index": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Index is the Instance this entry belongs to; it is a member.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Conditions is the Instance's conditions.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/apimachinery/pkg/apis/meta/v1.Condition"),
+									},
+								},
+							},
+						},
+					},
+					"readySince": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReadySince is the Instance's readySince.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"operation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Operation is the Instance's in-flight operation record.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceOperation"),
+						},
+					},
+					"lastFailure": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LastFailure is the Instance's preserved failure diagnostics.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceTermination"),
+						},
+					},
+				},
+				Required: []string{"index"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceOperation", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceTermination"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_InstanceStatusIncarnationGroup(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "InstanceStatusIncarnationGroup is one incarnation and the Instances that carry it. The value keeps the int64 domain of the dense row, including negative values; zero is the absent default and is never grouped.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"value": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Value is the shared nonzero incarnation.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"indexes": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Indexes is the canonical index set of the Instances with this value.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"value", "indexes"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_InstanceStatusPhaseGroup(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "InstanceStatusPhaseGroup is one phase and the Instances that carry it.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"value": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Value is the shared lifecycle phase.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"indexes": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Indexes is the canonical index set of the Instances with this value.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"value", "indexes"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_InstanceStatusRevisionGroup(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "InstanceStatusRevisionGroup is one full ControllerRevision name and the Instances that carry it.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"value": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Value is the shared revision name; the empty revision is never grouped.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"indexes": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Indexes is the canonical index set of the Instances with this value.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"value", "indexes"},
+			},
+		},
 	}
 }
 

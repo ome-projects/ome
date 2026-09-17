@@ -4,6 +4,11 @@ kind: ClusterRole
 metadata:
   name: ome-manager-role
 rules:
+- nonResourceURLs:
+  - /openapi/v3
+  - /openapi/v3/*
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:

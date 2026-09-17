@@ -589,7 +589,7 @@ func buildGroupObservation(ctx context.Context, reads client.Reader, isvc *v1bet
 		Components: make(map[v1beta1.ComponentType]ComponentObservation, len(g.Components)),
 	}
 	for _, c := range g.Components {
-		summary, err := irprojector.ComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, c)
+		summary, err := irprojector.DecodedComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, c)
 		if err != nil {
 			return GroupObservation{}, err
 		}

@@ -1,0 +1,671 @@
+package inferencereplica
+
+import (
+	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+
+	"golang.org/x/tools/go/packages"
+)
+
+// The executable consumer inventory for InferenceReplica per-Instance status.
+//
+// Three type-aware sweeps over every production package (pkg, cmd, internal,
+// scheduler; generated files and tests excluded) pin the per-Instance status
+// reader and writer boundaries:
+//
+//   - field reads: every use of InferenceReplicaStatus.InstanceStatuses,
+//     InstanceStatusColumns, and InstanceStatusEncoding outside the codec
+//     package must be listed below with the classification that makes it
+//     safe;
+//   - fetch sites: every Get or List of an InferenceReplica must be the
+//     decoded accessor or a listed pass-through that inspects no rows;
+//   - status writes: every InferenceReplica status write must be the single
+//     writer.
+//
+// A new site anywhere fails until it is classified here; a stale entry fails
+// so the table never drifts from the code. An import-graph check keeps the
+// shared test-fixture package out of every production package, which is what
+// makes its classification below true.
+
+const (
+	omeAPIPackagePath  = "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	codecPackagePath   = "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
+	fixturePackagePath = codecPackagePath + "/irstatustest"
+	decodedAccessor    = "GetDecoded"
+	singleWriter       = "persistInferenceReplicaStatus"
+)
+
+var representationFields = map[string]struct{}{
+	"InstanceStatuses":       {},
+	"InstanceStatusColumns":  {},
+	"InstanceStatusEncoding": {},
+}
+
+// Classifications name why a site outside the boundary is allowed.
+const (
+	// decodedObjectRows: the function consumes rows of an object that the
+	// decoded accessor rewrote into the dense logical shape before the
+	// function ran, or that the single writer decoded after its commit.
+	decodedObjectRows = "logical rows of an object decoded at the boundary"
+	// inMemoryMirror: the function copies committed rows onto the decoded
+	// in-memory object so later work in the same pass observes them.
+	inMemoryMirror = "in-memory mirror of committed rows onto the decoded object"
+	// passThroughSpecMetadata: the fetch serves a spec- or metadata-only
+	// path and never inspects the per-Instance representation.
+	passThroughSpecMetadata = "pass-through: spec/metadata only"
+	// passThroughTopLevelStatus: the fetch serves a reader of top-level
+	// status fields only (revisions, counters, conditions, traffic).
+	passThroughTopLevelStatus = "pass-through: top-level status only"
+	// decodedBoundary: the fetch is the decoded accessor itself.
+	decodedBoundary = "decoded-accessor boundary"
+	// administrativeCensus: the operator preflight's paginated list; every
+	// object is classified through the codec (ObservedEncoding, DecodeStatus)
+	// and no row is consumed by a decision.
+	administrativeCensus = "administrative paginated census classified through the codec"
+	// testFixtureBuilder: the function builds logical statuses for the codec
+	// and qualification suites to measure; its package is test support that
+	// no production package imports (TestIRStatusFixturePackageImportInventory).
+	testFixtureBuilder = "test-fixture builder constructing logical statuses; imported only by tests"
+	// rawReaderOutsideManager: a reader outside the manager (the kubectl-ome
+	// CLI, alfred) fetches the object raw and consumes the stored dense rows
+	// directly, so a ColumnarV2 object presents no rows to it until it reads
+	// through the decoded accessor.
+	rawReaderOutsideManager = "raw reader outside the manager: stored dense rows only; a ColumnarV2 object presents no rows"
+)
+
+type accessCounts struct {
+	reads      int
+	writes     int
+	readWrites int
+}
+
+type fieldUse struct {
+	file     string
+	function string
+	field    string
+}
+
+type approvedFieldUse struct {
+	counts accessCounts
+	reason string
+}
+
+type fetchSite struct {
+	file     string
+	function string
+	method   string
+}
+
+type approvedFetch struct {
+	count  int
+	reason string
+}
+
+func TestInferenceReplicaStatusReadInventory(t *testing.T) {
+	approved := map[fieldUse]approvedFieldUse{}
+	approve := func(file, function string, counts accessCounts, reason string, fields ...string) {
+		for _, field := range fields {
+			approved[fieldUse{file: file, function: function, field: field}] = approvedFieldUse{counts: counts, reason: reason}
+		}
+	}
+	read := func(n int) accessCounts { return accessCounts{reads: n} }
+	rows := "InstanceStatuses"
+
+	// InferenceReplica reconciler: every function below runs on an object
+	// fetched through irstatus.GetDecoded (see the fetch inventory). Counts
+	// are reads / writes / read-writes of the field selector.
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "observedFromIR", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildMutateInstance", accessCounts{reads: 4, writes: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildApplyInstanceMutationsWithRetryBlockFromReader", accessCounts{reads: 7, writes: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "instanceMutationPostconditionsHold", read(3), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "replaceInstanceStatuses", accessCounts{writes: 1}, inMemoryMirror, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "mirrorInstanceStatuses", accessCounts{reads: 4, writes: 1, readWrites: 2}, inMemoryMirror, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildPromoteCurrentRevision", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildRemoveInstance", accessCounts{reads: 1, writes: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.aggregateAndWriteStatus", accessCounts{reads: 3, readWrites: 7}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.reconcileHeldDeadlines", accessCounts{reads: 3, readWrites: 2}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", accessCounts{reads: 1, readWrites: 1}, inMemoryMirror, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "stagedAtPartition", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "computeRolloutStalledCondition", read(2), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "computeReadyCondition", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.Reconcile", read(2), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.reconcileRelocationDirectives", accessCounts{reads: 3, readWrites: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.stampAutoRelocationSuccess", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "Reconciler.resetInstances", accessCounts{reads: 2, readWrites: 2}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/retention.go", "Reconciler.sweepRevisions", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status_transition.go", "Reconciler.convertStoredRepresentation", read(1), decodedObjectRows, rows)
+
+	// Remote readers: coordination and placement consume the object that
+	// irprojector.DecodedComponentIR(Status) returned.
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "GateContext.CheckPairing", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.CheckRatio", read(3), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.CheckSurge", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/sequential_gate.go", "observeSequentialComponentsForGate", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/reconciler.go", "buildComponentObservation", read(2), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/admission.go", "admittedReplicaCount", read(2), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/admission.go", "componentHasAdmittedInstance", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/failed.go", "IsTerminallyFailed", read(1), decodedObjectRows, rows)
+
+	// Readers outside the manager: the kubectl-ome CLI and alfred fetch the
+	// object raw (see the fetch inventory) and read the stored dense rows.
+	approve("pkg/alfred/engine/dispatch_preflight.go", "dispatchSourceFingerprint", accessCounts{reads: 2, readWrites: 1}, rawReaderOutsideManager, rows)
+	approve("pkg/alfred/engine/prediction_source.go", "predictionOwnersMatch", read(1), rawReaderOutsideManager, rows)
+	approve("pkg/alfred/scheduling/input/relocation.go", "occupiedInstanceIndexes", accessCounts{reads: 1, readWrites: 1}, rawReaderOutsideManager, rows)
+	approve("pkg/alfred/scheduling/input/source.go", "resolveSource", accessCounts{reads: 1, readWrites: 1}, rawReaderOutsideManager, rows)
+	approve("pkg/alfred/snapshot/omenative.go", "buildOMENativeComponent", read(1), rawReaderOutsideManager, rows)
+	approve("pkg/cli/instancecollection/collect.go", "CollectRelated", read(2), rawReaderOutsideManager, rows)
+	approve("pkg/cli/instancecollection/collect.go", "boundedReplicaCopy", accessCounts{reads: 2, writes: 1, readWrites: 2}, rawReaderOutsideManager, rows)
+	approve("pkg/cli/instanceprojection/project.go", "Project", read(8), rawReaderOutsideManager, rows)
+	approve("pkg/cli/instanceprojection/project.go", "validAggregateStatus", read(2), rawReaderOutsideManager, rows)
+	approve("pkg/cli/instancestatusprojection/project.go", "EventTargets", accessCounts{reads: 2, readWrites: 1}, rawReaderOutsideManager, rows)
+	approve("pkg/cli/instancestatusprojection/project.go", "findRawRow", accessCounts{reads: 2, readWrites: 1}, rawReaderOutsideManager, rows)
+	approve("pkg/cli/mutate/held_release_source.go", "validateHeldReplicaIdentity", read(1), rawReaderOutsideManager, rows)
+	approve("pkg/cli/mutate/migration_evidence.go", "CollectMigrationEvidence", accessCounts{reads: 2, readWrites: 1}, rawReaderOutsideManager, rows)
+	approve("pkg/cli/mutate/replicas.go", "inspectReplica", read(2), rawReaderOutsideManager, rows)
+	approve("pkg/cli/mutate/replicas.go", "replicaPayloadBounded", read(1), rawReaderOutsideManager, rows)
+	approve("pkg/cli/mutate/scale_evidence.go", "scaleLifecycleWork", read(1), rawReaderOutsideManager, rows)
+
+	// Shared test fixtures: the builder writes dense rows into a status it
+	// constructs; nothing outside tests links it.
+	approve("pkg/controller/v1beta1/irstatus/irstatustest/fixtures.go", "LogicalStatus", accessCounts{writes: 1}, testFixtureBuilder, rows)
+
+	inv := loadStatusInventory(t)
+	actual := map[fieldUse]accessCounts{}
+	inv.eachProductionFile(func(pkg *packages.Package, file *ast.File, relative string) {
+		if pkg.PkgPath == codecPackagePath {
+			return
+		}
+		collectRepresentationFieldUses(pkg, file, relative, actual)
+	})
+
+	for use, got := range actual {
+		want, ok := approved[use]
+		if !ok {
+			t.Errorf("unclassified read of %s in %s:%s: %+v", use.field, use.file, use.function, got)
+			continue
+		}
+		if got != want.counts {
+			t.Errorf("access count changed for %s in %s:%s: got %+v, want %+v (%s)", use.field, use.file, use.function, got, want.counts, want.reason)
+		}
+	}
+	for use, want := range approved {
+		if _, ok := actual[use]; !ok {
+			t.Errorf("stale approval for %s in %s:%s (%s)", use.field, use.file, use.function, want.reason)
+		}
+	}
+}
+
+func TestInferenceReplicaFetchInventory(t *testing.T) {
+	approved := map[fetchSite]approvedFetch{}
+	approve := func(file, function, method string, count int, reason string) {
+		approved[fetchSite{file: file, function: function, method: method}] = approvedFetch{count: count, reason: reason}
+	}
+
+	approve("pkg/controller/v1beta1/irstatus/reader.go", decodedAccessor, "Get", 1, decodedBoundary)
+	approve("pkg/controller/v1beta1/irstatus/transitionpreflight/preflight.go", "checkReplicas", "List", 1, administrativeCensus)
+
+	// InferenceReplica reconciler pass-through reads.
+	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.Reconcile", "Get", 1, passThroughSpecMetadata+" (finalizer add rejected: re-read DeletionTimestamp)")
+	approve("pkg/controller/v1beta1/inferencereplica/teardown.go", "Reconciler.removeTeardownFinalizer", "Get", 1, passThroughSpecMetadata+" (finalizer removal)")
+	approve("pkg/controller/v1beta1/inferencereplica/release_held.go", "Reconciler.consumeReleaseHeldRequest", "Get", 1, passThroughSpecMetadata+" (annotation consumption)")
+	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "Reconciler.consumeResetInstancesRequest", "Get", 1, passThroughSpecMetadata+" (annotation consumption)")
+
+	// ISVC-side raw accessors and their callers.
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/irstatus_read.go", "ComponentIR", "Get", 1, passThroughTopLevelStatus+" (raw accessor for callers that inspect no rows)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/status.go", "aggregateOneComponent", "Get", 1, passThroughTopLevelStatus+" (counters, revisions, RolloutHold, Conditions mirrored onto the ISVC)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "EnsureInferenceReplica", "Get", 1, passThroughSpecMetadata+" (spec projection)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "observeCanaryRevisions", "Get", 1, passThroughTopLevelStatus+" (revision pointers)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "reconcileRollbackSignal", "Get", 1, passThroughTopLevelStatus+" (revision pointers and observedGeneration)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/observe.go", "observeGroupTargets", "Get", 1, passThroughTopLevelStatus+" (revision pointers and replica counters)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/pdb/cutover.go", "OMENativeCutoverReady", "Get", 1, passThroughTopLevelStatus+" (ready and available counters)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler/dispatch.go", "controlledByVerifiedModeBridge", "Get", 1, passThroughSpecMetadata+" (ownership: UID, labels, parentRef)")
+
+	// Generated client-go informer: a raw list/watch cache that consumes no
+	// rows; row-consuming code reads through the decoded accessor, never
+	// through this cache.
+	approve("pkg/client/informers/externalversions/ome/v1beta1/inferencereplica.go", "NewFilteredInferenceReplicaInformer", "List", 2, passThroughSpecMetadata+" (generated informer list/watch)")
+
+	// Readers outside the manager: the kubectl-ome CLI and alfred fetch the
+	// object raw; the rows they consume are listed in the read inventory.
+	approve("pkg/alfred/engine/dispatch_reconcile.go", "Dispatcher.reconcileDispatch", "Get", 1, rawReaderOutsideManager)
+	approve("pkg/alfred/snapshot/builder.go", "Build", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/cmd/get/registry.go", "<package>", "Get", 1, rawReaderOutsideManager)
+	approve("pkg/cli/cmd/get/registry.go", "<package>", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/cmd/scale/collect.go", "collect", "Get", 1, rawReaderOutsideManager)
+	approve("pkg/cli/instancecollection/collect.go", "CollectRelated", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/migrationcollection/collect.go", "Collect", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/migrationhistorycollection/collect.go", "collectReplicas", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/mutate/held_release_source.go", "CollectHeldReleaseEvidence", "Get", 1, rawReaderOutsideManager)
+	approve("pkg/cli/mutate/held_release_source.go", "CollectHeldReleaseEvidence", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/mutate/migration_evidence.go", "RecheckMigration", "Get", 1, rawReaderOutsideManager)
+	approve("pkg/cli/mutate/replicas.go", "collectReplicaEvidence", "List", 1, rawReaderOutsideManager)
+	approve("pkg/cli/mutate/scale_pinned.go", "CollectScalePinnedTargets", "Get", 1, rawReaderOutsideManager)
+	approve("pkg/cli/mutate/scale_pinned.go", "ScaleEvidence.Revalidate", "Get", 1, rawReaderOutsideManager)
+
+	inv := loadStatusInventory(t)
+	actual := map[fetchSite]int{}
+	inv.eachProductionFile(func(pkg *packages.Package, file *ast.File, relative string) {
+		collectInferenceReplicaFetches(pkg, file, relative, actual)
+	})
+
+	for site, got := range actual {
+		want, ok := approved[site]
+		if !ok {
+			t.Errorf("unclassified InferenceReplica %s in %s:%s (%d): route it through irstatus.GetDecoded or classify it as pass-through", site.method, site.file, site.function, got)
+			continue
+		}
+		if got != want.count {
+			t.Errorf("fetch count changed for %s in %s:%s: got %d, want %d (%s)", site.method, site.file, site.function, got, want.count, want.reason)
+		}
+	}
+	for site, want := range approved {
+		if _, ok := actual[site]; !ok {
+			t.Errorf("stale fetch approval for %s in %s:%s (%s)", site.method, site.file, site.function, want.reason)
+		}
+	}
+}
+
+// The shared fixture package writes the dense representation directly, so its
+// read-inventory classification holds only while no production package links
+// it. The inventory loads non-test files only, so any importer found here is
+// production code; the fixture package itself must be among the loaded
+// packages so a rename cannot make the check pass vacuously.
+func TestIRStatusFixturePackageImportInventory(t *testing.T) {
+	inv := loadStatusInventory(t)
+	loaded := false
+	var importers []string
+	for _, pkg := range inv.pkgs {
+		if pkg.PkgPath == fixturePackagePath {
+			loaded = true
+			continue
+		}
+		if _, ok := pkg.Imports[fixturePackagePath]; ok {
+			importers = append(importers, pkg.PkgPath)
+		}
+	}
+	if !loaded {
+		t.Fatalf("fixture package %s is not among the loaded production packages; update fixturePackagePath", fixturePackagePath)
+	}
+	sort.Strings(importers)
+	if len(importers) != 0 {
+		t.Fatalf("production packages import the test-only fixture package %s: %v", fixturePackagePath, importers)
+	}
+}
+
+// assertInferenceReplicaStatusWritesUseSingleWriter is the repo-wide,
+// type-aware half of the single-writer contract: every status-subresource
+// write of an InferenceReplica, through any client shape, must be the single
+// writer.
+func assertInferenceReplicaStatusWritesUseSingleWriter(t *testing.T) {
+	t.Helper()
+	inv := loadStatusInventory(t)
+	var sites []string
+	inv.eachProductionFile(func(pkg *packages.Package, file *ast.File, relative string) {
+		for _, site := range collectInferenceReplicaStatusWrites(pkg, file, relative) {
+			if site.function == singleWriter && strings.HasSuffix(site.file, "inferencereplica/status_writer.go") {
+				continue
+			}
+			sites = append(sites, fmt.Sprintf("%s:%s (%s)", site.file, site.function, site.method))
+		}
+	})
+	sort.Strings(sites)
+	if len(sites) != 0 {
+		t.Fatalf("InferenceReplica status writes outside %s: %v", singleWriter, sites)
+	}
+}
+
+// --- inventory mechanics ---
+
+type statusInventory struct {
+	repoRoot string
+	pkgs     []*packages.Package
+}
+
+var (
+	inventoryOnce sync.Once
+	inventoryPkgs []*packages.Package
+	inventoryRoot string
+	inventoryErr  error
+)
+
+func loadStatusInventory(t *testing.T) *statusInventory {
+	t.Helper()
+	inventoryOnce.Do(func() {
+		inventoryRoot = inventoryRepositoryRoot()
+		if inventoryRoot == "" {
+			inventoryErr = fmt.Errorf("resolve repository root")
+			return
+		}
+		// Every production root of the main module; a root that is its own
+		// module (scheduler) cannot be loaded from here and cannot import
+		// the main module's API types.
+		var patterns []string
+		for _, root := range []string{"pkg", "cmd", "internal", "scheduler"} {
+			if _, err := os.Stat(filepath.Join(inventoryRoot, root)); err != nil {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(inventoryRoot, root, "go.mod")); err == nil {
+				continue
+			}
+			patterns = append(patterns, "./"+root+"/...")
+		}
+		cfg := &packages.Config{
+			Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports,
+			Dir:   inventoryRoot,
+			Tests: false,
+		}
+		inventoryPkgs, inventoryErr = packages.Load(cfg, patterns...)
+	})
+	if inventoryErr != nil {
+		t.Fatalf("load production packages: %v", inventoryErr)
+	}
+	for _, pkg := range inventoryPkgs {
+		if len(pkg.Errors) == 0 {
+			continue
+		}
+		if _, usesAPI := pkg.Imports[omeAPIPackagePath]; usesAPI {
+			t.Fatalf("package %s did not type-check: %v", pkg.PkgPath, pkg.Errors[0])
+		}
+		t.Logf("skipping %s (does not import the OME API and did not load: %v)", pkg.PkgPath, pkg.Errors[0])
+	}
+	return &statusInventory{repoRoot: inventoryRoot, pkgs: inventoryPkgs}
+}
+
+func inventoryRepositoryRoot() string {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		return ""
+	}
+	for directory := filepath.Dir(source); ; directory = filepath.Dir(directory) {
+		if _, err := os.Stat(filepath.Join(directory, "go.mod")); err == nil {
+			return directory
+		}
+		if parent := filepath.Dir(directory); parent == directory {
+			return ""
+		}
+	}
+}
+
+func (inv *statusInventory) eachProductionFile(visit func(pkg *packages.Package, file *ast.File, relative string)) {
+	for _, pkg := range inv.pkgs {
+		if len(pkg.Errors) > 0 || pkg.TypesInfo == nil || pkg.Fset == nil {
+			continue
+		}
+		for _, file := range pkg.Syntax {
+			path := pkg.Fset.Position(file.Pos()).Filename
+			base := filepath.Base(path)
+			if strings.HasPrefix(base, "zz_generated.") || base == "openapi_generated.go" || strings.HasSuffix(base, "_test.go") {
+				continue
+			}
+			relative, err := filepath.Rel(inv.repoRoot, path)
+			if err != nil || strings.HasPrefix(relative, "..") {
+				continue
+			}
+			visit(pkg, file, filepath.ToSlash(relative))
+		}
+	}
+}
+
+// isOMEAPIType reports whether typ (after pointer dereference) is the named
+// type name from the OME API package.
+func isOMEAPIType(typ types.Type, name string) bool {
+	for {
+		pointer, ok := typ.(*types.Pointer)
+		if !ok {
+			break
+		}
+		typ = pointer.Elem()
+	}
+	named, ok := typ.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == omeAPIPackagePath && named.Obj().Name() == name
+}
+
+func enclosingFunction(file *ast.File, pos token.Pos) string {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || pos < function.Pos() || pos > function.End() {
+			continue
+		}
+		if function.Recv == nil || len(function.Recv.List) == 0 {
+			return function.Name.Name
+		}
+		receiver := function.Recv.List[0].Type
+		if star, ok := receiver.(*ast.StarExpr); ok {
+			receiver = star.X
+		}
+		if ident, ok := receiver.(*ast.Ident); ok {
+			return ident.Name + "." + function.Name.Name
+		}
+		return function.Name.Name
+	}
+	return "<package>"
+}
+
+func parentMap(file *ast.File) map[ast.Node]ast.Node {
+	parents := make(map[ast.Node]ast.Node)
+	stack := make([]ast.Node, 0, 16)
+	ast.Inspect(file, func(node ast.Node) bool {
+		if node == nil {
+			stack = stack[:len(stack)-1]
+			return false
+		}
+		if len(stack) > 0 {
+			parents[node] = stack[len(stack)-1]
+		}
+		stack = append(stack, node)
+		return true
+	})
+	return parents
+}
+
+func selectorAccessKind(selector ast.Node, parents map[ast.Node]ast.Node) string {
+	child := selector
+	for parent := parents[child]; parent != nil; child, parent = parent, parents[parent] {
+		switch node := parent.(type) {
+		case *ast.AssignStmt:
+			for _, left := range node.Lhs {
+				if left != child {
+					continue
+				}
+				if child != selector || (node.Tok != token.ASSIGN && node.Tok != token.DEFINE) {
+					return "read-write"
+				}
+				return "write"
+			}
+			return "read"
+		case *ast.IncDecStmt:
+			return "read-write"
+		case *ast.RangeStmt:
+			if node.Key == child || node.Value == child {
+				return "write"
+			}
+		case *ast.UnaryExpr:
+			if node.Op == token.AND && node.X == child {
+				return "read-write"
+			}
+		case *ast.FuncDecl, *ast.FuncLit:
+			return "read"
+		}
+	}
+	return "read"
+}
+
+func collectRepresentationFieldUses(pkg *packages.Package, file *ast.File, relative string, actual map[fieldUse]accessCounts) {
+	parents := parentMap(file)
+	record := func(pos token.Pos, field, kind string) {
+		use := fieldUse{file: relative, function: enclosingFunction(file, pos), field: field}
+		counts := actual[use]
+		switch kind {
+		case "write":
+			counts.writes++
+		case "read-write":
+			counts.readWrites++
+		default:
+			counts.reads++
+		}
+		actual[use] = counts
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.SelectorExpr:
+			if _, tracked := representationFields[n.Sel.Name]; !tracked {
+				return true
+			}
+			selection, ok := pkg.TypesInfo.Selections[n]
+			if !ok || selection.Kind() != types.FieldVal || !isOMEAPIType(selection.Recv(), "InferenceReplicaStatus") {
+				return true
+			}
+			record(n.Pos(), n.Sel.Name, selectorAccessKind(n, parents))
+		case *ast.CompositeLit:
+			if !isOMEAPIType(pkg.TypesInfo.TypeOf(n), "InferenceReplicaStatus") {
+				return true
+			}
+			for _, element := range n.Elts {
+				keyed, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := keyed.Key.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if _, tracked := representationFields[key.Name]; tracked {
+					record(key.Pos(), key.Name, "write")
+				}
+			}
+		}
+		return true
+	})
+}
+
+// inferenceReplicaFetch reports whether call fetches an InferenceReplica:
+// a Get or List whose object argument, or whose first result, is the
+// InferenceReplica or InferenceReplicaList type.
+func inferenceReplicaFetch(pkg *packages.Package, call *ast.CallExpr) (string, bool) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || (selector.Sel.Name != "Get" && selector.Sel.Name != "List") {
+		return "", false
+	}
+	for _, argument := range call.Args {
+		typ := pkg.TypesInfo.TypeOf(argument)
+		if typ != nil && (isOMEAPIType(typ, "InferenceReplica") || isOMEAPIType(typ, "InferenceReplicaList")) {
+			return selector.Sel.Name, true
+		}
+	}
+	if signature, ok := pkg.TypesInfo.TypeOf(call.Fun).(*types.Signature); ok && signature.Results().Len() > 0 {
+		first := signature.Results().At(0).Type()
+		if isOMEAPIType(first, "InferenceReplica") || isOMEAPIType(first, "InferenceReplicaList") {
+			return selector.Sel.Name, true
+		}
+	}
+	return "", false
+}
+
+func collectInferenceReplicaFetches(pkg *packages.Package, file *ast.File, relative string, actual map[fetchSite]int) {
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		method, fetch := inferenceReplicaFetch(pkg, call)
+		if !fetch {
+			return true
+		}
+		actual[fetchSite{file: relative, function: enclosingFunction(file, call.Pos()), method: method}]++
+		return true
+	})
+}
+
+// collectInferenceReplicaStatusWrites finds status-subresource writes of an
+// InferenceReplica through every client shape: controller-runtime
+// Status()/SubResource("status") writers, generated typed clients, and
+// dynamic clients.
+func collectInferenceReplicaStatusWrites(pkg *packages.Package, file *ast.File, relative string) []fetchSite {
+	var sites []fetchSite
+	record := func(pos token.Pos, method string) {
+		sites = append(sites, fetchSite{file: relative, function: enclosingFunction(file, pos), method: method})
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		method := selector.Sel.Name
+		switch method {
+		case "Update", "Patch", "Apply", "Create":
+			if statusWriterReceiver(selector.X) && callTouchesInferenceReplica(pkg, call) {
+				record(call.Pos(), "Status()."+method)
+			}
+		case "UpdateStatus", "ApplyStatus":
+			if callTouchesInferenceReplica(pkg, call) || dynamicResourceReceiver(pkg, selector.X) {
+				record(call.Pos(), method)
+			}
+		}
+		return true
+	})
+	return sites
+}
+
+// statusWriterReceiver reports whether expr is a Status() call or a
+// SubResource("status") call.
+func statusWriterReceiver(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	switch selector.Sel.Name {
+	case "Status":
+		return len(call.Args) == 0
+	case "SubResource":
+		if len(call.Args) != 1 {
+			return false
+		}
+		literal, ok := call.Args[0].(*ast.BasicLit)
+		return ok && literal.Kind == token.STRING && literal.Value == `"status"`
+	}
+	return false
+}
+
+func callTouchesInferenceReplica(pkg *packages.Package, call *ast.CallExpr) bool {
+	for _, argument := range call.Args {
+		if typ := pkg.TypesInfo.TypeOf(argument); typ != nil && isOMEAPIType(typ, "InferenceReplica") {
+			return true
+		}
+	}
+	if signature, ok := pkg.TypesInfo.TypeOf(call.Fun).(*types.Signature); ok && signature.Results().Len() > 0 {
+		return isOMEAPIType(signature.Results().At(0).Type(), "InferenceReplica")
+	}
+	return false
+}
+
+func dynamicResourceReceiver(pkg *packages.Package, expr ast.Expr) bool {
+	typ := pkg.TypesInfo.TypeOf(expr)
+	if typ == nil {
+		return false
+	}
+	named, ok := typ.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == "k8s.io/client-go/dynamic"
+}

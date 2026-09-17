@@ -53,6 +53,8 @@ import (
 	v1beta1isvccontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
 	trafficfactory "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/factory"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/schemapreflight"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
 	v1beta1runtimerevisioncontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/runtimerevision"
 	v1beta1servingruntimecontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/servingruntime"
@@ -105,6 +107,21 @@ func registerOptionalScheme(cfg *rest.Config, s *runtime.Scheme, groupVersion sc
 
 func loadPodBatchSizes(clientset kubernetes.Interface) (controllerconfig.PodBatchSizes, error) {
 	return controllerconfig.LoadPodBatchSizes(clientset)
+}
+
+// validateInstanceStatusWriteTarget rejects a configured status write target
+// this binary cannot honor. Its status writer persists DenseV1 only, so a
+// ColumnarV2 target would be silently downgraded; refusing to start keeps the
+// configured policy and the written representation identical.
+func validateInstanceStatusWriteTarget(cfg *controllerconfig.OMENativeStatusConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("omenativeStatus configuration is missing")
+	}
+	if cfg.InstanceStatusEncoding != irstatus.EncodingDenseV1 {
+		return fmt.Errorf("omenativeStatus.instanceStatusEncoding %q is not a write target this manager supports; it writes %s only",
+			cfg.InstanceStatusEncoding, irstatus.EncodingDenseV1)
+	}
+	return nil
 }
 
 func managerProbeChecker(enableWebhook bool, webhookServer func() webhook.Server) healthz.Checker {
@@ -327,6 +344,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The InferenceReplica status representation policy is loaded exactly
+	// once, before the manager exists: every IR reader decodes under the
+	// same bound for the process lifetime, and a manager whose cluster
+	// cannot store or validate the ColumnarV2 union must not start.
+	omenativeStatusConfig, err := controllerconfig.NewOMENativeStatusConfig(clientSet)
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize OMENative status configuration")
+		os.Exit(1)
+	}
+	if err := validateInstanceStatusWriteTarget(omenativeStatusConfig); err != nil {
+		setupLog.Error(err, "Unsupported OMENative status configuration")
+		os.Exit(1)
+	}
+	if err := schemapreflight.Verify(clientSet.Discovery().OpenAPIV3()); err != nil {
+		setupLog.Error(err, "InferenceReplica status schema preflight failed")
+		os.Exit(1)
+	}
+	instanceStatusDecoder := irstatus.NewDecoder(omenativeStatusConfig.DecodeBound())
+	setupLog.Info("Configured InferenceReplica status representation",
+		"instanceStatusEncoding", omenativeStatusConfig.InstanceStatusEncoding,
+		"maxDecodedInstances", omenativeStatusConfig.DecodeBound())
+
 	if !options.enableHTTP2 {
 		// if the enable-http2 flag is false (the default), http/2 should be disabled
 		// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -530,6 +569,7 @@ func main() {
 			Log:                       ctrl.Log.WithName("InferenceService"),
 			Scheme:                    mgr.GetScheme(),
 			Recorder:                  eventBroadcaster.NewRecorder(mgr.GetScheme(), v1.EventSource{Component: "v1beta1Controllers"}),
+			InstanceStatusDecoder:     instanceStatusDecoder,
 			TrafficReconciler:         trafficReconciler,
 			MaxConcurrentReconciles:   options.isvcMaxConcurrentReconciles,
 			ConfigCacheTTL:            options.configCacheTTL,
@@ -623,6 +663,7 @@ func main() {
 			Clientset:                clientSet,
 			Log:                      ctrl.Log.WithName("InferenceReplica"),
 			APIReader:                mgr.GetAPIReader(),
+			InstanceStatusDecoder:    instanceStatusDecoder,
 			Recorder:                 eventBroadcaster.NewRecorder(mgr.GetScheme(), v1.EventSource{Component: "v1beta1Controllers"}),
 			MaxConcurrentReconciles:  options.irMaxConcurrentReconciles,
 			ConfigCacheTTL:           options.configCacheTTL,
@@ -644,7 +685,7 @@ func main() {
 	// additionally runs the placement (fan-out) controller, its GC, and the endpoint
 	// publisher — see setupMultiCluster.
 	if options.enableMultiCluster || isControlPlane {
-		if err = setupMultiCluster(mgr, clientSet, options, isControlPlane); err != nil {
+		if err = setupMultiCluster(mgr, clientSet, options, isControlPlane, instanceStatusDecoder); err != nil {
 			setupLog.Error(err, "Failed to set up multi-cluster")
 			os.Exit(1)
 		}

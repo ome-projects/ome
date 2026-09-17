@@ -147,7 +147,7 @@ func (ctx GateContext) CheckPairing(strategy workloadtypes.UpdateStrategyType, i
 	transition := false
 	for _, comp := range pairingComponents {
 		serving[comp] = map[string]int32{}
-		ir, err := irprojector.ComponentIR(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, comp)
+		ir, _, err := irprojector.DecodedComponentIR(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, comp)
 		if err != nil {
 			return false, fmt.Sprintf("pairing gate: cannot read %s IR status, failing closed: %v", comp, err)
 		}

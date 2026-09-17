@@ -381,6 +381,21 @@ ome:
       # unconfigured — a group that omits tolerance then rolls with no drift
       # bound.
       defaultRatioTolerancePercent: 5
+    # omenativeStatus selects how the manager stores InferenceReplica
+    # per-Instance status. It is read once at manager startup and is
+    # required: a manager with no value, or an unknown one, refuses to start.
+    # Changing either key is a stopped-fleet operation, never a rolling one.
+    omenativeStatus:
+      # Status write target: DenseV1 (the dense instanceStatuses list) or
+      # ColumnarV2 (grouped columns, chosen only when strictly smaller).
+      # ColumnarV2 additionally requires maxDecodedInstances.
+      instanceStatusEncoding: DenseV1
+      # Largest number of per-Instance rows a stored ColumnarV2 payload may
+      # expand to; a positive integer sized to the deployment's supported
+      # ceiling of transient rows per InferenceReplica. Required under
+      # ColumnarV2. Leave unset under DenseV1 unless ColumnarV2 objects can be
+      # observed; without it any ColumnarV2 object fails closed.
+      # maxDecodedInstances: 5000
     # podDisruptionBudget configures pod-level availability policies by mode.
     # Explicit per-Component policies take precedence over these defaults. Set
     # either mode to null to disable its default.

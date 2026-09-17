@@ -364,6 +364,14 @@ kubectl-ome-cross: ## 🔌 Cross-compile kubectl-ome for all release platforms (
 	  done; \
 	done
 
+.PHONY: ome-status-preflight
+ome-status-preflight: ## 🔍 Build the read-only InferenceReplica status transition preflight.
+	@echo "🔍 Building ome-status-preflight..."
+	@# No xet dependency: the command only reads the API, so it stays a pure-Go
+	@# binary that builds anywhere without a Rust toolchain.
+	CGO_ENABLED=0 $(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/ome-status-preflight ./cmd/ome-status-preflight
+	@echo "✅ Build complete"
+
 .PHONY: run-ome-manager
 run-ome-manager: manifests generate fmt vet ## Run ome-manager binary from local host against the configured Kubernetes cluster in ~/.kube/config or KUBECONFIG env.
 	@echo "🏃‍♂️ Running ome-manager..."

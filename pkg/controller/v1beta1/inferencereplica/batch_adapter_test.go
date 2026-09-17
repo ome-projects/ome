@@ -32,6 +32,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -355,7 +356,7 @@ func TestBuildApplyInstanceMutations_OneWriteForBatch(t *testing.T) {
 	}
 	c, writes := newCountingStatusClient(t, 0, ir)
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
 		failedStamp(0), failedStamp(1),
 	})).To(gomega.Succeed())
@@ -384,7 +385,7 @@ func TestBuildApplyInstanceMutations_PreservesEveryRetainedField(t *testing.T) {
 	before := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, before)).To(gomega.Succeed())
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{failedStamp(7)})).To(gomega.Succeed())
 	g.Expect(*writes).To(gomega.Equal(1))
 
@@ -407,7 +408,7 @@ func TestBuildApplyInstanceMutations_DuplicateIndexMutationsCompose(t *testing.T
 	c, writes := newCountingStatusClient(t, 0, ir)
 	secondObservedFirst := false
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
 		{Index: 3, Mutate: func(s *workload.InstanceStatus) bool {
 			s.PodCount += 2
@@ -439,7 +440,7 @@ func TestBuildApplyInstanceMutations_DuplicateIndexMutationsCompose(t *testing.T
 }
 
 // TestBuildApplyInstanceMutations_TwoThousandEntriesOneWrite guards the
-// high-scale contract that motivated the adapter: appending a full 2,000-slot
+// adapter's high-scale contract: appending a full 2,000-slot
 // scale-up wave still performs one status update, not one full-IR rewrite per
 // Instance. It also exercises the indexed slot lookup used by large batches.
 func TestBuildApplyInstanceMutations_TwoThousandEntriesOneWrite(t *testing.T) {
@@ -455,7 +456,7 @@ func TestBuildApplyInstanceMutations_TwoThousandEntriesOneWrite(t *testing.T) {
 		mutations = append(mutations, creatingStamp(idx, now))
 	}
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), mutations)).To(gomega.Succeed())
 	g.Expect(*writes).To(gomega.Equal(1),
 		"2,000 mutations must coalesce into one Status().Update")
@@ -505,7 +506,7 @@ func TestBuildApplyInstanceMutations_ConflictRetriesWholeBatch(t *testing.T) {
 		}}
 	}
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
 		trackedFailedStamp(0), trackedFailedStamp(1),
 	})).To(gomega.Succeed())
@@ -535,7 +536,7 @@ func TestBuildApplyInstanceMutations_OnCommitReportsSuccessfulConflictAttemptOnc
 	commitCalls := 0
 	var previous, current *workload.InstanceStatus
 	mutationCalls := 0
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{{
 		Index: 0,
@@ -573,7 +574,7 @@ func TestBuildApplyInstanceMutations_OnCommitUsesPersistedRepresentation(t *test
 		committed = current
 	}
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{mutation})).To(gomega.Succeed())
 	g.Expect(*writes).To(gomega.Equal(1))
 	g.Expect(committed).NotTo(gomega.BeNil())
@@ -616,7 +617,7 @@ func TestBuildApplyInstanceMutations_ImmediateRollbackUsesAuthoritativeReader(t 
 	}
 
 	apply := instanceOnlyMutationAdapter(
-		buildApplyInstanceMutationsWithRetryBlockFromReader(writer, live, ir),
+		buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(writer), live, ir),
 	)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{mutation})).To(gomega.Succeed())
 	g.Expect(committed).NotTo(gomega.BeNil())
@@ -688,7 +689,7 @@ func TestBuildApplyInstanceMutations_MixedChangesWriteOnceWithoutPhantomSlots(t 
 	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, before)).To(gomega.Succeed())
 	ir.Status.InstanceStatuses = before.Status.DeepCopy().InstanceStatuses
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
 		failedStamp(0), // existing no-op
 		failedStamp(1), // existing change
@@ -723,7 +724,7 @@ func TestBuildApplyInstanceMutations_MixedChangesWriteOnceWithoutPhantomSlots(t 
 		g.Expect(status.Index).NotTo(gomega.Equal(int32(7)), "a declined missing-slot mutation must not append a phantom")
 	}
 	mirrored := ir.DeepCopy()
-	clearPodDerivedInstanceObservations(mirrored)
+	irstatus.ClearPodDerivedObservations(mirrored.Status.InstanceStatuses)
 	g.Expect(mirrored.Status.InstanceStatuses).To(gomega.Equal(got.Status.InstanceStatuses),
 		"the in-memory mirror may retain transient observations but must match every persisted field")
 }
@@ -740,7 +741,7 @@ func TestBuildApplyInstanceMutations_NoChangeZeroWrites(t *testing.T) {
 	}
 	c, writes := newCountingStatusClient(t, 0, ir)
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
 		failedStamp(0), // already Failed — reports no change
 		{Index: 7, Mutate: func(s *workload.InstanceStatus) bool {
@@ -763,7 +764,7 @@ func TestBuildApplyInstanceMutations_NotFoundAbortsStaleReconcile(t *testing.T) 
 	ir := baselineIR("llama-engine", "prod", 1)
 	c, writes := newCountingStatusClient(t, 0) // IR never stored
 
-	apply := buildApplyInstanceMutations(c, ir)
+	apply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 	err := apply(context.Background(), []workloadtypes.InstanceMutation{
 		failedStamp(0),
 	})
@@ -846,7 +847,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_AllNoOpZeroWrites(t *testing.
 		Phase: v1beta1.OMENativeInstanceFailed,
 	}}
 	c, writes := newCountingStatusClient(t, 0, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 
 	g.Expect(apply(
 		context.Background(),
@@ -886,7 +887,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_WriteFailureIsAtomic(t *testi
 	c, writes := newFailingStatusClient(t, ir)
 	storedBefore := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(ir), storedBefore)).To(gomega.Succeed())
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 
 	err := apply(
 		context.Background(),
@@ -926,7 +927,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_ConflictRetriesBothMutations(
 		AttemptsStarted: 3,
 	}}
 	c, writes := newCountingStatusClient(t, 1, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 	instanceCalls := 0
 	retryBlockCalls := 0
 
@@ -985,7 +986,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_MixedRestoreAndRemoveOneWrite
 		Admitted:          true,
 		NodesOccupied:     []string{"node-restored"},
 	}
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
 		{Index: 0, Mutate: func(status *workload.InstanceStatus) bool {
@@ -1016,7 +1017,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_RemovalConflictRetriesWholeBa
 		{Index: 1, Phase: v1beta1.OMENativeInstanceReady},
 	}
 	c, writes := newCountingStatusClient(t, 1, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 	restoreCalls := 0
 
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{
@@ -1049,7 +1050,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_PreconditionRejectsStaleRemov
 	}}
 	c, writes := newCountingStatusClient(t, 0, ir)
 	commitCalls := 0
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{{
 		Index:  0,
@@ -1075,12 +1076,12 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_OwnerGoneSentinel(t *testing.
 		ir := baselineIR("llama-engine", "prod", 1)
 		c, writes := newCountingStatusClient(t, 0)
 
-		atomicApply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+		atomicApply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 		err := atomicApply(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil)
 		g.Expect(errors.Is(err, workloadtypes.ErrStatusOwnerGone)).To(gomega.BeTrue())
 		g.Expect(*writes).To(gomega.Equal(0))
 
-		instanceOnlyApply := buildApplyInstanceMutations(c, ir)
+		instanceOnlyApply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 		err = instanceOnlyApply(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)})
 		g.Expect(errors.Is(err, workloadtypes.ErrStatusOwnerGone)).To(gomega.BeTrue())
 		g.Expect(*writes).To(gomega.Equal(0))
@@ -1096,13 +1097,13 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_OwnerGoneSentinel(t *testing.
 		original := ir.Status.DeepCopy()
 		c, writes := newStatusOwnerGoneOnUpdateClient(t, ir)
 
-		atomicApply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+		atomicApply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 		err := atomicApply(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil)
 		g.Expect(errors.Is(err, workloadtypes.ErrStatusOwnerGone)).To(gomega.BeTrue())
 		g.Expect(*writes).To(gomega.Equal(1))
 		g.Expect(ir.Status).To(gomega.Equal(*original), "an uncommitted write must not advance the in-memory mirror")
 
-		instanceOnlyApply := buildApplyInstanceMutations(c, ir)
+		instanceOnlyApply := buildApplyInstanceMutations(testStatusWriter(c), ir)
 		err = instanceOnlyApply(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)})
 		g.Expect(errors.Is(err, workloadtypes.ErrStatusOwnerGone)).To(gomega.BeTrue())
 		g.Expect(*writes).To(gomega.Equal(2))
@@ -1113,7 +1114,7 @@ func TestBuildApplyInstanceMutationsWithRetryBlock_RejectsAmbiguousMutation(t *t
 	g := gomega.NewWithT(t)
 	ir := baselineIR("llama-engine", "prod", 1)
 	c, writes := newCountingStatusClient(t, 0, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 
 	err := apply(context.Background(), []workloadtypes.InstanceMutation{{
 		Index:  0,
@@ -1145,7 +1146,7 @@ func TestBuildApplyInstanceMutations_BatchPreconditionRejectsEverything(t *testi
 		{Index: 1, Incarnation: 3, Phase: v1beta1.OMENativeInstanceReady},
 	}
 	c, writes := newCountingStatusClient(t, 0, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 	guardCalls := 0
 	err := apply(context.Background(), []workloadtypes.InstanceMutation{
 		{
@@ -1181,7 +1182,7 @@ func TestBuildApplyInstanceMutations_BatchPreconditionIncludesOwnerIdentity(t *t
 	c, writes := newCountingStatusClient(t, 0, ir)
 	var observed workloadtypes.InstanceMutationSnapshot
 
-	err := buildApplyInstanceMutationsWithRetryBlock(c, ir)(context.Background(), []workloadtypes.InstanceMutation{{
+	err := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)(context.Background(), []workloadtypes.InstanceMutation{{
 		Index: 0,
 		BatchPrecondition: func(snapshot workloadtypes.InstanceMutationSnapshot) bool {
 			observed = snapshot
@@ -1204,7 +1205,7 @@ func TestBuildApplyInstanceMutations_BatchPreconditionRecheckedAfterConflict(t *
 	ir := baselineIR("llama-engine", "prod", 1)
 	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
 	c, writes := newCountingStatusClient(t, 1, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlock(c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)
 	guardCalls := 0
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{{
 		Index: 0,
@@ -1230,7 +1231,7 @@ func TestBuildApplyInstanceMutations_GuardedRemovalRejectsOwnershipDriftAfterCon
 	}}
 	c, writes := newCountingStatusClient(t, 1, ir)
 	reads := &driftingInstanceReader{Reader: c, index: 0}
-	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(c, reads, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(c), reads, ir)
 	metricBefore := make(map[string]float64)
 	for _, result := range []string{obsmetrics.ResultSuccess, obsmetrics.ResultConflict, obsmetrics.ResultNotFound, obsmetrics.ResultError} {
 		metricBefore[result] = irStatusUpdateMetric(t, result)
@@ -1266,7 +1267,7 @@ func TestBuildApplyInstanceMutations_AmbiguousCommitConfirmedAuthoritatively(t *
 	ir := baselineIR("llama-engine", "prod", 1)
 	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Incarnation: 4, Phase: v1beta1.OMENativeInstanceReady}}
 	c, writes := newCommitThenErrorStatusClient(t, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(c, c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(c), c, ir)
 	now := metav1.NewTime(time.Date(2026, 4, 5, 6, 7, 8, 987654321, time.UTC))
 	commits := 0
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{{
@@ -1300,7 +1301,7 @@ func TestBuildApplyInstanceMutations_AmbiguousRemovalForgetsOnlyAfterConfirmedAb
 		Operation: &v1beta1.InstanceOperation{ID: "delete-0", Type: v1beta1.InstanceOperationDelete},
 	}}
 	c, writes := newCommitThenErrorStatusClient(t, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(c, c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(c), c, ir)
 	commits := 0
 	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{{
 		Index:  0,
@@ -1326,7 +1327,7 @@ func TestBuildApplyInstanceMutations_AmbiguousCombinedCommitConfirmed(t *testing
 	ir := baselineIR("llama-engine", "prod", 1)
 	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating}}
 	c, writes := newCommitThenErrorStatusClient(t, ir)
-	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(c, c, ir)
+	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(c), c, ir)
 	commits := 0
 
 	err := apply(context.Background(), []workloadtypes.InstanceMutation{{
@@ -1362,7 +1363,7 @@ func TestBuildApplyInstanceMutations_SameNameReplacementAborts(t *testing.T) {
 	replacement.UID = "replacement-uid"
 	replacement.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
 	c, writes := newCountingStatusClient(t, 0, replacement)
-	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(c, c, original)
+	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(c), c, original)
 
 	err := apply(context.Background(), []workloadtypes.InstanceMutation{{
 		Index: 0,
@@ -1388,7 +1389,7 @@ func TestBuildMutateInstance_SameNameReplacementAborts(t *testing.T) {
 	r, c := newReconciler(t, replacement)
 	called := false
 
-	mutate := buildMutateInstance(r.Client, r.Client, original)
+	mutate := buildMutateInstance(r.statusWriter(), r.Client, original)
 	err := mutate(context.Background(), 0, func(*workload.InstanceStatus) bool {
 		called = true
 		return true
@@ -1409,7 +1410,7 @@ func TestBuildRemoveInstance_SameNameReplacementAborts(t *testing.T) {
 	replacement.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
 	r, c := newReconciler(t, replacement)
 
-	remove := buildRemoveInstance(r.Client, r.Client, original, workload.NewExpectations())
+	remove := buildRemoveInstance(r.statusWriter(), r.Client, original, workload.NewExpectations())
 	removed, err := remove(context.Background(), 0)
 	g.Expect(errors.Is(err, workload.ErrStatusOwnerGone)).To(gomega.BeTrue())
 	g.Expect(removed).To(gomega.BeFalse())
@@ -1426,7 +1427,7 @@ func TestBuildWriteAggregateCondition_SameNameReplacementAborts(t *testing.T) {
 	replacement.UID = "replacement-uid"
 	r, c := newReconciler(t, replacement)
 
-	write := buildWriteAggregateCondition(r.Client, r.Client, original)
+	write := buildWriteAggregateCondition(r.statusWriter(), r.Client, original)
 	err := write(context.Background(), metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"})
 	g.Expect(errors.Is(err, workload.ErrStatusOwnerGone)).To(gomega.BeTrue())
 
@@ -1443,7 +1444,7 @@ func TestBuildApplyInstanceMutations_RecordsOneTerminalStatusOutcome(t *testing.
 		beforeSuccess := irStatusUpdateMetric(t, obsmetrics.ResultSuccess)
 		beforeConflict := irStatusUpdateMetric(t, obsmetrics.ResultConflict)
 
-		err := buildApplyInstanceMutationsWithRetryBlock(c, ir)(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil)
+		err := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1463,7 +1464,7 @@ func TestBuildApplyInstanceMutations_RecordsOneTerminalStatusOutcome(t *testing.
 		ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
 		c, _ := newFailingStatusClient(t, ir)
 		before := irStatusUpdateMetric(t, obsmetrics.ResultError)
-		if err := buildApplyInstanceMutationsWithRetryBlock(c, ir)(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil); err == nil {
+		if err := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil); err == nil {
 			t.Fatal("expected status failure")
 		}
 		if got := irStatusUpdateMetric(t, obsmetrics.ResultError) - before; got != 1 {
@@ -1476,7 +1477,7 @@ func TestBuildApplyInstanceMutations_RecordsOneTerminalStatusOutcome(t *testing.
 		ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
 		c, _ := newStatusOwnerGoneOnUpdateClient(t, ir)
 		before := irStatusUpdateMetric(t, obsmetrics.ResultNotFound)
-		err := buildApplyInstanceMutationsWithRetryBlock(c, ir)(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil)
+		err := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)(context.Background(), []workloadtypes.InstanceMutation{failedStamp(0)}, "", nil)
 		if !errors.Is(err, workloadtypes.ErrStatusOwnerGone) {
 			t.Fatalf("owner-gone error = %v", err)
 		}
@@ -1493,7 +1494,7 @@ func TestBuildApplyInstanceMutations_RecordsOneTerminalStatusOutcome(t *testing.
 		for _, result := range []string{obsmetrics.ResultSuccess, obsmetrics.ResultConflict, obsmetrics.ResultNotFound, obsmetrics.ResultError} {
 			before[result] = irStatusUpdateMetric(t, result)
 		}
-		err := buildApplyInstanceMutationsWithRetryBlock(c, ir)(context.Background(), []workloadtypes.InstanceMutation{{
+		err := buildApplyInstanceMutationsWithRetryBlock(testStatusWriter(c), ir)(context.Background(), []workloadtypes.InstanceMutation{{
 			Index: 0, Mutate: func(*workload.InstanceStatus) bool { return false },
 		}}, "", nil)
 		if err != nil {

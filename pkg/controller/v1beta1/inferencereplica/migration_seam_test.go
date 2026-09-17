@@ -43,7 +43,7 @@ func TestBuildMutateMigration_PersistsAndMirrors(t *testing.T) {
 	ir.Status.Migrations = []v1beta1.MigrationStatus{acceptedEntry("u-1")}
 	r, c := newReconciler(t, ir)
 
-	mutate := buildMutateMigration(r.Client, r.Client, ir)
+	mutate := buildMutateMigration(r.statusWriter(), r.Client, ir)
 	idx := int32(3)
 	g.Expect(mutate(context.Background(), "u-1", func(m *workload.MigrationRecord) bool {
 		g.Expect(m.Phase).To(gomega.Equal(workload.MigrationPhaseAccepted))
@@ -76,7 +76,7 @@ func TestBuildMutateMigration_MissingEntryNoOp(t *testing.T) {
 	before := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), key, before)).To(gomega.Succeed())
 
-	mutate := buildMutateMigration(r.Client, r.Client, ir)
+	mutate := buildMutateMigration(r.statusWriter(), r.Client, ir)
 	called := false
 	g.Expect(mutate(context.Background(), "u-gone", func(_ *workload.MigrationRecord) bool {
 		called = true
@@ -101,7 +101,7 @@ func TestBuildMutateMigration_UnchangedWritesNothing(t *testing.T) {
 	before := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), key, before)).To(gomega.Succeed())
 
-	mutate := buildMutateMigration(r.Client, r.Client, ir)
+	mutate := buildMutateMigration(r.statusWriter(), r.Client, ir)
 	g.Expect(mutate(context.Background(), "u-1", func(m *workload.MigrationRecord) bool {
 		m.Message = "scratch" // even a scribbling callback writes nothing on false
 		return false
@@ -125,7 +125,7 @@ func TestBuildMutateMigration_SameNameReplacementAborts(t *testing.T) {
 	g.Expect(c.Get(context.Background(), key, before)).To(gomega.Succeed())
 
 	called := false
-	mutate := buildMutateMigration(r.Client, r.Client, original)
+	mutate := buildMutateMigration(r.statusWriter(), r.Client, original)
 	err := mutate(context.Background(), "u-1", func(*workload.MigrationRecord) bool {
 		called = true
 		return true
@@ -150,7 +150,7 @@ func TestBuildAppendMigration_SameNameReplacementAborts(t *testing.T) {
 	before := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), key, before)).To(gomega.Succeed())
 
-	appendRec := buildAppendMigration(r.Client, r.Client, original)
+	appendRec := buildAppendMigration(r.statusWriter(), r.Client, original)
 	err := appendRec(context.Background(), workload.MigrationRecord{RequestUUID: "u-2"})
 	g.Expect(errors.Is(err, workload.ErrStatusOwnerGone)).To(gomega.BeTrue())
 
@@ -191,7 +191,7 @@ func TestBuildAppendMigration_AppendsIdempotently(t *testing.T) {
 	r, c := newReconciler(t, ir)
 	key := types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}
 
-	appendRec := buildAppendMigration(r.Client, r.Client, ir)
+	appendRec := buildAppendMigration(r.statusWriter(), r.Client, ir)
 	now := metav1.NewTime(migrationTestNow.Local())
 	completed := now
 	rec := workload.MigrationRecord{

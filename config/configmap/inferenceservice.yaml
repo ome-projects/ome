@@ -25,6 +25,17 @@ data:
       "defaultDeploymentMode": "RawDeployment"
     }
 
+  # How the manager stores InferenceReplica per-Instance status. Read once at
+  # manager startup and required: a missing or unknown instanceStatusEncoding
+  # prevents startup. DenseV1 writes the dense instanceStatuses list.
+  # maxDecodedInstances bounds how many rows a stored ColumnarV2 payload may
+  # expand to; it must be a positive integer, is required for ColumnarV2, and
+  # may be omitted for DenseV1 (any ColumnarV2 object then fails closed).
+  omenativeStatus: |-
+    {
+      "instanceStatusEncoding": "DenseV1"
+    }
+
   modelInit: |-
     {
         "image" : "ghcr.io/moirai-internal/ome-agent:v1.2.2",

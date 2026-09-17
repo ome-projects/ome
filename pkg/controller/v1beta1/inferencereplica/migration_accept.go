@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 )
@@ -158,7 +159,7 @@ func (r *Reconciler) consumeMigrationRequests(ctx context.Context, log logr.Logg
 		if mode == workload.MigrationModeNever {
 			now := metav1.NewTime(r.now())
 			msg := "migrations disabled by MigrationPolicy Mode=Never"
-			if aerr := appendMigrationStatus(ctx, r.Client, r.APIReader, ir, v1beta1.MigrationStatus{
+			if aerr := appendMigrationStatus(ctx, r.statusWriter(), r.liveReader(), ir, v1beta1.MigrationStatus{
 				RequestUUID:    uuid,
 				Trigger:        v1beta1.MigrationTriggerManual,
 				SourceInstance: req.Instance,
@@ -200,7 +201,7 @@ func (r *Reconciler) consumeMigrationRequests(ctx context.Context, log logr.Logg
 			continue
 		}
 		now := metav1.NewTime(r.now())
-		if aerr := appendMigrationStatus(ctx, r.Client, r.APIReader, ir, v1beta1.MigrationStatus{
+		if aerr := appendMigrationStatus(ctx, r.statusWriter(), r.liveReader(), ir, v1beta1.MigrationStatus{
 			RequestUUID:     uuid,
 			Trigger:         v1beta1.MigrationTriggerManual,
 			SourceInstance:  req.Instance,
@@ -274,7 +275,7 @@ func (r *Reconciler) consumeMigrationRequests(ctx context.Context, log logr.Logg
 // committed slice onto the caller's in-memory IR — same persistence
 // discipline as buildMutateRetryBlock. Idempotent: an entry with the
 // same RequestUUID already present writes nothing.
-func appendMigrationStatus(ctx context.Context, c client.Client, reads client.Reader, ir *v1beta1.InferenceReplica, entry v1beta1.MigrationStatus) error {
+func appendMigrationStatus(ctx context.Context, writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica, entry v1beta1.MigrationStatus) error {
 	key := client.ObjectKeyFromObject(ir)
 	ownerUID := ir.UID
 	var committed []v1beta1.MigrationStatus
@@ -282,7 +283,8 @@ func appendMigrationStatus(ctx context.Context, c client.Client, reads client.Re
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		wrote = false
 		fresh := &v1beta1.InferenceReplica{}
-		if err := reads.Get(ctx, key, fresh); err != nil {
+		source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}
@@ -299,7 +301,7 @@ func appendMigrationStatus(ctx context.Context, c client.Client, reads client.Re
 			}
 		}
 		fresh.Status.Migrations = append(fresh.Status.Migrations, entry)
-		if err := updateInferenceReplicaStatus(ctx, c, fresh); err != nil {
+		if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}
@@ -412,7 +414,7 @@ func migrationsFromIR(ir *v1beta1.InferenceReplica) []workload.MigrationRecord {
 //
 // A missing entry is a clean no-op. Owner disappearance or replacement
 // returns ErrStatusOwnerGone so callers stop effects from a stale snapshot.
-func buildMutateMigration(c client.Client, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, requestUUID string, mutate func(*workload.MigrationRecord) bool) error {
+func buildMutateMigration(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, requestUUID string, mutate func(*workload.MigrationRecord) bool) error {
 	key := client.ObjectKeyFromObject(ir)
 	ownerUID := ir.UID
 	return func(ctx context.Context, requestUUID string, mutate func(*workload.MigrationRecord) bool) error {
@@ -421,7 +423,8 @@ func buildMutateMigration(c client.Client, reads client.Reader, ir *v1beta1.Infe
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			wrote = false
 			fresh := &v1beta1.InferenceReplica{}
-			if err := reads.Get(ctx, key, fresh); err != nil {
+			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
+			if err != nil {
 				if apierrors.IsNotFound(err) {
 					return workload.ErrStatusOwnerGone
 				}
@@ -447,7 +450,7 @@ func buildMutateMigration(c client.Client, reads client.Reader, ir *v1beta1.Infe
 			// The subject key is fixed: a callback cannot re-key the entry.
 			w.RequestUUID = requestUUID
 			fresh.Status.Migrations[pos] = migrationFromWorkload(w)
-			if err := updateInferenceReplicaStatus(ctx, c, fresh); err != nil {
+			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
 				if apierrors.IsNotFound(err) {
 					return workload.ErrStatusOwnerGone
 				}
@@ -476,9 +479,9 @@ func buildMutateMigration(c client.Client, reads client.Reader, ir *v1beta1.Infe
 // appendMigrationStatus (same RMW + in-memory-mirror discipline as the
 // accept path); an entry with the RequestUUID already present writes
 // nothing.
-func buildAppendMigration(c client.Client, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, rec workload.MigrationRecord) error {
+func buildAppendMigration(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, rec workload.MigrationRecord) error {
 	return func(ctx context.Context, rec workload.MigrationRecord) error {
-		return appendMigrationStatus(ctx, c, reads, ir, migrationFromWorkload(rec))
+		return appendMigrationStatus(ctx, writer, reads, ir, migrationFromWorkload(rec))
 	}
 }
 
@@ -531,7 +534,8 @@ func (r *Reconciler) syncMigrationEntries(ctx context.Context, log logr.Logger, 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		wrote = false
 		fresh := &v1beta1.InferenceReplica{}
-		if err := r.APIReader.Get(ctx, key, fresh); err != nil {
+		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}
@@ -579,7 +583,7 @@ func (r *Reconciler) syncMigrationEntries(ctx context.Context, log logr.Logger, 
 			wrote = true
 			return nil
 		}
-		if err := updateInferenceReplicaStatus(ctx, r.Client, fresh); err != nil {
+		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
 				return workload.ErrStatusOwnerGone
 			}

@@ -298,6 +298,15 @@ type InferenceReplicaPacing struct {
 // writer. Fields mirror the LifecycleStatus shape so the ISVC's
 // aggregated per-Component status is a verbatim projection of this
 // block.
+//
+// The per-Instance rows have exactly one representation on a committed
+// object. Without instanceStatusEncoding the rows are the DenseV1 list
+// in instanceStatuses; with instanceStatusEncoding: ColumnarV2 the same
+// rows live in instanceStatusColumns and instanceStatuses is absent.
+// The rules below reject every mixed spelling of that union.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.instanceStatusEncoding) || !has(self.instanceStatusColumns)",message="instanceStatusColumns requires instanceStatusEncoding; an unmarked status carries only instanceStatuses"
+// +kubebuilder:validation:XValidation:rule="!has(self.instanceStatusEncoding) || (has(self.instanceStatusColumns) && !has(self.instanceStatuses))",message="instanceStatusEncoding: ColumnarV2 requires instanceStatusColumns and forbids instanceStatuses"
 type InferenceReplicaStatus struct {
 	// ObservedGeneration is the InferenceReplica.metadata.generation
 	// the most recent status flush reflects.
@@ -360,11 +369,27 @@ type InferenceReplicaStatus struct {
 	// +optional
 	LabelSelector string `json:"labelSelector,omitempty"`
 
-	// InstanceStatuses is the per-Instance status, one row per Instance.
+	// InstanceStatuses is the DenseV1 representation of the per-Instance
+	// status, one row per Instance. Absent when instanceStatusEncoding is
+	// ColumnarV2, in which case instanceStatusColumns carries the same rows.
 	// +optional
 	// +listType=map
 	// +listMapKey=index
 	InstanceStatuses []OMENativeInstanceStatus `json:"instanceStatuses,omitempty"`
+
+	// InstanceStatusEncoding names the representation that carries the
+	// per-Instance rows. Absent means DenseV1 (instanceStatuses). The only
+	// accepted value is ColumnarV2, which requires instanceStatusColumns
+	// and forbids instanceStatuses.
+	// +optional
+	InstanceStatusEncoding *InstanceStatusEncoding `json:"instanceStatusEncoding,omitempty"`
+
+	// InstanceStatusColumns is the ColumnarV2 representation of the
+	// per-Instance rows. Present exactly when instanceStatusEncoding is
+	// ColumnarV2; it decodes to the same rows, in the same order, that
+	// instanceStatuses would carry.
+	// +optional
+	InstanceStatusColumns *InstanceStatusColumns `json:"instanceStatusColumns,omitempty"`
 
 	// RetryBlocks records per-target-revision retry authority for update
 	// attempts. Revision-scoped: one block per failed target revision,
@@ -423,6 +448,200 @@ type InferenceReplicaStatus struct {
 	// has no rollout in flight. See RolloutHold for the field semantics.
 	// +optional
 	RolloutHold *RolloutHold `json:"rolloutHold,omitempty"`
+}
+
+// InstanceStatusEncoding names a stored representation of the per-Instance
+// rows. The wire carries only ColumnarV2; an absent marker means DenseV1.
+// +kubebuilder:validation:Enum=ColumnarV2
+type InstanceStatusEncoding string
+
+const (
+	// InstanceStatusEncodingColumnarV2 stores the per-Instance rows in
+	// instanceStatusColumns instead of the dense instanceStatuses list.
+	InstanceStatusEncodingColumnarV2 InstanceStatusEncoding = "ColumnarV2"
+)
+
+// InstanceStatusColumns is the ColumnarV2 representation of the per-Instance
+// rows. A value shared by many Instances is stored once against the index
+// set of the Instances that carry it; records that are rare or unique per
+// Instance stay keyed by index in entries.
+//
+// An index set is a string of comma-separated decimal terms, each a single
+// index or a closed "first-last" range, for example "0-8,10-114,116". The
+// canonical form is the only accepted one: terms are strictly ascending,
+// disjoint, and nonadjacent (adjacent terms are merged), a range has
+// first < last, indices are nonnegative int32 values without leading zeros,
+// and there is no whitespace, sign, empty term, or trailing comma.
+//
+// Members is the complete row set; every other index set is a subset of it.
+// Within one column the group index sets are pairwise disjoint and the groups
+// are in canonical value order: bytewise for phases and revisions, signed
+// numeric for incarnations and counts. A member absent from every group of
+// an optional column takes that column's documented default.
+type InstanceStatusColumns struct {
+	// Members is the index set of every Instance that has a row.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	Members string `json:"members"`
+
+	// RowOrder is the dense row order when it is not the ascending Members
+	// order: every member exactly once, in the order the DenseV1 list would
+	// carry. Absent means ascending Members order.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Minimum=0
+	// +listType=atomic
+	RowOrder []int32 `json:"rowOrder,omitempty"`
+
+	// Phases groups Instances by lifecycle phase. Every member appears in
+	// exactly one group; there is no default phase.
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	Phases []InstanceStatusPhaseGroup `json:"phases"`
+
+	// RunningRevisions groups Instances by nonempty running revision. A
+	// member absent from every group has an empty running revision.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	RunningRevisions []InstanceStatusRevisionGroup `json:"runningRevisions,omitempty"`
+
+	// TargetRevisions groups Instances by nonempty target revision. A
+	// member absent from every group has an empty target revision.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	TargetRevisions []InstanceStatusRevisionGroup `json:"targetRevisions,omitempty"`
+
+	// Incarnations groups Instances by nonzero incarnation. A member absent
+	// from every group has incarnation 0.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	Incarnations []InstanceStatusIncarnationGroup `json:"incarnations,omitempty"`
+
+	// PodCounts groups Instances by positive podCount. A member absent
+	// from every group has podCount 0.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	PodCounts []InstanceStatusCountGroup `json:"podCounts,omitempty"`
+
+	// ServingPodCounts groups Instances by positive servingPodCount. A
+	// member absent from every group has servingPodCount 0.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	ServingPodCounts []InstanceStatusCountGroup `json:"servingPodCounts,omitempty"`
+
+	// AvailablePodCounts groups Instances by positive availablePodCount. A
+	// member absent from every group has availablePodCount 0.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	AvailablePodCounts []InstanceStatusCountGroup `json:"availablePodCounts,omitempty"`
+
+	// Admitted is the index set of Instances whose admitted is true. Absent
+	// means no Instance is admitted.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	Admitted *string `json:"admitted,omitempty"`
+
+	// ActiveOrdinalOne is the index set of Instances whose activeOrdinal is
+	// 1. Absent means every activeOrdinal is 0.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	ActiveOrdinalOne *string `json:"activeOrdinalOne,omitempty"`
+
+	// Entries carries the per-Instance records that are not grouped:
+	// conditions, readySince, operation, and lastFailure. At most one entry
+	// per member, in ascending index order, each carrying at least one of
+	// those records. A member without an entry has none of them.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=atomic
+	Entries []InstanceStatusEntry `json:"entries,omitempty"`
+}
+
+// InstanceStatusPhaseGroup is one phase and the Instances that carry it.
+type InstanceStatusPhaseGroup struct {
+	// Value is the shared lifecycle phase.
+	Value OMENativeInstancePhase `json:"value"`
+
+	// Indexes is the canonical index set of the Instances with this value.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	Indexes string `json:"indexes"`
+}
+
+// InstanceStatusRevisionGroup is one full ControllerRevision name and the
+// Instances that carry it.
+type InstanceStatusRevisionGroup struct {
+	// Value is the shared revision name; the empty revision is never grouped.
+	// +kubebuilder:validation:MinLength=1
+	Value string `json:"value"`
+
+	// Indexes is the canonical index set of the Instances with this value.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	Indexes string `json:"indexes"`
+}
+
+// InstanceStatusIncarnationGroup is one incarnation and the Instances that
+// carry it. The value keeps the int64 domain of the dense row, including
+// negative values; zero is the absent default and is never grouped.
+// +kubebuilder:validation:XValidation:rule="self.value != 0",message="an incarnation group value must be nonzero; zero is the absent default"
+type InstanceStatusIncarnationGroup struct {
+	// Value is the shared nonzero incarnation.
+	Value int64 `json:"value"`
+
+	// Indexes is the canonical index set of the Instances with this value.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	Indexes string `json:"indexes"`
+}
+
+// InstanceStatusCountGroup is one positive pod count and the Instances that
+// carry it. Zero is the absent default and is never grouped.
+type InstanceStatusCountGroup struct {
+	// Value is the shared positive count.
+	// +kubebuilder:validation:Minimum=1
+	Value int32 `json:"value"`
+
+	// Indexes is the canonical index set of the Instances with this value.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	Indexes string `json:"indexes"`
+}
+
+// InstanceStatusEntry carries the records of one Instance that are not
+// grouped into columns. Each record is the dense row's value, unchanged.
+// +kubebuilder:validation:XValidation:rule="has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure)",message="an entry must carry at least one of conditions, readySince, operation, or lastFailure"
+type InstanceStatusEntry struct {
+	// Index is the Instance this entry belongs to; it is a member.
+	// +kubebuilder:validation:Minimum=0
+	Index int32 `json:"index"`
+
+	// Conditions is the Instance's conditions.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ReadySince is the Instance's readySince.
+	// +optional
+	ReadySince *metav1.Time `json:"readySince,omitempty"`
+
+	// Operation is the Instance's in-flight operation record.
+	// +optional
+	Operation *InstanceOperation `json:"operation,omitempty"`
+
+	// LastFailure is the Instance's preserved failure diagnostics.
+	// +optional
+	LastFailure *InstanceTermination `json:"lastFailure,omitempty"`
 }
 
 // RetryBlockState is the retry authority state for one target revision.

@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 // ComponentIR returns the authoritative InferenceReplica for one Component of
@@ -52,6 +53,38 @@ func IRPartition(ir *v1beta1.InferenceReplica) int32 {
 // behavior as consumers that also need desired spec state.
 func ComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
 	ir, err := ComponentIR(ctx, reads, namespace, isvcName, c)
+	if err != nil || ir == nil {
+		return nil, err
+	}
+	return &ir.Status, nil
+}
+
+// DecodedComponentIR is the decoded-accessor form of ComponentIR for callers
+// that inspect per-Instance rows: the object is returned in the dense
+// logical shape, decoded with the Decoder carried by reads, together with
+// the encoding it was stored in. A malformed or unbounded ColumnarV2 payload
+// is an error, never an empty row set. ComponentIR and ComponentIRStatus stay
+// raw for callers that read only spec, metadata, or top-level status.
+func DecodedComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
+	if reads == nil {
+		return nil, "", nil
+	}
+	ir := &v1beta1.InferenceReplica{}
+	key := types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)}
+	encoding, err := irstatus.GetDecoded(ctx, reads, key, ir)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("get InferenceReplica %s/%s: %w", key.Namespace, key.Name, err)
+	}
+	return ir, encoding, nil
+}
+
+// DecodedComponentIRStatus returns the decoded status of one Component's
+// InferenceReplica, or nil when the IR does not exist yet.
+func DecodedComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
+	ir, _, err := DecodedComponentIR(ctx, reads, namespace, isvcName, c)
 	if err != nil || ir == nil {
 		return nil, err
 	}

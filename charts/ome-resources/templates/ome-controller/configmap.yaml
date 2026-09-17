@@ -68,6 +68,26 @@ data:
       "defaultRatioTolerancePercent": {{ .Values.ome.controller.coordination.defaultRatioTolerancePercent }}{{- end }}
     }
 
+  {{- $omenativeStatus := .Values.ome.controller.omenativeStatus | default dict }}
+  {{- $encoding := toString ($omenativeStatus.instanceStatusEncoding | default "") }}
+  {{- if not (has $encoding (list "DenseV1" "ColumnarV2")) }}
+  {{- fail (printf "ome.controller.omenativeStatus.instanceStatusEncoding must be DenseV1 or ColumnarV2, got %q" $encoding) }}
+  {{- end }}
+  {{- $hasBound := hasKey $omenativeStatus "maxDecodedInstances" }}
+  {{- if $hasBound }}
+  {{- $bound := $omenativeStatus.maxDecodedInstances }}
+  {{- if or (not (or (kindIs "float64" $bound) (kindIs "int64" $bound) (kindIs "int" $bound))) (ne (toString $bound) (toString (int64 $bound))) (le (int64 $bound) 0) }}
+  {{- fail (printf "ome.controller.omenativeStatus.maxDecodedInstances must be a positive integer, got %v" $bound) }}
+  {{- end }}
+  {{- else if eq $encoding "ColumnarV2" }}
+  {{- fail "ome.controller.omenativeStatus.maxDecodedInstances is required when instanceStatusEncoding is ColumnarV2" }}
+  {{- end }}
+  omenativeStatus: |-
+    {
+      "instanceStatusEncoding": "{{ $encoding }}"{{- if $hasBound }},
+      "maxDecodedInstances": {{ int64 $omenativeStatus.maxDecodedInstances }}{{- end }}
+    }
+
   {{- with .Values.ome.controller.lifecycle }}
   {{- $fields := list }}
   {{- if hasKey . "scaleUpPodBatchSize" }}

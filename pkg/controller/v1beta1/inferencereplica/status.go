@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	isvcstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -149,7 +150,8 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 	var nextAvailableIn time.Duration
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &v1beta1.InferenceReplica{}
-		if err := r.APIReader.Get(ctx, key, fresh); err != nil {
+		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				// IR deleted under us; nothing to aggregate into.
 				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultNotFound)
@@ -220,7 +222,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 			fresh.Status.UpdatedReadyReplicas = counters.UpdatedReadyReplicas
 			fresh.Status.UpdateRevision = target.Name
 		}
-		clearPodDerivedInstanceObservations(fresh)
+		irstatus.ClearPodDerivedObservations(fresh.Status.InstanceStatuses)
 
 		fresh.Status.ObservedGeneration = fresh.Generation
 		fresh.Status.LabelSelector = irLabelSelectorString(fresh.Spec.ParentRef.Name, fresh.Spec.Component)
@@ -255,7 +257,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 			return nil
 		}
 
-		if err := updateInferenceReplicaStatus(ctx, r.Client, fresh); err != nil {
+		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
 				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultNotFound)
 				ownerUnavailable = true
@@ -379,7 +381,7 @@ func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) worklo
 		Key:                     buildKey(ir),
 		ObservedState:           observedFromIR(ir),
 		Clock:                   r.Clock,
-		MutateInstance:          buildMutateInstance(r.Client, r.APIReader, ir),
+		MutateInstance:          buildMutateInstance(r.statusWriter(), r.liveReader(), ir),
 		RemoveInstance:          func(_ context.Context, _ int32) (bool, error) { return false, nil },
 		WriteAggregateCondition: func(_ context.Context, _ metav1.Condition) error { return nil },
 		WarnInstanceFailed:      func(_ int32, _, _ string) {},

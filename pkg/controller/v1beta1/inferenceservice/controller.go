@@ -61,6 +61,7 @@ import (
 	traffic "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
 	isvcstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
@@ -138,6 +139,11 @@ type InferenceServiceReconciler struct {
 	// be a correctness problem (revision bookkeeping, audit ledger,
 	// EndpointSlice drain checks).
 	APIReader client.Reader
+	// InstanceStatusDecoder decodes the per-Instance representation of the
+	// InferenceReplica statuses the cross-Component coordination reads, under
+	// the operator-configured ColumnarV2 row bound. The zero value carries no
+	// bound: DenseV1 decodes unchanged and any ColumnarV2 object fails closed.
+	InstanceStatusDecoder irstatus.Decoder
 	// Expectations is the OMENative create/delete bookkeeping cache.
 	// SetupWithManager initializes it (if nil) and registers the Pod
 	// event handler against the same instance the component dispatch
@@ -824,9 +830,11 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return reconcile.Result{}, errors.Wrapf(err, "fails to load coordination config")
 	}
 	if _, err := coordination.Reconcile(ctx, coordination.ReconcileInputs{
-		ISVC:                         isvc,
-		Client:                       r.Client,
-		Reader:                       r.APIReader,
+		ISVC:   isvc,
+		Client: r.Client,
+		// The coordination gates decode per-Instance rows, so the live reader
+		// carries the configured row decoder.
+		Reader:                       irstatus.NewReader(r.APIReader, r.InstanceStatusDecoder),
 		Recorder:                     r.Recorder,
 		TrafficWeightDeadbandPercent: coordinationConfig.TrafficWeightDeadbandPercent,
 		DefaultRatioTolerancePercent: coordinationConfig.DefaultRatioTolerancePercent,

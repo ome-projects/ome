@@ -7,6 +7,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 // componentIRStatuses fetches the authoritative InferenceReplica status for
@@ -20,13 +21,22 @@ import (
 func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService) (map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, error) {
 	out := make(map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus)
 	for _, c := range declaredComponents(isvc) {
-		st, err := irprojector.ComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, c)
+		// The predicates below inspect per-Instance rows, so the status is
+		// read through the decoded accessor; a payload that cannot be decoded
+		// is a read error and holds the placement like any other read failure.
+		st, err := irprojector.DecodedComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, c)
 		if err != nil {
 			return nil, err
 		}
 		out[c] = st
 	}
 	return out, nil
+}
+
+// instanceStatusReader pairs a member-cluster reader with this controller's
+// row decoder so componentIRStatuses decodes under the configured bound.
+func (r *Reconciler) instanceStatusReader(reads client.Reader) client.Reader {
+	return irstatus.NewReader(reads, r.InstanceStatusDecoder)
 }
 
 // AnyInstanceAdmitted reports whether any component of the (derived) ISVC has at

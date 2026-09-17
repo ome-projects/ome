@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 )
 
@@ -89,6 +90,11 @@ type Reconciler struct {
 	// for the whole backoff. Required: SetupWithManager defaults it to
 	// mgr.GetAPIReader() and rejects a reconciler still missing it.
 	APIReader client.Reader
+	// InstanceStatusDecoder decodes the per-Instance representation of the
+	// member-cluster InferenceReplica statuses this controller inspects, under
+	// the operator-configured ColumnarV2 row bound. The zero value carries no
+	// bound: DenseV1 decodes unchanged and any ColumnarV2 object fails closed.
+	InstanceStatusDecoder irstatus.Decoder
 	// Requeue is the status-refresh poll cadence; defaults to DefaultPlacementRequeue.
 	Requeue time.Duration
 	// LocalQueue is the Kueue LocalQueue a derived workload's pods join when the
@@ -360,7 +366,7 @@ func (r *Reconciler) reconcileSingle(ctx context.Context, isvc *v1beta1.Inferenc
 			}
 			// Read the authoritative per-component IR status from the winner
 			// cluster (source of truth; the derived ISVC no longer mirrors it).
-			statuses, err := componentIRStatuses(ctx, cl, derived)
+			statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 			if err != nil {
 				// A transient IR read error must not be misread as terminal
 				// failure; hold and retry next poll.
@@ -582,7 +588,7 @@ func (r *Reconciler) reconcileAll(ctx context.Context, isvc *v1beta1.InferenceSe
 			carryForward(c)
 			continue
 		}
-		statuses, err := componentIRStatuses(ctx, cl, derived)
+		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 		if err != nil {
 			r.Log.Error(err, "all: reading IR statuses failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
 			unobserved = true
@@ -703,7 +709,7 @@ func (r *Reconciler) reconcileSplit(ctx context.Context, isvc *v1beta1.Inference
 			continue // no derived yet
 		}
 		o.present = true
-		statuses, err := componentIRStatuses(ctx, cl, derived)
+		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 		if err != nil {
 			r.Log.Error(err, "split: reading IR statuses failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
 			markUnreadable(c, o)
@@ -1028,7 +1034,7 @@ func (r *Reconciler) findWinner(ctx context.Context, isvc *v1beta1.InferenceServ
 		}
 		// Read the authoritative per-component IR status from candidate cluster
 		// c (source of truth; the derived ISVC no longer mirrors it).
-		statuses, err := componentIRStatuses(ctx, cl, derived)
+		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 		if err != nil {
 			r.Log.Error(err, "race: reading IR statuses failed; skipping candidate", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
 			continue

@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
@@ -97,7 +98,7 @@ func TestInferenceReplicaStatusSizeCompactionDropsExactlyThreeFields(t *testing.
 	original := observed.DeepCopy()
 
 	persisted := observed.DeepCopy()
-	clearPodDerivedInstanceObservations(persisted)
+	irstatus.ClearPodDerivedObservations(persisted.Status.InstanceStatuses)
 	want := observed.DeepCopy()
 	for i := range want.Status.InstanceStatuses {
 		want.Status.InstanceStatuses[i].ReadyPodCount = 0
@@ -165,7 +166,7 @@ func BenchmarkInferenceReplicaStatusNormalizedJSON(b *testing.B) {
 	for _, fixture := range fixtures {
 		observed := newStatusSizeIR(fixture, 2000)
 		persisted := observed.DeepCopy()
-		clearPodDerivedInstanceObservations(persisted)
+		irstatus.ClearPodDerivedObservations(persisted.Status.InstanceStatuses)
 		for _, state := range []struct {
 			name   string
 			object *v1beta1.InferenceReplica
@@ -215,7 +216,7 @@ func measureStatusSize(t *testing.T, fixture statusSizeFixture, instances int32)
 	t.Helper()
 	observed := newStatusSizeIR(fixture, instances)
 	persisted := observed.DeepCopy()
-	clearPodDerivedInstanceObservations(persisted)
+	irstatus.ClearPodDerivedObservations(persisted.Status.InstanceStatuses)
 	if len(observed.ManagedFields) != 0 || len(persisted.ManagedFields) != 0 {
 		t.Fatal("normalized fixtures must omit API-server-generated managedFields")
 	}

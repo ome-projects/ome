@@ -230,6 +230,56 @@ func (s indexSet) IsSubsetOf(other indexSet) bool {
 	return true
 }
 
+// prefixOffsets returns, per interval, how many indices precede it in the
+// ascending enumeration of s; rankOf uses it to map an index to a position.
+func (s indexSet) prefixOffsets() []uint64 {
+	offsets := make([]uint64, len(s.intervals))
+	var total uint64
+	for i, interval := range s.intervals {
+		offsets[i] = total
+		total += uint64(interval.last) - uint64(interval.first) + 1
+	}
+	return offsets
+}
+
+// rankOf returns the zero-based position of index in the ascending
+// enumeration of s, or false when index is not a member.
+func (s indexSet) rankOf(index int32, offsets []uint64) (uint64, bool) {
+	if index < 0 {
+		return 0, false
+	}
+	position := sort.Search(len(s.intervals), func(i int) bool {
+		return s.intervals[i].last >= index
+	})
+	if position == len(s.intervals) || s.intervals[position].first > index {
+		return 0, false
+	}
+	return offsets[position] + uint64(index-s.intervals[position].first), true
+}
+
+// disjointIndexSets reports whether no index belongs to two of the sets. It
+// sorts the pooled intervals once instead of comparing sets pairwise.
+func disjointIndexSets(sets []indexSet) bool {
+	if len(sets) < 2 {
+		return true
+	}
+	total := 0
+	for _, set := range sets {
+		total += len(set.intervals)
+	}
+	pooled := make([]indexInterval, 0, total)
+	for _, set := range sets {
+		pooled = append(pooled, set.intervals...)
+	}
+	sort.Slice(pooled, func(i, j int) bool { return pooled[i].first < pooled[j].first })
+	for i := 1; i < len(pooled); i++ {
+		if pooled[i].first <= pooled[i-1].last {
+			return false
+		}
+	}
+	return true
+}
+
 func (s indexSet) Values(maxCardinality uint64) ([]int32, error) {
 	if maxCardinality == 0 || s.cardinality > maxCardinality {
 		return nil, newCodecError(ErrorReasonCardinalityLimit)

@@ -49,7 +49,7 @@ func TestPromoteCurrentRevision_PartitionedRolloutDoesNotPromote(t *testing.T) {
 	}
 
 	r, _ := newReconciler(t, ir)
-	promote := buildPromoteCurrentRevision(r.Client, r.Client, ir)
+	promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
 	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
 
 	// In-memory snapshot untouched.
@@ -76,7 +76,7 @@ func TestPromoteCurrentRevision_FullConvergePromotes(t *testing.T) {
 	}
 
 	r, _ := newReconciler(t, ir)
-	promote := buildPromoteCurrentRevision(r.Client, r.Client, ir)
+	promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
 	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
 
 	g.Expect(ir.Status.CurrentRevision).To(gomega.Equal(promoteTargetRev),
@@ -101,7 +101,7 @@ func TestPromoteCurrentRevision_AlreadyEqualNoWrite(t *testing.T) {
 	r, _ := newReconciler(t, ir)
 	before := getFreshIR(t, r, ir).ResourceVersion
 
-	promote := buildPromoteCurrentRevision(r.Client, r.Client, ir)
+	promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
 	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
 
 	after := getFreshIR(t, r, ir).ResourceVersion
@@ -126,7 +126,7 @@ func TestPromoteCurrentRevision_UsesAuthoritativeStatusAfterLifecycleWrite(t *te
 	staleReader, _ := newCountingStatusClient(t, 0, stale.DeepCopy())
 	writer := &staleReadingClient{Client: live, reader: staleReader}
 
-	promote := buildPromoteCurrentRevision(writer, live, stale)
+	promote := buildPromoteCurrentRevision(testStatusWriter(writer), live, stale)
 	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
 	g.Expect(*writes).To(gomega.Equal(0),
 		"a stale Ready cache view must not promote across a committed lifecycle transition")
@@ -151,7 +151,7 @@ func TestPromoteCurrentRevision_SameNameReplacementAborts(t *testing.T) {
 	}}
 	live, writes := newCountingStatusClient(t, 0, replacement)
 
-	promote := buildPromoteCurrentRevision(live, live, stale)
+	promote := buildPromoteCurrentRevision(testStatusWriter(live), live, stale)
 	err := promote(context.Background(), promoteTargetRev)
 	g.Expect(errors.Is(err, workload.ErrStatusOwnerGone)).To(gomega.BeTrue())
 	g.Expect(*writes).To(gomega.Equal(0))
@@ -175,7 +175,7 @@ func TestPromoteCurrentRevision_GenerationChangeAborts(t *testing.T) {
 	liveObject.Generation++
 	live, writes := newCountingStatusClient(t, 0, liveObject)
 
-	promote := buildPromoteCurrentRevision(live, live, stale)
+	promote := buildPromoteCurrentRevision(testStatusWriter(live), live, stale)
 	err := promote(context.Background(), promoteTargetRev)
 	g.Expect(errors.Is(err, workload.ErrStatusMutationPrecondition)).To(gomega.BeTrue())
 	g.Expect(*writes).To(gomega.Equal(0))

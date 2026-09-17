@@ -34,7 +34,7 @@ func TestBuildMutateRetryBlock_PersistCreatesBlock(t *testing.T) {
 	ir := baselineIR("llama-engine", "prod", 1)
 	r, c := newReconciler(t, ir)
 
-	mutate := buildMutateRetryBlock(r.Client, r.Client, ir)
+	mutate := buildMutateRetryBlock(r.statusWriter(), r.Client, ir)
 	g.Expect(mutate(context.Background(), "rev-a", func(b *workload.RetryBlock) workload.RetryBlockDisposition {
 		g.Expect(b.TargetRevision).To(gomega.Equal("rev-a"),
 			"an absent block must be handed to the callback as a zero block with TargetRevision set")
@@ -78,7 +78,7 @@ func TestBuildMutateRetryBlock_RemoveDeletes(t *testing.T) {
 	r, c := newReconciler(t, ir)
 	key := types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}
 
-	mutate := buildMutateRetryBlock(r.Client, r.Client, ir)
+	mutate := buildMutateRetryBlock(r.statusWriter(), r.Client, ir)
 	g.Expect(mutate(context.Background(), "rev-a", func(_ *workload.RetryBlock) workload.RetryBlockDisposition {
 		return workload.RetryBlockRemove
 	})).To(gomega.Succeed())
@@ -116,7 +116,7 @@ func TestBuildMutateRetryBlock_UnchangedWritesNothing(t *testing.T) {
 	before := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), key, before)).To(gomega.Succeed())
 
-	mutate := buildMutateRetryBlock(r.Client, r.Client, ir)
+	mutate := buildMutateRetryBlock(r.statusWriter(), r.Client, ir)
 	g.Expect(mutate(context.Background(), "rev-a", func(b *workload.RetryBlock) workload.RetryBlockDisposition {
 		// Even a callback that scribbles on the block writes nothing when
 		// it reports Unchanged.
@@ -142,7 +142,7 @@ func TestBuildMutateRetryBlock_SameNameReplacementAborts(t *testing.T) {
 	r, c := newReconciler(t, replacement)
 	called := false
 
-	mutate := buildMutateRetryBlock(r.Client, r.Client, original)
+	mutate := buildMutateRetryBlock(r.statusWriter(), r.Client, original)
 	err := mutate(context.Background(), "rev-a", func(*workload.RetryBlock) workload.RetryBlockDisposition {
 		called = true
 		return workload.RetryBlockRemove
@@ -179,7 +179,7 @@ func TestBuildMutateRetryBlock_RetentionPrunesOldest(t *testing.T) {
 	// (> cap 3): the oldest historical — rev-old-nil, nil LastFailureAt —
 	// must be pruned; rev-current must survive despite being older than
 	// everything else.
-	mutate := buildMutateRetryBlock(r.Client, r.Client, ir)
+	mutate := buildMutateRetryBlock(r.statusWriter(), r.Client, ir)
 	g.Expect(mutate(context.Background(), "rev-old-3", func(b *workload.RetryBlock) workload.RetryBlockDisposition {
 		b.State = workload.RetryBlockHeld
 		b.AttemptsStarted = 3

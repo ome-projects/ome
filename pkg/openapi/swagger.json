@@ -3519,7 +3519,7 @@
       }
     },
     "v1beta1.InferenceReplicaStatus": {
-      "description": "InferenceReplicaStatus is the observed state of one InferenceReplica. The InferenceReplica controller is the sole writer. Fields mirror the LifecycleStatus shape so the ISVC's aggregated per-Component status is a verbatim projection of this block.",
+      "description": "InferenceReplicaStatus is the observed state of one InferenceReplica. The InferenceReplica controller is the sole writer. Fields mirror the LifecycleStatus shape so the ISVC's aggregated per-Component status is a verbatim projection of this block.\n\nThe per-Instance rows have exactly one representation on a committed object. Without instanceStatusEncoding the rows are the DenseV1 list in instanceStatuses; with instanceStatusEncoding: ColumnarV2 the same rows live in instanceStatusColumns and instanceStatuses is absent. The rules below reject every mixed spelling of that union.",
       "type": "object",
       "properties": {
         "availableReplicas": {
@@ -3552,8 +3552,16 @@
           "description": "CurrentRevision names the ControllerRevision currently serving traffic. Set by the InferenceReplica controller.",
           "type": "string"
         },
+        "instanceStatusColumns": {
+          "description": "InstanceStatusColumns is the ColumnarV2 representation of the per-Instance rows. Present exactly when instanceStatusEncoding is ColumnarV2; it decodes to the same rows, in the same order, that instanceStatuses would carry.",
+          "$ref": "#/definitions/v1beta1.InstanceStatusColumns"
+        },
+        "instanceStatusEncoding": {
+          "description": "InstanceStatusEncoding names the representation that carries the per-Instance rows. Absent means DenseV1 (instanceStatuses). The only accepted value is ColumnarV2, which requires instanceStatusColumns and forbids instanceStatuses.",
+          "type": "string"
+        },
         "instanceStatuses": {
-          "description": "InstanceStatuses is the per-Instance status, one row per Instance.",
+          "description": "InstanceStatuses is the DenseV1 representation of the per-Instance status, one row per Instance. Absent when instanceStatusEncoding is ColumnarV2, in which case instanceStatusColumns carries the same rows.",
           "type": "array",
           "items": {
             "default": {},
@@ -3954,6 +3962,232 @@
         "waiting": {
           "description": "Waiting is a short token naming an EXTERNAL condition currently holding the operation back — e.g. \"QuotaExceeded\" when admission refuses the operation's pods for lack of quota. Distinct from Reason, which names why the operation exists: Waiting comes and goes while the operation runs, so overloading Reason would erase the operation's cause. Empty means nothing external is blocking. A token only: the blocking authority's own message is volatile (an exceeded-quota message moves as other workloads come and go) and belongs in the Event, not in status.",
           "type": "string"
+        }
+      }
+    },
+    "v1beta1.InstanceStatusColumns": {
+      "description": "InstanceStatusColumns is the ColumnarV2 representation of the per-Instance rows. A value shared by many Instances is stored once against the index set of the Instances that carry it; records that are rare or unique per Instance stay keyed by index in entries.\n\nAn index set is a string of comma-separated decimal terms, each a single index or a closed \"first-last\" range, for example \"0-8,10-114,116\". The canonical form is the only accepted one: terms are strictly ascending, disjoint, and nonadjacent (adjacent terms are merged), a range has first \u003c last, indices are nonnegative int32 values without leading zeros, and there is no whitespace, sign, empty term, or trailing comma.\n\nMembers is the complete row set; every other index set is a subset of it. Within one column the group index sets are pairwise disjoint and the groups are in canonical value order: bytewise for phases and revisions, signed numeric for incarnations and counts. A member absent from every group of an optional column takes that column's documented default.",
+      "type": "object",
+      "required": [
+        "members",
+        "phases"
+      ],
+      "properties": {
+        "activeOrdinalOne": {
+          "description": "ActiveOrdinalOne is the index set of Instances whose activeOrdinal is 1. Absent means every activeOrdinal is 0.",
+          "type": "string"
+        },
+        "admitted": {
+          "description": "Admitted is the index set of Instances whose admitted is true. Absent means no Instance is admitted.",
+          "type": "string"
+        },
+        "availablePodCounts": {
+          "description": "AvailablePodCounts groups Instances by positive availablePodCount. A member absent from every group has availablePodCount 0.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusCountGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "entries": {
+          "description": "Entries carries the per-Instance records that are not grouped: conditions, readySince, operation, and lastFailure. At most one entry per member, in ascending index order, each carrying at least one of those records. A member without an entry has none of them.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusEntry"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "incarnations": {
+          "description": "Incarnations groups Instances by nonzero incarnation. A member absent from every group has incarnation 0.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusIncarnationGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "members": {
+          "description": "Members is the index set of every Instance that has a row.",
+          "type": "string",
+          "default": ""
+        },
+        "phases": {
+          "description": "Phases groups Instances by lifecycle phase. Every member appears in exactly one group; there is no default phase.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusPhaseGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "podCounts": {
+          "description": "PodCounts groups Instances by positive podCount. A member absent from every group has podCount 0.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusCountGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "rowOrder": {
+          "description": "RowOrder is the dense row order when it is not the ascending Members order: every member exactly once, in the order the DenseV1 list would carry. Absent means ascending Members order.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "runningRevisions": {
+          "description": "RunningRevisions groups Instances by nonempty running revision. A member absent from every group has an empty running revision.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusRevisionGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "servingPodCounts": {
+          "description": "ServingPodCounts groups Instances by positive servingPodCount. A member absent from every group has servingPodCount 0.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusCountGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "targetRevisions": {
+          "description": "TargetRevisions groups Instances by nonempty target revision. A member absent from every group has an empty target revision.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.InstanceStatusRevisionGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        }
+      }
+    },
+    "v1beta1.InstanceStatusCountGroup": {
+      "description": "InstanceStatusCountGroup is one positive pod count and the Instances that carry it. Zero is the absent default and is never grouped.",
+      "type": "object",
+      "required": [
+        "value",
+        "indexes"
+      ],
+      "properties": {
+        "indexes": {
+          "description": "Indexes is the canonical index set of the Instances with this value.",
+          "type": "string",
+          "default": ""
+        },
+        "value": {
+          "description": "Value is the shared positive count.",
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        }
+      }
+    },
+    "v1beta1.InstanceStatusEntry": {
+      "description": "InstanceStatusEntry carries the records of one Instance that are not grouped into columns. Each record is the dense row's value, unchanged.",
+      "type": "object",
+      "required": [
+        "index"
+      ],
+      "properties": {
+        "conditions": {
+          "description": "Conditions is the Instance's conditions.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1.Condition"
+          },
+          "x-kubernetes-list-map-keys": [
+            "type"
+          ],
+          "x-kubernetes-list-type": "map"
+        },
+        "index": {
+          "description": "Index is the Instance this entry belongs to; it is a member.",
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "lastFailure": {
+          "description": "LastFailure is the Instance's preserved failure diagnostics.",
+          "$ref": "#/definitions/v1beta1.InstanceTermination"
+        },
+        "operation": {
+          "description": "Operation is the Instance's in-flight operation record.",
+          "$ref": "#/definitions/v1beta1.InstanceOperation"
+        },
+        "readySince": {
+          "description": "ReadySince is the Instance's readySince.",
+          "$ref": "#/definitions/v1.Time"
+        }
+      }
+    },
+    "v1beta1.InstanceStatusIncarnationGroup": {
+      "description": "InstanceStatusIncarnationGroup is one incarnation and the Instances that carry it. The value keeps the int64 domain of the dense row, including negative values; zero is the absent default and is never grouped.",
+      "type": "object",
+      "required": [
+        "value",
+        "indexes"
+      ],
+      "properties": {
+        "indexes": {
+          "description": "Indexes is the canonical index set of the Instances with this value.",
+          "type": "string",
+          "default": ""
+        },
+        "value": {
+          "description": "Value is the shared nonzero incarnation.",
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        }
+      }
+    },
+    "v1beta1.InstanceStatusPhaseGroup": {
+      "description": "InstanceStatusPhaseGroup is one phase and the Instances that carry it.",
+      "type": "object",
+      "required": [
+        "value",
+        "indexes"
+      ],
+      "properties": {
+        "indexes": {
+          "description": "Indexes is the canonical index set of the Instances with this value.",
+          "type": "string",
+          "default": ""
+        },
+        "value": {
+          "description": "Value is the shared lifecycle phase.",
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "v1beta1.InstanceStatusRevisionGroup": {
+      "description": "InstanceStatusRevisionGroup is one full ControllerRevision name and the Instances that carry it.",
+      "type": "object",
+      "required": [
+        "value",
+        "indexes"
+      ],
+      "properties": {
+        "indexes": {
+          "description": "Indexes is the canonical index set of the Instances with this value.",
+          "type": "string",
+          "default": ""
+        },
+        "value": {
+          "description": "Value is the shared revision name; the empty revision is never grouped.",
+          "type": "string",
+          "default": ""
         }
       }
     },

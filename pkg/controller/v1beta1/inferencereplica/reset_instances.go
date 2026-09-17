@@ -213,7 +213,7 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 	if expectations == nil {
 		expectations = workload.DefaultExpectations
 	}
-	mutateInstance := buildMutateInstance(r.Client, r.APIReader, ir)
+	mutateInstance := buildMutateInstance(r.statusWriter(), r.liveReader(), ir)
 	for _, idx := range candidates {
 		// Live list: a stale cache view of "pods gone" must not skip a
 		// pod the apiserver still holds.

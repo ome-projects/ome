@@ -443,3 +443,76 @@ func TestDeleteISVCSeries(t *testing.T) {
 		t.Errorf("pod-create-to-ready series survived delete with count %v", cnt)
 	}
 }
+
+func TestIRStatusBytesGaugeTracksOneEncodingAndCleansUp(t *testing.T) {
+	dense := prometheus.Labels{"namespace": "team-a", "name": "chat-engine", "component": "engine", "encoding": IRStatusEncodingDenseV1}
+	columnar := prometheus.Labels{"namespace": "team-a", "name": "chat-engine", "component": "engine", "encoding": IRStatusEncodingColumnarV2}
+
+	SetIRStatusBytes("team-a", "chat-engine", "engine", IRStatusEncodingDenseV1, 4096)
+	if got, found := gaugeFor("ome_omenative_ir_status_bytes", dense); !found || got != 4096 {
+		t.Fatalf("dense gauge = %v (found %v), want 4096", got, found)
+	}
+
+	// A switch of representation replaces the series rather than leaving a
+	// stale size under the other encoding.
+	SetIRStatusBytes("team-a", "chat-engine", "engine", IRStatusEncodingColumnarV2, 512)
+	if got, found := gaugeFor("ome_omenative_ir_status_bytes", columnar); !found || got != 512 {
+		t.Fatalf("columnar gauge = %v (found %v), want 512", got, found)
+	}
+	if _, found := gaugeFor("ome_omenative_ir_status_bytes", dense); found {
+		t.Fatal("dense series must be dropped when the IR is written as ColumnarV2")
+	}
+
+	// Invalid samples are dropped without touching the live series.
+	SetIRStatusBytes("team-a", "chat-engine", "engine", "compressed", 1)
+	SetIRStatusBytes("team-a", "chat-engine", "engine", IRStatusEncodingColumnarV2, -1)
+	SetIRStatusBytes("", "chat-engine", "engine", IRStatusEncodingColumnarV2, 7)
+	if got, found := gaugeFor("ome_omenative_ir_status_bytes", columnar); !found || got != 512 {
+		t.Fatalf("columnar gauge after invalid samples = %v (found %v), want 512", got, found)
+	}
+
+	DeleteIRStatusSeries("team-a", "chat-engine", "engine")
+	if _, found := gaugeFor("ome_omenative_ir_status_bytes", columnar); found {
+		t.Fatal("series must be removed when the IR is torn down")
+	}
+}
+
+func TestRecordIRStatusWriteFixedVocabulary(t *testing.T) {
+	for _, result := range []string{IRStatusWriteAttempt, IRStatusWriteCommitted, IRStatusWriteConfirmed, IRStatusWriteConflict, IRStatusWriteRejected, IRStatusWriteError} {
+		labels := prometheus.Labels{"encoding": IRStatusEncodingDenseV1, "result": result}
+		start := counterFor("ome_omenative_ir_status_writes_total", labels)
+		RecordIRStatusWrite(IRStatusEncodingDenseV1, result)
+		if end := counterFor("ome_omenative_ir_status_writes_total", labels); end-start != 1 {
+			t.Errorf("result %q: got delta %v want 1", result, end-start)
+		}
+	}
+	for _, sample := range [][2]string{{"", IRStatusWriteAttempt}, {IRStatusEncodingDenseV1, ""}, {"DenseV1", IRStatusWriteAttempt}, {IRStatusEncodingColumnarV2, "success"}} {
+		labels := prometheus.Labels{"encoding": sample[0], "result": sample[1]}
+		start := counterFor("ome_omenative_ir_status_writes_total", labels)
+		RecordIRStatusWrite(sample[0], sample[1])
+		if end := counterFor("ome_omenative_ir_status_writes_total", labels); end != start {
+			t.Errorf("sample %v: unknown label values must be dropped", sample)
+		}
+	}
+}
+
+func TestRecordIRStatusCodecError(t *testing.T) {
+	labels := prometheus.Labels{"reason": "cardinality_limit"}
+	start := counterFor("ome_omenative_ir_status_codec_errors_total", labels)
+	RecordIRStatusCodecError("cardinality_limit")
+	RecordIRStatusCodecError("")
+	if end := counterFor("ome_omenative_ir_status_codec_errors_total", labels); end-start != 1 {
+		t.Fatalf("got delta %v want 1", end-start)
+	}
+}
+
+func TestRecordIRStatusConversion(t *testing.T) {
+	labels := prometheus.Labels{"from": IRStatusEncodingColumnarV2, "to": IRStatusEncodingDenseV1}
+	start := counterFor("ome_omenative_ir_status_conversions_total", labels)
+	RecordIRStatusConversion(IRStatusEncodingColumnarV2, IRStatusEncodingDenseV1)
+	RecordIRStatusConversion(IRStatusEncodingDenseV1, IRStatusEncodingDenseV1)
+	RecordIRStatusConversion("ColumnarV2", IRStatusEncodingDenseV1)
+	if end := counterFor("ome_omenative_ir_status_conversions_total", labels); end-start != 1 {
+		t.Fatalf("got delta %v want 1", end-start)
+	}
+}

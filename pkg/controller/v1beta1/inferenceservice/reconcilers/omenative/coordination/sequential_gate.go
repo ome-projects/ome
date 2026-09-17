@@ -203,7 +203,7 @@ func observeSequentialComponentsForGate(ctx context.Context, reads client.Reader
 		// fails closed: fabricating a zero-valued observation for the
 		// rolling peer would admit a second Component and break
 		// at-most-one-rolling.
-		ir, err := irprojector.ComponentIR(ctx, reads, isvc.Namespace, isvc.Name, c)
+		ir, _, err := irprojector.DecodedComponentIR(ctx, reads, isvc.Namespace, isvc.Name, c)
 		if err != nil {
 			return nil, err
 		}
