@@ -209,8 +209,14 @@ func (b *projector) projectGroups() {
 	}
 	b.rejectUnexpectedCanaryStatuses(groups)
 
-	if b.canCollapseSequential(groups) {
-		b.projectSequential(groups)
+	if collapsed := b.collapsedSequentialIndices(groups); len(collapsed) > 0 {
+		for index := range groups {
+			if index == collapsed[0] {
+				b.projectSequential(groups, collapsed)
+			} else if groups[index].Canary != nil {
+				b.projectGroup(index, &groups[index])
+			}
+		}
 	} else {
 		for index := range groups {
 			b.projectGroup(index, &groups[index])
@@ -249,40 +255,63 @@ func (b *projector) rejectUnexpectedComponentPhaseResidue() {
 	}
 }
 
-func (b *projector) canCollapseSequential(groups []omev1beta1.RolloutGroup) bool {
-	if len(groups) < 2 {
-		return false
+// The controller drops canary groups before collapsing two or more singleton
+// blue-green groups into coordination status "0". The projected Sequential
+// group uses the first blue-green source index, so it cannot collide with a
+// canary at source index 0 in the report's group-indexed views.
+func (b *projector) collapsedSequentialIndices(groups []omev1beta1.RolloutGroup) []int {
+	if len(groups) < 2 || len(groups) > 3 {
+		return nil
 	}
 	seen := make(map[omev1beta1.ComponentType]struct{}, len(groups))
 	for i := range groups {
-		group := &groups[i]
-		if len(group.Components) != 1 || group.Canary != nil || group.RollingUpdate != nil {
-			return false
+		if len(groups[i].Components) == 0 {
+			return nil
 		}
-		if _, duplicate := seen[group.Components[0]]; duplicate {
-			return false
+		for _, component := range groups[i].Components {
+			if !supportedComponent(component) {
+				return nil
+			}
+			if _, duplicate := seen[component]; duplicate {
+				return nil
+			}
+			seen[component] = struct{}{}
 		}
-		if !supportedComponent(group.Components[0]) {
-			return false
-		}
-		seen[group.Components[0]] = struct{}{}
 	}
-	return true
+	indices := make([]int, 0, len(groups))
+	for i := range groups {
+		group := &groups[i]
+		if group.Canary != nil {
+			if group.BlueGreen != nil || group.RollingUpdate != nil {
+				return nil
+			}
+			continue
+		}
+		if len(group.Components) != 1 || group.RollingUpdate != nil {
+			return nil
+		}
+		indices = append(indices, i)
+	}
+	if len(indices) < 2 {
+		return nil
+	}
+	return indices
 }
 
-func (b *projector) projectSequential(groups []omev1beta1.RolloutGroup) {
+func (b *projector) projectSequential(groups []omev1beta1.RolloutGroup, indices []int) {
+	index := indices[0]
 	projected := reportv1alpha1.RolloutGroupStatus{
-		Index:      0,
+		Index:      index,
 		Strategy:   reportv1alpha1.RolloutStrategySequential,
 		Phase:      reportv1alpha1.RolloutPhaseUnknown,
-		Components: make([]reportv1alpha1.RuntimeComponentType, 0, len(groups)),
+		Components: make([]reportv1alpha1.RuntimeComponentType, 0, len(indices)),
 	}
-	expectedComponents := make([]omev1beta1.ComponentType, 0, len(groups))
-	for i := range groups {
+	expectedComponents := make([]omev1beta1.ComponentType, 0, len(indices))
+	for _, i := range indices {
 		component := groups[i].Components[0]
 		expectedComponents = append(expectedComponents, component)
 		b.declared[component] = struct{}{}
-		b.groupFor[component] = 0
+		b.groupFor[component] = index
 		projected.Components = append(projected.Components, projectComponent(component))
 	}
 	if observed := b.coordinationGroup("0"); observed != nil {
@@ -293,7 +322,7 @@ func (b *projector) projectSequential(groups []omev1beta1.RolloutGroup) {
 			expectedComponents,
 		)
 	} else {
-		b.addIssue(reportv1alpha1.RolloutIssueGroupStatusMissing, ptrInt(0), "")
+		b.addIssue(reportv1alpha1.RolloutIssueGroupStatusMissing, ptrInt(index), "")
 	}
 	b.content.Groups = append(b.content.Groups, projected)
 }
@@ -667,12 +696,19 @@ func (b *projector) projectComponents() {
 }
 
 func (b *projector) groupStrategy(index int) reportv1alpha1.RolloutStrategy {
-	for _, group := range b.content.Groups {
-		if group.Index == index {
-			return group.Strategy
-		}
+	if group := b.projectedGroup(index); group != nil {
+		return group.Strategy
 	}
 	return reportv1alpha1.RolloutStrategyUnknown
+}
+
+func (b *projector) projectedGroup(index int) *reportv1alpha1.RolloutGroupStatus {
+	for i := range b.content.Groups {
+		if b.content.Groups[i].Index == index {
+			return &b.content.Groups[i]
+		}
+	}
+	return nil
 }
 
 func (b *projector) independentLifecyclePhase(
@@ -971,10 +1007,14 @@ func hasIndependentComponent(components []reportv1alpha1.RolloutComponentStatus)
 }
 
 func (b *projector) nonCanaryCoordinationGroup(groupIndex *int) bool {
-	if groupIndex == nil || *groupIndex < 0 || *groupIndex >= len(b.content.Groups) {
+	if groupIndex == nil {
 		return false
 	}
-	switch b.content.Groups[*groupIndex].Strategy {
+	group := b.projectedGroup(*groupIndex)
+	if group == nil {
+		return false
+	}
+	switch group.Strategy {
 	case reportv1alpha1.RolloutStrategyBlueGreen,
 		reportv1alpha1.RolloutStrategyRollingUpdate,
 		reportv1alpha1.RolloutStrategySequential:
@@ -991,7 +1031,11 @@ func (b *projector) nonCanaryComponentPhaseContradicts(
 	if !b.nonCanaryCoordinationGroup(groupIndex) {
 		return false
 	}
-	groupPhase := b.content.Groups[*groupIndex].Phase
+	group := b.projectedGroup(*groupIndex)
+	if group == nil {
+		return false
+	}
+	groupPhase := group.Phase
 	switch groupPhase {
 	case reportv1alpha1.RolloutPhaseIdle,
 		reportv1alpha1.RolloutPhaseAwaitingNextComponent:
@@ -1075,7 +1119,7 @@ func (b *projector) flagUnexpectedCoordination(groups []omev1beta1.RolloutGroup)
 		return
 	}
 	expected := make(map[string]struct{})
-	if b.canCollapseSequential(groups) {
+	if len(b.collapsedSequentialIndices(groups)) > 0 {
 		expected["0"] = struct{}{}
 	} else {
 		for i := range groups {
