@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/instancecollection"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 var (
@@ -51,6 +52,18 @@ func Project(input Input, clock reportv1alpha1.Clock) (reportv1alpha1.InstanceLi
 	}
 	if input.CollectionUnavailable != "" && !validUnavailableReason(input.CollectionUnavailable) {
 		return reportv1alpha1.InstanceListReport{}, ErrCollectionEvidenceInvalid
+	}
+	if len(input.Collection.StatusEncodings) != 0 {
+		if len(input.Collection.StatusEncodings) != len(input.Collection.Items) {
+			return reportv1alpha1.InstanceListReport{}, ErrCollectionEvidenceInvalid
+		}
+		for i, observed := range input.Collection.StatusEncodings {
+			item := &input.Collection.Items[i]
+			if observed.Name != item.Name || observed.Component != item.Spec.Component || observed.UID != item.UID ||
+				(observed.Encoding != irstatus.EncodingDenseV1 && observed.Encoding != irstatus.EncodingColumnarV2) {
+				return reportv1alpha1.InstanceListReport{}, ErrCollectionEvidenceInvalid
+			}
+		}
 	}
 	isvc := input.InferenceService
 	content := reportv1alpha1.InstanceListContent{
@@ -532,6 +545,7 @@ func validSourceIdentity(namespace, name string, uid types.UID) bool {
 func validCollectedReplicaIdentity(ir *omev1beta1.InferenceReplica, isvc *omev1beta1.InferenceService) bool {
 	requireRelationshipLabel := len(validation.IsValidLabelValue(isvc.Name)) == 0
 	if ir == nil || ir.Namespace != isvc.Namespace || !validSourceIdentity(ir.Namespace, ir.Name, ir.UID) ||
+		ir.Status.InstanceStatusEncoding != nil || ir.Status.InstanceStatusColumns != nil ||
 		(requireRelationshipLabel && ir.Labels[constants.InferenceServiceLabel] != isvc.Name) ||
 		ir.Labels[constants.OMEComponentLabel] != string(ir.Spec.Component) ||
 		ir.Spec.ParentRef.Name != isvc.Name || !validComponent(ir.Spec.Component) {

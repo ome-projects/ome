@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/instancecollection"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 func TestCollectRelatedPagesWithExactSelectorAndRejectsUnboundObjects(t *testing.T) {
@@ -299,6 +300,164 @@ func TestCollectRelatedBoundsNestedStatusCopies(t *testing.T) {
 	encoded, marshalErr := json.Marshal(got.Items[0])
 	require.NoError(t, marshalErr)
 	assert.NotContains(t, string(encoded), "SECRET-NESTED-OPAQUE-VALUE")
+}
+
+func TestCollectRelatedColumnarCopiesLogicalRowsAndSelectedDetails(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	source := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	rows := []omev1beta1.OMENativeInstanceStatus{
+		{
+			Index: 2, Phase: omev1beta1.OMENativeInstanceUpdating,
+			Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Healthy"}},
+		},
+		{Index: 0, Phase: omev1beta1.OMENativeInstanceReady},
+	}
+	columns, err := irstatus.EncodeColumns(rows, 2)
+	require.NoError(t, err)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	source.Status.Replicas = 2
+	source.Status.InstanceStatusEncoding = &encoding
+	source.Status.InstanceStatusColumns = columns
+	original := source.DeepCopy()
+	limits := collectionLimits()
+	limits.MaxStatusRows = 2
+	limits.Details = instancecollection.DetailLimits{
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+		MaxConditions: 4, MaxScannedConditions: 4, MaxNodeHints: 4, MaxScannedNodeHints: 4,
+	}
+
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+	}), isvc, limits)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Empty(t, got.StatusRowsTruncated)
+	require.Len(t, got.Items[0].Status.InstanceStatuses, 2)
+	assert.Equal(t, []int32{2, 0}, []int32{
+		got.Items[0].Status.InstanceStatuses[0].Index,
+		got.Items[0].Status.InstanceStatuses[1].Index,
+	})
+	assert.Equal(t, omev1beta1.OMENativeInstanceUpdating, got.Items[0].Status.InstanceStatuses[0].Phase)
+	assert.Equal(t, omev1beta1.OMENativeInstanceReady, got.Items[0].Status.InstanceStatuses[1].Phase)
+	require.Len(t, got.Items[0].Status.InstanceStatuses[0].Conditions, 1)
+	assert.Equal(t, "Ready", got.Items[0].Status.InstanceStatuses[0].Conditions[0].Type)
+	assert.Nil(t, got.Items[0].Status.InstanceStatusEncoding)
+	assert.Nil(t, got.Items[0].Status.InstanceStatusColumns)
+	assert.Equal(t, original, source.DeepCopy(), "collection must not mutate the API object")
+}
+
+func TestCollectRelatedColumnarRejectsMalformedRepresentations(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	rows := []omev1beta1.OMENativeInstanceStatus{{Index: 0, Phase: omev1beta1.OMENativeInstanceReady}}
+	columns, err := irstatus.EncodeColumns(rows, 1)
+	require.NoError(t, err)
+	columnar := omev1beta1.InstanceStatusEncodingColumnarV2
+	unknown := omev1beta1.InstanceStatusEncoding("SECRET-FUTURE-ENCODING")
+	tests := []struct {
+		name   string
+		mutate func(*omev1beta1.InferenceReplica)
+	}{
+		{name: "unknown encoding", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusEncoding = &unknown
+		}},
+		{name: "marked with dense rows", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Status.InstanceStatuses = rows
+		}},
+		{name: "missing columns", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns = nil
+		}},
+		{name: "bad coverage", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Phases = nil
+		}},
+		{name: "group count exceeds members", mutate: func(ir *omev1beta1.InferenceReplica) {
+			ir.Status.InstanceStatusColumns.Phases = append(ir.Status.InstanceStatusColumns.Phases,
+				omev1beta1.InstanceStatusPhaseGroup{Value: omev1beta1.OMENativeInstanceUpdating, Indexes: "0"})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			source := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+			source.Status.Replicas = 1
+			source.Status.InstanceStatusEncoding = &columnar
+			source.Status.InstanceStatusColumns = columns.DeepCopy()
+			test.mutate(&source)
+			limits := collectionLimits()
+			limits.MaxStatusRows = 1
+			got, collectErr := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+				return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+			}), isvc, limits)
+			require.Error(t, collectErr)
+			assert.Equal(t, "instance collection status encoding is invalid", collectErr.Error())
+			assert.Empty(t, got.Items)
+			assert.NotContains(t, collectErr.Error(), "SECRET-FUTURE-ENCODING")
+		})
+	}
+}
+
+func TestCollectRelatedColumnarTruncatesAfterValidatedAggregateBudget(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	engine := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	engine.Status.Replicas = 1
+	engine.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{Index: 0, Phase: omev1beta1.OMENativeInstanceReady}}
+	decoder := relatedReplica(isvc, "chat-decoder", omev1beta1.DecoderComponent)
+	decoder.Status.Replicas = 2
+	columns, err := irstatus.EncodeColumns([]omev1beta1.OMENativeInstanceStatus{
+		{Index: 2, Phase: omev1beta1.OMENativeInstanceReady},
+		{Index: 1, Phase: omev1beta1.OMENativeInstanceReady},
+	}, 2)
+	require.NoError(t, err)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	decoder.Status.InstanceStatusEncoding = &encoding
+	decoder.Status.InstanceStatusColumns = columns
+	limits := collectionLimits()
+	limits.MaxStatusRows = 2
+	collect := func(items []omev1beta1.InferenceReplica) instancecollection.Result {
+		got, collectErr := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: items}, nil
+		}), isvc, limits)
+		require.NoError(t, collectErr)
+		return got
+	}
+
+	got := collect([]omev1beta1.InferenceReplica{decoder, engine})
+	assert.Equal(t, got, collect([]omev1beta1.InferenceReplica{engine, decoder}))
+	require.Len(t, got.Items, 2)
+	require.Len(t, got.Items[0].Status.InstanceStatuses, 1)
+	assert.Empty(t, got.Items[1].Status.InstanceStatuses)
+	assert.Equal(t, []instancecollection.StatusRowsTruncation{{
+		Name: "chat-decoder", Component: omev1beta1.DecoderComponent,
+	}}, got.StatusRowsTruncated)
+}
+
+func TestCollectRelatedColumnarTruncatesDefaultControllerCardinality(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	source := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	source.Status.InstanceStatusEncoding = &encoding
+	source.Status.InstanceStatusColumns = &omev1beta1.InstanceStatusColumns{
+		Members: "0-4999",
+		Phases:  []omev1beta1.InstanceStatusPhaseGroup{{Value: omev1beta1.OMENativeInstanceReady, Indexes: "0-4999"}},
+	}
+	limits := collectionLimits()
+	limits.MaxStatusRows = 1
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+	}), isvc, limits)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	assert.Empty(t, got.Items[0].Status.InstanceStatuses)
+	assert.Equal(t, []instancecollection.StatusRowsTruncation{{Name: source.Name, Component: source.Spec.Component}}, got.StatusRowsTruncated)
 }
 
 func TestCollectRelatedCopiesSelectedLifecycleAndRelevantMigrationsOnly(t *testing.T) {

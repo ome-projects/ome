@@ -36,6 +36,7 @@ import (
 	versioned "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 )
@@ -80,6 +81,58 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, eventRequests)
+}
+
+func TestStatusRendersColumnarReplicaWithEncodingProvenance(t *testing.T) {
+	t.Parallel()
+
+	isvc := commandISVC()
+	ir := commandIR(isvc)
+	columns, err := irstatus.EncodeColumns(ir.Status.InstanceStatuses, 100)
+	require.NoError(t, err)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = columns
+	ir.Status.InstanceStatuses = nil
+	wire, err := json.Marshal(ir)
+	require.NoError(t, err)
+	assert.Contains(t, string(wire), `"instanceStatusEncoding":"ColumnarV2"`)
+	var fromWire omev1beta1.InferenceReplica
+	require.NoError(t, json.Unmarshal(wire, &fromWire))
+
+	out, err := executeStatus(t, factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, &fromWire), Kube: kubefake.NewSimpleClientset(), NS: "prod",
+	}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"phase": "Ready"`)
+	assert.Contains(t, out, `"name": "ColumnarV2"`)
+	assert.NotContains(t, out, `"code": "EncodingUnsupported"`)
+	t.Logf("columnar instance status output:\n%s", out)
+	table, err := executeStatus(t, factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, &fromWire), Kube: kubefake.NewSimpleClientset(), NS: "prod",
+	}, statusCommandDependencies(), "chat", "0", "--component", "engine")
+	require.NoError(t, err)
+	assert.Contains(t, table, "ColumnarV2")
+	t.Logf("columnar instance status table output:\n%s", table)
+}
+
+func TestStatusMalformedColumnarSkipsPodAndEventReads(t *testing.T) {
+	t.Parallel()
+
+	isvc := commandISVC()
+	ir := commandIR(isvc)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = &omev1beta1.InstanceStatusColumns{Members: "SECRET-COLUMN-SET"}
+	ir.Status.InstanceStatuses = nil
+	kube := kubefake.NewSimpleClientset()
+	out, err := executeStatus(t, factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, ir), Kube: kube, NS: "prod",
+	}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"code": "CollectionUnavailable"`)
+	assert.NotContains(t, out, "SECRET-COLUMN-SET")
+	assert.Empty(t, kube.Actions())
 }
 
 func TestStatusValidatesArgumentsComponentIndexAndOutputBeforeFactoryAccess(t *testing.T) {
@@ -586,7 +639,7 @@ func TestStatusHelpDefinesFieldsBoundsAndReadOnlyBehavior(t *testing.T) {
 	for _, want := range []string{
 		"IR status is authoritative", "serving readiness gate", "Event messages are never shown",
 		"POD restarts", "table, wide, json or yaml", "read-only", "--ome-namespace",
-		"ControllerRevision", "migration", "encoding",
+		"ControllerRevision", "migration", "encoding", "DenseV1", "ColumnarV2",
 	} {
 		assert.Contains(t, out.String(), want)
 	}

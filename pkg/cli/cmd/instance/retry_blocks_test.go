@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/retryblockprojection"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 func TestRetryBlocksReadsExactParentAndBoundedRelatedReplicas(t *testing.T) {
@@ -66,6 +67,60 @@ func TestRetryBlocksReadsExactParentAndBoundedRelatedReplicas(t *testing.T) {
 	assert.Equal(t, "chat", value)
 	options := client.Actions()[1].(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
 	assert.Equal(t, int64(2), options.Limit)
+}
+
+func TestRetryBlocksKeepsBlocksWhenColumnarRowsExceedRowBudget(t *testing.T) {
+	t.Parallel()
+
+	isvc := commandISVC()
+	ir := commandIR(isvc)
+	ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, omev1beta1.OMENativeInstanceStatus{
+		Index: 1, Phase: omev1beta1.OMENativeInstanceReady,
+	})
+	columns, err := irstatus.EncodeColumns(ir.Status.InstanceStatuses, 2)
+	require.NoError(t, err)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = columns
+	ir.Status.InstanceStatuses = nil
+	ir.Status.RetryBlocks = []omev1beta1.RetryBlock{{
+		TargetRevision: "chat-engine-aaaaaaaa", State: omev1beta1.RetryBlockHeld,
+		AttemptsStarted: 3, Reason: "image pull failed",
+	}}
+
+	out, err := executeRetryBlocks(t, factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, ir), NS: "prod",
+	}, retryCommandDependencies(), "chat", "--component", "engine")
+	require.NoError(t, err)
+	assert.Contains(t, out, "engine   HELD")
+	assert.NotContains(t, out, "UNAVAILABLE")
+}
+
+func TestRetryBlocksMalformedColumnarCannotClaimReleaseEligible(t *testing.T) {
+	t.Parallel()
+
+	isvc := commandISVC()
+	ir := commandIR(isvc)
+	columns, err := irstatus.EncodeColumns(ir.Status.InstanceStatuses, 1)
+	require.NoError(t, err)
+	columns.Phases = append(columns.Phases, omev1beta1.InstanceStatusPhaseGroup{
+		Value: omev1beta1.OMENativeInstanceUpdating, Indexes: "0",
+	})
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = columns
+	ir.Status.InstanceStatuses = nil
+	ir.Status.RetryBlocks = []omev1beta1.RetryBlock{{
+		TargetRevision: "chat-engine-aaaaaaaa", State: omev1beta1.RetryBlockHeld,
+		AttemptsStarted: 3, Reason: "image pull failed",
+	}}
+
+	out, err := executeRetryBlocks(t, factory.Static{
+		OME: omefake.NewSimpleClientset(isvc, ir), NS: "prod",
+	}, retryCommandDependencies(), "chat", "--component", "engine")
+	require.NoError(t, err)
+	assert.Contains(t, out, "COLL_UNAV")
+	assert.NotContains(t, out, " YES ")
 }
 
 func TestRetryBlocksWritesTypedJSONAndYAML(t *testing.T) {

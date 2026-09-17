@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -254,6 +255,45 @@ func TestProjectDoesNotGuessRemovedInstanceStatusEncoding(t *testing.T) {
 	assert.Contains(t, encoded, `"encoding":{"evidence":"Unavailable","unavailableReason":"UnsupportedAPI"}`)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueEncodingUnsupported)
 	assert.NotContains(t, encoded, "DenseV1")
+}
+
+func TestProjectReportsCollectedStatusEncoding(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		columnar bool
+	}{
+		{name: "DenseV1"},
+		{name: "ColumnarV2", columnar: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			input := statusInput()
+			replica := input.Collection.Items[0]
+			if tc.columnar {
+				columns, err := irstatus.EncodeColumns(replica.Status.InstanceStatuses, 100)
+				require.NoError(t, err)
+				encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+				replica.Status.InstanceStatusEncoding = &encoding
+				replica.Status.InstanceStatusColumns = columns
+				replica.Status.InstanceStatuses = nil
+			}
+			collection, err := instancecollection.CollectRelated(context.Background(), conditionLister{replica}, input.InferenceService, instancecollection.Limits{
+				Paging: paging.Limits{PageSize: 20, MaxItems: 60, MaxPages: 3, RequestTimeout: time.Second}, MaxStatusRows: 100,
+			})
+			require.NoError(t, err)
+			input.Collection = collection
+
+			got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+			require.NoError(t, err)
+			require.NotNil(t, got.Content.Instance)
+			assert.Equal(t, tc.name, got.Content.Encoding.Name)
+			assert.Equal(t, reportv1alpha1.EvidenceReported, got.Content.Encoding.Evidence)
+			assert.Empty(t, got.Content.Encoding.UnavailableReason)
+			assert.NotContains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueEncodingUnsupported)
+		})
+	}
 }
 
 func TestProjectRejectsSelectorBlindWrongNamespaceLabelsIndexAndOwner(t *testing.T) {

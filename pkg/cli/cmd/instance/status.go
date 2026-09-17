@@ -100,9 +100,9 @@ evidence. A RawDeployment component is reported as NotOMENative.
 Effective deployment mode follows the controller's live-runtime or pinned
 ControllerRevision snapshot; --ome-namespace selects the revision namespace.
 The report includes ReadySince, active ordinal, and migrations involving the
-selected source or surge instance. Because the current typed API removed its
-encoding discriminator, encoding provenance is explicitly UnsupportedAPI and
-the command never guesses DenseV1.
+selected source or surge instance. Status encoding provenance is reported as
+DenseV1 or ColumnarV2 when a complete related InferenceReplica was collected.
+It is unavailable when that evidence cannot be established.
 
 POD Ready is the Kubernetes Ready condition. Serving is the controller-owned
 ome.io/serving readiness gate. POD restarts total bounded init and regular

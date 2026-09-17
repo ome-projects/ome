@@ -150,7 +150,6 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		Pods:     []reportv1alpha1.InstanceStatusPod{}, Events: []reportv1alpha1.InstanceStatusEvent{},
 		Issues: []reportv1alpha1.InstanceStatusIssue{},
 	}, reportv1alpha1.ClockFunc(func() time.Time { return list.CollectedAt }))
-	report.Content.Issues = append(report.Content.Issues, reportv1alpha1.InstanceStatusIssue{Code: reportv1alpha1.InstanceStatusIssueEncodingUnsupported, UnavailableReason: reportv1alpha1.UnavailableUnsupportedAPI})
 	if input.DeploymentUnavailable != "" || input.DeploymentMode == "" {
 		report.Content.Deployment.Evidence = reportv1alpha1.EvidenceUnavailable
 	}
@@ -191,6 +190,17 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		}
 		copyListIssues(&report, list, input.Component, component.InferenceReplica, input.Index)
 		return finish(report), nil
+	}
+	if len(input.Collection.StatusEncodings) == len(input.Collection.Items) {
+		for i := range input.Collection.Items {
+			ir := &input.Collection.Items[i]
+			if ir.Name == component.InferenceReplica && ir.Spec.Component == input.Component {
+				report.Content.Encoding = reportv1alpha1.InstanceStatusEncoding{
+					Name: string(input.Collection.StatusEncodings[i].Encoding), Evidence: reportv1alpha1.EvidenceReported,
+				}
+				break
+			}
+		}
 	}
 	report.Content.Summary.Evidence = component.State
 	if component.State == reportv1alpha1.InstanceEvidenceMalformed || component.State == reportv1alpha1.InstanceEvidenceUnavailable {
@@ -883,6 +893,12 @@ func addIssue(report *reportv1alpha1.InstanceStatusReport, code reportv1alpha1.I
 }
 
 func finish(report reportv1alpha1.InstanceStatusReport) reportv1alpha1.InstanceStatusReport {
+	if report.Content.Encoding.Evidence == reportv1alpha1.EvidenceUnavailable &&
+		report.Content.Encoding.UnavailableReason == reportv1alpha1.UnavailableUnsupportedAPI {
+		report.Content.Issues = append(report.Content.Issues, reportv1alpha1.InstanceStatusIssue{
+			Code: reportv1alpha1.InstanceStatusIssueEncodingUnsupported, UnavailableReason: reportv1alpha1.UnavailableUnsupportedAPI,
+		})
+	}
 	if report.Content.Summary.Truncated {
 		report.Warnings = append(report.Warnings, reportv1alpha1.InstanceStatusWarning{Code: reportv1alpha1.WarningTruncated})
 	}

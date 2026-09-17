@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 var commandClock = reportv1alpha1.ClockFunc(func() time.Time {
@@ -69,6 +70,51 @@ func TestListReadsOnlyExactInferenceServiceAndBoundedRelatedReplicas(t *testing.
 	options := list.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
 	assert.Equal(t, constants.InferenceServiceLabel+"=chat", options.LabelSelector)
 	assert.Equal(t, int64(2), options.Limit)
+}
+
+func TestListRendersColumnarReplicaLikeDenseReplica(t *testing.T) {
+	t.Parallel()
+
+	isvc := commandISVC()
+	dense := commandIR(isvc)
+	columnar := *dense.DeepCopy()
+	columns, err := irstatus.EncodeColumns(columnar.Status.InstanceStatuses, 100)
+	require.NoError(t, err)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	columnar.Status.InstanceStatusEncoding = &encoding
+	columnar.Status.InstanceStatusColumns = columns
+	columnar.Status.InstanceStatuses = nil
+	wire, err := json.Marshal(&columnar)
+	require.NoError(t, err)
+	assert.Contains(t, string(wire), `"instanceStatusEncoding":"ColumnarV2"`)
+	var fromWire omev1beta1.InferenceReplica
+	require.NoError(t, json.Unmarshal(wire, &fromWire))
+
+	denseOutput, err := executeList(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, dense), NS: "prod"}, commandDependencies(), "chat")
+	require.NoError(t, err)
+	columnarOutput, err := executeList(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, &fromWire), NS: "prod"}, commandDependencies(), "chat")
+	require.NoError(t, err)
+
+	assert.Equal(t, denseOutput, columnarOutput)
+	assert.Contains(t, columnarOutput, "engine   0/1       Ready")
+	t.Logf("columnar instance list output:\n%s", columnarOutput)
+}
+
+func TestListMalformedColumnarDoesNotLookEmptyOrLeakPayload(t *testing.T) {
+	t.Parallel()
+
+	isvc := commandISVC()
+	ir := commandIR(isvc)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = &omev1beta1.InstanceStatusColumns{Members: "SECRET-COLUMN-SET"}
+	ir.Status.InstanceStatuses = nil
+	out, err := executeList(t, factory.Static{OME: omefake.NewSimpleClientset(isvc, ir), NS: "prod"}, commandDependencies(), "chat", "-o", "json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"code": "CollectionUnavailable"`)
+	assert.Contains(t, out, `"unavailableReason": "Unreadable"`)
+	assert.NotContains(t, out, "SECRET-COLUMN-SET")
+	assert.NotContains(t, out, `"state": "Reported"`)
 }
 
 func TestListWritesTypedJSONAndYAMLFromDirectStatusFields(t *testing.T) {

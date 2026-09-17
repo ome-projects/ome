@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/instanceprojection"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 func TestProjectUsesCurrentInstanceStatusesAndQualifiesStaleAndSparseEvidence(t *testing.T) {
@@ -138,6 +139,55 @@ func TestProjectRejectsDuplicateComponentIdentity(t *testing.T) {
 		})
 	}
 	assert.Equal(t, []reportv1alpha1.InstanceListWarning{{Code: reportv1alpha1.WarningPartialData}}, got.Warnings)
+}
+
+func TestProjectRejectsUnnormalizedColumnarReplica(t *testing.T) {
+	t.Parallel()
+
+	isvc := instanceISVC()
+	ir := instanceReplica(isvc, "chat-engine", omev1beta1.EngineComponent, 1, 1)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = &omev1beta1.InstanceStatusColumns{
+		Members: "0",
+		Phases:  []omev1beta1.InstanceStatusPhaseGroup{{Value: omev1beta1.OMENativeInstanceReady, Indexes: "0"}},
+	}
+
+	_, err := instanceprojection.Project(instanceprojection.Input{
+		InferenceService: isvc,
+		Collection:       instancecollection.Result{Items: []omev1beta1.InferenceReplica{ir}},
+		MaxInstances:     100,
+	}, reportv1alpha1.ClockFunc(func() time.Time { return time.Unix(1, 0) }))
+
+	require.ErrorIs(t, err, instanceprojection.ErrCollectionEvidenceInvalid)
+}
+
+func TestProjectRejectsUnboundStatusEncodingProvenance(t *testing.T) {
+	t.Parallel()
+
+	isvc := instanceISVC()
+	ir := instanceReplica(isvc, "chat-engine", omev1beta1.EngineComponent, 1, 1)
+	valid := instancecollection.StatusEncoding{
+		Name: ir.Name, Component: ir.Spec.Component, UID: ir.UID, Encoding: irstatus.EncodingDenseV1,
+	}
+	for _, tc := range []struct {
+		name    string
+		records []instancecollection.StatusEncoding
+	}{
+		{name: "unknown encoding", records: []instancecollection.StatusEncoding{{Name: ir.Name, Component: ir.Spec.Component, UID: ir.UID, Encoding: "Future"}}},
+		{name: "wrong UID", records: []instancecollection.StatusEncoding{{Name: ir.Name, Component: ir.Spec.Component, UID: "wrong", Encoding: irstatus.EncodingDenseV1}}},
+		{name: "extra record", records: []instancecollection.StatusEncoding{valid, valid}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := instanceprojection.Project(instanceprojection.Input{
+				InferenceService: isvc,
+				Collection:       instancecollection.Result{Items: []omev1beta1.InferenceReplica{ir}, StatusEncodings: tc.records},
+				MaxInstances:     100,
+			}, reportv1alpha1.ClockFunc(func() time.Time { return time.Unix(1, 0) }))
+			require.ErrorIs(t, err, instanceprojection.ErrCollectionEvidenceInvalid)
+		})
+	}
 }
 
 func TestProjectRejectsDuplicateInstanceIndex(t *testing.T) {
