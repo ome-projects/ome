@@ -24,11 +24,12 @@ type scaleRead struct {
 }
 
 type fakeScaleReader struct {
-	scale *autoscalingv1.Scale
-	ir    *ome.InferenceReplica
-	err   error
-	irErr error
-	reads []scaleRead
+	scale   *autoscalingv1.Scale
+	ir      *ome.InferenceReplica
+	err     error
+	irErr   error
+	reads   []scaleRead
+	onIRGet func()
 }
 
 func (r *fakeScaleReader) GetInferenceReplicaScale(_ context.Context, namespace, name string, _ metav1.GetOptions) (*autoscalingv1.Scale, error) {
@@ -38,6 +39,9 @@ func (r *fakeScaleReader) GetInferenceReplicaScale(_ context.Context, namespace,
 
 func (r *fakeScaleReader) GetInferenceReplica(_ context.Context, namespace, name string, _ metav1.GetOptions) (*ome.InferenceReplica, error) {
 	r.reads = append(r.reads, scaleRead{namespace, name})
+	if r.onIRGet != nil {
+		r.onIRGet()
+	}
 	if r.ir != nil || r.irErr != nil {
 		return r.ir, r.irErr
 	}
@@ -168,6 +172,36 @@ func TestLiveScaleDetectsDeletingIRAbsentFromCRDScaleMetadata(t *testing.T) {
 	require.Nil(t, result.Content.Components[0].LiveScale.SpecReplicas)
 }
 
+func TestLiveScaleStaleIRObservedGenerationStopsBeforeScale(t *testing.T) {
+	parent := liveParent()
+	base, err := autoscaleprojection.Project(parent, nil)
+	require.NoError(t, err)
+	ir := liveReplica()
+	ir.Status.ObservedGeneration = ir.Generation - 1
+	reader := &fakeScaleReader{ir: ir, scale: liveScale(3, 2)}
+	result, err := autoscaleprojection.EnrichLiveScale(context.Background(), parent, base, reader, nil)
+	require.NoError(t, err)
+	require.Equal(t, []scaleRead{{"prod", "chat-engine"}}, reader.reads)
+	require.Equal(t, reportv1alpha1.AutoscaleLiveScaleStale, result.Content.Components[0].LiveScale.Evidence)
+	require.Equal(t, reportv1alpha1.AutoscaleLiveScaleUnknown, result.Content.Components[0].LiveScale.CountComparison)
+	require.Len(t, result.Sources, 2)
+	require.Equal(t, reportv1alpha1.EvidenceObserved, result.Sources[1].Evidence)
+	require.Equal(t, []reportv1alpha1.AutoscaleWarning{{Code: reportv1alpha1.AutoscaleWarningPartialData}}, result.Warnings)
+}
+
+func TestLiveScaleCancellationAfterIRReadStopsBeforeScale(t *testing.T) {
+	parent := liveParent()
+	base, err := autoscaleprojection.Project(parent, nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader := &fakeScaleReader{ir: liveReplica(), scale: liveScale(3, 2), onIRGet: cancel}
+	result, err := autoscaleprojection.EnrichLiveScale(ctx, parent, base, reader, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, reportv1alpha1.AutoscaleStatusReport{}, result)
+	require.Equal(t, []scaleRead{{"prod", "chat-engine"}}, reader.reads)
+}
+
 func TestLiveScaleRefusesForeignOrChangedIRIdentity(t *testing.T) {
 	parent := liveParent()
 	base, err := autoscaleprojection.Project(parent, nil)
@@ -183,6 +217,7 @@ func TestLiveScaleRefusesForeignOrChangedIRIdentity(t *testing.T) {
 		}, reportv1alpha1.AutoscaleLiveScaleInvalid},
 		{"changed scale UID", func(r *fakeScaleReader) { r.scale.UID = "replacement" }, reportv1alpha1.AutoscaleLiveScaleChanged},
 		{"changed scale resource version", func(r *fakeScaleReader) { r.scale.ResourceVersion = "10" }, reportv1alpha1.AutoscaleLiveScaleChanged},
+		{"changed counts at same resource version", func(r *fakeScaleReader) { r.scale.Spec.Replicas = 4 }, reportv1alpha1.AutoscaleLiveScaleChanged},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := &fakeScaleReader{ir: liveReplica(), scale: liveScale(3, 2)}
