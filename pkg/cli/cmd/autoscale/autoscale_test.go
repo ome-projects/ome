@@ -96,9 +96,10 @@ func TestStatusHelpDefinesTheReportedEvidenceBoundary(t *testing.T) {
 	cmd.SetArgs([]string{"status", "--help"})
 
 	require.NoError(t, cmd.Execute())
-	assert.Equal(t, `Show autoscaling evidence already reported on the InferenceService parent.
-It does not query HPA, KEDA ScaledObject, Deployment, or InferenceReplica
-objects, so "Reported" describes controller-reported evidence, not freshness.
+	assert.Equal(t, `Show autoscaling evidence reported on the InferenceService parent.
+By default, this performs no HPA, KEDA, Deployment, or InferenceReplica reads.
+--live-scale adds exact parent-selected InferenceReplica and /scale reads only.
+Count equality is not proof of ongoing freshness or scaler health.
 The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
 as UTC MonDD HH:MMZ. ISSUES uses compact aliases:
   UnknownComp=UnknownComponentStatus
@@ -122,6 +123,7 @@ Usage:
 
 Flags:
   -h, --help            help for status
+      --live-scale      Compare parent counts with exact selected InferenceReplica and /scale reads
   -o, --output string   Output format: table, wide, json or yaml (default "table")
 `, output.String())
 }

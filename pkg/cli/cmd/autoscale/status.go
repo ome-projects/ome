@@ -43,8 +43,9 @@ type statusDependencies struct {
 
 type statusOptions struct {
 	genericiooptions.IOStreams
-	output string
-	deps   statusDependencies
+	output    string
+	liveScale bool
+	deps      statusDependencies
 }
 
 func newStatusCmd(
@@ -56,9 +57,10 @@ func newStatusCmd(
 	cmd := &cobra.Command{
 		Use:   "status INFERENCESERVICE",
 		Short: "Show controller-reported autoscaling status",
-		Long: `Show autoscaling evidence already reported on the InferenceService parent.
-It does not query HPA, KEDA ScaledObject, Deployment, or InferenceReplica
-objects, so "Reported" describes controller-reported evidence, not freshness.
+		Long: `Show autoscaling evidence reported on the InferenceService parent.
+By default, this performs no HPA, KEDA, Deployment, or InferenceReplica reads.
+--live-scale adds exact parent-selected InferenceReplica and /scale reads only.
+Count equality is not proof of ongoing freshness or scaler health.
 The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
 as UTC MonDD HH:MMZ. ISSUES uses compact aliases:
   UnknownComp=UnknownComponentStatus
@@ -82,6 +84,7 @@ Use -o wide for exact issue codes, complete identities, and timestamps.`,
 		},
 	}
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
+	cmd.Flags().BoolVar(&o.liveScale, "live-scale", false, "Compare parent counts with exact selected InferenceReplica and /scale reads")
 	return cmd
 }
 
@@ -128,6 +131,12 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 	reportValue, err := o.deps.project(isvc, o.deps.clock)
 	if err != nil {
 		return fmt.Errorf("project autoscale status for InferenceService %q: %w", namespace+"/"+name, err)
+	}
+	if o.liveScale {
+		reportValue, err = autoscaleprojection.EnrichLiveScale(ctx, isvc, reportValue, &statusScaleReader{factory: f, ome: client.OmeV1beta1()}, o.deps.clock)
+		if err != nil {
+			return fmt.Errorf("inspect live scale for InferenceService %q: %w", namespace+"/"+name, err)
+		}
 	}
 	if wide {
 		if err := reportValue.WideTable().Write(o.Out); err != nil {

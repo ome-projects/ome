@@ -18,7 +18,11 @@ const AutoscaleStatusReportKind = "AutoscaleStatusReport"
 
 type AutoscaleSourceKind string
 
-const AutoscaleSourceInferenceService AutoscaleSourceKind = "InferenceService"
+const (
+	AutoscaleSourceInferenceService      AutoscaleSourceKind = "InferenceService"
+	AutoscaleSourceInferenceReplica      AutoscaleSourceKind = "InferenceReplica"
+	AutoscaleSourceInferenceReplicaScale AutoscaleSourceKind = "InferenceReplicaScale"
+)
 
 type AutoscaleState string
 
@@ -147,9 +151,8 @@ const (
 	AutoscaleWarningPartialData AutoscaleWarningCode = "PartialData"
 )
 
-// AutoscaleSourceReference identifies the one allowlisted parent object used
-// to build a status report. It deliberately omits Kubernetes versioning and
-// metadata fields that are not part of the evidence contract.
+// AutoscaleSourceReference identifies an allowlisted parent, exact IR, or
+// exact IR /scale read. Raw status messages never enter the report.
 type AutoscaleSourceReference struct {
 	Kind        AutoscaleSourceKind `json:"kind"`
 	Namespace   string              `json:"namespace"`
@@ -179,6 +182,39 @@ type AutoscaleReplicaStatus struct {
 	LastScaleTime   *time.Time            `json:"lastScaleTime,omitempty"`
 }
 
+// AutoscaleLiveScale is a count-only comparison of the parent projection with
+// an opt-in exact InferenceReplica /scale read. Equality is not a claim about
+// IR ownership, status freshness, or autoscaler health.
+type AutoscaleLiveScale struct {
+	Evidence        AutoscaleLiveScaleEvidence   `json:"evidence"`
+	CountComparison AutoscaleLiveScaleComparison `json:"countComparison"`
+	SpecReplicas    *int32                       `json:"specReplicas,omitempty"`
+	CurrentReplicas *int32                       `json:"currentReplicas,omitempty"`
+}
+
+type AutoscaleLiveScaleEvidence string
+
+const (
+	AutoscaleLiveScaleReported    AutoscaleLiveScaleEvidence = "Reported"
+	AutoscaleLiveScaleNotSelected AutoscaleLiveScaleEvidence = "NotSelected"
+	AutoscaleLiveScaleUnsupported AutoscaleLiveScaleEvidence = "Unsupported"
+	AutoscaleLiveScaleForbidden   AutoscaleLiveScaleEvidence = "Forbidden"
+	AutoscaleLiveScaleNotFound    AutoscaleLiveScaleEvidence = "NotFound"
+	AutoscaleLiveScaleDeleting    AutoscaleLiveScaleEvidence = "Deleting"
+	AutoscaleLiveScaleChanged     AutoscaleLiveScaleEvidence = "Changed"
+	AutoscaleLiveScaleStale       AutoscaleLiveScaleEvidence = "Stale"
+	AutoscaleLiveScaleInvalid     AutoscaleLiveScaleEvidence = "Invalid"
+	AutoscaleLiveScaleUnavailable AutoscaleLiveScaleEvidence = "Unavailable"
+)
+
+type AutoscaleLiveScaleComparison string
+
+const (
+	AutoscaleLiveScaleUnknown AutoscaleLiveScaleComparison = "Unknown"
+	AutoscaleLiveScaleEqual   AutoscaleLiveScaleComparison = "Equal"
+	AutoscaleLiveScaleDrift   AutoscaleLiveScaleComparison = "Drift"
+)
+
 type AutoscaleCondition struct {
 	Type               AutoscaleConditionType   `json:"type"`
 	Status             AutoscaleConditionStatus `json:"status"`
@@ -198,6 +234,7 @@ type AutoscaleComponentStatus struct {
 	SpecSource AutoscaleSpecSource       `json:"specSource"`
 	Target     AutoscaleTarget           `json:"target"`
 	Replicas   AutoscaleReplicaStatus    `json:"replicas"`
+	LiveScale  *AutoscaleLiveScale       `json:"liveScale,omitempty"`
 	Conditions AutoscaleConditionsStatus `json:"conditions"`
 }
 
@@ -216,9 +253,9 @@ type AutoscaleStatusContent struct {
 	Issues     []AutoscaleIssue           `json:"issues"`
 }
 
-// AutoscaleStatusReport is a dedicated message-free status contract. Values
-// in it are controller-reported evidence, never a claim about current cluster
-// state.
+// AutoscaleStatusReport is a dedicated message-free status contract. Base
+// values are controller-reported; opt-in liveScale values are separate exact
+// IR and /scale observations, never a health or freshness claim.
 type AutoscaleStatusReport struct {
 	APIVersion  string                     `json:"apiVersion"`
 	Kind        string                     `json:"kind"`
@@ -334,6 +371,10 @@ func (c AutoscaleStatusContent) Table() report.Table {
 		"CURRENT",
 		"DESIRED",
 		"REPLICA-EVIDENCE",
+		"LIVE-EVIDENCE",
+		"LIVE-SPEC",
+		"LIVE-CURRENT",
+		"LIVE-COUNT",
 		"LAST-SCALE",
 		"COND-EVIDENCE",
 		"ABLE-TO-SCALE",
@@ -405,6 +446,12 @@ func compactAutoscaleComponentValues(component AutoscaleComponentStatus) map[str
 		"REPLICA-EVIDENCE": string(component.Replicas.State),
 		"LAST-SCALE":       compactAutoscaleTimeCell(component.Replicas.LastScaleTime),
 		"COND-EVIDENCE":    string(component.Conditions.State),
+	}
+	if component.LiveScale != nil {
+		values["LIVE-EVIDENCE"] = string(component.LiveScale.Evidence)
+		values["LIVE-SPEC"] = autoscaleInt32Cell(component.LiveScale.SpecReplicas)
+		values["LIVE-CURRENT"] = autoscaleInt32Cell(component.LiveScale.CurrentReplicas)
+		values["LIVE-COUNT"] = string(component.LiveScale.CountComparison)
 	}
 	for _, condition := range component.Conditions.Items {
 		field := compactAutoscaleConditionField(condition.Type)
@@ -545,6 +592,13 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 		"STATE", "COMPONENT", "COMPONENT-STATE", "CLASS", "MANAGED-BY", "SPEC-SOURCE",
 		"TARGET", "TARGET-EVIDENCE", "CURRENT", "DESIRED", "REPLICA-EVIDENCE", "LAST-SCALE", "CONDITION-EVIDENCE", "CONDITIONS", "ISSUES",
 	}, Rows: [][]string{}}
+	liveRequested := false
+	for _, component := range canonical.Components {
+		liveRequested = liveRequested || component.LiveScale != nil
+	}
+	if liveRequested {
+		table.Headers = append(table.Headers, "LIVE-EVIDENCE", "LIVE-SPEC", "LIVE-CURRENT", "LIVE-COUNT")
+	}
 	if len(canonical.Components) == 0 {
 		table.Rows = append(table.Rows, []string{
 			string(canonical.Summary.State), "-", "-", "-", "-", "-", "-",
@@ -553,7 +607,7 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 		return table
 	}
 	for _, component := range canonical.Components {
-		table.Rows = append(table.Rows, []string{
+		row := []string{
 			string(canonical.Summary.State), string(component.Type), string(component.State),
 			string(component.Class), string(component.ManagedBy), string(component.SpecSource),
 			autoscaleTargetCell(component.Target), string(component.Target.State), autoscaleInt32Cell(component.Replicas.CurrentReplicas),
@@ -561,13 +615,32 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 			autoscaleTimeCell(component.Replicas.LastScaleTime), string(component.Conditions.State),
 			autoscaleConditionsCell(component.Conditions.Items),
 			autoscaleIssuesCell(component.Type, canonical.Issues),
-		})
+		}
+		if liveRequested {
+			live := component.LiveScale
+			if live == nil {
+				row = append(row, "-", "-", "-", "-")
+			} else {
+				row = append(row, string(live.Evidence), autoscaleInt32Cell(live.SpecReplicas), autoscaleInt32Cell(live.CurrentReplicas), string(live.CountComparison))
+			}
+		}
+		table.Rows = append(table.Rows, row)
 	}
 	return table
 }
 
 func canonicalAutoscaleComponent(component AutoscaleComponentStatus) AutoscaleComponentStatus {
 	result := component
+	if component.LiveScale != nil {
+		copy := *component.LiveScale
+		copy.SpecReplicas = copyInt32(component.LiveScale.SpecReplicas)
+		copy.CurrentReplicas = copyInt32(component.LiveScale.CurrentReplicas)
+		if copy.Evidence != AutoscaleLiveScaleReported {
+			copy.SpecReplicas, copy.CurrentReplicas = nil, nil
+			copy.CountComparison = AutoscaleLiveScaleUnknown
+		}
+		result.LiveScale = &copy
+	}
 	result.Replicas.CurrentReplicas = copyInt32(component.Replicas.CurrentReplicas)
 	result.Replicas.DesiredReplicas = copyInt32(component.Replicas.DesiredReplicas)
 	if component.Replicas.LastScaleTime != nil {
@@ -605,6 +678,7 @@ func canonicalAutoscaleComponent(component AutoscaleComponentStatus) AutoscaleCo
 
 func autoscaleSourceLess(a, b AutoscaleSourceReference) bool {
 	for _, result := range []int{
+		cmp.Compare(autoscaleSourceRank(a.Kind), autoscaleSourceRank(b.Kind)),
 		cmp.Compare(a.Kind, b.Kind),
 		cmp.Compare(a.Namespace, b.Namespace),
 		cmp.Compare(a.Name, b.Name),
@@ -620,6 +694,19 @@ func autoscaleSourceLess(a, b AutoscaleSourceReference) bool {
 	return false
 }
 
+func autoscaleSourceRank(kind AutoscaleSourceKind) int {
+	switch kind {
+	case AutoscaleSourceInferenceService:
+		return 0
+	case AutoscaleSourceInferenceReplica:
+		return 1
+	case AutoscaleSourceInferenceReplicaScale:
+		return 2
+	default:
+		return 3
+	}
+}
+
 func compareAutoscaleComponents(a, b AutoscaleComponentStatus) int {
 	for _, result := range []int{
 		cmp.Compare(autoscaleComponentRank(a.Type), autoscaleComponentRank(b.Type)),
@@ -630,7 +717,28 @@ func compareAutoscaleComponents(a, b AutoscaleComponentStatus) int {
 		cmp.Compare(a.SpecSource, b.SpecSource),
 		compareAutoscaleTargets(a.Target, b.Target),
 		compareAutoscaleReplicas(a.Replicas, b.Replicas),
+		compareAutoscaleLiveScale(a.LiveScale, b.LiveScale),
 		compareAutoscaleConditions(a.Conditions, b.Conditions),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareAutoscaleLiveScale(a, b *AutoscaleLiveScale) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	}
+	for _, result := range []int{
+		cmp.Compare(a.Evidence, b.Evidence), cmp.Compare(a.CountComparison, b.CountComparison),
+		compareAutoscaleInt32Pointers(a.SpecReplicas, b.SpecReplicas), compareAutoscaleInt32Pointers(a.CurrentReplicas, b.CurrentReplicas),
 	} {
 		if result != 0 {
 			return result
