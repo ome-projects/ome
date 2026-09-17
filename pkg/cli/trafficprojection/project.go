@@ -26,6 +26,7 @@ import (
 const (
 	maxRoutes              = 4
 	maxEndpoints           = 16
+	maxCanaryGroups        = 3
 	maxAllocationsPerClass = 8
 	maxEndpointPathBytes   = 256
 	maxEndpointBytes       = 512
@@ -93,6 +94,7 @@ type projector struct {
 	unsupported      *reportv1alpha1.TrafficCondition
 	unsupportedValid bool
 	issueSet         map[string]struct{}
+	canaries         map[reportv1alpha1.RuntimeComponentType]*reportv1alpha1.TrafficCanary
 	invalid          bool
 	partial          bool
 	stale            bool
@@ -377,41 +379,67 @@ func (b *projector) projectEndpoints() {
 }
 
 func (b *projector) projectCanary() {
-	rollout := omerollout.Effective(b.isvc)
-	var group *omev1beta1.RolloutGroup
-	if rollout != nil {
-		for i := range rollout.Groups {
-			if rollout.Groups[i].Canary == nil {
-				continue
-			}
-			if group != nil {
-				b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)
-				return
-			}
-			group = &rollout.Groups[i]
-		}
-	}
-	status := b.isvc.Status.Canary
-	if status == nil {
-		_, primary, primaryOK := canaryPrimary(group)
-		component, componentOK := b.isvc.Status.Components[primary]
-		if primaryOK && componentOK && canaryevidence.PhaseNeedsStatus(canaryevidence.ProjectPhase(component.RolloutPhase)) {
+	groups := omerollout.CanaryGroups(b.isvc)
+	if len(groups) == 0 {
+		if b.isvc.Status.Canary != nil {
 			b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)
 		}
 		return
 	}
-	component, primary, componentOK := canaryPrimary(group)
-	if !componentOK || group == nil || group.Canary == nil || !canaryevidence.ValidCanaryPlan(group.Canary) || len(group.Canary.Steps) > 20 ||
-		!validCanaryStatus(status, len(group.Canary.Steps)) ||
-		!b.validCanaryEpoch(group.Canary.Steps, primary, status) {
+	if len(groups) > maxCanaryGroups {
 		b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)
 		return
 	}
-	b.content.Canary = &reportv1alpha1.TrafficCanary{
-		Component: component, CurrentStep: status.CurrentStep,
-		TotalSteps: int32(len(group.Canary.Steps)), ObservedTraffic: status.ObservedTrafficWeight,
-		StableRevisionHash: status.StableRevisionHash, CanaryRevisionHash: status.CanaryRevisionHash,
-		Source: source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnverifiable),
+	// The report has one canary-step field. For concurrent runs, keep their
+	// per-unit allocation roles but do not pretend one run describes them all.
+	if len(groups) > 1 {
+		b.partial = true
+	}
+	b.canaries = make(map[reportv1alpha1.RuntimeComponentType]*reportv1alpha1.TrafficCanary, len(groups))
+	seenUnits := make(map[omev1beta1.ComponentType]struct{}, len(groups))
+	for _, group := range groups {
+		component, primary, primaryOK := canaryPrimary(group)
+		issueComponent := reportv1alpha1.RuntimeComponentType("")
+		if len(groups) > 1 {
+			issueComponent = component
+		}
+		if !primaryOK || !canaryevidence.ValidCanaryPlan(group.Canary) || len(group.Canary.Steps) > 20 || b.canaries[component] != nil {
+			b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, issueComponent, true)
+			continue
+		}
+		if _, duplicate := seenUnits[primary]; duplicate {
+			b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, issueComponent, true)
+			continue
+		}
+		seenUnits[primary] = struct{}{}
+		var status *omev1beta1.CanaryStatus
+		if len(groups) == 1 {
+			status = omerollout.CanaryStatusFor(&b.isvc.Status, primary)
+		} else if entrypoint, found := b.isvc.Status.Components[omerollout.CanaryUnit(primary)]; found {
+			// The legacy alias cannot identify which of several units owns it.
+			status = entrypoint.Canary
+		}
+		if status == nil {
+			if entrypoint, found := b.isvc.Status.Components[primary]; found &&
+				canaryevidence.PhaseNeedsStatus(canaryevidence.ProjectPhase(entrypoint.RolloutPhase)) {
+				b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, issueComponent, true)
+			}
+			continue
+		}
+		if !validCanaryStatus(status, len(group.Canary.Steps)) || !b.validCanaryEpoch(group.Canary.Steps, primary, status) {
+			b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, issueComponent, true)
+			continue
+		}
+		canary := &reportv1alpha1.TrafficCanary{
+			Component: component, CurrentStep: status.CurrentStep,
+			TotalSteps: int32(len(group.Canary.Steps)), ObservedTraffic: status.ObservedTrafficWeight,
+			StableRevisionHash: status.StableRevisionHash, CanaryRevisionHash: status.CanaryRevisionHash,
+			Source: source(reportv1alpha1.EvidenceReported, reportv1alpha1.TrafficFreshnessUnverifiable),
+		}
+		b.canaries[component] = canary
+		if len(groups) == 1 {
+			b.content.Canary = canary
+		}
 	}
 }
 
@@ -500,7 +528,7 @@ func (b *projector) projectComponentAllocations(component omev1beta1.ComponentTy
 		unique = append(unique, candidate)
 	}
 	stableName := ""
-	if b.content.Canary == nil || b.content.Canary.Component != projectedComponent {
+	if b.canaries[projectedComponent] == nil {
 		stableName = b.stableAllocationName(component, projectedComponent, status.LatestRolledoutRevision, unique)
 	}
 	if len(unique) > maxAllocationsPerClass {
@@ -558,12 +586,12 @@ func (b *projector) stableAllocationName(
 }
 
 func (b *projector) allocationRole(component reportv1alpha1.RuntimeComponentType, hash, name, stableName string) reportv1alpha1.TrafficAllocationRole {
-	if b.content.Canary != nil && b.content.Canary.Component == component {
-		if b.content.Canary.StableRevisionHash != "" && hash == b.content.Canary.StableRevisionHash {
+	if canary := b.canaries[component]; canary != nil {
+		if canary.StableRevisionHash != "" && hash == canary.StableRevisionHash {
 			return reportv1alpha1.TrafficRoleStable
 		}
-		if hash == b.content.Canary.CanaryRevisionHash {
-			if b.content.Canary.CurrentStep == b.content.Canary.TotalSteps {
+		if hash == canary.CanaryRevisionHash {
+			if canary.CurrentStep == canary.TotalSteps {
 				return reportv1alpha1.TrafficRoleStable
 			}
 			return reportv1alpha1.TrafficRoleCanary

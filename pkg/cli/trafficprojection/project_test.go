@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/trafficprojection"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
+	"sigs.k8s.io/ome/pkg/validation"
 )
 
 var projectionClock = reportv1alpha1.ClockFunc(func() time.Time {
@@ -349,6 +350,118 @@ func TestProjectCanaryUsesPinnedActiveRunPlan(t *testing.T) {
 	require.NotNil(t, got.Content.Canary)
 	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canary.Component)
 	assert.Equal(t, int32(2), got.Content.Canary.TotalSteps)
+}
+
+func TestProjectUsesPerUnitCanaryInsteadOfLegacyAlias(t *testing.T) {
+	isvc := currentTrafficISVC(t)
+	engine := isvc.Status.Components[omev1beta1.EngineComponent]
+	engine.Canary = isvc.Status.Canary.DeepCopy()
+	isvc.Status.Components[omev1beta1.EngineComponent] = engine
+	isvc.Status.Canary = &omev1beta1.CanaryStatus{CurrentStep: 99, ObservedTrafficWeight: 99}
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Canary)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canary.Component)
+	assert.Equal(t, int32(20), got.Content.Canary.ObservedTraffic)
+	assert.Empty(t, got.Content.Issues)
+}
+
+func TestProjectConcurrentCanariesKeepUnitAllocationsWithoutInventingGlobalStep(t *testing.T) {
+	isvc := concurrentCanaryTrafficISVC(t)
+	setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
+	before := isvc.DeepCopy()
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, before, isvc, "projection must not mutate API evidence")
+	assert.Nil(t, got.Content.Canary, "one canary field cannot represent two independent steps")
+	assert.Equal(t, reportv1alpha1.TrafficStatePartial, got.Content.Summary.State)
+	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
+	assert.Contains(t, got.Warnings, reportv1alpha1.TrafficWarning{Code: reportv1alpha1.WarningPartialData})
+	assert.Empty(t, tableRows(got.Table().Rows, "CANARY"))
+	for _, component := range []reportv1alpha1.RuntimeComponentType{reportv1alpha1.RuntimeComponentEngine, reportv1alpha1.RuntimeComponentRouter} {
+		allocations := allocationsForComponent(got.Content.Allocations, component)
+		require.Len(t, allocations, 2)
+		assert.Equal(t, []reportv1alpha1.TrafficAllocationRole{reportv1alpha1.TrafficRoleStable, reportv1alpha1.TrafficRoleCanary},
+			[]reportv1alpha1.TrafficAllocationRole{allocations[0].Role, allocations[1].Role})
+	}
+	var output bytes.Buffer
+	require.NoError(t, report.Write(&output, report.FormatTable, got))
+	assert.NotContains(t, output.String(), "SECRET_")
+	t.Logf("concurrent-canary traffic status (fixture):\n%s", output.String())
+}
+
+func TestProjectConcurrentCanariesDoNotReuseAliasForMissingUnit(t *testing.T) {
+	isvc := concurrentCanaryTrafficISVC(t)
+	router := isvc.Status.Components[omev1beta1.RouterComponent]
+	router.Canary = nil
+	isvc.Status.Components[omev1beta1.RouterComponent] = router
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Nil(t, got.Content.Canary)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code: reportv1alpha1.TrafficIssueCanaryInvalid, Component: reportv1alpha1.RuntimeComponentRouter,
+	})
+}
+
+func TestProjectRejectsDuplicateCanaryUnitEvenWithoutStatus(t *testing.T) {
+	isvc := concurrentCanaryTrafficISVC(t)
+	isvc.Spec.Rollout.Groups[1].Components = []omev1beta1.ComponentType{omev1beta1.EngineComponent}
+	engine := isvc.Status.Components[omev1beta1.EngineComponent]
+	engine.Canary = nil
+	engine.RolloutPhase = omev1beta1.RolloutPhaseStable
+	isvc.Status.Components[omev1beta1.EngineComponent] = engine
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateInvalid, got.Content.Summary.State)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code:      reportv1alpha1.TrafficIssueCanaryInvalid,
+		Component: reportv1alpha1.RuntimeComponentEngine,
+	})
+}
+
+func concurrentCanaryTrafficISVC(t *testing.T) *omev1beta1.InferenceService {
+	t.Helper()
+	isvc := currentTrafficISVC(t)
+	mode := constants.OMENative
+	isvc.Spec.DeploymentMode = &mode
+	isvc.Spec.Engine = &omev1beta1.EngineSpec{}
+	isvc.Spec.Router = &omev1beta1.RouterSpec{}
+	concurrent := omev1beta1.RolloutGroupOrderingConcurrent
+	isvc.Spec.Rollout.GroupOrdering = &concurrent
+	isvc.Spec.Rollout.Groups = append(isvc.Spec.Rollout.Groups, omev1beta1.RolloutGroup{
+		Components: []omev1beta1.ComponentType{omev1beta1.RouterComponent},
+		Canary: &omev1beta1.GroupCanary{Steps: []omev1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("30%"), Traffic: 30},
+			{Capacity: intstr.FromString("50%"), Traffic: 50},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		}},
+	})
+	engine := isvc.Status.Components[omev1beta1.EngineComponent]
+	engine.Canary = isvc.Status.Canary.DeepCopy()
+	isvc.Status.Components[omev1beta1.EngineComponent] = engine
+	routerCanary := &omev1beta1.CanaryStatus{
+		CurrentStep: 1, ObservedTrafficWeight: 50,
+		StableRevisionHash: "11112222", CanaryRevisionHash: "33334444",
+	}
+	isvc.Status.Components[omev1beta1.RouterComponent] = omev1beta1.ComponentStatusSpec{
+		Canary:       routerCanary,
+		RolloutPhase: omev1beta1.RolloutPhaseCanarying,
+		Traffic: []omev1beta1.ComponentTrafficTarget{
+			{RevisionName: "chat-router-rev-11112222", Percent: 50},
+			{RevisionName: "chat-router-rev-33334444", Percent: 50, LatestRevision: true},
+		},
+	}
+	isvc.Status.Canary = routerCanary.DeepCopy()
+	require.NoError(t, validation.ValidateCanary(&isvc.Spec), "fixture must be a valid concurrent canary plan")
+	return isvc
 }
 
 func TestProjectRejectsMissingCanaryStatusForEveryRequiredPrimaryPhase(t *testing.T) {

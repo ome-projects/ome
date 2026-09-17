@@ -82,6 +82,20 @@ func TestProjectExplainHealthyIntentSupportAndRealization(t *testing.T) {
 	}
 }
 
+func TestProjectExplainConcurrentCanaryComparisonIsUnverifiable(t *testing.T) {
+	isvc := concurrentCanaryTrafficISVC(t)
+	setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
+
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficExplainPartial, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficComparisonUnverifiable,
+		explainComparison(t, got, reportv1alpha1.TrafficComparisonCanaryWeight).State)
+	assert.NotContains(t, got.Content.Reported.Issues,
+		reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
+}
+
 func TestProjectExplainClassifiesAlgorithmMismatch(t *testing.T) {
 	isvc := currentTrafficISVC(t)
 	algorithm := omev1beta1.LoadBalancingTypeLeastRequest
