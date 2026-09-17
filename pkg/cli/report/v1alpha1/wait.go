@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/waitheld"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
 	"sigs.k8s.io/ome/pkg/cli/waitruntime"
+	"sigs.k8s.io/ome/pkg/cli/waitscale"
 )
 
 const WaitReportKind = "WaitReport"
@@ -30,6 +31,7 @@ const (
 	WaitRequestedReadyReplicas           WaitRequested = "Replicas=Ready"
 	WaitRequestedRuntimeSyncAcknowledged WaitRequested = "RuntimeSync=Acknowledged"
 	WaitRequestedHeldRevisionUnheld      WaitRequested = "HeldRevision=Unheld"
+	WaitRequestedScaleCurrent            WaitRequested = "Replicas=Current"
 )
 
 type WaitCounts struct {
@@ -49,6 +51,7 @@ type WaitContent struct {
 	ReadyReplicas       *WaitReadyReplicasObservation `json:"readyReplicas,omitempty"`
 	RuntimeSync         *WaitRuntimeSyncObservation   `json:"runtimeSync,omitempty"`
 	HeldRevision        *WaitHeldRevisionObservation  `json:"heldRevision,omitempty"`
+	Scale               *WaitScaleObservation         `json:"scale,omitempty"`
 	Evidence            EvidenceLevel                 `json:"evidence"`
 	ElapsedMilliseconds int64                         `json:"elapsedMilliseconds"`
 	Counts              WaitCounts                    `json:"counts"`
@@ -85,7 +88,7 @@ func (r WaitReport) Canonical() WaitReport {
 	return r
 }
 func (c WaitContent) Canonical() WaitContent {
-	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() && !c.Requested.IsRuntimeSync() && !c.Requested.IsHeldRevision() {
+	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() && !c.Requested.IsRuntimeSync() && !c.Requested.IsHeldRevision() && !c.Requested.IsScale() {
 		c.Requested = "Unknown"
 	}
 	switch c.Outcome {
@@ -126,6 +129,11 @@ func (c WaitContent) Canonical() WaitContent {
 		waitengine.Reason(waitheld.ReasonMailboxPending), waitengine.Reason(waitheld.ReasonMailboxSuperseded),
 		waitengine.Reason(waitheld.ReasonInvalidRetryBlocks), waitengine.Reason(waitheld.ReasonInvalidStatus):
 		if !c.Requested.IsHeldRevision() {
+			c.Reason = "PredicateUnmet"
+		}
+	case waitscale.ReasonMatched, waitscale.ReasonNotMatched, waitscale.ReasonNotRecorded,
+		waitscale.ReasonInvalid, waitscale.ReasonUnsupported:
+		if !c.Requested.IsScale() {
 			c.Reason = "PredicateUnmet"
 		}
 	default:
@@ -284,6 +292,30 @@ func (c WaitContent) Canonical() WaitContent {
 	} else {
 		c.HeldRevision = nil
 	}
+	if c.Requested.IsScale() {
+		if c.Scale == nil {
+			c.Scale = &WaitScaleObservation{Validity: "Unavailable", Freshness: "Unavailable"}
+		}
+		observed := c.Scale.Canonical()
+		if c.Outcome == waitengine.OutcomeMatched &&
+			(observed.Validity != "Valid" || observed.Freshness != "Current" ||
+				observed.SpecReplicas == nil || *observed.SpecReplicas != observed.Requested ||
+				observed.CurrentReplicas == nil || *observed.CurrentReplicas != observed.Requested ||
+				c.Reason != waitscale.ReasonMatched) {
+			observed.Validity = "Invalid"
+			observed = observed.Canonical()
+			c.Outcome = "Unknown"
+			c.Reason = waitscale.ReasonInvalid
+		}
+		c.Scale = &observed
+		c.Observed = waitpredicate.Observation{Status: "NotRecorded", Validity: "Unavailable", GenerationFreshness: "Unverifiable", Inspection: waitpredicate.Inspection{State: "NotInspected", Warnings: []waitpredicate.Warning{}}}
+		c.Evidence = EvidenceUnavailable
+		if observed.Validity == "Valid" {
+			c.Evidence = EvidenceReported
+		}
+	} else {
+		c.Scale = nil
+	}
 	return c
 }
 func (r WaitReport) Table() report.Table {
@@ -302,6 +334,9 @@ func (r WaitReport) table(wide bool) report.Table {
 	}
 	if c.HeldRevision != nil {
 		return r.heldRevisionTable(wide)
+	}
+	if c.Scale != nil {
+		return r.scaleTable(wide)
 	}
 	if c.ReadyReplicas != nil {
 		return r.readyReplicasTable(wide)

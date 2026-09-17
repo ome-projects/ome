@@ -1,4 +1,4 @@
-// Package waitscale evaluates exact InferenceReplica /scale observation.
+// Package waitscale evaluates an exact InferenceReplica spec/status snapshot.
 // A match is current desired-and-logical Instance count, not readiness,
 // durable parent intent, or attribution to a preceding scale action.
 package waitscale

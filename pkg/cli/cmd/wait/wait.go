@@ -29,10 +29,11 @@ import (
 
 var (
 	errFlags                = errors.New("InvalidWaitFlags")
-	errPredicate            = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready, runtime-sync=acknowledged, or held-revision=unheld")
+	errPredicate            = errors.New("InvalidWaitPredicate: require condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready|current, runtime-sync=acknowledged, or held-revision=unheld")
 	errRequestID            = errors.New("InvalidMigrationRequestID: require canonical UUID only with migration=terminal")
 	errRuntimeSyncRequestID = errors.New("InvalidRuntimeSyncRequestID: require canonical v4 UUID with runtime-sync=acknowledged")
 	errCountFlags           = errors.New("InvalidReadyReplicaFlags: require --component=engine|decoder|router and --replicas=N only with replicas=ready; N must be nonnegative")
+	errScaleFlags           = errors.New("InvalidCurrentReplicaFlags: require --component=engine|decoder|router and positive --replicas=N; --ir-name and --ir-uid must be paired")
 	errHeldTarget           = errors.New("InvalidHeldRevisionTarget: require --component, full --revision, --ir-name and --ir-uid only with held-revision=unheld")
 	errName                 = errors.New("InvalidInferenceServiceName")
 	errNamespace            = errors.New("InvalidNamespace")
@@ -51,6 +52,7 @@ type options struct {
 	requestedRollout        reportv1alpha1.WaitRequested
 	requestedMigration      bool
 	requestedReadyReplicas  bool
+	requestedScaleCurrent   bool
 	requestedRuntimeSync    bool
 	requestedHeldRevision   bool
 	requestID               string
@@ -75,7 +77,7 @@ func newCmd(f factory.Factory, streams genericiooptions.IOStreams, clock clock.C
 	cmd := &cobra.Command{
 		Use:   "wait INFERENCESERVICE --for=PREDICATE",
 		Short: "Wait for reported service, replica, or runtime-sync state",
-		Long: `Wait for a reported condition, rollout, migration, exact IR ready count, or
+		Long: `Wait for a reported condition, rollout, migration, exact IR count, or
 runtime-sync acknowledgment on one bound service.
 --for is required; omitted condition status means True. Missing Ready is
 NotRecorded, not the explicit Unknown status. The timeout defaults to 60s
@@ -96,6 +98,15 @@ availability, /scale convergence, or attribution to a preceding action.
 Like migration, this path polls bounded parent/IR reads every 5s.
 Reads admit at most 32 related IRs and 2,048 status rows; incomplete
 snapshots never satisfy an exact count.
+Use replicas=current with --component=engine|decoder|router and positive
+--replicas=N for exact current InferenceReplica spec.replicas and reported
+logical status.replicas. DenseV1 and ColumnarV2 instance status are decoded
+and checked; Ready is reported separately, not required for this predicate.
+Optional paired --ir-name and --ir-uid bind the wait to the original target
+from a scale ActionResult; otherwise the current parent scaleTargetRef selects
+one IR. This is status-oriented, not durable scale intent, readiness, or proof
+that a preceding action caused the state. It polls bounded named parent and
+exact IR GETs every 5s, without sibling LISTs or parent WATCHes.
 Use runtime-sync=acknowledged with the v4 --request-id from runtime sync.
 It matches only when the same current parent reports the exact annotation
 token acknowledged in status, an eligible managed pin, and no reported
@@ -124,8 +135,8 @@ Generation freshness is Unverifiable: reported Ready is not proof of
 current-spec or rollout convergence. No controller algorithms are reproduced.
 
 Ready and rollout use a named GET and exact-name WATCH with bounded named-GET
-polling fallback. Migration and IR count use a named parent GET plus bounded
-related-IR reads; they do not claim parent-watch observation of IR-only changes.
+polling fallback. Migration and IR count use bounded named parent/IR reads;
+they do not claim parent-watch observation of IR-only changes.
 Cancellation/deadlines are cooperative;
 external credential plugins or custom transports may ignore cancellation.
 One final typed report is emitted; no raw conditions or API objects are printed.`,
@@ -136,6 +147,7 @@ One final typed report is emitted; no raw conditions or API objects are printed.
   kubectl ome wait chat --for=rollout=failed -o wide
   kubectl ome wait chat --for=migration=terminal --request-id=12345678-1234-4234-8234-123456789abc -n prod
   kubectl ome wait chat --for=replicas=ready --component=engine --replicas=2 -n prod
+  kubectl ome wait chat --for=replicas=current --component=engine --replicas=2 -n prod
   kubectl ome wait chat --for=runtime-sync=acknowledged --request-id=123e4567-e89b-42d3-a456-426614174000 -n prod
   kubectl ome wait chat --for=held-revision=unheld --component=engine --revision=chat-engine-aaaaaaaa --ir-name=chat-engine --ir-uid=original-uid -n prod`,
 		Args: cobra.ExactArgs(1),
@@ -152,13 +164,13 @@ One final typed report is emitted; no raw conditions or API objects are printed.
 		},
 	}
 	cmd.SetFlagErrorFunc(func(*cobra.Command, error) error { return errFlags })
-	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready, runtime-sync=acknowledged, or held-revision=unheld")
+	cmd.Flags().StringVar(&o.forValue, "for", "", "Required: condition=Ready[=True|False|Unknown], rollout=stable|failed|rolled-back, migration=terminal, replicas=ready|current, runtime-sync=acknowledged, or held-revision=unheld")
 	cmd.Flags().StringVar(&o.requestID, "request-id", "", "Canonical UUID for migration=terminal; canonical v4 UUID for runtime-sync=acknowledged")
-	cmd.Flags().StringVar(&o.component, "component", "", "IR component, required for replicas=ready or held-revision=unheld: engine, decoder, router")
-	cmd.Flags().Int32Var(&o.replicas, "replicas", 0, "Exact nonnegative ready-replica count, required only for replicas=ready")
+	cmd.Flags().StringVar(&o.component, "component", "", "IR component for replica or held-revision waits: engine, decoder, router")
+	cmd.Flags().Int32Var(&o.replicas, "replicas", 0, "Exact count: nonnegative for replicas=ready; positive for replicas=current")
 	cmd.Flags().StringVar(&o.revision, "revision", "", "Full ISVC-COMPONENT-REVISIONHASH, required only for held-revision=unheld")
-	cmd.Flags().StringVar(&o.irName, "ir-name", "", "Exact ActionResult target.name, required only for held-revision=unheld")
-	cmd.Flags().StringVar(&o.irUID, "ir-uid", "", "Exact ActionResult target.uid, required only for held-revision=unheld")
+	cmd.Flags().StringVar(&o.irName, "ir-name", "", "Exact ActionResult target.name; required for held-revision, optional paired with --ir-uid for replicas=current")
+	cmd.Flags().StringVar(&o.irUID, "ir-uid", "", "Exact ActionResult target.uid; required for held-revision, optional paired with --ir-name for replicas=current")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 60*time.Second, "Positive wait timeout, at most 24h")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	return cmd
@@ -171,6 +183,7 @@ func (o *options) validate(name string) error {
 	o.requestedRollout = ""
 	o.requestedMigration = false
 	o.requestedReadyReplicas = false
+	o.requestedScaleCurrent = false
 	o.requestedRuntimeSync = false
 	o.requestedHeldRevision = false
 	o.wide = false
@@ -191,6 +204,8 @@ func (o *options) validate(name string) error {
 		o.requestedMigration = true
 	case "replicas=ready":
 		o.requestedReadyReplicas = true
+	case "replicas=current":
+		o.requestedScaleCurrent = true
 	case "runtime-sync=acknowledged":
 		o.requestedRuntimeSync = true
 	case "held-revision=unheld":
@@ -216,6 +231,13 @@ func (o *options) validate(name string) error {
 			(o.component != "engine" && o.component != "decoder" && o.component != "router") {
 			return errCountFlags
 		}
+	} else if o.requestedScaleCurrent {
+		if !o.componentSet || !o.replicasSet || o.replicas < 1 ||
+			(o.component != "engine" && o.component != "decoder" && o.component != "router") ||
+			o.irNameSet != o.irUIDSet ||
+			(o.irNameSet && (len(utilvalidation.IsDNS1123Subdomain(o.irName)) > 0 || !waitheld.ValidIdentity(o.irUID))) {
+			return errScaleFlags
+		}
 	} else if o.requestedHeldRevision {
 		if !o.componentSet || o.replicasSet || !o.revisionSet || !o.irNameSet || !o.irUIDSet ||
 			!waitheld.ValidTarget(waitheld.Target{Namespace: "default", ParentName: name, Component: o.component,
@@ -225,7 +247,8 @@ func (o *options) validate(name string) error {
 	} else if o.componentSet || o.replicasSet {
 		return errCountFlags
 	}
-	if !o.requestedHeldRevision && (o.revisionSet || o.irNameSet || o.irUIDSet) {
+	if !o.requestedHeldRevision && o.revisionSet ||
+		!o.requestedHeldRevision && !o.requestedScaleCurrent && (o.irNameSet || o.irUIDSet) {
 		return errHeldTarget
 	}
 	if o.timeout <= 0 || o.timeout > 24*time.Hour {
@@ -259,6 +282,9 @@ func (o *options) run(ctx context.Context, f factory.Factory, name string) error
 	}
 	if o.requestedReadyReplicas {
 		return o.runReadyReplicas(ctx, f, name, namespace)
+	}
+	if o.requestedScaleCurrent {
+		return o.runScaleCurrent(ctx, f, name, namespace)
 	}
 	if o.requestedRuntimeSync {
 		return o.runRuntimeSync(ctx, f, name, namespace)
