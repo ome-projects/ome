@@ -2,12 +2,14 @@ package waitir_test
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ktesting "k8s.io/client-go/testing"
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -100,4 +102,129 @@ func TestReadySourceUnobservedZeroNeverMatches(t *testing.T) {
 	decision, observation := new(waitir.Evaluator).Evaluate(snapshot.Value, v1alpha1.RuntimeComponentEngine, 0)
 	require.False(t, decision.Matched)
 	require.Nil(t, observation.ReadyReplicas)
+}
+
+func TestReadySourceRefusesWatchAndDecode(t *testing.T) {
+	source := waitir.NewSource(nil, "prod", "chat", nil)
+	stream, err := source.Watch(context.Background(), "11")
+	require.Nil(t, stream)
+	require.ErrorContains(t, err, "invalid InferenceReplica ready-count wait source")
+
+	snapshot, err := source.Decode(&ome.InferenceReplica{})
+	require.Equal(t, "", string(snapshot.UID))
+	require.ErrorContains(t, err, "invalid InferenceReplica ready-count wait source")
+}
+
+func TestReadySourceDefaultsNilClockToCurrentTime(t *testing.T) {
+	parent, ir := readySourceFixture(1)
+	client := omefake.NewSimpleClientset(parent, ir)
+	source := waitir.NewSource(client.OmeV1beta1(), "prod", "chat", nil)
+	before := time.Now().UTC()
+	snapshot, err := source.Get(context.Background())
+	after := time.Now().UTC()
+	require.NoError(t, err)
+	require.False(t, snapshot.Value.CollectedAt.Before(before))
+	require.False(t, snapshot.Value.CollectedAt.After(after))
+}
+
+func TestReadySourceRejectsInvalidInputWithoutReads(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*omefake.Clientset) (*waitir.Source, context.Context)
+	}{
+		{name: "nil source", build: func(*omefake.Clientset) (*waitir.Source, context.Context) { return nil, context.Background() }},
+		{name: "nil context", build: func(client *omefake.Clientset) (*waitir.Source, context.Context) {
+			return waitir.NewSource(client.OmeV1beta1(), "prod", "chat", time.Now), nil
+		}},
+		{name: "nil client", build: func(*omefake.Clientset) (*waitir.Source, context.Context) {
+			return waitir.NewSource(nil, "prod", "chat", time.Now), context.Background()
+		}},
+		{name: "invalid namespace", build: func(client *omefake.Clientset) (*waitir.Source, context.Context) {
+			return waitir.NewSource(client.OmeV1beta1(), "Prod", "chat", time.Now), context.Background()
+		}},
+		{name: "invalid name", build: func(client *omefake.Clientset) (*waitir.Source, context.Context) {
+			return waitir.NewSource(client.OmeV1beta1(), "prod", "Chat", time.Now), context.Background()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := omefake.NewSimpleClientset()
+			source, ctx := tc.build(client)
+			snapshot, err := source.Get(ctx)
+			require.ErrorContains(t, err, "invalid InferenceReplica ready-count wait source")
+			require.Equal(t, "", string(snapshot.UID))
+			require.Empty(t, client.Actions())
+		})
+	}
+}
+
+func TestReadySourcePropagatesCanceledContextAndReadErrors(t *testing.T) {
+	parent, ir := readySourceFixture(1)
+	t.Run("pre-canceled", func(t *testing.T) {
+		client := omefake.NewSimpleClientset(parent, ir)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := waitir.NewSource(client.OmeV1beta1(), "prod", "chat", time.Now).Get(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, client.Actions())
+	})
+	t.Run("canceled during parent GET", func(t *testing.T) {
+		client := omefake.NewSimpleClientset(parent, ir)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client.PrependReactor("get", "inferenceservices", func(ktesting.Action) (bool, runtime.Object, error) {
+			cancel()
+			return true, parent.DeepCopy(), nil
+		})
+		_, err := waitir.NewSource(client.OmeV1beta1(), "prod", "chat", time.Now).Get(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Len(t, client.Actions(), 1)
+	})
+	t.Run("parent GET error", func(t *testing.T) {
+		client := omefake.NewSimpleClientset(parent, ir)
+		readErr := errors.New("parent read failed")
+		client.PrependReactor("get", "inferenceservices", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, readErr
+		})
+		_, err := waitir.NewSource(client.OmeV1beta1(), "prod", "chat", time.Now).Get(context.Background())
+		require.ErrorIs(t, err, readErr)
+		require.Len(t, client.Actions(), 1)
+	})
+	t.Run("IR LIST error", func(t *testing.T) {
+		client := omefake.NewSimpleClientset(parent, ir)
+		readErr := errors.New("replica list failed")
+		client.PrependReactor("list", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, readErr
+		})
+		_, err := waitir.NewSource(client.OmeV1beta1(), "prod", "chat", time.Now).Get(context.Background())
+		require.ErrorIs(t, err, readErr)
+		require.Len(t, client.Actions(), 2)
+	})
+}
+
+func TestReadySourceRejectsInvalidParentBeforeIRRead(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*ome.InferenceService)
+	}{
+		{name: "wrong name", change: func(p *ome.InferenceService) { p.Name = "other" }},
+		{name: "wrong namespace", change: func(p *ome.InferenceService) { p.Namespace = "other" }},
+		{name: "missing UID", change: func(p *ome.InferenceService) { p.UID = "" }},
+		{name: "missing resource version", change: func(p *ome.InferenceService) { p.ResourceVersion = "" }},
+		{name: "zero generation", change: func(p *ome.InferenceService) { p.Generation = 0 }},
+		{name: "wrong kind", change: func(p *ome.InferenceService) { p.Kind = "Pod" }},
+		{name: "wrong API version", change: func(p *ome.InferenceService) { p.APIVersion = "v1" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, ir := readySourceFixture(1)
+			client := omefake.NewSimpleClientset(parent, ir)
+			response := parent.DeepCopy()
+			tc.change(response)
+			client.PrependReactor("get", "inferenceservices", func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, response, nil
+			})
+			_, err := waitir.NewSource(client.OmeV1beta1(), "prod", "chat", time.Now).Get(context.Background())
+			require.ErrorContains(t, err, "invalid InferenceReplica ready-count wait source")
+			require.Len(t, client.Actions(), 1)
+		})
+	}
 }
