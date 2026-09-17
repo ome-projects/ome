@@ -20,7 +20,6 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      priorityClassName: system-node-critical
       serviceAccountName: ome-model-agent
       affinity:
         nodeAffinity:
@@ -51,7 +50,9 @@ spec:
         - '2'
         - --num-high-priority-worker
         - '1'
-        - --same-path-wait-timeout
+        - --task-scheduler-capacity
+        - '4096'
+        - --same-path-reuse-wait-timeout
         - 30m
         - --concurrency
         - '2'
