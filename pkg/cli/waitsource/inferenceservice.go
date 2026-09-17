@@ -32,7 +32,13 @@ func NewInferenceService(config *rest.Config, namespace, name string) (*Inferenc
 	if config == nil || len(utilvalidation.IsDNS1123Label(namespace)) > 0 || len(utilvalidation.IsDNS1123Subdomain(name)) > 0 {
 		return nil, errSource
 	}
-	cp := rest.CopyConfig(config)
+	// CopyConfig normalizes ExecProvider.Config in place. Detach the caller's
+	// provider before that first copy, including on construction failure.
+	owned := *config
+	if config.ExecProvider != nil {
+		owned.ExecProvider = config.ExecProvider.DeepCopy()
+	}
+	cp := rest.CopyConfig(&owned)
 	scheme := runtime.NewScheme()
 	if err := ome.AddToScheme(scheme); err != nil {
 		return nil, errSource
@@ -49,7 +55,15 @@ func NewInferenceService(config *rest.Config, namespace, name string) (*Inferenc
 		cp.Timeout = 10 * time.Second
 	}
 	cp.Wrap(func(base http.RoundTripper) http.RoundTripper { return boundedTransport{base: base} })
-	client, err := rest.RESTClientFor(cp)
+	selected, err := rest.HTTPClientFor(cp)
+	if err != nil {
+		return nil, errSource
+	}
+	// A named read must not turn into an unselected read via any redirect.
+	// Use a fresh client rather than changing a shared or default client.
+	httpClient := &http.Client{Transport: selected.Transport, Timeout: cp.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client, err := rest.RESTClientForConfigAndClient(cp, httpClient)
 	if err != nil {
 		return nil, errSource
 	}

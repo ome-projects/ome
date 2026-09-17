@@ -27,17 +27,22 @@ type Source[T any] interface {
 type Reason string
 
 const (
-	ReasonMatched           Reason = "ConditionMatched"
-	ReasonNotRecorded       Reason = "ConditionNotRecorded"
-	ReasonNotMatched        Reason = "ConditionNotMatched"
-	ReasonInvalidCondition  Reason = "InvalidCondition"
-	ReasonInvalidIdentity   Reason = "InvalidIdentity"
-	ReasonInspectionLimit   Reason = "ConditionInspectionLimit"
-	ReasonAcquisitionFailed Reason = "AcquisitionFailed"
-	ReasonBudgetExceeded    Reason = "AcquisitionBudgetExceeded"
-	ReasonEventLimit        Reason = "EventBudgetExceeded"
-	ReasonCanceled          Reason = "Canceled"
-	ReasonInvalidOptions    Reason = "InvalidOptions"
+	ReasonMatched                Reason = "ConditionMatched"
+	ReasonNotRecorded            Reason = "ConditionNotRecorded"
+	ReasonNotMatched             Reason = "ConditionNotMatched"
+	ReasonInvalidCondition       Reason = "InvalidCondition"
+	ReasonInvalidIdentity        Reason = "InvalidIdentity"
+	ReasonInspectionLimit        Reason = "ConditionInspectionLimit"
+	ReasonAcquisitionFailed      Reason = "AcquisitionFailed"
+	ReasonBudgetExceeded         Reason = "AcquisitionBudgetExceeded"
+	ReasonEventLimit             Reason = "EventBudgetExceeded"
+	ReasonCanceled               Reason = "Canceled"
+	ReasonInvalidOptions         Reason = "InvalidOptions"
+	ReasonRolloutMatched         Reason = "RolloutMatched"
+	ReasonRolloutNotMatched      Reason = "RolloutNotMatched"
+	ReasonRolloutNotRecorded     Reason = "RolloutNotRecorded"
+	ReasonInvalidRollout         Reason = "InvalidRollout"
+	ReasonRolloutInspectionLimit Reason = "RolloutInspectionLimit"
 )
 
 type Error struct{ Reason Reason }

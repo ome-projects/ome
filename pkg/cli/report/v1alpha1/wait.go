@@ -17,9 +17,12 @@ const WaitReportKind = "WaitReport"
 type WaitRequested string
 
 const (
-	WaitRequestedTrue    WaitRequested = "Ready=True"
-	WaitRequestedFalse   WaitRequested = "Ready=False"
-	WaitRequestedUnknown WaitRequested = "Ready=Unknown"
+	WaitRequestedTrue              WaitRequested = "Ready=True"
+	WaitRequestedFalse             WaitRequested = "Ready=False"
+	WaitRequestedUnknown           WaitRequested = "Ready=Unknown"
+	WaitRequestedRolloutStable     WaitRequested = "Rollout=Stable"
+	WaitRequestedRolloutFailed     WaitRequested = "Rollout=Failed"
+	WaitRequestedRolloutRolledBack WaitRequested = "Rollout=RolledBack"
 )
 
 type WaitCounts struct {
@@ -34,6 +37,7 @@ type WaitContent struct {
 	Outcome             waitengine.Outcome        `json:"outcome"`
 	Reason              waitengine.Reason         `json:"reason"`
 	Observed            waitpredicate.Observation `json:"observed"`
+	Rollout             *WaitRolloutObservation   `json:"rollout,omitempty"`
 	Evidence            EvidenceLevel             `json:"evidence"`
 	ElapsedMilliseconds int64                     `json:"elapsedMilliseconds"`
 	Counts              WaitCounts                `json:"counts"`
@@ -57,7 +61,7 @@ func (r WaitReport) Canonical() WaitReport {
 	return r
 }
 func (c WaitContent) Canonical() WaitContent {
-	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown {
+	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() {
 		c.Requested = "Unknown"
 	}
 	switch c.Outcome {
@@ -67,6 +71,10 @@ func (c WaitContent) Canonical() WaitContent {
 	}
 	switch c.Reason {
 	case waitengine.ReasonMatched, waitengine.ReasonNotRecorded, waitengine.ReasonNotMatched, waitengine.ReasonInvalidCondition:
+	case waitengine.ReasonRolloutMatched, waitengine.ReasonRolloutNotMatched, waitengine.ReasonRolloutNotRecorded, waitengine.ReasonInvalidRollout:
+		if !c.Requested.IsRollout() {
+			c.Reason = "PredicateUnmet"
+		}
 	default:
 		c.Reason = "PredicateUnmet"
 	}
@@ -115,6 +123,20 @@ func (c WaitContent) Canonical() WaitContent {
 	c.Counts.Polls = max(0, min(c.Counts.Polls, 17280))
 	c.Counts.Events = max(0, min(c.Counts.Events, 4096))
 	c.Counts.Observations = max(0, min(c.Counts.Observations, 21378))
+	if c.Requested.IsRollout() {
+		if c.Rollout == nil {
+			c.Rollout = &WaitRolloutObservation{Validity: "Unavailable", Inspection: WaitRolloutInspection{State: "NotInspected"}}
+		}
+		rollout := c.Rollout.Canonical()
+		c.Rollout = &rollout
+		c.Observed = waitpredicate.Observation{Status: "NotRecorded", Validity: "Unavailable", GenerationFreshness: "Unverifiable", Inspection: waitpredicate.Inspection{State: "NotInspected", Warnings: []waitpredicate.Warning{}}}
+		c.Evidence = EvidenceReported
+		if rollout.Validity == "Unavailable" {
+			c.Evidence = EvidenceUnavailable
+		}
+	} else {
+		c.Rollout = nil
+	}
 	return c
 }
 func (r WaitReport) Table() report.Table {
@@ -144,6 +166,32 @@ func (r WaitReport) table(wide bool) report.Table {
 		{"Elapsed milliseconds", strconv.FormatInt(c.ElapsedMilliseconds, 10)},
 		{"GET / WATCH / polls", fmt.Sprintf("%d / %d / %d", c.Counts.Gets, c.Counts.Watches, c.Counts.Polls)},
 		{"Events / observations", fmt.Sprintf("%d / %d", c.Counts.Events, c.Counts.Observations)},
+	}
+	if c.Rollout != nil {
+		o := c.Rollout
+		rows = append([][]string{
+			{"Service", r.Metadata.Namespace + "/" + r.Metadata.Name}, {"Requested", string(c.Requested)}, {"Outcome", string(c.Outcome)},
+			{"Reported rollout", string(o.Summary.ReportedState)}, {"Rollout state", string(o.Summary.State)}, {"Rollout validity", o.Validity},
+			{"Reason", string(c.Reason)}, {"Evidence", string(c.Evidence)}, {"Rollout epoch", string(o.Summary.Epoch)}, {"Coordination Ready", string(o.Summary.CoordinationReady)},
+			{"Freshness caveat", "Reported rollout; not current-spec convergence"}, {"Attribution caveat", "Same-object state; not action attribution"},
+			{"Rollout inspection", o.Inspection.State}, {"Expansion", "JSON/YAML retain complete safe report values"},
+		}, rows[10:]...)
+		for _, issue := range o.Issues {
+			value := string(issue.Code)
+			if issue.Group != nil {
+				value += fmt.Sprintf(" group=%d", *issue.Group)
+			}
+			if issue.Component != "" {
+				value += " component=" + string(issue.Component)
+			}
+			rows = append(rows, []string{"Rollout issue", value})
+		}
+		for _, warning := range o.Warnings {
+			rows = append(rows, []string{"Inspection warning", string(warning)})
+		}
+		if wide {
+			rows = append(rows, []string{"Inspected conditions", strconv.Itoa(o.Inspection.Conditions)}, []string{"Inspected components", strconv.Itoa(o.Inspection.Components)}, []string{"Inspected live groups", strconv.Itoa(o.Inspection.Groups)}, []string{"Pinned groups", strconv.Itoa(o.Inspection.PinnedGroups)}, []string{"Inspected targets", strconv.Itoa(o.Inspection.Targets)})
+		}
 	}
 	for _, warning := range c.Observed.Inspection.Warnings {
 		rows = append(rows, []string{"Inspection warning", string(warning)})
