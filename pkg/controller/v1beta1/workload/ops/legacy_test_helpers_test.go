@@ -220,6 +220,7 @@ func legacyInstanceStatuses(c client.Client, isvc *v1beta1.InferenceService, com
 			TargetRevision:  s.TargetRevision,
 			ActiveOrdinal:   s.ActiveOrdinal,
 			Operation:       legacyFromV1beta1Op(s.Operation),
+			LastFailure:     legacyFromV1beta1Termination(s.LastFailure),
 		})
 	}
 	return out
@@ -263,6 +264,7 @@ func legacyMutateInstance(c client.Client, isvc *v1beta1.InferenceService, compo
 				TargetRevision:  s.TargetRevision,
 				ActiveOrdinal:   s.ActiveOrdinal,
 				Operation:       legacyFromV1beta1Op(s.Operation),
+				LastFailure:     legacyFromV1beta1Termination(s.LastFailure),
 			}
 		}
 		if !mutate(&w) {
@@ -276,6 +278,7 @@ func legacyMutateInstance(c client.Client, isvc *v1beta1.InferenceService, compo
 			TargetRevision:  w.TargetRevision,
 			ActiveOrdinal:   w.ActiveOrdinal,
 			Operation:       legacyToV1beta1Op(w.Operation),
+			LastFailure:     legacyToV1beta1Termination(w.LastFailure),
 		}
 		if pos == -1 {
 			ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, updated)
@@ -298,6 +301,45 @@ func legacyMutateInstance(c client.Client, isvc *v1beta1.InferenceService, compo
 	}
 }
 
+// legacyFromV1beta1Termination / legacyToV1beta1Termination round-trip
+// LastFailure so fixtures observe the failure diagnostics the
+// dispositions record, not just the phase flip.
+func legacyFromV1beta1Termination(t *v1beta1.InstanceTermination) *workload.InstanceTermination {
+	if t == nil {
+		return nil
+	}
+	out := &workload.InstanceTermination{
+		PodName:       t.PodName,
+		ContainerName: t.ContainerName,
+		Reason:        t.Reason,
+		Message:       t.Message,
+		Time:          t.Time,
+	}
+	if t.ExitCode != nil {
+		e := *t.ExitCode
+		out.ExitCode = &e
+	}
+	return out
+}
+
+func legacyToV1beta1Termination(t *workload.InstanceTermination) *v1beta1.InstanceTermination {
+	if t == nil {
+		return nil
+	}
+	out := &v1beta1.InstanceTermination{
+		PodName:       t.PodName,
+		ContainerName: t.ContainerName,
+		Reason:        t.Reason,
+		Message:       t.Message,
+		Time:          t.Time,
+	}
+	if t.ExitCode != nil {
+		e := *t.ExitCode
+		out.ExitCode = &e
+	}
+	return out
+}
+
 func legacyFromV1beta1Op(op *v1beta1.InstanceOperation) *workload.InstanceOperation {
 	if op == nil {
 		return nil
@@ -311,6 +353,7 @@ func legacyFromV1beta1Op(op *v1beta1.InstanceOperation) *workload.InstanceOperat
 		Deadline:       op.Deadline,
 		TargetRevision: op.TargetRevision,
 		Reason:         op.Reason,
+		Waiting:        op.Waiting,
 		RequestUUID:    op.RequestUUID,
 		// SurgeIndex round-trips so gang-surge fixtures (Op.Step=Surge with
 		// a SurgeIndex pointer) survive the projection. Without it the
@@ -334,6 +377,7 @@ func legacyToV1beta1Op(op *workload.InstanceOperation) *v1beta1.InstanceOperatio
 		Deadline:       op.Deadline,
 		TargetRevision: op.TargetRevision,
 		Reason:         op.Reason,
+		Waiting:        op.Waiting,
 		RequestUUID:    op.RequestUUID,
 		SurgeIndex:     op.SurgeIndex,
 	}

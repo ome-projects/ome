@@ -212,6 +212,7 @@ func InstanceOperationToWorkload(v *v1beta1.InstanceOperation) *workload.Instanc
 		RetryCount:     v.RetryCount,
 		TargetRevision: v.TargetRevision,
 		Reason:         v.Reason,
+		Waiting:        v.Waiting,
 		FromNode:       v.FromNode,
 		RequestUUID:    v.RequestUUID,
 	}
@@ -243,6 +244,7 @@ func InstanceOperationFromWorkload(w *workload.InstanceOperation) *v1beta1.Insta
 		RetryCount:     w.RetryCount,
 		TargetRevision: w.TargetRevision,
 		Reason:         w.Reason,
+		Waiting:        w.Waiting,
 		FromNode:       w.FromNode,
 		RequestUUID:    w.RequestUUID,
 	}

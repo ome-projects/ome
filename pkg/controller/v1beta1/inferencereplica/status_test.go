@@ -1662,6 +1662,56 @@ func TestComputeRolloutStalledCondition(t *testing.T) {
 	if computeRolloutStalledCondition(mk()).Type == InferenceReplicaConditionReady {
 		t.Errorf("RolloutStalled must be a distinct condition type from Ready")
 	}
+
+	// Failure the current Operation post-dates → retry, not a wedge.
+	old := metav1.NewTime(time.Now().Add(-33 * time.Hour))
+	s4 := mk()
+	s4.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, RunningRevision: target},
+		{
+			Index:           1,
+			RunningRevision: cur,
+			LastFailure:     &v1beta1.InstanceTermination{Reason: "DeadlineExceeded", Time: old},
+			Operation: &v1beta1.InstanceOperation{
+				Type:           v1beta1.InstanceOperationUpdate,
+				Step:           "Drain",
+				StartedAt:      metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+				LastProgressAt: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+				Deadline:       metav1.NewTime(time.Now().Add(2 * time.Hour)),
+				TargetRevision: target,
+			},
+		},
+	}
+	if c := computeRolloutStalledCondition(s4); c.Status != metav1.ConditionFalse {
+		t.Errorf("failure older than the in-flight Operation must not stall: got %s (%s)", c.Status, c.Message)
+	}
+
+	// Failure during the in-flight Operation → still stalls.
+	s5 := mk()
+	s5.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{
+			Index:           0,
+			RunningRevision: cur,
+			LastFailure:     &v1beta1.InstanceTermination{Reason: "CrashLoopBackOff", Time: metav1.NewTime(time.Now())},
+			Operation: &v1beta1.InstanceOperation{
+				Type:           v1beta1.InstanceOperationUpdate,
+				StartedAt:      metav1.NewTime(time.Now().Add(-30 * time.Minute)),
+				TargetRevision: target,
+			},
+		},
+	}
+	if c := computeRolloutStalledCondition(s5); c.Status != metav1.ConditionTrue {
+		t.Errorf("failure during the in-flight Operation must still stall: got %s", c.Status)
+	}
+
+	// No Operation → unchanged, still stalls.
+	s6 := mk()
+	s6.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, RunningRevision: cur, LastFailure: &v1beta1.InstanceTermination{Reason: "CrashLoopBackOff", Time: old}},
+	}
+	if c := computeRolloutStalledCondition(s6); c.Status != metav1.ConditionTrue {
+		t.Errorf("failure with no in-flight Operation must stall: got %s", c.Status)
+	}
 }
 
 // TestNextRolloutHold_StableSinceAcrossIdenticalGateTarget pins the

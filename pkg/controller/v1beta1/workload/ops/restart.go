@@ -107,8 +107,11 @@ func DetectRestartTriggerWithPods(input workload.ReconcileInput, plan workload.C
 			return true, fmt.Sprintf("pod %s Failed", pod.Name)
 		}
 	}
-	if int32(len(instancePods)) < expected {
-		return true, fmt.Sprintf("pod count %d below desired %d", len(instancePods), expected)
+	// Terminal pods are absent for the count: a Succeeded pod, or a Failed
+	// one that carried no termination detail, still leaves the Instance
+	// short of its desired set.
+	if live := len(query.ExcludeTerminalPods(instancePods)); int32(live) < expected {
+		return true, fmt.Sprintf("pod count %d below desired %d", live, expected)
 	}
 	return false, ""
 }
@@ -149,22 +152,23 @@ func instanceLostGangMember(input workload.ReconcileInput, plan workload.Compone
 	if isMigrateOwnedStatus(s) {
 		return "", false
 	}
-	// A preserved non-Create operation means that pass is still the owner
-	// even though the phase no longer says so — a spent Restart attempt
-	// parked at Failed must not re-arm itself.
-	if s.Operation != nil && s.Operation.Type != workload.InstanceOperationCreate {
+	// A preserved Update or Migrate operation keeps its own pass as owner
+	// whatever the phase says. A Restart operation parked at Failed is a
+	// spent attempt, not an owner: its deadline elapsed with a member still
+	// missing, and only another Restart can rebuild the gang as a whole
+	// (incarnation bump, survivors drained), so it may re-arm. Each cycle
+	// is bounded by the attempt deadline.
+	if s.Operation != nil && s.Operation.Type != workload.InstanceOperationCreate &&
+		!(s.Operation.Type == workload.InstanceOperationRestart && s.Phase == workload.InstancePhaseFailed) {
 		return "", false
 	}
 	createCommitted := s.Operation != nil && s.Operation.Step == createStepCreatePods
 	if !createCommitted && s.Phase != workload.InstancePhaseFailed && s.PodCount < expected {
 		return "", false
 	}
-	live := 0
-	for _, pod := range pods {
-		if pod != nil {
-			live++
-		}
-	}
+	// A terminal pod is not a survivor: it holds no capacity and pins no
+	// topology, so it counts as lost, not live.
+	live := len(query.ExcludeTerminalPods(pods))
 	if live == 0 || int32(live) >= expected {
 		return "", false
 	}
@@ -352,7 +356,17 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 	newInst.Incarnation = newInc
 
 	desired := expectedPodNamesForInstance(input, plan, newInst)
-	existingByName := query.IndexPodsByName(newPods)
+	// A new-incarnation pod that died (rejected at admission, evicted) is
+	// absent: it holds the stable name but will never run. Recycle it so
+	// the name frees up; its target is created on a later pass.
+	recycling, err := recycleTerminalPods(ctx, deps, input, inst.Index, workload.InstanceOperationRestart, terminalTargetPods(newPods, desired))
+	if err != nil {
+		return false, fmt.Errorf("Restart: recycle terminal pods (instance=%d): %w", inst.Index, err)
+	}
+	if recycling {
+		return false, nil
+	}
+	existingByName := query.IndexPodsByName(query.ExcludeTerminalPods(newPods))
 	missing := make([]podTarget, 0)
 	for _, target := range desired {
 		if _, ok := existingByName[target.Name]; !ok {
@@ -363,7 +377,10 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 		if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index) {
 			return false, nil
 		}
-		if _, err := createMissingPods(ctx, deps, input, plan, newInst, inst.Index, missing, revisionHashForInstance(input, inst.Index)); err != nil {
+		if _, err := createMissingPods(ctx, deps, input, plan, newInst, inst.Index, missing, revisionForInstance(input, inst.Index)); err != nil {
+			if createRejectionHandled(err) {
+				return false, nil
+			}
 			return false, err
 		}
 		return false, nil
@@ -405,6 +422,13 @@ func patchInstanceStatusRestarting(ctx context.Context, input workload.Reconcile
 			observedIncarnation = s.Incarnation
 			return false
 		}
+		// An Instance that never ran a revision has only the revision its
+		// interrupted attempt pinned; the rebuilt pods must carry it so the
+		// per-revision Service selects them.
+		pinned := ""
+		if s.RunningRevision == "" && s.TargetRevision == "" && s.Operation != nil {
+			pinned = s.Operation.TargetRevision
+		}
 		// Bump first so old pods can be distinguished from the new set.
 		if s.Incarnation == 0 {
 			s.Incarnation = 1
@@ -421,6 +445,7 @@ func patchInstanceStatusRestarting(ctx context.Context, input workload.Reconcile
 			StartedAt:      now,
 			LastProgressAt: now,
 			Deadline:       metav1.NewTime(now.Add(timeout)),
+			TargetRevision: pinned,
 		}
 		return true
 	})
@@ -495,24 +520,28 @@ func sameTermination(a, b *workload.InstanceTermination) bool {
 	}
 }
 
-// revisionHashForInstance returns the revision hash to stamp on pods
+// revisionForInstance returns the revision to stamp on pods
 // being recreated for one Instance. Restart keeps the Instance on its
 // existing revision, so we read RunningRevision from the observed
-// status. Returns "" when no per-Instance running revision is recorded
-// (initial-create paths shouldn't hit Restart, but the empty fallback
-// keeps the function total).
-func revisionHashForInstance(input workload.ReconcileInput, idx int32) string {
+// status. An Instance that never ran a revision (a gang rebuilt after
+// losing a member while still forming) has only the revision its attempt
+// pinned on the Operation. Returns the zero RevisionID when nothing
+// records a revision.
+func revisionForInstance(input workload.ReconcileInput, idx int32) query.RevisionID {
 	s := findInstanceStatus(input.ObservedState.InstanceStatuses, idx)
 	if s == nil {
-		return ""
+		return query.RevisionID{}
 	}
 	if s.RunningRevision != "" {
-		return query.RevisionFromName(s.RunningRevision).Hash()
+		return query.RevisionFromName(s.RunningRevision)
 	}
 	if s.TargetRevision != "" {
-		return query.RevisionFromName(s.TargetRevision).Hash()
+		return query.RevisionFromName(s.TargetRevision)
 	}
-	return ""
+	if s.Operation != nil && s.Operation.TargetRevision != "" {
+		return query.RevisionFromName(s.Operation.TargetRevision)
+	}
+	return query.RevisionID{}
 }
 
 // runnerRestartedSinceReady reports whether pod's runner container carries

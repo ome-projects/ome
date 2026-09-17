@@ -115,12 +115,13 @@ func gangSurgeUpdate(ctx context.Context, deps workload.Deps, input workload.Rec
 			promotedSurgeTarget = true
 		}
 		if startingSurge && !promotedTarget && surgeMarker.Operation.Step == workload.UpdateStepGangSurgeTargetCleanup {
-			failedTargetRev, failureReason := "", ""
+			failedTargetRev, failureReason, workloadCaused := "", "", false
 			if src.Phase == workload.InstancePhaseFailed {
 				failedTargetRev = src.Operation.TargetRevision
 				failureReason = instanceFailureReason(src, "gang surge abandoned before the target became Ready")
+				workloadCaused = instanceFailureWorkloadCaused(src)
 			}
-			return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, surgeIdx, src.RunningRevision, failedTargetRev, failureReason)
+			return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, surgeIdx, src.RunningRevision, failedTargetRev, failureReason, workloadCaused)
 		}
 		if !promotedTarget && (input.ApplyInstanceMutationsWithRetryBlock != nil || input.FinalizeInstanceResources != nil) {
 			resolution, err := restoreInstanceStatusGangSurgeTarget(ctx, input, src, surgeIdx, surgeTargetName, plan.InstanceReadyTimeout)
@@ -131,12 +132,13 @@ func gangSurgeUpdate(ctx context.Context, deps workload.Deps, input workload.Rec
 				if !startingSurge {
 					return false, nil
 				}
-				failedTargetRev, failureReason := "", ""
+				failedTargetRev, failureReason, workloadCaused := "", "", false
 				if src.Phase == workload.InstancePhaseFailed {
 					failedTargetRev = src.Operation.TargetRevision
 					failureReason = instanceFailureReason(src, "gang surge abandoned before the target became Ready")
+					workloadCaused = instanceFailureWorkloadCaused(src)
 				}
-				return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, surgeIdx, src.RunningRevision, failedTargetRev, failureReason)
+				return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, surgeIdx, src.RunningRevision, failedTargetRev, failureReason, workloadCaused)
 			}
 			if resolution != gangSurgeTargetMarkerActive {
 				return false, nil
@@ -149,7 +151,8 @@ func gangSurgeUpdate(ctx context.Context, deps workload.Deps, input workload.Rec
 	if startingSurge && !promotedSurgeTarget && src.Phase == workload.InstancePhaseFailed {
 		// Record failure against the revision owned by this operation.
 		return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, *src.Operation.SurgeIndex, src.RunningRevision,
-			src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned before the target became Ready"))
+			src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned before the target became Ready"),
+			instanceFailureWorkloadCaused(src))
 	}
 
 	// Retire an incomplete replacement when the desired revision changes. A
@@ -161,7 +164,7 @@ func gangSurgeUpdate(ctx context.Context, deps workload.Deps, input workload.Rec
 		}
 		if int32(len(surgePods)) < inst.TotalPods() || !query.AllPodsRuntimeReady(surgePods) {
 			// A spec change is not a failure of the retired revision.
-			return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, *src.Operation.SurgeIndex, src.RunningRevision, "", "")
+			return abandonFailedGangSurge(ctx, deps, input, plan, sourceIdx, *src.Operation.SurgeIndex, src.RunningRevision, "", "", false)
 		}
 	}
 
@@ -237,7 +240,10 @@ func gangSurgeUpdate(ctx context.Context, deps workload.Deps, input workload.Rec
 		// Stamp the pinned in-flight rev hash (NOT the latest target) so
 		// the gang's pods match the revision this surge committed to and
 		// the per-revision drain Service selects them. See surgeTargetName.
-		if _, cerr := createMissingPods(ctx, deps, input, renderPlan, surgeInst, surgeIdx, missing, query.RevisionFromName(surgeTargetName).Hash()); cerr != nil {
+		if _, cerr := createMissingPods(ctx, deps, input, renderPlan, surgeInst, surgeIdx, missing, query.RevisionFromName(surgeTargetName)); cerr != nil {
+			if createRejectionHandled(cerr) {
+				return false, nil
+			}
 			return false, fmt.Errorf("create surge gang (instance=%d): %w", surgeIdx, cerr)
 		}
 		return false, nil
@@ -639,8 +645,11 @@ func cloneInstanceTopologyKeys(in map[int32]string) map[int32]string {
 
 // abandonFailedGangSurge drains and finalizes a retired replacement, then
 // atomically removes its marker and resets the source. A failed revision also
-// records its RetryBlock in that status transition.
-func abandonFailedGangSurge(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, sourceIdx, surgeIdx int32, sourceRunningRev, failedTargetRev, failureReason string) (bool, error) {
+// records its RetryBlock in that status transition: workloadCaused (the
+// source's LastFailure evidence, see instanceFailureWorkloadCaused) decides
+// whether the wave charges the revision's retry ladder or only paces the
+// next attempt, and both abandon tails apply that one verdict.
+func abandonFailedGangSurge(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, sourceIdx, surgeIdx int32, sourceRunningRev, failedTargetRev, failureReason string, workloadCaused bool) (bool, error) {
 	ns, owner, comp := input.Key.Namespace, input.Key.OwnerName, plan.Component
 	guardTerminalMarker := input.ApplyInstanceMutationsWithRetryBlock != nil || input.FinalizeInstanceResources != nil
 	source := findInstanceStatus(input.ObservedState.InstanceStatuses, sourceIdx)
@@ -701,7 +710,7 @@ func abandonFailedGangSurge(ctx context.Context, deps workload.Deps, input workl
 	// mistaken for an interrupted target-stamp and restored as active work.
 	if guardTerminalMarker {
 		complete, err := finalizeAndResetAbandonedGangSurge(
-			ctx, deps, input, source, marker, surgeIdx, sourceRunningRev, failedTargetRev, failureReason,
+			ctx, deps, input, source, marker, surgeIdx, sourceRunningRev, failedTargetRev, failureReason, workloadCaused,
 		)
 		if err != nil {
 			return false, fmt.Errorf("finalize abandoned gang surge (instance=%d): %w", surgeIdx, err)
@@ -717,7 +726,7 @@ func abandonFailedGangSurge(ctx context.Context, deps workload.Deps, input workl
 		if !removed {
 			return false, nil
 		}
-		if err := recordUpdateFailureInRetryBlock(ctx, input, failedTargetRev, failureReason); err != nil {
+		if err := recordUpdateFailureInRetryBlock(ctx, input, failedTargetRev, failureReason, workloadCaused); err != nil {
 			return false, fmt.Errorf("record retry block for failed gang surge (rev=%s): %w", failedTargetRev, err)
 		}
 		if err := patchInstanceStatusReadyOnRevision(ctx, input, sourceIdx, sourceRunningRev); err != nil {
@@ -906,6 +915,7 @@ func finalizeAndResetAbandonedGangSurge(
 	sourceRunningRev string,
 	failedTargetRev string,
 	failureReason string,
+	workloadCaused bool,
 ) (bool, error) {
 	if source == nil || !gangSurgeSourceOwnsRemoval(source, surgeIdx) {
 		return false, nil
@@ -989,7 +999,7 @@ func finalizeAndResetAbandonedGangSurge(
 		mutateRetryBlock = func(block *workload.RetryBlock) workload.RetryBlockDisposition {
 			var disposition workload.RetryBlockDisposition
 			disposition, heldAttempts = workload.ApplyUpdateFailureToRetryBlock(
-				block, input.UpdateRetryPolicy, now, failureReason,
+				block, input.UpdateRetryPolicy, now, failureReason, workloadCaused,
 			)
 			return disposition
 		}

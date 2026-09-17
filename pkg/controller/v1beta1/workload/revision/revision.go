@@ -408,19 +408,23 @@ const (
 
 // isLifecycleAnnotation reports whether the annotation key is one the
 // controller reads or writes as part of normal reconcile (migration
-// requests, rollout-paused signal, the canary promote/rollback verbs)
-// and therefore must not feed into the pod-template revision hash.
-// Without this filter, adding or removing the annotation would flip the
+// requests, rollout-paused signal, the canary promote/rollback verbs,
+// the InferenceReplica release-held and reset-instances verbs) and
+// therefore must not feed into the pod-template revision hash. Without
+// this filter, adding or removing the annotation would flip the
 // ControllerRevision name and drive a phantom rollout on a spec the user
 // never edited — e.g. an operator's `rollout-promote` would mint a new
-// revision and roll to it instead of the one being promoted.
+// revision and roll to it instead of the one being promoted, and a
+// `reset-instances` meant to rebuild two Failed Instances would roll
+// every Instance.
 // Object-scoped annotations are filtered by the InferenceReplica reconciler before this call.
 func isLifecycleAnnotation(key string) bool {
 	if strings.HasPrefix(key, audit.MigrationRequestAnnotationPrefix) {
 		return true
 	}
 	switch key {
-	case pausedRolloutAnnotation, rolloutPromoteAnnotation, rolloutRollbackAnnotation:
+	case pausedRolloutAnnotation, rolloutPromoteAnnotation, rolloutRollbackAnnotation,
+		constants.ReleaseHeldRevisionAnnotationKey, constants.ResetInstancesAnnotationKey:
 		return true
 	}
 	return false

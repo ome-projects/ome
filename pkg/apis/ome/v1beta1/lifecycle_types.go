@@ -353,9 +353,24 @@ type InstanceOperation struct {
 	// +optional
 	TargetRevision string `json:"targetRevision,omitempty"`
 
-	// Reason is a short cause string for the operation.
+	// Reason is a short cause string for the operation. Set once, when the
+	// operation starts, by whichever state machine owns it (the restart
+	// trigger, the revision-roll cause): it names WHY the operation
+	// exists and must survive for the operation's lifetime.
 	// +optional
 	Reason string `json:"reason,omitempty"`
+
+	// Waiting is a short token naming an EXTERNAL condition currently
+	// holding the operation back — e.g. "QuotaExceeded" when admission
+	// refuses the operation's pods for lack of quota. Distinct from
+	// Reason, which names why the operation exists: Waiting comes and
+	// goes while the operation runs, so overloading Reason would erase
+	// the operation's cause. Empty means nothing external is blocking.
+	// A token only: the blocking authority's own message is volatile (an
+	// exceeded-quota message moves as other workloads come and go) and
+	// belongs in the Event, not in status.
+	// +optional
+	Waiting string `json:"waiting,omitempty"`
 
 	// SurgeIndex is the Instance index allocated for a surge replacement.
 	// Set only when Type=Migrate.

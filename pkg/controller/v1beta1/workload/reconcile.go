@@ -23,6 +23,7 @@ package workload
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -92,6 +93,12 @@ func Reconcile(ctx context.Context, deps Deps, input ReconcileInput, plan Compon
 	if deps.Client == nil {
 		return ctrl.Result{}, fmt.Errorf("workload.Reconcile: nil client (component=%s)", plan.Component)
 	}
+	// One pacing sink per pass. The op state machines report progress as
+	// (done, error) and a throttled write is neither, so the server's
+	// suggested delay is deposited here and floors the wake-up below.
+	if input.Pacing == nil {
+		input.Pacing = &APIPacing{}
+	}
 
 	// Teardown mode: the owner is being deleted. The planned index set is
 	// treated as empty so every observed Instance is a scale-down extra
@@ -133,7 +140,8 @@ func Reconcile(ctx context.Context, deps Deps, input ReconcileInput, plan Compon
 	if perr != nil {
 		return ctrl.Result{}, perr
 	}
-	return Execute(ctx, deps, input, plan, target, snapshot, decision)
+	res, err := Execute(ctx, deps, input, plan, target, snapshot, decision)
+	return floorRetryAfter(res, input.Pacing.Throttle()), err
 }
 
 // Execute applies the Decision: the op-pass action loop, then — when
@@ -187,13 +195,20 @@ func executeActions(ctx context.Context, deps Deps, input ReconcileInput, plan C
 				return ctrl.Result{}, false, derr
 			}
 
-		// 3. Per-Instance restart pass.
+		// 3. Per-Instance restart pass. Instances are isolated from each
+		// other: one Instance's failed step never skips the Instances
+		// after it, and the pass fails as a whole (joined error) only
+		// after every selection has run.
 		case ActionRestart:
 			anyRestarting := false
+			var restartErrs []error
 			for _, sel := range action.Restarts {
 				done, rerr := workloadops.Restart(ctx, deps, input, plan, sel.Instance, sel.Reason)
 				if rerr != nil {
-					return ctrl.Result{}, false, fmt.Errorf("workload.Reconcile: restart instance %d: %w", sel.Instance.Index, rerr)
+					logf.FromContext(ctx).Error(rerr, "restart pass: instance failed",
+						"component", plan.Component, "instance", sel.Instance.Index)
+					restartErrs = append(restartErrs, fmt.Errorf("workload.Reconcile: restart instance %d: %w", sel.Instance.Index, rerr))
+					continue
 				}
 				if !done {
 					anyRestarting = true
@@ -202,14 +217,24 @@ func executeActions(ctx context.Context, deps Deps, input ReconcileInput, plan C
 			if anyRestarting {
 				result := ctrl.Result{RequeueAfter: workloadops.RestartRequeueInterval}
 				if hasActionKind(d.Actions[actionIndex+1:], ActionCreate) {
+					// Surge-free indices are materialized even when another
+					// Instance's restart failed this pass: a persistently
+					// failing restart must not starve an unrelated scale-up.
 					freshPlan := planExcludingRestartSelections(plan, action.Restarts)
 					createResult, ferr := workloadops.CreateFreshIndices(ctx, deps, input, freshPlan, target)
 					if ferr != nil {
-						return createResult, false, fmt.Errorf("workload.Reconcile: create fresh indices during restart: %w", ferr)
+						restartErrs = append(restartErrs, fmt.Errorf("workload.Reconcile: create fresh indices during restart: %w", ferr))
+						return createResult, false, errors.Join(restartErrs...)
 					}
 					result = foldRetryAfter(createResult, workloadops.RestartRequeueInterval)
 				}
+				if len(restartErrs) > 0 {
+					return ctrl.Result{}, false, errors.Join(restartErrs...)
+				}
 				return result, false, nil
+			}
+			if len(restartErrs) > 0 {
+				return ctrl.Result{}, false, errors.Join(restartErrs...)
 			}
 
 		// 4. Migration expiry pass. When anything expired, requeue
@@ -595,6 +620,21 @@ func foldRetryAfter(res ctrl.Result, retryAfter time.Duration) ctrl.Result {
 		return res
 	}
 	if res.RequeueAfter == 0 || retryAfter < res.RequeueAfter {
+		res.RequeueAfter = retryAfter
+	}
+	return res
+}
+
+// floorRetryAfter raises res's wake-up to at least retryAfter. Used for a
+// delay the apiserver itself asked for: unlike foldRetryAfter's min, a
+// server-suggested Retry-After is a FLOOR — waking sooner just re-earns
+// the rejection. An immediate requeue is left alone; the caller's own
+// reasons to come straight back outrank a pacing hint.
+func floorRetryAfter(res ctrl.Result, retryAfter time.Duration) ctrl.Result {
+	if retryAfter <= 0 || res.Requeue {
+		return res
+	}
+	if retryAfter > res.RequeueAfter {
 		res.RequeueAfter = retryAfter
 	}
 	return res

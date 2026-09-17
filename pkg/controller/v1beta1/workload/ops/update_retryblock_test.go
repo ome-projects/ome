@@ -341,6 +341,9 @@ func TestPatchSurgingForUpdate_FlipsBackoffOnAttemptStart(t *testing.T) {
 // attempts per WAVE — an existing Backoff block means this wave
 // already recorded, so only the evidence refreshes. Policy nil (unconfigured)
 // or exhausted → Held + WarnRetryHeld exactly once at the transition.
+// These drive workload-caused waves (the charged arm); the uncharged,
+// environment-caused arm is pinned in the types package and the gang
+// abandon tests.
 // ---------------------------------------------------------------------------
 
 // retryHeldWarning records one WarnRetryHeld invocation.
@@ -393,7 +396,7 @@ func TestRecordUpdateFailure_FirstFailureBacksOff(t *testing.T) {
 	t0 := time.Now()
 	input, calls, warns := retryWriterInput(t0, nil, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "ImagePullBackOff"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "ImagePullBackOff", true); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -441,7 +444,7 @@ func TestRecordUpdateFailure_SecondWaveCounts(t *testing.T) {
 		Reason:          "old evidence",
 	}}, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "still ImagePullBackOff"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "still ImagePullBackOff", true); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -484,7 +487,7 @@ func TestRecordUpdateFailure_SameWaveRefreshOnly(t *testing.T) {
 		Reason:          "first instance failed",
 	}}, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "second instance failed"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "second instance failed", true); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -523,7 +526,7 @@ func TestRecordUpdateFailure_ExhaustionHolds(t *testing.T) {
 		AttemptsStarted: 2,
 	}}, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "third strike"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "third strike", true); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -548,7 +551,7 @@ func TestRecordUpdateFailure_ExhaustionHolds(t *testing.T) {
 
 	// A subsequent failure against the persisted Held block: refresh only.
 	input.ObservedState.RetryBlocks = []workload.RetryBlock{b}
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "post-hold noise"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "post-hold noise", true); err != nil {
 		t.Fatalf("record on Held: %v", err)
 	}
 	held := (*calls)[1].block
@@ -569,7 +572,7 @@ func TestRecordUpdateFailure_NilPolicyHoldsFirstFailure(t *testing.T) {
 	t0 := time.Now()
 	input, calls, warns := retryWriterInput(t0, nil, nil)
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "no policy configured"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "no policy configured", true); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -596,12 +599,12 @@ func TestRecordUpdateFailure_UnwiredNoOp(t *testing.T) {
 	t0 := time.Now()
 
 	unwired := &workload.ReconcileInput{Clock: clocktesting.NewFakeClock(t0)}
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *unwired, "rev-bad", "x"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *unwired, "rev-bad", "x", true); err != nil {
 		t.Fatalf("nil closure must no-op: %v", err)
 	}
 
 	input, calls, _ := retryWriterInput(t0, nil, retryTestPolicy())
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "", "x"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "", "x", true); err != nil {
 		t.Fatalf("empty targetRev must no-op: %v", err)
 	}
 	if len(*calls) != 0 {
@@ -628,6 +631,35 @@ func TestInstanceFailureReason(t *testing.T) {
 	s.LastFailure.Message = "DeadlineExceeded: Update/Surge exceeded InstanceReadyTimeout"
 	if got := instanceFailureReason(s, "fallback"); got != s.LastFailure.Message {
 		t.Errorf("Message path: got %q want %q", got, s.LastFailure.Message)
+	}
+}
+
+// TestInstanceFailureWorkloadCaused pins the call-site cause attribution:
+// only a LastFailure whose Reason is in the workload-caused set charges
+// the ladder; an elapsed deadline, an ambiguous kubelet reason, and
+// missing evidence do not.
+func TestInstanceFailureWorkloadCaused(t *testing.T) {
+	if instanceFailureWorkloadCaused(nil) {
+		t.Error("nil status must not be workload-caused")
+	}
+	s := &workload.InstanceStatus{}
+	if instanceFailureWorkloadCaused(s) {
+		t.Error("nil LastFailure must not be workload-caused")
+	}
+	for reason, want := range map[string]bool{
+		"ImagePullBackOff":           true,
+		"ErrImagePull":               true,
+		"InvalidImageName":           true,
+		"CreateContainerConfigError": true,
+		"DeadlineExceeded":           false,
+		"CrashLoopBackOff":           false,
+		"RunContainerError":          false,
+		"":                           false,
+	} {
+		s.LastFailure = &workload.InstanceTermination{PodName: "p-0", Reason: reason}
+		if got := instanceFailureWorkloadCaused(s); got != want {
+			t.Errorf("reason %q: got %v want %v", reason, got, want)
+		}
 	}
 }
 

@@ -309,14 +309,42 @@ func PartitionPodsByIncarnation(pods []*corev1.Pod, current int64) (old, fresh, 
 	return
 }
 
+// IsTerminalPod reports whether the pod has reached a terminal phase
+// (Failed or Succeeded). The kubelet never runs another container in a
+// terminal pod, so the object is dead weight that still occupies its
+// stable name: every presence decision treats it as absent, and the
+// owning operation must delete it before the name can be reused.
+func IsTerminalPod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// ExcludeTerminalPods returns the pods that are not terminal — the set a
+// presence or liveness decision may count. Nil entries are dropped too.
+func ExcludeTerminalPods(pods []*corev1.Pod) []*corev1.Pod {
+	out := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if pod == nil || IsTerminalPod(pod) {
+			continue
+		}
+		out = append(out, pod)
+	}
+	return out
+}
+
 // AllPodsRuntimeReady reports whether every pod has the ContainersReady
-// PodCondition. Empty input returns false (nothing is Ready).
+// PodCondition. Empty input returns false (nothing is Ready). A terminal
+// pod is never runtime-ready whatever conditions it still carries: the
+// presence pass ahead of every readiness gate treats it as a missing
+// target, so answering true here would promote an incomplete set.
 func AllPodsRuntimeReady(pods []*corev1.Pod) bool {
 	if len(pods) == 0 {
 		return false
 	}
 	for _, pod := range pods {
-		if !podreadiness.IsContainersReady(pod) {
+		if IsTerminalPod(pod) || !podreadiness.IsContainersReady(pod) {
 			return false
 		}
 	}

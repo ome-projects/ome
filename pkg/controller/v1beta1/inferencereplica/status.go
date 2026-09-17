@@ -477,6 +477,10 @@ func stagedAtPartition(status *v1beta1.InferenceReplicaStatus, pacing *v1beta1.I
 // — i.e. the rollout is wedged on failing Instances. Keyed on LastFailure (not
 // live Phase) so it stays stable even when a stuck Instance oscillates
 // Updating<->Failed each reconcile. Advisory only: not folded into Ready.
+//
+// Failures from before the current attempt started are ignored. LastFailure is
+// kept across revision rolls on purpose, so an Instance that failed once would
+// otherwise look wedged on every roll after it.
 func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) metav1.Condition {
 	cond := metav1.Condition{
 		Type:               InferenceReplicaConditionRolloutStalled,
@@ -494,6 +498,10 @@ func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) meta
 		s := status.InstanceStatuses[i]
 		// Already on the target revision → a stale prior failure isn't blocking.
 		if s.LastFailure == nil || s.RunningRevision == status.UpdateRevision {
+			continue
+		}
+		// It failed before this attempt began, so it is retrying, not stuck.
+		if op := s.Operation; op != nil && !op.StartedAt.Before(&s.LastFailure.Time) {
 			continue
 		}
 		stalled++

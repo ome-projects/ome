@@ -112,8 +112,11 @@ func createFiltered(ctx context.Context, deps workload.Deps, input workload.Reco
 }
 
 type createStartAction struct {
-	instance       workload.InstancePlan
-	missing        []podTarget
+	instance workload.InstancePlan
+	missing  []podTarget
+	// terminal holds the dead pods still occupying missing targets' names;
+	// they are recycled before the targets can be created.
+	terminal       []*corev1.Pod
 	firstCreate    bool
 	statusChanges  bool
 	transition     statusTransition
@@ -216,6 +219,7 @@ func createFilteredBatched(
 			action := &createStartAction{
 				instance:      inst,
 				missing:       missing,
+				terminal:      terminalTargetPods(existing, missing),
 				firstCreate:   observed == nil,
 				statusChanges: mutation.Mutate(&probe),
 				transition:    statusTransition{index: inst.Index},
@@ -317,6 +321,11 @@ func createFilteredBatched(
 	if retryBlockWait > 0 && (res.RequeueAfter == 0 || retryBlockWait < res.RequeueAfter) {
 		res.RequeueAfter = retryBlockWait
 	}
+	// A server-suggested throttle delay is a floor, not a preference:
+	// waking earlier just re-earns the 429.
+	if throttle := input.Pacing.Throttle(); throttle > res.RequeueAfter {
+		res.RequeueAfter = throttle
+	}
 	return res, nil
 }
 
@@ -350,10 +359,38 @@ func processStartActions(
 				"OMENative %s materialized; %d pod(s) requested",
 				instanceKey(input.Key.Component, action.instance.Index), len(action.missing))
 		}
+		// A dead pod on a stable name must be gone before the name can be
+		// reused; the create waits for a later pass.
+		recycling, err := recycleTerminalPods(ctx, deps, input, action.instance.Index, workload.InstanceOperationCreate, action.terminal)
+		if err != nil {
+			rollbackErr := rollbackStartActions(ctx, input, actions[i+1:])
+			return true, errors.Join(err, rollbackErr)
+		}
+		if recycling {
+			continue
+		}
 		if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, action.instance.Index) {
 			continue
 		}
-		if _, err := createMissingPods(ctx, deps, input, plan, action.instance, action.instance.Index, action.missing, revisionHashFromTarget(target)); err != nil {
+		if _, err := createMissingPods(ctx, deps, input, plan, action.instance, action.instance.Index, action.missing, query.RevisionOf(target)); err != nil {
+			rejection, classified := asPodRejection(err)
+			switch {
+			case classified && rejection.rejection.Class == workload.APIRejectionThrottled:
+				// The server asked for room. Stop creating this pass, roll
+				// back the intents whose pods were never attempted, and wake
+				// on the server's suggested delay instead of burning the
+				// caller's backoff on an error that is not a fault. The delay
+				// itself is already on the pass pacing.
+				if rollbackErr := rollbackStartActions(ctx, input, actions[i+1:]); rollbackErr != nil {
+					return true, rollbackErr
+				}
+				return true, nil
+			case classified:
+				// Permanent (already disposed) or capacity-blocked (waiting
+				// with its clock parked): either way this Instance is
+				// settled for the pass and its neighbours are unaffected.
+				continue
+			}
 			rollbackErr := rollbackStartActions(ctx, input, actions[i+1:])
 			return true, errors.Join(err, rollbackErr)
 		}
@@ -632,9 +669,12 @@ func applyCreateIntentMutations(ctx context.Context, input workload.ReconcileInp
 	return true, flipRetryBlockOnAttemptStart(ctx, input, target.Name)
 }
 
+// missingPodTargets diffs the desired pod names against the live pods. A
+// terminal pod is absent for this purpose: it still holds its stable name,
+// but nothing will ever run in it again, so the target must be recreated.
 func missingPodTargets(input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, existing []*corev1.Pod) []podTarget {
 	desired := expectedPodNamesForInstance(input, plan, inst)
-	existingByName := query.IndexPodsByName(existing)
+	existingByName := query.IndexPodsByName(query.ExcludeTerminalPods(existing))
 	missing := make([]podTarget, 0)
 	for _, target := range desired {
 		if _, ok := existingByName[target.Name]; !ok {
@@ -839,27 +879,21 @@ func findInstanceStatus(observed []workload.InstanceStatus, idx int32) *workload
 	return nil
 }
 
-type podCreateError struct {
-	podName string
-	err     error
-}
-
-func (e *podCreateError) Error() string {
-	return fmt.Sprintf("create pod %s: %v", e.podName, e.err)
-}
-
-func (e *podCreateError) Unwrap() error {
-	return e.err
-}
-
 // createMissingPods renders and creates targets, owning the per-pod
 // ExpectCreates bookkeeping. idx is the expectations bucket — pass
 // inst.Index for steady-state Create / Restart Phase B. Callers must
-// NOT call ExpectCreates themselves. revisionHash, when non-empty,
-// stamps ome.io/revision-hash on every created pod so per-revision
-// Services can select it.
-func createMissingPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, targets []podTarget, revisionHash string) (int, error) {
+// NOT call ExpectCreates themselves. target, when non-zero, stamps
+// ome.io/revision-hash on every created pod so per-revision Services can
+// select it, and names the revision a rejection is charged against.
+//
+// Every create path in the engine funnels through here, so this is where
+// an apiserver rejection is READ rather than passed up opaquely. The
+// classified outcome is returned as a *podRejectionError; only an
+// unclassified (transient) rejection stays a *podCreateError, which callers
+// propagate.
+func createMissingPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, targets []podTarget, target query.RevisionID) (int, error) {
 	created := 0
+	revisionHash := target.Hash()
 	// Prime the gang's peer-DNS host list once. It's identical for every
 	// pod in the Instance, so caching it here turns the per-pod O(gangsize)
 	// rebuild inside Render into O(gangsize) total per gang. inst is a value
@@ -906,19 +940,44 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 				// Prior reconcile created it; cache hasn't caught up yet.
 				continue
 			}
+			rejection := workload.ClassifyAPIError(err)
+			switch rejection.Class {
+			case workload.APIRejectionPermanentWorkload, workload.APIRejectionPermanentEnvironment:
+				// A migration surge's pod carries the request's placement
+				// overlay, so its rejection may indict the overlay rather
+				// than the revision — see disposeRejectedAttempt.
+				blameRevision := inst.MigrationOverlay == nil
+				if derr := disposeRejectedAttempt(ctx, deps, input, idx, target.Name(), t.Name, rejection, blameRevision); derr != nil {
+					return created, fmt.Errorf("dispose rejected create (instance=%d, pod=%s): %w", idx, t.Name, derr)
+				}
+				return created, &podRejectionError{podName: t.Name, rejection: rejection, disposed: true, err: err}
+			case workload.APIRejectionCapacityBlocked:
+				entered, merr := markCapacityBlocked(ctx, input, idx)
+				if merr != nil {
+					return created, fmt.Errorf("record quota wait (instance=%d, pod=%s): %w", idx, t.Name, merr)
+				}
+				if entered {
+					recordNormal(deps.Recorder, eventTarget(input), workload.EventReasonInstanceQuotaBlocked,
+						"OMENative %s waiting on capacity: %s", instanceKey(input.Key.Component, idx), rejection.Message)
+				}
+				return created, &podRejectionError{podName: t.Name, rejection: rejection, err: err}
+			case workload.APIRejectionThrottled:
+				// The server named its own delay; deposit it on the pass so
+				// whichever operation issued this create wakes no earlier.
+				input.Pacing.ObserveThrottle(rejection.RetryAfter)
+				return created, &podRejectionError{podName: t.Name, rejection: rejection, err: err}
+			}
 			return created, &podCreateError{podName: t.Name, err: err}
 		}
 		created++
 	}
+	// Reaching here means every target was placed or already existed and
+	// no quota refusal was seen: release the waiting token so the parked
+	// deadline re-arms from this moment.
+	if err := clearCapacityBlock(ctx, input, idx); err != nil {
+		return created, fmt.Errorf("clear quota wait (instance=%d): %w", idx, err)
+	}
 	return created, nil
-}
-
-// revisionHashFromTarget extracts the hash suffix from a target
-// ControllerRevision. Returns "" when target is nil so callers can
-// pass-through to RenderWithRevision; an empty hash skips the
-// ome.io/revision-hash label.
-func revisionHashFromTarget(target *appsv1.ControllerRevision) string {
-	return query.RevisionOf(target).Hash()
 }
 
 // createStatusCreatingMutation stamps Phase=Creating with a durable Create

@@ -210,6 +210,13 @@ var (
 	// name or bare hash. The controller consumes it after handling the release request.
 	ReleaseHeldRevisionAnnotationKey = OMEAPIGroupName + "/release-held-revision"
 
+	// ResetInstancesAnnotationKey names Failed Instances the operator wants rebuilt:
+	// ResetInstancesAll or a comma-separated list of Instance indices. The controller
+	// deletes their pods, clears the preserved operation, and consumes the annotation.
+	ResetInstancesAnnotationKey = OMEAPIGroupName + "/reset-instances"
+	// ResetInstancesAll is the ResetInstancesAnnotationKey value selecting every Failed Instance.
+	ResetInstancesAll = "all"
+
 	// RevisionExcludedAnnotationKeysAnnotationKey lists inherited ISVC annotation keys
 	// omitted from the pod-template revision hash; component annotations remain hash inputs.
 	RevisionExcludedAnnotationKeysAnnotationKey = OMEAPIGroupName + "/revision-excluded-annotation-keys"

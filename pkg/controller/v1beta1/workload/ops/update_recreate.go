@@ -144,7 +144,10 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 		if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index) {
 			return false, nil
 		}
-		if _, err := createMissingPods(ctx, deps, input, plan, newInst, inst.Index, missing, revisionHashFromTarget(target)); err != nil {
+		if _, err := createMissingPods(ctx, deps, input, plan, newInst, inst.Index, missing, query.RevisionOf(target)); err != nil {
+			if createRejectionHandled(err) {
+				return false, nil
+			}
 			return false, err
 		}
 		return false, nil

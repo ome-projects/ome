@@ -13,6 +13,19 @@ const (
 	EventReasonInstanceCreated EventReason = "InstanceCreated"
 	EventReasonInstanceReady   EventReason = "InstanceReady"
 
+	// EventReasonInstanceRejected fires when the apiserver PERMANENTLY
+	// rejects an Instance's pod create or in-place patch — an invalid pod
+	// template (422) or a terminating namespace. The attempt is disposed
+	// Failed; retrying the same revision would reproduce the rejection
+	// byte for byte. Names the pod and the apiserver's own explanation.
+	EventReasonInstanceRejected EventReason = "InstanceRejected"
+
+	// EventReasonInstanceQuotaBlocked fires once per blocking episode
+	// when admission refuses an Instance's pods for lack of quota. The
+	// attempt is NOT failed: it waits with its InstanceReadyTimeout clock
+	// parked until quota frees up.
+	EventReasonInstanceQuotaBlocked EventReason = "InstanceQuotaBlocked"
+
 	// In-place update (workload/ops/update.go).
 	EventReasonInPlaceUpdateStarted     EventReason = "InPlaceUpdateStarted"
 	EventReasonInPlaceUpdateCompleted   EventReason = "InPlaceUpdateCompleted"
@@ -26,6 +39,11 @@ const (
 	// Restart (workload/ops/restart.go).
 	EventReasonRestartTriggered EventReason = "RestartTriggered"
 	EventReasonRestartCompleted EventReason = "RestartCompleted"
+
+	// EventReasonTerminalPodRecycled fires when Create or Restart deletes
+	// a terminal pod (phase Failed or Succeeded) that occupied one of an
+	// Instance's stable pod names, so the target can be recreated.
+	EventReasonTerminalPodRecycled EventReason = "TerminalPodRecycled"
 
 	// EventReasonFoundOrphan fires when Restart or recreate-Update
 	// finds a pod under the OMENative selector but missing the
@@ -81,12 +99,29 @@ const (
 	// changed.
 	EventReasonRetryBlockReleaseSkipped EventReason = "RetryBlockReleaseSkipped"
 
+	// EventReasonInstancesReset fires when the operator reset annotation
+	// (ome.io/reset-instances) tears down Failed Instances for rebuild:
+	// their pods are deleted and the preserved Operation cleared so the
+	// ordinary Create/Restart passes recreate them. Names the indices.
+	EventReasonInstancesReset EventReason = "InstancesReset"
+
+	// EventReasonInstancesResetSkipped fires when the reset annotation
+	// names Instances that cannot be reset — not Phase=Failed, no such
+	// index, or nothing left to tear down. The annotation is still
+	// consumed; the event lists each index with the reason it was skipped.
+	EventReasonInstancesResetSkipped EventReason = "InstancesResetSkipped"
+
+	// EventReasonInstancesResetRejected fires when the reset annotation
+	// value is malformed (neither "all" nor a comma-separated list of
+	// non-negative indices). Nothing is reset; the annotation is consumed.
+	EventReasonInstancesResetRejected EventReason = "InstancesResetRejected"
+
 	// EventReasonInstanceDemoted fires when the truth pass demotes a
 	// Ready Instance with no live pods and no in-flight operation to
 	// Pending. Status-only; recovery stays with the ordinary passes.
 	EventReasonInstanceDemoted EventReason = "InstanceDemoted"
 
-	// EventReasonPodForceDeleted fires when scale-down escalation
+	// EventReasonPodForceDeleted fires when a teardown escalation
 	// force-deletes (grace 0, UID-preconditioned) a Terminating pod
 	// overdue past its own deletion deadline on a node that provably
 	// cannot acknowledge the termination (gone, or unreachable-tainted /

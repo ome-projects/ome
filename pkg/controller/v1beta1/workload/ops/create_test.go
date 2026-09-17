@@ -239,6 +239,7 @@ func fromV1beta1Op(op *v1beta1.InstanceOperation) *workload.InstanceOperation {
 		RetryCount:     op.RetryCount,
 		TargetRevision: op.TargetRevision,
 		Reason:         op.Reason,
+		Waiting:        op.Waiting,
 		FromNode:       op.FromNode,
 		RequestUUID:    op.RequestUUID,
 	}
@@ -266,6 +267,7 @@ func toV1beta1Op(op *workload.InstanceOperation) *v1beta1.InstanceOperation {
 		RetryCount:     op.RetryCount,
 		TargetRevision: op.TargetRevision,
 		Reason:         op.Reason,
+		Waiting:        op.Waiting,
 		FromNode:       op.FromNode,
 		RequestUUID:    op.RequestUUID,
 	}

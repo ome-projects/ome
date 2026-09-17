@@ -12,8 +12,8 @@ import (
 // implementation for the gang abandon here and the workload-root
 // deadline disposition. Kept as a package-local name so the ops-side
 // call sites and invariant tests read unchanged.
-func recordUpdateFailureInRetryBlock(ctx context.Context, input workload.ReconcileInput, targetRev, reason string) error {
-	return workload.RecordUpdateFailureInRetryBlock(ctx, input, targetRev, reason)
+func recordUpdateFailureInRetryBlock(ctx context.Context, input workload.ReconcileInput, targetRev, reason string, workloadCaused bool) error {
+	return workload.RecordUpdateFailureInRetryBlock(ctx, input, targetRev, reason, workloadCaused)
 }
 
 // pruneRetryBlockOnPromote removes the RetryBlock for rev once the
@@ -47,4 +47,13 @@ func instanceFailureReason(s *workload.InstanceStatus, fallback string) string {
 		return short
 	}
 	return fallback
+}
+
+// instanceFailureWorkloadCaused reports whether the failure evidence the
+// escalators stamped on the instance (LastFailure.Reason) blames the
+// revision itself. Only that evidence charges the revision's retry
+// ladder; an elapsed deadline or an ambiguous kubelet reason paces the
+// next attempt without counting toward Held.
+func instanceFailureWorkloadCaused(s *workload.InstanceStatus) bool {
+	return s != nil && s.LastFailure != nil && workload.IsWorkloadCausedReason(s.LastFailure.Reason)
 }

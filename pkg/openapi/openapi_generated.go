@@ -7053,7 +7053,14 @@ func schema_pkg_apis_ome_v1beta1_InstanceOperation(ref common.ReferenceCallback)
 					},
 					"reason": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Reason is a short cause string for the operation.",
+							Description: "Reason is a short cause string for the operation. Set once, when the operation starts, by whichever state machine owns it (the restart trigger, the revision-roll cause): it names WHY the operation exists and must survive for the operation's lifetime.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"waiting": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Waiting is a short token naming an EXTERNAL condition currently holding the operation back — e.g. \"QuotaExceeded\" when admission refuses the operation's pods for lack of quota. Distinct from Reason, which names why the operation exists: Waiting comes and goes while the operation runs, so overloading Reason would erase the operation's cause. Empty means nothing external is blocking. A token only: the blocking authority's own message is volatile (an exceeded-quota message moves as other workloads come and go) and belongs in the Event, not in status.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

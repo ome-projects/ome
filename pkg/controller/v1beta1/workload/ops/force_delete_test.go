@@ -674,3 +674,91 @@ func TestForceDelete_ActionRecordsOnce_NoDoubleLedgerOnReplay(t *testing.T) {
 		t.Errorf("timestamps: StartedAt=%q CompletedAt=%q", e.StartedAt, e.CompletedAt)
 	}
 }
+
+// The teardown sweep applies the per-pod predicate to a whole slice, so
+// it must not widen it: a Terminating pod on a long-dead node goes, a
+// Terminating pod on a Ready node stays (the kubelet is merely slow),
+// and a pod nobody deleted is never even classified.
+func TestForceDeletePods_SweepsOnlyActionableTerminatingPods(t *testing.T) {
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+
+	wedged := fdTerminatingPod("wedge-0", "dead-node", overdueTS)
+	wedged.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001")
+	slow := fdTerminatingPod("slow-1", "live-node", overdueTS)
+	slow.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002")
+	serving := fdTerminatingPod("serving-2", "dead-node", overdueTS)
+	serving.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0003")
+	serving.DeletionTimestamp = nil
+
+	c := fdFakeClient(t, &funcs,
+		fdStoredCopy(wedged), fdStoredCopy(slow), fdStoredCopy(serving),
+		fdNodeUnreachable("dead-node", 10*time.Minute), fdNodeReady("live-node"))
+
+	pods := []*corev1.Pod{wedged, slow, serving}
+	if err := escalateStuckTerminatingPods(context.Background(), workload.Deps{Client: c}, fdInput(fdISVC("llama"), fdPolicy()), pods, 0); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("deletes: got %d want 1 (%+v)", len(deletes), deletes)
+	}
+	if deletes[0].name != "wedge-0" {
+		t.Errorf("deleted pod: got %q want wedge-0", deletes[0].name)
+	}
+	if deletes[0].grace == nil || *deletes[0].grace != 0 {
+		t.Errorf("GracePeriodSeconds: got %v want 0", deletes[0].grace)
+	}
+}
+
+// Unconfigured policy disables the sweep entirely — no node is read for
+// any pod in the slice, matching the single-pod contract.
+func TestForceDeletePods_NilPolicy_NoNodeReadsNoAction(t *testing.T) {
+	nodeGets := 0
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Node); ok {
+			nodeGets++
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	pod := fdTerminatingPod("wedge-0", "gone-node", overdueTS)
+	c := fdFakeClient(t, &funcs, fdStoredCopy(pod))
+
+	if err := escalateStuckTerminatingPods(context.Background(), workload.Deps{Client: c}, fdInput(fdISVC("llama"), nil), []*corev1.Pod{pod}, 0); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if nodeGets != 0 {
+		t.Errorf("node reads with nil policy: got %d want 0", nodeGets)
+	}
+	if len(deletes) != 0 {
+		t.Errorf("deletes with nil policy: got %d want 0", len(deletes))
+	}
+}
+
+// A failed Node read is the fail-safe branch: the sweep surfaces the
+// error rather than guessing, so the caller can requeue with no pod
+// touched on evidence it never obtained.
+func TestForceDeletePods_NodeReadError_Propagates(t *testing.T) {
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Node); ok {
+			return apierrors.NewServiceUnavailable("apiserver down")
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	pod := fdTerminatingPod("wedge-0", "dead-node", overdueTS)
+	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeUnreachable("dead-node", 10*time.Minute))
+
+	err := escalateStuckTerminatingPods(context.Background(), workload.Deps{Client: c}, fdInput(fdISVC("llama"), fdPolicy()), []*corev1.Pod{pod}, 0)
+	if err == nil {
+		t.Fatal("expected node-read error to propagate, got nil")
+	}
+	if !strings.Contains(err.Error(), "wedge-0") {
+		t.Errorf("error should name the pod: %v", err)
+	}
+	if len(deletes) != 0 {
+		t.Errorf("deletes on unreadable evidence: got %d want 0", len(deletes))
+	}
+}

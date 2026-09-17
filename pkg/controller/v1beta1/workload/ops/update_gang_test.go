@@ -135,7 +135,7 @@ func TestAbandonFailedGangSurge_DeletesStalePodsFirst(t *testing.T) {
 	blockCalls := recordRetryBlockCalls(&input, nil)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 2, src.RunningRevision, "gang-a-engine-badrev", "pod stuck")
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 2, src.RunningRevision, "gang-a-engine-badrev", "pod stuck", true)
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestAbandonFailedGangSurge_ResetsSourceAfterPodsGone(t *testing.T) {
 	blockCalls := recordRetryBlockCalls(&input, nil)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx, src.RunningRevision, src.TargetRevision, "pod stuck")
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx, src.RunningRevision, src.TargetRevision, "pod stuck", true)
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestAbandonFailedGangSurge_RecordsRetryBlockWithPolicy(t *testing.T) {
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
 	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx,
-		src.RunningRevision, src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned"))
+		src.RunningRevision, src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned"), instanceFailureWorkloadCaused(src))
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -307,6 +307,160 @@ func TestAbandonFailedGangSurge_RecordsRetryBlockWithPolicy(t *testing.T) {
 	}
 	if prune := (*blockCalls)[1]; prune.rev != "gang-a-engine-goodrev" || prune.disposition != workload.RetryBlockRemove {
 		t.Errorf("prune call: got (rev=%q, disposition=%v) want (gang-a-engine-goodrev, Remove)", prune.rev, prune.disposition)
+	}
+}
+
+// gangAbandonWave drives one reset-pass abandon (surge pods already gone)
+// for a Failed source whose LastFailure carries failure, with the blocks
+// persisted by prior waves seeded into ObservedState. Returns the wave's
+// MutateRetryBlock calls and WarnRetryHeld invocations.
+func gangAbandonWave(t *testing.T, t0 time.Time, failure *workload.InstanceTermination, persisted []workload.RetryBlock) (*[]retryBlockCall, *[]retryHeldWarning) {
+	t.Helper()
+	legacyResetExpectations(t)
+	const isvc, ns = "gang-a", "test-ns"
+	c := legacyNewFakeClient(t) // surge pods already deleted
+	surgeIdx := int32(2)
+	src := &workload.InstanceStatus{
+		Index:           0,
+		Phase:           workload.InstancePhaseFailed,
+		RunningRevision: "gang-a-engine-goodrev",
+		TargetRevision:  "gang-a-engine-badrev",
+		Operation: &workload.InstanceOperation{
+			Type:           workload.InstanceOperationUpdate,
+			Step:           updateStepSurge,
+			SurgeIndex:     &surgeIdx,
+			TargetRevision: "gang-a-engine-badrev",
+		},
+		LastFailure: failure,
+	}
+	var removed []int32
+	input := gangAbandonInput(isvc, ns, src, &removed)
+	input.Clock = clocktesting.NewFakeClock(t0)
+	input.UpdateRetryPolicy = retryTestPolicy()
+	calls := recordRetryBlockCalls(&input, persisted)
+	warns := &[]retryHeldWarning{}
+	input.WarnRetryHeld = func(rev string, attempts int32, reason string) {
+		*warns = append(*warns, retryHeldWarning{rev: rev, attempts: attempts, reason: reason})
+	}
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+
+	if _, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx,
+		src.RunningRevision, src.Operation.TargetRevision,
+		instanceFailureReason(src, "gang surge abandoned"), instanceFailureWorkloadCaused(src)); err != nil {
+		t.Fatalf("abandonFailedGangSurge: %v", err)
+	}
+	if src.Operation != nil || src.Phase != workload.InstancePhaseReady {
+		t.Fatalf("source: got (phase=%q, op=%+v) want (Ready, nil)", src.Phase, src.Operation)
+	}
+	return calls, warns
+}
+
+// nextGangAbandonWave models the machinery between two abandon waves: the
+// retry gate denies until the recorded Backoff is due, admits at
+// NextRetryAt, and the attempt stamp then flips the block to
+// RetryInProgress for the new attempt. Returns the persisted block set the
+// next wave observes.
+func nextGangAbandonWave(t *testing.T, block workload.RetryBlock, now time.Time) []workload.RetryBlock {
+	t.Helper()
+	if block.NextRetryAt == nil {
+		t.Fatalf("Backoff block without NextRetryAt: %+v", block)
+	}
+	wantAfter := block.NextRetryAt.Time.Sub(now)
+	if denied, retryAfter := evaluateRetryBlockGate(&block, now, false); !denied || retryAfter != wantAfter {
+		t.Fatalf("gate before NextRetryAt: got (denied=%v, retryAfter=%v) want (true, %v)", denied, retryAfter, wantAfter)
+	}
+	if denied, _ := evaluateRetryBlockGate(&block, block.NextRetryAt.Time, false); denied {
+		t.Fatalf("gate at NextRetryAt must admit the next attempt: %+v", block)
+	}
+	if markRetryBlockAttemptStarted(&block) != workload.RetryBlockPersist || block.State != workload.RetryBlockRetryInProgress {
+		t.Fatalf("attempt stamp must flip Backoff to RetryInProgress: %+v", block)
+	}
+	return []workload.RetryBlock{block}
+}
+
+// TestAbandonFailedGangSurge_WorkloadCausedWavesHold: ImagePullBackOff
+// evidence charges the ladder on every abandoned wave — AttemptsStarted
+// 1, 2, then Held at MaxAttempts with WarnRetryHeld exactly once — and
+// the gate admits each intermediate retry once its Backoff is due.
+func TestAbandonFailedGangSurge_WorkloadCausedWavesHold(t *testing.T) {
+	t0 := time.Now()
+	policy := retryTestPolicy()
+	evidence := &workload.InstanceTermination{PodName: "gang-a-engine-2-leader-0", Reason: "ImagePullBackOff"}
+	var persisted []workload.RetryBlock
+	for wave := int32(1); wave <= policy.MaxAttempts; wave++ {
+		calls, warns := gangAbandonWave(t, t0, evidence, persisted)
+		if len(*calls) == 0 {
+			t.Fatalf("wave %d: no MutateRetryBlock call", wave)
+		}
+		rec := (*calls)[0]
+		if rec.rev != "gang-a-engine-badrev" || rec.disposition != workload.RetryBlockPersist {
+			t.Fatalf("wave %d: record call got (rev=%q, disposition=%v) want (gang-a-engine-badrev, Persist)", wave, rec.rev, rec.disposition)
+		}
+		if rec.block.AttemptsStarted != wave {
+			t.Errorf("wave %d: AttemptsStarted got %d want %d (every workload-caused wave counts)", wave, rec.block.AttemptsStarted, wave)
+		}
+		if wave < policy.MaxAttempts {
+			if rec.block.State != workload.RetryBlockBackoff {
+				t.Fatalf("wave %d: state got %q want Backoff", wave, rec.block.State)
+			}
+			if want := t0.Add(policy.NextRetryDelay(wave)); rec.block.NextRetryAt == nil || !rec.block.NextRetryAt.Time.Equal(want) {
+				t.Errorf("wave %d: NextRetryAt got %v want %v", wave, rec.block.NextRetryAt, want)
+			}
+			if len(*warns) != 0 {
+				t.Errorf("wave %d: WarnRetryHeld got %d calls want 0", wave, len(*warns))
+			}
+			persisted = nextGangAbandonWave(t, rec.block, t0)
+			continue
+		}
+		if rec.block.State != workload.RetryBlockHeld || rec.block.NextRetryAt != nil {
+			t.Errorf("wave %d: got (state=%q, next=%v) want (Held, nil)", wave, rec.block.State, rec.block.NextRetryAt)
+		}
+		if len(*warns) != 1 || (*warns)[0].attempts != policy.MaxAttempts {
+			t.Errorf("wave %d: WarnRetryHeld got %+v want exactly one call with attempts=%d", wave, *warns, policy.MaxAttempts)
+		}
+		held := rec.block
+		if denied, retryAfter := evaluateRetryBlockGate(&held, t0.Add(policy.MaxDelay), false); !denied || retryAfter != 0 {
+			t.Errorf("Held must deny with no time bound: got (denied=%v, retryAfter=%v)", denied, retryAfter)
+		}
+	}
+}
+
+// TestAbandonFailedGangSurge_EnvironmentCausedWavesNeverHold:
+// DeadlineExceeded evidence (no workload-caused pod) never charges the
+// ladder — however many waves are abandoned, AttemptsStarted stays 0, the
+// block never Holds and no Held warning fires — while each wave still
+// paces the next attempt with the policy's first-rung delay, after which
+// the gate admits it.
+func TestAbandonFailedGangSurge_EnvironmentCausedWavesNeverHold(t *testing.T) {
+	t0 := time.Now()
+	policy := retryTestPolicy()
+	evidence := &workload.InstanceTermination{
+		Reason:  "DeadlineExceeded",
+		Message: "DeadlineExceeded: Update/Surge exceeded InstanceReadyTimeout",
+	}
+	var persisted []workload.RetryBlock
+	for wave := int32(1); wave <= 2*policy.MaxAttempts; wave++ {
+		calls, warns := gangAbandonWave(t, t0, evidence, persisted)
+		if len(*calls) == 0 {
+			t.Fatalf("wave %d: no MutateRetryBlock call", wave)
+		}
+		rec := (*calls)[0]
+		if rec.rev != "gang-a-engine-badrev" || rec.disposition != workload.RetryBlockPersist {
+			t.Fatalf("wave %d: record call got (rev=%q, disposition=%v) want (gang-a-engine-badrev, Persist)", wave, rec.rev, rec.disposition)
+		}
+		if rec.block.State != workload.RetryBlockBackoff || rec.block.AttemptsStarted != 0 {
+			t.Fatalf("wave %d: got (state=%q, attempts=%d) want (Backoff, 0) — environment faults never count toward Held", wave, rec.block.State, rec.block.AttemptsStarted)
+		}
+		if want := t0.Add(policy.InitialDelay); rec.block.NextRetryAt == nil || !rec.block.NextRetryAt.Time.Equal(want) {
+			t.Errorf("wave %d: NextRetryAt got %v want %v (first-rung pacing)", wave, rec.block.NextRetryAt, want)
+		}
+		if rec.block.Reason != evidence.Message {
+			t.Errorf("wave %d: Reason got %q want the deadline evidence", wave, rec.block.Reason)
+		}
+		if len(*warns) != 0 {
+			t.Errorf("wave %d: WarnRetryHeld got %d calls want 0", wave, len(*warns))
+		}
+		persisted = nextGangAbandonWave(t, rec.block, t0)
 	}
 }
 
@@ -423,7 +577,7 @@ func TestAbandonFailedGangSurge_EventReasons(t *testing.T) {
 		plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
 		if _, err := abandonFailedGangSurge(context.Background(), deps, input, plan, 0, surgeIdx,
-			src.RunningRevision, failedTargetRev, "pod stuck"); err != nil {
+			src.RunningRevision, failedTargetRev, "pod stuck", true); err != nil {
 			t.Fatalf("abandonFailedGangSurge: %v", err)
 		}
 		events := drainRecorderEvents(rec)

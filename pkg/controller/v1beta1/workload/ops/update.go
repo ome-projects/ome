@@ -100,6 +100,14 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 
 	pods := instancePods
 
+	// Every update mode below, the surge machine included, tears pods down
+	// and then waits for them to go away. On a dead node that wait never
+	// ends, so clear the ones the force-delete policy proves are
+	// unrecoverable before any mode runs.
+	if err := escalateStuckTerminatingPods(ctx, deps, input, pods, inst.Index); err != nil {
+		return false, fmt.Errorf("Update: force-delete stuck-Terminating pods (instance=%d): %w", inst.Index, err)
+	}
+
 	// UpdateStrategy is not part of the revision payload, so a strategy edit
 	// retargets nothing: the same roll continues under a different mechanism,
 	// and the mode resolved below can differ from the one that opened the

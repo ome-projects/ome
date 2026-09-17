@@ -113,6 +113,74 @@ func TestExpireOperations_ExpiredDeadlineFailsInstance(t *testing.T) {
 	}
 }
 
+// TestExpireOperations_DeadlineKeepsWorkloadCausedPodEvidence pins the
+// evidence contract of the gang deadline stamp: when a blamed (surge
+// bucket) pod shows a workload-caused waiting reason at the deadline,
+// LastFailure records that pod's reason — the gang abandon charges the
+// revision's retry ladder on it once the pods are gone — while pods
+// without such a reason leave the bare DeadlineExceeded record.
+func TestExpireOperations_DeadlineKeepsWorkloadCausedPodEvidence(t *testing.T) {
+	now := time.Now()
+	surgeIdx := int32(2)
+	gangSurgeSource := func() []workload.InstanceStatus {
+		return []workload.InstanceStatus{{
+			Index: 0,
+			Phase: workload.InstancePhaseUpdating,
+			Operation: &workload.InstanceOperation{
+				Type:       workload.InstanceOperationUpdate,
+				Step:       "Surge",
+				SurgeIndex: &surgeIdx,
+				Deadline:   metav1.NewTime(now.Add(-1 * time.Minute)),
+			},
+		}}
+	}
+	waiting := func(name, reason string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"},
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "main",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+			}}},
+		}
+	}
+
+	t.Run("workload-caused surge pod outranks the timeout", func(t *testing.T) {
+		input, store, event := expireFixture(gangSurgeSource())
+		byIdx := map[int32][]*corev1.Pod{surgeIdx: {
+			waiting("engine-2-leader-0", "ContainerCreating"),
+			waiting("engine-2-worker-0", "ImagePullBackOff"),
+		}}
+		if err := runEscalationPass(t, workload.Deps{}, input, workload.ComponentPlan{}, byIdx); err != nil {
+			t.Fatalf("escalation pass: %v", err)
+		}
+		got := (*store)[0]
+		if got.Phase != workload.InstancePhaseFailed || got.Operation == nil {
+			t.Fatalf("got (phase=%q, op=%+v) want (Failed, Operation preserved)", got.Phase, got.Operation)
+		}
+		if got.LastFailure == nil || got.LastFailure.Reason != "ImagePullBackOff" || got.LastFailure.PodName != "engine-2-worker-0" {
+			t.Errorf("LastFailure: got %+v want Reason=ImagePullBackOff PodName=engine-2-worker-0", got.LastFailure)
+		}
+		if event.count != 1 {
+			t.Errorf("event count: got %d want 1", event.count)
+		}
+	})
+
+	t.Run("pods without a workload-caused reason keep DeadlineExceeded", func(t *testing.T) {
+		input, store, _ := expireFixture(gangSurgeSource())
+		byIdx := map[int32][]*corev1.Pod{surgeIdx: {
+			waiting("engine-2-leader-0", "ContainerCreating"),
+			waiting("engine-2-worker-0", "CrashLoopBackOff"),
+		}}
+		if err := runEscalationPass(t, workload.Deps{}, input, workload.ComponentPlan{}, byIdx); err != nil {
+			t.Fatalf("escalation pass: %v", err)
+		}
+		got := (*store)[0]
+		if got.LastFailure == nil || got.LastFailure.Reason != workload.DeadlineExceededReason {
+			t.Errorf("LastFailure: got %+v want Reason=%s", got.LastFailure, workload.DeadlineExceededReason)
+		}
+	})
+}
+
 // TestExpireOperations_NotYetExpiredUntouched pins the negative case: a
 // transient-phase Instance whose Deadline is still in the future is left
 // alone (no Phase change, no event).

@@ -129,6 +129,22 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 		}
 		livePods = append(livePods, fresh)
 	}
+	// A pod mutation the apiserver PERMANENTLY rejects is a statement
+	// about the revision, not a transient hiccup: the object this
+	// revision asks for is not admissible, so no number of retries
+	// produces a different answer. Dispose exactly as a rejected create
+	// does — the corrected revision is then admitted immediately.
+	rejected := func(pod *corev1.Pod, err error) (bool, error) {
+		rejection := workload.ClassifyAPIError(err)
+		if !rejection.Class.Permanent() {
+			return false, nil
+		}
+		if derr := disposeRejectedAttempt(ctx, deps, input, inst.Index, target.Name, pod.Name, rejection, true); derr != nil {
+			return true, fmt.Errorf("dispose rejected in-place patch (instance=%d, pod=%s): %w", inst.Index, pod.Name, derr)
+		}
+		return true, nil
+	}
+
 	mutated := false
 	for _, pod := range livePods {
 		imagePatches := imagePatchTargets(pod, targetSpec)
@@ -141,6 +157,9 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 		}
 		markerReady, merr := ensureInPlaceImageTransition(ctx, deps.Client, pod, targetSpec, imagePatches)
 		if merr != nil {
+			if disposed, derr := rejected(pod, merr); disposed {
+				return false, derr
+			}
 			return false, fmt.Errorf("record image transition (instance=%d, pod=%s): %w", inst.Index, pod.Name, merr)
 		}
 		if !markerReady {
@@ -149,6 +168,9 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 		if needsImagePatch {
 			issued, perr := patchPodImages(ctx, deps.Client, pod, targetSpec)
 			if perr != nil {
+				if disposed, derr := rejected(pod, perr); disposed {
+					return false, derr
+				}
 				return false, fmt.Errorf("patch images (instance=%d, pod=%s): %w", inst.Index, pod.Name, perr)
 			}
 			if issued {
@@ -157,6 +179,9 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 		}
 		annotationsPatched, err := patchPodAnnotations(ctx, deps.Client, pod, previousAnnotations, targetAnnotations)
 		if err != nil {
+			if disposed, derr := rejected(pod, err); disposed {
+				return false, derr
+			}
 			return false, fmt.Errorf("patch annotations (instance=%d, pod=%s): %w", inst.Index, pod.Name, err)
 		}
 		mutated = mutated || annotationsPatched
@@ -171,6 +196,9 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 		}
 		revisionLabelsPatched, err := patchPodRevisionLabels(ctx, deps.Client, pod, query.RevisionOf(target).Hash(), targetProtocol)
 		if err != nil {
+			if disposed, derr := rejected(pod, err); disposed {
+				return false, derr
+			}
 			return false, fmt.Errorf("patch revision labels (instance=%d, pod=%s): %w", inst.Index, pod.Name, err)
 		}
 		mutated = mutated || revisionLabelsPatched

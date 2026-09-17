@@ -352,8 +352,8 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 
 	// Phase 1: create surge pod if missing. The created pod's
 	// ome.io/revision-hash label is stamped from surgeTargetName so it
-	// matches the in-flight commitment. revisionHashFromName is the
-	// pinned-target equivalent of revisionHashFromTarget.
+	// matches the in-flight commitment — the pinned-target equivalent of
+	// rendering against the live target revision.
 	//
 	// Skip the create when the surge ordinal slot is already occupied
 	// by a pod the reclassify just moved into the drain set. That's
@@ -378,7 +378,10 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 			Runner:  runner,
 			Ordinal: newOrdinal,
 		}}
-		if _, err := createMissingPods(ctx, deps, input, plan, inst, inst.Index, targets, query.RevisionFromName(surgeTargetName).Hash()); err != nil {
+		if _, err := createMissingPods(ctx, deps, input, plan, inst, inst.Index, targets, query.RevisionFromName(surgeTargetName)); err != nil {
+			if createRejectionHandled(err) {
+				return false, nil
+			}
 			return false, fmt.Errorf("create surge pod (instance=%d, ordinal=%d): %w", inst.Index, newOrdinal, err)
 		}
 		return false, nil

@@ -108,6 +108,53 @@ func TestRevisionHashStableUnderExcludedAnnotations(t *testing.T) {
 		"a deliberate declared-annotation change must still produce a new revision")
 }
 
+// TestRevisionHashUnchangedByIROperatorVerbAnnotations verifies the
+// InferenceReplica operator verbs (release-held-revision, reset-instances)
+// never mint a revision: stamped on the IR object they are not hash
+// inputs at all, and even inherited onto the pod-template metadata they
+// are filtered as lifecycle annotations. Each hash is computed on a fresh
+// Reconciler so the memoization cache cannot mask a drift.
+func TestRevisionHashUnchangedByIROperatorVerbAnnotations(t *testing.T) {
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img:1"}}}
+	templateMeta := &metav1.ObjectMeta{Annotations: map[string]string{"ome.io/declared": "1"}}
+	input := workload.ReconcileInput{DesiredSpec: workload.WorkloadDesiredSpec{
+		PodSpec:               podSpec,
+		PodTemplateObjectMeta: templateMeta,
+	}}
+	ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
+		Name: "engine", Namespace: "default", UID: "ir-uid", Generation: 1,
+	}}
+	verbs := map[string]string{
+		constants.ReleaseHeldRevisionAnnotationKey: "llama-engine-aaaaaaaa",
+		constants.ResetInstancesAnnotationKey:      "13,14",
+	}
+	for key, val := range verbs {
+		t.Run(key, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+
+			baseHash, _, err := (&Reconciler{}).revisionHash(ir, input, nil, "scope-uid")
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+
+			annotated := ir.DeepCopy()
+			annotated.Annotations = map[string]string{key: val}
+			objectHash, _, err := (&Reconciler{}).revisionHash(annotated, input, nil, "scope-uid")
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(objectHash).To(gomega.Equal(baseHash),
+				"%s on the IR object must not change the revision", key)
+
+			inherited := input
+			inherited.DesiredSpec.PodTemplateObjectMeta = &metav1.ObjectMeta{Annotations: map[string]string{
+				"ome.io/declared": "1",
+				key:               val,
+			}}
+			templateHash, _, err := (&Reconciler{}).revisionHash(ir, inherited, nil, "scope-uid")
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(templateHash).To(gomega.Equal(baseHash),
+				"%s inherited onto the pod template must be filtered from the revision", key)
+		})
+	}
+}
+
 func TestRevisionHashCacheInvalidatesWhenExcludedAnnotationsChange(t *testing.T) {
 	g := gomega.NewWithT(t)
 	const inheritedKey = "editor.example.com/resource-version"

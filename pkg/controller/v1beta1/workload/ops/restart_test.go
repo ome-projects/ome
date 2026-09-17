@@ -676,12 +676,24 @@ func TestDetectRestartTrigger_GangMemberLossBelowReady(t *testing.T) {
 		live: 1, expected: 2, policy: workload.RestartPolicyRecreateInstance,
 		want: false,
 	}, {
-		// A spent Restart attempt must not re-arm itself.
-		name: "preserved restart operation does not loop",
+		// A Restart attempt parked at Failed is spent, not in flight: only a
+		// new Restart can rebuild the gang as a whole, so it re-arms.
+		name: "spent restart attempt at failed re-arms",
 		status: workload.InstanceStatus{
 			Index: 0, Incarnation: 74, Phase: workload.InstancePhaseFailed, PodCount: 2,
 			RunningRevision: gangLossRevision,
 			Operation:       &workload.InstanceOperation{Type: workload.InstanceOperationRestart, Step: "Drain"},
+		},
+		live: 1, expected: 2, policy: workload.RestartPolicyRecreateInstance,
+		want: true,
+	}, {
+		// A preserved Update operation keeps the update pass as owner even
+		// at Failed (its abandon continuation consumes it).
+		name: "failed with preserved update operation stays update-owned",
+		status: workload.InstanceStatus{
+			Index: 0, Incarnation: 74, Phase: workload.InstancePhaseFailed, PodCount: 2,
+			RunningRevision: gangLossRevision,
+			Operation:       &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: "Drain"},
 		},
 		live: 1, expected: 2, policy: workload.RestartPolicyRecreateInstance,
 		want: false,

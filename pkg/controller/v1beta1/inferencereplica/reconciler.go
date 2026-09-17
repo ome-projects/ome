@@ -305,6 +305,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Operator rebuild mailbox for Failed Instances. Consumed before the
+	// workload input is built so this pass's ObservedState already
+	// reflects a just-cleared Operation and the Create pass can rebuild.
+	if requeue, rerr := r.consumeResetInstancesRequest(ctx, log, ir, parent); rerr != nil {
+		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: consume reset-instances request: %w", rerr)
+	} else if requeue {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Resolve the same-target update retry policy ONCE per reconcile from
 	// the operator lifecycle config. nil (absent/invalid config) fails
 	// safe: the workload layer Holds on the first same-target failure.

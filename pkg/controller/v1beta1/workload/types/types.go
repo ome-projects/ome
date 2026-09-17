@@ -157,7 +157,18 @@ type InstanceOperation struct {
 	// converging toward.
 	TargetRevision string
 
+	// Reason names WHY the operation exists (restart trigger,
+	// revision-roll cause). Written once at the start by the owning state
+	// machine and part of the terminal-finalize identity tuple, so it
+	// must not be reused for transient annotations.
 	Reason string
+
+	// Waiting names an EXTERNAL condition currently holding the operation
+	// back, as a short token (see RejectionReason*). It comes and goes
+	// while the operation runs — deliberately NOT part of the
+	// terminal-finalize identity tuple, or a blip would read as the
+	// operation being replaced.
+	Waiting string
 
 	// Migrate-only fields. The Operation is a pin: SurgeIndex correlates
 	// the source/surge pair and RequestUUID keys the authoritative

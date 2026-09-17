@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -72,9 +73,16 @@ type recoveryHarness struct {
 	isvc *v1beta1.InferenceService
 	clk  *clocktesting.FakeClock
 
-	multiPod bool
-	desired  workload.WorkloadDesiredSpec
-	target   *appsv1.ControllerRevision
+	multiPod  bool
+	replicas  int32
+	lifecycle workload.Lifecycle
+	desired   workload.WorkloadDesiredSpec
+	target    *appsv1.ControllerRevision
+
+	// mutateErr rejects every InstanceStatus write for the listed
+	// indices — the API server refusing that Instance's status update
+	// on every pass — while other indices round-trip normally.
+	mutateErr map[int32]error
 
 	blocks          []workload.RetryBlock
 	currentRevision string
@@ -109,6 +117,7 @@ func newRecoveryHarness(t *testing.T, multiPod bool) *recoveryHarness {
 		isvc:     isvc,
 		clk:      clocktesting.NewFakeClock(time.Now()),
 		multiPod: multiPod,
+		replicas: 1,
 	}
 	h.revV1 = h.ensureRevision(recoveryPodSpec(goodImage))
 	h.revBad = h.ensureRevision(recoveryPodSpec(badImage))
@@ -149,8 +158,9 @@ func (h *recoveryHarness) setTarget(cr *appsv1.ControllerRevision, image string)
 	h.target = cr
 	spec := recoveryPodSpec(image)
 	h.desired = workload.WorkloadDesiredSpec{
-		Replicas: 1,
-		PodSpec:  spec,
+		Replicas:  h.replicas,
+		PodSpec:   spec,
+		Lifecycle: h.lifecycle,
 	}
 	if h.multiPod {
 		h.desired.MultiPod = true
@@ -278,6 +288,18 @@ func (h *recoveryHarness) removeInstance() func(ctx context.Context, idx int32) 
 	}
 }
 
+// mutateInstance is the harness's status-write seam: the IR round-trip
+// for every index, except those mutateErr rejects.
+func (h *recoveryHarness) mutateInstance() func(context.Context, int32, func(*workload.InstanceStatus) bool) error {
+	delegate := roundTripMutateInstance(h.c, h.isvc, workload.ComponentEngine)
+	return func(ctx context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
+		if err := h.mutateErr[idx]; err != nil {
+			return err
+		}
+		return delegate(ctx, idx, mutate)
+	}
+}
+
 func (h *recoveryHarness) buildInput() workload.ReconcileInput {
 	in := workload.ReconcileInput{
 		OwnerObject: h.isvc,
@@ -295,7 +317,7 @@ func (h *recoveryHarness) buildInput() workload.ReconcileInput {
 			CurrentRevision:  h.currentRevision,
 			UpdateRevision:   h.target.Name,
 		},
-		MutateInstance:    roundTripMutateInstance(h.c, h.isvc, workload.ComponentEngine),
+		MutateInstance:    h.mutateInstance(),
 		RemoveInstance:    h.removeInstance(),
 		UpdateRetryPolicy: &workload.RetryPolicy{MaxAttempts: 2, InitialDelay: 20 * time.Second, MaxDelay: time.Minute, Multiplier: 2},
 		StuckPodGrace:     30 * time.Second,
@@ -333,8 +355,18 @@ func (h *recoveryHarness) buildInput() workload.ReconcileInput {
 
 // step runs one reconcile: kubelet convergence, fresh expectations
 // (watch caught up), Reconcile, aggregate CurrentRevision, clock
-// advance (the op's own requeue interval, or a 10s baseline).
+// advance (the op's own requeue interval, or a 10s baseline). A
+// Reconcile error fails the test.
 func (h *recoveryHarness) step() {
+	h.t.Helper()
+	if _, err := h.stepResult(); err != nil {
+		h.t.Fatalf("Reconcile: %v", err)
+	}
+}
+
+// stepResult is step returning the pass's result and error, for tests
+// that expect a pass to fail.
+func (h *recoveryHarness) stepResult() (ctrl.Result, error) {
 	h.t.Helper()
 	h.kubelet()
 	deps := workload.Deps{Client: h.c, APIReader: h.c, Expectations: workload.NewExpectations()}
@@ -344,9 +376,6 @@ func (h *recoveryHarness) step() {
 		h.t.Fatalf("BuildPlan: %v", err)
 	}
 	res, err := workload.Reconcile(h.ctx, deps, in, plan, h.target)
-	if err != nil {
-		h.t.Fatalf("Reconcile: %v", err)
-	}
 	if workload.RolloutComplete(h.irStatuses(), h.target.Name) {
 		h.currentRevision = h.target.Name
 	}
@@ -358,6 +387,7 @@ func (h *recoveryHarness) step() {
 		advance = res.RequeueAfter
 	}
 	h.clk.Step(advance)
+	return res, err
 }
 
 // run steps until pred returns true, up to max iterations. Returns

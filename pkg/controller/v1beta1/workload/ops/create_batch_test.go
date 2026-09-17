@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -997,9 +998,14 @@ func TestCreate_BatchedGlobalAPIFailureStopsFurtherPodCreates(t *testing.T) {
 		return nil
 	}}
 
-	_, err := ops.Create(context.Background(), workload.Deps{Client: observedClient}, input, buildPlanSinglePodEngine(3), nil)
-	if !apierrors.IsTooManyRequests(err) {
-		t.Fatalf("Create error: got %v, want TooManyRequests", err)
+	result, err := ops.Create(context.Background(), workload.Deps{Client: observedClient}, input, buildPlanSinglePodEngine(3), nil)
+	if err != nil {
+		t.Fatalf("Create error: got %v, want nil — a throttled apiserver is paced, not failed", err)
+	}
+	// The server's suggested delay is a floor. A 1s suggestion is already
+	// satisfied by the ordinary create interval, so the pass keeps it.
+	if result.RequeueAfter != ops.CreateRequeueInterval || result.RequeueAfter < time.Second {
+		t.Fatalf("RequeueAfter: got %v, want %v (>= the server's suggested 1s)", result.RequeueAfter, ops.CreateRequeueInterval)
 	}
 	if !reflect.DeepEqual(attempted, []int32{0, 1}) {
 		t.Fatalf("Pod-create attempts after API overload: got %v, want [0 1]", attempted)

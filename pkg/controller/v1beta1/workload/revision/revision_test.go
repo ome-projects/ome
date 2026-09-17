@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -700,6 +701,42 @@ func TestRevisionHash_CanaryVerbAnnotationsDoNotDriftHash(t *testing.T) {
 		hWith, _, _ := Hash(ps, withVerb, nil, "")
 		if hBase != hWith {
 			t.Errorf("%s annotation must be filtered from revision hash: base=%s withVerb=%s", verb.key, hBase, hWith)
+		}
+	}
+}
+
+// The InferenceReplica operator verbs — release-held-revision and
+// reset-instances — are mailboxes consumed off the owner. They must NOT
+// feed the revision hash: otherwise releasing one Held block or
+// rebuilding two Failed Instances would mint a new revision and roll
+// every Instance — the blunt outcome both verbs exist to avoid.
+func TestRevisionHash_IROperatorVerbAnnotationsDoNotDriftHash(t *testing.T) {
+	ps := basicPodSpecForRevision()
+	base := &metav1.ObjectMeta{
+		Annotations: map[string]string{"ome.io/base-model-name": "llama-7b"},
+	}
+	hBase, _, _ := Hash(ps, base, nil, "")
+	hNil, _, _ := Hash(ps, nil, nil, "")
+	for _, verb := range []struct{ key, val string }{
+		{constants.ReleaseHeldRevisionAnnotationKey, "llama-engine-aaaaaaaa"},
+		{constants.ResetInstancesAnnotationKey, "13,14"},
+	} {
+		withVerb := &metav1.ObjectMeta{
+			Annotations: map[string]string{
+				"ome.io/base-model-name": "llama-7b",
+				verb.key:                 verb.val,
+			},
+		}
+		hWith, _, _ := Hash(ps, withVerb, nil, "")
+		if hBase != hWith {
+			t.Errorf("%s annotation must be filtered from revision hash: base=%s withVerb=%s", verb.key, hBase, hWith)
+		}
+		onlyVerb := &metav1.ObjectMeta{
+			Annotations: map[string]string{verb.key: verb.val},
+		}
+		hOnly, _, _ := Hash(ps, onlyVerb, nil, "")
+		if hNil != hOnly {
+			t.Errorf("a template carrying only %s must hash like no metadata: nil=%s only=%s", verb.key, hNil, hOnly)
 		}
 	}
 }

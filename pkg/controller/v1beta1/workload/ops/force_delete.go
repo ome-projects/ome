@@ -260,6 +260,34 @@ func escalateStuckTerminating(ctx context.Context, deps workload.Deps, input wor
 	return err
 }
 
+// escalateStuckTerminatingPods applies the escalation to every pod in
+// pods that is already Terminating. A teardown phase that waits for the
+// pods it deleted to disappear waits forever when the node running them
+// is dead, because only a live kubelet clears the pod object; this gives
+// such a phase the same escalation the scale-down path has. Pods whose
+// evidence is not actionable are left untouched.
+//
+// Call it BEFORE any expectations gate: the unobserved delete is exactly
+// what those expectations are blocked on, so an escalation behind the
+// gate would be waiting on the wedge it exists to clear.
+//
+// For callers on a periodic requeue, the next pass re-evaluates every
+// pod, so no policy-boundary deadline has to be threaded back.
+func escalateStuckTerminatingPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, pods []*corev1.Pod, idx int32) error {
+	if input.ForceDelete == nil {
+		return nil
+	}
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil {
+			continue
+		}
+		if err := escalateStuckTerminating(ctx, deps, input, pod, idx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // escalateStuckTerminatingWithDeadline also reports the next exact policy
 // boundary. Callers without a periodic poll use it to preserve time-driven
 // force-delete progress without inventing a default cadence.

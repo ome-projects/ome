@@ -510,17 +510,36 @@ func Migrate(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 		surgeInput := input
 		surgeInput.DesiredSpec.PodSpec = surgeRevSpec
 		surgeInput.DesiredSpec.WorkerPodSpec = surgeWorkerSpec
-		if _, cerr := createMissingPods(ctx, deps, surgeInput, plan, surgeInst, surgeIdx, missing, revisionHashFromTarget(surgeRev)); cerr != nil {
+		if _, cerr := createMissingPods(ctx, deps, surgeInput, plan, surgeInst, surgeIdx, missing, query.RevisionOf(surgeRev)); cerr != nil {
+			rejection, classified := asPodRejection(cerr)
+			// A permanently rejected surge can never be created, so the
+			// request is closed now rather than idling to its deadline —
+			// the same early-fail the node-affinity conflict gate applies.
+			if classified && rejection.disposed {
+				reason := fmt.Sprintf("surge pod %s rejected by the apiserver (%s): %s",
+					rejection.podName, rejection.rejection.Reason, rejection.rejection.Message)
+				d, ferr := failMigration(ctx, deps, input, ledger, req, requestUUID, reason)
+				return d, accepted, ferr
+			}
+			// A classified-but-transient rejection (out of quota, throttled)
+			// is handled as the blocked-create wait below.
+			blockedPod := ""
 			var createErr *podCreateError
-			if errors.As(cerr, &createErr) &&
+			switch {
+			case classified:
+				blockedPod = rejection.podName
+			case errors.As(cerr, &createErr):
+				blockedPod = createErr.podName
+			}
+			if blockedPod != "" &&
 				!entry.Deadline.IsZero() &&
 				!errors.Is(cerr, context.Canceled) &&
 				!errors.Is(cerr, context.DeadlineExceeded) {
 				recordWarning(deps.Recorder, eventTarget(input), workload.EventReasonMigrationSurgeCreateBlocked,
 					"OMENative migration uuid=%s waiting to create surge pod %s before its deadline",
-					requestUUID, createErr.podName)
+					requestUUID, blockedPod)
 				logf.FromContext(ctx).V(1).Info("migration surge pod creation blocked",
-					"uuid", requestUUID, "pod", createErr.podName, "error", createErr.err.Error())
+					"uuid", requestUUID, "pod", blockedPod, "error", cerr.Error())
 				return false, accepted, nil
 			}
 			return false, accepted, fmt.Errorf("Migrate: create surge pod set: %w", cerr)

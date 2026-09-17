@@ -102,7 +102,7 @@ func TestCreate_RetryBlockHeld_DeniesFreshStart(t *testing.T) {
 	input.WarnRetryHeld = func(rev string, attempts int32, reason string) {
 		*warns = append(*warns, retryHeldWarning{rev: rev, attempts: attempts, reason: reason})
 	}
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, tcr.Name, "ImagePullBackOff"); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, tcr.Name, "ImagePullBackOff", true); err != nil {
 		t.Fatalf("seed Held block: %v", err)
 	}
 	if len(*warns) != 1 {

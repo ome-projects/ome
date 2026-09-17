@@ -211,7 +211,8 @@ type ReconcileInput struct {
 	// nil = unconfigured → fail-safe: first failure Holds.
 	UpdateRetryPolicy *RetryPolicy
 
-	// ForceDelete gates the stuck-Terminating force-delete escalation.
+	// ForceDelete gates the stuck-Terminating force-delete escalation
+	// that scale-down, migration, and update teardown all share.
 	// nil = unconfigured → the escalation is disabled entirely (does not
 	// exist); when non-nil both durations are > 0 — config validation
 	// guarantees it, consumers never re-check.
@@ -223,6 +224,15 @@ type ReconcileInput struct {
 	// (lifecycle.stuckPodGracePeriod); zero or negative disables fast
 	// escalation (the InstanceReadyTimeout backstop still fires).
 	StuckPodGrace time.Duration
+
+	// Pacing collects the wake-up the apiserver itself asked for while
+	// refusing writes during this pass. The op entry points report
+	// progress as (done, error) and have no result channel of their own,
+	// so a server-suggested Retry-After is deposited here and folded into
+	// the pass's requeue by the dispatcher. Reconcile allocates one per
+	// pass; nil is safe (every method no-ops) for adapters and tests that
+	// call an op directly.
+	Pacing *APIPacing
 
 	// Disposition carries the operator-config inputs the terminal-failure
 	// disposition (DisposeExpiredAttempt) branches on. The zero value

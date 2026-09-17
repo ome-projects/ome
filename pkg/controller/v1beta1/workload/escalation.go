@@ -41,9 +41,12 @@ import (
 //     (StartedAt + InstanceReadyTimeout, stamped by the per-op writers)
 //     elapses. Instances whose blamed pods (own bucket, plus the
 //     SurgeIndex bucket for a gang-surge source) are held by an
-//     admission scheduling gate (e.g. Kueue) are excluded: the
-//     deadline-parking step (ReconcileGatedDeadlines) owns their clock,
-//     and a queued wait must not count against the timeout.
+//     admission scheduling gate (e.g. Kueue) are excluded, as are those
+//     whose operation is parked on the capacity-blocked Waiting token
+//     (a create admission refused for lack of quota leaves no pod to
+//     carry a gate): the deadline-parking step (ReconcileGatedDeadlines)
+//     owns their clock, and a queued wait must not count against the
+//     timeout.
 //
 // BOTH paths skip operations whose state machine owns its own terminal
 // handling:
@@ -175,6 +178,16 @@ func escalateFromEvidence(ctx context.Context, deps Deps, input ReconcileInput, 
 		if s.Operation != nil && s.Operation.SurgeIndex != nil && anyPodAdmissionGated(byIdx[*s.Operation.SurgeIndex]) {
 			continue
 		}
+		// Same rationale, no pod to read it from: a create admission
+		// refused for lack of quota leaves nothing to carry a scheduling
+		// gate, so the wait is recorded on the Operation instead — on the
+		// surge row for a gang surge, whose source this check follows the
+		// same way the gate check above follows the SurgeIndex bucket. The
+		// parking step zeroes that deadline; one stamped before the park
+		// landed must not expire either.
+		if instanceCapacityBlocked(&s, input.ObservedState.InstanceStatuses) {
+			continue
+		}
 		op := s.Operation
 		if disposableAttempt(&s, desired) {
 			if ferr := buf.flush(ctx); ferr != nil {
@@ -186,7 +199,15 @@ func escalateFromEvidence(ctx context.Context, deps Deps, input ReconcileInput, 
 			continue
 		}
 		idx := s.Index
-		buf.add(idx, deadlineFailedMutation(now, op), func() {
+		// The teardown that follows deletes the blamed pods, so revision-scoped
+		// evidence must survive on LastFailure: a workload-caused waiting reason
+		// names the cause more precisely than the elapsed timeout, and it is what
+		// the gang abandon charges the revision's retry ladder on.
+		termination := deadlineTermination(now, op)
+		if pod, reason := firstWorkloadCausedPod(pods); pod != nil {
+			termination = PodTerminationWithReason(pod, reason, metav1.NewTime(now))
+		}
+		buf.add(idx, deadlineFailedMutation(termination), func() {
 			input.WarnInstanceFailed(idx, "", deadlineFailureMessage(op))
 		})
 	}
@@ -250,8 +271,12 @@ func (b *failureStampBuffer) flush(ctx context.Context) error {
 // rotation: at least `desired` live (non-deleting) pods, every one of
 // them ContainersReady AND carrying the serving gate. Deleting pods are
 // excluded rather than disqualifying — a completed surge leaves the old
-// pod draining next to the serving replacement. desired <= 0 never
-// counts as serving (nothing is expected, so nothing can prove health).
+// pod draining next to the serving replacement. A terminal pod is never
+// live and disqualifies the set outright: it is failure evidence that
+// must reach escalation even when stale conditions on it still read
+// healthy, or when a serving sibling would otherwise cover the count.
+// desired <= 0 never counts as serving (nothing is expected, so nothing
+// can prove health).
 func podSetFullyServing(pods []*corev1.Pod, desired int32) bool {
 	if desired <= 0 {
 		return false
@@ -261,7 +286,7 @@ func podSetFullyServing(pods []*corev1.Pod, desired int32) bool {
 		if p == nil || p.DeletionTimestamp != nil {
 			continue
 		}
-		if !podreadiness.IsContainersReady(p) || !podreadiness.IsServing(p) {
+		if query.IsTerminalPod(p) || !podreadiness.IsContainersReady(p) || !podreadiness.IsServing(p) {
 			return false
 		}
 		live++
