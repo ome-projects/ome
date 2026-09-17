@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/safetext"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
 	"sigs.k8s.io/ome/pkg/cli/waitpredicate"
+	"sigs.k8s.io/ome/pkg/cli/waitruntime"
 )
 
 const WaitReportKind = "WaitReport"
@@ -17,14 +18,15 @@ const WaitReportKind = "WaitReport"
 type WaitRequested string
 
 const (
-	WaitRequestedTrue              WaitRequested = "Ready=True"
-	WaitRequestedFalse             WaitRequested = "Ready=False"
-	WaitRequestedUnknown           WaitRequested = "Ready=Unknown"
-	WaitRequestedRolloutStable     WaitRequested = "Rollout=Stable"
-	WaitRequestedRolloutFailed     WaitRequested = "Rollout=Failed"
-	WaitRequestedRolloutRolledBack WaitRequested = "Rollout=RolledBack"
-	WaitRequestedMigrationTerminal WaitRequested = "Migration=Terminal"
-	WaitRequestedReadyReplicas     WaitRequested = "Replicas=Ready"
+	WaitRequestedTrue                    WaitRequested = "Ready=True"
+	WaitRequestedFalse                   WaitRequested = "Ready=False"
+	WaitRequestedUnknown                 WaitRequested = "Ready=Unknown"
+	WaitRequestedRolloutStable           WaitRequested = "Rollout=Stable"
+	WaitRequestedRolloutFailed           WaitRequested = "Rollout=Failed"
+	WaitRequestedRolloutRolledBack       WaitRequested = "Rollout=RolledBack"
+	WaitRequestedMigrationTerminal       WaitRequested = "Migration=Terminal"
+	WaitRequestedReadyReplicas           WaitRequested = "Replicas=Ready"
+	WaitRequestedRuntimeSyncAcknowledged WaitRequested = "RuntimeSync=Acknowledged"
 )
 
 type WaitCounts struct {
@@ -42,6 +44,7 @@ type WaitContent struct {
 	Rollout             *WaitRolloutObservation       `json:"rollout,omitempty"`
 	Migration           *WaitMigrationObservation     `json:"migration,omitempty"`
 	ReadyReplicas       *WaitReadyReplicasObservation `json:"readyReplicas,omitempty"`
+	RuntimeSync         *WaitRuntimeSyncObservation   `json:"runtimeSync,omitempty"`
 	Evidence            EvidenceLevel                 `json:"evidence"`
 	ElapsedMilliseconds int64                         `json:"elapsedMilliseconds"`
 	Counts              WaitCounts                    `json:"counts"`
@@ -65,7 +68,7 @@ func (r WaitReport) Canonical() WaitReport {
 	return r
 }
 func (c WaitContent) Canonical() WaitContent {
-	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() {
+	if c.Requested != WaitRequestedTrue && c.Requested != WaitRequestedFalse && c.Requested != WaitRequestedUnknown && !c.Requested.IsRollout() && !c.Requested.IsMigration() && !c.Requested.IsReadyReplicas() && !c.Requested.IsRuntimeSync() {
 		c.Requested = "Unknown"
 	}
 	switch c.Outcome {
@@ -88,6 +91,11 @@ func (c WaitContent) Canonical() WaitContent {
 		}
 	case waitengine.ReasonReplicaReadyMatched, waitengine.ReasonReplicaReadyNotMatched, waitengine.ReasonReplicaReadyNotRecorded, waitengine.ReasonInvalidReplicaReady:
 		if !c.Requested.IsReadyReplicas() {
+			c.Reason = "PredicateUnmet"
+		}
+	case waitruntime.ReasonObserved, waitruntime.ReasonNotAcknowledged,
+		waitruntime.ReasonNotRecorded, waitruntime.ReasonUnsupportedPlacement:
+		if !c.Requested.IsRuntimeSync() {
 			c.Reason = "PredicateUnmet"
 		}
 	default:
@@ -196,6 +204,32 @@ func (c WaitContent) Canonical() WaitContent {
 	} else {
 		c.ReadyReplicas = nil
 	}
+	if c.Requested.IsRuntimeSync() {
+		if c.RuntimeSync == nil {
+			c.RuntimeSync = &WaitRuntimeSyncObservation{
+				TokenState: waitruntime.TokenUnavailable, DriftState: waitruntime.DriftUnavailable,
+				PinState: waitruntime.PinUnavailable, PlacementState: waitruntime.PlacementDirect,
+				Validity: "Unavailable",
+			}
+		}
+		observed := c.RuntimeSync.Canonical()
+		if c.Outcome == waitengine.OutcomeMatched &&
+			(observed.Validity != "Valid" || observed.RequestID == "" || observed.TokenState != waitruntime.TokenAcknowledged ||
+				observed.DriftState != waitruntime.DriftClear || observed.PinState != waitruntime.PinManaged ||
+				observed.PlacementState != waitruntime.PlacementDirect || c.Reason != waitruntime.ReasonObserved) {
+			observed.Validity = "Invalid"
+			c.Outcome = "Unknown"
+			c.Reason = waitengine.ReasonInvalidCondition
+		}
+		c.RuntimeSync = &observed
+		c.Observed = waitpredicate.Observation{Status: "NotRecorded", Validity: "Unavailable", GenerationFreshness: "Unverifiable", Inspection: waitpredicate.Inspection{State: "NotInspected", Warnings: []waitpredicate.Warning{}}}
+		c.Evidence = EvidenceUnavailable
+		if observed.Validity == "Valid" {
+			c.Evidence = EvidenceReported
+		}
+	} else {
+		c.RuntimeSync = nil
+	}
 	return c
 }
 func (r WaitReport) Table() report.Table {
@@ -209,6 +243,9 @@ func (r WaitReport) WideTable() report.Table {
 func (c WaitContent) Table() report.Table { return WaitReport{Content: c.Canonical()}.table(false) }
 func (r WaitReport) table(wide bool) report.Table {
 	c := r.Content
+	if c.RuntimeSync != nil {
+		return r.runtimeSyncTable(wide)
+	}
 	if c.ReadyReplicas != nil {
 		return r.readyReplicasTable(wide)
 	}

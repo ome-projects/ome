@@ -66,8 +66,14 @@ func TestReadyReplicaWaitReportsExactCountInAllFormats(t *testing.T) {
 		t.Run(format, func(t *testing.T) {
 			parent, ir := readyWaitFixture(0)
 			client := omefake.NewSimpleClientset(parent, ir)
-			out, stderr, err := execute(t, factory.Static{NS: "prod", OME: client},
-				"chat", "--for=replicas=ready", "--component=engine", "--replicas=0", "-o", format)
+			var stdout, errorOutput bytes.Buffer
+			clock := clocktesting.NewFakeClock(time.Unix(1000, 0))
+			cmd := newCmd(factory.Static{NS: "prod", OME: client},
+				genericiooptions.IOStreams{Out: &stdout, ErrOut: &errorOutput}, clock)
+			cmd.SetArgs([]string{"chat", "--for=replicas=ready", "--component=engine", "--replicas=0", "-o", format})
+			cmd.SilenceUsage, cmd.SilenceErrors = true, true
+			err := cmd.Execute()
+			out, stderr := stdout.String(), errorOutput.String()
 			require.NoError(t, err)
 			require.Empty(t, stderr)
 			require.Equal(t, 0, exitcode.FromError(err))
