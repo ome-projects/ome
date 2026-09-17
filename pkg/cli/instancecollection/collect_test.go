@@ -460,6 +460,32 @@ func TestCollectRelatedColumnarTruncatesDefaultControllerCardinality(t *testing.
 	assert.Equal(t, []instancecollection.StatusRowsTruncation{{Name: source.Name, Component: source.Spec.Component}}, got.StatusRowsTruncated)
 }
 
+func TestCollectRelatedColumnarRejectsExpansionBeyondFixedCeiling(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	source := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	source.Status.Replicas = 20_001
+	source.Status.InstanceStatusEncoding = &encoding
+	source.Status.InstanceStatusColumns = &omev1beta1.InstanceStatusColumns{
+		Members: "0-20000",
+		Phases:  []omev1beta1.InstanceStatusPhaseGroup{{Value: omev1beta1.OMENativeInstanceReady, Indexes: "0-20000"}},
+	}
+	original := source.DeepCopy()
+	limits := collectionLimits()
+	limits.MaxStatusRows = 20_001 // A caller's larger output budget must not raise the decoder's cap.
+
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+	}), isvc, limits)
+
+	require.ErrorIs(t, err, instancecollection.ErrStatusEncodingInvalid)
+	assert.Empty(t, got.Items)
+	assert.Empty(t, got.StatusEncodings)
+	assert.Equal(t, original, source.DeepCopy(), "decoding must not mutate the API object")
+}
+
 func TestCollectRelatedCopiesSelectedLifecycleAndRelevantMigrationsOnly(t *testing.T) {
 	t.Parallel()
 	isvc := collectionISVC()
