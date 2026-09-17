@@ -87,6 +87,22 @@ func TestTrafficExplainCanonicalUnknownEnumsHaveTotalOrder(t *testing.T) {
 	}
 }
 
+func TestTrafficExplainRealizationSourceIncludesPerUnitCanaries(t *testing.T) {
+	value := trafficExplainReportFixture()
+	canary := *value.Content.Reported.Canary
+	value.Content.Reported.Canary = nil
+	value.Content.Reported.Canaries = []v1alpha1.TrafficCanary{canary}
+	value.Content.Reported.Routes = nil
+	value.Content.Reported.Endpoints = nil
+	value.Content.Reported.Allocations = nil
+
+	got := value.Canonical()
+
+	assert.Equal(t, v1alpha1.TrafficValueSource{
+		Evidence: v1alpha1.EvidenceReported, Freshness: v1alpha1.TrafficFreshnessUnverifiable,
+	}, got.Content.Summary.RealizationSource)
+}
+
 func TestTrafficExplainCompactAndWideTables(t *testing.T) {
 	value := trafficExplainReportFixture()
 

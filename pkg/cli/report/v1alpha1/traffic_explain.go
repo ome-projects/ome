@@ -328,6 +328,14 @@ func (c TrafficExplainContent) Table() report.Table {
 		{"TRANSLATE", string(c.Reported.Summary.Source.Translator.Evidence), string(c.Reported.Summary.Translator), trafficSourceCell(c.Reported.Summary.Source.Translator)},
 		{"REALIZE", string(c.Summary.Realization), trafficCompactRealizationCell(c.Reported), trafficSourceCell(c.Summary.RealizationSource)},
 	}
+	// The singular canary retains its historical compact shape. Concurrent
+	// canaries need separate rows: their step weights are not additive.
+	if c.Reported.Canary == nil {
+		for i := range c.Reported.Canaries {
+			canary := &c.Reported.Canaries[i]
+			rows = append(rows, []string{"CANARY", string(canary.Component), canaryStepCell(canary), trafficSourceCell(canary.Source)})
+		}
+	}
 	for _, comparison := range c.Comparisons {
 		rows = append(rows, []string{
 			"CHECK", string(comparison.State), string(comparison.Field),
@@ -416,6 +424,22 @@ func trafficExplainReportedRows(c TrafficStatusContent) [][]string {
 			"OBSERVED", "canary-revision", "Reported", trafficOptionalCell(c.Canary.CanaryRevisionHash),
 			trafficSourceCell(c.Canary.Source),
 		})
+	} else {
+		for i := range c.Canaries {
+			canary := &c.Canaries[i]
+			component := string(canary.Component)
+			rows = append(rows, []string{
+				"OBSERVED", "canary", "Reported",
+				fmt.Sprintf("%s step=%d/%d traffic=%d%%", component, canaryDisplayStep(canary), canary.TotalSteps, canary.ObservedTraffic),
+				trafficSourceCell(canary.Source),
+			}, []string{
+				"OBSERVED", component + "/stable-revision", "Reported", trafficOptionalCell(canary.StableRevisionHash),
+				trafficSourceCell(canary.Source),
+			}, []string{
+				"OBSERVED", component + "/canary-revision", "Reported", trafficOptionalCell(canary.CanaryRevisionHash),
+				trafficSourceCell(canary.Source),
+			})
+		}
 	}
 	for _, allocation := range c.Allocations {
 		rows = append(rows, []string{
@@ -511,7 +535,7 @@ func trafficCompactRealizationCell(content TrafficStatusContent) string {
 }
 
 func trafficRealizationSource(content TrafficStatusContent) TrafficValueSource {
-	sources := make([]TrafficValueSource, 0, len(content.Routes)+len(content.Endpoints)+len(content.Allocations)+1)
+	sources := make([]TrafficValueSource, 0, len(content.Routes)+len(content.Endpoints)+len(content.Allocations)+len(content.Canaries)+1)
 	for _, route := range content.Routes {
 		sources = append(sources, route.Source)
 	}
@@ -523,6 +547,9 @@ func trafficRealizationSource(content TrafficStatusContent) TrafficValueSource {
 	}
 	if content.Canary != nil {
 		sources = append(sources, content.Canary.Source)
+	}
+	for _, canary := range content.Canaries {
+		sources = append(sources, canary.Source)
 	}
 	if len(sources) == 0 {
 		return TrafficValueSource{

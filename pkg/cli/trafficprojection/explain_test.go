@@ -96,6 +96,44 @@ func TestProjectExplainConcurrentCanaryComparisonIsUnverifiable(t *testing.T) {
 		reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
 }
 
+func TestProjectExplainShowsIndependentCanaryStepsWithoutAggregateWeight(t *testing.T) {
+	isvc := concurrentCanaryTrafficISVC(t)
+	setReadyCondition(isvc, metav1.ConditionTrue, omev1beta1.TrafficReasonAcceptedByGateway, 7)
+
+	got, err := trafficprojection.ProjectExplain(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Equal(t, reportv1alpha1.TrafficStateReported, got.Content.Reported.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficExplainPartial, got.Content.Summary.State)
+	assert.Equal(t, reportv1alpha1.TrafficComparisonUnverifiable,
+		explainComparison(t, got, reportv1alpha1.TrafficComparisonCanaryWeight).State)
+	assert.Equal(t, reportv1alpha1.TrafficFreshnessUnverifiable,
+		explainComparison(t, got, reportv1alpha1.TrafficComparisonCanaryWeight).Source.Freshness)
+	assert.Contains(t, got.Table().Rows, []string{"CANARY", "engine", "1/2 @ 20%", "Reported/Unverifiable"})
+	assert.Contains(t, got.Table().Rows, []string{"CANARY", "router", "2/3 @ 50%", "Reported/Unverifiable"})
+	wide := got.WideTable().Rows
+	for _, row := range [][]string{
+		{"OBSERVED", "canary", "Reported", "engine step=1/2 traffic=20%", "Reported/Unverifiable"},
+		{"OBSERVED", "engine/stable-revision", "Reported", "a1b2c3d4", "Reported/Unverifiable"},
+		{"OBSERVED", "engine/canary-revision", "Reported", "e5f6a7b8", "Reported/Unverifiable"},
+		{"OBSERVED", "canary", "Reported", "router step=2/3 traffic=50%", "Reported/Unverifiable"},
+		{"OBSERVED", "router/stable-revision", "Reported", "11112222", "Reported/Unverifiable"},
+		{"OBSERVED", "router/canary-revision", "Reported", "33334444", "Reported/Unverifiable"},
+	} {
+		assert.Contains(t, wide, row)
+	}
+	var compact bytes.Buffer
+	require.NoError(t, report.Write(&compact, report.FormatTable, got))
+	for _, line := range strings.Split(strings.TrimSuffix(compact.String(), "\n"), "\n") {
+		assert.LessOrEqual(t, len(line), 80, "compact explain must fit an 80-column terminal")
+	}
+	t.Logf("concurrent-canary traffic explain (fixture):\n%s", compact.String())
+	var machine bytes.Buffer
+	require.NoError(t, report.Write(&machine, report.FormatJSON, got))
+	assert.Contains(t, machine.String(), `"canaries":`)
+	assert.NotContains(t, machine.String(), `"canary":`)
+}
+
 func TestProjectExplainClassifiesAlgorithmMismatch(t *testing.T) {
 	isvc := currentTrafficISVC(t)
 	algorithm := omev1beta1.LoadBalancingTypeLeastRequest

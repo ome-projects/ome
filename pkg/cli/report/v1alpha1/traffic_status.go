@@ -245,11 +245,14 @@ type TrafficWarning struct {
 }
 
 type TrafficStatusContent struct {
-	Summary     TrafficSummary      `json:"summary"`
-	Policy      *TrafficPolicy      `json:"policy,omitempty"`
-	Routes      []TrafficRoute      `json:"routes"`
-	Endpoints   []TrafficEndpoint   `json:"endpoints"`
-	Canary      *TrafficCanary      `json:"canary,omitempty"`
+	Summary   TrafficSummary    `json:"summary"`
+	Policy    *TrafficPolicy    `json:"policy,omitempty"`
+	Routes    []TrafficRoute    `json:"routes"`
+	Endpoints []TrafficEndpoint `json:"endpoints"`
+	Canary    *TrafficCanary    `json:"canary,omitempty"`
+	// Canaries holds independently observed unit runs when more than one
+	// canary is active. Canary remains the wire-compatible single-run field.
+	Canaries    []TrafficCanary     `json:"canaries,omitempty"`
 	Allocations []TrafficAllocation `json:"allocations"`
 	Conditions  []TrafficCondition  `json:"conditions"`
 	Issues      []TrafficIssue      `json:"issues"`
@@ -323,6 +326,15 @@ func (c TrafficStatusContent) Canonical() TrafficStatusContent {
 	if c.Canary != nil {
 		canary := *c.Canary
 		result.Canary = &canary
+		// Match the existing table precedence and keep the legacy singular
+		// report unambiguous if a caller supplied both representations.
+		result.Canaries = nil
+	} else {
+		result.Canaries = append([]TrafficCanary(nil), c.Canaries...)
+		sort.Slice(result.Canaries, func(i, j int) bool {
+			return compareTrafficCanary(result.Canaries[i], result.Canaries[j]) < 0
+		})
+		result.Canaries = slices.Compact(result.Canaries)
 	}
 	result.Allocations = append([]TrafficAllocation{}, c.Allocations...)
 	sort.Slice(result.Allocations, func(i, j int) bool {
@@ -358,6 +370,11 @@ func (c TrafficStatusContent) Table() report.Table {
 	rows = append(rows, []string{"ENDPOINTS", "-", strconv.Itoa(len(c.Endpoints)), trafficSourceCell(endpointsSource(c.Endpoints))})
 	if c.Canary != nil {
 		rows = append(rows, []string{"CANARY", string(c.Canary.Component), canaryStepCell(c.Canary), trafficSourceCell(c.Canary.Source)})
+	} else {
+		for i := range c.Canaries {
+			canary := &c.Canaries[i]
+			rows = append(rows, []string{"CANARY", string(canary.Component), canaryStepCell(canary), trafficSourceCell(canary.Source)})
+		}
 	}
 	for _, allocation := range c.Allocations {
 		rows = append(rows, []string{"WEIGHT", string(allocation.Component), fmt.Sprintf("%s:%s=%d%%", allocation.Role, allocation.RevisionHash, allocation.Percent), trafficSourceCell(allocation.Source)})
@@ -380,6 +397,11 @@ func (c TrafficStatusContent) WideTable() report.Table {
 	}
 	if c.Canary != nil {
 		rows = append(rows, []string{"CANARY", string(c.Canary.Component), canaryStepCell(c.Canary), trafficSourceCell(c.Canary.Source)})
+	} else {
+		for i := range c.Canaries {
+			canary := &c.Canaries[i]
+			rows = append(rows, []string{"CANARY", string(canary.Component), canaryStepCell(canary), trafficSourceCell(canary.Source)})
+		}
 	}
 	for _, allocation := range c.Allocations {
 		rows = append(rows, []string{"TARGET", string(allocation.Component), fmt.Sprintf("%s:%s=%d%%", allocation.Role, allocation.RevisionName, allocation.Percent), trafficSourceCell(allocation.Source)})
@@ -453,6 +475,21 @@ func compareTrafficRoute(a, b TrafficRoute) int {
 
 func compareTrafficEndpoint(a, b TrafficEndpoint) int {
 	return slices.Compare([]string{a.URL, string(a.Source.Evidence), string(a.Source.Freshness)}, []string{b.URL, string(b.Source.Evidence), string(b.Source.Freshness)})
+}
+
+func compareTrafficCanary(a, b TrafficCanary) int {
+	for _, result := range []int{
+		cmp.Compare(trafficComponentRank(a.Component), trafficComponentRank(b.Component)),
+		cmp.Compare(a.Component, b.Component), cmp.Compare(a.CurrentStep, b.CurrentStep),
+		cmp.Compare(a.TotalSteps, b.TotalSteps), cmp.Compare(a.ObservedTraffic, b.ObservedTraffic),
+		cmp.Compare(a.StableRevisionHash, b.StableRevisionHash), cmp.Compare(a.CanaryRevisionHash, b.CanaryRevisionHash),
+		cmp.Compare(a.Source.Evidence, b.Source.Evidence), cmp.Compare(a.Source.Freshness, b.Source.Freshness),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
 }
 
 func compareTrafficAllocation(a, b TrafficAllocation) int {

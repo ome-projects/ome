@@ -390,11 +390,8 @@ func (b *projector) projectCanary() {
 		b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)
 		return
 	}
-	// The report has one canary-step field. For concurrent runs, keep their
-	// per-unit allocation roles but do not pretend one run describes them all.
-	if len(groups) > 1 {
-		b.partial = true
-	}
+	// Preserve the singular field for one run. Concurrent runs are separately
+	// reported in Canaries; neither status nor weight is aggregated across units.
 	b.canaries = make(map[reportv1alpha1.RuntimeComponentType]*reportv1alpha1.TrafficCanary, len(groups))
 	seenUnits := make(map[omev1beta1.ComponentType]struct{}, len(groups))
 	for _, group := range groups {
@@ -439,6 +436,8 @@ func (b *projector) projectCanary() {
 		b.canaries[component] = canary
 		if len(groups) == 1 {
 			b.content.Canary = canary
+		} else {
+			b.content.Canaries = append(b.content.Canaries, *canary)
 		}
 	}
 }

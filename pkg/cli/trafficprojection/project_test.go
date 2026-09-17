@@ -378,10 +378,20 @@ func TestProjectConcurrentCanariesKeepUnitAllocationsWithoutInventingGlobalStep(
 	require.NoError(t, err)
 	assert.Equal(t, before, isvc, "projection must not mutate API evidence")
 	assert.Nil(t, got.Content.Canary, "one canary field cannot represent two independent steps")
-	assert.Equal(t, reportv1alpha1.TrafficStatePartial, got.Content.Summary.State)
+	require.Len(t, got.Content.Canaries, 2)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canaries[0].Component)
+	assert.Equal(t, int32(0), got.Content.Canaries[0].CurrentStep)
+	assert.Equal(t, int32(20), got.Content.Canaries[0].ObservedTraffic)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentRouter, got.Content.Canaries[1].Component)
+	assert.Equal(t, int32(1), got.Content.Canaries[1].CurrentStep)
+	assert.Equal(t, int32(50), got.Content.Canaries[1].ObservedTraffic)
+	assert.Equal(t, reportv1alpha1.TrafficStateReported, got.Content.Summary.State)
 	assert.NotContains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{Code: reportv1alpha1.TrafficIssueCanaryInvalid})
-	assert.Contains(t, got.Warnings, reportv1alpha1.TrafficWarning{Code: reportv1alpha1.WarningPartialData})
-	assert.Empty(t, tableRows(got.Table().Rows, "CANARY"))
+	assert.Empty(t, got.Warnings)
+	assert.Equal(t, [][]string{
+		{"CANARY", "engine", "1/2 @ 20%", "Reported/Unverifiable"},
+		{"CANARY", "router", "2/3 @ 50%", "Reported/Unverifiable"},
+	}, tableRows(got.Table().Rows, "CANARY"))
 	for _, component := range []reportv1alpha1.RuntimeComponentType{reportv1alpha1.RuntimeComponentEngine, reportv1alpha1.RuntimeComponentRouter} {
 		allocations := allocationsForComponent(got.Content.Allocations, component)
 		require.Len(t, allocations, 2)
@@ -404,6 +414,25 @@ func TestProjectConcurrentCanariesDoNotReuseAliasForMissingUnit(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Nil(t, got.Content.Canary)
+	require.Len(t, got.Content.Canaries, 1)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canaries[0].Component)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
+		Code: reportv1alpha1.TrafficIssueCanaryInvalid, Component: reportv1alpha1.RuntimeComponentRouter,
+	})
+}
+
+func TestProjectConcurrentCanariesKeepHealthyUnitWhenSiblingStatusIsMalformed(t *testing.T) {
+	isvc := concurrentCanaryTrafficISVC(t)
+	router := isvc.Status.Components[omev1beta1.RouterComponent]
+	router.Canary.CurrentStep = 99
+	isvc.Status.Components[omev1beta1.RouterComponent] = router
+
+	got, err := trafficprojection.Project(isvc, projectionClock)
+
+	require.NoError(t, err)
+	assert.Nil(t, got.Content.Canary)
+	require.Len(t, got.Content.Canaries, 1)
+	assert.Equal(t, reportv1alpha1.RuntimeComponentEngine, got.Content.Canaries[0].Component)
 	assert.Contains(t, got.Content.Issues, reportv1alpha1.TrafficIssue{
 		Code: reportv1alpha1.TrafficIssueCanaryInvalid, Component: reportv1alpha1.RuntimeComponentRouter,
 	})

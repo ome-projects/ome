@@ -335,7 +335,7 @@ func projectTrafficRealization(status reportv1alpha1.TrafficStatusContent) repor
 			return reportv1alpha1.TrafficRealizationInvalid
 		}
 	}
-	count := len(status.Routes) + len(status.Endpoints) + len(status.Allocations)
+	count := len(status.Routes) + len(status.Endpoints) + len(status.Allocations) + len(status.Canaries)
 	if status.Canary != nil {
 		count++
 	}
@@ -404,6 +404,10 @@ func projectTrafficComparisons(
 	if hasDeclaredCanary(isvc) {
 		canary = reportv1alpha1.TrafficComparisonUnverifiable
 		canaryFreshness = reportv1alpha1.TrafficFreshnessUnavailable
+		if len(status.Canaries) > 0 {
+			// Unit observations exist, but there is no single aggregate weight.
+			canaryFreshness = reportv1alpha1.TrafficFreshnessUnverifiable
+		}
 		if hasTrafficIssue(status.Issues, reportv1alpha1.TrafficIssueCanaryInvalid) ||
 			hasCanaryAllocationIssue(isvc, status.Issues) {
 			canary = reportv1alpha1.TrafficComparisonInvalid

@@ -2,6 +2,7 @@ package v1alpha1_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -129,6 +130,52 @@ func TestTrafficStatusCompactAndWideTables(t *testing.T) {
 	} {
 		assert.Contains(t, joined, wanted)
 	}
+}
+
+func TestTrafficStatusConcurrentCanariesAreTypedAndIndividuallyRendered(t *testing.T) {
+	var content v1alpha1.TrafficStatusContent
+	require.NoError(t, json.Unmarshal([]byte(`{"canaries":[
+		{"component":"router","currentStep":1,"totalSteps":3,"observedTraffic":50,"stableRevisionHash":"11112222","canaryRevisionHash":"33334444","source":{"evidence":"Reported","freshness":"Unverifiable"}},
+		{"component":"engine","currentStep":0,"totalSteps":2,"observedTraffic":20,"stableRevisionHash":"a1b2c3d4","canaryRevisionHash":"e5f6a7b8","source":{"evidence":"Reported","freshness":"Unverifiable"}}
+	]}`), &content))
+
+	canonical := content.Canonical()
+	compact := flattenTrafficTable(canonical.Table())
+	assert.Contains(t, compact, "CANARY|engine|1/2 @ 20%|Reported/Unverifiable")
+	assert.Contains(t, compact, "CANARY|router|2/3 @ 50%|Reported/Unverifiable")
+	assert.Less(t, strings.Index(compact, "CANARY|engine"), strings.Index(compact, "CANARY|router"))
+	wide := flattenTrafficTable(canonical.WideTable())
+	assert.Contains(t, wide, "CANARY|engine|1/2 @ 20%|Reported/Unverifiable")
+	assert.Contains(t, wide, "CANARY|router|2/3 @ 50%|Reported/Unverifiable")
+	encoded, err := json.Marshal(canonical)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"canaries":[`)
+	assert.NotContains(t, string(encoded), `"canary":`)
+
+	canonical.Canaries[0].CanaryRevisionHash = "changed"
+	assert.Equal(t, "e5f6a7b8", content.Canaries[1].CanaryRevisionHash)
+
+	single, err := json.Marshal(trafficStatusReportFixture().Content)
+	require.NoError(t, err)
+	assert.Contains(t, string(single), `"canary":`)
+	assert.NotContains(t, string(single), `"canaries":`)
+}
+
+func TestTrafficStatusCanonicalPrefersSingularWhenBothFormsAreSet(t *testing.T) {
+	content := trafficStatusReportFixture().Content
+	content.Canaries = []v1alpha1.TrafficCanary{{
+		Component: v1alpha1.RuntimeComponentRouter, CurrentStep: 1, TotalSteps: 3,
+		ObservedTraffic: 50, CanaryRevisionHash: "33334444",
+	}}
+
+	canonical := content.Canonical()
+
+	require.NotNil(t, canonical.Canary)
+	assert.Empty(t, canonical.Canaries)
+	encoded, err := json.Marshal(canonical)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"canary":`)
+	assert.NotContains(t, string(encoded), `"canaries":`)
 }
 
 func TestTrafficStatusMachineOutputIsStableAndTyped(t *testing.T) {
