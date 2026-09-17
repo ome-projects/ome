@@ -1,14 +1,13 @@
-// Package endpoint programs ONE concrete global-traffic backend so the global
-// host of a multi-cluster InferenceService resolves to whichever workload
-// cluster currently wins the placement race.
+// Package endpoint programs one concrete traffic backend for a multi-cluster
+// InferenceService.
 //
 // The control-plane fan-out controller (package placement) already records the
 // winner and the winner's externally-addressable URL in
 // status.placement.{cluster,endpoint}. That is status-only: an external LB has
-// to consume it. This package closes that gap by actually programming a backend
-// — the Gateway API HTTPRoute backend (GatewayAPIPublisher) is the first
-// concrete implementation; the EndpointPublisher interface lets DNS/GSLB
-// backends be added later without touching the reconciler.
+// to consume it. This package closes that gap by actually programming a backend.
+// The Gateway API HTTPRoute backend is the default implementation. The
+// EndpointPublisher interface lets another backend reuse the same watch and
+// lifecycle reconciliation.
 package endpoint
 
 import (
@@ -23,9 +22,11 @@ import (
 // backend translates it into its own resource(s). Single mode yields exactly one
 // Home; All/Split yield one per serving cluster.
 type Target struct {
-	// GlobalHost is the externally-addressable hostname the publisher programs
-	// (e.g. "my-svc.global.example"). Rendered from Config + the ISVC, never a
-	// baked-in literal.
+	// Service is the logical service represented by the target.
+	Service string
+
+	// GlobalHost is the externally-addressable hostname used by publishers that
+	// create a global endpoint. It is empty for backends that consume only Homes.
 	GlobalHost string
 
 	// Homes are the serving clusters the global host resolves to, one per admitted
@@ -38,6 +39,9 @@ type Target struct {
 type Home struct {
 	// Cluster is the WorkloadCluster serving this home (labels/logging).
 	Cluster string
+	// Endpoint is the complete client-facing URL reported by this home. Backends
+	// that need more than a Kubernetes Service hostname can consume it directly.
+	Endpoint string
 	// BackendHost is that cluster's ingress hostname the global host resolves to —
 	// the host of the home's status endpoint. A bare hostname (no scheme/port);
 	// the backend supplies the port from Config.
@@ -51,16 +55,13 @@ type Home struct {
 	Weight int32
 }
 
-// EndpointPublisher programs the global-traffic backend(s) so the global host of
-// a multi-cluster InferenceService points at every serving home (one in Single;
-// several, load-balanced, in All/Split), adjusts the set as homes come and go,
-// and tears it all down when the service is no longer placed. Implementations
-// are backend-specific (Gateway API HTTPRoute today; DNS/GSLB later) and MUST be
+// EndpointPublisher programs a backend from the resolved serving homes and
+// tears it down when the service leaves the placed state. Implementations MUST be
 // idempotent: Publish for an unchanged Target is a no-op, and Unpublish for an
 // already-clean service is a no-op.
 type EndpointPublisher interface {
 	// Publish ensures the backend routes target.GlobalHost to
-	// target.BackendHost for isvc, creating or repointing as needed.
+	// target.Homes for isvc, creating or repointing as needed.
 	Publish(ctx context.Context, isvc *v1beta1.InferenceService, target Target) error
 
 	// Unpublish removes any backend resources this publisher created for isvc.

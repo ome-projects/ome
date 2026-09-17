@@ -67,7 +67,13 @@ func TestResolveMCWiringFullConfig(t *testing.T) {
 				"endpointSlices": {"enabled": true, "addressRefreshInterval": "1m"}
 			}
 		},
-		"routing": { "enabled": true }
+		"routing": {
+			"enabled": true,
+			"publisher": {
+				"name": "test-publisher",
+				"options": {"key": "value"}
+			}
+		}
 	}`)
 
 	// WorkloadCluster transport.
@@ -109,6 +115,8 @@ func TestResolveMCWiringFullConfig(t *testing.T) {
 
 	// Routing.
 	assert.True(t, w.routing.Enabled)
+	assert.Equal(t, "test-publisher", w.routing.Publisher.Name)
+	assert.Equal(t, map[string]string{"key": "value"}, w.routing.Publisher.Options)
 }
 
 // TestResolveMCWiringSafetyRequeueDependsOnCache pins the one non-trivial bit of

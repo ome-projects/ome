@@ -207,6 +207,20 @@ type RoutingConfig struct {
 	// Absent (no path) means allocation comes from the control-plane plan alone.
 	// Independent of Probe: enabling one never enables the other.
 	Capacity CapacityConfig `json:"capacity,omitempty"`
+
+	// Publisher selects an optional compiled-in backend for the existing endpoint
+	// publisher. Empty retains the Gateway API backend. A selected stateful
+	// backend must be drained by disabling routing before its name is removed.
+	// Options are validated by the selected backend at manager startup.
+	Publisher TrafficMapPublisherConfig `json:"publisher,omitempty"`
+}
+
+// TrafficMapPublisherConfig selects one backend compiled into the manager.
+//
+// +kubebuilder:object:generate=false
+type TrafficMapPublisherConfig struct {
+	Name    string            `json:"name,omitempty"`
+	Options map[string]string `json:"options,omitempty"`
 }
 
 // +kubebuilder:object:generate=false

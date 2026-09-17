@@ -62,6 +62,23 @@ func updateEvent(old, nw *v1beta1.InferenceService) event.UpdateEvent {
 	return event.UpdateEvent{ObjectOld: old, ObjectNew: nw}
 }
 
+type recordingEndpointPublisher struct {
+	published   []Target
+	unpublished int
+}
+
+func (*recordingEndpointPublisher) Name() string { return "recording" }
+
+func (p *recordingEndpointPublisher) Publish(_ context.Context, _ *v1beta1.InferenceService, target Target) error {
+	p.published = append(p.published, target)
+	return nil
+}
+
+func (p *recordingEndpointPublisher) Unpublish(_ context.Context, _ *v1beta1.InferenceService) error {
+	p.unpublished++
+	return nil
+}
+
 func TestReconcile_PlacedPublishesAndFinalizes(t *testing.T) {
 	r, c := newReconciler(t, baseConfig(), placedISVC("cluster-a", "svc.prod.cloud-a.example"))
 
@@ -79,6 +96,85 @@ func TestReconcile_PlacedPublishesAndFinalizes(t *testing.T) {
 	got := &v1beta1.InferenceService{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc", Namespace: "prod"}, got))
 	assert.True(t, controllerutil.ContainsFinalizer(got, EndpointFinalizer))
+}
+
+func TestReconcile_TrafficMapPublisherUsesExistingLifecycle(t *testing.T) {
+	isvc := placedISVC("cluster-a", "placement.example")
+	isvc.Spec.Placement = &v1beta1.PlacementSpec{}
+	tm := &v1beta1.TrafficMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"},
+		Spec: v1beta1.TrafficMapSpec{Entries: []v1beta1.TrafficMapEntry{
+			{Cluster: "cluster-b", Endpoint: apis.HTTPS("b.example:8443"), Weight: 0},
+			{Cluster: "cluster-a", Endpoint: apis.HTTPS("a.example"), Weight: 70},
+		}},
+	}
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&v1beta1.InferenceService{}).
+		WithObjects(isvc, tm).Build()
+	publisher := &recordingEndpointPublisher{}
+	active := true
+	r := &Reconciler{
+		Client:        c,
+		Log:           log.Log,
+		Publisher:     publisher,
+		Active:        &active,
+		UseTrafficMap: true,
+		RequeueAfter:  time.Minute,
+	}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "svc", Namespace: "prod"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, time.Minute, result.RequeueAfter)
+	require.Len(t, publisher.published, 1)
+	assert.Equal(t, []Home{
+		{Cluster: "cluster-a", Endpoint: "https://a.example", BackendHost: "a.example", Weight: 70},
+		{Cluster: "cluster-b", Endpoint: "https://b.example:8443", BackendHost: "b.example", Weight: 0},
+	}, publisher.published[0].Homes)
+
+	got := &v1beta1.InferenceService{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(isvc), got))
+	assert.Contains(t, got.Finalizers, EndpointFinalizer)
+}
+
+func TestReconcile_TrafficMapPublisherDoesNotFallBackWithoutMap(t *testing.T) {
+	isvc := placedISVC("cluster-a", "placement.example")
+	isvc.Spec.Placement = &v1beta1.PlacementSpec{}
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&v1beta1.InferenceService{}).
+		WithObjects(isvc).Build()
+	publisher := &recordingEndpointPublisher{}
+	active := true
+	r := &Reconciler{
+		Client: c, Log: log.Log, Publisher: publisher,
+		Active: &active, UseTrafficMap: true,
+	}
+
+	reconcile(t, r)
+	require.Len(t, publisher.published, 1)
+	assert.Empty(t, publisher.published[0].Homes,
+		"a missing TrafficMap must not restore placement-derived weights")
+}
+
+func TestReconcile_InactiveTrafficMapPublisherUsesExistingCleanup(t *testing.T) {
+	isvc := placedISVC("cluster-a", "placement.example")
+	isvc.Finalizers = []string{EndpointFinalizer}
+	s := pubScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&v1beta1.InferenceService{}).
+		WithObjects(isvc).Build()
+	publisher := &recordingEndpointPublisher{}
+	active := false
+	r := &Reconciler{Client: c, Log: log.Log, Publisher: publisher, Active: &active, UseTrafficMap: true}
+
+	reconcile(t, r)
+	assert.Equal(t, 1, publisher.unpublished)
+	got := &v1beta1.InferenceService{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(isvc), got))
+	assert.NotContains(t, got.Finalizers, EndpointFinalizer)
 }
 
 func TestReconcile_GatewayBackendSchedulesAddressRefresh(t *testing.T) {

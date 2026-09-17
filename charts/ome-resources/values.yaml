@@ -119,6 +119,27 @@ ome:
       # TrafficMap a gateway consumes. Alpha; default off.
       routing:
         enabled: false          # generate TrafficMaps for placed InferenceServices
+        publisher: []
+        # publisher replaces the default Gateway API backend with an optional
+        # adapter compiled into the manager. To remove a stateful publisher,
+        # first set enabled=false and wait for it to drain.
+        # publisher:
+        #   name: example
+        #   options:
+        #     key: value
+        probe: []
+        # probe actively checks each TrafficMap entry's client-facing endpoint.
+        # Every field is required. Statuses omitted from both lists are
+        # inconclusive and do not change the health gate.
+        # probe:
+        #   path: /v1/models
+        #   method: GET
+        #   acceptStatuses: [200]
+        #   gateStatuses: [404, 500, 502, 503, 504]
+        #   period: 10s
+        #   timeout: 3s
+        #   failureThreshold: 3
+        #   successThreshold: 2
   # autoscalerPolicy is the single gate for the reusable AutoscalerPolicy
   # feature: the manager's policy RBAC, the policy validating webhook, and the
   # autoscalerPolicy config block all install together on this one value —

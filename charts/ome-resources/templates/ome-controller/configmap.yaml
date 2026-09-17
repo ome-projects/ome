@@ -154,7 +154,21 @@ data:
         }
       },
       "routing": {
-        "enabled": {{ .Values.ome.multicluster.config.routing.enabled | default false }}
+        "enabled": {{ .Values.ome.multicluster.config.routing.enabled | default false }}{{- with .Values.ome.multicluster.config.routing.probe }},
+        "probe": {
+          "path": {{ .path | quote }},
+          "method": {{ .method | quote }},
+          "acceptStatuses": {{ .acceptStatuses | default (list) | toJson }},
+          "gateStatuses": {{ .gateStatuses | default (list) | toJson }},
+          "period": {{ .period | quote }},
+          "timeout": {{ .timeout | quote }},
+          "failureThreshold": {{ .failureThreshold | default 0 }},
+          "successThreshold": {{ .successThreshold | default 0 }}
+        }{{- end }}{{- with .Values.ome.multicluster.config.routing.publisher }},
+        "publisher": {
+          "name": {{ .name | quote }},
+          "options": {{ .options | default dict | toJson }}
+        }{{- end }}
       }
     }
 {{- if .Values.ome.autoscalerPolicy.enabled }}

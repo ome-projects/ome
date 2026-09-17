@@ -2,9 +2,11 @@ package endpoint
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,20 +22,26 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// Reconciler watches InferenceServices on the control-plane cluster and, when an
-// ISVC is Placed (status.placement reports a winner and an addressable
-// endpoint), programs the configured Publisher so the global host resolves to
-// the winner's ingress. It repoints the backend on re-placement and tears it
-// down when the ISVC is no longer placed or is deleted. When the Publisher's
-// backend is not configured, Reconcile publishes nothing and releases whatever
-// it already owns.
+// Reconciler watches InferenceServices and their TrafficMaps on the control
+// plane and drives the selected publisher through one shared lifecycle.
 type Reconciler struct {
 	client.Client
 	Log logr.Logger
-	// Publisher is the global-traffic backend. Required.
+	// Publisher is the selected traffic backend. Required.
 	Publisher EndpointPublisher
 	// Config supplies the config-driven host/gateway/port/namespace inputs.
 	Config Config
+	// Active overrides Config.IsEnabled when set. Deployment-specific
+	// publishers use it to share this reconciler without requiring Gateway API
+	// configuration.
+	Active *bool
+	// UseTrafficMap makes the generated TrafficMap, including an empty map, the
+	// publisher's exact desired input instead of overlaying its weights on the
+	// placement-derived homes used by the Gateway API compatibility path.
+	UseTrafficMap bool
+	// RequeueAfter periodically reasserts external publisher state. Zero keeps
+	// the Gateway API publisher's existing refresh behavior.
+	RequeueAfter time.Duration
 }
 
 // +kubebuilder:rbac:groups=ome.io,resources=inferenceservices,verbs=get;list;watch;update;patch
@@ -56,7 +64,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Backend not configured: tear down anything already published — it carries no
 	// OwnerReferences, so dropping the finalizer without unpublishing leaks it —
 	// and release the object, deleted or not.
-	if !r.Config.IsEnabled() {
+	if !r.isActive() {
 		if controllerutil.ContainsFinalizer(isvc, EndpointFinalizer) {
 			if err := r.Publisher.Unpublish(ctx, isvc); err != nil {
 				return ctrl.Result{}, err
@@ -73,12 +81,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.reconcileDelete(ctx, isvc)
 	}
 
-	target, ok, err := r.resolveTarget(isvc, r.trafficMapWeights(ctx, isvc))
-	if err != nil {
-		// A bad global-host template is the operator's config error; surface it
-		// and retry on the next change/poll rather than hot-looping.
-		r.Log.Error(err, "endpoint: resolve target failed", "isvc", req.String())
-		return ctrl.Result{}, nil
+	var target Target
+	var ok bool
+	var err error
+	if r.UseTrafficMap {
+		target, ok, err = r.trafficMapTarget(ctx, isvc)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		target, ok, err = r.resolveTarget(isvc, r.trafficMapWeights(ctx, isvc))
+		if err != nil {
+			// An invalid global-host template is an operator configuration error;
+			// surface it and retry on the next change rather than hot-looping.
+			r.Log.Error(err, "endpoint: resolve target failed", "isvc", req.String())
+			return ctrl.Result{}, nil
+		}
 	}
 
 	if !ok {
@@ -96,10 +114,53 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	r.Log.Info("endpoint published", "isvc", req.String(), "backend", r.Publisher.Name(),
 		"globalHost", target.GlobalHost, "homes", len(target.Homes))
+	if r.RequeueAfter > 0 {
+		return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
+	}
 	if r.Config.GatewayBackend.EndpointSlices.Enabled && r.Config.GatewayBackend.EndpointSlices.AddressRefreshInterval > 0 {
 		return ctrl.Result{RequeueAfter: r.Config.GatewayBackend.EndpointSlices.AddressRefreshInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) isActive() bool {
+	if r.Active != nil {
+		return *r.Active
+	}
+	return r.Config.IsEnabled()
+}
+
+// trafficMapTarget resolves the exact routing table for a deployment-specific
+// publisher. A missing or empty map for a multi-cluster service is still a
+// valid empty target, allowing a stateful publisher to hold retired homes at
+// zero instead of restoring a static fallback.
+func (r *Reconciler) trafficMapTarget(ctx context.Context, isvc *v1beta1.InferenceService) (Target, bool, error) {
+	if isvc.Spec.Placement == nil {
+		return Target{}, false, nil
+	}
+	tm := &v1beta1.TrafficMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, tm)
+	if apierrors.IsNotFound(err) {
+		return Target{}, true, nil
+	}
+	if err != nil {
+		return Target{}, false, err
+	}
+
+	homes := make([]Home, 0, len(tm.Spec.Entries))
+	for _, entry := range tm.Spec.Entries {
+		if entry.Endpoint == nil || entry.Endpoint.Host == "" {
+			return Target{}, false, fmt.Errorf("TrafficMap entry %q has no endpoint host", entry.Cluster)
+		}
+		homes = append(homes, Home{
+			Cluster:     entry.Cluster,
+			Endpoint:    entry.Endpoint.String(),
+			BackendHost: hostOnly(entry.Endpoint.Host),
+			Weight:      entry.Weight,
+		})
+	}
+	sort.Slice(homes, func(i, j int) bool { return homes[i].Cluster < homes[j].Cluster })
+	return Target{Service: tm.Spec.Service, Homes: homes}, true, nil
 }
 
 // resolveTarget builds the publication Target from status.placement. ok is false
@@ -125,7 +186,7 @@ func (r *Reconciler) resolveTarget(isvc *v1beta1.InferenceService, weights map[s
 		return Target{}, false, nil
 	}
 	applyTrafficMapWeights(homes, weights)
-	return Target{GlobalHost: host, Homes: homes}, true, nil
+	return Target{Service: isvc.Name, GlobalHost: host, Homes: homes}, true, nil
 }
 
 // trafficMapWeights returns the per-cluster apply-verbatim weights the routing
@@ -177,11 +238,16 @@ func homesFromPlacement(pl *v1beta1.PlacementStatus) []Home {
 	for i := range pl.Candidates {
 		c := &pl.Candidates[i]
 		if c.Phase == v1beta1.CandidatePhaseAdmitted && c.Endpoint != nil && c.Endpoint.Host != "" {
-			homes = append(homes, Home{Cluster: c.Cluster, BackendHost: hostOnly(c.Endpoint.Host), Weight: c.ReadyReplicas})
+			homes = append(homes, Home{
+				Cluster: c.Cluster, Endpoint: c.Endpoint.String(),
+				BackendHost: hostOnly(c.Endpoint.Host), Weight: c.ReadyReplicas,
+			})
 		}
 	}
 	if len(homes) == 0 && pl.Cluster != "" && pl.Endpoint != nil && pl.Endpoint.Host != "" {
-		homes = append(homes, Home{Cluster: pl.Cluster, BackendHost: hostOnly(pl.Endpoint.Host)})
+		homes = append(homes, Home{
+			Cluster: pl.Cluster, Endpoint: pl.Endpoint.String(), BackendHost: hostOnly(pl.Endpoint.Host),
+		})
 	}
 	sort.Slice(homes, func(i, j int) bool { return homes[i].Cluster < homes[j].Cluster })
 	return homes

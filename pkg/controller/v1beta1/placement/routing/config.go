@@ -29,12 +29,35 @@ type Config struct {
 	// serving capacity, a capacity poll does not -- and enabling one never
 	// enables the other.
 	Capacity CapacityConfig
+
+	// Publisher selects an optional deployment-specific backend for the existing
+	// endpoint publisher. Empty retains the Gateway API backend. Options are
+	// opaque here and validated by the selected publisher at manager startup.
+	Publisher PublisherConfig
 }
 
 // IsEnabled reports whether TrafficMap generation is on. When false the routing
 // controller publishes nothing and releases what it already owns.
 func (c Config) IsEnabled() bool {
 	return c.Enabled
+}
+
+// PublisherConfig selects one compiled-in TrafficMap publisher backend.
+//
+// +kubebuilder:object:generate=false
+type PublisherConfig struct {
+	// Name is the registered publisher name. Empty retains the Gateway API
+	// publisher. To disable a stateful publisher safely, leave its name selected
+	// while disabling routing so the shared reconciler can withdraw its state.
+	Name string
+
+	// Options are interpreted and validated only by the named publisher.
+	Options map[string]string
+}
+
+// IsEnabled reports whether a TrafficMap publisher was explicitly selected.
+func (c PublisherConfig) IsEnabled() bool {
+	return c.Name != ""
 }
 
 // ProbeConfig configures the active end-to-end probe of each home's

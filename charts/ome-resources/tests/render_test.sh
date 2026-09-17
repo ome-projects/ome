@@ -368,6 +368,75 @@ for expected in \
     fail "gateway backend setting was not rendered: ${expected}"
 done
 
+if grep -Fq '"probe"' <<<"${controller_config}"; then
+  fail "routing probe was rendered when disabled"
+fi
+
+routing_probe_args=(
+  --set-string ome.multicluster.config.routing.probe.path=/v1/models
+  --set-string ome.multicluster.config.routing.probe.method=GET
+  --set 'ome.multicluster.config.routing.probe.acceptStatuses={200}'
+  --set 'ome.multicluster.config.routing.probe.gateStatuses={404,500,502,503,504}'
+  --set-string ome.multicluster.config.routing.probe.period=10s
+  --set-string ome.multicluster.config.routing.probe.timeout=3s
+  --set ome.multicluster.config.routing.probe.failureThreshold=3
+  --set ome.multicluster.config.routing.probe.successThreshold=2
+)
+routing_probe_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_probe_args[@]}" \
+  --show-only templates/ome-controller/configmap.yaml)"
+for expected in \
+  '"path": "/v1/models"' \
+  '"method": "GET"' \
+  '"acceptStatuses": [200]' \
+  '"gateStatuses": [404,500,502,503,504]' \
+  '"period": "10s"' \
+  '"timeout": "3s"' \
+  '"failureThreshold": 3' \
+  '"successThreshold": 2'; do
+  grep -Fq "${expected}" <<<"${routing_probe_config}" ||
+    fail "routing probe setting was not rendered: ${expected}"
+done
+
+routing_probe_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_probe_args[@]}" \
+  --show-only templates/ome-controller/deployment.yaml)"
+routing_probe_checksum="$(grep -m1 'checksum/config:' <<<"${routing_probe_controller}" | awk '{print $2}')"
+[[ -n "${routing_probe_checksum}" ]] ||
+  fail "routing probe controller checksum was not rendered"
+[[ "${default_controller_checksum}" != "${routing_probe_checksum}" ]] ||
+  fail "enabling the routing probe did not roll the controller checksum"
+
+if grep -Fq '"publisher"' <<<"${controller_config}"; then
+  fail "TrafficMap publisher was rendered when disabled"
+fi
+
+routing_publisher_args=(
+  --set-string ome.multicluster.config.routing.publisher.name=test-publisher
+  --set-json 'ome.multicluster.config.routing.publisher.options={"key":"value"}'
+)
+routing_publisher_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_publisher_args[@]}" \
+  --show-only templates/ome-controller/configmap.yaml)"
+for expected in \
+  '"name": "test-publisher"' \
+  '"key":"value"'; do
+  grep -Fq "${expected}" <<<"${routing_publisher_config}" ||
+    fail "TrafficMap publisher setting was not rendered: ${expected}"
+done
+routing_publisher_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_publisher_args[@]}" \
+  --show-only templates/ome-controller/deployment.yaml)"
+routing_publisher_checksum="$(grep -m1 'checksum/config:' <<<"${routing_publisher_controller}" | awk '{print $2}')"
+[[ -n "${routing_publisher_checksum}" ]] ||
+  fail "TrafficMap publisher controller checksum was not rendered"
+[[ "${default_controller_checksum}" != "${routing_publisher_checksum}" ]] ||
+  fail "configuring a TrafficMap publisher did not roll the controller checksum"
+
 # acceleratorResources has no in-code default: the chart default is the only
 # source of any non-nvidia recognition. It stays nvidia-only so upgrading the
 # chart cannot change which pods get a PARALLELISM_SIZE env var — recognizing

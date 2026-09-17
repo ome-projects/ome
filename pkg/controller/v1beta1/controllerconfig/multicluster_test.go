@@ -37,6 +37,7 @@ func TestNewMultiClusterConfig(t *testing.T) {
 				assert.Equal(t, 0, cfg.Placement.MaxConcurrentReconciles)
 				assert.Equal(t, "", cfg.Placement.DispatcherMode)
 				assert.Equal(t, "", cfg.Endpoint.GlobalGateway)
+				assert.Equal(t, "", cfg.Routing.Publisher.Name)
 			},
 		},
 		{
@@ -74,6 +75,12 @@ func TestNewMultiClusterConfig(t *testing.T) {
 						"globalGateway": "ome/global-gateway",
 						"routeNamespace": "ome-routes",
 						"backendPort": 8080
+					},
+					"routing": {
+						"publisher": {
+							"name": "test-publisher",
+							"options": {"key": "value"}
+						}
 					}
 				}`,
 			},
@@ -109,6 +116,9 @@ func TestNewMultiClusterConfig(t *testing.T) {
 				assert.Equal(t, "ome/global-gateway", ep.GlobalGateway)
 				assert.Equal(t, "ome-routes", ep.RouteNamespace)
 				assert.Equal(t, 8080, ep.BackendPort)
+
+				assert.Equal(t, "test-publisher", cfg.Routing.Publisher.Name)
+				assert.Equal(t, map[string]string{"key": "value"}, cfg.Routing.Publisher.Options)
 			},
 		},
 		{
