@@ -219,6 +219,24 @@ func TestAutoscaleStatusCanonicalOrderingIsTotal(t *testing.T) {
 	assert.Equal(t, left, right)
 }
 
+func TestAutoscaleStatusCanonicalOrderingIncludesLiveScaler(t *testing.T) {
+	componentA := v1alpha1.AutoscaleComponentStatus{
+		Type: v1alpha1.RuntimeComponentEngine,
+		LiveScaler: &v1alpha1.AutoscaleLiveScaler{
+			Kind:     v1alpha1.AutoscaleClassHPA,
+			Evidence: v1alpha1.AutoscaleLiveScalerForbidden,
+		},
+	}
+	componentB := componentA
+	componentB.LiveScaler = &v1alpha1.AutoscaleLiveScaler{
+		Kind:     v1alpha1.AutoscaleClassHPA,
+		Evidence: v1alpha1.AutoscaleLiveScalerNotFound,
+	}
+	left := v1alpha1.AutoscaleStatusContent{Components: []v1alpha1.AutoscaleComponentStatus{componentA, componentB}}.Canonical()
+	right := v1alpha1.AutoscaleStatusContent{Components: []v1alpha1.AutoscaleComponentStatus{componentB, componentA}}.Canonical()
+	assert.Equal(t, left, right)
+}
+
 func TestAutoscaleStatusTableUsesOnlyTypedReportedEvidence(t *testing.T) {
 	reportValue := autoscaleStatusFixture()
 

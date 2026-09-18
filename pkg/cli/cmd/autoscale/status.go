@@ -43,9 +43,10 @@ type statusDependencies struct {
 
 type statusOptions struct {
 	genericiooptions.IOStreams
-	output    string
-	liveScale bool
-	deps      statusDependencies
+	output     string
+	liveScale  bool
+	liveScaler bool
+	deps       statusDependencies
 }
 
 func newStatusCmd(
@@ -60,6 +61,11 @@ func newStatusCmd(
 		Long: `Show autoscaling evidence reported on the InferenceService parent.
 By default, this performs no HPA, KEDA, Deployment, or InferenceReplica reads.
 --live-scale adds exact parent-selected InferenceReplica and /scale reads only.
+--live-scaler adds exact HPA or KEDA ScaledObject reads for OME-managed scalers;
+IR-backed targets first require a verified exact InferenceReplica read.
+KEDA's generated HPA and reconciliation freshness are not observed by this flag.
+SCALER-GEN=Matched means only HPA observedGeneration equals HPA generation.
+STATE remains parent-reported; SCALER-EVIDENCE is separate live evidence.
 Count equality is not proof of ongoing freshness or scaler health.
 The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
 as UTC MonDD HH:MMZ. ISSUES uses compact aliases:
@@ -85,6 +91,7 @@ Use -o wide for exact issue codes, complete identities, and timestamps.`,
 	}
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
 	cmd.Flags().BoolVar(&o.liveScale, "live-scale", false, "Compare parent counts with exact selected InferenceReplica and /scale reads")
+	cmd.Flags().BoolVar(&o.liveScaler, "live-scaler", false, "Inspect exact selected HPA or KEDA ScaledObject (additional read permission)")
 	return cmd
 }
 
@@ -136,6 +143,12 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 		reportValue, err = autoscaleprojection.EnrichLiveScale(ctx, isvc, reportValue, &statusScaleReader{factory: f}, o.deps.clock)
 		if err != nil {
 			return fmt.Errorf("inspect live scale for InferenceService %q: %w", namespace+"/"+name, err)
+		}
+	}
+	if o.liveScaler {
+		reportValue, err = autoscaleprojection.EnrichLiveScaler(ctx, isvc, reportValue, &statusScalerReader{factory: f}, o.deps.clock)
+		if err != nil {
+			return fmt.Errorf("inspect live scaler for InferenceService %q: %w", namespace+"/"+name, err)
 		}
 	}
 	if wide {

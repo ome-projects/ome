@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
 
@@ -16,6 +17,31 @@ var ErrResponseTooLarge = errors.New("API response exceeds safety bounds")
 // response bytes, including error responses. Existing wrappers are preserved.
 // Do not use this client for streaming watches.
 func NewBounded(config *rest.Config, limit int64) (*Client, error) {
+	cfg, err := boundedConfig(config, limit)
+	if err != nil {
+		return nil, err
+	}
+	return New(cfg)
+}
+
+// NewBoundedDynamic supplies a dynamic client for optional API resources
+// without permitting oversized responses or cross-host redirects. Callers
+// remain responsible for issuing only the specific reads they need.
+func NewBoundedDynamic(config *rest.Config, limit int64) (dynamic.Interface, error) {
+	cfg, err := boundedConfig(config, limit)
+	if err != nil {
+		return nil, err
+	}
+	inherited, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	isolated := *inherited
+	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return dynamic.NewForConfigAndClient(cfg, &isolated)
+}
+
+func boundedConfig(config *rest.Config, limit int64) (*rest.Config, error) {
 	if config == nil || limit < 1 || limit > 64*1024*1024 {
 		return nil, errors.New("transport: bounded response configuration is invalid")
 	}
@@ -23,7 +49,7 @@ func NewBounded(config *rest.Config, limit int64) (*Client, error) {
 	cfg.Wrap(func(inner http.RoundTripper) http.RoundTripper {
 		return &boundedTransport{inner: inner, limit: limit}
 	})
-	return New(cfg)
+	return cfg, nil
 }
 
 type boundedTransport struct {

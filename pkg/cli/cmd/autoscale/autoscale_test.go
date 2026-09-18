@@ -99,6 +99,11 @@ func TestStatusHelpDefinesTheReportedEvidenceBoundary(t *testing.T) {
 	assert.Equal(t, `Show autoscaling evidence reported on the InferenceService parent.
 By default, this performs no HPA, KEDA, Deployment, or InferenceReplica reads.
 --live-scale adds exact parent-selected InferenceReplica and /scale reads only.
+--live-scaler adds exact HPA or KEDA ScaledObject reads for OME-managed scalers;
+IR-backed targets first require a verified exact InferenceReplica read.
+KEDA's generated HPA and reconciliation freshness are not observed by this flag.
+SCALER-GEN=Matched means only HPA observedGeneration equals HPA generation.
+STATE remains parent-reported; SCALER-EVIDENCE is separate live evidence.
 Count equality is not proof of ongoing freshness or scaler health.
 The compact table abbreviates InferenceReplica as IR and formats LAST-SCALE
 as UTC MonDD HH:MMZ. ISSUES uses compact aliases:
@@ -124,6 +129,7 @@ Usage:
 Flags:
   -h, --help            help for status
       --live-scale      Compare parent counts with exact selected InferenceReplica and /scale reads
+      --live-scaler     Inspect exact selected HPA or KEDA ScaledObject (additional read permission)
   -o, --output string   Output format: table, wide, json or yaml (default "table")
 `, output.String())
 }

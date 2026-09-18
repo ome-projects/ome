@@ -22,6 +22,8 @@ const (
 	AutoscaleSourceInferenceService      AutoscaleSourceKind = "InferenceService"
 	AutoscaleSourceInferenceReplica      AutoscaleSourceKind = "InferenceReplica"
 	AutoscaleSourceInferenceReplicaScale AutoscaleSourceKind = "InferenceReplicaScale"
+	AutoscaleSourceHPA                   AutoscaleSourceKind = "HorizontalPodAutoscaler"
+	AutoscaleSourceScaledObject          AutoscaleSourceKind = "ScaledObject"
 )
 
 type AutoscaleState string
@@ -215,6 +217,43 @@ const (
 	AutoscaleLiveScaleDrift   AutoscaleLiveScaleComparison = "Drift"
 )
 
+// AutoscaleLiveScaler contains only allowlisted evidence from an opt-in exact
+// HPA or ScaledObject GET. It never carries condition messages or trigger data.
+type AutoscaleLiveScaler struct {
+	Kind            AutoscaleClass                 `json:"kind"`
+	Evidence        AutoscaleLiveScalerEvidence    `json:"evidence"`
+	GenerationState AutoscaleScalerGenerationState `json:"generationState"`
+	CurrentReplicas *int32                         `json:"currentReplicas,omitempty"`
+	DesiredReplicas *int32                         `json:"desiredReplicas,omitempty"`
+	Conditions      []AutoscaleScalerCondition     `json:"conditions"`
+}
+
+type AutoscaleLiveScalerEvidence string
+
+const (
+	AutoscaleLiveScalerReported    AutoscaleLiveScalerEvidence = "Reported"
+	AutoscaleLiveScalerNotSelected AutoscaleLiveScalerEvidence = "NotSelected"
+	AutoscaleLiveScalerUnsupported AutoscaleLiveScalerEvidence = "Unsupported"
+	AutoscaleLiveScalerForbidden   AutoscaleLiveScalerEvidence = "Forbidden"
+	AutoscaleLiveScalerNotFound    AutoscaleLiveScalerEvidence = "NotFound"
+	AutoscaleLiveScalerDeleting    AutoscaleLiveScalerEvidence = "Deleting"
+	AutoscaleLiveScalerStale       AutoscaleLiveScalerEvidence = "Stale"
+	AutoscaleLiveScalerInvalid     AutoscaleLiveScalerEvidence = "Invalid"
+	AutoscaleLiveScalerUnavailable AutoscaleLiveScalerEvidence = "Unavailable"
+)
+
+type AutoscaleScalerGenerationState string
+
+const (
+	AutoscaleScalerGenerationMatched  AutoscaleScalerGenerationState = "Matched"
+	AutoscaleScalerGenerationUnproven AutoscaleScalerGenerationState = "Unproven"
+)
+
+type AutoscaleScalerCondition struct {
+	Type   AutoscaleConditionType   `json:"type"`
+	Status AutoscaleConditionStatus `json:"status"`
+}
+
 type AutoscaleCondition struct {
 	Type               AutoscaleConditionType   `json:"type"`
 	Status             AutoscaleConditionStatus `json:"status"`
@@ -235,6 +274,7 @@ type AutoscaleComponentStatus struct {
 	Target     AutoscaleTarget           `json:"target"`
 	Replicas   AutoscaleReplicaStatus    `json:"replicas"`
 	LiveScale  *AutoscaleLiveScale       `json:"liveScale,omitempty"`
+	LiveScaler *AutoscaleLiveScaler      `json:"liveScaler,omitempty"`
 	Conditions AutoscaleConditionsStatus `json:"conditions"`
 }
 
@@ -375,6 +415,18 @@ func (c AutoscaleStatusContent) Table() report.Table {
 		"LIVE-SPEC",
 		"LIVE-CURRENT",
 		"LIVE-COUNT",
+		"SCALER-KIND",
+		"SCALER-EVIDENCE",
+		"SCALER-GEN",
+		"SCALER-CURRENT",
+		"SCALER-DESIRED",
+		"SCALER-ABLE",
+		"SCALER-SCALING",
+		"SCALER-LIMITED",
+		"SCALER-READY",
+		"SCALER-ACTIVE",
+		"SCALER-FALLBACK",
+		"SCALER-PAUSED",
 		"LAST-SCALE",
 		"COND-EVIDENCE",
 		"ABLE-TO-SCALE",
@@ -453,6 +505,18 @@ func compactAutoscaleComponentValues(component AutoscaleComponentStatus) map[str
 		values["LIVE-CURRENT"] = autoscaleInt32Cell(component.LiveScale.CurrentReplicas)
 		values["LIVE-COUNT"] = string(component.LiveScale.CountComparison)
 	}
+	if component.LiveScaler != nil {
+		values["SCALER-KIND"] = string(component.LiveScaler.Kind)
+		values["SCALER-EVIDENCE"] = string(component.LiveScaler.Evidence)
+		values["SCALER-GEN"] = string(component.LiveScaler.GenerationState)
+		values["SCALER-CURRENT"] = autoscaleInt32Cell(component.LiveScaler.CurrentReplicas)
+		values["SCALER-DESIRED"] = autoscaleInt32Cell(component.LiveScaler.DesiredReplicas)
+		for _, condition := range component.LiveScaler.Conditions {
+			if field := scalerConditionField(condition.Type); field != "" {
+				values[field] = string(condition.Status)
+			}
+		}
+	}
 	for _, condition := range component.Conditions.Items {
 		field := compactAutoscaleConditionField(condition.Type)
 		if field == "" {
@@ -511,6 +575,27 @@ func compactAutoscaleConditionField(condition AutoscaleConditionType) string {
 		return "FALLBACK"
 	case AutoscaleConditionPaused:
 		return "PAUSED"
+	default:
+		return ""
+	}
+}
+
+func scalerConditionField(condition AutoscaleConditionType) string {
+	switch condition {
+	case AutoscaleConditionAbleToScale:
+		return "SCALER-ABLE"
+	case AutoscaleConditionScalingActive:
+		return "SCALER-SCALING"
+	case AutoscaleConditionScalingLimited:
+		return "SCALER-LIMITED"
+	case AutoscaleConditionReady:
+		return "SCALER-READY"
+	case AutoscaleConditionActive:
+		return "SCALER-ACTIVE"
+	case AutoscaleConditionFallback:
+		return "SCALER-FALLBACK"
+	case AutoscaleConditionPaused:
+		return "SCALER-PAUSED"
 	default:
 		return ""
 	}
@@ -593,11 +678,16 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 		"TARGET", "TARGET-EVIDENCE", "CURRENT", "DESIRED", "REPLICA-EVIDENCE", "LAST-SCALE", "CONDITION-EVIDENCE", "CONDITIONS", "ISSUES",
 	}, Rows: [][]string{}}
 	liveRequested := false
+	scalerRequested := false
 	for _, component := range canonical.Components {
 		liveRequested = liveRequested || component.LiveScale != nil
+		scalerRequested = scalerRequested || component.LiveScaler != nil
 	}
 	if liveRequested {
 		table.Headers = append(table.Headers, "LIVE-EVIDENCE", "LIVE-SPEC", "LIVE-CURRENT", "LIVE-COUNT")
+	}
+	if scalerRequested {
+		table.Headers = append(table.Headers, "SCALER-KIND", "SCALER-EVIDENCE", "SCALER-GEN", "SCALER-CURRENT", "SCALER-DESIRED", "SCALER-CONDITIONS")
 	}
 	if len(canonical.Components) == 0 {
 		table.Rows = append(table.Rows, []string{
@@ -624,6 +714,18 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 				row = append(row, string(live.Evidence), autoscaleInt32Cell(live.SpecReplicas), autoscaleInt32Cell(live.CurrentReplicas), string(live.CountComparison))
 			}
 		}
+		if scalerRequested {
+			live := component.LiveScaler
+			if live == nil {
+				row = append(row, "-", "-", "-", "-", "-", "-")
+			} else {
+				conditions := make([]string, 0, len(live.Conditions))
+				for _, condition := range live.Conditions {
+					conditions = append(conditions, string(condition.Type)+"="+string(condition.Status))
+				}
+				row = append(row, string(live.Kind), string(live.Evidence), string(live.GenerationState), autoscaleInt32Cell(live.CurrentReplicas), autoscaleInt32Cell(live.DesiredReplicas), strings.Join(conditions, ","))
+			}
+		}
 		table.Rows = append(table.Rows, row)
 	}
 	return table
@@ -631,6 +733,24 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 
 func canonicalAutoscaleComponent(component AutoscaleComponentStatus) AutoscaleComponentStatus {
 	result := component
+	if component.LiveScaler != nil {
+		copy := *component.LiveScaler
+		copy.CurrentReplicas = copyInt32(component.LiveScaler.CurrentReplicas)
+		copy.DesiredReplicas = copyInt32(component.LiveScaler.DesiredReplicas)
+		copy.Conditions = append([]AutoscaleScalerCondition{}, component.LiveScaler.Conditions...)
+		if copy.Evidence != AutoscaleLiveScalerReported {
+			copy.CurrentReplicas, copy.DesiredReplicas = nil, nil
+			copy.Conditions = []AutoscaleScalerCondition{}
+			copy.GenerationState = AutoscaleScalerGenerationUnproven
+		}
+		sort.Slice(copy.Conditions, func(i, j int) bool {
+			if copy.Conditions[i].Type == copy.Conditions[j].Type {
+				return copy.Conditions[i].Status < copy.Conditions[j].Status
+			}
+			return copy.Conditions[i].Type < copy.Conditions[j].Type
+		})
+		result.LiveScaler = &copy
+	}
 	if component.LiveScale != nil {
 		copy := *component.LiveScale
 		copy.SpecReplicas = copyInt32(component.LiveScale.SpecReplicas)
@@ -718,6 +838,7 @@ func compareAutoscaleComponents(a, b AutoscaleComponentStatus) int {
 		compareAutoscaleTargets(a.Target, b.Target),
 		compareAutoscaleReplicas(a.Replicas, b.Replicas),
 		compareAutoscaleLiveScale(a.LiveScale, b.LiveScale),
+		compareAutoscaleLiveScaler(a.LiveScaler, b.LiveScaler),
 		compareAutoscaleConditions(a.Conditions, b.Conditions),
 	} {
 		if result != 0 {
@@ -739,6 +860,34 @@ func compareAutoscaleLiveScale(a, b *AutoscaleLiveScale) int {
 	for _, result := range []int{
 		cmp.Compare(a.Evidence, b.Evidence), cmp.Compare(a.CountComparison, b.CountComparison),
 		compareAutoscaleInt32Pointers(a.SpecReplicas, b.SpecReplicas), compareAutoscaleInt32Pointers(a.CurrentReplicas, b.CurrentReplicas),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareAutoscaleLiveScaler(a, b *AutoscaleLiveScaler) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	}
+	for _, result := range []int{
+		cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Evidence, b.Evidence),
+		cmp.Compare(a.GenerationState, b.GenerationState),
+		compareAutoscaleInt32Pointers(a.CurrentReplicas, b.CurrentReplicas),
+		compareAutoscaleInt32Pointers(a.DesiredReplicas, b.DesiredReplicas),
+		slices.CompareFunc(a.Conditions, b.Conditions, func(a, b AutoscaleScalerCondition) int {
+			if result := cmp.Compare(a.Type, b.Type); result != 0 {
+				return result
+			}
+			return cmp.Compare(a.Status, b.Status)
+		}),
 	} {
 		if result != 0 {
 			return result
