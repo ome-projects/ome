@@ -44,15 +44,20 @@ func newRootCmd(f factory.Factory, configFlags *genericclioptions.ConfigFlags, s
 	cmd := &cobra.Command{
 		Use:   "ome",
 		Short: "Inspect OME models, runtimes and inference services",
-		Long: `kubectl-ome is the official OME CLI, invoked as a kubectl plugin:
+		Long: `kubectl-ome is the OME CLI, invoked as a kubectl plugin:
 
   kubectl ome <command>
 
-It provides model-centric visibility into OME resources: rich listings,
-controller-reported autoscaling, logical-instance, migration, placement, and traffic
-evidence, InferenceService readiness and rollout diagnosis, runtime-selection
-explanations, accelerator-selection evidence, and component-aware log streaming.
-Guarded alpha rollout pause/resume actions use exact identity and confirmation.`,
+Inspect models, runtimes, inference services, and logical instances.
+Review cluster and control-plane evidence, autoscaling, and rollout.
+Inspect migration, placement, quota, and traffic.
+Explain runtime selection and review accelerator-selection evidence.
+Stream component logs.
+
+Action families include rollout pause/resume/promote/rollback,
+migration start, transient scale, instance release-held, and runtime sync.
+Wait for reported readiness and workflow state.
+See each subcommand's help for flags and safeguards.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

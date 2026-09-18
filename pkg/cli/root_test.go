@@ -255,6 +255,42 @@ func TestRootHelpListsLogicalInstanceInspection(t *testing.T) {
 	}
 }
 
+func TestRootHelpOverviewFitsTerminalAndNamesCurrentActions(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	root := NewRootCmdWithFactory(factory.Static{NS: "default"}, genericiooptions.IOStreams{
+		In: &bytes.Buffer{}, Out: &output, ErrOut: &output,
+	})
+	root.SetArgs([]string{"--help"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	overview, generatedHelp, found := strings.Cut(output.String(), "\nUsage:")
+	if !found || !strings.Contains(generatedHelp, "Available Commands:") {
+		t.Fatalf("root help lacks expected usage and command sections:\n%s", output.String())
+	}
+	for _, line := range strings.Split(overview, "\n") {
+		if len(line) > 80 {
+			t.Errorf("root help overview line is %d columns (limit 80): %q", len(line), line)
+		}
+	}
+	for _, phrase := range []string{
+		"inference services", "logical instances", "autoscaling", "migration",
+		"placement", "quota", "traffic", "cluster", "control-plane evidence",
+		"accelerator-selection evidence",
+		"rollout pause/resume/promote/rollback", "migration start",
+		"transient scale", "instance release-held", "runtime sync",
+		"Wait for reported readiness",
+		"See each subcommand's help for flags and safeguards.",
+	} {
+		if !strings.Contains(overview, phrase) {
+			t.Errorf("root help overview lacks %q:\n%s", phrase, overview)
+		}
+	}
+}
+
 func TestRootHeldReleaseRegistrationAndClosedParser(t *testing.T) {
 	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
 	for _, flag := range []string{"--yes=" + credential, "--insecure-skip-tls-verify=" + credential, "--" + credential, "--dry-run"} {
