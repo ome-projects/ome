@@ -125,6 +125,26 @@ func TestActionParserPrivacyBeforeAnyFactoryAcquisition(t *testing.T) {
 	}
 }
 
+func TestActionRejectsInvalidNameBeforeFactoryAcquisition(t *testing.T) {
+	for _, action := range []string{"pause", "resume", "promote", "rollback"} {
+		t.Run(action, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			f := &actionParserFactory{}
+			cmd := NewCmd(f, genericiooptions.IOStreams{Out: &stdout, ErrOut: &stderr})
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&stderr)
+			cmd.SetArgs([]string{action, "bad/name", "--yes", "--dry-run=client"})
+
+			err := cmd.Execute()
+			require.ErrorIs(t, err, ErrInvalidInferenceServiceName)
+			require.Empty(t, f.calls)
+			require.Empty(t, stdout.String())
+			require.Empty(t, stderr.String())
+		})
+	}
+}
+
 func newWireFactory(t *testing.T, server *httptest.Server, rt *v1beta1.ServingRuntime) actionFactory {
 	t.Helper()
 	config := &rest.Config{Host: server.URL}
