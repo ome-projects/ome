@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	"sigs.k8s.io/ome/pkg/cli/transport"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
 	"sigs.k8s.io/ome/pkg/cli/waitscale"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
@@ -28,7 +29,15 @@ func (o *options) runScaleCurrent(ctx context.Context, f factory.Factory, name, 
 	}
 	target := waitscale.Target{Component: ome.ComponentType(o.component), Replicas: o.replicas,
 		IRName: o.irName, IRUID: types.UID(o.irUID)}
-	source := waitscale.NewSource(client.OmeV1beta1(), namespace, name, target)
+	config, err := f.RESTConfig()
+	if err != nil || config == nil {
+		return errConfig
+	}
+	replicaReader, err := transport.NewBounded(config, 1<<20)
+	if err != nil {
+		return errConfig
+	}
+	source := waitscale.NewSource(client.OmeV1beta1(), replicaReader, namespace, name, target)
 	evaluator := waitscale.NewEvaluator(target)
 	unavailable := reportv1alpha1.WaitScaleObservation{
 		Component: target.Component, Requested: target.Replicas,

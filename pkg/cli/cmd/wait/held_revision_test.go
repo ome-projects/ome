@@ -32,16 +32,16 @@ import (
 
 const heldRevision = "chat-engine-aaaaaaaa"
 
-type heldRESTFactory struct {
+type exactReplicaRESTFactory struct {
 	factory.Static
 	host string
 }
 
-func (f heldRESTFactory) RESTConfig() (*rest.Config, error) {
+func (f exactReplicaRESTFactory) RESTConfig() (*rest.Config, error) {
 	return &rest.Config{Host: f.host}, nil
 }
 
-func heldWaitFactory(t *testing.T, client *omefake.Clientset) factory.Factory {
+func exactReplicaWaitFactory(t *testing.T, client *omefake.Clientset) factory.Factory {
 	t.Helper()
 	const prefix = "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +64,7 @@ func heldWaitFactory(t *testing.T, client *omefake.Clientset) factory.Factory {
 		}
 	}))
 	t.Cleanup(server.Close)
-	return heldRESTFactory{Static: factory.Static{NS: "prod", OME: client}, host: server.URL}
+	return exactReplicaRESTFactory{Static: factory.Static{NS: "prod", OME: client}, host: server.URL}
 }
 
 func heldWaitFixture() (*ome.InferenceService, *ome.InferenceReplica) {
@@ -107,7 +107,7 @@ func TestHeldRevisionWaitRendersStateOnlyExactTargetInAllFormats(t *testing.T) {
 				return false, nil, nil
 			})
 			var stdout, stderrBuffer bytes.Buffer
-			cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{
+			cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{
 				In: &bytes.Buffer{}, Out: &stdout, ErrOut: &stderrBuffer,
 			}, clocktesting.NewFakeClock(time.Unix(1000, 0)))
 			cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
@@ -164,7 +164,7 @@ func TestHeldRevisionWaitAcceptsCompactStatusOverExactRESTRead(t *testing.T) {
 		Phases:  []ome.InstanceStatusPhaseGroup{{Value: ome.OMENativeInstanceReady, Indexes: "0"}},
 	}
 	client := omefake.NewSimpleClientset(parent, ir)
-	out, stderr, err := execute(t, heldWaitFactory(t, client),
+	out, stderr, err := execute(t, exactReplicaWaitFactory(t, client),
 		"chat", "--for=held-revision=unheld", "--component=engine", "--revision="+heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json")
 	require.NoError(t, err)
@@ -229,7 +229,7 @@ func TestHeldRevisionWaitPollsExactOriginalIRToUnheld(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -269,7 +269,7 @@ func TestHeldRevisionWaitParentReplacementClearsPriorIREvidence(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -299,7 +299,7 @@ func TestHeldRevisionWaitTimeoutReportsLastHeldState(t *testing.T) {
 	client := omefake.NewSimpleClientset(parent, ir)
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "--timeout=1s", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -329,7 +329,7 @@ func TestHeldRevisionWaitRedactsCredentialShapedActionTarget(t *testing.T) {
 	secretUID := "ghp_0123456789abcdefghijklmnopqrst"
 	ir.Name, ir.UID = secretName, types.UID(secretUID)
 	client := omefake.NewSimpleClientset(parent, ir)
-	out, stderr, err := execute(t, heldWaitFactory(t, client),
+	out, stderr, err := execute(t, exactReplicaWaitFactory(t, client),
 		"chat", "--for=held-revision=unheld", "--component=engine", "--revision="+heldRevision,
 		"--ir-name="+secretName, "--ir-uid="+secretUID, "-o", "json")
 	require.NoError(t, err)
@@ -357,7 +357,7 @@ func TestHeldRevisionWaitAcceptsLongParentAndOpaqueActionIdentities(t *testing.T
 	ir.ResourceVersion = "rv:ir/31+1"
 	revision := parent.Name + "-engine-aaaaaaaa"
 	client := omefake.NewSimpleClientset(parent, ir)
-	out, stderr, err := execute(t, heldWaitFactory(t, client),
+	out, stderr, err := execute(t, exactReplicaWaitFactory(t, client),
 		parent.Name, "--for=held-revision=unheld", "--component=engine", "--revision="+revision,
 		"--ir-name=custom-engine", "--ir-uid="+string(ir.UID), "-o", "json")
 	require.NoError(t, err)

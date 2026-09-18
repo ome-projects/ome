@@ -60,7 +60,7 @@ func TestScaleCurrentWaitRendersExactLogicalCountInAllFormats(t *testing.T) {
 				t.Fatal("scale wait must not LIST sibling replicas")
 				return true, nil, nil
 			})
-			out, stderr, err := execute(t, factory.Static{NS: "prod", OME: client},
+			out, stderr, err := execute(t, exactReplicaWaitFactory(t, client),
 				"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "-o", format)
 			require.NoError(t, err)
 			require.Empty(t, stderr)
@@ -100,7 +100,7 @@ func TestScaleCurrentWaitAcceptsCompactedColumnarStatus(t *testing.T) {
 	ir.Status.InstanceStatuses = nil
 	ir.Status.InstanceStatusEncoding = &encoding
 	ir.Status.InstanceStatusColumns = columns
-	out, stderr, err := execute(t, factory.Static{NS: "prod", OME: omefake.NewSimpleClientset(parent, ir)},
+	out, stderr, err := execute(t, exactReplicaWaitFactory(t, omefake.NewSimpleClientset(parent, ir)),
 		"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "-o", "json")
 	require.NoError(t, err)
 	require.Empty(t, stderr)
@@ -154,7 +154,7 @@ func TestScaleCurrentWaitPollsExactIRStatusAndSeparatesReady(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
 	done := make(chan error, 1)
@@ -182,7 +182,7 @@ func TestScaleCurrentWaitBindsExactActionTargetWithoutParentRef(t *testing.T) {
 	parent, ir := scaleCurrentFixture()
 	parent.Status.Components = nil
 	client := omefake.NewSimpleClientset(parent, ir)
-	out, stderr, err := execute(t, factory.Static{NS: "prod", OME: client},
+	out, stderr, err := execute(t, exactReplicaWaitFactory(t, client),
 		"chat", "--for=replicas=current", "--component=engine", "--replicas=2",
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json")
 	require.NoError(t, err)
@@ -210,7 +210,7 @@ func TestScaleCurrentWaitParentReplacementClearsPriorIRCounts(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
 	done := make(chan error, 1)
@@ -239,7 +239,7 @@ func TestScaleCurrentWaitTimeoutDoesNotClaimDesiredAsCurrent(t *testing.T) {
 	client := omefake.NewSimpleClientset(parent, ir)
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "--timeout=1s", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
 	done := make(chan error, 1)
@@ -266,7 +266,7 @@ func TestScaleCurrentWaitActionUIDMismatchNeverMatches(t *testing.T) {
 	client := omefake.NewSimpleClientset(parent, ir)
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=replicas=current", "--component=engine", "--replicas=2",
 		"--ir-name=custom-engine", "--ir-uid=old-ir-uid", "--timeout=1s", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -305,7 +305,7 @@ func TestScaleCurrentWaitParentDeletionClearsPriorIRCounts(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
 	done := make(chan error, 1)
@@ -335,7 +335,7 @@ func TestScaleCurrentWaitCancellationProducesNoReport(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(exactReplicaWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetContext(ctx)
 	cmd.SetArgs([]string{"chat", "--for=replicas=current", "--component=engine", "--replicas=2", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true

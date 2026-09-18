@@ -16,12 +16,23 @@ import (
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/waitscale"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 )
+
+type fakeScaleReplicaReader struct{ client omeclient.OmeV1beta1Interface }
+
+func (r fakeScaleReplicaReader) GetInferenceReplica(ctx context.Context, namespace, name string, options metav1.GetOptions) (*ome.InferenceReplica, error) {
+	return r.client.InferenceReplicas(namespace).Get(ctx, name, options)
+}
+
+func newScaleTestSource(client omeclient.OmeV1beta1Interface, namespace, name string, target waitscale.Target) *waitscale.Source {
+	return waitscale.NewSource(client, fakeScaleReplicaReader{client: client}, namespace, name, target)
+}
 
 func TestScaleSourceReadsOnlyExactParentAndSelectedIR(t *testing.T) {
 	evidence := scaleEvidence(2, 2, 1)
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-	source := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2})
+	source := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2})
 	snapshot, err := source.Get(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, evidence.Parent.UID, snapshot.UID)
@@ -42,7 +53,7 @@ func TestScaleSourceReadsOnlyExactParentAndSelectedIR(t *testing.T) {
 func TestScaleSourceAllowsMissingIRButNotBroadFallback(t *testing.T) {
 	evidence := scaleEvidence(2, 2, 1)
 	client := omefake.NewSimpleClientset(evidence.Parent)
-	source := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2})
+	source := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2})
 	snapshot, err := source.Get(context.Background())
 	require.NoError(t, err)
 	require.Nil(t, snapshot.Value.Replica)
@@ -58,7 +69,7 @@ func TestScaleSourceMissingTargetMakesOnlyParentGET(t *testing.T) {
 	evidence := scaleEvidence(2, 2, 1)
 	evidence.Parent.Status.Components = nil
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-	snapshot, err := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(context.Background())
+	snapshot, err := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(context.Background())
 	require.NoError(t, err)
 	require.Nil(t, snapshot.Value.Replica)
 	require.Len(t, client.Actions(), 1)
@@ -70,7 +81,7 @@ func TestScaleSourceOptionalActionIdentitySelectsOneExactIR(t *testing.T) {
 	evidence.Parent.Status.Components = nil
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
 	target := waitscale.Target{Component: ome.EngineComponent, Replicas: 2, IRName: evidence.Replica.Name, IRUID: evidence.Replica.UID}
-	snapshot, err := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", target).Get(context.Background())
+	snapshot, err := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", target).Get(context.Background())
 	require.NoError(t, err)
 	require.Len(t, client.Actions(), 3)
 	require.Equal(t, "chat-engine", client.Actions()[1].(ktesting.GetAction).GetName())
@@ -103,7 +114,7 @@ func TestScaleSourceDiscardsTornParentAndIRSnapshot(t *testing.T) {
 				require.NoError(t, err)
 				return false, nil, nil
 			})
-			snapshot, err := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(context.Background())
+			snapshot, err := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(context.Background())
 			require.NoError(t, err)
 			require.Len(t, client.Actions(), 3)
 			require.Equal(t, "13", snapshot.ResourceVersion)
@@ -126,14 +137,14 @@ func TestScaleSourcePropagatesIRReadDenialAndCancellation(t *testing.T) {
 	client.PrependReactor("get", "inferencereplicas", func(action ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "ome.io", Resource: "inferencereplicas"}, "chat-engine", errors.New("secret error"))
 	})
-	_, err := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(context.Background())
+	_, err := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(context.Background())
 	require.Error(t, err)
 	require.True(t, apierrors.IsForbidden(err))
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	client = omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-	_, err = waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(canceled)
+	_, err = newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 2}).Get(canceled)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Empty(t, client.Actions())
 }
@@ -141,7 +152,7 @@ func TestScaleSourcePropagatesIRReadDenialAndCancellation(t *testing.T) {
 func TestScaleSourceRejectsInvalidInputWithoutCallsAndDisablesWatch(t *testing.T) {
 	evidence := scaleEvidence(2, 2, 1)
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-	source := waitscale.NewSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 0})
+	source := newScaleTestSource(client.OmeV1beta1(), "prod", "chat", waitscale.Target{Component: ome.EngineComponent, Replicas: 0})
 	_, err := source.Get(context.Background())
 	require.Error(t, err)
 	require.Empty(t, client.Actions())

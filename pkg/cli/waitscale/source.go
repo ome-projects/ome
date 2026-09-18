@@ -12,6 +12,7 @@ import (
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
 	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 )
@@ -25,17 +26,23 @@ var errSource = errors.New("invalid scale wait source")
 // must use waitengine.Options{PollOnly: true}.
 type Source struct {
 	client          omeclient.OmeV1beta1Interface
+	replica         ReplicaReader
 	namespace, name string
 	target          Target
 }
 
-func NewSource(client omeclient.OmeV1beta1Interface, namespace, name string, target Target) *Source {
-	return &Source{client: client, namespace: namespace, name: name, target: target}
+// ReplicaReader reads one exact InferenceReplica through a bounded transport.
+type ReplicaReader interface {
+	GetInferenceReplica(context.Context, string, string, metav1.GetOptions) (*v1beta1.InferenceReplica, error)
+}
+
+func NewSource(client omeclient.OmeV1beta1Interface, replica ReplicaReader, namespace, name string, target Target) *Source {
+	return &Source{client: client, replica: replica, namespace: namespace, name: name, target: target}
 }
 
 func (s *Source) Get(ctx context.Context) (waitengine.Snapshot[Evidence], error) {
 	zero := waitengine.Snapshot[Evidence]{}
-	if s == nil || ctx == nil || s.client == nil || !validTarget(s.target) ||
+	if s == nil || ctx == nil || s.client == nil || s.replica == nil || !validTarget(s.target) ||
 		len(utilvalidation.IsDNS1123Label(s.namespace)) != 0 || len(utilvalidation.IsDNS1123Subdomain(s.name)) != 0 {
 		return zero, errSource
 	}
@@ -80,7 +87,7 @@ func (s *Source) Get(ctx context.Context) (waitengine.Snapshot[Evidence], error)
 		return zero, err
 	}
 	call, cancel = context.WithTimeout(ctx, requestTimeout)
-	replica, err := s.client.InferenceReplicas(s.namespace).Get(call, selected, metav1.GetOptions{})
+	replica, err := s.replica.GetInferenceReplica(call, s.namespace, selected, metav1.GetOptions{})
 	callErr = call.Err()
 	cancel()
 	if callErr != nil {
