@@ -10,24 +10,36 @@ import (
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/transport"
-	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 )
 
-// statusScaleReader constructs the bounded /scale REST seam only after an
-// exact IR GET. Unsupported or missing targets cause no extra read.
+// statusScaleReader lazily constructs a bounded REST seam for exact IR and
+// /scale GETs. Unsupported or missing targets cause no extra read.
 type statusScaleReader struct {
 	factory factory.Factory
-	ome     omeclient.OmeV1beta1Interface
 	client  *transport.Client
 }
 
 func (r *statusScaleReader) GetInferenceReplica(ctx context.Context, namespace, name string, options metav1.GetOptions) (*ome.InferenceReplica, error) {
+	client, err := r.boundedClient()
+	if err != nil {
+		return nil, err
+	}
 	request, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return r.ome.InferenceReplicas(namespace).Get(request, name, options)
+	return client.GetInferenceReplica(request, namespace, name, options)
 }
 
 func (r *statusScaleReader) GetInferenceReplicaScale(ctx context.Context, namespace, name string, options metav1.GetOptions) (*autoscalingv1.Scale, error) {
+	client, err := r.boundedClient()
+	if err != nil {
+		return nil, err
+	}
+	request, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return client.GetInferenceReplicaScale(request, namespace, name, options)
+}
+
+func (r *statusScaleReader) boundedClient() (*transport.Client, error) {
 	if r.client == nil {
 		config, err := r.factory.RESTConfig()
 		if err != nil {
@@ -38,7 +50,5 @@ func (r *statusScaleReader) GetInferenceReplicaScale(ctx context.Context, namesp
 			return nil, err
 		}
 	}
-	request, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	return r.client.GetInferenceReplicaScale(request, namespace, name, options)
+	return r.client, nil
 }

@@ -51,20 +51,31 @@ func liveStatusIR() *ome.InferenceReplica {
 }
 
 func TestStatusLiveScaleUsesOnlyExactIRScaleAndRendersCounts(t *testing.T) {
+	ir := liveStatusIR()
+	ir.TypeMeta = metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceReplica"}
+	irBody, err := json.Marshal(ir)
+	require.NoError(t, err)
 	paths := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine" {
+			_, _ = w.Write(irBody)
+			return
+		}
 		_, _ = w.Write([]byte(`{"apiVersion":"autoscaling/v1","kind":"Scale","metadata":{"name":"chat-engine","namespace":"prod","uid":"ir-uid","resourceVersion":"9"},"spec":{"replicas":3},"status":{"replicas":2}}`))
 	}))
 	defer server.Close()
-	f := liveScaleFactory{Static: factory.Static{OME: omefake.NewSimpleClientset(liveStatusParent(), liveStatusIR()), NS: "prod"}, config: &rest.Config{Host: server.URL}}
+	f := liveScaleFactory{Static: factory.Static{OME: omefake.NewSimpleClientset(liveStatusParent()), NS: "prod"}, config: &rest.Config{Host: server.URL}}
 	var output bytes.Buffer
 	cmd := NewCmd(f, genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: &output, ErrOut: &bytes.Buffer{}})
 	cmd.SetArgs([]string{"status", "chat", "--live-scale"})
 	require.NoError(t, cmd.Execute())
 	t.Logf("synthetic CLI fixture output:\n%s", output.String())
-	require.Equal(t, []string{"GET /apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine/scale"}, paths)
+	require.Equal(t, []string{
+		"GET /apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine",
+		"GET /apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine/scale",
+	}, paths)
 	for _, want := range []string{"LIVE-EVIDENCE", "Reported", "LIVE-SPEC", "3", "LIVE-CURRENT", "2", "LIVE-COUNT", "Equal"} {
 		require.Contains(t, output.String(), want)
 	}
@@ -93,24 +104,35 @@ func TestStatusLiveScaleUsesOnlyExactIRScaleAndRendersCounts(t *testing.T) {
 	require.Contains(t, output.String(), "LIVE-SPEC")
 	require.Contains(t, output.String(), "LIVE-CURRENT")
 	require.Contains(t, output.String(), "LIVE-COUNT")
-	require.Len(t, paths, 4)
+	require.Len(t, paths, 8)
 }
 
 func TestStatusLiveScaleDeniedIsTypedAndDoesNotLeakResponse(t *testing.T) {
+	ir := liveStatusIR()
+	ir.TypeMeta = metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceReplica"}
+	irBody, err := json.Marshal(ir)
+	require.NoError(t, err)
 	paths := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine" {
+			_, _ = w.Write(irBody)
+			return
+		}
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"Status","status":"Failure","message":"private token","reason":"Forbidden","code":403}`))
 	}))
 	defer server.Close()
-	f := liveScaleFactory{Static: factory.Static{OME: omefake.NewSimpleClientset(liveStatusParent(), liveStatusIR()), NS: "prod"}, config: &rest.Config{Host: server.URL}}
+	f := liveScaleFactory{Static: factory.Static{OME: omefake.NewSimpleClientset(liveStatusParent()), NS: "prod"}, config: &rest.Config{Host: server.URL}}
 	var output bytes.Buffer
 	cmd := NewCmd(f, genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: &output, ErrOut: &bytes.Buffer{}})
 	cmd.SetArgs([]string{"status", "chat", "--live-scale", "-o", "json"})
 	require.NoError(t, cmd.Execute())
-	require.Len(t, paths, 1)
+	require.Equal(t, []string{
+		"/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine",
+		"/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/chat-engine/scale",
+	}, paths)
 	require.NotContains(t, output.String(), "private token")
 	var typed reportv1alpha1.AutoscaleStatusReport
 	require.NoError(t, json.Unmarshal(output.Bytes(), &typed))

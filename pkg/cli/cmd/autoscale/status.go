@@ -133,7 +133,7 @@ func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string)
 		return fmt.Errorf("project autoscale status for InferenceService %q: %w", namespace+"/"+name, err)
 	}
 	if o.liveScale {
-		reportValue, err = autoscaleprojection.EnrichLiveScale(ctx, isvc, reportValue, &statusScaleReader{factory: f, ome: client.OmeV1beta1()}, o.deps.clock)
+		reportValue, err = autoscaleprojection.EnrichLiveScale(ctx, isvc, reportValue, &statusScaleReader{factory: f}, o.deps.clock)
 		if err != nil {
 			return fmt.Errorf("inspect live scale for InferenceService %q: %w", namespace+"/"+name, err)
 		}
