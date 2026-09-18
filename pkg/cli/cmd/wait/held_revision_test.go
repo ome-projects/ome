@@ -3,6 +3,8 @@ package wait
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/yaml"
@@ -28,6 +31,41 @@ import (
 )
 
 const heldRevision = "chat-engine-aaaaaaaa"
+
+type heldRESTFactory struct {
+	factory.Static
+	host string
+}
+
+func (f heldRESTFactory) RESTConfig() (*rest.Config, error) {
+	return &rest.Config{Host: f.host}, nil
+}
+
+func heldWaitFactory(t *testing.T, client *omefake.Clientset) factory.Factory {
+	t.Helper()
+	const prefix = "/apis/ome.io/v1beta1/namespaces/prod/inferencereplicas/"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, prefix)
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) || name == "" || strings.Contains(name, "/") {
+			t.Errorf("unexpected IR request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		ir, err := client.OmeV1beta1().InferenceReplicas("prod").Get(r.Context(), name, metav1.GetOptions{})
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		copyIR := ir.DeepCopy()
+		copyIR.APIVersion, copyIR.Kind = "ome.io/v1beta1", "InferenceReplica"
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(copyIR); err != nil {
+			t.Errorf("encode IR response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return heldRESTFactory{Static: factory.Static{NS: "prod", OME: client}, host: server.URL}
+}
 
 func heldWaitFixture() (*ome.InferenceService, *ome.InferenceReplica) {
 	parent := &ome.InferenceService{ObjectMeta: metav1.ObjectMeta{
@@ -68,7 +106,7 @@ func TestHeldRevisionWaitRendersStateOnlyExactTargetInAllFormats(t *testing.T) {
 				require.Equal(t, "custom-engine", action.(ktesting.GetAction).GetName())
 				return false, nil, nil
 			})
-			out, stderr, err := execute(t, factory.Static{NS: "prod", OME: client},
+			out, stderr, err := execute(t, heldWaitFactory(t, client),
 				"chat", "--for=held-revision=unheld", "--component=engine", "--revision="+heldRevision,
 				"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", format)
 			require.NoError(t, err)
@@ -99,6 +137,8 @@ func TestHeldRevisionWaitRendersStateOnlyExactTargetInAllFormats(t *testing.T) {
 			if format == "json" {
 				jsonContent = decoded.Content
 			} else {
+				jsonContent.ElapsedMilliseconds = 0
+				decoded.Content.ElapsedMilliseconds = 0
 				require.Equal(t, jsonContent, decoded.Content)
 			}
 			require.Contains(t, out, "custom-engine")
@@ -106,6 +146,26 @@ func TestHeldRevisionWaitRendersStateOnlyExactTargetInAllFormats(t *testing.T) {
 			require.Contains(t, out, "Unverifiable")
 		})
 	}
+}
+
+func TestHeldRevisionWaitAcceptsCompactStatusOverExactRESTRead(t *testing.T) {
+	parent, ir := heldWaitFixture()
+	encoding := ome.InstanceStatusEncodingColumnarV2
+	ir.Status.InstanceStatusEncoding = &encoding
+	ir.Status.InstanceStatusColumns = &ome.InstanceStatusColumns{
+		Members: "0",
+		Phases:  []ome.InstanceStatusPhaseGroup{{Value: ome.OMENativeInstanceReady, Indexes: "0"}},
+	}
+	client := omefake.NewSimpleClientset(parent, ir)
+	out, stderr, err := execute(t, heldWaitFactory(t, client),
+		"chat", "--for=held-revision=unheld", "--component=engine", "--revision="+heldRevision,
+		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json")
+	require.NoError(t, err)
+	require.Empty(t, stderr)
+	var value reportv1alpha1.WaitReport
+	require.NoError(t, json.Unmarshal([]byte(out), &value))
+	require.Equal(t, waitengine.OutcomeMatched, value.Content.Outcome)
+	require.Equal(t, "ColumnarV2", string(value.Content.HeldRevision.Encoding))
 }
 
 func TestHeldRevisionWaitRejectsMissingMalformedAndStrayFlagsBeforeReads(t *testing.T) {
@@ -162,7 +222,7 @@ func TestHeldRevisionWaitPollsExactOriginalIRToUnheld(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -202,7 +262,7 @@ func TestHeldRevisionWaitParentReplacementClearsPriorIREvidence(t *testing.T) {
 	})
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -232,7 +292,7 @@ func TestHeldRevisionWaitTimeoutReportsLastHeldState(t *testing.T) {
 	client := omefake.NewSimpleClientset(parent, ir)
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	var out, stderr bytes.Buffer
-	cmd := newCmd(factory.Static{NS: "prod", OME: client}, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
+	cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, clk)
 	cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
 		"--ir-name=custom-engine", "--ir-uid=ir-uid", "--timeout=1s", "-o", "json"})
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -262,7 +322,7 @@ func TestHeldRevisionWaitRedactsCredentialShapedActionTarget(t *testing.T) {
 	secretUID := "ghp_0123456789abcdefghijklmnopqrst"
 	ir.Name, ir.UID = secretName, types.UID(secretUID)
 	client := omefake.NewSimpleClientset(parent, ir)
-	out, stderr, err := execute(t, factory.Static{NS: "prod", OME: client},
+	out, stderr, err := execute(t, heldWaitFactory(t, client),
 		"chat", "--for=held-revision=unheld", "--component=engine", "--revision="+heldRevision,
 		"--ir-name="+secretName, "--ir-uid="+secretUID, "-o", "json")
 	require.NoError(t, err)
@@ -290,7 +350,7 @@ func TestHeldRevisionWaitAcceptsLongParentAndOpaqueActionIdentities(t *testing.T
 	ir.ResourceVersion = "rv:ir/31+1"
 	revision := parent.Name + "-engine-aaaaaaaa"
 	client := omefake.NewSimpleClientset(parent, ir)
-	out, stderr, err := execute(t, factory.Static{NS: "prod", OME: client},
+	out, stderr, err := execute(t, heldWaitFactory(t, client),
 		parent.Name, "--for=held-revision=unheld", "--component=engine", "--revision="+revision,
 		"--ir-name=custom-engine", "--ir-uid="+string(ir.UID), "-o", "json")
 	require.NoError(t, err)

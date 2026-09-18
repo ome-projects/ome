@@ -7,6 +7,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	"sigs.k8s.io/ome/pkg/cli/transport"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
 	"sigs.k8s.io/ome/pkg/cli/waitheld"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
@@ -25,7 +26,15 @@ func (o *options) runHeldRevision(ctx context.Context, f factory.Factory, name, 
 	}
 	target := waitheld.Target{Namespace: namespace, ParentName: name, Component: o.component,
 		IRName: o.irName, Revision: o.revision, IRUID: o.irUID}
-	source, err := waitheld.NewSource(client.OmeV1beta1(), target)
+	config, err := f.RESTConfig()
+	if err != nil || config == nil {
+		return errConfig
+	}
+	replicaReader, err := transport.NewBounded(config, 1<<20)
+	if err != nil {
+		return errConfig
+	}
+	source, err := waitheld.NewSource(client.OmeV1beta1(), replicaReader, target)
 	if err != nil {
 		return errHeldTarget
 	}

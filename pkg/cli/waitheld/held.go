@@ -200,7 +200,7 @@ func Evaluate(target Target, evidence Evidence) Observation {
 	}
 	// RetryBlocks is top-level and independent of instance rows, but malformed
 	// compacted status cannot be promoted to complete authoritative evidence.
-	if len(ir.Status.InstanceStatuses) > maxStatusRows || !actionbounds.PrivatePayload(ir) {
+	if !actionbounds.PrivatePayload(ir) {
 		o.Reason = ReasonInvalidStatus
 		return o
 	}

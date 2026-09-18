@@ -17,8 +17,19 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
+
+type fakeReplicaReader struct{ client omeclient.OmeV1beta1Interface }
+
+func (r fakeReplicaReader) GetInferenceReplica(ctx context.Context, namespace, name string, options metav1.GetOptions) (*v1beta1.InferenceReplica, error) {
+	return r.client.InferenceReplicas(namespace).Get(ctx, name, options)
+}
+
+func newTestSource(client omeclient.OmeV1beta1Interface, target Target) (*Source, error) {
+	return NewSource(client, fakeReplicaReader{client: client}, target)
+}
 
 func TestSourceExactNameGETMatchesWithManyUnrelatedIRsAndNoLIST(t *testing.T) {
 	target, evidence := heldFixture()
@@ -43,7 +54,7 @@ func TestSourceExactNameGETMatchesWithManyUnrelatedIRsAndNoLIST(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +79,7 @@ func TestSourceAcceptsActionResultNoncanonicalIRName(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +103,7 @@ func TestSourceNoncanonicalActionTargetStillRejectsReplacementUID(t *testing.T) 
 		replacement.UID = "replacement"
 		return true, replacement, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +120,7 @@ func TestSourceRedactsCredentialShapedNoncanonicalIRName(t *testing.T) {
 	evidence.Replica.Name = secret
 	evidence.Replica.Status.RetryBlocks = nil
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +144,7 @@ func TestSourceOtherParentClaimantDoesNotVetoExactTarget(t *testing.T) {
 	hidden.Name, hidden.UID, hidden.ResourceVersion = "hidden-engine", "hidden-uid", "32"
 	hidden.Labels[constants.InferenceServiceLabel] = "other"
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica, hidden)
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +163,7 @@ func TestSourceExactUIDReplacementCannotMatchEmptyBlocks(t *testing.T) {
 		replacement.UID = "replacement"
 		return true, replacement, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +179,7 @@ func TestSourceChildNotFoundIsUnmetNotParentNotFound(t *testing.T) {
 	client.PrependReactor("get", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "ome.io", Resource: "inferencereplicas"}, target.IRName)
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +205,7 @@ func TestSourceParentRefreshDeletionIsPromptlyTerminal(t *testing.T) {
 		}
 		return true, parent, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +229,7 @@ func TestSourceParentRefreshGenerationChangeStaysPartial(t *testing.T) {
 		}
 		return true, parent, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +251,7 @@ func TestSourceParentRefreshNotFoundIsDeletingNotUnheld(t *testing.T) {
 		}
 		return true, evidence.Parent.DeepCopy(), nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +275,7 @@ func TestSourceParentRefreshWrongUIDStaysPartial(t *testing.T) {
 		}
 		return true, parent, nil
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +308,7 @@ func TestSourceRejectsUnsafeExactParentResponses(t *testing.T) {
 			client.PrependReactor("get", "inferenceservices", func(ktesting.Action) (bool, runtime.Object, error) {
 				return true, tc.edit(evidence.Parent.DeepCopy()), nil
 			})
-			source, err := NewSource(client.OmeV1beta1(), target)
+			source, err := newTestSource(client.OmeV1beta1(), target)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -336,7 +347,7 @@ func TestSourceRejectsUnsafeExactReplicaResponses(t *testing.T) {
 				}
 				return true, tc.edit(evidence.Replica.DeepCopy()), nil
 			})
-			source, err := NewSource(client.OmeV1beta1(), target)
+			source, err := newTestSource(client.OmeV1beta1(), target)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -381,7 +392,7 @@ func TestSourceCancellationDuringExactReads(t *testing.T) {
 					return true, evidence.Parent.DeepCopy(), nil
 				})
 			}
-			source, err := NewSource(client.OmeV1beta1(), target)
+			source, err := newTestSource(client.OmeV1beta1(), target)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -395,7 +406,7 @@ func TestSourceCancellationDuringExactReads(t *testing.T) {
 
 func TestSourceWatchAndDecodeAreUnsupported(t *testing.T) {
 	target, evidence := heldFixture()
-	source, err := NewSource(omefake.NewSimpleClientset(evidence.Parent, evidence.Replica).OmeV1beta1(), target)
+	source, err := newTestSource(omefake.NewSimpleClientset(evidence.Parent, evidence.Replica).OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +442,7 @@ func TestSourceSanitizesCredentialShapedExactIdentity(t *testing.T) {
 				evidence.Replica.UID = types.UID(secret)
 			}
 			client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-			source, err := NewSource(client.OmeV1beta1(), target)
+			source, err := newTestSource(client.OmeV1beta1(), target)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -456,7 +467,7 @@ func TestSourceParentNotFoundClassificationAndPrivateErrors(t *testing.T) {
 	client.PrependReactor("get", "inferenceservices", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, &apierrors.StatusError{ErrStatus: metav1.Status{Reason: metav1.StatusReasonNotFound, Message: "PRIVATE_SERVER_MESSAGE", Code: 404}}
 	})
-	source, err := NewSource(client.OmeV1beta1(), target)
+	source, err := newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +480,7 @@ func TestSourceParentNotFoundClassificationAndPrivateErrors(t *testing.T) {
 	client.PrependReactor("get", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("PRIVATE_CHILD_ERROR")
 	})
-	source, err = NewSource(client.OmeV1beta1(), target)
+	source, err = newTestSource(client.OmeV1beta1(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +494,7 @@ func TestSourceRequiresValidatedActionTargetBeforeReads(t *testing.T) {
 	target, evidence := heldFixture()
 	target.IRName = ""
 	client := omefake.NewSimpleClientset(evidence.Parent, evidence.Replica)
-	if _, err := NewSource(client.OmeV1beta1(), target); err == nil {
+	if _, err := newTestSource(client.OmeV1beta1(), target); err == nil {
 		t.Fatal("missing action-result name must be rejected before API access")
 	}
 }

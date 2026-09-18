@@ -30,20 +30,26 @@ var (
 // Source implements a PollOnly waitengine source. InferenceReplica status
 // changes need not trigger a parent InferenceService watch event. It reads
 // only the exact IR name carried by release-held ActionResult.
-// Generated typed clients decode before the private-payload cap, so this is
-// a post-decode budget rather than a hard wire-response byte cap.
+// The caller supplies a bounded exact-name IR reader. The predicate uses
+// top-level status and validates, but does not inspect, compact instance rows.
 type Source struct {
-	client omeclient.OmeV1beta1Interface
-	target Target
+	client  omeclient.OmeV1beta1Interface
+	replica ReplicaReader
+	target  Target
+}
+
+// ReplicaReader reads one exact InferenceReplica through a bounded transport.
+type ReplicaReader interface {
+	GetInferenceReplica(context.Context, string, string, metav1.GetOptions) (*v1beta1.InferenceReplica, error)
 }
 
 var _ waitengine.Source[Observation] = (*Source)(nil)
 
-func NewSource(client omeclient.OmeV1beta1Interface, target Target) (*Source, error) {
-	if client == nil || !validTarget(target) {
+func NewSource(client omeclient.OmeV1beta1Interface, replica ReplicaReader, target Target) (*Source, error) {
+	if client == nil || replica == nil || !validTarget(target) {
 		return nil, ErrInvalidTarget
 	}
-	return &Source{client: client, target: target}, nil
+	return &Source{client: client, replica: replica, target: target}, nil
 }
 
 func (s *Source) Get(ctx context.Context) (waitengine.Snapshot[Observation], error) {
@@ -130,7 +136,7 @@ func (s *Source) getParent(ctx context.Context) (*v1beta1.InferenceService, erro
 func (s *Source) getReplica(ctx context.Context) (*v1beta1.InferenceReplica, error) {
 	call, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	replica, err := s.client.InferenceReplicas(s.target.Namespace).Get(call, s.target.IRName, metav1.GetOptions{})
+	replica, err := s.replica.GetInferenceReplica(call, s.target.Namespace, s.target.IRName, metav1.GetOptions{})
 	if call.Err() != nil {
 		return nil, call.Err()
 	}
