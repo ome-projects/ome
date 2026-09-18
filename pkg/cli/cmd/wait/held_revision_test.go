@@ -106,15 +106,22 @@ func TestHeldRevisionWaitRendersStateOnlyExactTargetInAllFormats(t *testing.T) {
 				require.Equal(t, "custom-engine", action.(ktesting.GetAction).GetName())
 				return false, nil, nil
 			})
-			out, stderr, err := execute(t, heldWaitFactory(t, client),
-				"chat", "--for=held-revision=unheld", "--component=engine", "--revision="+heldRevision,
-				"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", format)
+			var stdout, stderrBuffer bytes.Buffer
+			cmd := newCmd(heldWaitFactory(t, client), genericiooptions.IOStreams{
+				In: &bytes.Buffer{}, Out: &stdout, ErrOut: &stderrBuffer,
+			}, clocktesting.NewFakeClock(time.Unix(1000, 0)))
+			cmd.SetArgs([]string{"chat", "--for=held-revision=unheld", "--component=engine", "--revision=" + heldRevision,
+				"--ir-name=custom-engine", "--ir-uid=ir-uid", "-o", format})
+			cmd.SilenceUsage, cmd.SilenceErrors = true, true
+			err := cmd.Execute()
+			out, stderr := stdout.String(), stderrBuffer.String()
 			require.NoError(t, err)
 			require.Empty(t, stderr)
 			require.Equal(t, 1, gets)
 			require.NotContains(t, out, "PRIVATE")
 			t.Logf("kubectl ome wait chat --for=held-revision=unheld --component=engine --revision=%s --ir-name=custom-engine --ir-uid=ir-uid -n prod -o %s (synthetic fixture):\n%s", heldRevision, format, out)
 			if format == "table" || format == "wide" {
+				require.Regexp(t, `(?m)^Elapsed milliseconds +0$`, out)
 				require.Contains(t, out, "HeldRevision=Unheld")
 				require.Contains(t, out, "Matched")
 				require.Contains(t, out, "Unverifiable")

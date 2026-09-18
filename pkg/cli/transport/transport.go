@@ -155,8 +155,9 @@ func (c *Client) Watch(ctx context.Context, collection Collection, options metav
 		Watch(ctx)
 }
 
-// GetInferenceReplica returns one raw InferenceReplica for callers that inspect
-// only its spec, metadata, and top-level status, not per-instance rows.
+// GetInferenceReplica returns one InferenceReplica with its raw wire status.
+// Callers that inspect per-instance rows must explicitly decode compact status
+// with irstatus; the typed status does not expand compacted rows.
 func (c *Client) GetInferenceReplica(ctx context.Context, namespace, name string, options metav1.GetOptions) (*v1beta1.InferenceReplica, error) {
 	result := &v1beta1.InferenceReplica{}
 	err := c.rest.Get().
