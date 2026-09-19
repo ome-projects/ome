@@ -423,12 +423,12 @@ func TestBuildReconcileInput_SequentialGateReadsFreshPeerStatus(t *testing.T) {
 	g.Expect(reason).To(gomega.ContainSubstring("Sequential waiting on decoder"))
 }
 
-// TestBuildReconcileInput_ThreadsGangSchedulingAvailable pins the IR-path
-// multi-node gang fix: buildReconcileInput must thread the controller's
-// GangSchedulingAvailable flag into DesiredSpec, because EnsurePodGroups gates
-// per-Instance PodGroup creation on it. Without this, IR-managed multi-node
-// pods render the gang reference but no PodGroup object is ever created, so the
-// gang stays Pending forever ("PodGroup not found") — the bug this fixes.
+// TestBuildReconcileInput_ThreadsGangSchedulingAvailable pins that
+// buildReconcileInput threads the controller's GangSchedulingAvailable flag
+// into DesiredSpec, because EnsurePodGroups gates per-Instance PodGroup
+// creation on it. Without it, IR-managed multi-node pods render the gang
+// reference but no PodGroup object is ever created, so the gang stays
+// Pending forever ("PodGroup not found").
 func TestBuildReconcileInput_ThreadsGangSchedulingAvailable(t *testing.T) {
 	g := gomega.NewWithT(t)
 	r, _ := newReconciler(t)

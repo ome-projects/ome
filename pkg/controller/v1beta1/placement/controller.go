@@ -365,7 +365,7 @@ func (r *Reconciler) reconcileSingle(ctx context.Context, isvc *v1beta1.Inferenc
 				return ctrl.Result{RequeueAfter: r.requeue()}, nil
 			}
 			// Read the authoritative per-component IR status from the winner
-			// cluster (source of truth; the derived ISVC no longer mirrors it).
+			// cluster (source of truth; the derived ISVC does not mirror it).
 			statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 			if err != nil {
 				// A transient IR read error must not be misread as terminal
@@ -1033,7 +1033,7 @@ func (r *Reconciler) findWinner(ctx context.Context, isvc *v1beta1.InferenceServ
 			continue
 		}
 		// Read the authoritative per-component IR status from candidate cluster
-		// c (source of truth; the derived ISVC no longer mirrors it).
+		// c (source of truth; the derived ISVC does not mirror it).
 		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 		if err != nil {
 			r.Log.Error(err, "race: reading IR statuses failed; skipping candidate", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)

@@ -836,11 +836,10 @@ func TestSurgeUpdate_SingleBump_DoesNotShiftTarget(t *testing.T) {
 	_ = beforeRV
 }
 
-// TestSurgeUpdate_PostV2Promote_V2PodsDrainedWhenV3SurgeFires pins the
-// X-2 follow-up regression: after a v1→v2 surge cycle COMPLETES with
-// RunningRevision=v2 and ActiveOrdinal=1, a fresh spec bump to v3 must
-// drive the Instance to RunningRevision=v3 with the v2 pod fully
-// drained.
+// TestSurgeUpdate_PostV2Promote_V2PodsDrainedWhenV3SurgeFires pins that
+// after a v1→v2 surge cycle COMPLETES with RunningRevision=v2 and
+// ActiveOrdinal=1, a fresh spec bump to v3 drives the Instance to
+// RunningRevision=v3 with the v2 pod fully drained.
 func TestSurgeUpdate_PostV2Promote_V2PodsDrainedWhenV3SurgeFires(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
@@ -1267,10 +1266,9 @@ func TestSurgeUpdate_AlternatesOrdinalAcrossSurges(t *testing.T) {
 	}
 }
 
-// TestSurgeUpdate_GangSurges pins that a multi-pod Instance no longer
-// errors out of surgeUpdate — it branches to gangSurgeUpdate, which on
-// its first pass stamps the source for a surge and requeues (done=false)
-// rather than refusing to act.
+// TestSurgeUpdate_GangSurges pins that surgeUpdate branches a multi-pod
+// Instance to gangSurgeUpdate, which on its first pass stamps the source
+// for a surge and requeues (done=false) rather than refusing to act.
 func TestSurgeUpdate_GangSurges(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, ir := surgeISVCReady("llama-70b", "prod", 1)

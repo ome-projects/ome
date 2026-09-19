@@ -182,10 +182,10 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	//
 	// Emit the event ONCE, on the transition into this state, tracked by
 	// the CoordinationAdvisory status condition. Firing it every reconcile
-	// (the previous behavior) relied on event aggregation collapsing to one
-	// object, but the aggregated count still climbed unboundedly and the
-	// Event was re-PATCHed every loop — alarming noise plus apiserver write
-	// load on the hot path. Clearing the condition when a group is later
+	// would lean on event aggregation collapsing to one object, but the
+	// aggregated count still climbs unboundedly and the Event is re-PATCHed
+	// every loop — alarming noise plus apiserver write load on the hot
+	// path. Clearing the condition when a group is later
 	// declared (or the Component count drops) re-arms the one-shot event.
 	if len(componentsTouched) >= 2 && len(groups) == 0 {
 		if SetCoordinationAdvisory(in.ISVC, componentsTouched) && in.Recorder != nil {

@@ -16,10 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// Ledger round-trip + annotation-parsing tests. Moved here from the
-// retired omenative/ops package (whose detection layer these helpers
-// used to back) — the ledger itself is audit-only now, but dedup and
-// trim behavior still guard the history surface.
+// Ledger round-trip + annotation-parsing tests. The ledger is
+// audit-only; dedup and trim behavior guard the history surface.
 
 func TestExtractRequestUUID(t *testing.T) {
 	if got := ExtractRequestUUID(MigrationRequestAnnotationPrefix + "abc-123"); got != "abc-123" {

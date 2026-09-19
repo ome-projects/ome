@@ -1,7 +1,7 @@
 // Package engine is Alfred's decision core: the Arbiter that admits or
 // rejects the merged candidate stream under the global safety bounds, and the
-// Ledger that carries the little cross-pass state arbitration needs
-// (OEP-0008 §The arbiter, §Safety bounds). Everything here is pure and
+// Ledger that carries the little cross-pass state arbitration needs.
+// Everything here is pure and
 // clock-injected: methods take `now`, hold no client, and re-derive whatever
 // they can from the snapshot so leader failover degrades safety margins,
 // never correctness.

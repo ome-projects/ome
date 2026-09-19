@@ -273,24 +273,20 @@ func TestAggregateIRStatus_OMENative_PreservesNonOMENativeFields(t *testing.T) {
 	g.Expect(cs.Lifecycle.Replicas).To(gomega.Equal(int32(1)))
 }
 
-// TestAggregateIRStatus_EmitsEngineReadyCondition pins the bug fix: the
-// IR-managed path must emit the top-level EngineReady condition derived
-// from the OMENative counters, mirroring what the legacy direct path
-// does (omenative/status_aggregate.go:140-143). Without it, the aggregate
-// Ready rollup stays Unknown forever even though the subtree counters
-// are correct.
-//
-// Real-cluster symptom: a PD-disagg-shaped single-engine
-// ISVC in OMENative mode had all subtree fields populated (replicas=1,
-// updatedReplicas=1, InstanceStatuses[0].Phase=Ready) and IngressReady=True
-// — but ISVC.Status.Conditions carried only IngressReady + Ready=Unknown.
-// No EngineReady was emitted, so the top-level Ready aggregator never
-// flipped.
+// TestAggregateIRStatus_EmitsEngineReadyCondition pins that the
+// IR-managed path emits the top-level EngineReady condition derived
+// from the OMENative counters, mirroring what the direct path does
+// (omenative/status_aggregate.go). Without it, the aggregate Ready
+// rollup stays Unknown forever even though the subtree counters are
+// correct: a single-engine ISVC in OMENative mode with every subtree
+// field populated (replicas=1, updatedReplicas=1,
+// InstanceStatuses[0].Phase=Ready) and IngressReady=True would carry only
+// IngressReady + Ready=Unknown in ISVC.Status.Conditions, and the
+// top-level Ready aggregator would never flip.
 func TestAggregateIRStatus_EmitsEngineReadyCondition(t *testing.T) {
 	g := gomega.NewWithT(t)
 	isvc := baselineISVC("llama", "prod")
-	// liveIR with replicas=1, all-ready counters — the same shape the
-	// real-cluster ISVC was in when the bug was observed.
+	// liveIR with replicas=1, all-ready counters — the shape described above.
 	ir := liveIR("llama", "prod", 1)
 	c := fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
@@ -312,8 +308,7 @@ func TestAggregateIRStatus_EmitsEngineReadyCondition(t *testing.T) {
 	g.Expect(om.Replicas).To(gomega.Equal(int32(1)))
 	g.Expect(om.ReadyReplicas).To(gomega.Equal(int32(1)))
 
-	// NEW: the EngineReady top-level condition must be emitted with
-	// Status=True. This is the bug fix.
+	// The EngineReady top-level condition must be emitted with Status=True.
 	cond := got.Status.GetCondition(v1beta1.EngineReady)
 	g.Expect(cond).NotTo(gomega.BeNil(),
 		"EngineReady condition must be emitted alongside the OMENative subtree")
@@ -617,8 +612,8 @@ func TestAggregateIRStatus_NoWriteWhenUnchanged(t *testing.T) {
 // aliasing guard for the fields the projector still copies. The
 // CollisionCount pointer must be a fresh allocation so downstream
 // mutations of the ISVC summary don't clobber the IR's source-of-truth.
-// (Per-Instance detail is intentionally no longer projected onto the
-// summary — the IR is read directly via ComponentIRStatus.)
+// (Per-Instance detail is not projected onto the summary — the IR is read
+// directly via ComponentIRStatus.)
 func TestIrStatusToComponentStatus_DeepCopiesCollisionCount(t *testing.T) {
 	g := gomega.NewWithT(t)
 	ir := &v1beta1.InferenceReplica{

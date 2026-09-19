@@ -265,16 +265,15 @@ func TestMirrorInstanceCountersUsesTransientPublicationIntersection(t *testing.T
 // pins the AvailableReplicas counter via the end-to-end Reconcile path.
 // With pods ContainersReady AND published as Ready in the per-Component
 // headless Service's EndpointSlice, AvailableReplicas should collapse
-// onto ReadyReplicas. The aggregator post-fix reads availability off
-// the slice exactly like the omenative direct path
+// onto ReadyReplicas. The aggregator reads availability off the slice
+// exactly like the omenative direct path
 // (TestAggregateAndWriteStatus_PerInstanceCountersFromObservedPods),
 // so the two adapters produce byte-identical counters.
 //
-// Replaces the legacy assertion that AvailableReplicas always mirrors
-// ReadyReplicas. The two CAN diverge — see
-// TestAggregateStatus_AvailableReplicas_ZeroWhenSliceNotReady — so the
-// surface tested here is "with EndpointSlices published Ready, the two
-// match".
+// AvailableReplicas does not always mirror ReadyReplicas — the two CAN
+// diverge, see TestAggregateStatus_AvailableReplicas_ZeroWhenSliceNotReady —
+// so the surface tested here is "with EndpointSlices published Ready, the
+// two match".
 func TestAggregateStatus_AvailableReplicas_MatchesReadyWithEndpointSlices(t *testing.T) {
 	g := gomega.NewWithT(t)
 	ir := baselineIR("llama-engine", "prod", 3)

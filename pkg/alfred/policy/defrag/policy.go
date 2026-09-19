@@ -69,8 +69,7 @@ type evalCtx struct {
 	executionOpen bool
 }
 
-// Evaluate turns the snapshot into a ranked []Candidate (OEP-0008
-// §Candidate selection). Gate → enumerate → classify → simulate → score →
+// Evaluate turns the snapshot into a ranked []Candidate. Gate → enumerate → classify → simulate → score →
 // boost → rank → filter.
 func (*Policy) Evaluate(snap *snapshot.ClusterSnapshot, cfg *config.Config) []policy.Candidate {
 	d := &cfg.Policies.Defragmentation

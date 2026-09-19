@@ -16,14 +16,10 @@ import (
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// Ported from omenative/services_test.go alongside the move of
-// BuildHeadlessService + reconcileHeadlessService into the workload
-// package. The tests previously built specs by constructing an
-// *v1beta1.InferenceService and passing it into the omenative-side
-// helpers; the workload-side helpers consume a
-// PerComponentServiceSpec directly, so each test constructs the spec
-// inline against the same set of expected outputs. No adapter glue,
-// no owner-CRD imports.
+// Headless Service tests for BuildHeadlessService + reconcileHeadlessService.
+// The workload-side helpers consume a PerComponentServiceSpec directly,
+// so each test constructs the spec inline against the expected outputs.
+// No adapter glue, no owner-CRD imports.
 
 // trueP is the controller-true pointer the OwnerReference fixture
 // stamps. Local helper so tests don't need to import pointer.Bool.

@@ -2,7 +2,7 @@
 // model of the physical GPU layer — nodes and their GPU accounting, OME
 // workloads broken into components and instances, model availability, and
 // pending-pod pressure — captured once per loop and shared read-only across
-// every policy (OEP-0008).
+// every policy.
 package snapshot
 
 import (

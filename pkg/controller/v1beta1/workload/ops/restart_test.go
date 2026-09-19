@@ -489,11 +489,11 @@ func TestRestart_EmitsRichRestartTriggeredEvent(t *testing.T) {
 //
 // Under RecreateInstance only Restart bumps the Incarnation, and only the
 // bump drains the survivors. A gang that loses a member before it reaches
-// Ready therefore has no owner: restart detection used to return on the
-// phase, and Create's backfill re-materializes the missing pod at the
-// unchanged Incarnation, leaving the survivors holding a topology domain
-// the replacement cannot enter. These cases pin the boundary between that
-// loss and an Instance that is merely slow to form.
+// Ready therefore needs an owner: if restart detection returned on the
+// phase alone, Create's backfill would re-materialize the missing pod at
+// the unchanged Incarnation, leaving the survivors holding a topology
+// domain the replacement cannot enter. These cases pin the boundary
+// between that loss and an Instance that is merely slow to form.
 
 // gangLossRevision is the revision the wedged Instance is both running
 // and converging toward — the shape that leaves the update pass nothing

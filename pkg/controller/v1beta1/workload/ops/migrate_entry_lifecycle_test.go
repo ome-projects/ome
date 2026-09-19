@@ -1447,12 +1447,12 @@ func TestMigrate_Rejections_RecordFailed(t *testing.T) {
 	})
 }
 
-// TestMigrate_QueuedBatch_NotCapacityPoisoned_SerialCompletion pins THE
-// BATCH REGRESSION: five requests accepted in one burst sit queued
+// TestMigrate_QueuedBatch_NotCapacityPoisoned_SerialCompletion pins the
+// queued-batch guard: five requests accepted in one burst sit queued
 // (Accepted, no surge allocated). Capacity counts EXECUTION — allocated
 // surges and AllocatedAt in the window — never queued intent, so the
-// oldest record's fresh-path gate admits (pre-fix: 4 queued siblings
-// tripped the in-flight cap and terminally Failed the whole batch), and
+// oldest record's fresh-path gate admits (counting the 4 queued siblings
+// against the in-flight cap would terminally Fail the whole batch), and
 // serial dispatch completes all five.
 func TestMigrate_QueuedBatch_NotCapacityPoisoned_SerialCompletion(t *testing.T) {
 	const n = 5
@@ -1492,10 +1492,10 @@ func TestMigrate_QueuedBatch_NotCapacityPoisoned_SerialCompletion(t *testing.T) 
 // fresh-path overlay pre-check on BOTH gang templates: a WORKER spec
 // whose hard NodeAffinity pins hostname=FromNode makes the surge
 // unschedulable, so the request must fail terminally BEFORE the pair is
-// stamped — no surge InstanceStatus, source untouched. (Pre-fix the
-// fresh pre-check resolved only the leader spec; the gang passed,
-// stamped the pair, then terminally failed on resume, orphaning the
-// stamped pair until the legacy deadline.)
+// stamped — no surge InstanceStatus, source untouched. (A pre-check that
+// resolved only the leader spec would pass the gang, stamp the pair, then
+// terminally fail on resume, orphaning the stamped pair until the
+// deadline.)
 func TestMigrate_GangWorkerPinnedToFromNode_RejectedPreStamp(t *testing.T) {
 	f := newGangMigFixtureWithWorkerSpec(t, &corev1.PodSpec{
 		Containers: []corev1.Container{{Name: "worker", Image: "llama:v1"}},

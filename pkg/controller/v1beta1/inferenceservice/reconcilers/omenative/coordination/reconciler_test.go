@@ -336,12 +336,11 @@ func perRevisionServiceFixture(isvc *v1beta1.InferenceService, component v1beta1
 	}
 }
 
-// TestReconcile_RecreatesDeletedServiceWhenConverged is the regression
-// test for the self-heal bug: a per-revision Service deleted out-of-band
-// must be recreated on the next reconcile even when the live revision-hash
-// set is unchanged (converged). Pre-fix, ensure was gated on convergence,
-// so the deleted Service stayed gone and the HTTPRoute routed to a dead
-// backend.
+// TestReconcile_RecreatesDeletedServiceWhenConverged pins Service
+// self-heal: a per-revision Service deleted out-of-band must be recreated
+// on the next reconcile even when the live revision-hash set is unchanged
+// (converged). Gating ensure on convergence would leave the deleted
+// Service gone and the HTTPRoute routing to a dead backend.
 func TestReconcile_RecreatesDeletedServiceWhenConverged(t *testing.T) {
 	isvc := testOMENativeISVC()
 	steadyEngineStatus(isvc, "hash1")
@@ -616,13 +615,13 @@ func TestReconcile_TrafficLatestRevisionIdenticalShapeAcrossComponents(t *testin
 }
 
 // TestReconcile_TrafficLatestRevisionFlipPersists is the focused
-// reconcile-level regression for the no-op short-circuit bug. On the
-// first observation the UpdateRevision is empty (matches the
-// first-reconcile race where AggregateIRStatus has not yet mirrored
-// IR.Status). On the second observation UpdateRevision is populated.
-// The writer MUST flip Traffic[0].LatestRevision from false to true on
-// the second pass — without the fix, TrafficDiffersMeaningfully treats
-// the change as cosmetic and skips the write.
+// reconcile-level check of the no-op short-circuit. On the first
+// observation the UpdateRevision is empty (matches the first-reconcile
+// race where AggregateIRStatus has not yet mirrored IR.Status). On the
+// second observation UpdateRevision is populated. The writer MUST flip
+// Traffic[0].LatestRevision from false to true on the second pass —
+// TrafficDiffersMeaningfully must not treat the change as cosmetic and
+// skip the write.
 func TestReconcile_TrafficLatestRevisionFlipPersists(t *testing.T) {
 	isvc := testOMENativeISVC()
 	pod := buildPod(isvc, v1beta1.EngineComponent, "engineHash", 0)
@@ -865,11 +864,10 @@ func TestReconcile_InvalidGroupShapeErrors(t *testing.T) {
 	// no surge headroom and no drain headroom, so the roll can never make
 	// progress. The webhook rejects it in production; ValidateGroupShape is the
 	// runtime safety net the reconciler runs in case an object bypassed admission.
-	// (Single-Component rollingUpdate is NOT invalid in v2 — it's a valid
-	// progression; only the deadlock-budget shape is rejected here. v1's
-	// "Sequential without order" is likewise no longer expressible: Sequential is
-	// a run of single-Component blueGreen groups the controller collapses with a
-	// derived Order, so it can never be order-less.)
+	// (Single-Component rollingUpdate is a valid progression; only the
+	// deadlock-budget shape is rejected here. "Sequential without order" is not
+	// expressible: Sequential is a run of single-Component blueGreen groups the
+	// controller collapses with a derived Order, so it can never be order-less.)
 	zero := intstr.FromInt(0)
 	isvc.Spec.Rollout = &v1beta1.RolloutSpec{
 		Groups: []v1beta1.RolloutGroup{
@@ -1142,8 +1140,8 @@ func TestReconcile_ConsiderCoordinationGroupEventFiresOnceAcrossReconciles(t *te
 			EventReasonConsiderCoordinationGroup, got)
 	}
 	// Second reconcile, same ISVC (CoordinationAdvisory condition now set):
-	// the one-shot event must NOT re-fire — this is the fix for the runaway
-	// per-reconcile event count.
+	// the one-shot event must NOT re-fire — a runaway per-reconcile event
+	// count is exactly what the condition prevents.
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Recorder: rec, Now: time.Now(),
 		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent, v1beta1.DecoderComponent),
@@ -1356,7 +1354,7 @@ func TestBuildGroupObservation_PartitionFromProjectedIRSpec(t *testing.T) {
 func TestBuildComponentObservation_FailedPropagatesThroughBlueGreen(t *testing.T) {
 	// End-to-end: a Failed Instance flows through buildComponentObservation
 	// into the BlueGreen state machine, which returns Phase=Failed for
-	// the group. This is the bug the bad_image_kind KIND regression pins.
+	// the group. The bad_image_kind KIND spec pins the same path end to end.
 	g := ResolvedGroup{
 		Name:       "0",
 		Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
@@ -1419,15 +1417,15 @@ func TestCollectFailedInstanceIndices_EmptyOnNoFailures(t *testing.T) {
 	}
 }
 
-// TestBuildRatioState_DefersSnapshotWhenStatusEmpty pins the fix for
-// the BlueGreen+RatioBalanced deadlock. The first reconcile of a
-// freshly-created ISVC observes every Component with
+// TestBuildRatioState_DefersSnapshotWhenStatusEmpty pins the snapshot
+// deferral behind the BlueGreen+RatioBalanced anchor. The first reconcile
+// of a freshly-created ISVC observes every Component with
 // status.OMENative.Replicas == 0 (the OMENative status writer hasn't
-// run yet). Snapshotting from that empty status anchored Original to
+// run yet). Snapshotting from that empty status would anchor Original to
 // {Engine: 1, Decoder: 1} via SnapshotOriginal's zero-clamp, deadlocking
-// rollouts whose live ratio disagreed with 1:1.
+// rollouts whose live ratio disagrees with 1:1.
 //
-// The fix defers the snapshot until every Component has non-zero
+// The snapshot is deferred until every Component has non-zero
 // observed Replicas. This test pins that contract: empty status →
 // empty Original; populated status → {eng: 4, dec: 2} matches the
 // cluster shape.

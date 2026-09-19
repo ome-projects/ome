@@ -174,8 +174,8 @@ func TestValidateCapacity_OlderThanWindowDoesNotCount(t *testing.T) {
 
 func TestValidateCapacity_BurstAcceptedExecutedSlowly(t *testing.T) {
 	// 11 requests accepted in one burst (StartedAt all inside the
-	// window — the pre-fix per-hour counter would reject on StartedAt
-	// alone), executed slowly: 6 already done with AllocatedAt spread
+	// window — a per-hour counter keyed on StartedAt alone would
+	// reject), executed slowly: 6 already done with AllocatedAt spread
 	// 20 minutes apart so only two executions fall inside the trailing
 	// window, 4 still queued. The 11th's gate admits — per-hour counts
 	// executions, not accepts.

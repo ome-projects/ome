@@ -353,12 +353,11 @@ func TestMigrateExpiry_CrashWindow_DrainKeysAppliedAtSurgeReady_UnDrained(t *tes
 // TestMigrateExpiry_SurgeReadyButNotInRotation_Expires pins the
 // parked-forever strand: a Draining record whose source is fully
 // drained but whose surge fell out of rotation. The drive blocks at
-// its rotation gate every pass; pre-fix migrationTailReady checked
-// only surge ContainersReady + source drained — weaker than the
-// drive's gates — so expiry ALSO deferred every pass and the record
-// sat non-terminal past its deadline forever. tailReady now shares
-// the drive's exact gates (surgeTailGatesPassed), so this state
-// expires.
+// its rotation gate every pass; tailReady shares the drive's exact
+// gates (surgeTailGatesPassed), so this state expires. A weaker tail
+// check (surge ContainersReady + source drained only) would defer
+// expiry every pass too and leave the record non-terminal past its
+// deadline forever.
 func TestMigrateExpiry_SurgeReadyButNotInRotation_Expires(t *testing.T) {
 	f := newSinglePodMigFixture(t)
 	clk := f.withFakeClock()
@@ -398,8 +397,8 @@ func TestMigrateExpiry_SurgeReadyButNotInRotation_Expires(t *testing.T) {
 		t.Fatalf("drive must block at the rotation gate: done=%v accepted=%v", done, accepted)
 	}
 
-	// Pre-fix: n=0 here, every pass, forever. Post-fix the record
-	// expires because tailReady fails the same rotation gate.
+	// The record expires because tailReady fails the same rotation gate;
+	// a weaker tail check would return n=0 here, every pass, forever.
 	if n := f.expire(t); n != 1 {
 		t.Fatalf("ready-but-not-in-rotation surge past deadline must expire: got %d, want 0-fix-regression", n)
 	}
@@ -427,9 +426,9 @@ func TestMigrateExpiry_SurgeReadyButNotInRotation_Expires(t *testing.T) {
 // terminal ledger mirror cannot persist, the expiry pass ERRORS BEFORE
 // the record's terminal write — the record stays non-terminal and the
 // next pass re-runs the idempotent steps until the mirror lands. A
-// best-effort mirror (pre-fix) closed the record terminal with no
-// ledger row; after the 1h status trim, the upgrade import would
-// re-synthesize the UUID from its Started row as fresh Accepted work.
+// best-effort mirror would close the record terminal with no ledger
+// row; after the 1h status trim, the upgrade import would re-synthesize
+// the UUID from its Started row as fresh Accepted work.
 func TestMigrateExpiry_MirrorPersistFails_RetriesUntilTerminal(t *testing.T) {
 	f := newSinglePodMigFixture(t)
 	clk := f.withFakeClock()
@@ -558,12 +557,11 @@ func TestMigrateExpiry_DrainingIncomplete_Expired(t *testing.T) {
 	if surge == nil || surge.Operation != nil {
 		t.Fatalf("surge must be unpinned; got %+v", surge)
 	}
-	// THE STRANDED-SOURCE REGRESSION: expiry must undo the drive's
-	// drain. Pre-fix nothing removed the serving key except source-pod
-	// deletion — which an expired-but-kept source never gets — so the
-	// "restored Ready" source stayed serving=False on every pod:
-	// permanently out of the routed Service and invisible to the
-	// availability counters.
+	// Stranded-source guard: expiry must undo the drive's drain. If only
+	// source-pod deletion removed the serving key — which an
+	// expired-but-kept source never gets — the "restored Ready" source
+	// would stay serving=False on every pod: permanently out of the
+	// routed Service and invisible to the availability counters.
 	srcPod = &corev1.Pod{}
 	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: srcPodName}, srcPod); err != nil {
 		t.Fatalf("re-get source pod: %v", err)

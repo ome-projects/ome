@@ -73,7 +73,7 @@ migration:
   acknowledgementTimeout: 2m
   failureBackoff: 5m
 
-# Alfred's policy configuration (OEP-0008 §Configuration), rendered verbatim
+# Alfred's policy configuration, rendered verbatim
 # into <configMapName>'s config.yaml and hot-reloaded by every replica. A
 # config that fails schema validation is rejected at reload and the
 # last-known-good stays in force.

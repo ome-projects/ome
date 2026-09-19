@@ -654,14 +654,14 @@ func TestRestoreRunnerName_FallbackPrecedence(t *testing.T) {
 
 // --- Component-level PodSpec → Leader/Worker fold ---------------------
 //
-// These pin the fix for the multi-node bug: component-level pod fields
-// declared on engineConfig/decoderConfig (volumes, nodeSelector,
-// tolerations, affinity, imagePullSecrets, ...) must flow into the
-// rendered leader/worker pods. Before the fix, the renderer sourced its
-// base PodSpec from Leader.PodSpec / Worker.PodSpec only, so a runtime
-// declaring `engineConfig.volumes:[dshm]` + a leader/worker runner that
-// mounted `dshm` produced pods that mounted a volume that did not exist
-// → apiserver rejected them.
+// These pin the multi-node fold: component-level pod fields declared on
+// engineConfig/decoderConfig (volumes, nodeSelector, tolerations,
+// affinity, imagePullSecrets, ...) must flow into the rendered
+// leader/worker pods. A renderer sourcing its base PodSpec from
+// Leader.PodSpec / Worker.PodSpec only would, for a runtime declaring
+// `engineConfig.volumes:[dshm]` + a leader/worker runner that mounts
+// `dshm`, produce pods that mount a volume that does not exist → the
+// apiserver rejects them.
 
 func emptyDirVolume(name string) v1.Volume {
 	return v1.Volume{
@@ -704,7 +704,7 @@ func TestMergeEngineSpec_FoldComponentPodSpec(t *testing.T) {
 				ImagePullSecrets: []v1.LocalObjectReference{{Name: "regcred"}},
 			},
 			// Leader/Worker declare only the runner mount, NOT the volume —
-			// exactly the shape that broke before the fix.
+			// the shape that depends on the fold.
 			Leader: &v1beta1.LeaderSpec{
 				Runner: &v1beta1.RunnerSpec{Container: v1.Container{
 					Name:         "ome-container",

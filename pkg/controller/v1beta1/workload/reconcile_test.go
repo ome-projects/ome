@@ -592,7 +592,7 @@ func TestReconcile_UpdateGateNil_AllowsAll(t *testing.T) {
 }
 
 // TestReconcile_FreshMigrateOnNonReadySource_FallsThroughToUpdate pins
-// the affinity-trigger-not-detected bugfix: when a fresh Accepted
+// the Migrate-defer fall-through: when a fresh Accepted
 // migration record exists (no surge allocated, no stamped Operation)
 // but the source InstanceStatus is NOT in a state where Migrate can
 // accept it (Phase=Updating, Creating, Restarting, or any Operation !=
@@ -608,14 +608,14 @@ func TestReconcile_UpdateGateNil_AllowsAll(t *testing.T) {
 // The controller fires Update (Phase=Updating). A migration request is
 // accepted into status.migrations before the Update converges. The
 // dispatcher picks the record; Migrate sees Phase=Updating, returns
-// done=false without stamping. Without this fix the dispatcher
+// done=false without stamping. Without the fall-through the dispatcher
 // requeues at MigrateRequeueInterval indefinitely and Update never
 // runs.
 //
 // Test shape: instrument MutateInstance to count calls. Without the
-// fix: zero mutations (Migrate's defer doesn't mutate; Update never
-// runs). With the fix: Update fires and at minimum touches MutateInstance
-// to stamp Op.Step=Surge.
+// fall-through: zero mutations (Migrate's defer doesn't mutate; Update
+// never runs). With it: Update fires and at minimum touches
+// MutateInstance to stamp Op.Step=Surge.
 func TestReconcile_FreshMigrateOnNonReadySource_FallsThroughToUpdate(t *testing.T) {
 	scheme := makeScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()

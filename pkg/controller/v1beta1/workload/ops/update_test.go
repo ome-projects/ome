@@ -173,8 +173,8 @@ func TestUpdate_InPlaceEligibleImageOnly_PatchesPodImage(t *testing.T) {
 	}
 }
 
-// TestUpdate_InPlace_RestampsRevisionHashLabel pins the fix for the
-// in-place revision-hash gap: an in-place rollout must restamp the pod's
+// TestUpdate_InPlace_RestampsRevisionHashLabel pins in-place revision-hash
+// restamping: an in-place rollout must restamp the pod's
 // ome.io/revision-hash label to the target revision. Without it the rolled
 // pod keeps its old label, so per-revision Service routing / drain /
 // stuck-pod detection (all keyed on the label) mis-classify it as the
@@ -292,8 +292,8 @@ func TestUpdate_InPlaceConverges_MarksReadyWithRunningRevision(t *testing.T) {
 	}
 }
 
-// TestUpdate_InPlaceWaitsForRuntimeImageRoll pins the post-fix runtime-
-// truth gate: spec.image == target but kubelet has not yet rolled the
+// TestUpdate_InPlaceWaitsForRuntimeImageRoll pins the runtime-truth
+// gate: spec.image == target but kubelet has not yet rolled the
 // container — pod.Status.ContainerStatuses still reflects the old
 // image. Update must NOT flip serving / mark Ready: doing so would
 // expose stale runtime to traffic on the new revision pointer.
@@ -352,7 +352,7 @@ func TestUpdate_InPlaceWaitsForRuntimeImageRoll(t *testing.T) {
 // TestPodImagesMatch_InjectedSidecarIgnored pins the container-subset
 // compare: live containers absent from the target spec (istio/linkerd
 // style injections) are not OMENative-owned and must not block the
-// match — pre-fix they failed podImagesMatch and podRuntimeImagesMatch
+// match — counting them would fail podImagesMatch and podRuntimeImagesMatch
 // forever, livelocking the in-place update with the pod held drained.
 // A TARGET container missing from the pod still fails both.
 func TestPodImagesMatch_InjectedSidecarIgnored(t *testing.T) {
@@ -429,10 +429,10 @@ func TestPatchPodImages_ReportsIssued(t *testing.T) {
 }
 
 // TestUpdate_InPlace_InjectedSidecar_Converges is the end-to-end
-// livelock regression: a pod already on the target image but carrying
+// livelock guard: a pod already on the target image but carrying
 // a webhook-injected sidecar (spec + status) absent from the target
-// must converge to Ready — pre-fix every pass redeclared an image
-// mismatch, patched nothing, and requeued forever with the pod
+// must converge to Ready rather than redeclaring an image mismatch
+// every pass, patching nothing, and requeuing forever with the pod
 // drained.
 func TestUpdate_InPlace_InjectedSidecar_Converges(t *testing.T) {
 	legacyResetExpectations(t)

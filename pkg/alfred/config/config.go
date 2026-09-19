@@ -1,7 +1,7 @@
 // Package config loads and hot-reloads Alfred's configuration from the
 // alfred-config ConfigMap (key config.yaml), with schema validation and a
 // last-known-good fallback: a fat-fingered edit must never leave the
-// caretaker acting on a half-parsed policy (OEP-0008).
+// caretaker acting on a half-parsed policy.
 package config
 
 import (
@@ -102,8 +102,7 @@ type Defragmentation struct {
 	Scoring                Scoring  `json:"scoring"`
 }
 
-// Scoring holds the fragmentation-score knobs (OEP-0008 §Fragmentation
-// scoring).
+// Scoring holds the fragmentation-score knobs.
 type Scoring struct {
 	// SizeLadder is the within-node demand-size ladder, ascending.
 	SizeLadder []int `json:"sizeLadder"`

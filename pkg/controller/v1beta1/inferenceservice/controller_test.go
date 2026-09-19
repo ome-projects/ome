@@ -624,17 +624,17 @@ func TestInferenceServiceReconcile(t *testing.T) {
 	}
 }
 
-// TestUpdateStatusFlushesCoordinationWrites is the regression test for
-// a bug where per-Component requeues would drop coordination's in-memory
-// status mutations. When a Component asks the reconciler to requeue, the
-// controller now flushes coordination's in-memory status mutations
-// (Status.RolloutCoordination, per-Component Status.Components.<c>.Traffic[])
-// BEFORE returning the requeue. Before the fix, those writes were dropped
-// on every requeuing pass — the steady state during active rollouts —
-// because updateStatus ran only on the no-requeue tail of Reconcile.
+// TestUpdateStatusFlushesCoordinationWrites pins that per-Component
+// requeues do not drop coordination's in-memory status mutations. When a
+// Component asks the reconciler to requeue, the controller flushes
+// coordination's in-memory status mutations (Status.RolloutCoordination,
+// per-Component Status.Components.<c>.Traffic[]) BEFORE returning the
+// requeue. Running updateStatus only on the no-requeue tail of Reconcile
+// would drop those writes on every requeuing pass — the steady state
+// during active rollouts.
 //
-// This test asserts the contract updateStatus must satisfy for the fix
-// to be effective: an in-memory desiredService with coordination-style
+// This test asserts the contract updateStatus must satisfy for that
+// flush to be effective: an in-memory desiredService with coordination-style
 // Status mutations is persisted to the apiserver in one call. If
 // updateStatus ever stops persisting those fields (e.g., a future
 // refactor that scopes the writes), this test fails immediately.
@@ -709,10 +709,9 @@ func TestUpdateStatusFlushesCoordinationWrites(t *testing.T) {
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
 	// Re-fetch from the fake apiserver and verify both coordination
-	// writes landed. Pre-fix, the controller never called updateStatus
-	// on the requeue short-circuit path, so these fields stayed unset
-	// across every requeueing reconcile — i.e., the entire duration of
-	// an active rollout.
+	// writes landed. Skipping updateStatus on the requeue short-circuit
+	// path would leave these fields unset across every requeueing
+	// reconcile — i.e., the entire duration of an active rollout.
 	flushed := &v1beta1.InferenceService{}
 	g.Expect(c.Get(context.TODO(), types.NamespacedName{
 		Name:      existing.Name,
@@ -829,9 +828,9 @@ func TestUpdateStatusPersistsCanaryStepDespiteStaleCache(t *testing.T) {
 	g.Expect(err).NotTo(gomega.HaveOccurred(),
 		"status flush must not lose an optimistic-lock race to a concurrent metadata patch")
 
-	// The authoritative store must show the advanced step. Pre-fix, the
-	// retry base came from the stale cache, so the write 409'd and
-	// currentStep stayed 0 — the wedged-at-Paused-step-0 symptom.
+	// The authoritative store must show the advanced step. A retry base
+	// taken from the stale cache would 409 the write and leave currentStep
+	// at 0 — a rollout wedged at Paused step 0.
 	persisted := &v1beta1.InferenceService{}
 	g.Expect(live.Get(context.TODO(), nn, persisted)).NotTo(gomega.HaveOccurred())
 	g.Expect(persisted.Status.Canary).NotTo(gomega.BeNil())
@@ -1215,10 +1214,10 @@ func TestMergeRuntimeSpecs(t *testing.T) {
 	}
 }
 
-// TestSetOverlaysReadyConditionPreservesConditionSet guards against the
-// pre-fix behavior where setOverlaysReadyCondition raw-replaced the whole
-// conditions slice (wiping every other condition) and restamped
-// LastTransitionTime each pass, forcing a status write per reconcile.
+// TestSetOverlaysReadyConditionPreservesConditionSet pins that
+// setOverlaysReadyCondition merges into the conditions slice: raw-replacing
+// it would wipe every other condition, and restamping LastTransitionTime
+// each pass would force a status write per reconcile.
 func TestSetOverlaysReadyConditionPreservesConditionSet(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 

@@ -442,9 +442,9 @@ func ValidateAutoscalerTargetUtilizationPercentage(isvc *v1beta1.InferenceServic
 }
 
 // ValidateHPAMetrics validates the legacy ome.io/metrics annotation value
-// against the AutoscalerAllowedMetricsList enum. Accepts the raw string
-// from the annotation — the v1beta1.ScaleMetric enum this used to take is
-// gone.
+// against the AutoscalerAllowedMetricsList enum. It takes the raw
+// annotation string: the annotation is its only caller and carries no
+// typed enum.
 func ValidateHPAMetrics(metric string) error {
 	for _, item := range constants.AutoscalerAllowedMetricsList {
 		if string(item) == metric {
@@ -729,17 +729,16 @@ func ValidateAutoscalerAnnotationConflict(isvc *v1beta1.InferenceService) error 
 }
 
 // ValidateLegacyAutoscalerFieldsRaw inspects the raw admission-request
-// JSON for the deleted scaleTarget / scaleMetric fields and returns a
+// JSON for the legacy scaleTarget / scaleMetric fields and returns a
 // friendly migration error if either is set on any Component
 // (spec.engine, spec.decoder, spec.router, spec.engineConfig.*, etc).
 //
-// These fields have been removed from ComponentExtensionSpec; the
-// generated CRD no longer carries them in the OpenAPI schema. A modern
-// kubectl with --validate=true against an up-to-date CRD will reject the
-// unknown fields server-side before they reach the webhook; the API
-// server's structural-schema pruning will silently drop them when
-// --validate=false. This helper exists as defense-in-depth for the
-// narrow window where:
+// ComponentExtensionSpec has no such fields and the generated CRD's
+// OpenAPI schema does not carry them, so a kubectl with --validate=true
+// against an up-to-date CRD rejects them server-side before they reach
+// the webhook, and the API server's structural-schema pruning silently
+// drops them when --validate=false. This helper exists as
+// defense-in-depth for the narrow window where:
 //
 //   - An operator's local CRD is stale (cluster updated, kubeconfig
 //     points at older CRD), AND

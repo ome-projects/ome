@@ -1131,13 +1131,13 @@ func TestGetFormatMismatchReason(t *testing.T) {
 	})
 }
 
-// TestModelSizeRangePartialBounds locks in the fix for the nil-deref that
-// occurred when a ServingRuntime's ModelSizeRange set only Min or only Max
-// (both are *string and +optional in the CRD). A missing Min must behave as
-// "no lower bound" and a missing Max as "no upper bound" — never a panic.
-// Each row is driven through all three call sites that previously dereferenced
-// both pointers unconditionally: GetCompatibilityDetails, checkModelSize (via
-// IsCompatible), and calculateSizeScore (via CompareRuntimes).
+// TestModelSizeRangePartialBounds pins partial ModelSizeRange handling: a
+// ServingRuntime may set only Min or only Max (both are *string and
+// +optional in the CRD). A missing Min must behave as "no lower bound" and
+// a missing Max as "no upper bound" — never a panic. Each row is driven
+// through all three call sites that read both pointers:
+// GetCompatibilityDetails, checkModelSize (via IsCompatible), and
+// calculateSizeScore (via CompareRuntimes).
 func TestModelSizeRangePartialBounds(t *testing.T) {
 	tests := []struct {
 		name      string

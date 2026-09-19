@@ -109,8 +109,8 @@ OME Resources and Controller
 
 The chart enables a single-replica Prometheus alongside the controller by
 default. It exists for one purpose: to be the metrics source that KEDA
-`prometheus` triggers point at when an InferenceService's
-[OEP-0013][oep-0013] autoscaler asks for one.
+`prometheus` triggers point at when an InferenceService's KEDA-class
+autoscaler asks for one.
 
 Keep it enabled when your cluster does not already run a Prometheus that
 scrapes OME pods. Operators with an existing cluster Prometheus should disable
@@ -216,8 +216,6 @@ and cardinality limits before preserving a WAL that cannot be replayed.
 
 For long-term observability, deploy a separate full Prometheus stack
 (kube-prometheus-stack, etc.) and leave `prometheus.enabled=false`.
-
-[oep-0013]: ../../oeps/0013-autoscaling/README.md
 
 ## Multicluster Access
 

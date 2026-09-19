@@ -15,13 +15,13 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// TestReconcileOMENativeSubresources_SkipsPodMonitorWhenSchemeAbsent guards the
-// regression where an OMENative ISVC failed to reconcile on a cluster without
-// the Prometheus operator: creating the per-component PodMonitor returned
-// "no kind is registered for the type v1.PodMonitor in scheme" (OME registers
-// that scheme only when the CRD is present), aborting the reconcile before
-// status was written. The stable Service must still be created; the PodMonitor
-// is skipped, not fatal.
+// TestReconcileOMENativeSubresources_SkipsPodMonitorWhenSchemeAbsent pins
+// that an OMENative ISVC reconciles on a cluster without the Prometheus
+// operator: creating the per-component PodMonitor returns "no kind is
+// registered for the type v1.PodMonitor in scheme" (OME registers that
+// scheme only when the CRD is present), which must not abort the reconcile
+// before status is written. The stable Service must still be created; the
+// PodMonitor is skipped, not fatal.
 func TestReconcileOMENativeSubresources_SkipsPodMonitorWhenSchemeAbsent(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1beta1.AddToScheme(scheme))

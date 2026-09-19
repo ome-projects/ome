@@ -74,13 +74,12 @@ func renderedPod(component v1beta1.ComponentType) *corev1.Pod {
 	}
 }
 
-// TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent is the
-// regression test for the peer-env injection bug. The hook used to read
-// the component off the wrong label key ("ome.io/component" instead of
-// constants.OMEComponentLabel == "component"), so the recovered component
-// was always "", the peer lookup returned empty, and InjectPeerEnv was
-// never called. This drives a rendered engine pod through the live hook and
-// asserts the decoder peer endpoint env actually lands on every container.
+// TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent pins that the
+// hook recovers the component from constants.OMEComponentLabel
+// ("component"); reading any other key yields "", an empty peer lookup,
+// and no InjectPeerEnv call. This drives a rendered engine pod through the
+// live hook and asserts the decoder peer endpoint env actually lands on
+// every container.
 func TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent(t *testing.T) {
 	isvc := coordinatedISVC()
 	hook := ISVCRenderHook(isvc)

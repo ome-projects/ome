@@ -7,8 +7,8 @@ metadata:
   labels:
     {{- include "ome-alfred.labels" . | nindent 4 }}
 ---
-# Alfred's cluster-scoped permissions are read-only plus two narrow writes
-# (OEP-0008 §RBAC): no node writes, no pod writes, no pods/eviction. Every
+# Alfred's cluster-scoped permissions are read-only plus two narrow writes:
+# no node writes, no pod writes, no pods/eviction. Every
 # pod-level action is executed by the controller that owns the workload.
 # Anything confined to Alfred's own namespace — its ConfigMaps, its
 # leader-election Lease — lives in the namespaced Role instead.

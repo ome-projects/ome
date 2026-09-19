@@ -1663,10 +1663,9 @@ func registerISVCRuntimeNameIndex(ctx context.Context, indexer client.FieldIndex
 //     spec from the LIVE runtime, so a runtime edit rolls the ISVC forward.
 //     Fanning these out is the whole point — without it a runtime change
 //     never triggers the float ISVC's reconcile, so it silently fails to
-//     propagate until some unrelated event happens to wake the ISVC. That
-//     used to be masked by frequent incidental reconciles; once those were
-//     trimmed (event-filter predicates, scoped informers), runtime edits
-//     stopped reaching float ISVCs entirely.
+//     propagate until some unrelated event happens to wake the ISVC.
+//     Event-filter predicates and scoped informers keep incidental
+//     reconciles rare, so nothing else would deliver the edit.
 //
 //   - autoSync=false ("pinned"): the reconcile runs drift detection and
 //     warns the operator that the runtime edit was rejected; it does not roll.

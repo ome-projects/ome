@@ -65,7 +65,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// written by the pod event handler. Mirrors how the ISVC controller
 	// seeds omenative.NewExpectations(). When nil the workload dispatcher
 	// would fall back to the global singleton, which the pod handler does
-	// not feed — the bug this fixes.
+	// not feed.
 	if r.Expectations == nil {
 		r.Expectations = workload.NewExpectations()
 	}

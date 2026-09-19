@@ -833,7 +833,7 @@ func TestCheckSequentialGate_GenerationCaughtUpAndIdleBypasses(t *testing.T) {
 
 func TestCheckSequentialGate_NoOrderBypasses(t *testing.T) {
 	// Defensive: a 2-Component group with no Order set resolves to a
-	// (non-Sequential) blueGreen group — the v2 spec can no longer express
+	// (non-Sequential) blueGreen group — the spec cannot express
 	// "Sequential without Order" (Sequential is a run of single-Component
 	// groups the controller collapses with a derived Order). The gate must
 	// still bypass cleanly without panic / wedge.

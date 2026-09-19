@@ -803,10 +803,9 @@ func ProcessBaseLabels(b *BaseComponentFields, isvc *v1beta1.InferenceService, c
 }
 
 // UpdateComponentStatus updates component status based on deployment mode.
-// All surviving deployment modes (RawDeployment, MultiNode, OMENative)
-// emit pods carrying the raw-deployment app label — the engine / decoder
-// / router previously routed the same constant pair through a per-component
-// getPodLabelInfo callback; that indirection was dead and is inlined here.
+// Every deployment mode (RawDeployment, MultiNode, OMENative) emits pods
+// carrying the raw-deployment app label, so one constant label pair serves
+// the engine, decoder and router alike.
 func UpdateComponentStatus(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, objectMeta metav1.ObjectMeta, componentExt *v1beta1.ComponentExtensionSpec) error {
 	// Always initialize the component ready condition to ensure it's visible from the start
 	// The deployment reconciler will update the condition based on the actual deployment status:
@@ -1205,10 +1204,9 @@ func ReconcileOMENativeSubresources(
 // performed by the caller.
 //
 // On annotation-build failure the returned ObjectMeta carries Name +
-// Namespace only; on label-build failure the returned ObjectMeta
-// carries Name + Namespace + Annotations — preserving the partial-
-// metadata error-return shape the individual receivers used to
-// surface.
+// Namespace only; on label-build failure it carries Name + Namespace +
+// Annotations, so callers see exactly the metadata built before the
+// failure.
 func ReconcileComponentObjectMeta(
 	b *BaseComponentFields,
 	isvc *v1beta1.InferenceService,

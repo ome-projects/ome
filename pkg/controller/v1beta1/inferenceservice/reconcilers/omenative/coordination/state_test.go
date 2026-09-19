@@ -673,9 +673,8 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 			RatioTolerancePercent: &tol,
 		},
 	}
-	// Same fleet, but ServingPods left at zero — simulates the OLD
-	// behavior where computeSurgeBudgetWithRatio used NewPods as
-	// baseline and saw {0, 0} at rollout start.
+	// Same fleet, but ServingPods left at zero — the {0, 0} shape a
+	// NewPods-based baseline would see at rollout start.
 	obs := GroupObservation{
 		Group: g,
 		Components: map[v1beta1.ComponentType]ComponentObservation{
@@ -684,7 +683,7 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 				DesiredReplicas: 4,
 				TotalPods:       4,
 				ReadyPods:       4,
-				ServingPods:     0, // <-- simulates the bug
+				ServingPods:     0, // <-- the zero-serving shape
 				NewRevisionPods: 0,
 			},
 			v1beta1.DecoderComponent: {
@@ -692,7 +691,7 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 				DesiredReplicas: 2,
 				TotalPods:       2,
 				ReadyPods:       2,
-				ServingPods:     0, // <-- simulates the bug
+				ServingPods:     0, // <-- the zero-serving shape
 				NewRevisionPods: 0,
 			},
 		},
@@ -703,7 +702,7 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 	}
 	_, skew := computeSurgeBudgetWithRatio(obs)
 	if !skew {
-		t.Errorf("with ServingPods=0 (the pre-fix baseline behavior) the gate MUST trip skew — this test pins the deadlock shape so a re-regression is visible at unit level, not just in KIND")
+		t.Errorf("with ServingPods=0 (a zero-serving baseline) the gate MUST trip skew — this test pins the deadlock shape so a regression is visible at unit level, not just in KIND")
 	}
 }
 

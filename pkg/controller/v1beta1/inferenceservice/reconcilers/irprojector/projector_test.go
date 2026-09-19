@@ -312,9 +312,9 @@ func TestEnsureInferenceReplica_Update_PreservesGeneration(t *testing.T) {
 
 // TestEnsureInferenceReplica_NoChange_IssuesNoWrite pins the no-op guard at
 // the API layer: a second projection with identical params must issue ZERO
-// Create/Update/Patch calls. This is the fix for the conflict hot-loop —
-// an unconditional write every reconcile churned the IR's ResourceVersion
-// and fought the IR controller's status writes.
+// Create/Update/Patch calls. An unconditional write every reconcile would
+// churn the IR's ResourceVersion and fight the IR controller's status
+// writes in a conflict hot-loop.
 func TestEnsureInferenceReplica_NoChange_IssuesNoWrite(t *testing.T) {
 	g := gomega.NewWithT(t)
 	isvc := baselineISVC("llama", "prod")
@@ -599,17 +599,14 @@ func TestEnsureInferenceReplica_AlreadyExists_PropagatedAsUpdate(t *testing.T) {
 // revision hash flips and triggers the ControllerRevision / rollout
 // machinery.
 //
-// Real-cluster failure shape (pre-fix): operator bumps
+// Failure shape this prevents: operator bumps
 // spec.engine.annotations.test.ome.io/rollout-trigger to a fresh
 // timestamp; ISVC generation bumps; IR.spec.runners[].template
 // .metadata.annotations stays EMPTY; no new ControllerRevision; the
-// rollout never fires. The fix is for the projector to treat
-// p.ComponentExt.Annotations as authoritative — even when the dispatch
-// site forgets to merge them into p.ObjectMeta, the projector still
-// emits them.
-//
-// Same bug class as the legacy direct-omenative path; this is the
-// IR-managed analog.
+// rollout never fires. The projector treats p.ComponentExt.Annotations
+// as authoritative — even when the dispatch site does not merge them
+// into p.ObjectMeta, the projector still emits them. The direct
+// omenative path has the same contract; this is the IR-managed analog.
 func TestEnsureInferenceReplica_PropagatesComponentAnnotations(t *testing.T) {
 	g := gomega.NewWithT(t)
 	isvc := baselineISVC("llama", "prod")
@@ -979,17 +976,17 @@ func hpaAutoscalerBlock() *v1beta1.ComponentAutoscaler {
 }
 
 // TestEnsureInferenceReplica_AutoscalerManaged_PreservesLiveReplicas pins
-// the core bugfix: when the Component is autoscaler-managed (HPA / KEDA /
-// External), a re-projection MUST NOT clobber the live ir.Spec.Replicas.
+// that when the Component is autoscaler-managed (HPA / KEDA / External), a
+// re-projection MUST NOT clobber the live ir.Spec.Replicas.
 //
 // The IR's /scale subresource (.spec.replicas) is the HPA / KEDA / external
 // scale target — the autoscaler is the authoritative writer of
-// spec.replicas. Before this fix the projector unconditionally re-stamped
-// MinReplicas on every reconcile, so the ISVC controller and the autoscaler
-// fought over the count: HPA scales engine from 2 -> 8, the next ISVC
-// reconcile slams it back to MinReplicas=2, HPA scales back up, ... forever.
+// spec.replicas. Unconditionally re-stamping MinReplicas on every reconcile
+// would make the ISVC controller and the autoscaler fight over the count:
+// HPA scales engine from 2 -> 8, the next ISVC reconcile slams it back to
+// MinReplicas=2, HPA scales back up, ... forever.
 //
-// Failure shape (pre-fix): scaledReplicas (8) is overwritten with
+// Failure shape this prevents: scaledReplicas (8) overwritten with
 // MinReplicas (2) on the second EnsureInferenceReplica call.
 func TestEnsureInferenceReplica_AutoscalerManaged_PreservesLiveReplicas(t *testing.T) {
 	g := gomega.NewWithT(t)
@@ -1034,7 +1031,7 @@ func TestEnsureInferenceReplica_AutoscalerManaged_PreservesLiveReplicas(t *testi
 }
 
 // TestEnsureInferenceReplica_AutoscalingOff_AppliesMinReplicas pins the
-// other half of the bugfix: when autoscaling is OFF (resolved Class None),
+// complementary rule: when autoscaling is OFF (resolved Class None),
 // the ISVC controller owns the count, so a re-projection re-applies
 // MinReplicas even if the live IR drifted to a different value. A drifted
 // spec.replicas with no autoscaler running must converge back to the spec.

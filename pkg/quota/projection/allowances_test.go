@@ -299,8 +299,8 @@ func TestResolveIsolatesAFailedLeaf(t *testing.T) {
 // than the admin authorized, and the excess surfaces only when the member
 // returns.
 //
-// Reproduced live before this table existed: a 96-chip tenant split 64/32 became
-// 96 on the survivor while the absent member kept its 32.
+// Worked example: a 96-chip tenant split 64/32 becomes 96 on the survivor
+// while the absent member keeps its 32.
 func TestResolveHoldsAnIncompleteBasis(t *testing.T) {
 	proportional := ResolveOptions{DefaultPolicy: v1beta1.AcceleratorQuotaDistributionProportional}
 

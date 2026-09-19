@@ -404,9 +404,8 @@ func TestCreateHPA_Behavior(t *testing.T) {
 // TestCreateHPA_ComponentExtShim_Identical pins the byte-identical
 // contract for the Raw Deployment path: createHPAFromComponentExt must
 // emit the same HPA as createHPA when given an equivalent Autoscaler.HPA
-// block. The metric configuration lives entirely in Autoscaler.HPA.Metrics
-// — operators who used to set ScaleTarget=55 + ScaleMetric=cpu now declare
-// a Resource{cpu, 55%} entry in Autoscaler.HPA.Metrics.
+// block. The metric configuration lives entirely in Autoscaler.HPA.Metrics:
+// a CPU target of 55% is a Resource{cpu, 55%} entry there.
 func TestCreateHPA_ComponentExtShim_Identical(t *testing.T) {
 	componentMeta := metav1.ObjectMeta{
 		Name:      "raw-engine",
@@ -707,8 +706,8 @@ func TestHPAReconcilerRejectsForeignController(t *testing.T) {
 	}
 }
 
-// TestSemanticHPAEquals_ServerDefaultedBehavior is the regression test for the
-// no-op-write bug: OME's generated HPA carries a nil or empty-stub
+// TestSemanticHPAEquals_ServerDefaultedBehavior pins the no-op-write
+// guard: OME's generated HPA carries a nil or empty-stub
 // spec.behavior, while the live HPA always has the apiserver-defaulted
 // scaleUp/scaleDown policies populated. semanticHPAEquals must treat that as
 // equal (so the reconciler reports Existed, not Update) yet still catch a real

@@ -43,7 +43,7 @@ func TestGangMembersCreatedBeforePodGroupHold(t *testing.T) {
 	}
 
 	// No member may bind while its PodGroup is unresolvable — otherwise a lone gang
-	// member is running with no gate (the bug). The scheduler has ample time to try.
+	// member runs with no gate. The scheduler has ample time to try.
 	for _, name := range podNames {
 		ensureNotBound(t, tc, ns, name, 3*time.Second)
 	}
@@ -139,8 +139,8 @@ func TestConcurrentGangBurst(t *testing.T) {
 		t.Fatalf("burst setup: %v", err)
 	}
 
-	// Every pod must bind — a wedged gang (the bug: pinned to a full domain with
-	// free capacity elsewhere, never re-planning) would time out here.
+	// Every pod must bind — a wedged gang (pinned to a full domain with free
+	// capacity elsewhere, never re-planning) would time out here.
 	type result struct {
 		gang int
 		node string

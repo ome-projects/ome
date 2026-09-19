@@ -46,9 +46,9 @@ scheduler:
   # gang pinned, pinStale inputs, per-domain free counts, Filter rejects).
   verbosity: 2
 
-  # Disable the built-in DefaultPreemption plugin for this scheduler. Until
-  # topology-aware preemption lands (OEP-0022 Phase C), default preemption is
-  # domain-blind for gangs and can evict victims that never form a whole domain.
+  # Disable the built-in DefaultPreemption plugin for this scheduler. Default
+  # preemption is domain-blind for gangs and can evict victims that never form
+  # a whole domain.
   # Leave true so ome-scheduler waits for capacity instead; the default scheduler
   # still preempts for its own workloads. Set false to restore built-in behavior.
   disablePreemption: true

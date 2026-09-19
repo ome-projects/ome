@@ -31,9 +31,9 @@ data:
               - name: OMEGangPack
             {{- if .Values.scheduler.disablePreemption }}
             disabled:
-              # Until OEP-0022 Phase C adds topology-aware preemption, the default
-              # preemptor is domain-blind for gangs: a no-fit gang carries no pin
-              # for Filter to enforce during preemption simulation, so it can evict
+              # The default preemptor is domain-blind for gangs: a no-fit gang
+              # carries no pin for Filter to enforce during preemption
+              # simulation, so it can evict
               # victims scattered across domains that never assemble one whole free
               # domain — churning pods for nothing. Disabling it here means
               # ome-scheduler simply waits for capacity (the default scheduler still
@@ -52,7 +52,7 @@ data:
                 weight: {{ .Values.scheduler.omeGangPack.scoreWeight }}
             {{- if .Values.scheduler.disablePodTopologySpreadScore }}
             disabled:
-              # Soft topology spreading directly conflicts with OEP-0022's
+              # Soft topology spreading directly conflicts with OMEGangPack's
               # packing policy. Hard DoNotSchedule constraints still run via
               # PodTopologySpread's PreFilter and Filter extension points.
               - name: PodTopologySpread

@@ -875,9 +875,8 @@ func TestEnsurePodGroups_MaybeNoGangScheduler_DedupPerProcess(t *testing.T) {
 
 // TestEnsurePodGroups_MaybeNoGangScheduler_DedupSeparateComponents
 // verifies the dedup key is (owner, Component) — same owner but a
-// different Component must still get a warning. Catches the
-// regression where the key was accidentally collapsed to just the
-// owner name.
+// different Component must still get a warning. A key collapsed to
+// just the owner name would suppress it.
 func TestEnsurePodGroups_MaybeNoGangScheduler_DedupSeparateComponents(t *testing.T) {
 	resetMaybeNoGangSchedulerSeen()
 

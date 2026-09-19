@@ -1,4 +1,4 @@
-// Alfred is the OME GPU cluster caretaker (OEP-0008): a leader-elected
+// Alfred is the OME GPU cluster caretaker: a leader-elected
 // controller that observes the physical GPU layer and recommends corrective
 // migrations. Explicit operator compatibility configuration enables guarded
 // migration-request annotations handled by the workload-owning controllers.
@@ -49,7 +49,7 @@ var (
 	setupLog = ctrl.Log.WithName("alfred-setup")
 )
 
-// Leader-election parameters per OEP-0008 §Leader election (mirrors
+// Leader-election parameters for leader election (mirrors
 // cluster-autoscaler's pattern).
 const (
 	leaderElectionID = "alfred.ome.io"

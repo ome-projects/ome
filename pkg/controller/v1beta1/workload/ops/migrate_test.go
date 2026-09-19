@@ -250,12 +250,12 @@ func vfnGangPod(runner, nodeName string) *corev1.Pod {
 	return p
 }
 
-// TestValidateFromNode_GangSpanningNodesNotRejected is the regression:
-// a multi-node gang Instance's pods span nodes BY
-// DESIGN (leader + worker land on different nodes), so a migration whose
-// FromNode hosts one of them must NOT be rejected. The pre-fix code
-// rejected any source whose pods spanned nodes, wrongly failing every
-// gang migration that wasn't co-located on a single node.
+// TestValidateFromNode_GangSpanningNodesNotRejected pins that a
+// multi-node gang Instance's pods span nodes BY DESIGN (leader + worker
+// land on different nodes), so a migration whose FromNode hosts one of
+// them must NOT be rejected. Rejecting any source whose pods span nodes
+// would wrongly fail every gang migration that isn't co-located on a
+// single node.
 func TestValidateFromNode_GangSpanningNodesNotRejected(t *testing.T) {
 	deps, input, plan := vfnGangFixture(t,
 		vfnGangPod("leader", "node5"),

@@ -720,7 +720,7 @@ func (ctx GateContext) CheckRatio(inFlightSurge, inFlightUnavail, projDelta int3
 // isvc.Status reflect the prior reconcile pass — they don't see
 // in-wake-up writes — so the dispatcher must thread the running count
 // in or every gate decision in one wake-up shares the same stale
-// snapshot answer (the original mass-outage bug).
+// snapshot answer and the whole Component drains at once.
 //
 // Returns allowed=true when:
 //   - The Component is not in any coord group,
@@ -733,7 +733,7 @@ func (ctx GateContext) CheckRatio(inFlightSurge, inFlightUnavail, projDelta int3
 // updates: kubelet still reports ContainersReady while the controller
 // has flipped the serving gate to False; using ReadyReplicas would
 // mislead the gate into letting every pod get pulled from traffic at
-// once (the original mass-outage bug at scale).
+// once.
 //
 // Honest semantic: with MaxUnavailable=0 and an update strategy that
 // requires drain-first (in-place, recreate without surge), this gate

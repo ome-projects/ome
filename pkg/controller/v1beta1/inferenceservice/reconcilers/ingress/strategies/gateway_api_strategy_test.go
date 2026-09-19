@@ -367,10 +367,9 @@ func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute(t *testing.T) {
 }
 
 // typedNilHTTPRouteBuilder is a stub HTTPRouteBuilder that always returns
-// a (*gatewayapiv1.HTTPRoute)(nil) wrapped in a non-nil client.Object — the
-// exact shape of the value that triggered the production panic before the
-// builder-side dispatcher was hardened. The strategy must defend against
-// this shape even if a future dispatcher regression reintroduces it.
+// a (*gatewayapiv1.HTTPRoute)(nil) wrapped in a non-nil client.Object — a
+// shape a bare `== nil` check does not catch. The strategy must defend
+// against it even if a dispatcher regression reintroduces it.
 type typedNilHTTPRouteBuilder struct{}
 
 func (typedNilHTTPRouteBuilder) GetResourceType() string { return "HTTPRoute" }
@@ -380,11 +379,10 @@ func (typedNilHTTPRouteBuilder) Build(_ context.Context, _ *v1beta1.InferenceSer
 }
 
 func (typedNilHTTPRouteBuilder) BuildHTTPRoute(_ context.Context, _ *v1beta1.InferenceService, _ string) (client.Object, error) {
-	// Wrap a typed-nil *HTTPRoute in the interface return — this is the
-	// shape that crashed the reconciler at gateway_api_strategy.go:165
-	// pre-fix. `result == nil` returns FALSE for this value because the
-	// interface header carries non-nil type info; only the inner value
-	// is nil. The strategy's typed-nil guard must catch this.
+	// Wrap a typed-nil *HTTPRoute in the interface return. `result == nil`
+	// returns FALSE for this value because the interface header carries
+	// non-nil type info; only the inner value is nil. The strategy's
+	// typed-nil guard must catch this.
 	return (*gatewayapiv1.HTTPRoute)(nil), nil
 }
 
@@ -393,30 +391,24 @@ func (typedNilHTTPRouteBuilder) Endpoints(_ *v1beta1.InferenceService, _ string)
 }
 
 // TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPanic
-// pins the layer-2 defense for the typed-nil-through-interface panic.
+// pins the strategy-side defense against a typed-nil-through-interface
+// panic.
 //
-// Repro trace (PD-disaggregated ISVC example-ns/sglang-example-pd):
-//
-//	panic: runtime error: invalid memory address or nil pointer dereference
-//	  gateway_api_strategy.go:165
-//	  → reconciler.go:99
-//	  → controller.go:516
-//
-// Root cause: BuildHTTPRoute returned a typed-nil *HTTPRoute wrapped in a
-// non-nil client.Object interface. The `desired == nil` check at the top
-// of reconcileComponentHTTPRoute returned FALSE (interface non-nil), the
-// type assertion succeeded with ok=true, and the subsequent
-// controllerutil.SetControllerReference call dereferenced the typed-nil
+// A typed-nil *HTTPRoute wrapped in a non-nil client.Object interface
+// defeats the `desired == nil` check at the top of
+// reconcileComponentHTTPRoute (the interface is non-nil), the type
+// assertion succeeds with ok=true, and the subsequent
+// controllerutil.SetControllerReference call dereferences the typed-nil
 // pointer.
 //
-// The layer-1 fix (BuildHTTPRoute dispatcher returns interface-nil for the
-// not-ready branch) closes the source. This test exercises layer-2 — a
-// defensive nil check inside the strategy that catches any future caller
-// (test stub, dispatcher regression, third-party builder) that still
-// hands the strategy a typed-nil-wrapped-in-interface. We deliberately
-// inject the stub builder directly into the strategy struct, bypassing
-// the dispatcher fix, so this test pins the defense regardless of any
-// future change to BuildHTTPRoute.
+// The BuildHTTPRoute dispatcher returns interface-nil for the not-ready
+// branch, which closes the usual source. This test exercises the second
+// layer — a defensive nil check inside the strategy that catches any
+// caller (test stub, dispatcher regression, third-party builder) that
+// still hands the strategy a typed-nil-wrapped-in-interface. The stub
+// builder is injected directly into the strategy struct, bypassing the
+// dispatcher, so this test pins the defense regardless of any change to
+// BuildHTTPRoute.
 func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPanic(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1beta1.AddToScheme(scheme))
@@ -443,7 +435,7 @@ func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPa
 	// defense in isolation.
 	strategy.httpRouteBuilder = typedNilHTTPRouteBuilder{}
 
-	// The pre-fix behavior was a panic at SetControllerReference. Wrap in a
+	// Without the guard this panics at SetControllerReference. Wrap in a
 	// recover() check to give a precise diagnostic if the defense regresses.
 	var err error
 	var ready bool
@@ -530,19 +522,13 @@ func TestGatewayAPIStrategy_CheckHTTPRouteStatuses(t *testing.T) {
 	}
 }
 
-// TestGatewayAPIStrategy_CheckHTTPRouteStatuses_NotFoundIsTolerated guards
-// against a regression of the live-cluster bug where checkHTTPRouteStatuses
-// returned IsNotFound as a hard error, crashing the reconcile every loop
-// during PD-disaggregated bring-up. reconcileComponentHTTPRoute correctly
-// skips create when a component isn't Ready (Builder returns nil); this
-// test asserts the downstream status-check tolerates the resulting absence
-// of HTTPRoutes by continuing past them rather than failing.
-//
-// Repro trace (example-ns/sglang-example-pd):
-//
-//	ERROR Reconciler error ...
-//	  error: "fails to reconcile ingress: HTTPRoute.gateway.networking.k8s.io
-//	         \"sglang-example-pd-engine\" not found"
+// TestGatewayAPIStrategy_CheckHTTPRouteStatuses_NotFoundIsTolerated pins
+// that checkHTTPRouteStatuses treats IsNotFound as a tolerable absence,
+// not a hard error. reconcileComponentHTTPRoute skips create when a
+// component isn't Ready (Builder returns nil), so during PD-disaggregated
+// bring-up some routes do not exist yet; a hard error there would crash
+// the reconcile every loop. The status-check must continue past the
+// missing routes rather than failing.
 func TestGatewayAPIStrategy_CheckHTTPRouteStatuses_NotFoundIsTolerated(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1beta1.AddToScheme(scheme))
@@ -785,8 +771,8 @@ func TestGatewayAPIStrategy_GetRawServiceHost(t *testing.T) {
 			expectedHost: "test-isvc-router.default.svc.cluster.local",
 		},
 		{
-			// Engine Service is named "<isvc>-engine" (constants.EngineServiceName).
-			// Pre-fix this returned "<isvc>" which doesn't resolve to a real Service.
+			// Engine Service is named "<isvc>-engine" (constants.EngineServiceName);
+			// "<isvc>" resolves to no Service.
 			name:         "without router",
 			isvc:         createTestInferenceServiceGateway("test-isvc", "default"),
 			expectedHost: "test-isvc-engine.default.svc.cluster.local",
@@ -834,8 +820,8 @@ func TestGatewayAPIStrategy_GetComponentType(t *testing.T) {
 		expectedType string
 	}{
 		{
-			// engine HTTPRoute is "<isvc>-engine" (distinct from the
-			// top-level "<isvc>"). Previously they collided.
+			// engine HTTPRoute is "<isvc>-engine", distinct from the
+			// top-level "<isvc>".
 			name:         "engine component",
 			serviceName:  "test-isvc-engine",
 			isvc:         createTestInferenceServiceGateway("test-isvc", "default"),

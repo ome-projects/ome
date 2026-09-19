@@ -348,25 +348,24 @@ func TestRemoveNotReadyKey_NilPodRejected(t *testing.T) {
 	}
 }
 
-// TestRemoveLastKey_ClearsMessageField pins the bug where in-place
-// updates stalled forever after a second annotation-only patch.
+// TestRemoveLastKey_ClearsMessageField pins that removing the last
+// writer leaves the persisted pod's message field actually empty.
 //
-// Background: PodCondition.Message has `json:",omitempty"`, so the
-// typed corev1.PodCondition.MarshalJSON drops the field when empty.
-// When the controller removed the last writer and re-issued the patch
-// with Status=True + Message="" the strategic-merge payload contained
-// no `message` key, so the apiserver preserved the prior Status=False
-// message list. The pod ended up Status=True with a stale writer
-// still in the message — the next in-place update's AddNotReadyKey
-// found its (UserAgent, Key) tuple already present, short-circuited
-// without issuing a Status=False patch, and drain.IsPodDrained
-// observed the pod still in rotation. The Instance state machine
-// stalled at Phase=Updating; readyReplicas read 0 for the entire
-// post-patch window.
+// PodCondition.Message has `json:",omitempty"`, so the typed
+// corev1.PodCondition.MarshalJSON drops the field when empty. A patch
+// issued through the typed marshal with Status=True + Message="" would
+// carry no `message` key, so the apiserver would preserve the prior
+// Status=False message list. The pod would end up Status=True with a
+// stale writer still in the message — the next in-place update's
+// AddNotReadyKey would find its (UserAgent, Key) tuple already present,
+// short-circuit without issuing a Status=False patch, and
+// drain.IsPodDrained would observe the pod still in rotation, stalling
+// the Instance at Phase=Updating with readyReplicas reading 0 for the
+// entire post-patch window.
 //
 // Assertion: after the last writer is removed the message field is
-// actually empty on the persisted pod. Without the patchCondition
-// hand-marshal fix the assertion fails — the message survives.
+// actually empty on the persisted pod, which the patchCondition
+// hand-marshal guarantees.
 func TestRemoveLastKey_ClearsMessageField(t *testing.T) {
 	pod := newReadinessTestPod("p")
 	c := newReadinessTestClient(t, pod)
@@ -399,8 +398,8 @@ func TestRemoveLastKey_ClearsMessageField(t *testing.T) {
 	}
 }
 
-// TestSecondInPlaceCycle_CanReDrain pins the end-to-end shape of the
-// reported regression: two back-to-back in-place updates on the same
+// TestSecondInPlaceCycle_CanReDrain pins the end-to-end shape: two
+// back-to-back in-place updates on the same
 // (Instance, Incarnation) must each be able to flip the pod to
 // Status=False. The first cycle drains, ContainersReady stays True,
 // we re-mark Serving; the second cycle issues the same {UserAgent,
@@ -446,11 +445,10 @@ func TestSecondInPlaceCycle_CanReDrain(t *testing.T) {
 }
 
 // TestAddNotReadyKey_RecoversInconsistentStatusTrueWithStaleMessage
-// pins the self-healing branch in AddNotReadyKey. Existing pods that
-// ran the pre-fix controller may be sitting at the paradoxical
-// {Status=True, Message=[stale-writer]} state because the
-// last-writer-removed patch omitted Message via json:",omitempty".
-// The next in-place update cycle MUST be able to drain those pods —
+// pins the self-healing branch in AddNotReadyKey. A pod may be sitting
+// at the paradoxical {Status=True, Message=[stale-writer]} state if a
+// last-writer-removed patch ever omitted Message via json:",omitempty".
+// The next in-place update cycle MUST be able to drain such pods —
 // otherwise the only recovery path is operator-triggered pod restarts.
 //
 // Setup: synthesize a pod in the paradoxical state. Call

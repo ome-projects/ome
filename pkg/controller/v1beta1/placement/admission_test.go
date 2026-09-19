@@ -11,10 +11,10 @@ import (
 
 // isvcWithInstances builds a derived ISVC declaring `component` with an empty
 // Lifecycle summary. Used by the controller reconcile tests that seed a derived
-// ISVC on a worker cluster; the per-instance data now lives on the paired
+// ISVC on a worker cluster; the per-instance data lives on the paired
 // InferenceReplica (see irWithInstances), which the predicates read via
-// ComponentIRStatus. The variadic arg is retained for call-site symmetry with
-// irWithInstances but no longer populates the ISVC.
+// ComponentIRStatus. The variadic arg exists only for call-site symmetry with
+// irWithInstances; it does not populate the ISVC.
 func isvcWithInstances(component v1beta1.ComponentType, _ ...bool) *v1beta1.InferenceService {
 	isvc := &v1beta1.InferenceService{
 		Status: v1beta1.InferenceServiceStatus{

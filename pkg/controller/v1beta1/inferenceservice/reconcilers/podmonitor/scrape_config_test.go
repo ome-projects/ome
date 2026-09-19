@@ -28,10 +28,10 @@ func vllmRename() controllerconfig.RelabelConfig {
 	}
 }
 
-// TestApplyManagedScrapeConfig_MetricRelabelingsOnly pins the fix: a config with
-// ONLY metricRelabelings (no relabelings) must still be applied to every
-// endpoint. The previous implementation returned early when relabelings was
-// empty, which would have dropped metricRelabelings entirely.
+// TestApplyManagedScrapeConfig_MetricRelabelingsOnly pins that a config with
+// ONLY metricRelabelings (no relabelings) is still applied to every
+// endpoint; returning early on empty relabelings would drop
+// metricRelabelings entirely.
 func TestApplyManagedScrapeConfig_MetricRelabelingsOnly(t *testing.T) {
 	pm := twoEndpointPM()
 	cfg := controllerconfig.PodMonitorConfig{

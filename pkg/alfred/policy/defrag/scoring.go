@@ -1,7 +1,6 @@
-// Package defrag implements Policy #1 (Defragmentation) of OEP-0008.
+// Package defrag implements the Defragmentation policy.
 //
-// This file is the fragmentation-scoring pipeline (OEP-0008 §Fragmentation
-// scoring): a pure function of the ClusterSnapshot that answers "how much of
+// This file is the fragmentation-scoring pipeline: a pure function of the ClusterSnapshot that answers "how much of
 // the cluster's free GPU capacity could defragmentation make usable that is
 // not usable now?" — per hardware pool (Node.GPUPool), never mixed across
 // pools.

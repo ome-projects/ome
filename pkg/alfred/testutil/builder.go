@@ -1,7 +1,7 @@
 // Package testutil provides the shared synthetic ClusterSnapshot harness
 // used by Alfred's policy, arbiter, and chaos tests. Building snapshots
 // directly — no fake clients, no informers — is what keeps every policy a
-// table-testable pure function of the snapshot (OEP-0008).
+// table-testable pure function of the snapshot.
 package testutil
 
 import (

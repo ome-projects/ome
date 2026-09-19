@@ -88,9 +88,9 @@ func TestPodTermination_CrashLoopBackOffUsesLastTerminationFinishedAt(t *testing
 	}
 }
 
-// The regression test for the write-storm bug: observing an unchanged failed
-// pod twice, at two different times, must produce byte-identical records.
-// If this fails, the status DeepEqual guard cannot converge.
+// Write-storm guard: observing an unchanged failed pod twice, at two
+// different times, must produce byte-identical records. If this fails, the
+// status DeepEqual guard cannot converge.
 func TestPodTermination_StableAcrossObservations(t *testing.T) {
 	cases := map[string]corev1.ContainerStatus{
 		"non-zero exit": {

@@ -1,5 +1,5 @@
 {{- if .Values.enabled }}
-# Alfred's policy configuration (OEP-0008 §Configuration). Alfred watches
+# Alfred's policy configuration. Alfred watches
 # this ConfigMap and hot-reloads it; a config that fails schema validation is
 # rejected and the last-known-good stays in force.
 apiVersion: v1

@@ -84,10 +84,9 @@ func findCondition(isvc *v1beta1.InferenceService, condType string) *knapis.Cond
 	return nil
 }
 
-// TestResolvePinnedRuntime_SourceDeleted_ServesPin is the regression
-// test for the deleted-source wedge: a NotFound on the live runtime
-// used to hard-fail the reconcile even though the pinned revision was
-// intact, wedging the ISVC. The pin must keep serving with drift
+// TestResolvePinnedRuntime_SourceDeleted_ServesPin pins the deleted-source
+// case: a NotFound on the live runtime must not fail the reconcile while
+// the pinned revision is intact. The pin keeps serving, with drift
 // surfaced as a condition.
 func TestResolvePinnedRuntime_SourceDeleted_ServesPin(t *testing.T) {
 	const runtimeName = "vllm-rt"

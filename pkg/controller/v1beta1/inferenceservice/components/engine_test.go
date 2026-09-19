@@ -897,15 +897,14 @@ func TestEngineWorkerPodSpec(t *testing.T) {
 }
 
 // TestEngineUsesLeaderTemplate pins the structural predicate that drives
-// pod-template selection in reconcilePodSpec. The earlier implementation
-// called isvcutils.DetermineEngineDeploymentMode(spec) and switched on the
-// result — which returned MultiNode for ANY spec with Leader/Worker set,
-// regardless of the authoritative DeploymentMode wired in at construction
-// time. For an OMENative-mode engine with Leader != nil the two disagreed
-// (helper said MultiNode; dispatch said OMENative); the bug was masked
-// only because the MultiNode branch happened to also use Leader.PodSpec.
-// Replacing the helper with engineUsesLeaderTemplate decouples template
-// selection from dispatch-mode classification.
+// pod-template selection in reconcilePodSpec. Switching on
+// isvcutils.DetermineEngineDeploymentMode(spec) instead would return
+// MultiNode for ANY spec with Leader/Worker set, regardless of the
+// authoritative DeploymentMode wired in at construction time; for an
+// OMENative-mode engine with Leader != nil the two disagree (helper says
+// MultiNode; dispatch says OMENative), and only the MultiNode branch's
+// incidental use of Leader.PodSpec would hide it. engineUsesLeaderTemplate
+// decouples template selection from dispatch-mode classification.
 func TestEngineUsesLeaderTemplate(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
@@ -969,12 +968,9 @@ func TestEngineUsesLeaderTemplate(t *testing.T) {
 
 // TestEngineReconcilePodSpec_OMENativeWithLeader pins that the
 // OMENative-mode engine with Leader != nil picks the Leader pod template
-// (not the top-level engine spec template). This is the latent-bug
-// regression test for a bug where the code called
-// isvcutils.DetermineEngineDeploymentMode which would return MultiNode
-// for this shape, and the MultiNode branch happened to use Leader.PodSpec
-// — so today it accidentally works. Pin the behavior so a future refactor
-// of the MultiNode branch to do something MultiNode-specific does NOT
+// (not the top-level engine spec template). Template selection must not
+// ride on the MultiNode branch's incidental use of Leader.PodSpec, so a
+// refactor of that branch to do something MultiNode-specific does NOT
 // silently break the OMENative + Leader path.
 func TestEngineReconcilePodSpec_OMENativeWithLeader(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)

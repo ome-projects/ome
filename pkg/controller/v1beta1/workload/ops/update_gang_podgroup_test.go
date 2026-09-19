@@ -42,23 +42,22 @@ func gangSchedClient(t *testing.T, initObjs ...client.Object) client.Client {
 		Build()
 }
 
-// TestGangSurgeUpdate_EnsuresPodGroupBeforeSurgePods pins the canary
-// gang-rollout fix: gangSurgeUpdate must announce the surge index's
-// PodGroup to the gang scheduler BEFORE creating that gang's pods.
+// TestGangSurgeUpdate_EnsuresPodGroupBeforeSurgePods pins that
+// gangSurgeUpdate announces the surge index's PodGroup to the gang
+// scheduler BEFORE creating that gang's pods.
 //
 // Scenario: a multi-node engine (minReplicas=4, canary capacity 50%).
 // The canary surges a new gang at a fresh instance index; on a
-// coscheduler-style cluster the surge pods are rejected with "0/1
-// nodes are available: 1 PodGroup not found" and never scheduled, so
-// the canary capacity gate never opens and the rollout stalls at
-// phase=Pending.
+// coscheduler-style cluster, surge pods created before their PodGroup
+// exists are rejected with "0/1 nodes are available: 1 PodGroup not
+// found" and never scheduled, so the canary capacity gate never opens
+// and the rollout stalls at phase=Pending.
 //
-// Root cause: the surge gang's PodGroup is created by the top-level
-// EnsurePodGroups pass, which keys off plan.Instances — and the surge index
-// only lands in the plan once its GangSurgeTarget status round-trips into
-// ObservedState. In the window before that round-trip, gangSurgeUpdate
-// creates the surge pods carrying the pod-group label while no PodGroup
-// exists. The fix ensures the PodGroup inline before the create.
+// The top-level EnsurePodGroups pass keys off plan.Instances, and the
+// surge index only lands in the plan once its GangSurgeTarget status
+// round-trips into ObservedState. In the window before that round-trip,
+// gangSurgeUpdate creates the surge pods carrying the pod-group label, so
+// it must ensure the PodGroup inline before the create.
 func TestGangSurgeUpdate_EnsuresPodGroupBeforeSurgePods(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, _ := surgeISVCReady("gang-a", "prod", 1)
@@ -134,8 +133,8 @@ func TestGangSurgeUpdate_EnsuresPodGroupBeforeSurgePods(t *testing.T) {
 	}
 }
 
-// TestGangSurgeUpdate_HoldsSourceDrainUntilReplacementPodReady pins the
-// RatioBalanced regression fix: a gang surge must NOT drain the source gang
+// TestGangSurgeUpdate_HoldsSourceDrainUntilReplacementPodReady pins that
+// a gang surge must NOT drain the source gang
 // out of serving until the REPLACEMENT gang is PodReady (containers ready AND
 // the ome.io/serving readiness gate AND'd in by kubelet) — not merely
 // ContainersReady. ome.io/serving is itself a readiness gate, so a just-served
@@ -166,7 +165,7 @@ func TestGangSurgeUpdate_HoldsSourceDrainUntilReplacementPodReady(t *testing.T) 
 		}
 	}
 	// Replacement gang (idx=1, new rev): ContainersReady + serving, but NOT
-	// yet PodReady — the window where the bug drained the source too early.
+	// yet PodReady — the window in which the source must still be held.
 	for _, runner := range []string{"leader", "worker"} {
 		if err := c.Create(context.Background(), gangPodAt(isvc, 1, runner, v2Hash, true, true)); err != nil {
 			t.Fatalf("seed replacement pod (%s): %v", runner, err)

@@ -1863,21 +1863,19 @@ func encodeCSR(t *testing.T, csr *v1beta1.ClusterServingRuntime) []byte {
 	return raw
 }
 
-// TestClusterServingRuntimeValidator_PriorityConflictAcrossCSRs is the
-// regression test for the bug where the CSR validator passed the
-// admitted CSR's own name as BOTH `existingRuntimeName` and
-// `newRuntimeName` to validateServingRuntimePriority, causing the
-// self-skip early-exit to fire for every pairing in the loop and
-// silently allowing cross-CSR priority conflicts to slip through.
+// TestClusterServingRuntimeValidator_PriorityConflictAcrossCSRs pins that
+// the CSR validator compares the admitted CSR against every OTHER CSR:
+// validateServingRuntimePriority receives the other CSR's name as
+// `existingRuntimeName`, so the self-skip early-exit fires only for the
+// CSR itself and cross-CSR priority conflicts are detected. Passing the
+// admitted CSR's own name as both `existingRuntimeName` and
+// `newRuntimeName` would make the early-exit fire for every pairing and
+// let conflicts slip through.
 //
 // Scenario: two existing CSRs both auto-select `safetensors` at
 // priorities 1 and 2. A third CSR is created auto-selecting
-// `safetensors` at priority 1 (CONFLICTS with the first existing CSR).
-// With the bug, the early-exit `clusterServingRuntime.Name ==
-// clusterServingRuntime.Name` is always true, so the conflict is
-// missed and the CSR is admitted. With the fix, the loop passes the
-// OTHER CSR's name, the equality check no longer short-circuits, and
-// the conflict is detected.
+// `safetensors` at priority 1 (CONFLICTS with the first existing CSR)
+// and must be rejected.
 func TestClusterServingRuntimeValidator_PriorityConflictAcrossCSRs(t *testing.T) {
 	g := gomega.NewWithT(t)
 
@@ -2048,8 +2046,8 @@ func TestClusterServingRuntimeValidator_AutoscalerShape(t *testing.T) {
 
 // TestValidator_SpecOnlyChecksRunWithNoExistingRuntimes verifies that
 // the spec-only model-format priority check is enforced even when no
-// other runtime exists (the check used to live inside the loop over
-// existing runtimes, so the first runtime admitted escaped it).
+// other runtime exists: it runs independently of the loop over existing
+// runtimes, so the first runtime admitted cannot escape it.
 func TestValidator_SpecOnlyChecksRunWithNoExistingRuntimes(t *testing.T) {
 	// Same auto-selected format name at two different priorities —
 	// invalid per ValidateModelFormatPrioritySame.

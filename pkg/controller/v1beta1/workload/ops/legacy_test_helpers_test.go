@@ -105,8 +105,8 @@ func legacyIRName(isvc *v1beta1.InferenceService, component workload.ComponentTy
 }
 
 // legacyInstanceIR builds the InferenceReplica that carries the given
-// per-instance statuses for (isvc, component). Instance detail is the IR's
-// source-of-truth (no longer mirrored onto the ISVC), so fixtures seed it
+// per-instance statuses for (isvc, component). The IR is the source of
+// truth for instance detail (the ISVC carries none), so fixtures seed it
 // here and pass the returned IR to legacyNewFakeClient alongside the ISVC.
 func legacyInstanceIR(isvc *v1beta1.InferenceService, component workload.ComponentType, insts ...v1beta1.OMENativeInstanceStatus) *v1beta1.InferenceReplica {
 	return &v1beta1.InferenceReplica{
@@ -119,9 +119,8 @@ func legacyInstanceIR(isvc *v1beta1.InferenceService, component workload.Compone
 }
 
 // legacyInstanceStatusesOnIR re-reads the InferenceReplica and returns its
-// persisted per-instance statuses, for assertions that previously read
-// isvc.Status.Components[c].Lifecycle.InstanceStatuses. Returns nil when the
-// IR does not exist.
+// persisted per-instance statuses, the authoritative copy assertions check.
+// Returns nil when the IR does not exist.
 func legacyInstanceStatusesOnIR(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType) []v1beta1.OMENativeInstanceStatus {
 	ir := &v1beta1.InferenceReplica{}
 	key := types.NamespacedName{Namespace: isvc.Namespace, Name: legacyIRName(isvc, component)}
@@ -208,7 +207,7 @@ func legacyTestInput(isvc *v1beta1.InferenceService, c client.Client, component 
 
 // legacyInstanceStatuses reads the authoritative InferenceReplica and
 // converts its per-instance statuses into the workload-owned mirror. The
-// IR is the source of truth (no longer projected onto the ISVC).
+// IR is the source of truth (the ISVC carries no projection of it).
 func legacyInstanceStatuses(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType) []workload.InstanceStatus {
 	var out []workload.InstanceStatus
 	for _, s := range legacyInstanceStatusesOnIR(c, isvc, component) {

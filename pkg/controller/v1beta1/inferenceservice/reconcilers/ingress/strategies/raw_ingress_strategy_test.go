@@ -248,8 +248,8 @@ func TestKubernetesIngressStrategy_GetRawServiceHost(t *testing.T) {
 			expectedHost: "test-isvc-router.default.svc.cluster.local",
 		},
 		{
-			// Engine Service is named "<isvc>-engine" (constants.EngineServiceName).
-			// Pre-fix this returned "<isvc>" which doesn't resolve to a real Service.
+			// Engine Service is named "<isvc>-engine" (constants.EngineServiceName);
+			// "<isvc>" resolves to no Service.
 			name:         "without router",
 			isvc:         createTestInferenceServiceRaw("test-isvc", "default"),
 			expectedHost: "test-isvc-engine.default.svc.cluster.local",

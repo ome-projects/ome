@@ -176,10 +176,10 @@ type InstanceOperation struct {
 	SurgeIndex  *int32
 	RequestUUID string
 
-	// FromNode / HintTargetNodes are no longer stamped (migration facts
-	// live on the owner's status.migrations record) and have no readers;
-	// retained only so the CRD InstanceOperation mirror round-trips
-	// pre-existing stamped values unchanged. Do not add new writers.
+	// FromNode / HintTargetNodes are never stamped (migration facts live
+	// on the owner's status.migrations record) and have no readers; they
+	// exist only so the CRD InstanceOperation mirror round-trips
+	// already-stamped values unchanged. Do not add writers.
 	FromNode        string
 	HintTargetNodes []string
 }

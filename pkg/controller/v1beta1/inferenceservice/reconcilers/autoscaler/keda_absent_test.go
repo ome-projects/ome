@@ -14,11 +14,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// TestDeleteScaledObjectIfExists_ToleratesAbsentKedaCRD guards the regression
-// where OMENative autoscaler dispatch failed the whole ISVC reconcile on a
-// cluster without KEDA: cleaning up a stale ScaledObject returns a
-// NoKindMatchError (CRD absent -> no REST mapping), which must be treated as a
-// no-op, not an error.
+// TestDeleteScaledObjectIfExists_ToleratesAbsentKedaCRD pins that OMENative
+// autoscaler dispatch does not fail the whole ISVC reconcile on a cluster
+// without KEDA: cleaning up a stale ScaledObject returns a NoKindMatchError
+// (CRD absent -> no REST mapping), which must be treated as a no-op, not an
+// error.
 func TestDeleteScaledObjectIfExists_ToleratesAbsentKedaCRD(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, kedav1.AddToScheme(scheme)) // type is in scheme; CRD is not in the cluster

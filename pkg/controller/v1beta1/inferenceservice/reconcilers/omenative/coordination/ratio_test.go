@@ -742,22 +742,20 @@ func TestCheckRatioGate_BlueGreenRatioBalancedDoesNotDeadlock(t *testing.T) {
 	pinActiveRun(isvc)
 	// Engine drain (-1): projected serving = {eng: 3, dec: 2}, ratio
 	// 3/2 = 1.5, lower band 2.0 * (1 - 0.25) = 1.5 → boundary, in band
-	// (inclusive) → MUST be allowed. The deadlock manifested as this
-	// gate rejecting EVERY surge because Original was set to {1, 1}
-	// rather than {4, 2}.
+	// (inclusive) → MUST be allowed. With Original anchored at {1, 1}
+	// rather than {4, 2} this gate would reject EVERY surge.
 	if allowed, reason := CheckRatioGate(isvc, v1beta1.EngineComponent, 0); !allowed {
 		t.Fatalf("BlueGreen + RatioBalanced with 4:2 fleet and 25%% tolerance: first engine drain should be allowed (projected 3/2=1.5 sits at band lower edge [1.5, 2.5]); got allowed=false reason=%s", reason)
 	}
 }
 
 // TestCheckRatioGate_BogusOnePerComponentAnchorReproducesDeadlock pins
-// the BAD BEHAVIOR side of the same fix: with the broken {1, 1} anchor
-// (what buildRatioState used to produce when status.OMENative.Replicas
-// was 0 at snapshot time), the gate rejects every drain on a fleet
+// the failure side of the same invariant: with a {1, 1} anchor (the
+// shape an empty-status snapshot produces when status.OMENative.Replicas
+// is 0 at snapshot time), the gate rejects every drain on a fleet
 // whose live ratio differs from 1:1. This test documents the failure
-// mode so a future regression that re-introduces the empty-status
-// snapshot will trip here AND in the ratiobalanced_kind / loadtest_kind
-// KIND specs together.
+// mode so an empty-status snapshot trips here AND in the
+// ratiobalanced_kind / loadtest_kind KIND specs together.
 func TestCheckRatioGate_BogusOnePerComponentAnchorReproducesDeadlock(t *testing.T) {
 	tol := int32(25)
 	isvc := &v1beta1.InferenceService{
@@ -809,8 +807,8 @@ func TestCheckRatioGate_BogusOnePerComponentAnchorReproducesDeadlock(t *testing.
 	// With anchor {1, 1}, band = 1.0 * (1 ± 0.25) = [0.75, 1.25].
 	// Live ratio 4/2 = 2.0 is OUT of band. Engine drain projects
 	// 3/2 = 1.5 → still out of band → REJECT.
-	// (This is the deadlock the bug report captures: the gate rejects
-	// every drain because the anchor doesn't match the cluster shape.)
+	// (This is the deadlock: the gate rejects every drain because the
+	// anchor doesn't match the cluster shape.)
 	if allowed, reason := CheckRatioGate(isvc, v1beta1.EngineComponent, 0); allowed {
 		t.Fatalf("with bogus 1:1 anchor against 4:2 live fleet, gate should reject (projection 3:2=1.5 is outside band [0.75, 1.25] derived from 1.0); got allowed=true reason=%q — if this test PASSES with the bogus anchor it means the band semantics changed and the deadlock can't be reproduced from this anchor any more", reason)
 	}
@@ -987,8 +985,8 @@ func TestCheckUnavailabilityGate_InFlightDeltaCharges(t *testing.T) {
 	// inFlightDelta=0 → projected=1 → allowed.
 	// inFlightDelta=1 → projected=2 → allowed (boundary).
 	// inFlightDelta=2 → projected=3 → DENIED.
-	// Proves the wake-up-counter closes the within-pass stale-state hole
-	// that previously let the dispatcher fire every instance at once.
+	// Proves the wake-up counter closes the within-pass stale-state hole
+	// through which the dispatcher would otherwise fire every instance at once.
 	pct := intstr.FromString("20%")
 	isvc := mkUnavailFixture(&pct)
 	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
@@ -1023,7 +1021,7 @@ func TestCheckUnavailabilityGate_ServingDivergesFromReady(t *testing.T) {
 	// controller has flipped serving=False on 3 pods. The gate must
 	// see 3 currently unavailable (from serving count), not 0 (from
 	// ready count). MaxUnavailable=3 → projected=4 > budget=3 → DENY.
-	// Before the fix, this scenario was the mass-outage bug.
+	// Counting from ReadyReplicas instead would admit every drain at once.
 	isvc := mkUnavailFixture(iosInt(3))
 	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
 		v1beta1.EngineComponent: {
@@ -1308,7 +1306,7 @@ func TestEvaluateUpdateGate_RatioBalancedSurgeNotDeadlocked(t *testing.T) {
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); !allowed {
 		t.Errorf("SurgeThenDrain RatioBalanced 4:4 must be allowed (no deadlock); got denied: %s", reason)
 	}
-	// (RecreatePod on a symmetric pair is now also cleared by the Part-2
+	// (RecreatePod on a symmetric pair is likewise allowed, by the
 	// tiebreaker — see TestEvaluateUpdateGate_RecreatePodSymmetricCleared.)
 }
 
@@ -1451,7 +1449,7 @@ func TestEvaluateSurge_SurgeTiebreaker(t *testing.T) {
 		comp        v1beta1.ComponentType
 		wantAllowed bool
 	}{
-		// Cleared — rounding-error overshoot within 2x band:
+		// Allowed — rounding-error overshoot within 2x band:
 		{ // 3:3 -> 4:3 = 1.333 <= 2x band 1.5
 			name: "N=3 symmetric (ratio_n3)", tol: 25, comp: eng, wantAllowed: true,
 			original: map[v1beta1.ComponentType]int32{eng: 3, dec: 3},
@@ -1467,19 +1465,18 @@ func TestEvaluateSurge_SurgeTiebreaker(t *testing.T) {
 			original: map[v1beta1.ComponentType]int32{eng: 8, dec: 2},
 			serving:  map[v1beta1.ComponentType]int32{eng: 8, dec: 2},
 		},
-		// Now CLEARED — a minimal +1 surge on a balanced full-original
-		// baseline is allowed regardless of overshoot magnitude: a surge
-		// can't starve a peer and SurgeThenDrain drains it back. A
-		// 2x-band cap would leave these as permanent deadlocks, wedging
-		// a roll that can ONLY proceed by surging — seen in real-cluster
-		// testing on both single-pod and gang shapes.
+		// A minimal +1 surge on a balanced full-original baseline is
+		// allowed regardless of overshoot magnitude: a surge can't starve
+		// a peer and SurgeThenDrain drains it back. A 2x-band cap would
+		// leave these as permanent deadlocks, wedging a roll that can ONLY
+		// proceed by surging, on both single-pod and gang shapes.
 		{ // 1:1 -> 2:1 — N=1 can only roll by surging
-			name: "N=1 minimal surge (cleared)", tol: 25, comp: eng, wantAllowed: true,
+			name: "N=1 minimal surge", tol: 25, comp: eng, wantAllowed: true,
 			original: map[v1beta1.ComponentType]int32{eng: 1, dec: 1},
 			serving:  map[v1beta1.ComponentType]int32{eng: 1, dec: 1},
 		},
 		{ // 4:4 tol=10 -> 5:4 — band narrower than one pod
-			name: "tight tol=10 at N=4 minimal surge (cleared)", tol: 10, comp: eng, wantAllowed: true,
+			name: "tight tol=10 at N=4 minimal surge", tol: 10, comp: eng, wantAllowed: true,
 			original: map[v1beta1.ComponentType]int32{eng: 4, dec: 4},
 			serving:  map[v1beta1.ComponentType]int32{eng: 4, dec: 4},
 		},
@@ -1849,18 +1846,17 @@ func mkGangSurgeFixture() (*v1beta1.InferenceService, []v1beta1.OMENativeInstanc
 	}), engineInstances
 }
 
-// TestCheckRatioGate_GangSurgePeakDoesNotAuthorizeDrain reproduces a
-// multi-node RatioBalanced mis-pacing found in real-cluster testing.
-// Engine is mid gang SurgeThenDrain so
-// its ServingReplicas reads the transient PEAK N+1=3 against decoder's steady
-// N=2. A drain of one engine Instance would, once the surge settles back to
-// N, leave engine at 1 : decoder 2 = ratio 2.0 vs the 1:1 anchor — far past
-// the 25% band. The gate must REJECT the drain.
+// TestCheckRatioGate_GangSurgePeakDoesNotAuthorizeDrain pins multi-node
+// RatioBalanced pacing during a gang surge. Engine is mid gang
+// SurgeThenDrain so its ServingReplicas reads the transient PEAK N+1=3
+// against decoder's steady N=2. A drain of one engine Instance would, once
+// the surge settles back to N, leave engine at 1 : decoder 2 = ratio 2.0 vs
+// the 1:1 anchor — far past the 25% band. The gate must REJECT the drain.
 //
-// Before the fix the gate counted the surge peak as durable serving (3:2 → a
-// -1 drain projects 2:2, in band) and ALLOWED it. After the fix the gate
-// nets the in-flight gang-surge peak out, sees the steady 2:2, and a -1 drain
-// projects 1:2 (out of band) → DENIED. Single-pod is unaffected: it has no
+// Counting the surge peak as durable serving would read 3:2, project 2:2
+// for a -1 drain (in band) and ALLOW it. The gate nets the in-flight
+// gang-surge peak out, sees the steady 2:2, and a -1 drain projects 1:2
+// (out of band) → DENIED. Single-pod is unaffected: it has no
 // GangSurgeTarget Instance, so nothing is netted.
 func TestCheckRatioGate_GangSurgePeakDoesNotAuthorizeDrain(t *testing.T) {
 	isvc, engInsts := mkGangSurgeFixture()
@@ -1970,11 +1966,11 @@ func mkGangSurgeDrainedFixture() (*v1beta1.InferenceService, []v1beta1.OMENative
 // the true 2:2 to engine 2 : decoder 1 = ratio 2.0 vs the 1:1 anchor — past the
 // 25% band — and MUST be denied.
 //
-// Before the fix the gate netted the still-marked target out of engine's
-// serving, read engine=1, and a decoder -1 projected 1:1 (in band) → ALLOWED,
-// driving the very trough this proves. After the fix the target's source is no
-// longer serving, so nothing is netted, engine reads the steady 2, and the
-// decoder drain projects 2:1 (out of band) → DENIED.
+// Netting the still-marked target out of engine's serving would read
+// engine=1, and a decoder -1 would project 1:1 (in band) → ALLOWED, driving
+// the very trough this proves. Because the target's source is not serving,
+// nothing is netted: engine reads the steady 2, and the decoder drain
+// projects 2:1 (out of band) → DENIED.
 func TestCheckRatioGate_DrainedGangSurgeNotANetTrough(t *testing.T) {
 	isvc, engInsts := mkGangSurgeDrainedFixture()
 	if got := servingSurgePeakInFlight(engInsts); got != 0 {

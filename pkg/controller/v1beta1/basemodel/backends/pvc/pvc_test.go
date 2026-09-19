@@ -561,10 +561,6 @@ func TestJobFailedConditionMessage(t *testing.T) {
 	}
 }
 
-// TestProcessModelStatus_NonPVCConfigMapStillRequiresNode is a regression
-// guard so the relaxation in C13 doesn't accidentally let per-node
-// ConfigMaps pass when their Node is gone.
-
 func TestReconcilePVCStorage_ClusterBaseModel(t *testing.T) {
 	scheme := newPVCTestScheme(t)
 	ctx := context.Background()

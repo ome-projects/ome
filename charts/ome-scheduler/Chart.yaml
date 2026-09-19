@@ -2,7 +2,7 @@ apiVersion: v2
 name: ome-scheduler
 description: >-
   OME accelerator scheduler — the upstream kube-scheduler built as a library with
-  the OME placement plugin (OMEGangPack, OEP-0022) registered. Installed as a
+  the OME placement plugin (OMEGangPack) registered. Installed as a
   SECOND scheduler; workloads opt in via spec.schedulerName. Requires the
   scheduler-plugins PodGroup CRD (scheduling.x-k8s.io) to be present in the
   cluster.

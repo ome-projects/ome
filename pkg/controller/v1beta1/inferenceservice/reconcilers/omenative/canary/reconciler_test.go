@@ -1788,10 +1788,10 @@ func runWithTargets(isvc *v1beta1.InferenceService, targets ...v1beta1.RolloutRu
 	isvc.Status.Rollout.ActiveRun.TargetRevisions = targets
 }
 
-// The bug: a router-only bounce opens a run, the engine unit is handed that
-// run's TargetID, and it armed a full no-op ladder on a revision it already
-// serves -- burning its analysis budget and able to reach a rollback for a
-// rollout that never happened.
+// A router-only bounce opens a run and the engine unit is handed that run's
+// TargetID; arming a full no-op ladder on a revision it already serves would
+// burn its analysis budget and could reach a rollback for a rollout that
+// never happened.
 func TestReconcile_IdleUnitDoesNotArm(t *testing.T) {
 	isvc := canaryISVC(twoStep(), nil)
 	runWithTargets(isvc,

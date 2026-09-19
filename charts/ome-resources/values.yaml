@@ -340,16 +340,15 @@ ome:
     # checks, per-pod accelerator counts feeding multi-node PARALLELISM_SIZE
     # sizing). Exact names, no patterns. The OME binary has NO built-in default
     # list; omitting this key (or setting an empty list) falls back to
-    # recognizing only "nvidia.com/gpu" — the sole resource name OME recognized
-    # before this field existed — so an unconfigured/upgraded cluster's behavior
-    # is unchanged. The chart default below preserves that same nvidia-only
-    # behavior for every existing install.
+    # recognizing only "nvidia.com/gpu", so an unconfigured cluster gets
+    # nvidia-only behavior. The chart default below preserves that same
+    # nvidia-only behavior for every install.
     #
     # Adding a resource name here is a template-affecting change, not a config
     # tweak: for any multi-node Engine/Decoder Component whose runner container
     # requests that resource, recognizing it materializes the PARALLELISM_SIZE
-    # env var onto the pod template where it was previously absent (0 GPUs
-    # detected). That changes the hashed OMENative revision payload, which mints
+    # env var onto a pod template that had none (0 GPUs detected). That
+    # changes the hashed OMENative revision payload, which mints
     # a new revision and rolls every such Component still running. Schedule
     # adding a vendor here like any other pod-template change, not like a
     # config-only edit.

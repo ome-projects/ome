@@ -297,10 +297,9 @@ func TestRender_DelegatesToRenderWithRevisionEmptyHash(t *testing.T) {
 
 // TestRenderWithRevision_PropagatesComponentMetaAnnotationsAndLabels pins
 // the merge from the upstream-built componentObjectMeta onto the rendered
-// pod. Before this fix the renderer dropped both, breaking PD runtimes
-// that need multus IB annotations (k8s.v1.cni.cncf.io/networks) to spin
-// up. OME-mandatory labels still win on collision so selectors keep
-// working.
+// pod. Dropping either breaks PD runtimes that need multus IB annotations
+// (k8s.v1.cni.cncf.io/networks) to spin up. OME-mandatory labels still
+// win on collision so selectors keep working.
 func TestRenderWithRevision_PropagatesComponentMetaAnnotationsAndLabels(t *testing.T) {
 	plan, inst, runner := singlePodPlan()
 	meta := &metav1.ObjectMeta{

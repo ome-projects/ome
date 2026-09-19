@@ -1,6 +1,6 @@
 // Package policy defines the contract every Alfred policy implements: a
 // pure, side-effect-free function of the ClusterSnapshot that returns ranked
-// Candidates (OEP-0008 §The engine). A policy holds no client and emits no
+// Candidates. A policy holds no client and emits no
 // Event, metric, or ConfigMap entry — the engine gates scheduling before
 // routing executable Candidates to the Arbiter and advisories to the Reporter.
 package policy

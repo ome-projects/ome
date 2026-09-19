@@ -1,4 +1,4 @@
-// Command ome-quota-manager is the OME fleet-quota control plane (OEP-0024): it
+// Command ome-quota-manager is the OME fleet-quota control plane: it
 // assembles the AcceleratorQuota tree, reports each node's position and
 // condition, and — in a later increment — renders the tree into Kueue or
 // projects per-cluster shares onto members.

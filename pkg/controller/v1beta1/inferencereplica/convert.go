@@ -79,11 +79,11 @@ func IRGVK() schema.GroupVersionKind { return irGVK }
 // UpdateGate IS wired (when the parent ISVC is resolvable) onto the
 // shared coordination.EvaluateUpdateGate decision site — the identical
 // gate stack the ISVC-direct path runs. Without it, the IR-managed path
-// (the production default) silently skipped ALL cross-Component
-// coordination: Sequential ordering, RatioBalanced, and the group-wide
-// surge / unavailability budgets were never enforced (both Components of
-// a Sequential group recreated concurrently; a group MaxSurge never
-// capped a Component whose per-Component budget was larger). The gate
+// (the production default) would skip ALL cross-Component coordination:
+// Sequential ordering, RatioBalanced, and the group-wide surge /
+// unavailability budgets would go unenforced (both Components of a
+// Sequential group recreated concurrently; a group MaxSurge never capping
+// a Component whose per-Component budget is larger). The gate
 // reads only the parent ISVC's Spec + Status, so the resolved parent is
 // all it needs. When parent is nil (no resolvable parent / fetch failed)
 // the gate stays nil and the dispatcher falls back to "always allowed" —

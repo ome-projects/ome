@@ -59,8 +59,8 @@ func irName(isvc *v1beta1.InferenceService, component workload.ComponentType) st
 }
 
 // instanceIR builds the InferenceReplica carrying the given per-instance
-// statuses for (isvc, component). Per-instance detail is the IR's
-// source-of-truth (no longer mirrored onto the ISVC), so fixtures seed it here
+// statuses for (isvc, component). The IR is the source of truth for
+// per-instance detail (the ISVC carries none), so fixtures seed it here
 // and pass the returned IR to newFakeClient alongside the ISVC.
 func instanceIR(isvc *v1beta1.InferenceService, component workload.ComponentType, insts ...v1beta1.OMENativeInstanceStatus) *v1beta1.InferenceReplica {
 	return &v1beta1.InferenceReplica{
@@ -70,9 +70,8 @@ func instanceIR(isvc *v1beta1.InferenceService, component workload.ComponentType
 }
 
 // instanceStatusesOnIR re-reads the InferenceReplica and returns its persisted
-// per-instance statuses, for assertions that previously read
-// isvc.Status.Components[c].Lifecycle.InstanceStatuses. Returns nil when the IR
-// does not exist.
+// per-instance statuses, the authoritative copy assertions check. Returns nil
+// when the IR does not exist.
 func instanceStatusesOnIR(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType) []v1beta1.OMENativeInstanceStatus {
 	ir := &v1beta1.InferenceReplica{}
 	key := types.NamespacedName{Namespace: isvc.Namespace, Name: irName(isvc, component)}
@@ -318,8 +317,8 @@ func toV1beta1Termination(t *workload.InstanceTermination) *v1beta1.InstanceTerm
 }
 
 // findInstanceStatusOnIR looks up the InstanceStatus by (component, idx) on the
-// authoritative InferenceReplica (per-instance detail no longer lives on the
-// ISVC). Returns nil when the IR or the instance is absent.
+// authoritative InferenceReplica (the ISVC carries no per-instance detail).
+// Returns nil when the IR or the instance is absent.
 func findInstanceStatusOnIR(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType, idx int32) *v1beta1.OMENativeInstanceStatus {
 	if isvc == nil {
 		return nil

@@ -7,7 +7,7 @@
 {{- fail "migration.apiVersion requires simulation.configMapName" }}
 {{- end }}
 {{- end }}
-# Alfred, the GPU cluster caretaker (OEP-0008). Every replica runs the
+# Alfred, the GPU cluster caretaker. Every replica runs the
 # read-only observation loop; only the leader decides and dispatches.
 apiVersion: apps/v1
 kind: Deployment

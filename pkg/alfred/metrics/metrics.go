@@ -1,5 +1,4 @@
-// Package metrics defines every Prometheus series Alfred exports (OEP-0008
-// §Observability), constructed against an injectable registerer so tests can
+// Package metrics defines every Prometheus series Alfred exports, constructed against an injectable registerer so tests can
 // use a private registry. All series share the alfred_ prefix.
 package metrics
 

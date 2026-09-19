@@ -31,7 +31,7 @@ const (
 	RejectHourlyCap             = "HourlyCap"
 )
 
-// AutoscalerIntent is the OEP-0013 read-only signal.
+// AutoscalerIntent is the autoscaler's read-only signal.
 type AutoscalerIntent int
 
 const (
@@ -70,7 +70,7 @@ type Decision struct {
 type Arbiter struct {
 	Ledger *Ledger
 
-	// AutoscalerIntent reports whether OEP-0013 is actively scaling a
+	// AutoscalerIntent reports whether the autoscaler is actively scaling a
 	// workload. Nil means no autoscaler integration is wired into this
 	// build (no CRDs are read yet), which is idle by construction — the
 	// treat-unavailable-as-busy default applies to a wired signal that
@@ -245,7 +245,7 @@ func (st *admitState) decide(c policy.Candidate) Decision {
 		return Decision{Candidate: c, Reason: RejectWorkloadBusy}
 	}
 
-	// OEP-0013 awareness: never race the autoscaler over the same pods.
+	// Autoscaler awareness: never race the autoscaler over the same pods.
 	if st.arbiter.AutoscalerIntent != nil {
 		if st.arbiter.AutoscalerIntent(st.snap, key) != IntentIdle {
 			return Decision{Candidate: c, Reason: RejectAutoscalerActive}

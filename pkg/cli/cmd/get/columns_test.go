@@ -432,7 +432,7 @@ func TestWorkloadClusterConnectionModes(t *testing.T) {
 // on clusters running older OME operators that populate the deprecated flat
 // .name field instead of the nested .modelFormat.name. The column now falls back
 // to .modelFormat.name when the flat field is unset, maintaining version-skew
-// tolerance (OEP-0011).
+// tolerance.
 func TestRuntimeFormatsColumnFallback(t *testing.T) {
 	e, err := resolve("runtimes")
 	require.NoError(t, err)

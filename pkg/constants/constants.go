@@ -363,9 +363,9 @@ type InferenceServiceVerb string
 
 type InferenceServiceProtocol string
 
-// VisibilityLabel is the cluster-local visibility marker. Kept for
-// backward compatibility with manifests that still carry the Knative
-// idiom even though OME no longer serves Knative.
+// VisibilityLabel is the cluster-local visibility marker. OME does not
+// serve Knative; the Knative label key is honored for backward
+// compatibility with manifests that carry it.
 const (
 	VisibilityLabel = "networking.knative.dev/visibility"
 )

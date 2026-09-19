@@ -356,13 +356,12 @@ func TestHTTPRouteBuilder_TopLevelRoutesToRouterEvenWhenNotReady(t *testing.T) {
 		"top-level HTTPRoute must use router port even when RouterReady is false")
 }
 
-// TestHTTPRouteBuilder_EngineAndTopLevel_DistinctNames is the
-// naming regression: when both engine and top-level routes are
-// reconciled for the same ISVC, they must have distinct names so the
-// top-level reconcile doesn't overwrite the engine route. Previously
-// both routes were named "<isvc>" (PredictorServiceName == isvc.Name)
-// and the top-level always won, leaving the engine externally
-// unaddressable.
+// TestHTTPRouteBuilder_EngineAndTopLevel_DistinctNames pins route
+// naming: when both engine and top-level routes are reconciled for the
+// same ISVC, they must have distinct names so the top-level reconcile
+// doesn't overwrite the engine route. If both were named "<isvc>"
+// (PredictorServiceName == isvc.Name) the top-level would always win,
+// leaving the engine externally unaddressable.
 func TestHTTPRouteBuilder_EngineAndTopLevel_DistinctNames(t *testing.T) {
 	builder := createHTTPRouteBuilder()
 
@@ -386,11 +385,10 @@ func TestHTTPRouteBuilder_EngineAndTopLevel_DistinctNames(t *testing.T) {
 	assert.Equal(t, "test-isvc", topLevelRoute.Name)
 }
 
-// TestHTTPRouteBuilder_EngineBackendUsesEngineService fixes the silent
-// pre-existing bug: engine HTTPRoute used to reference "<isvc>" as
-// backend Service (PredictorServiceName) but the actual engine Service
-// is named "<isvc>-engine" (defaultEngineName in engine.go). The route
-// was pointing at a non-existent backend.
+// TestHTTPRouteBuilder_EngineBackendUsesEngineService pins the engine
+// route's backend: the engine Service is named "<isvc>-engine"
+// (defaultEngineName in engine.go), not "<isvc>" (PredictorServiceName);
+// a route referencing the latter points at a non-existent backend.
 func TestHTTPRouteBuilder_EngineBackendUsesEngineService(t *testing.T) {
 	builder := createHTTPRouteBuilder()
 	isvc := createTestInferenceServiceHTTPRoute("test-isvc", "default")
@@ -430,19 +428,17 @@ func TestHTTPRouteBuilder_TopLevelEngineFallback_UsesEngineService(t *testing.T)
 }
 
 // TestHTTPRouteBuilder_BuildHTTPRoute_ReturnsInterfaceNilWhenComponentNotReady
-// pins the layer-1 source fix for the typed-nil-through-interface panic.
+// pins the dispatcher-side guard against a typed-nil-through-interface panic.
 //
-// Pre-fix, the BuildHTTPRoute dispatcher returned the per-component builder's
-// (*HTTPRoute, error) directly. When a per-component builder returned
-// (nil, nil) for the "component not ready" branch, Go wrapped the typed-nil
-// pointer into the returned client.Object interface — the interface itself
-// is non-nil (carries type info), only the inner value is nil. Callers
-// checking `if obj == nil` saw FALSE and proceeded to dereference the
-// typed-nil pointer, crashing the reconciler in
-// controllerutil.SetControllerReference (gateway_api_strategy.go:165).
+// A per-component builder returns (nil, nil) for the "component not ready"
+// branch. Returned directly through the client.Object interface, Go wraps
+// the typed-nil pointer — the interface itself is non-nil (carries type
+// info), only the inner value is nil. A caller checking `if obj == nil`
+// sees FALSE and dereferences the typed-nil pointer in
+// controllerutil.SetControllerReference, crashing the reconciler.
 //
-// The fix is to detect the typed-nil in the dispatcher and explicitly return
-// untyped nil so `desired == nil` in the caller is true.
+// The dispatcher detects the typed-nil and explicitly returns untyped nil
+// so `desired == nil` in the caller is true.
 //
 // NOTE: testify's `assert.Nil` uses reflect.IsNil under the hood and would
 // pass even for a typed-nil wrapped in an interface — so this test uses the
@@ -485,10 +481,10 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_ReturnsInterfaceNilWhenComponentNotRead
 			result, err := builder.BuildHTTPRoute(context.Background(), tc.isvc, tc.componentType)
 			require.NoError(t, err)
 
-			// The bug: result is a (*HTTPRoute)(nil) wrapped in a non-nil
-			// client.Object interface, so `result == nil` returns false and
-			// the strategy panics on the subsequent SetControllerReference.
-			// The fix returns interface-nil instead, so this assertion holds.
+			// A (*HTTPRoute)(nil) wrapped in a non-nil client.Object
+			// interface makes `result == nil` false and the strategy panic
+			// on the subsequent SetControllerReference. The dispatcher
+			// returns interface-nil instead, so this assertion holds.
 			//
 			// We deliberately use bare `== nil` here, NOT assert.Nil, since
 			// the former is the exact check the strategy performs.
@@ -600,9 +596,9 @@ func TestHTTPRouteBuilder_ToGatewayAPIDuration(t *testing.T) {
 
 // TestHTTPRouteBuilder_BackendRefUsesComponentServicePort verifies the
 // HTTPRoute backendRef targets each component Service's actual port (its
-// runner's containerPort) rather than the hardcoded default. A runtime on
-// a non-default port (e.g. 8000) previously produced a backendRef on the
-// default port -> the route matched no Service port -> no endpoints.
+// runner's containerPort) rather than the hardcoded default. For a runtime
+// on a non-default port (e.g. 8000), a backendRef on the default port would
+// match no Service port and yield no endpoints.
 func TestHTTPRouteBuilder_BackendRefUsesComponentServicePort(t *testing.T) {
 	const customPort int32 = 8000
 

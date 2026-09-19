@@ -484,7 +484,7 @@ func TestSyncMigrationEntries_TrimsAgedTerminal(t *testing.T) {
 // it would free the UUID for the upgrade import, which would
 // re-synthesize the Started row as fresh Accepted work an hour after
 // the operator saw Failed, and an unsolicited migration would execute.
-// Once the terminal row lands (the now-hard expiry mirror guarantees
+// Once the terminal row lands (the hard expiry mirror guarantees
 // it), the entry trims and the import stays blocked by
 // HasCompletedOrFailedRequest.
 func TestSyncMigrationEntries_TrimRequiresLedgerTerminal_NoResurrection(t *testing.T) {
@@ -509,8 +509,8 @@ func TestSyncMigrationEntries_TrimRequiresLedgerTerminal_NoResurrection(t *testi
 	key := types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}
 
 	// Pass 1: the aged terminal entry is retained (backstop) — and in
-	// particular NEVER resurrected as an Accepted import (pre-fix the
-	// trim freed the UUID and the import re-synthesized it Accepted in
+	// particular NEVER resurrected as an Accepted import (a trim that
+	// freed the UUID would let the import re-synthesize it Accepted in
 	// the same pass).
 	g.Expect(r.syncMigrationEntries(context.Background(), r.Log, ir, parent, migrationTestTimeout)).To(gomega.Succeed())
 	fresh := &v1beta1.InferenceReplica{}

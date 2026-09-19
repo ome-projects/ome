@@ -1145,9 +1145,9 @@ func TestRevisionHash_CollisionCountFramingDistinguishesAmbiguousConcat(t *testi
 		t.Errorf("cc=0 and cc=10 must yield distinct hashes; got both %q", h0)
 	}
 
-	// Direct framing check: build two hashes by hand simulating the
-	// pre-fix concatenation and prove the framing version diverges where
-	// the raw version would have collided.
+	// Direct framing check: build two hashes by hand simulating raw
+	// concatenation and prove the framed version diverges where the raw
+	// version would collide.
 	wantFrame := "|cc=0|"
 	if !strings.Contains(fmt.Sprintf("%s%s", "raw-bytes-ending-in-1", wantFrame), wantFrame) {
 		t.Errorf("framing literal must remain |cc=N| so raw-byte boundaries can't ambiguously concatenate")

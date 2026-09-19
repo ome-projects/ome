@@ -237,11 +237,10 @@ func TestResolveGroups_DedupComponentsWithinGroup(t *testing.T) {
 }
 
 func TestResolveGroups_PreservesUserSuppliedPacing(t *testing.T) {
-	// v2: the surge budget rides on a rollingUpdate group's MaxSurge. (v1's
-	// per-Component pacing on an Independent group is gone — Independent is
-	// no longer a policy; a Component left out of every group rolls
-	// independently with no resolved pacing to assert against. The
-	// surge-budget-flows-through intent is preserved on rollingUpdate.)
+	// The surge budget rides on a rollingUpdate group's MaxSurge. (There is
+	// no Independent policy: a Component left out of every group rolls
+	// independently with no resolved pacing to assert against, so the
+	// surge-budget-flows-through check lives on rollingUpdate.)
 	maxSurge := intstr.FromInt(5)
 	spec := &v1beta1.RolloutSpec{
 		Groups: []v1beta1.RolloutGroup{

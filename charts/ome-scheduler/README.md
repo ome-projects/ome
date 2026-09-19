@@ -1,7 +1,7 @@
 # ome-scheduler Helm chart
 
 Installs [ome-scheduler](../../scheduler) — the upstream kube-scheduler built as a
-library with the OME placement plugin (`OMEGangPack`, OEP-0022) — as a **second
+library with the OME placement plugin (`OMEGangPack`) — as a **second
 scheduler**. It does not replace the cluster's default scheduler; workloads opt
 in per-pod via `spec.schedulerName`.
 

@@ -8,7 +8,7 @@ metadata:
     cert-manager.io/inject-ca-from: ome/serving-cert
 webhooks:
 {{- /*
-  OEP-0018: the ISVC defaulter runtime-selects against the local catalog, which
+  The ISVC defaulter runtime-selects against the local catalog, which
   is empty on the control plane, so the manager skips this handler there.
   Installing the config (failurePolicy: Fail) would 404 and reject every user
   ISVC, so skip the defaulter entry under the control-plane role. The pod

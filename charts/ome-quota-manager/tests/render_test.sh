@@ -380,8 +380,9 @@ fi
 # An exec-credential binary runs inside this pod and authenticates with material
 # the chart cannot know about, so extraEnv/extraVolumes/extraVolumeMounts have to
 # reach the container. The case worth pinning is with the webhook OFF: the
-# volumes and volumeMounts blocks used to exist only for the webhook cert, so a
-# mount added while the webhook is disabled is the one that silently vanishes.
+# webhook cert is the only other source of volumes and volumeMounts, so a
+# mount added while the webhook is disabled is the one that would silently
+# vanish.
 # The three markers share no substring: env renders outside the webhook guard,
 # so a value that merely contained the mount path would satisfy the mount's
 # assertion too and hide exactly the regression this is here to catch.

@@ -1,10 +1,10 @@
 apiVersion: v2
 name: ome-quota-manager
 description: >-
-  OME fleet quota control plane (OEP-0024). Assembles the AcceleratorQuota tree,
-  reports each node's position and condition, and — once materialization lands —
-  renders the tree into Kueue on a workload cluster or projects per-cluster
-  shares onto members from a management cluster. Installed as its own Deployment
+  OME fleet quota control plane. Assembles the AcceleratorQuota tree, reports
+  each node's position and condition, and renders the tree into Kueue on a
+  workload cluster or projects per-cluster shares onto members from a
+  management cluster. Installed as its own Deployment
   so the Kueue write grant it needs is scoped to a ServiceAccount that does not
   also run the InferenceService reconcilers or the pod mutating webhook.
   Requires the ome-crd chart (ome.io/AcceleratorQuota).

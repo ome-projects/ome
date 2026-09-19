@@ -164,8 +164,8 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	@# with no properties. CRD pruning then silently drops every key under
 	@# .spec.runners[].template.metadata on Update — including the per-Component
 	@# annotations + labels the IR projector stamps from the parent ISVC. Without
-	@# this fix, no-image-bump rollout triggers (annotation-only ISVC edits) never
-	@# reach the pod template and the revision hash never flips.
+	@# these properties, no-image-bump rollout triggers (annotation-only ISVC
+	@# edits) never reach the pod template and the revision hash never flips.
 	@$(YQ) '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.runners.items.properties.template.properties.metadata.properties = {"annotations": {"type": "object", "additionalProperties": {"type": "string"}}, "labels": {"type": "object", "additionalProperties": {"type": "string"}}}' -i config/crd/full/ome.io_inferencereplicas.yaml
 	@echo "  • Setting protocol defaults..."
 	@$(YQ) '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | .. | select(has("protocol")) | path' config/crd/full/ome.io_inferenceservices.yaml -o j | jq -r '. | map(select(numbers)="["+tostring+"]") | join(".")' | awk '{print "."$$0".protocol.default"}' | xargs -n1 -I{} $(YQ) '{} = "TCP"' -i config/crd/full/ome.io_inferenceservices.yaml

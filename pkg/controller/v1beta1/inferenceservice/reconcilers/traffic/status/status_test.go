@@ -333,9 +333,8 @@ func TestBuild_GatewayRejected_ReasonOnlyFallback(t *testing.T) {
 }
 
 func TestBuild_GatewayPending_KeepsPendingCondition(t *testing.T) {
-	// Default (Pending) acceptance must produce the same condition as
-	// before adding acceptance signals — no regression for the
-	// first-reconcile case.
+	// Default (Pending) acceptance must produce the Pending/Unknown
+	// condition for the first-reconcile case.
 	policy := newEmittedPolicy("foo-btp")
 	got := Build(BuildArgs{
 		TranslatorName:    "envoy-gateway",

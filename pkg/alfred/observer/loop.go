@@ -2,7 +2,7 @@
 // ClusterSnapshot on a fixed cadence and publish the snapshot-derived
 // Prometheus gauges. The loop runs on every replica (not only the leader) so
 // an operator can scrape any pod, and it only ever reads — actuation lives
-// exclusively in the decision loop's dispatcher (OEP-0008).
+// exclusively in the decision loop's dispatcher.
 package observer
 
 import (

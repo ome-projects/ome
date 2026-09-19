@@ -183,10 +183,10 @@ func TestSecondaryCapacityReadyRequiresAuthoritativeIR(t *testing.T) {
 	}
 }
 
-// TestSecondaryCapacityReady_PerComponentHashes reproduces the PD-canary stall:
-// revision hashes are PER-Component, so gating a secondary on the PRIMARY's hash
-// (the old behavior) found 0 secondary canary pods and blocked Pending forever
-// even though the secondary's OWN canary capacity was fully up. The gate must
+// TestSecondaryCapacityReady_PerComponentHashes pins per-Component hash
+// resolution: revision hashes are PER-Component, so gating a secondary on the
+// PRIMARY's hash would find 0 secondary canary pods and block Pending forever
+// even though the secondary's OWN canary capacity is fully up. The gate must
 // resolve each secondary's own target hash.
 func TestSecondaryCapacityReady_PerComponentHashes(t *testing.T) {
 	ns := "default"
@@ -196,7 +196,7 @@ func TestSecondaryCapacityReady_PerComponentHashes(t *testing.T) {
 		{Capacity: intstr.FromString("50%"), Traffic: 50},
 		{Capacity: intstr.FromString("100%"), Traffic: 100},
 	}
-	pd := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "p302"}}
+	pd := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pd-canary"}}
 	pd.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
 	pd.Spec.Engine = &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
 	pd.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
@@ -208,9 +208,9 @@ func TestSecondaryCapacityReady_PerComponentHashes(t *testing.T) {
 	reads := fake.NewClientBuilder().WithScheme(canaryScheme(t)).
 		WithStatusSubresource(&v1beta1.InferenceReplica{}).
 		WithRuntimeObjects(
-			ir(ns, "p302", v1beta1.RouterComponent, "53db7c07"),
-			ir(ns, "p302", v1beta1.EngineComponent, "73e1335d"),
-			ir(ns, "p302", v1beta1.DecoderComponent, "f8f90d6d"),
+			ir(ns, "pd-canary", v1beta1.RouterComponent, "53db7c07"),
+			ir(ns, "pd-canary", v1beta1.EngineComponent, "73e1335d"),
+			ir(ns, "pd-canary", v1beta1.DecoderComponent, "f8f90d6d"),
 		).Build()
 
 	// Every Component's OWN canary capacity is up (2 of 4 = step-0 50%), each on
@@ -246,7 +246,7 @@ func TestSecondaryCapacityReady_UnbumpedSecondary(t *testing.T) {
 		{Capacity: intstr.FromString("50%"), Traffic: 50},
 		{Capacity: intstr.FromString("100%"), Traffic: 100},
 	}
-	pd := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "p302"}}
+	pd := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pd-canary"}}
 	pd.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
 	pd.Spec.Engine = &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
 	pd.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
@@ -258,9 +258,9 @@ func TestSecondaryCapacityReady_UnbumpedSecondary(t *testing.T) {
 	// Only the router was bumped: engine/decoder IRs name their stable revision as
 	// the (only) target, and only that one revision has pods.
 	reads := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(
-		ir(ns, "p302", v1beta1.RouterComponent, "53db7c07"),
-		ir(ns, "p302", v1beta1.EngineComponent, "engStable"),
-		ir(ns, "p302", v1beta1.DecoderComponent, "decStable"),
+		ir(ns, "pd-canary", v1beta1.RouterComponent, "53db7c07"),
+		ir(ns, "pd-canary", v1beta1.EngineComponent, "engStable"),
+		ir(ns, "pd-canary", v1beta1.DecoderComponent, "decStable"),
 	).Build()
 
 	pods := map[v1beta1.ComponentType]map[string]int32{
