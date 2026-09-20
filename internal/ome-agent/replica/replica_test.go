@@ -37,11 +37,22 @@ type TestReplicaAgent struct {
 
 type targetArtifactStateRequestDispatcher struct {
 	listResponse string
+	statusCode   int
+}
+
+type targetArtifactStateRequestFunc func(*http.Request) (*http.Response, error)
+
+func (f targetArtifactStateRequestFunc) Do(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 func (d targetArtifactStateRequestDispatcher) Do(request *http.Request) (*http.Response, error) {
+	statusCode := d.statusCode
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
 	return &http.Response{
-		StatusCode: http.StatusOK,
+		StatusCode: statusCode,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(d.listResponse)),
 		Request:    request,
@@ -750,6 +761,98 @@ func TestReplicaAgent_StartReturnsErrorWhenCompletionMarkerUploadFails(t *testin
 	assert.Contains(t, err.Error(), "marker upload failed")
 }
 
+func TestReplicaAgent_StartStopsWhenTargetArtifactInspectionFails(t *testing.T) {
+	tests := []struct {
+		name             string
+		failOnInspection int
+		acquireLock      bool
+		wantAcquireCalls int
+		wantReleaseCalls int
+		wantError        string
+	}{
+		{
+			name:             "before lock acquisition",
+			failOnInspection: 1,
+			wantError:        "failed to inspect target artifact state:",
+		},
+		{
+			name:             "while waiting for another uploader",
+			failOnInspection: 2,
+			wantAcquireCalls: 1,
+			wantError:        "failed to inspect target artifact state while waiting for upload lock:",
+		},
+		{
+			name:             "after acquiring own lock",
+			failOnInspection: 2,
+			acquireLock:      true,
+			wantAcquireCalls: 1,
+			wantReleaseCalls: 1,
+			wantError:        "failed to inspect target artifact state before upload:",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent, cleanup := newTestAgentForCompletionMarker(t)
+			defer cleanup()
+
+			inspectionErr := errors.New("Object Storage inspection unavailable")
+			inspectionCalls := 0
+			targetArtifactStateFunc = func(_ *ociobjectstore.OCIOSDataStore, _ ociobjectstore.ObjectURI) (targetArtifactState, error) {
+				inspectionCalls++
+				if inspectionCalls >= tt.failOnInspection {
+					return targetArtifactState{}, inspectionErr
+				}
+				return targetArtifactState{}, nil
+			}
+			// Advance a fake clock so an erroneous retry cannot spin forever.
+			now := time.Date(2026, 9, 19, 0, 0, 0, 0, time.UTC)
+			nowFunc = func() time.Time { return now }
+			sleepFunc = func(d time.Duration) { now = now.Add(d) }
+			agent.Config.ArtifactUploadLockTimeout = time.Minute
+
+			acquireCalls := 0
+			tryAcquireArtifactUploadLockFunc = func(_ *ociobjectstore.OCIOSDataStore, _ string, _ ociobjectstore.ObjectURI) (string, bool, error) {
+				acquireCalls++
+				if tt.acquireLock {
+					return "owned-lock-etag", true, nil
+				}
+				return "", false, nil
+			}
+			releaseCalls := 0
+			releaseArtifactUploadLockFunc = func(_ *ociobjectstore.OCIOSDataStore, target ociobjectstore.ObjectURI, etag string) (bool, error) {
+				releaseCalls++
+				assert.Equal(t, agent.targetArtifactUploadLockURI(), target)
+				assert.Equal(t, "owned-lock-etag", etag)
+				return true, nil
+			}
+			newReplicatorFunc = func(_ *ReplicaAgent) (replicator.Replicator, error) {
+				t.Fatal("inspection failure must stop replication, not fall back to an uncoordinated upload")
+				return nil, nil
+			}
+			deleteArtifactCompletionMarkerFunc = func(_ *ociobjectstore.OCIOSDataStore, _ ociobjectstore.ObjectURI) error {
+				t.Fatal("inspection failure must preserve the completion marker")
+				return nil
+			}
+			uploadCompletionMarkerFunc = func(_ *ociobjectstore.OCIOSDataStore, _ string, _ ociobjectstore.ObjectURI) error {
+				t.Fatal("inspection failure must not publish a completion marker")
+				return nil
+			}
+			deleteStaleArtifactUploadLockFunc = func(_ *ociobjectstore.OCIOSDataStore, _ ociobjectstore.ObjectURI, _ string) (bool, error) {
+				t.Fatal("inspection failure must not delete another uploader's lock")
+				return false, nil
+			}
+
+			err := agent.Start()
+
+			require.ErrorIs(t, err, inspectionErr)
+			assert.Contains(t, err.Error(), tt.wantError)
+			assert.Equal(t, tt.failOnInspection, inspectionCalls)
+			assert.Equal(t, tt.wantAcquireCalls, acquireCalls)
+			assert.Equal(t, tt.wantReleaseCalls, releaseCalls)
+		})
+	}
+}
+
 func TestReplicaAgent_StartSkipsReplicationWhenTargetArtifactUploadLockCompletes(t *testing.T) {
 	agent, cleanup := newTestAgentForCompletionMarker(t)
 	defer cleanup()
@@ -1317,6 +1420,21 @@ func TestDefaultTargetArtifactState(t *testing.T) {
 		Prefix:     "models/",
 	}
 
+	t.Run("list failure is returned instead of an incomplete artifact", func(t *testing.T) {
+		dataStore := newTargetArtifactStateDataStore("")
+		dataStore.Client.HTTPClient = targetArtifactStateRequestDispatcher{
+			statusCode:   http.StatusForbidden,
+			listResponse: `{"code":"NotAuthorized","message":"Object listing denied"}`,
+		}
+
+		state, err := defaultTargetArtifactState(dataStore, target)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "NotAuthorized")
+		assert.Contains(t, err.Error(), "Object listing denied")
+		assert.Equal(t, targetArtifactState{}, state)
+	})
+
 	t.Run("complete artifact excludes replication metadata from size", func(t *testing.T) {
 		dataStore := newTargetArtifactStateDataStore(`{
 			"objects": [
@@ -1374,6 +1492,118 @@ func TestDefaultTargetArtifactState(t *testing.T) {
 		assert.Equal(t, time.Date(2026, time.August, 20, 12, 30, 0, 0, time.UTC), *state.UploadLockModifiedTime)
 		assert.Nil(t, state.ArtifactSizeBytes)
 	})
+}
+
+func TestDefaultTargetArtifactStateMissingObjectMetadata(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		prefix   string
+		response string
+		want     targetArtifactState
+	}{
+		{
+			name:   "nameless and nested metadata objects cannot complete an artifact",
+			prefix: "models",
+			response: `{"objects":[
+				{"size":999},
+				{"name":"models/.ome-artifact-complete","size":1},
+				{"name":"models/nested/.ome-artifact-complete","size":1},
+				{"name":"models/nested/.ome-artifact-upload.lock","size":1},
+				{"name":"models/.ome-artifact-upload.lock","size":1}
+			]}`,
+			want: targetArtifactState{CompletionMarked: true, UploadLocked: true},
+		},
+		{
+			name:   "artifact object with unknown size still establishes completeness",
+			prefix: "models/",
+			response: `{"objects":[
+				{"name":"models/.ome-artifact-complete"},
+				{"name":"models/config.json"}
+			]}`,
+			want: targetArtifactState{CompletionMarked: true, Complete: true},
+		},
+		{
+			name: "root prefix recognizes markers and empty files",
+			response: `{"objects":[
+				{"name":".ome-artifact-complete","size":1},
+				{"name":"config.json","size":0}
+			]}`,
+			want: targetArtifactState{CompletionMarked: true, Complete: true},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			state, err := defaultTargetArtifactState(newTargetArtifactStateDataStore(tt.response), ociobjectstore.ObjectURI{
+				Namespace: "target-namespace", BucketName: "target-bucket", Prefix: tt.prefix,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, state)
+		})
+	}
+}
+
+func TestDefaultTargetArtifactStateRequiresAllListingPages(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		secondPage targetArtifactStateRequestDispatcher
+		wantError  string
+	}{
+		{
+			name: "later page contributes artifact size",
+			secondPage: targetArtifactStateRequestDispatcher{
+				listResponse: `{"objects":[{"name":"models/model.safetensors","size":100}]}`,
+			},
+		},
+		{
+			name: "later page denied discards complete first page",
+			secondPage: targetArtifactStateRequestDispatcher{
+				statusCode:   http.StatusForbidden,
+				listResponse: `{"code":"NotAuthorized","message":"listing denied"}`,
+			},
+			wantError: "NotAuthorized",
+		},
+		{
+			name:       "malformed later page discards complete first page",
+			secondPage: targetArtifactStateRequestDispatcher{listResponse: `{"objects":`},
+			wantError:  "error listing objects at page 1",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dataStore := newTargetArtifactStateDataStore("")
+			requests := 0
+			dataStore.Client.HTTPClient = targetArtifactStateRequestFunc(func(request *http.Request) (*http.Response, error) {
+				requests++
+				assert.Equal(t, "models/", request.URL.Query().Get("prefix"))
+				assert.Equal(t, "/n/target-namespace/b/target-bucket/o", request.URL.Path)
+				if requests == 1 {
+					assert.Empty(t, request.URL.Query().Get("start"))
+					return (targetArtifactStateRequestDispatcher{listResponse: `{
+						"objects":[
+							{"name":"models/.ome-artifact-complete","size":1},
+							{"name":"models/config.json","size":12}
+						],
+						"nextStartWith":"models/model.safetensors"
+					}`}).Do(request)
+				}
+				assert.Equal(t, "models/model.safetensors", request.URL.Query().Get("start"))
+				return tt.secondPage.Do(request)
+			})
+
+			state, err := defaultTargetArtifactState(dataStore, ociobjectstore.ObjectURI{
+				Namespace: "target-namespace", BucketName: "target-bucket", Prefix: "models/",
+			})
+
+			assert.Equal(t, 2, requests)
+			if tt.wantError != "" {
+				require.ErrorContains(t, err, tt.wantError)
+				assert.Equal(t, targetArtifactState{}, state, "partial listing must never permit reuse")
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, state.Complete)
+			require.NotNil(t, state.ArtifactSizeBytes)
+			assert.Equal(t, int64(112), *state.ArtifactSizeBytes)
+		})
+	}
 }
 
 func newTestAgentForCompletionMarker(t *testing.T) (*ReplicaAgent, func()) {
