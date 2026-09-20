@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
+	"sync/atomic"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/fx"
@@ -57,6 +59,7 @@ func runAgentCommand(cmd *cobra.Command, module AgentModule, action func() error
 
 	// Add lifecycle hooks
 	options = append(options, fx.Invoke(func(lc fx.Lifecycle, l *zap.Logger, sh fx.Shutdowner) {
+		var completed atomic.Bool
 		lc.Append(
 			fx.Hook{
 				OnStart: func(context.Context) error {
@@ -65,6 +68,7 @@ func runAgentCommand(cmd *cobra.Command, module AgentModule, action func() error
 							l.Error(module.Name()+" encountered an error during execution", zap.Error(err))
 							os.Exit(1)
 						}
+						completed.Store(true)
 						if err := sh.Shutdown(); err != nil {
 							l.Error("Failed to shutdown "+module.Name(), zap.Error(err))
 						}
@@ -72,6 +76,11 @@ func runAgentCommand(cmd *cobra.Command, module AgentModule, action func() error
 					return nil
 				},
 				OnStop: func(ctx context.Context) error {
+					// Fx treats SIGTERM as a successful shutdown by default. An
+					// interrupted replica must not make its Job report completion.
+					if module.Name() == "replica" && !completed.Load() {
+						return errors.New("replication interrupted before completion")
+					}
 					return nil
 				},
 			})
