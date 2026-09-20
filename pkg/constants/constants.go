@@ -115,9 +115,28 @@ var (
 
 // Model agent Constants
 const (
-	AgentConfigMapKeyName = "agent"
-	TensorRTLLM           = "tensorrtllm"
+	AgentConfigMapKeyName          = "agent"
+	TensorRTLLM                    = "tensorrtllm"
+	ArtifactCompleteMarkerFileName = ".ome-artifact-complete"
+	ArtifactCompleteMarkerBody     = "complete\n"
+	ArtifactUploadLockFileName     = ".ome-artifact-upload.lock"
+	ArtifactUploadLockBody         = "uploading\n"
+
+	HuggingFaceArtifactConfigMapKeyPrefix  = "artifact.huggingface."
+	HuggingFaceArtifactReadyMarkerFileName = ".ome-hf-artifact-ready"
 )
+
+func IsArtifactCompleteMarkerObjectName(objectName string) bool {
+	return objectName == ArtifactCompleteMarkerFileName || strings.HasSuffix(objectName, "/"+ArtifactCompleteMarkerFileName)
+}
+
+func IsArtifactUploadLockObjectName(objectName string) bool {
+	return objectName == ArtifactUploadLockFileName || strings.HasSuffix(objectName, "/"+ArtifactUploadLockFileName)
+}
+
+func IsInternalArtifactObjectName(objectName string) bool {
+	return IsArtifactCompleteMarkerObjectName(objectName) || IsArtifactUploadLockObjectName(objectName)
+}
 
 // InferenceService Annotations
 var (
@@ -402,8 +421,12 @@ const (
 	LLamaVllmFTServingServedModelNamePrefix = "/data"
 )
 
-// DefaultModelLocalMountPath is where models will be mounted by the storage-initializer
-const DefaultModelLocalMountPath = "/mnt/models"
+const (
+	// DefaultModelLocalMountPath is where models will be mounted by the storage-initializer.
+	DefaultModelLocalMountPath = "/mnt/models"
+	// ModelArtifactsDirectory is the node-local shared artifact directory under a model store.
+	ModelArtifactsDirectory = "_artifacts"
+)
 
 var (
 	ServiceAnnotationDisallowedList = []string{

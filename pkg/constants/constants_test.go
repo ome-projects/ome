@@ -62,3 +62,82 @@ func TestLWSNameTruncates(t *testing.T) {
 		})
 	}
 }
+
+func TestIsArtifactCompleteMarkerObjectName(t *testing.T) {
+	tests := []struct {
+		name       string
+		objectName string
+		want       bool
+	}{
+		{
+			name:       "marker at root",
+			objectName: ArtifactCompleteMarkerFileName,
+			want:       true,
+		},
+		{
+			name:       "marker under model prefix",
+			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/" + ArtifactCompleteMarkerFileName,
+			want:       true,
+		},
+		{
+			name:       "regular model file",
+			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/config.json",
+		},
+		{
+			name:       "similar suffix without path separator",
+			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/not-" + ArtifactCompleteMarkerFileName,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsArtifactCompleteMarkerObjectName(tt.objectName); got != tt.want {
+				t.Fatalf("IsArtifactCompleteMarkerObjectName(%q) = %v, want %v", tt.objectName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsArtifactUploadLockObjectName(t *testing.T) {
+	tests := []struct {
+		name       string
+		objectName string
+		want       bool
+	}{
+		{
+			name:       "lock at root",
+			objectName: ArtifactUploadLockFileName,
+			want:       true,
+		},
+		{
+			name:       "lock under model prefix",
+			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/" + ArtifactUploadLockFileName,
+			want:       true,
+		},
+		{
+			name:       "regular model file",
+			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/tokenizer.json",
+		},
+		{
+			name:       "similar suffix without path separator",
+			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/not-" + ArtifactUploadLockFileName,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsArtifactUploadLockObjectName(tt.objectName); got != tt.want {
+				t.Fatalf("IsArtifactUploadLockObjectName(%q) = %v, want %v", tt.objectName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHuggingFaceArtifactConstants(t *testing.T) {
+	if HuggingFaceArtifactConfigMapKeyPrefix != "artifact.huggingface." {
+		t.Fatalf("HuggingFaceArtifactConfigMapKeyPrefix = %q", HuggingFaceArtifactConfigMapKeyPrefix)
+	}
+	if HuggingFaceArtifactReadyMarkerFileName != ".ome-hf-artifact-ready" {
+		t.Fatalf("HuggingFaceArtifactReadyMarkerFileName = %q", HuggingFaceArtifactReadyMarkerFileName)
+	}
+}

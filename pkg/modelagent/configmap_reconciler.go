@@ -927,7 +927,11 @@ func (c *ConfigMapReconciler) updateConfigMapWithRetry(ctx context.Context, upda
 
 		needUpdate, updatedConfigmap, err := updateConfigmap(latestCM)
 		if err != nil {
-			c.logger.Errorf("failed to compute updated ConfigMap: %s", err)
+			if err == errHuggingFaceArtifactParentUpdating {
+				c.logger.Infof("ConfigMap update deferred because Hugging Face artifact parent is Updating")
+			} else {
+				c.logger.Errorf("failed to compute updated ConfigMap: %s", err)
+			}
 			return err
 		}
 		if !needUpdate {
@@ -1312,6 +1316,275 @@ func (c *ConfigMapReconciler) updateConfigMapWithRemovedChildPath(ctx context.Co
 		c.logger.Errorf("failed to remove child path %s from data entry %s", childPath, parentName)
 	}
 	return err
+}
+
+func (c *ConfigMapReconciler) upsertHuggingFaceArtifactParentEntry(ctx context.Context, parentName string, identity ArtifactIdentity, parentPath string, childPath string) error {
+	updateConfigMap := func(currentConfigMap *corev1.ConfigMap) (bool, *corev1.ConfigMap, error) {
+		if currentConfigMap.Data == nil {
+			currentConfigMap.Data = make(map[string]string)
+		}
+		recordingChild := strings.TrimSpace(childPath) != ""
+
+		modelEntry := ModelEntry{
+			Name:   parentName,
+			Status: ModelStatusReady,
+			Config: &ModelConfig{
+				Artifact: Artifact{
+					Sha:           strings.ToLower(identity.HFCommitSHA),
+					Origin:        identity.toOrigin(),
+					ParentPath:    map[string]string{parentName: parentPath},
+					ChildrenPaths: []string{},
+				},
+			},
+		}
+		if existingDataEntry, exists := currentConfigMap.Data[parentName]; exists {
+			var existing ModelEntry
+			if err := json.Unmarshal([]byte(existingDataEntry), &existing); err != nil {
+				c.logger.Warnf("failed to parse existing Hugging Face artifact parent entry %s, rebuilding it: %v", parentName, err)
+			} else {
+				if recordingChild && existing.Status == ModelStatusUpdating {
+					return false, currentConfigMap, errHuggingFaceArtifactParentUpdating
+				}
+				modelEntry = existing
+				modelEntry.Name = parentName
+				modelEntry.Status = ModelStatusReady
+				if modelEntry.Config == nil {
+					modelEntry.Config = &ModelConfig{}
+				}
+				modelEntry.Config.Artifact.Sha = strings.ToLower(identity.HFCommitSHA)
+				modelEntry.Config.Artifact.Origin = identity.toOrigin()
+				modelEntry.Config.Artifact.ParentPath = map[string]string{parentName: parentPath}
+				if modelEntry.Config.Artifact.ChildrenPaths == nil {
+					modelEntry.Config.Artifact.ChildrenPaths = []string{}
+				}
+			}
+		}
+
+		if recordingChild && !containsString(modelEntry.Config.Artifact.ChildrenPaths, childPath) {
+			modelEntry.Config.Artifact.ChildrenPaths = append(modelEntry.Config.Artifact.ChildrenPaths, childPath)
+		}
+
+		entryJSON, err := json.Marshal(modelEntry)
+		if err != nil {
+			return false, currentConfigMap, err
+		}
+		currentConfigMap.Data[parentName] = string(entryJSON)
+		return true, currentConfigMap, nil
+	}
+	return c.updateConfigMapWithRetry(ctx, updateConfigMap)
+}
+
+// setHuggingFaceArtifactParentStatus updates the synthetic Hugging Face parent
+// status while preserving its origin, parent path, and childrenPaths metadata.
+func (c *ConfigMapReconciler) setHuggingFaceArtifactParentStatus(ctx context.Context, parentName string, identity ArtifactIdentity, parentPath string, status ModelStatus, skipIfUpdating bool) (string, bool, error) {
+	observedParentPath := parentPath
+	updated := false
+	updateConfigMap := func(currentConfigMap *corev1.ConfigMap) (bool, *corev1.ConfigMap, error) {
+		observedParentPath = parentPath
+		updated = false
+		acquired := true
+		if currentConfigMap.Data == nil {
+			currentConfigMap.Data = make(map[string]string)
+		}
+
+		modelEntry := ModelEntry{
+			Name:   parentName,
+			Status: status,
+			Config: &ModelConfig{
+				Artifact: Artifact{
+					Sha:           strings.ToLower(identity.HFCommitSHA),
+					Origin:        identity.toOrigin(),
+					ParentPath:    map[string]string{parentName: parentPath},
+					ChildrenPaths: []string{},
+				},
+			},
+		}
+		if existingDataEntry, exists := currentConfigMap.Data[parentName]; exists {
+			var existing ModelEntry
+			if err := json.Unmarshal([]byte(existingDataEntry), &existing); err != nil {
+				c.logger.Warnf("Replacing corrupt Hugging Face artifact parent entry %s while setting status %s: %v", parentName, status, err)
+			} else {
+				var existingParentPath string
+				var existingChildrenPaths []string
+				if existing.Config != nil {
+					existingParentPath = existing.Config.Artifact.ParentPath[parentName]
+					existingChildrenPaths = existing.Config.Artifact.ChildrenPaths
+				}
+				if existing.Config == nil || existing.Config.Artifact.Origin == nil {
+					c.logger.Warnf("Repairing invalid Hugging Face artifact parent entry %s while setting status %s because origin metadata is missing", parentName, status)
+					if strings.TrimSpace(existingParentPath) != "" {
+						observedParentPath = existingParentPath
+					}
+					modelEntry.Config.Artifact.ChildrenPaths = existingChildrenPaths
+					if skipIfUpdating && existing.Status == ModelStatusUpdating {
+						acquired = false
+					}
+				} else {
+					origin := existing.Config.Artifact.Origin
+					if !strings.EqualFold(origin.Type, identity.OriginType) || origin.HFModelID != identity.HFModelID || !strings.EqualFold(origin.HFCommitSHA, identity.HFCommitSHA) {
+						return false, currentConfigMap, fmt.Errorf("existing Hugging Face artifact parent entry %s has mismatched origin metadata", parentName)
+					}
+					parentPathMissing := strings.TrimSpace(existingParentPath) == ""
+					if strings.TrimSpace(existingParentPath) != "" {
+						observedParentPath = existingParentPath
+					} else {
+						c.logger.Warnf("Repairing invalid Hugging Face artifact parent entry %s while setting status %s because parent path is missing", parentName, status)
+					}
+					if skipIfUpdating && existing.Status == ModelStatusUpdating {
+						if !parentPathMissing {
+							return false, currentConfigMap, nil
+						}
+						acquired = false
+					}
+					modelEntry = existing
+					modelEntry.Name = parentName
+					modelEntry.Status = status
+					modelEntry.Config.Artifact.Sha = strings.ToLower(identity.HFCommitSHA)
+					modelEntry.Config.Artifact.Origin = identity.toOrigin()
+					if modelEntry.Config.Artifact.ChildrenPaths == nil {
+						modelEntry.Config.Artifact.ChildrenPaths = []string{}
+					}
+				}
+				modelEntry.Config.Artifact.ParentPath = map[string]string{parentName: observedParentPath}
+				if modelEntry.Config.Artifact.ChildrenPaths == nil {
+					modelEntry.Config.Artifact.ChildrenPaths = []string{}
+				}
+			}
+			modelEntry.Config.Artifact.Sha = strings.ToLower(identity.HFCommitSHA)
+			modelEntry.Config.Artifact.Origin = identity.toOrigin()
+		}
+
+		entryJSON, err := json.Marshal(modelEntry)
+		if err != nil {
+			return false, currentConfigMap, err
+		}
+		currentConfigMap.Data[parentName] = string(entryJSON)
+		updated = acquired
+		return true, currentConfigMap, nil
+	}
+
+	err := c.updateConfigMapWithRetry(ctx, updateConfigMap)
+	return observedParentPath, updated, err
+}
+
+// markHuggingFaceArtifactParentUpdating marks the synthetic Hugging Face parent
+// as Updating before a DownloadOverride repair writes to the shared parent path.
+// Existing childrenPaths are preserved so ready child entries keep pointing to
+// the same parent metadata while the repair runs. If another worker already
+// owns the Updating parent, acquired is false and the caller should wait.
+func (c *ConfigMapReconciler) markHuggingFaceArtifactParentUpdating(ctx context.Context, parentName string, identity ArtifactIdentity, parentPath string) (string, bool, error) {
+	return c.setHuggingFaceArtifactParentStatus(ctx, parentName, identity, parentPath, ModelStatusUpdating, true)
+}
+
+func (c *ConfigMapReconciler) markHuggingFaceArtifactParentFailed(ctx context.Context, parentName string, identity ArtifactIdentity, parentPath string) error {
+	_, _, err := c.setHuggingFaceArtifactParentStatus(ctx, parentName, identity, parentPath, ModelStatusFailed, false)
+	return err
+}
+
+// reserveHuggingFaceArtifactParentEntry creates the synthetic parent in Updating
+// state before the first worker downloads to the canonical path. Other workers
+// see the reservation and wait instead of writing to the same directory.
+func (c *ConfigMapReconciler) reserveHuggingFaceArtifactParentEntry(ctx context.Context, parentName string, identity ArtifactIdentity, parentPath string) (string, ModelStatus, bool, error) {
+	var observedParentPath string
+	var observedStatus ModelStatus
+	var reserved bool
+
+	writeReservation := func(currentConfigMap *corev1.ConfigMap, reservationParentPath string, childrenPaths []string, acquire bool) (bool, *corev1.ConfigMap, error) {
+		if strings.TrimSpace(reservationParentPath) == "" {
+			reservationParentPath = parentPath
+		}
+		if childrenPaths == nil {
+			childrenPaths = []string{}
+		}
+		modelEntry := ModelEntry{
+			Name:   parentName,
+			Status: ModelStatusUpdating,
+			Config: &ModelConfig{
+				Artifact: Artifact{
+					Sha:           strings.ToLower(identity.HFCommitSHA),
+					Origin:        identity.toOrigin(),
+					ParentPath:    map[string]string{parentName: reservationParentPath},
+					ChildrenPaths: childrenPaths,
+				},
+			},
+		}
+		entryJSON, err := json.Marshal(modelEntry)
+		if err != nil {
+			return false, currentConfigMap, err
+		}
+		currentConfigMap.Data[parentName] = string(entryJSON)
+		observedParentPath = reservationParentPath
+		observedStatus = ModelStatusUpdating
+		reserved = acquire
+		return true, currentConfigMap, nil
+	}
+
+	updateConfigMap := func(currentConfigMap *corev1.ConfigMap) (bool, *corev1.ConfigMap, error) {
+		observedParentPath = ""
+		observedStatus = ""
+		reserved = false
+		if currentConfigMap.Data == nil {
+			currentConfigMap.Data = make(map[string]string)
+		}
+
+		if existingDataEntry, exists := currentConfigMap.Data[parentName]; exists {
+			var existing ModelEntry
+			if err := json.Unmarshal([]byte(existingDataEntry), &existing); err != nil {
+				c.logger.Warnf("Replacing corrupt Hugging Face artifact parent entry %s before reservation: %v", parentName, err)
+				return writeReservation(currentConfigMap, parentPath, nil, true)
+			}
+			var existingParentPath string
+			var existingChildrenPaths []string
+			if existing.Config != nil {
+				existingParentPath = existing.Config.Artifact.ParentPath[parentName]
+				existingChildrenPaths = existing.Config.Artifact.ChildrenPaths
+			}
+			if existing.Config == nil || existing.Config.Artifact.Origin == nil {
+				c.logger.Warnf("Replacing invalid Hugging Face artifact parent entry %s before reservation because origin metadata is missing", parentName)
+				return writeReservation(currentConfigMap, existingParentPath, existingChildrenPaths, existing.Status != ModelStatusUpdating)
+			}
+			origin := existing.Config.Artifact.Origin
+			if !strings.EqualFold(origin.Type, identity.OriginType) || origin.HFModelID != identity.HFModelID || !strings.EqualFold(origin.HFCommitSHA, identity.HFCommitSHA) {
+				return false, currentConfigMap, fmt.Errorf("existing Hugging Face artifact parent entry %s has mismatched origin metadata", parentName)
+			}
+			observedParentPath = existingParentPath
+			if strings.TrimSpace(observedParentPath) == "" {
+				c.logger.Warnf("Replacing invalid Hugging Face artifact parent entry %s before reservation because parent path is missing", parentName)
+				return writeReservation(currentConfigMap, parentPath, existingChildrenPaths, existing.Status != ModelStatusUpdating)
+			}
+			observedStatus = existing.Status
+			reserved = false
+			return false, currentConfigMap, nil
+		}
+
+		return writeReservation(currentConfigMap, parentPath, nil, true)
+	}
+
+	err := c.updateConfigMapWithRetry(ctx, updateConfigMap)
+	return observedParentPath, observedStatus, reserved, err
+}
+
+func (c *ConfigMapReconciler) deleteConfigMapDataEntry(ctx context.Context, key string) error {
+	updateConfigMap := func(currentConfigMap *corev1.ConfigMap) (bool, *corev1.ConfigMap, error) {
+		if currentConfigMap.Data == nil {
+			return false, currentConfigMap, nil
+		}
+		if _, exists := currentConfigMap.Data[key]; !exists {
+			return false, currentConfigMap, nil
+		}
+		delete(currentConfigMap.Data, key)
+		return true, currentConfigMap, nil
+	}
+	return c.updateConfigMapWithRetry(ctx, updateConfigMap)
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *ConfigMapReconciler) getDataEntryBasedOnModelKey(ctx context.Context, modelKey string) (bool, string, error) {

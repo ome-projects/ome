@@ -32,10 +32,22 @@ type ModelMetadata struct {
 // Artifact records the information of model artifact, including version (Sha) and storage paths
 type Artifact struct {
 	Sha string `json:"sha"` // sha string fetched from HuggingFace
+	// Origin captures optional provenance for artifact reuse across storage
+	// backends, for example OCI objects imported from a Hugging Face revision.
+	Origin *ArtifactOrigin `json:"origin,omitempty"`
 	// parent model name -> parent model artifact storage path
 	// parent name convention is
 	// For ClusterBaseModel: clusterbasemodel.{model_name}
 	// For BaseModel: {namespace}.basemodel.{model_name}
 	ParentPath    map[string]string `json:"parentPath"`
 	ChildrenPaths []string          `json:"childrenPaths"` // an array of children paths
+}
+
+// ArtifactOrigin records the source identity used to prove two local artifacts
+// are equivalent even when they were downloaded through different storage
+// backends.
+type ArtifactOrigin struct {
+	Type        string `json:"type,omitempty"`
+	HFModelID   string `json:"hfModelId,omitempty"`
+	HFCommitSHA string `json:"hfCommitSha,omitempty"`
 }
