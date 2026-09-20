@@ -18,6 +18,9 @@ func (h *hfArtifactTaskHandler) handleDownload(
 		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 	}
 	defer unlock()
+	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}

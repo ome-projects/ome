@@ -71,8 +71,9 @@ type hfArtifactValidateFunc func(parentPath string) (bool, error)
 // hfArtifactTaskHandler coordinates local files and persisted relationships.
 // Those operations are separate; they are not one filesystem/ConfigMap transaction.
 type hfArtifactTaskHandler struct {
-	repository *HfArtifactRepository
-	files      hfArtifactFiles
+	repository      *HfArtifactRepository
+	files           hfArtifactFiles
+	pendingFailures sync.Map // Parent key -> *HfArtifactEntry awaiting Failed publication.
 	// updateChildStatuses optionally updates node labels. It must be idempotent:
 	// repair calls it before file writes and before publishing parent Ready,
 	// including retries of marker-backed completion.
@@ -153,7 +154,11 @@ func (h *hfArtifactTaskHandler) markLockedParentFailed(
 func (h *hfArtifactTaskHandler) markParentFailed(ctx context.Context, parent HfArtifactEntry) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	return h.repository.MarkFailed(cleanupCtx, parent)
+	err := h.repository.MarkFailed(cleanupCtx, parent)
+	if err != nil {
+		h.pendingFailures.Store(parent.Key, &parent)
+	}
+	return err
 }
 
 func newHfArtifactRetryResult(parentKey string, reason error) hfArtifactTaskResult {

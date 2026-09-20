@@ -129,6 +129,8 @@ func newTestHfArtifactGopher(t *testing.T) (*Gopher, *GopherTask, hfArtifactTask
 		logger: zap.NewNop().Sugar(), gopherChan: make(chan *GopherTask, 10), taskQueue: newGopherTaskQueue(),
 		baseModelLister:        modelslister.NewBaseModelLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
 		clusterBaseModelLister: modelslister.NewClusterBaseModelLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))}
+	gopher.sharedHfArtifactHandler()
+	require.NoError(t, gopher.hfArtifactStartup.recover(context.Background()))
 	return gopher, task, input
 }
 

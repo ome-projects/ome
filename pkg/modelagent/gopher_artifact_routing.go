@@ -17,9 +17,10 @@ import (
 // The existing startup snapshot supplies this index without a per-task API
 // lookup for ordinary models. An unavailable snapshot is retried before routing.
 type gopherArtifactRouting struct {
-	mutex    sync.Mutex
-	known    bool
-	children map[string]bool
+	mutex       sync.Mutex
+	known       bool
+	sharedState bool
+	children    map[string]bool
 }
 
 func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) error {
@@ -33,6 +34,7 @@ func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) er
 	}
 	for key, raw := range data {
 		if strings.HasPrefix(key, constants.HfArtifactConfigMapKeyPrefix) {
+			routing.sharedState = true
 			var parent HfArtifactEntry
 			if err := json.Unmarshal([]byte(raw), &parent); err != nil {
 				return fmt.Errorf("decode shared artifact ownership %s: %w", key, err)
@@ -49,6 +51,12 @@ func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) er
 	}
 	routing.known = true
 	return nil
+}
+
+func (s *Gopher) hasSharedArtifactTasks() bool {
+	s.artifactRouting.mutex.Lock()
+	defer s.artifactRouting.mutex.Unlock()
+	return s.artifactRouting.sharedState || len(s.artifactRouting.children) != 0
 }
 
 func (s *Gopher) cleanupDeletingModel(current, cleanup *GopherTask) error {
