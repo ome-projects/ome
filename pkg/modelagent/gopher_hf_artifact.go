@@ -33,6 +33,9 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 	handler := s.sharedHfArtifactHandler()
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
 	stored, referenced, lookupErr := handler.repository.GetParentForChild(ctx, key)
+	if err := ctx.Err(); err != nil {
+		return true, false, err
+	}
 	if lookupErr != nil && !apierrors.IsNotFound(lookupErr) {
 		// Opt-out still needs the old relationship for cleanup, even when the
 		// replacement path is not a shared symlink.
@@ -100,7 +103,10 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 			return true, true, nil
 		}
 		if s.modelConfigParser != nil {
-			if err := s.safeParseAndUpdateModelConfig(input.ChildModelPath, task.BaseModel, task.ClusterBaseModel, nil); err != nil {
+			if err := s.safeParseAndUpdateModelConfig(ctx, input.ChildModelPath, task.BaseModel, task.ClusterBaseModel, nil); err != nil {
+				if ctx.Err() != nil {
+					return true, false, ctx.Err()
+				}
 				s.logger.Errorf("Failed to parse shared artifact model configuration: %v", err)
 			}
 		}
@@ -124,7 +130,8 @@ func (s *Gopher) sharedHfArtifactHandler() *hfArtifactTaskHandler {
 // callback writes labels directly while holding the same operation lock.
 func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func(), error) {
 	noop := func() {}
-	if s.configMapReconciler == nil || op.ModelStateOnNode == Deleted {
+	if s.configMapReconciler == nil || op.ModelStateOnNode == Deleted ||
+		(op.BaseModel == nil && op.ClusterBaseModel == nil) {
 		return noop, nil
 	}
 	task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
@@ -408,19 +415,25 @@ func (s *Gopher) requeueHfArtifactTask(task *GopherTask, result hfArtifactTaskRe
 	return fmt.Errorf("shared artifact %s retry budget exhausted (last error: %v)", result.RetryParentKey, result.RetryReason)
 }
 
-func (s *Gopher) finishDownloadStatus(task *GopherTask, op *NodeLabelOp) error {
-	err := s.safeNodeLabelReconciliation(op)
+// finishDownloadStatus reports whether Ready was published. A queued retry is
+// not a completed download and must not increment success metrics.
+func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op *NodeLabelOp) (bool, error) {
+	err := s.safeNodeLabelReconciliation(ctx, op)
+	// A canceled task must not be revived by the shared-parent retry path.
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if err == nil {
-		return nil
+		return true, nil
 	}
 	s.logger.Errorf("Failed to mark model %s as Ready: %v", getModelInfoForLogging(task), err)
 	spec := taskModelSpec(task)
 	if isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
 		// A sibling may acquire the parent after this child attaches. Keep the
 		// successful task queued until its final Ready update is safe.
-		return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
 	}
-	return err
+	return false, err
 }
 
 func isSharedHfArtifactSymlink(childPath string) bool {

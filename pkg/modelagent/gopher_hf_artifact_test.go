@@ -2,6 +2,7 @@ package modelagent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,7 +13,9 @@ import (
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -53,20 +56,89 @@ func TestGopherHfArtifactReadyStatusRequeuesDuringSiblingOperation(t *testing.T)
 	handler := s.sharedHfArtifactHandler()
 	require.NoError(t, runTestHfArtifactDownload(handler, input))
 	client := s.configMapReconciler.kubeClient.(*k8sfake.Clientset)
-	_, err := client.CoreV1().Nodes().Create(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: s.configMapReconciler.nodeName}}, metav1.CreateOptions{})
+	_, err := client.CoreV1().Nodes().Create(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: s.configMapReconciler.nodeName, Labels: map[string]string{"kubernetes.io/hostname": s.configMapReconciler.nodeName},
+	}}, metav1.CreateOptions{})
 	require.NoError(t, err)
 	s.nodeLabelReconciler = NewNodeLabelReconciler(s.configMapReconciler.nodeName, client, 1, s.logger)
 	s.samePathWaitDelay = time.Millisecond
 	unlock, acquired := handler.tryParentOperation(input.Parent.Key)
 	require.True(t, acquired)
 	op := &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready}
-	require.NoError(t, s.finishDownloadStatus(task, op))
+	published, err := s.finishDownloadStatus(context.Background(), task, op)
+	require.NoError(t, err)
+	assert.False(t, published)
 	unlock()
 	select {
 	case retry := <-s.gopherChan:
-		require.NoError(t, s.finishDownloadStatus(retry, op))
+		published, err := s.finishDownloadStatus(context.Background(), retry, op)
+		require.NoError(t, err)
+		assert.True(t, published)
 	case <-time.After(time.Second):
 		t.Fatal("completed child was not requeued for its Ready update")
+	}
+}
+
+func TestGopherHfArtifactCanceledReadyStatusDoesNotRequeue(t *testing.T) {
+	s, task, input := newTestHfArtifactGopher(t)
+	require.NoError(t, runTestHfArtifactDownload(s.sharedHfArtifactHandler(), input))
+	client := s.configMapReconciler.kubeClient.(*k8sfake.Clientset)
+	client.ClearActions()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	op := &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready}
+
+	published, err := s.finishDownloadStatus(ctx, task, op)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, published)
+	assert.True(t, task.SamePathWaitStartedAt.IsZero(), "cancellation must not schedule a new retry")
+	assert.Empty(t, client.Actions(), "cancellation must not publish child status")
+}
+
+func TestGopherHfArtifactLookupCancellationDoesNotRequeue(t *testing.T) {
+	for _, failure := range []string{"canceled", "deadline exceeded", "transient failure"} {
+		t.Run(failure, func(t *testing.T) {
+			g, task, _ := newTestHfArtifactGopher(t)
+			g.samePathWaitDelay = time.Millisecond
+			ctx, cancel := context.WithCancel(context.Background())
+			if failure == "deadline exceeded" {
+				cancel()
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			}
+			defer cancel()
+			client := g.configMapReconciler.kubeClient.(*k8sfake.Clientset)
+			lookupCalled := false
+			client.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+				lookupCalled = true
+				if failure == "canceled" {
+					cancel()
+				}
+				if ctx.Err() != nil {
+					return true, nil, ctx.Err()
+				}
+				return true, nil, errors.New("configmap lookup failed")
+			})
+
+			handled, waiting, err := g.processHfOCIArtifact(ctx, task, task.BaseModel.Spec, true)
+			assert.True(t, lookupCalled)
+			assert.True(t, handled)
+			if failure != "transient failure" {
+				require.ErrorIs(t, err, ctx.Err())
+				assert.False(t, waiting)
+				assert.True(t, task.SamePathWaitStartedAt.IsZero(), "cancellation must not schedule a retry")
+				assert.Empty(t, g.gopherChan)
+			} else {
+				require.NoError(t, err)
+				assert.True(t, waiting)
+				assert.False(t, task.SamePathWaitStartedAt.IsZero())
+				select {
+				case retry := <-g.gopherChan:
+					assert.Same(t, task, retry)
+				case <-time.After(time.Second):
+					t.Fatal("transient lookup failure must still queue a retry")
+				}
+			}
+		})
 	}
 }
 

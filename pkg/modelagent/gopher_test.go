@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,10 @@ import (
 	"go.uber.org/zap/zaptest"
 	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/oracle/oci-go-sdk/v65/objectstorage"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -21,12 +27,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/ociobjectstore"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -2386,4 +2395,187 @@ func Test_hasChildrenPaths_EmptyNoError_ReturnsFalse(t *testing.T) {
 func Test_hasChildrenPaths_NonEmptyNoError_ReturnsTrue(t *testing.T) {
 	assert.True(t, hasChildrenPaths([]string{"/child"}, nil))
 	assert.True(t, hasChildrenPaths([]string{"/child1", "/child2"}, nil))
+}
+
+// Affinity cleanup keeps the CR and its UID alive. A canceled download must not
+// recreate state after that cleanup, even when it subsequently reports an error.
+func TestCanceledDownloadFailureAfterAffinityCleanup(t *testing.T) {
+	cm := makeConfigMap("node-1", map[string]string{})
+	g := newGopherForProcessTask(cm, map[string]string{"kubernetes.io/hostname": "node-1"})
+	g.metrics = NewMetrics(prometheus.NewRegistry())
+	uri := "local:///missing-model"
+	missing := filepath.Join(t.TempDir(), "missing")
+	model := &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "same-uid"},
+		Spec:       v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &missing}},
+	}
+	task := &GopherTask{TaskType: Download, BaseModel: model}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempt := g.taskTracker.beginLegacyTask(gopherTaskModelKey(task), cancel)
+	defer g.taskTracker.finishLegacyTask(attempt)
+	g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
+	require.NoError(t, g.processTask(&GopherTask{TaskType: Delete, BaseModel: model}))
+
+	// Exercise the shared failure publisher through an existing download path.
+	require.Error(t, g.processLocalStorageModel(ctx, task, model.Spec, "model", "BaseModel", "default", "model"))
+	latest, err := g.configMapReconciler.kubeClient.CoreV1().ConfigMaps(cm.Namespace).Get(context.Background(), cm.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, latest.Data, constants.GetModelConfigMapKey("default", "model", false))
+	node, err := g.nodeLabelReconciler.kubeClient.CoreV1().Nodes().Get(context.Background(), cm.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, node.Labels, constants.GetBaseModelLabel("default", "model"))
+
+	// Affinity can later include this node again without changing the CR UID.
+	require.NoError(t, g.safeNodeLabelReconciliation(context.Background(), &NodeLabelOp{BaseModel: model, ModelStateOnNode: Ready}))
+	latest, err = g.configMapReconciler.kubeClient.CoreV1().ConfigMaps(cm.Namespace).Get(context.Background(), cm.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	var entry ModelEntry
+	require.NoError(t, json.Unmarshal([]byte(latest.Data[constants.GetModelConfigMapKey("default", "model", false)]), &entry))
+	assert.Equal(t, ModelStatusReady, entry.Status)
+}
+
+func TestCanceledDownloadCannotPublishAfterCleanup(t *testing.T) {
+	for _, state := range []ModelStateOnNode{Failed, Ready, Updating} {
+		t.Run(string(state), func(t *testing.T) {
+			cm := makeConfigMap("node-1", map[string]string{})
+			g := newGopherForProcessTask(cm, map[string]string{"kubernetes.io/hostname": "node-1"})
+			model := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "same-uid"}}
+			op := &NodeLabelOp{BaseModel: model, ModelStateOnNode: state}
+			ctx, cancel := context.WithCancel(context.Background())
+			// Hold the cleanup lock while the old writer waits; cancellation must be
+			// checked inside the lock before either Kubernetes mutation is attempted.
+			g.configMapMutex.Lock()
+			done := make(chan error, 1)
+			go func() { done <- g.safeNodeLabelReconciliation(ctx, op) }()
+			cancel()
+			g.configMapMutex.Unlock()
+			require.ErrorIs(t, <-done, context.Canceled)
+			assert.Empty(t, g.configMapReconciler.kubeClient.(*k8sfake.Clientset).Actions())
+
+			// A new attempt for the same UID must remain allowed, including real failures.
+			require.NoError(t, g.safeNodeLabelReconciliation(context.Background(), op))
+			latest, err := g.configMapReconciler.kubeClient.CoreV1().ConfigMaps(cm.Namespace).Get(context.Background(), cm.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			var entry ModelEntry
+			require.NoError(t, json.Unmarshal([]byte(latest.Data[constants.GetModelConfigMapKey("default", "model", false)]), &entry))
+			assert.Equal(t, ModelStatus(state), entry.Status)
+			// The old task still cannot overwrite a newer task's status.
+			op.ModelStateOnNode = Failed
+			require.ErrorIs(t, g.safeNodeLabelReconciliation(ctx, op), context.Canceled)
+		})
+	}
+}
+
+func TestCanceledDownloadSkipsMetadataAndOCIRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	g := &Gopher{}
+	// Nil dependencies deliberately ensure no parsing or OCI initialization occurs.
+	require.ErrorIs(t, g.safeParseAndUpdateModelConfig(ctx, "", nil, nil, nil), context.Canceled)
+	require.ErrorIs(t, g.downloadModel(ctx, nil, "", nil), context.Canceled)
+}
+
+type cancelVerificationDispatcher struct {
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (d *cancelVerificationDispatcher) Do(req *http.Request) (*http.Response, error) {
+	d.calls++
+	d.cancel()
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Length": []string{"4"}, "Content-Md5": []string{"jXd/OF09/siBXSD3SWAm3A=="}}, Body: http.NoBody, Request: req}, nil
+}
+
+type verificationTestSigner struct{}
+
+func (verificationTestSigner) Sign(*http.Request) error { return nil }
+
+func TestVerificationStopsWhenAffinityCleanupCancelsDownload(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dispatcher := &cancelVerificationDispatcher{cancel: cancel}
+	store := &ociobjectstore.OCIOSDataStore{Client: &objectstorage.ObjectStorageClient{BaseClient: common.BaseClient{
+		HTTPClient: dispatcher, Signer: verificationTestSigner{}, Host: "https://objectstorage.test", UserAgent: "test",
+	}}}
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "first"), []byte("data"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "second"), []byte("data"), 0600))
+	// A nil metrics collector makes accidental recording of cancellation as an
+	// integrity failure fail the test. Subsequent files must not be verified.
+	g := &Gopher{}
+	_ = g.verifyDownloadedFiles(ctx, store, []ociobjectstore.ObjectURI{
+		{Namespace: "ns", BucketName: "bucket", ObjectName: "first"},
+		{Namespace: "ns", BucketName: "bucket", ObjectName: "second"},
+	}, dir, nil)
+	assert.Equal(t, 1, dispatcher.calls)
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+}
+
+// Cover the other ordering: a publisher has already passed the context check
+// when deletion cancels it. Cleanup must run after that publisher and win.
+func TestAffinityCleanupWinsOverInFlightStatusWrite(t *testing.T) {
+	cm := makeConfigMap("node-1", map[string]string{})
+	g := newGopherForProcessTask(cm, map[string]string{"kubernetes.io/hostname": "node-1"})
+	model := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "same-uid"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	patchStarted := make(chan struct{})
+	releasePatch := make(chan struct{})
+	client := g.configMapReconciler.kubeClient.(*k8sfake.Clientset)
+	var firstPatch sync.Once
+	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		firstPatch.Do(func() { close(patchStarted); <-releasePatch })
+		return false, nil, nil
+	})
+	published := make(chan error, 1)
+	go func() {
+		published <- g.safeNodeLabelReconciliation(ctx, &NodeLabelOp{BaseModel: model, ModelStateOnNode: Ready})
+	}()
+	<-patchStarted
+	cancel()
+	deleted := make(chan error, 1)
+	go func() {
+		deleted <- g.safeNodeLabelReconciliation(context.Background(), &NodeLabelOp{BaseModel: model, ModelStateOnNode: Deleted})
+	}()
+	close(releasePatch)
+	// Real clients may reject the in-flight request after cancellation. Fake
+	// clients may complete it; either outcome must be followed by cleanup.
+	if err := <-published; err != nil {
+		require.ErrorIs(t, err, context.Canceled)
+	}
+	require.NoError(t, <-deleted)
+	latest, err := client.CoreV1().ConfigMaps(cm.Namespace).Get(context.Background(), cm.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, latest.Data, constants.GetModelConfigMapKey("default", "model", false))
+	node, err := client.CoreV1().Nodes().Get(context.Background(), cm.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, node.Labels, constants.GetBaseModelLabel("default", "model"))
+	g.configMapReconciler.cacheMutex.RLock()
+	_, exists := g.configMapReconciler.modelCache[constants.GetModelConfigMapKey("default", "model", false)]
+	g.configMapReconciler.cacheMutex.RUnlock()
+	assert.False(t, exists, "periodic reconciliation must not restore the entry")
+}
+
+func TestOCICanceledDownloadDoesNotRecordFailure(t *testing.T) {
+	cm := makeConfigMap("node-1", map[string]string{})
+	g := newGopherForProcessTask(cm, map[string]string{"kubernetes.io/hostname": "node-1"})
+	g.metrics = NewMetrics(prometheus.NewRegistry())
+	g.downloadRetry = 3
+	uri := "oci://n/test-ns/b/test-bucket/o/model"
+	model := &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "same-uid"},
+		Spec:       v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: stringPtr(t.TempDir())}},
+	}
+	task := &GopherTask{TaskType: DownloadOverride, BaseModel: model}
+	// Cancel after registration during the Updating write, before OCI access.
+	client := g.configMapReconciler.kubeClient.(*k8sfake.Clientset)
+	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
+		return false, nil, nil
+	})
+	require.ErrorIs(t, g.processTask(task), context.Canceled)
+	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
+	assert.Zero(t, testutil.ToFloat64(g.metrics.modelDownloadsFailedTotal.WithLabelValues(modelType, namespace, name)))
+	assert.Zero(t, testutil.ToFloat64(g.metrics.modelDownloadsSuccessTotal.WithLabelValues(modelType, namespace, name)))
 }

@@ -258,10 +258,15 @@ func (s *Gopher) runHighPriorityWorker() {
 
 // safeNodeLabelReconciliation executes the NodeLabelReconciler's ReconcileNodeLabels method with mutex protection
 // to ensure thread-safe ConfigMap updates
-func (s *Gopher) safeNodeLabelReconciliation(op *NodeLabelOp) error {
-	ctx := context.Background()
+func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelOp) error {
 	s.configMapMutex.Lock()
 	defer s.configMapMutex.Unlock()
+
+	// Deletion uses this same lock. Check after acquiring it so a canceled
+	// download cannot restore state after node-local cleanup has completed.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Mark the node label
 	unlock, err := s.lockHfChildStatus(ctx, op)
@@ -306,10 +311,15 @@ func (s *Gopher) safeNodeLabelReconciliation(op *NodeLabelOp) error {
 
 // safeParseAndUpdateModelConfig executes the ModelConfigParser's ParseAndUpdateModelConfig method with mutex protection
 // to ensure thread-safe ConfigMap updates
-func (s *Gopher) safeParseAndUpdateModelConfig(modelPath string, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel, artifact *Artifact) error {
-	ctx := context.Background()
+func (s *Gopher) safeParseAndUpdateModelConfig(ctx context.Context, modelPath string, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel, artifact *Artifact) error {
 	s.configMapMutex.Lock()
 	defer s.configMapMutex.Unlock()
+
+	// Deletion uses this same lock. Check after acquiring it so a canceled
+	// download cannot restore state after node-local cleanup has completed.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// First parse the configuration without updating the ConfigMap
 	// This call will return model metadata
@@ -392,16 +402,22 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			ClusterBaseModel: task.ClusterBaseModel,
 		}
 
-		if err := s.safeNodeLabelReconciliation(nodeLabelOp); err != nil {
+		err := s.safeNodeLabelReconciliation(ctx, nodeLabelOp)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
 			s.logger.Errorf("Failed to set model %s status to Updating: %v", modelInfo, err)
 			// Continue with download anyway
 		}
-
 	}
 
 	storageType, err := storage.GetStorageType(*baseModelSpec.Storage.StorageUri)
 
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Errorf("Failed to get target directory path for model %s: %v", modelInfo, err)
 
 		// Record failed download in metrics
@@ -409,7 +425,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			s.metrics.RecordFailedDownload(modelType, namespace, name, "target_path_error")
 		}
 
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return err
 	}
 
@@ -427,7 +443,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		case storage.StorageTypeOCI:
 			handled, waiting, sharedErr := s.processHfOCIArtifact(ctx, task, baseModelSpec, allowFallbackDownload)
 			if sharedErr != nil {
-				s.markModelOnNodeFailed(task)
+				s.markModelOnNodeFailed(ctx, task)
 				return sharedErr
 			}
 			if waiting {
@@ -456,6 +472,9 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					}
 					return downloadErr
 				})
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				if err != nil {
 					s.logger.Errorf("All download attempts failed for model %s: %v", modelInfo, err)
 
@@ -466,7 +485,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					}
 					s.metrics.RecordFailedDownload(modelType, namespace, name, errorType)
 
-					s.markModelOnNodeFailed(task)
+					s.markModelOnNodeFailed(ctx, task)
 					return err
 				}
 				return nil
@@ -503,7 +522,10 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				s.logger.Warnf("No model object found in task, skipping config parsing")
 			}
 
-			if err := s.safeParseAndUpdateModelConfig(destPath, baseModel, clusterBaseModel, nil); err != nil {
+			if err := s.safeParseAndUpdateModelConfig(ctx, destPath, baseModel, clusterBaseModel, nil); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				s.logger.Errorf("Failed to parse and update model config: %v", err)
 			}
 		case storage.StorageTypeVendor:
@@ -537,16 +559,6 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		// Calculate download duration
 		downloadDuration := time.Since(downloadStartTime)
 
-		// Record successful download in metrics
-		s.metrics.RecordSuccessfulDownload(modelType, namespace, name)
-		s.metrics.ObserveDownloadDuration(modelType, namespace, name, downloadDuration)
-
-		if task.BaseModel != nil {
-			s.logger.Infof("Successfully downloaded BaseModel %s in namespace %s", task.BaseModel.Name, task.BaseModel.Namespace)
-		} else {
-			s.logger.Infof("Successfully downloaded ClusterBaseModel %s", task.ClusterBaseModel.Name)
-		}
-
 		if skip, runDeleteCleanup := s.shouldSkipStaleDownloadTask(task); skip {
 			if runDeleteCleanup {
 				s.logger.Infof("Model %s is deleting after download, running cleanup instead of marking Ready", modelInfo)
@@ -569,8 +581,16 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 
 		// This will update both the node label and ConfigMap status
-		if err := s.finishDownloadStatus(task, nodeLabelOp); err != nil {
+		published, err := s.finishDownloadStatus(ctx, task, nodeLabelOp)
+		if err != nil || !published {
 			return err
+		}
+		s.metrics.RecordSuccessfulDownload(modelType, namespace, name)
+		s.metrics.ObserveDownloadDuration(modelType, namespace, name, downloadDuration)
+		if task.BaseModel != nil {
+			s.logger.Infof("Successfully downloaded BaseModel %s in namespace %s", task.BaseModel.Name, task.BaseModel.Namespace)
+		} else {
+			s.logger.Infof("Successfully downloaded ClusterBaseModel %s", task.ClusterBaseModel.Name)
 		}
 	case Delete:
 		if !task.SharedArtifact {
@@ -663,7 +683,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			ClusterBaseModel: task.ClusterBaseModel,
 		}
 
-		err = s.safeNodeLabelReconciliation(nodeLabelOp)
+		err = s.safeNodeLabelReconciliation(ctx, nodeLabelOp)
 		if err != nil {
 			s.logger.Errorf("Failed to mark model %s as deleted: %v", modelInfo, err)
 			return err
@@ -891,7 +911,7 @@ func (s *Gopher) isTaskModelReplaced(task *GopherTask) bool {
 	return false
 }
 
-func (s *Gopher) markModelOnNodeFailed(task *GopherTask) {
+func (s *Gopher) markModelOnNodeFailed(ctx context.Context, task *GopherTask) {
 	modelInfo := getModelInfoForLogging(task)
 	s.logger.Infof("Marking model %s as Failed on node", modelInfo)
 
@@ -902,8 +922,10 @@ func (s *Gopher) markModelOnNodeFailed(task *GopherTask) {
 	}
 
 	// This will update both node label and ConfigMap status
-	err := s.safeNodeLabelReconciliation(nodeLabelOp)
-	if err != nil {
+	err := s.safeNodeLabelReconciliation(ctx, nodeLabelOp)
+	if ctx.Err() != nil {
+		s.logger.Infof("Skipping Failed status for canceled model download %s", modelInfo)
+	} else if err != nil {
 		s.logger.Errorf("Failed to mark model %s as Failed on node: %v", modelInfo, err)
 	} else {
 		s.logger.Infof("Successfully marked model %s as Failed on node", modelInfo)
@@ -912,7 +934,7 @@ func (s *Gopher) markModelOnNodeFailed(task *GopherTask) {
 
 // getHuggingFaceToken retrieves authentication token for Hugging Face models.
 // It attempts to get the token from either a Kubernetes secret or direct parameters.
-func (s *Gopher) getHuggingFaceToken(task *GopherTask, baseModelSpec v1beta1.BaseModelSpec, modelInfo string) string {
+func (s *Gopher) getHuggingFaceToken(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec, modelInfo string) string {
 	var hfToken string
 	var namespace string
 
@@ -930,7 +952,7 @@ func (s *Gopher) getHuggingFaceToken(task *GopherTask, baseModelSpec v1beta1.Bas
 		if s.kubeClient != nil {
 			s.logger.Infof("Fetching Hugging Face token from secret %s in namespace %s for model %s", *baseModelSpec.Storage.StorageKey, namespace, modelInfo)
 
-			secret, err := s.kubeClient.CoreV1().Secrets(namespace).Get(context.Background(), *baseModelSpec.Storage.StorageKey, metav1.GetOptions{})
+			secret, err := s.kubeClient.CoreV1().Secrets(namespace).Get(ctx, *baseModelSpec.Storage.StorageKey, metav1.GetOptions{})
 			if err != nil {
 				s.logger.Warnf("Failed to retrieve secret %s in namespace %s for Hugging Face token: %v", *baseModelSpec.Storage.StorageKey, namespace, err)
 			} else {
@@ -1218,6 +1240,9 @@ func filterObjectStorageObjectsForTask(objects []objectstorage.ObjectSummary, ta
 }
 
 func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectURI, destPath string, task *GopherTask) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	startTime := time.Now()
 	defer func() {
 		s.logger.Infof("Download process took %v", time.Since(startTime).Round(time.Millisecond))
@@ -1316,10 +1341,17 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Perform final verification of all downloaded files
 	s.logger.Info("Performing final integrity verification of all downloaded files...")
 	verificationStartTime := time.Now()
-	verificationErrors := s.verifyDownloadedFiles(ociOSDataStore, objectUris, destPath, task)
+	verificationErrors := s.verifyDownloadedFiles(ctx, ociOSDataStore, objectUris, destPath, task)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	verificationDuration := time.Since(verificationStartTime)
 
 	// Record verification duration
@@ -1349,9 +1381,12 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	return nil
 }
 
-func (s *Gopher) verifyDownloadedFiles(ociOSDataStore *ociobjectstore.OCIOSDataStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
+func (s *Gopher) verifyDownloadedFiles(ctx context.Context, ociOSDataStore *ociobjectstore.OCIOSDataStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
 	errors := make(map[string]error)
 	for _, obj := range uris {
+		if ctx.Err() != nil {
+			return errors
+		}
 		relativeName := filepath.Join(destPath, ociobjectstore.TrimObjectPrefix(obj.ObjectName, obj.Prefix))
 		// Fallback: if relativeName is empty, use the object name directly
 		if relativeName == "" {
@@ -1366,6 +1401,10 @@ func (s *Gopher) verifyDownloadedFiles(ociOSDataStore *ociobjectstore.OCIOSDataS
 		if !valid {
 			errors[obj.ObjectName] = fmt.Errorf("MD5 or size mismatch for %s", obj.ObjectName)
 		}
+	}
+
+	if ctx.Err() != nil {
+		return errors
 	}
 
 	// Record verification result in metrics
@@ -1435,12 +1474,18 @@ func (s *Gopher) isReservingModelArtifact(task *GopherTask) bool {
 // performs the download using the hub client, and updates model configuration.
 func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
 	modelInfo, modelType, namespace, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Parse the Hugging Face URI to get modelID and branch
 	hfComponents, err := storage.ParseHuggingFaceStorageURI(*baseModelSpec.Storage.StorageUri)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Errorf("Failed to parse Hugging Face URI for model %s: %v", modelInfo, err)
 		s.metrics.RecordFailedDownload(modelType, namespace, name, "invalid_hf_uri")
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return err
 	}
 
@@ -1493,7 +1538,10 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		childrenPaths = currentChildren
 
 		// Get Hugging Face token from storage key or parameters
-		hfToken := s.getHuggingFaceToken(task, baseModelSpec, modelInfo)
+		hfToken := s.getHuggingFaceToken(ctx, task, baseModelSpec, modelInfo)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		s.logger.Infof("Downloading HuggingFace model %s (revision: %s) to %s",
 			hfComponents.ModelID, hfComponents.Branch, destPath)
@@ -1538,8 +1586,15 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 				BaseModel:        task.BaseModel,
 				ClusterBaseModel: task.ClusterBaseModel,
 			}
-			flushCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			flushCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
+			// Serialize with cleanup: an in-flight flush finishes before deletion,
+			// and a canceled flush waiting behind deletion must not restore progress.
+			s.configMapMutex.Lock()
+			defer s.configMapMutex.Unlock()
+			if flushCtx.Err() != nil {
+				return
+			}
 			if err := s.configMapReconciler.ReconcileModelProgress(flushCtx, progressOp); err != nil {
 				s.logger.Warnf("Failed to update download progress for %s: %v", modelInfo, err)
 			}
@@ -1564,13 +1619,13 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 			}
 		}()
 
-		// Ensure worker stops before we set Ready status
-		// This guarantees no race condition between progress updates and status updates
-		defer func() {
+		// Stop explicitly after the download, with deferred cleanup for other exits.
+		stopProgressWorker := sync.OnceFunc(func() {
 			close(stopWorker) // Signal worker to stop
 			<-workerDone      // Wait for worker to finish
 			s.logger.Debugf("Progress worker stopped for %s", modelInfo)
-		}()
+		})
+		defer stopProgressWorker()
 
 		progressHandler := func(update xet.ProgressUpdate) {
 			now := time.Now()
@@ -1602,7 +1657,12 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		// Perform snapshot download with progress tracking
 		// Note: Progress is cleared atomically with status update in ReconcileModelStatus
 		// when status becomes Ready/Failed, ensuring the controller sees the final progress
-		downloadPath, err := xet.SnapshotDownloadWithProgress(ctx, config, progressHandler, progressThrottle)
+		downloadPath, err := snapshotDownloadWithProgress(ctx, config, progressHandler, progressThrottle)
+		// Finish all progress writes before a terminal status clears progress.
+		stopProgressWorker()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 
 		if err != nil {
 			// Check error type for better handling
@@ -1615,7 +1675,7 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 				s.metrics.RecordFailedDownload(modelType, namespace, name, "hf_download_error")
 			}
 
-			s.markModelOnNodeFailed(task)
+			s.markModelOnNodeFailed(ctx, task)
 			return err
 		}
 
@@ -1636,7 +1696,10 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		s.logger.Debugf("Using ClusterBaseModel %s for config parsing", clusterBaseModel.Name)
 	}
 
-	if err := s.safeParseAndUpdateModelConfig(destPath, baseModel, clusterBaseModel, artifact); err != nil {
+	if err := s.safeParseAndUpdateModelConfig(ctx, destPath, baseModel, clusterBaseModel, artifact); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Errorf("Failed to parse and update model config: %v", err)
 	}
 	return nil
@@ -1691,12 +1754,18 @@ func (s *Gopher) handelReuseArtifactIfNecessary(ctx context.Context, baseModelSp
 // This allows users to reference pre-existing models without copying or removing them.
 func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
 	modelInfo, modelType, namespace, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Parse the local storage URI to get the path
 	localComponents, err := storage.ParseLocalStorageURI(*baseModelSpec.Storage.StorageUri)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Errorf("Failed to parse local storage URI for model %s: %v", modelInfo, err)
 		s.metrics.RecordFailedDownload(modelType, namespace, name, "invalid_local_uri")
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return err
 	}
 
@@ -1715,9 +1784,12 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 
 	// Check if the path exists
 	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Errorf("Local model path does not exist for model %s: %s", modelInfo, modelPath)
 		s.metrics.RecordFailedDownload(modelType, namespace, name, "local_path_not_found")
-		s.markModelOnNodeFailed(task)
+		s.markModelOnNodeFailed(ctx, task)
 		return fmt.Errorf("local model path does not exist: %s", modelPath)
 	}
 
@@ -1735,7 +1807,10 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 		s.logger.Debugf("Using ClusterBaseModel %s for config parsing", clusterBaseModel.Name)
 	}
 
-	if err := s.safeParseAndUpdateModelConfig(modelPath, baseModel, clusterBaseModel, nil); err != nil {
+	if err := s.safeParseAndUpdateModelConfig(ctx, modelPath, baseModel, clusterBaseModel, nil); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Errorf("Failed to parse and update model config for local model: %v", err)
 		// This is not necessarily a failure - the model might still be usable
 	}
@@ -1746,6 +1821,8 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 
 // for unit test
 var fetchAttributeFromHfModelMetaData = FetchAttributeFromHfModelMetaData
+
+var snapshotDownloadWithProgress = xet.SnapshotDownloadWithProgress
 
 // fetchSha retrieves the git commit SHA associated with a Hugging Face model ID.
 // It queries the Hugging Face model metadata API for the "sha" attribute and returns:
