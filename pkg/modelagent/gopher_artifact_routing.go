@@ -101,6 +101,9 @@ func (s *Gopher) routeArtifactTaskLocked(task *GopherTask) {
 	_, eligible, err := newHfArtifactTaskInputForOCI(&probe, spec.Storage, s.modelRootDir)
 	task.SharedArtifact = task.SharedArtifact || eligible || err != nil ||
 		isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir))
+	if isDirectHfReuseEligible(task, spec.Storage) {
+		task.SharedArtifact = true
+	}
 	if task.SharedArtifact {
 		if s.artifactRouting.children == nil {
 			s.artifactRouting.children = make(map[string]bool)

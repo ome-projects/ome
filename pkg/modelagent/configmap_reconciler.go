@@ -931,26 +931,6 @@ func extractChildrenPaths(artifact map[string]interface{}) []string {
 	return children
 }
 
-// getModelDataByArtifactSha fetches the node-scoped ConfigMap (namespace "ome", name c.nodeName) and searches it for a model entry whose artifact SHA equals
-// targetSha and whose key is prefixed by modelType (case-insensitive).
-// Returns:
-// - modelKey:   The matched ConfigMap Data key (modelType + model identifier).
-// - parentPath: The value of config.artifact.parentPath for the matched entry.
-// - err:        The last JSON parsing error encountered during scanning; nil if none.
-func (c *ConfigMapReconciler) getModelDataByArtifactSha(ctx context.Context, targetSha string, modelType string, currentModelTypeAndNodeName string) (string, string, error) {
-	cm, err := c.kubeClient.CoreV1().ConfigMaps("ome").Get(ctx, c.nodeName, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			c.logger.Warn("cannot find configmap %s", c.nodeName)
-			// ConfigMap doesn't exist, recreate it from scratch
-			return "", "", fmt.Errorf("cannot find configmap %s", c.nodeName)
-		}
-		c.logger.Errorf("Failed to get ConfigMap %s: %v", c.nodeName, err)
-		return "", "", fmt.Errorf("failed to get ConfigMap %s: %v", c.nodeName, err)
-	}
-	return c.FindMatchedModelFromConfigMap(cm, targetSha, modelType, currentModelTypeAndNodeName)
-}
-
 // addPathToChildrenPaths appends newPath to the config.artifact.childrenPaths array if the newPath is not contained in the children paths
 func (c *ConfigMapReconciler) addPathToChildrenPaths(modelTypeAndModelName string, newPath string, dataEntry string) (string, error) {
 	// Parse the JSON into a generic map
