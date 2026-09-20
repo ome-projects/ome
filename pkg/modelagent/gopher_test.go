@@ -705,7 +705,6 @@ func newGopherForProcessTask(cm *corev1.ConfigMap, nodeLabels ...map[string]stri
 		configMapReconciler: cmr,
 		nodeLabelReconciler: NewNodeLabelReconciler(cm.Name, client, 1, logger),
 		logger:              logger,
-		activeDownloads:     map[string]activeDownload{},
 	}
 }
 
@@ -1231,12 +1230,8 @@ func TestGopherEnqueueDeleteCancelsActiveDownload(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
 	g.taskQueue = newGopherTaskQueue()
-	g.activeDownloads = map[string]activeDownload{
-		string(model.UID): {
-			token:  "download-token",
-			cancel: cancel,
-		},
-	}
+	attempt := g.taskTracker.beginLegacyTask(string(model.UID), cancel)
+	t.Cleanup(func() { g.taskTracker.finishLegacyTask(attempt) })
 
 	g.enqueueTask(&GopherTask{TaskType: Delete, BaseModel: model})
 
@@ -1247,32 +1242,23 @@ func TestGopherEnqueueDeleteCancelsActiveDownload(t *testing.T) {
 	}
 }
 
-func TestUnregisterActiveDownloadDoesNotRemoveNewerRegistration(t *testing.T) {
+func TestFinishActiveDownloadDoesNotRemoveNewerRegistration(t *testing.T) {
 	modelUID := "model-uid"
 	oldCtx, oldCancel := context.WithCancel(context.Background())
 	newCtx, newCancel := context.WithCancel(context.Background())
 	t.Cleanup(oldCancel)
 	t.Cleanup(newCancel)
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
-	g.activeDownloads = map[string]activeDownload{
-		modelUID: {
-			token:  "old-token",
-			cancel: oldCancel,
-		},
-	}
-	g.activeDownloads[modelUID] = activeDownload{
-		token:  "new-token",
-		cancel: newCancel,
-	}
-
-	g.unregisterActiveDownload(modelUID, "old-token")
-
-	g.activeDownloadsMutex.RLock()
-	active, exists := g.activeDownloads[modelUID]
-	g.activeDownloadsMutex.RUnlock()
-	require.True(t, exists)
-	assert.Equal(t, "new-token", active.token)
-	active.cancel()
+	oldAttempt, result := g.taskTracker.beginDownload(modelUID, 1, oldCancel)
+	require.Equal(t, gopherTaskProceed, result)
+	g.taskTracker.finishDownload(oldAttempt)
+	newAttempt, result := g.taskTracker.beginDownload(modelUID, 2, newCancel)
+	require.Equal(t, gopherTaskProceed, result)
+	t.Cleanup(func() { g.taskTracker.finishDownload(newAttempt) })
+	g.taskTracker.finishDownload(oldAttempt)
+	deletion, result := g.taskTracker.beginDelete(modelUID, 3)
+	require.Equal(t, gopherTaskWait, result)
+	t.Cleanup(func() { g.taskTracker.finishDelete(deletion, false) })
 	select {
 	case <-newCtx.Done():
 	case <-time.After(100 * time.Millisecond):

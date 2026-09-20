@@ -47,11 +47,10 @@ type GopherTask struct {
 	SamePathWaitStartedAt  time.Time
 	NormalPriorityOnly     bool
 	RevalidationReplay     bool
-}
-
-type activeDownload struct {
-	token  string
-	cancel context.CancelFunc
+	// Sequence is assigned once and retained when this logical task is requeued.
+	Sequence uint64
+	// SharedArtifact selects ownership-aware handling; ordinary tasks keep the legacy path.
+	SharedArtifact bool
 }
 
 type Gopher struct {
@@ -71,15 +70,16 @@ type Gopher struct {
 	baseModelLister        omev1beta1lister.BaseModelLister
 	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister
 
-	// Track active downloads for cancellation
-	activeDownloads      map[string]activeDownload // key: model UID
-	activeDownloadsMutex sync.RWMutex
+	taskTracker     gopherTaskTracker
+	artifactRouting gopherArtifactRouting
 
 	taskQueue           *gopherTaskQueue
 	samePathWaitDelay   time.Duration
 	samePathWaitTimeout time.Duration
 
 	startupReadyModelKeys map[string]struct{}
+	hfArtifactHandlerOnce sync.Once
+	hfArtifactHandler     *hfArtifactTaskHandler
 }
 
 const (
@@ -127,7 +127,6 @@ func NewGopher(
 		nodeLabelReconciler:    nodeLabelReconciler,
 		metrics:                metrics,
 		logger:                 logger,
-		activeDownloads:        make(map[string]activeDownload),
 		baseModelLister:        baseModelLister,
 		clusterBaseModelLister: clusterBaseModelLister,
 		taskQueue:              newGopherTaskQueue(),
@@ -195,11 +194,21 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if task == nil {
 		return
 	}
+	s.artifactRouting.mutex.Lock()
+	s.routeArtifactTaskLocked(task)
+	s.artifactRouting.mutex.Unlock()
+	task.Sequence = s.taskTracker.ensureSequence(task.Sequence)
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue()
 	}
-	if task.TaskType == Delete {
-		s.cancelActiveDownload(task)
+	if task.TaskType == Delete && task.SharedArtifact {
+		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
+		if result == gopherTaskStale {
+			return
+		}
+		s.taskTracker.finishDelete(attempt, true)
+	} else if task.TaskType == Delete {
+		s.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
 	} else {
 		s.classifyStartupRevalidation(task)
 	}
@@ -215,9 +224,6 @@ func (s *Gopher) runWorker() {
 		if !ok {
 			s.logger.Info("gopher task queue closed, worker exits.")
 			return
-		}
-		if task.TaskType == Delete {
-			s.cancelActiveDownload(task)
 		}
 		err := s.processTask(task)
 		if err != nil {
@@ -236,25 +242,10 @@ func (s *Gopher) runHighPriorityWorker() {
 			s.logger.Info("gopher high-priority task queue closed, worker exits.")
 			return
 		}
-		if task.TaskType == Delete {
-			s.cancelActiveDownload(task)
-		}
 		err := s.processTaskWithOptions(task, false)
 		if err != nil {
 			s.logger.Errorf("Gopher high-priority task failed with error: %s", err.Error())
 		}
-	}
-}
-
-func (s *Gopher) cancelActiveDownload(task *GopherTask) {
-	modelUID := getModelUID(task)
-	s.activeDownloadsMutex.RLock()
-	active, isDownloading := s.activeDownloads[modelUID]
-	s.activeDownloadsMutex.RUnlock()
-
-	if isDownloading {
-		s.logger.Infof("Model %s is currently downloading, will cancel it", getModelInfoForLogging(task))
-		active.cancel()
 	}
 }
 
@@ -266,7 +257,12 @@ func (s *Gopher) safeNodeLabelReconciliation(op *NodeLabelOp) error {
 	defer s.configMapMutex.Unlock()
 
 	// Mark the node label
-	err := s.nodeLabelReconciler.ReconcileNodeLabels(op)
+	unlock, err := s.lockHfChildStatus(ctx, op)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	err = s.nodeLabelReconciler.ReconcileNodeLabels(op)
 	if err != nil {
 		return err
 	}
@@ -344,10 +340,14 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
 	}
-
 	// Get model info for logging
 	modelInfo := getModelInfoForLogging(task)
-	modelUID := getModelUID(task)
+	ctx, finish, proceed, err := s.beginTask(task)
+	if err != nil || !proceed {
+		return err
+	}
+	keepDeleteBarrier := false
+	defer func() { finish(keepDeleteBarrier) }()
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
 
 	// Get model type, namespace, and name for metrics
@@ -360,15 +360,11 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		baseModelSpec = task.ClusterBaseModel.Spec
 	}
 
-	// Create context - will be cancellable for downloads
-	ctx := context.Background()
-	var cancel context.CancelFunc
-
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
 		if skip, runDeleteCleanup := s.shouldSkipStaleDownloadTask(task); skip {
 			if runDeleteCleanup {
 				s.logger.Infof("Model %s is deleting, running cleanup instead of download", modelInfo)
-				return s.processTask(&GopherTask{
+				return s.cleanupDeletingModel(task, &GopherTask{
 					TaskType:               Delete,
 					BaseModel:              task.BaseModel,
 					ClusterBaseModel:       task.ClusterBaseModel,
@@ -394,23 +390,6 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			// Continue with download anyway
 		}
 
-		// Create a cancellable context for this download
-		ctx, cancel = context.WithCancel(context.Background())
-
-		// Register the cancel function
-		activeDownloadToken := fmt.Sprintf("%s-%d", modelUID, time.Now().UnixNano())
-		s.activeDownloadsMutex.Lock()
-		s.activeDownloads[modelUID] = activeDownload{
-			token:  activeDownloadToken,
-			cancel: cancel,
-		}
-		s.activeDownloadsMutex.Unlock()
-
-		// Ensure cleanup on completion
-		defer func() {
-			s.unregisterActiveDownload(modelUID, activeDownloadToken)
-			cancel() // Ensure context is cancelled
-		}()
 	}
 
 	storageType, err := storage.GetStorageType(*baseModelSpec.Storage.StorageUri)
@@ -439,6 +418,17 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		downloadStartTime := time.Now()
 		switch storageType {
 		case storage.StorageTypeOCI:
+			handled, waiting, sharedErr := s.processHfOCIArtifact(ctx, task, baseModelSpec, allowFallbackDownload)
+			if sharedErr != nil {
+				s.markModelOnNodeFailed(task)
+				return sharedErr
+			}
+			if waiting {
+				return nil
+			}
+			if handled {
+				break
+			}
 			osUri, err := getTargetDirPath(&baseModelSpec)
 			destPath := getDestPath(&baseModelSpec, s.modelRootDir)
 			if err != nil {
@@ -512,6 +502,10 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		case storage.StorageTypeVendor:
 			s.logger.Infof("Skipping download for model %s", modelInfo)
 		case storage.StorageTypeHuggingFace:
+			waiting, err := s.detachHfArtifactForDefaultDownload(ctx, task, baseModelSpec, allowFallbackDownload)
+			if err != nil || waiting {
+				return err
+			}
 			s.logger.Infof("Starting Hugging Face download for model %s", modelInfo)
 
 			// Handle Hugging Face model download
@@ -549,7 +543,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		if skip, runDeleteCleanup := s.shouldSkipStaleDownloadTask(task); skip {
 			if runDeleteCleanup {
 				s.logger.Infof("Model %s is deleting after download, running cleanup instead of marking Ready", modelInfo)
-				return s.processTask(&GopherTask{
+				return s.cleanupDeletingModel(task, &GopherTask{
 					TaskType:               Delete,
 					BaseModel:              task.BaseModel,
 					ClusterBaseModel:       task.ClusterBaseModel,
@@ -568,90 +562,91 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 
 		// This will update both the node label and ConfigMap status
-		err = s.safeNodeLabelReconciliation(nodeLabelOp)
-		if err != nil {
-			s.logger.Errorf("Failed to mark model %s as Ready: %v", modelInfo, err)
+		if err := s.finishDownloadStatus(task, nodeLabelOp); err != nil {
 			return err
 		}
 	case Delete:
-		// First, cancel any ongoing download for this model
-		s.activeDownloadsMutex.RLock()
-		if active, exists := s.activeDownloads[modelUID]; exists {
-			s.logger.Infof("Cancelling ongoing download for model %s", modelInfo)
-			active.cancel() // This will cancel the download context
+		if !task.SharedArtifact {
+			// Preserve the existing ordinary deletion grace period.
+			time.Sleep(2 * time.Second)
 		}
-		s.activeDownloadsMutex.RUnlock()
-
-		// Wait a bit for download to stop
-		time.Sleep(2 * time.Second)
-
 		// Now proceed with deletion
-		switch storageType {
-		case storage.StorageTypeOCI:
-			s.logger.Infof("Starting deletion for model %s", modelInfo)
-			destPath := getDestPath(&baseModelSpec, s.modelRootDir)
-			// check if it needs to skip artifact deletion
-			isSkippingDeletion, _, _, _ := s.isSkippingArtifactDeletion(ctx, task, destPath, false)
-			if !isSkippingDeletion {
-				err = s.deleteModel(destPath, task)
-				if err != nil {
-					s.logger.Errorf("Failed to delete model %s: %v", modelInfo, err)
-					return err
-				}
-				if task.BaseModel != nil {
-					s.logger.Infof("Successfully deleted the BaseModel %s in namespace %s", task.BaseModel.Name, task.BaseModel.Namespace)
-				} else {
-					s.logger.Infof("Successfully deleted the ClusterBaseModel %s", task.ClusterBaseModel.Name)
-				}
-			}
-		case storage.StorageTypeVendor:
-			s.logger.Infof("Skipping deletion for model %s", modelInfo)
-		case storage.StorageTypeHuggingFace:
-			s.logger.Infof("Removing Hugging Face model %s", modelInfo)
-			// Use getDestPath to get the same path used during download
-			destPath := getDestPath(&baseModelSpec, s.modelRootDir)
-
-			// check if it needs to skip artifact deletion
-			isSkippingDeletion, isRemoveParent, parentName, parentDir := s.isSkippingArtifactDeletion(ctx, task, destPath, true)
-
-			if !isSkippingDeletion {
-				err = s.deleteModel(destPath, task)
-				if err != nil {
-					s.logger.Errorf("Failed to delete Hugging Face model %s: %v", modelInfo, err)
-					return err
-				}
-				s.logger.Infof("Successfully deleted Hugging Face model %s", modelInfo)
-			} else {
-				s.logger.Infof("model %s artifact deletion will be skipped", modelInfo)
-			}
-			if isRemoveParent && parentName != "" && parentDir != "" {
-				// check whether the parent directory still has other directory points to it using symbolic link
-				isParentHasSymbolicLinkPointedTo, symbolicLinkSearchErr := utils.HasSymlinkPointingToDir(s.modelRootDir, parentDir)
-				if symbolicLinkSearchErr != nil {
-					s.logger.Infof("fails to search for the SymbolicLink pointing to parent Dir %s: %v. will regard the parent is still being pointed conservatively", parentDir, symbolicLinkSearchErr)
-					isParentHasSymbolicLinkPointedTo = true
-				}
-				s.logger.Infof("parent %s:%s has other directory points to: %v", parentName, parentDir, isParentHasSymbolicLinkPointedTo)
-				if !isParentHasSymbolicLinkPointedTo {
-					err = s.deleteModel(parentDir, nil)
+		handled, waiting, sharedErr := s.processSharedHfArtifactDelete(ctx, task)
+		if sharedErr != nil {
+			return sharedErr
+		}
+		if waiting {
+			keepDeleteBarrier = true
+			return nil
+		}
+		if !handled {
+			switch storageType {
+			case storage.StorageTypeOCI:
+				s.logger.Infof("Starting deletion for model %s", modelInfo)
+				destPath := getDestPath(&baseModelSpec, s.modelRootDir)
+				// check if it needs to skip artifact deletion
+				isSkippingDeletion, _, _, _ := s.isSkippingArtifactDeletion(ctx, task, destPath, false)
+				if !isSkippingDeletion {
+					err = s.deleteModel(destPath, task)
 					if err != nil {
-						s.logger.Errorf("fail to delete parent model artifact directory %s: %s", parentName, parentDir)
+						s.logger.Errorf("Failed to delete model %s: %v", modelInfo, err)
+						return err
 					}
-					s.logger.Infof("Successfully delete parent model artifact directory %s: %s", parentName, parentDir)
+					if task.BaseModel != nil {
+						s.logger.Infof("Successfully deleted the BaseModel %s in namespace %s", task.BaseModel.Name, task.BaseModel.Namespace)
+					} else {
+						s.logger.Infof("Successfully deleted the ClusterBaseModel %s", task.ClusterBaseModel.Name)
+					}
 				}
-			} else {
-				s.logger.Infof("no need to delete parent model artifact directory %s: %s", parentName, parentDir)
+			case storage.StorageTypeVendor:
+				s.logger.Infof("Skipping deletion for model %s", modelInfo)
+			case storage.StorageTypeHuggingFace:
+				s.logger.Infof("Removing Hugging Face model %s", modelInfo)
+				// Use getDestPath to get the same path used during download
+				destPath := getDestPath(&baseModelSpec, s.modelRootDir)
+
+				// check if it needs to skip artifact deletion
+				isSkippingDeletion, isRemoveParent, parentName, parentDir := s.isSkippingArtifactDeletion(ctx, task, destPath, true)
+
+				if !isSkippingDeletion {
+					err = s.deleteModel(destPath, task)
+					if err != nil {
+						s.logger.Errorf("Failed to delete Hugging Face model %s: %v", modelInfo, err)
+						return err
+					}
+					s.logger.Infof("Successfully deleted Hugging Face model %s", modelInfo)
+				} else {
+					s.logger.Infof("model %s artifact deletion will be skipped", modelInfo)
+				}
+				if isRemoveParent && parentName != "" && parentDir != "" {
+					// check whether the parent directory still has other directory points to it using symbolic link
+					isParentHasSymbolicLinkPointedTo, symbolicLinkSearchErr := utils.HasSymlinkPointingToDir(s.modelRootDir, parentDir)
+					if symbolicLinkSearchErr != nil {
+						s.logger.Infof("fails to search for the SymbolicLink pointing to parent Dir %s: %v. will regard the parent is still being pointed conservatively", parentDir, symbolicLinkSearchErr)
+						isParentHasSymbolicLinkPointedTo = true
+					}
+					s.logger.Infof("parent %s:%s has other directory points to: %v", parentName, parentDir, isParentHasSymbolicLinkPointedTo)
+					if !isParentHasSymbolicLinkPointedTo {
+						err = s.deleteModel(parentDir, nil)
+						if err != nil {
+							s.logger.Errorf("fail to delete parent model artifact directory %s: %s", parentName, parentDir)
+						}
+						s.logger.Infof("Successfully delete parent model artifact directory %s: %s", parentName, parentDir)
+					}
+				} else {
+					s.logger.Infof("no need to delete parent model artifact directory %s: %s", parentName, parentDir)
+				}
+			case storage.StorageTypeLocal:
+				s.logger.Infof("Skipping deletion for local storage model %s (local files should not be deleted)", modelInfo)
+				// For local storage, we should NOT delete the actual files
+				// Just update the node labels and ConfigMap to reflect removal
+			case storage.StorageTypePVC:
+				s.logger.Infof("Skipping deletion for PVC storage model %s (handled by BaseModel controller)", modelInfo)
+				// PVC storage is handled entirely by the BaseModel controller
+				// Model agent doesn't delete PVC volumes
+			default:
+				s.logger.Warnf("Unsupported storage type %s for deletion of model %s", storageType, modelInfo)
 			}
-		case storage.StorageTypeLocal:
-			s.logger.Infof("Skipping deletion for local storage model %s (local files should not be deleted)", modelInfo)
-			// For local storage, we should NOT delete the actual files
-			// Just update the node labels and ConfigMap to reflect removal
-		case storage.StorageTypePVC:
-			s.logger.Infof("Skipping deletion for PVC storage model %s (handled by BaseModel controller)", modelInfo)
-			// PVC storage is handled entirely by the BaseModel controller
-			// Model agent doesn't delete PVC volumes
-		default:
-			s.logger.Warnf("Unsupported storage type %s for deletion of model %s", storageType, modelInfo)
 		}
 
 		// Mark the model as deleted in the node labels and remove from ConfigMap
@@ -667,21 +662,9 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			return err
 		}
 
-		// Clean up the active downloads map
-		s.activeDownloadsMutex.Lock()
-		delete(s.activeDownloads, modelUID)
-		s.activeDownloadsMutex.Unlock()
 	}
 
 	return nil
-}
-
-func (s *Gopher) unregisterActiveDownload(modelUID string, token string) {
-	s.activeDownloadsMutex.Lock()
-	defer s.activeDownloadsMutex.Unlock()
-	if active, exists := s.activeDownloads[modelUID]; exists && active.token == token {
-		delete(s.activeDownloads, modelUID)
-	}
 }
 
 func (s *Gopher) demoteToNormalPriority(task *GopherTask) {
@@ -715,11 +698,15 @@ func (s *Gopher) captureStartupReadyModels(ctx context.Context) {
 		if apierrors.IsNotFound(err) {
 			s.logger.Infof("No startup Ready model snapshot because node ConfigMap does not exist yet")
 			s.startupReadyModelKeys = map[string]struct{}{}
+			_ = s.artifactRouting.observeSnapshot(nil) // An empty snapshot cannot fail decoding.
 			return
 		}
 		s.logger.Warnf("Cannot capture startup Ready model snapshot: %v", err)
 		s.startupReadyModelKeys = map[string]struct{}{}
 		return
+	}
+	if err := s.artifactRouting.observeSnapshot(configMap.Data); err != nil {
+		s.logger.Warnf("Cannot capture startup shared artifact ownership: %v", err)
 	}
 	readyModelKeys := make(map[string]struct{})
 	for key, data := range configMap.Data {
@@ -782,6 +769,9 @@ func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
 			s.logger.Warnf("Cannot check latest BaseModel %s/%s before download: %v", task.BaseModel.Namespace, task.BaseModel.Name, err)
 			return false, false
 		}
+		if task.SharedArtifact && latestModel.UID != task.BaseModel.UID {
+			return true, false
+		}
 		isDeleting := latestModel.DeletionTimestamp != nil
 		return isDeleting, isDeleting
 	}
@@ -797,6 +787,9 @@ func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
 		if err != nil {
 			s.logger.Warnf("Cannot check latest ClusterBaseModel %s before download: %v", task.ClusterBaseModel.Name, err)
 			return false, false
+		}
+		if task.SharedArtifact && latestModel.UID != task.ClusterBaseModel.UID {
+			return true, false
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
 		return isDeleting, isDeleting
@@ -866,6 +859,29 @@ func getModelUID(task *GopherTask) string {
 		return string(task.ClusterBaseModel.UID)
 	}
 	return ""
+}
+
+func gopherTaskModelKey(task *GopherTask) string {
+	if uid := getModelUID(task); uid != "" {
+		return uid
+	}
+	// Kubernetes supplies UIDs; locally constructed tasks still need distinct
+	// tracker keys instead of sharing one empty identifier.
+	return getModelID(task.BaseModel, task.ClusterBaseModel)
+}
+
+// A CR name may be reused after deletion. Old work must not update the new CR's
+// deterministic node label or local path, even though its task UID differs.
+func (s *Gopher) isTaskModelReplaced(task *GopherTask) bool {
+	if task.BaseModel != nil && s.baseModelLister != nil {
+		model, err := s.baseModelLister.BaseModels(task.BaseModel.Namespace).Get(task.BaseModel.Name)
+		return err == nil && model.UID != task.BaseModel.UID
+	}
+	if task.ClusterBaseModel != nil && s.clusterBaseModelLister != nil {
+		model, err := s.clusterBaseModelLister.Get(task.ClusterBaseModel.Name)
+		return err == nil && model.UID != task.ClusterBaseModel.UID
+	}
+	return false
 }
 
 func (s *Gopher) markModelOnNodeFailed(task *GopherTask) {
@@ -1141,7 +1157,7 @@ func (s *Gopher) requeueSamePathInFlightReuseWait(task *GopherTask, matchedKey s
 	if task.SamePathWaitStartedAt.IsZero() {
 		task.SamePathWaitStartedAt = now
 	} else if now.Sub(task.SamePathWaitStartedAt) >= timeout {
-		s.logger.Warnf("Timed out waiting for same-path model %s to become Ready for %s; falling back to normal download", matchedKey, getModelInfoForLogging(task))
+		s.logger.Warnf("Timed out waiting for model %s for %s", matchedKey, getModelInfoForLogging(task))
 		return false
 	}
 
@@ -1228,6 +1244,9 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	objects, err := ociOSDataStore.ListObjects(*uri)
 	if err != nil {
 		return fmt.Errorf("failed to list objects: %w", err)
+	}
+	if task.SharedArtifact {
+		objects = filterInternalArtifactObjectSummaries(objects)
 	}
 
 	if len(objects) == 0 {
