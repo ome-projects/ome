@@ -144,6 +144,10 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 	if h.childPathConflictsWithParent(input.ChildModelPath, parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
+	// The child may have been deleted or replaced while the parent downloaded.
+	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
+		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
+	}
 	if err := h.files.CreateChildSymlink(input.ChildModelPath, parent.LocalPath); err != nil {
 		if errors.Is(err, errHfArtifactChildPathConflict) {
 			return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil

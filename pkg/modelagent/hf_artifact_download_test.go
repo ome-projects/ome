@@ -348,7 +348,7 @@ func TestHfArtifactDownloadRetriesWhenChildPathChanged(t *testing.T) {
 	})
 }
 
-func TestHfArtifactDownloadKeepsSymlinkWhenChildIsSuperseded(t *testing.T) {
+func TestHfArtifactDownloadSkipsSymlinkForSupersededChild(t *testing.T) {
 	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
 	handler := newHfArtifactTaskHandler(repository)
 	input := testHfArtifactTaskInput(t, t.TempDir(), "model-1")
@@ -368,12 +368,18 @@ func TestHfArtifactDownloadKeepsSymlinkWhenChildIsSuperseded(t *testing.T) {
 	repository.configMaps.cacheMutex.Lock()
 	repository.configMaps.modelCache[second.ChildModelKey] = &CacheEntry{ModelUID: types.UID("current-model-uid")}
 	repository.configMaps.cacheMutex.Unlock()
+	before, err := repository.configMaps.getConfigMap(context.Background())
+	require.NoError(t, err)
 
 	result, err := handler.attachChildToReadyParent(context.Background(), second, second.Parent)
 
 	require.NoError(t, err)
 	assert.Equal(t, hfArtifactTaskDone, result.Outcome)
-	assertChildSymlinkTarget(t, second.ChildModelPath, input.Parent.LocalPath)
+	assertChildPathMissing(t, second.ChildModelPath)
+	assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+	after, err := repository.configMaps.getConfigMap(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, before.Data, after.Data)
 	parent, found, getErr := repository.Get(context.Background(), input.Parent.Identity)
 	require.NoError(t, getErr)
 	require.True(t, found)
