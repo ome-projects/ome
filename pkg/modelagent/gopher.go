@@ -79,6 +79,9 @@ type Gopher struct {
 	samePathWaitDelay   time.Duration
 	samePathWaitTimeout time.Duration
 
+	stageConfig StageConfig
+	stageSlots  chan struct{}
+
 	startupReadyModelKeys map[string]struct{}
 }
 
@@ -99,6 +102,7 @@ func NewGopher(
 	multipartConcurrency int,
 	downloadRetry int,
 	modelRootDir string,
+	stageConfig StageConfig,
 	gopherChan chan *GopherTask,
 	samePathWaitTimeout time.Duration,
 	nodeLabelReconciler *NodeLabelReconciler,
@@ -112,6 +116,16 @@ func NewGopher(
 	}
 	if samePathWaitTimeout <= 0 {
 		samePathWaitTimeout = defaultSamePathWaitTimeout
+	}
+	if stageConfig.Concurrency <= 0 {
+		stageConfig.Concurrency = defaultStageConcurrency
+	}
+	// A source root that is not mounted yields nothing but per-model failures
+	// later, so say so once, loudly, at startup.
+	for _, root := range stageConfig.SourceRoots {
+		if _, statErr := os.Stat(root); statErr != nil {
+			logger.Errorf("Stage source root %s is not accessible: %v; stage:// models under it will fail", root, statErr)
+		}
 	}
 
 	return &Gopher{
@@ -133,6 +147,8 @@ func NewGopher(
 		taskQueue:              newGopherTaskQueue(),
 		samePathWaitDelay:      defaultSamePathWaitDelay,
 		samePathWaitTimeout:    samePathWaitTimeout,
+		stageConfig:            stageConfig,
+		stageSlots:             make(chan struct{}, stageConfig.Concurrency),
 	}, nil
 }
 
@@ -530,6 +546,12 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			if err := s.processLocalStorageModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
 				return err
 			}
+		case storage.StorageTypeStage:
+			s.logger.Infof("Processing stage storage type for model %s", modelInfo)
+			// Stage storage copies the model from a mounted source onto local disk
+			if err := s.processStageStorageModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unknown storage type %s", storageType)
 		}
@@ -641,6 +663,18 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				}
 			} else {
 				s.logger.Infof("no need to delete parent model artifact directory %s: %s", parentName, parentDir)
+			}
+		case storage.StorageTypeStage:
+			// Only the node-local copy goes; the shared source is never ours to delete.
+			destPath, pathErr := s.stageDestPath(baseModelSpec)
+			if pathErr != nil {
+				s.logger.Errorf("Cannot determine stage destination for model %s: %v", modelInfo, pathErr)
+				break
+			}
+			s.logger.Infof("Removing staged copy of model %s at %s", modelInfo, destPath)
+			if err = s.deleteModel(destPath, task); err != nil {
+				s.logger.Errorf("Failed to delete staged model %s: %v", modelInfo, err)
+				return err
 			}
 		case storage.StorageTypeLocal:
 			s.logger.Infof("Skipping deletion for local storage model %s (local files should not be deleted)", modelInfo)

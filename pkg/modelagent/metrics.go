@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/hfutil/hub"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -40,10 +41,31 @@ type Metrics struct {
 }
 
 // NewMetrics creates a new Metrics struct with initialized Prometheus metrics
-func NewMetrics(registerer prometheus.Registerer) *Metrics {
+func NewMetrics(registerer prometheus.Registerer, modelsRootDir string) *Metrics {
 	if registerer == nil {
 		registerer = prometheus.DefaultRegisterer
 	}
+
+	// There is no eviction: a full models root turns into failed downloads that
+	// only a human can clear. Publishing free space is what makes that visible
+	// before it happens, and what the console reads to warn before staging.
+	modelsRootFreeBytes := promauto.With(registerer).NewGauge(prometheus.GaugeOpts{
+		Name: "model_agent_models_root_free_bytes",
+		Help: "Free bytes on the filesystem holding the models root directory",
+	})
+	updateModelsRootFreeBytes := func() {
+		available, err := hub.AvailableDiskSpace(modelsRootDir)
+		if err != nil {
+			// An unreadable models root must not take the agent down; 0 reads
+			// as "unknown or full", which is the safe direction for an alert.
+			modelsRootFreeBytes.Set(0)
+			return
+		}
+		modelsRootFreeBytes.Set(float64(available))
+	}
+	// Publish once synchronously so the gauge is meaningful immediately after
+	// startup rather than after the first tick.
+	updateModelsRootFreeBytes()
 
 	// Manual Go metrics for more detailed tracking
 	goGoroutines := promauto.With(registerer).NewGauge(prometheus.GaugeOpts{
@@ -131,6 +153,8 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 					goGCDuration.Observe(float64(memStats.PauseNs[pauseIndex]) / 1e9)
 				}
 			}
+
+			updateModelsRootFreeBytes()
 
 			time.Sleep(15 * time.Second)
 		}

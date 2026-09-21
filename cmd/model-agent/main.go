@@ -44,6 +44,8 @@ type config struct {
 	numDownloadWorker     int
 	numHighPriorityWorker int
 	samePathWaitTimeout   time.Duration
+	stageSourceRoots      []string
+	stageConcurrency      int
 	namespace             string
 	logLevel              string
 }
@@ -76,6 +78,8 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
+	rootCmd.PersistentFlags().StringSliceVar(&cfg.stageSourceRoots, "stage-source-roots", nil, "Directories under which stage:// sources are allowed; staging is disabled when empty")
+	rootCmd.PersistentFlags().IntVar(&cfg.stageConcurrency, "stage-concurrency", 2, "Number of concurrent stage:// copies; bounded by the shared storage rather than by this node")
 	rootCmd.PersistentFlags().StringVar(&cfg.namespace, "namespace", "ome", "Kubernetes namespace to use")
 	rootCmd.PersistentFlags().StringVar(&cfg.logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
@@ -178,7 +182,7 @@ func initializePrometheusMetrics(logger *Logger) *modelagent.Metrics {
 	}
 
 	// Initialize metrics
-	metrics := modelagent.NewMetrics(nil)
+	metrics := modelagent.NewMetrics(nil, cfg.modelsRootDir)
 	logger.Info("Initialized Prometheus metrics")
 	return metrics
 }
@@ -267,6 +271,10 @@ func initializeComponents(
 		cfg.multipartConcurrency,
 		cfg.downloadRetry,
 		cfg.modelsRootDir,
+		modelagent.StageConfig{
+			SourceRoots: cfg.stageSourceRoots,
+			Concurrency: cfg.stageConcurrency,
+		},
 		gopherTaskChan,
 		cfg.samePathWaitTimeout,
 		nodeLabelReconciler,
