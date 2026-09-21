@@ -1302,10 +1302,17 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 		return fmt.Errorf("no objects found under namespace %s, bucket %s, object prefix %s", uri.Namespace, uri.BucketName, uri.Prefix)
 	}
 
+	_, sharedParentDownload, _ := newHfArtifactTaskInputForOCI(task, baseModelSpec.Storage, s.modelRootDir)
+	sharedParentDownload = sharedParentDownload && filepath.Clean(destPath) != filepath.Clean(getDestPath(&baseModelSpec, s.modelRootDir))
 	var objectUris []ociobjectstore.ObjectURI
 	for _, obj := range objects {
 		if obj.Name == nil {
 			continue
+		}
+		if sharedParentDownload {
+			if _, err := hfArtifactObjectPath(destPath, uri.Prefix, *obj.Name); err != nil {
+				return err
+			}
 		}
 		objectUris = append(objectUris, ociobjectstore.ObjectURI{
 			Namespace:  uri.Namespace,

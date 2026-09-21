@@ -9,6 +9,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestHfArtifactFilesystemPathsRequireExpectedParent(t *testing.T) {
+	for _, changed := range []string{"none", "key", "path"} {
+		t.Run(changed, func(t *testing.T) {
+			input := testHfArtifactTaskInput(t, t.TempDir(), "child")
+			parent := input.Parent
+			switch changed {
+			case "key":
+				input.Parent.Key += ".other"
+			case "path":
+				input.Parent.LocalPath = canonicalHfArtifactPath(filepath.Join(input.ModelStoreRoot, "other-store", "child"), parent.Identity)
+			}
+
+			err := input.validateFilesystemPaths(parent)
+
+			if changed == "none" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "shared artifact parent path changed")
+			}
+		})
+	}
+}
+
 func TestHfArtifactFilesHasChildren(t *testing.T) {
 	for _, tt := range []struct {
 		name          string
@@ -95,4 +118,15 @@ func TestHfArtifactFilesHasChildrenReturnsSymlinkReadError(t *testing.T) {
 	_, err := (hfArtifactFiles{}).HasChildren(parentPath, root)
 
 	require.Error(t, err, "an unreadable link must not be treated as an unrelated child")
+}
+
+func TestHfArtifactScanFindsUnknownLinkInOtherArtifact(t *testing.T) {
+	root := t.TempDir()
+	input := testHfArtifactTaskInput(t, root, "child")
+	other := filepath.Join(root, "_artifacts", "other", "old-snapshot")
+	require.NoError(t, os.MkdirAll(other, 0o755))
+	require.NoError(t, os.Symlink(input.Parent.LocalPath, filepath.Join(other, "unknown-child")))
+	found, err := (hfArtifactFiles{}).HasChildren(input.Parent.LocalPath, root)
+	require.NoError(t, err)
+	assert.True(t, found, "only the actual parent's contents may be skipped")
 }

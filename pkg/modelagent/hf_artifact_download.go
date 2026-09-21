@@ -13,9 +13,9 @@ func (h *hfArtifactTaskHandler) handleDownload(
 	input hfArtifactTaskInput,
 	download hfArtifactDownloadFunc,
 ) (hfArtifactTaskResult, error) {
-	unlock, acquired := h.tryParentOperation(input.Parent.Key)
-	if !acquired {
-		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
+	unlock, acquired, err := h.tryArtifactOperation(input)
+	if err != nil || !acquired {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
@@ -34,6 +34,9 @@ func (h *hfArtifactTaskHandler) handleDownload(
 	}
 	if !found {
 		parent = input.Parent
+	}
+	if err := input.validateFilesystemPaths(parent); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	if h.childPathConflictsWithParent(input.ChildModelPath, parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
@@ -64,6 +67,11 @@ func (h *hfArtifactTaskHandler) downloadParentAndAttachChild(
 
 	parent, acquired, err := h.repository.TryAcquireLock(ctx, parent)
 	if err != nil {
+		if acquired {
+			// The acquisition may have committed despite the error. Retain only
+			// our attempted owner so retry can release it before acquiring again.
+			h.pendingFailures.Store(parent.Key, &parent)
+		}
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	if !acquired {
@@ -156,16 +164,23 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
-	if err := h.files.CreateChildSymlink(input.ChildModelPath, parent.LocalPath); err != nil {
+	created, err := h.files.createChildSymlink(input.ChildModelPath, parent.LocalPath)
+	if err != nil {
 		if errors.Is(err, errHfArtifactChildPathConflict) {
 			return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 		}
 		return hfArtifactTaskResult{}, err
 	}
-	err := h.repository.AddModelReference(ctx, parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath)
+	err = h.repository.AddModelReference(ctx, parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath)
 	// Deletion or same-name recreation can race with the reference write.
-	// Do not remove a path that might now belong to the replacement CR instance.
+	// The child path lock excludes replacement attaches until this task exits.
+	// Roll back only the link this attempt created, never a pre-existing link.
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
+		if created && h.files.IsChildLinkedToParent(input.ChildModelPath, parent.LocalPath) {
+			if err := h.files.RemoveChildSymlink(input.ChildModelPath, parent.LocalPath); err != nil {
+				return newHfArtifactRetryResult(parent.Key, err), nil
+			}
+		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
 	if err != nil {

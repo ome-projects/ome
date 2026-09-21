@@ -144,6 +144,46 @@ func TestStartupCoverageQuarantinesInvalidOwnership(t *testing.T) {
 	}
 }
 
+func TestHfArtifactStartupQuarantinesMismatchedEntryKey(t *testing.T) {
+	h, first, second := newTestHfArtifactRepair(t)
+	ctx := context.Background()
+	c := h.repository.configMaps
+	cm, err := c.getConfigMap(ctx)
+	require.NoError(t, err)
+	parentRaw := cm.Data[first.Parent.Key]
+	parent, err := decodeHfArtifactEntry(first.Parent.Key, parentRaw)
+	require.NoError(t, err)
+	parent.Status = HfArtifactStatusUpdating
+	parent.LockID = "abandoned-foreign-lock"
+	parent.LastCompletedLockID = ""
+	foreignKey := first.Parent.Key + ".foreign"
+	foreignRaw, err := json.Marshal(parent)
+	require.NoError(t, err)
+	cm.Data[foreignKey] = string(foreignRaw)
+	_, err = c.kubeClient.CoreV1().ConfigMaps(c.namespace).Update(ctx, cm, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	startup := newHfArtifactStartup(h)
+	require.NoError(t, startup.recover(ctx))
+	assert.True(t, startup.recovered)
+	assert.True(t, startup.needsValidation(foreignKey))
+	assert.NotContains(t, startup.deferred, foreignKey)
+	after, err := c.getConfigMap(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, parentRaw, after.Data[first.Parent.Key])
+	assert.Equal(t, string(foreignRaw), after.Data[foreignKey])
+
+	validations := 0
+	result, err := startup.validateOnce(ctx, second, func(string) (bool, error) {
+		validations++
+		return true, nil
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, hfArtifactTaskDone, result.Outcome)
+	assert.Equal(t, 1, validations)
+	assertChildSymlinkTarget(t, second.ChildModelPath, first.Parent.LocalPath)
+}
+
 func TestStartupCoverageCompletedValidationReusesParent(t *testing.T) {
 	h, first, second := newTestHfArtifactRepair(t)
 	startup := newHfArtifactStartup(h)
@@ -169,6 +209,10 @@ func TestStartupCoveragePreserveWaitsForDurableCompletion(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, runTestHfArtifactDownload(h, input))
 	require.NoError(t, s.hfArtifactStartup.recover(ctx))
+	lock, acquired, err := tryHfArtifactParentFileLock(input.Parent, input.ModelStoreRoot)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	t.Cleanup(func() { _ = lock.Close() })
 	parent, acquired, err := h.repository.TryAcquireLockForRepair(ctx, input.Parent)
 	require.NoError(t, err)
 	require.True(t, acquired)
@@ -177,6 +221,7 @@ func TestStartupCoveragePreserveWaitsForDurableCompletion(t *testing.T) {
 	require.Equal(t, hfArtifactTaskRetry, result.Outcome)
 	assertChildSymlinkTarget(t, input.ChildModelPath, parent.LocalPath)
 	require.NoError(t, h.files.WriteParentReadyMarker(parent))
+	require.NoError(t, lock.Close())
 	unavailable := true
 	h.repository.configMaps.kubeClient.(*fake.Clientset).PrependReactor("update", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
 		if unavailable {

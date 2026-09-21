@@ -141,6 +141,130 @@ func TestSharedOCIStatusRechecksReferenceAndReleasesLock(t *testing.T) {
 	unlock()
 }
 
+func TestSharedOCIRejectsReplacedPathsBeforeStatusOrPreservation(t *testing.T) {
+	for _, operation := range []string{"status", "preserve"} {
+		for _, changedPath := range []string{"parent only", "child only"} {
+			t.Run(operation+"/"+changedPath, func(t *testing.T) {
+				ctx := context.Background()
+				s, task, input := newTestHfArtifactGopher(t)
+				handler := s.sharedHfArtifactHandler()
+				require.NoError(t, runTestHfArtifactDownload(handler, input))
+				oldSnapshot, err := handler.repository.configMaps.getConfigMap(ctx)
+				require.NoError(t, err)
+
+				// Build a valid replacement using an independent reconciler. Both
+				// paths remain inside the original model store.
+				replacementRepository, _ := newTestHfArtifactRepository(t, oldSnapshot.DeepCopy().Data)
+				replacementHandler := newHfArtifactTaskHandler(replacementRepository)
+				result, err := replacementHandler.handleDelete(ctx, input)
+				require.NoError(t, err)
+				require.Equal(t, hfArtifactTaskDone, result.Outcome)
+				replacement := input
+				if changedPath == "parent only" {
+					replacement.Parent.LocalPath = canonicalHfArtifactPath(filepath.Join(input.ModelStoreRoot, "replacement-store", "child"), replacement.Parent.Identity)
+					require.NotEqual(t, input.Parent.LocalPath, replacement.Parent.LocalPath)
+					require.Equal(t, input.ChildModelPath, replacement.ChildModelPath)
+				} else {
+					replacement.ChildModelPath = filepath.Join(input.ModelStoreRoot, "replacement-child")
+					require.Equal(t, input.Parent.LocalPath, replacement.Parent.LocalPath)
+					require.NotEqual(t, input.ChildModelPath, replacement.ChildModelPath)
+				}
+				require.Equal(t, input.Parent.Key, replacement.Parent.Key)
+				require.Equal(t, input.Parent.Identity, replacement.Parent.Identity)
+				require.NoError(t, replacement.validateFilesystemPaths(replacement.Parent))
+				require.NoError(t, runTestHfArtifactDownload(replacementHandler, replacement))
+				currentModel := task.BaseModel.DeepCopy()
+				currentModel.Spec.Storage.Path = &replacement.ChildModelPath
+				require.NoError(t, replacementRepository.configMaps.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
+					BaseModel: currentModel, ModelStatus: ModelStatusReady,
+				}))
+				initialLabel := Updating
+				if operation == "preserve" {
+					// A completed repair marker must not let stale preserve input
+					// finalize the replacement before its child path is checked.
+					parent, acquired, err := replacementRepository.TryAcquireLockForRepair(ctx, replacement.Parent)
+					require.NoError(t, err)
+					require.True(t, acquired)
+					parent, err = replacementRepository.MarkChildrenFailedForRepair(ctx, parent)
+					require.NoError(t, err)
+					require.NoError(t, replacementHandler.files.WriteParentReadyMarker(parent))
+					initialLabel = Failed
+				}
+				replacementSnapshot, err := replacementRepository.configMaps.getConfigMap(ctx)
+				require.NoError(t, err)
+				markerPath := filepath.Join(replacement.Parent.LocalPath, constants.HfArtifactReadyMarkerFileName)
+				marker, err := os.ReadFile(markerPath)
+				require.NoError(t, err)
+				configPath := filepath.Join(replacement.Parent.LocalPath, "config.json")
+				config, err := os.ReadFile(configPath)
+				require.NoError(t, err)
+
+				client := s.configMapReconciler.kubeClient.(*k8sfake.Clientset)
+				nodeName := s.configMapReconciler.nodeName
+				label := constants.GetBaseModelLabel(currentModel.Namespace, currentModel.Name)
+				_, err = client.CoreV1().Nodes().Create(ctx, &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{label: string(initialLabel)}},
+				}, metav1.CreateOptions{})
+				require.NoError(t, err)
+				s.nodeLabelReconciler = NewNodeLabelReconciler(nodeName, client, 1, s.logger)
+				indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+				require.NoError(t, indexer.Add(currentModel))
+				s.baseModelLister = modelslister.NewBaseModelLister(indexer)
+				injected := false
+				client.PrependReactor("get", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+					if injected {
+						return false, nil, nil
+					}
+					injected = true
+					// Return the read from before replacement, but make the next
+					// read observe it. Never reenter the fake client in its reactor.
+					err := client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), replacementSnapshot.DeepCopy(), replacementSnapshot.Namespace)
+					require.NoError(t, err)
+					return true, oldSnapshot.DeepCopy(), nil
+				})
+				client.ClearActions()
+
+				if operation == "status" {
+					err = s.safeNodeLabelReconciliation(ctx, &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready})
+					require.Error(t, err, "a stale path must not authorize replacement Ready publication")
+				} else {
+					result, err = s.releaseHfArtifactChild(ctx, input, true)
+					require.NoError(t, err)
+					require.Equal(t, hfArtifactTaskRetry, result.Outcome)
+					require.Error(t, result.RetryReason)
+				}
+				require.True(t, injected)
+				for _, action := range client.Actions() {
+					require.False(t, action.Matches("update", "configmaps") || action.Matches("patch", "nodes"),
+						"stale paths must be rejected before status or reference writes: %s %s", action.GetVerb(), action.GetResource().Resource)
+				}
+				unlock, acquired, err := handler.tryArtifactOperation(input)
+				require.NoError(t, err)
+				require.True(t, acquired, "rejection must release the original local, parent-file, and child-file locks")
+				unlock()
+				after, err := handler.repository.configMaps.getConfigMap(ctx)
+				require.NoError(t, err)
+				require.Equal(t, replacementSnapshot.Data, after.Data)
+				node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, string(initialLabel), node.Labels[label])
+				afterMarker, err := os.ReadFile(markerPath)
+				require.NoError(t, err)
+				require.Equal(t, marker, afterMarker)
+				afterConfig, err := os.ReadFile(configPath)
+				require.NoError(t, err)
+				require.Equal(t, config, afterConfig)
+				assertChildSymlinkTarget(t, replacement.ChildModelPath, replacement.Parent.LocalPath)
+				if changedPath == "child only" {
+					assertChildPathMissing(t, input.ChildModelPath)
+				} else {
+					require.NoDirExists(t, input.Parent.LocalPath)
+				}
+			})
+		}
+	}
+}
+
 func TestSharedOCIPreserveHandlesMissingAndBusyReferences(t *testing.T) {
 	for _, scenario := range []string{"missing", "busy", "lookup error", "changed parent", "missing marker"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -266,7 +390,11 @@ func TestSharedOCIDetachDefersWhileParentIsUpdating(t *testing.T) {
 			s, task, input := newTestHfArtifactGopher(t)
 			handler := s.sharedHfArtifactHandler()
 			require.NoError(t, runTestHfArtifactDownload(handler, input))
-			_, acquired, err := handler.repository.TryAcquireLockForRepair(context.Background(), input.Parent)
+			lock, acquired, err := tryHfArtifactParentFileLock(input.Parent, input.ModelStoreRoot)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			t.Cleanup(func() { _ = lock.Close() })
+			_, acquired, err = handler.repository.TryAcquireLockForRepair(context.Background(), input.Parent)
 			require.NoError(t, err)
 			require.True(t, acquired)
 			task.BaseModel.Spec.Storage.DownloadPolicy = nil

@@ -8,9 +8,9 @@ import (
 // handleDelete removes this child's references and symlink. Only the final
 // recorded child acquires the lock needed to delete parent files.
 func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifactTaskInput) (hfArtifactTaskResult, error) {
-	unlock, acquired := h.tryParentOperation(input.Parent.Key)
-	if !acquired {
-		return newHfArtifactRetryResult(input.Parent.Key, nil), nil
+	unlock, acquired, err := h.tryArtifactOperation(input)
+	if err != nil || !acquired {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
@@ -32,6 +32,9 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("child model %s parent reference changed", input.ChildModelKey)), nil
 	}
 	if err := input.validateStoredChildPath(parent); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
+	if err := input.validateFilesystemPaths(parent); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 	if parent.Status == HfArtifactStatusUpdating {
@@ -84,6 +87,9 @@ func (h *hfArtifactTaskHandler) removeUnreferencedChildSymlink(ctx context.Conte
 	if !found {
 		parent = input.Parent
 	} else {
+		if err := input.validateFilesystemPaths(parent); err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
 		// A one-sided record requires reconciliation, not removal of the local link.
 		if _, referencesChild := parent.Children[input.ChildModelKey]; referencesChild {
 			return newHfArtifactRetryResult(parent.Key, fmt.Errorf("child model %s and shared Hugging Face parent %s do not contain matching references", input.ChildModelKey, parent.Key)), nil
@@ -135,5 +141,5 @@ func (h *hfArtifactTaskHandler) releaseParentDeletionLock(ctx context.Context, p
 	if wasReady && h.files.ParentReadyMarkerExists(parent) {
 		return h.repository.MarkReady(ctx, parent)
 	}
-	return h.repository.MarkFailed(ctx, parent)
+	return h.markParentFailed(ctx, parent)
 }

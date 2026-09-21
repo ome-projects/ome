@@ -85,8 +85,8 @@ func newHfArtifactTaskHandler(repository *HfArtifactRepository) *hfArtifactTaskH
 }
 
 // tryParentOperation covers filesystem and label side effects as well as the
-// ConfigMap transition. LockID fences durable writes; this process-local lock
-// prevents a late completion callback from racing the next parent operation.
+// ConfigMap transition. This local guard is retained for label callbacks; file
+// operations also acquire advisory locks through tryParentFileOperation.
 // Contenders return to the queue instead of blocking a worker on a download.
 func (h *hfArtifactTaskHandler) tryParentOperation(key string) (func(), bool) {
 	value, _ := h.repository.configMaps.hfArtifactOperations.LoadOrStore(key, &sync.Mutex{})

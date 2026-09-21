@@ -14,12 +14,13 @@ import (
 type hfArtifactStartup struct {
 	mu        sync.Mutex
 	recovered bool
-	pending   map[string]bool // true while a worker validates this startup parent
+	pending   map[string]bool            // true while a worker validates this startup parent
+	deferred  map[string]HfArtifactEntry // Updating parents awaiting ownership recovery.
 	handler   *hfArtifactTaskHandler
 }
 
 func newHfArtifactStartup(handler *hfArtifactTaskHandler) *hfArtifactStartup {
-	return &hfArtifactStartup{handler: handler, pending: make(map[string]bool)}
+	return &hfArtifactStartup{handler: handler, pending: make(map[string]bool), deferred: make(map[string]HfArtifactEntry)}
 }
 
 // recover must run before any shared-artifact task can acquire a parent. Keeping
@@ -31,7 +32,7 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 	if s.recovered {
 		return nil
 	}
-	cm, err := s.handler.repository.configMaps.getConfigMap(ctx)
+	cm, err := s.handler.repository.configMaps.getConfigMapForRecovery(ctx)
 	if apierrors.IsNotFound(err) {
 		s.recovered = true
 		return nil
@@ -44,6 +45,9 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 			continue
 		}
 		parent, err := decodeHfArtifactEntry(key, raw)
+		if err == nil && parent.Key != key {
+			err = fmt.Errorf("shared artifact entry %s records key %s", key, parent.Key)
+		}
 		if err == nil {
 			err = validateHfArtifactIdentityAndPath(parent)
 		}
@@ -61,12 +65,27 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 			continue
 		}
 		if parent.Status == HfArtifactStatusUpdating {
+			unlock, acquired, err := s.handler.tryParentFileOperation(parent, hfArtifactParentStoreRoot(parent))
+			if err != nil {
+				s.deferred[key] = parent
+				s.pending[key] = false
+				s.handler.repository.configMaps.logger.Warnf("Cannot inspect startup parent ownership %s: %v", key, err)
+				continue
+			}
+			if !acquired {
+				// Another agent process still owns this directory. Its completion
+				// must be validated by this process, never reset merely by age.
+				s.pending[key] = false
+				s.deferred[key] = parent
+				continue
+			}
 			if s.handler.files.ParentReadyMarkerMatchesLock(parent) {
 				if _, err := hfArtifactChildStatusesToRestore(cm.Data, parent, parent); err != nil {
 					// A malformed relationship blocks this identity only. API errors
 					// below still keep the global scan pending until it can finish.
 					s.pending[key] = false
 					s.handler.repository.configMaps.logger.Warnf("Cannot finalize shared artifact %s during startup: %v", key, err)
+					unlock()
 					continue
 				}
 				err = s.handler.markParentReady(ctx, parent)
@@ -75,6 +94,7 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 				err = s.handler.repository.MarkFailed(ctx, parent)
 				parent.Status = HfArtifactStatusFailed
 			}
+			unlock()
 			if err != nil {
 				return fmt.Errorf("recover shared artifact %s: %w", key, err)
 			}
@@ -84,6 +104,69 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 		}
 	}
 	s.recovered = true
+	return nil
+}
+
+// recoverParent checks current ownership, including work started by another
+// process after our startup snapshot. Only an available OS lock permits recovery;
+// a cached Updating record alone never proves that its owner has stopped.
+func (s *hfArtifactStartup) recoverParent(ctx context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expected, deferred := s.deferred[key]
+	if !deferred {
+		exists, raw, err := s.handler.repository.configMaps.getDataEntryBasedOnModelKey(ctx, key)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil || !exists {
+			return err
+		}
+		expected, err = decodeHfArtifactEntry(key, raw)
+		if err != nil {
+			return err
+		}
+		if expected.Key != key {
+			return fmt.Errorf("shared artifact entry %s records key %s", key, expected.Key)
+		}
+		if err := validateHfArtifactIdentityAndPath(expected); err != nil {
+			return err
+		}
+		if expected.Status != HfArtifactStatusUpdating {
+			return nil
+		}
+		if expected.LockID == "" {
+			return fmt.Errorf("Updating shared artifact %s has no lock owner", key)
+		}
+		s.deferred[key] = expected
+	}
+	unlock, acquired, err := s.handler.tryParentFileOperation(expected, hfArtifactParentStoreRoot(expected))
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return fmt.Errorf("shared artifact %s still has an active owner", key)
+	}
+	defer unlock()
+	parent, found, err := s.handler.repository.Get(ctx, expected.Identity)
+	if err != nil {
+		return err
+	}
+	if found && parent.LocalPath != expected.LocalPath {
+		s.deferred[key] = parent
+		return fmt.Errorf("startup parent %s path changed", key)
+	}
+	if found && parent.Status == HfArtifactStatusUpdating {
+		if s.handler.files.ParentReadyMarkerMatchesLock(parent) {
+			err = s.handler.markParentReady(ctx, parent)
+		} else {
+			err = s.handler.repository.MarkFailed(ctx, parent)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	delete(s.deferred, key)
 	return nil
 }
 

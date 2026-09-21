@@ -150,7 +150,11 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	if err != nil || !found {
 		return noop, err
 	}
-	unlock, acquired := handler.tryParentOperation(parent.Key)
+	input := s.hfArtifactInputForChild(task, parent)
+	unlock, acquired, err := handler.tryParentFileOperation(parent, input.ModelStoreRoot)
+	if err != nil {
+		return noop, err
+	}
 	if !acquired {
 		return noop, fmt.Errorf("shared artifact %s has an active operation", parent.Key)
 	}
@@ -158,6 +162,12 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	parent, found, err = handler.repository.GetParentForChild(ctx, key)
 	if err == nil && (!found || parent.Key != lockedParentKey) {
 		err = fmt.Errorf("shared artifact reference changed before child status update")
+	}
+	if err == nil {
+		err = input.validateStoredChildPath(parent)
+	}
+	if err == nil {
+		err = input.validateFilesystemPaths(parent)
 	}
 	if err == nil && found && (op.ModelStateOnNode == Ready || len(parent.ChildStatusesBeforeRepair) != 0) &&
 		(parent.Status != HfArtifactStatusReady || !handler.files.ParentReadyMarkerExists(parent)) {
@@ -222,6 +232,9 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (hfArtifactTaskResult, error) {
 	handler := s.sharedHfArtifactHandler()
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
+	if err := s.hfArtifactStartup.recoverParent(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	parent, found, err := handler.repository.Get(ctx, input.Parent.Identity)
@@ -357,8 +370,14 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
+	if err := s.hfArtifactStartup.recoverParent(ctx, input.Parent.Key); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if preserve {
-		unlock, acquired := handler.tryParentOperation(input.Parent.Key)
+		unlock, acquired, err := handler.tryArtifactOperation(input)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
 		if !acquired {
 			return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 		}
@@ -375,6 +394,12 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 		}
 		if current.Key != input.Parent.Key {
 			return newHfArtifactRetryResult(current.Key, fmt.Errorf("child parent changed before preserving artifact")), nil
+		}
+		if err := input.validateStoredChildPath(current); err != nil {
+			return newHfArtifactRetryResult(current.Key, err), nil
+		}
+		if err := input.validateFilesystemPaths(current); err != nil {
+			return newHfArtifactRetryResult(current.Key, err), nil
 		}
 		input.Parent = current
 		if current.Status == HfArtifactStatusUpdating {
@@ -463,7 +488,10 @@ func (s *Gopher) validateHfOCIArtifact(ctx context.Context, task *GopherTask, ur
 		}
 		objectURI := *uri
 		objectURI.ObjectName = *object.Name
-		localPath := filepath.Join(parentPath, strings.TrimPrefix(*object.Name, uri.Prefix))
+		localPath, err := hfArtifactObjectPath(parentPath, uri.Prefix, *object.Name)
+		if err != nil {
+			return false, err
+		}
 		valid, err := store.IsLocalCopyValid(objectURI, localPath)
 		if err != nil || !valid {
 			return false, err

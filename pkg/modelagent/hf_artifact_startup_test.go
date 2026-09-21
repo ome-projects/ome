@@ -144,6 +144,161 @@ func TestHfArtifactStartupMissingConfigMapIsColdStart(t *testing.T) {
 	assert.Empty(t, startup.pending)
 }
 
+func TestHfArtifactStartupWaitsForOldProcessBeforeRecovery(t *testing.T) {
+	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+	h := newHfArtifactTaskHandler(repository)
+	input := testHfArtifactTaskInput(t, t.TempDir(), "model-1")
+	parent, acquired, err := repository.TryAcquireLock(context.Background(), input.Parent)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	lock, acquired, err := tryHfArtifactParentFileLock(parent, input.ModelStoreRoot)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	t.Cleanup(func() { _ = lock.Close() })
+	startup := newHfArtifactStartup(h)
+	require.NoError(t, startup.recover(context.Background()))
+	assert.True(t, startup.recovered, "one active owner must not block unrelated parents")
+	require.ErrorContains(t, startup.recoverParent(context.Background(), parent.Key), "active owner")
+	stored, _, err := repository.Get(context.Background(), parent.Identity)
+	require.NoError(t, err)
+	assert.Equal(t, parent.LockID, stored.LockID)
+	// Simulate the older process exiting without finishing its ConfigMap state.
+	require.NoError(t, lock.Close())
+	require.NoError(t, startup.recoverParent(context.Background(), parent.Key))
+	stored, _, err = repository.Get(context.Background(), parent.Identity)
+	require.NoError(t, err)
+	assert.Equal(t, HfArtifactStatusFailed, stored.Status)
+	assert.Empty(t, stored.LockID)
+}
+
+func TestHfArtifactStartupRecoversOwnerStartedAfterSnapshot(t *testing.T) {
+	for _, marker := range []string{"old", "matching", "missing"} {
+		t.Run(marker, func(t *testing.T) {
+			ctx := context.Background()
+			repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+			handler := newHfArtifactTaskHandler(repository)
+			input := testHfArtifactTaskInput(t, t.TempDir(), "child")
+			seedTestChildModelEntry(t, repository, input)
+			require.NoError(t, runTestHfArtifactDownload(handler, input))
+			startup := newHfArtifactStartup(handler)
+			require.NoError(t, startup.recover(ctx))
+
+			// Another process begins repair after this process saw Ready.
+			lock, acquired, err := tryHfArtifactParentFileLock(input.Parent, input.ModelStoreRoot)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			t.Cleanup(func() { _ = lock.Close() })
+			parent, acquired, err := repository.TryAcquireLockForRepair(ctx, input.Parent)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			switch marker {
+			case "matching":
+				require.NoError(t, handler.files.WriteParentReadyMarker(parent))
+			case "missing":
+				require.NoError(t, os.Remove(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName)))
+			}
+			require.ErrorContains(t, startup.recoverParent(ctx, parent.Key), "active owner")
+			stored, _, err := repository.Get(ctx, parent.Identity)
+			require.NoError(t, err)
+			require.Equal(t, parent.LockID, stored.LockID)
+
+			// A crash releases the OS lock but leaves Updating in the ConfigMap.
+			require.NoError(t, lock.Close())
+			require.NoError(t, startup.recoverParent(ctx, parent.Key))
+			stored, _, err = repository.Get(ctx, parent.Identity)
+			require.NoError(t, err)
+			expectedStatus := HfArtifactStatusFailed
+			if marker == "matching" {
+				expectedStatus = HfArtifactStatusReady
+			}
+			require.Equal(t, expectedStatus, stored.Status)
+			require.Empty(t, stored.LockID)
+			validations := 0
+			result, err := startup.validateOnce(ctx, input, func(string) (bool, error) {
+				validations++
+				return true, nil
+			}, nil)
+			require.NoError(t, err)
+			require.Equal(t, hfArtifactTaskDone, result.Outcome)
+			require.Equal(t, 1, validations)
+			assert.False(t, startup.needsValidation(parent.Key))
+		})
+	}
+}
+
+func TestHfArtifactStartupChecksNewParentAfterSnapshot(t *testing.T) {
+	for _, completed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "abandoned", true: "completed"}[completed], func(t *testing.T) {
+			ctx := context.Background()
+			repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+			handler := newHfArtifactTaskHandler(repository)
+			startup := newHfArtifactStartup(handler)
+			require.NoError(t, startup.recover(ctx))
+			input := testHfArtifactTaskInput(t, t.TempDir(), "child")
+			seedTestChildModelEntry(t, repository, input)
+			lock, acquired, err := tryHfArtifactParentFileLock(input.Parent, input.ModelStoreRoot)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			t.Cleanup(func() { _ = lock.Close() })
+			parent, acquired, err := repository.TryAcquireLock(ctx, input.Parent)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			require.NoError(t, writeTestHfArtifactFiles(parent.LocalPath))
+			if completed {
+				// A waiting task must not turn a new download into startup work.
+				require.ErrorContains(t, startup.recoverParent(ctx, parent.Key), "active owner")
+				require.NoError(t, handler.files.WriteParentReadyMarker(parent))
+				require.NoError(t, repository.MarkReady(ctx, parent))
+			}
+			require.NoError(t, lock.Close())
+			// In the abandoned case, recovery has never observed the live owner.
+			require.NoError(t, startup.recoverParent(ctx, parent.Key))
+			stored, found, err := repository.Get(ctx, parent.Identity)
+			require.NoError(t, err)
+			require.True(t, found)
+			want := HfArtifactStatusFailed
+			if completed {
+				want = HfArtifactStatusReady
+			}
+			assert.Equal(t, want, stored.Status)
+			assert.Empty(t, stored.LockID)
+			assert.False(t, startup.needsValidation(parent.Key))
+			assert.NotContains(t, startup.deferred, parent.Key)
+			if completed {
+				result, err := startup.validateOnce(ctx, input, func(string) (bool, error) {
+					t.Fatal("a completed new download must not be revalidated as startup work")
+					return false, nil
+				}, nil)
+				require.NoError(t, err)
+				assert.Equal(t, hfArtifactTaskDone, result.Outcome)
+				assertChildSymlinkTarget(t, input.ChildModelPath, parent.LocalPath)
+			}
+		})
+	}
+}
+
+func TestHfArtifactStartupLockErrorRetainsValidation(t *testing.T) {
+	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+	h := newHfArtifactTaskHandler(repository)
+	input := testHfArtifactTaskInput(t, t.TempDir(), "model-1")
+	parent, acquired, err := repository.TryAcquireLock(context.Background(), input.Parent)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, writeTestHfArtifactFiles(parent.LocalPath))
+	require.NoError(t, h.files.WriteParentReadyMarker(parent))
+	lockDirectory := filepath.Join(input.ModelStoreRoot, hfArtifactLockDirectory)
+	require.NoError(t, os.WriteFile(lockDirectory, []byte("unavailable lock directory"), 0o644))
+	startup := newHfArtifactStartup(h)
+	require.NoError(t, startup.recover(context.Background()))
+	require.Contains(t, startup.deferred, parent.Key)
+	require.NoError(t, os.Remove(lockDirectory))
+	require.NoError(t, startup.recoverParent(context.Background(), parent.Key))
+	stored, _, err := repository.Get(context.Background(), parent.Identity)
+	require.NoError(t, err)
+	assert.Equal(t, HfArtifactStatusReady, stored.Status)
+	assert.True(t, startup.needsValidation(parent.Key), "successful recovery must still validate bytes after startup")
+}
+
 func TestHfArtifactStartupCorruptForeignRecordDoesNotBlockRecovery(t *testing.T) {
 	h, first, _ := newTestHfArtifactRepair(t)
 	c := h.repository.configMaps
