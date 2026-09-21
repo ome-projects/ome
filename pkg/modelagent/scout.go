@@ -108,7 +108,6 @@ func NewScout(ctx context.Context, nodeName string,
 		"baseModelInformer":        baseModelInformer.Informer(),
 		"clusterBaseModelInformer": clusterBaseModelInformer.Informer(),
 	}
-
 	for name, informer := range informers {
 		err := informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
 			// Pipe to the default handler first, which just logs the error
@@ -277,8 +276,9 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		}
 
 		gopherTask := &GopherTask{
-			TaskType:  Download,
-			BaseModel: baseModel,
+			TaskType:         Download,
+			BaseModel:        baseModel,
+			DownloadPriority: effectiveModelDownloadPriority(baseModel.Spec.Storage, &baseModel.Status),
 			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 				IsTensorrtLLMModel: IsTensorrtLLMModel,
 				ShapeAlias:         w.nodeShapeAlias,
@@ -324,6 +324,7 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		gopherTask := &GopherTask{
 			TaskType:         Download,
 			ClusterBaseModel: clusterBaseModel,
+			DownloadPriority: effectiveModelDownloadPriority(clusterBaseModel.Spec.Storage, &clusterBaseModel.Status),
 			TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 				IsTensorrtLLMModel: IsTensorrtLLMModel,
 				ShapeAlias:         w.nodeShapeAlias,
@@ -359,14 +360,14 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnBM(oldBaseModel, newBaseModel)
 
-	// Exclude DownloadPolicy from Spec diff — policy changes are detected separately above.
-	ignoreDownloadPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy")
+	// Policy changes are handled separately; priority changes only reorder work.
+	ignoreScheduling := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy", "DownloadPriority")
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
 		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
-	}, ignoreDownloadPolicy)
+	}, ignoreScheduling)
 	if err != nil {
 		w.logger.Errorf("Failed to diff BaseModel %s in namespace %s: %v",
 			newBaseModel.Name, newBaseModel.Namespace, err)
@@ -376,6 +377,13 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	if (policyChanged || hasChanges) && w.shouldDownloadModel(newBaseModel.Spec.Storage) {
 		w.logger.Infof("BaseModel %s needs refresh in namespace %s", newBaseModel.GetName(), newBaseModel.GetNamespace())
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
+	} else if effectiveModelDownloadPriority(oldBaseModel.Spec.Storage, &oldBaseModel.Status) !=
+		effectiveModelDownloadPriority(newBaseModel.Spec.Storage, &newBaseModel.Status) &&
+		w.shouldDownloadModel(newBaseModel.Spec.Storage) {
+		w.gopherChan <- &GopherTask{
+			TaskType: Reprioritize, BaseModel: newBaseModel,
+			DownloadPriority: effectiveModelDownloadPriority(newBaseModel.Spec.Storage, &newBaseModel.Status),
+		}
 	}
 }
 
@@ -408,14 +416,14 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel)
 
-	// Exclude DownloadPolicy from Spec diff — policy changes are detected separately above.
-	ignoreDownloadPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy")
+	// Policy changes are handled separately; priority changes only reorder work.
+	ignoreScheduling := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy", "DownloadPriority")
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
 		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
-	}, ignoreDownloadPolicy)
+	}, ignoreScheduling)
 	if err != nil {
 		w.logger.Errorf("Failed to diff ClusterBaseModel %s: %v", newClusterBaseModel.Name, err)
 		return
@@ -424,6 +432,13 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	if (policyChanged || hasChanges) && w.shouldDownloadModel(newClusterBaseModel.Spec.Storage) {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
+	} else if effectiveModelDownloadPriority(oldClusterBaseModel.Spec.Storage, &oldClusterBaseModel.Status) !=
+		effectiveModelDownloadPriority(newClusterBaseModel.Spec.Storage, &newClusterBaseModel.Status) &&
+		w.shouldDownloadModel(newClusterBaseModel.Spec.Storage) {
+		w.gopherChan <- &GopherTask{
+			TaskType: Reprioritize, ClusterBaseModel: newClusterBaseModel,
+			DownloadPriority: effectiveModelDownloadPriority(newClusterBaseModel.Spec.Storage, &newClusterBaseModel.Status),
+		}
 	}
 }
 
@@ -741,6 +756,7 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseM
 	gopherTask := &GopherTask{
 		TaskType:         DownloadOverride,
 		ClusterBaseModel: clusterBaseModel,
+		DownloadPriority: effectiveModelDownloadPriority(clusterBaseModel.Spec.Storage, &clusterBaseModel.Status),
 		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 			IsTensorrtLLMModel: IsTensorrtLLMModel,
 			ShapeAlias:         w.nodeShapeAlias,
@@ -760,8 +776,9 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.
 		modelType = modelTypeFromMetadata
 	}
 	gopherTask := &GopherTask{
-		TaskType:  DownloadOverride,
-		BaseModel: baseModel,
+		TaskType:         DownloadOverride,
+		BaseModel:        baseModel,
+		DownloadPriority: effectiveModelDownloadPriority(baseModel.Spec.Storage, &baseModel.Status),
 		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
 			IsTensorrtLLMModel: IsTensorrtLLMModel,
 			ShapeAlias:         w.nodeShapeAlias,
@@ -770,4 +787,14 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.
 	}
 	w.logger.Infof("generate DownloadOverride task %v", baseModel.Spec.DisplayName)
 	w.gopherChan <- gopherTask
+}
+
+func effectiveModelDownloadPriority(storage *v1beta1.StorageSpec, status *v1beta1.ModelStatusSpec) v1beta1.ModelDownloadPriority {
+	if status != nil && status.DownloadScheduling != nil && status.DownloadScheduling.ServingDemand {
+		return v1beta1.ModelDownloadPriorityHigh
+	}
+	if storage != nil && storage.DownloadPriority != nil {
+		return *storage.DownloadPriority
+	}
+	return v1beta1.ModelDownloadPriorityStandard
 }

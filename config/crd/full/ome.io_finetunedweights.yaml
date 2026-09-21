@@ -78,6 +78,13 @@ spec:
                     - AlwaysDownload
                     - ReuseIfExists
                     type: string
+                  downloadPriority:
+                    default: Standard
+                    enum:
+                    - Background
+                    - Standard
+                    - High
+                    type: string
                   key:
                     type: string
                   nodeAffinity:
@@ -269,6 +276,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              downloadScheduling:
+                properties:
+                  referenceCount:
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  servingDemand:
+                    type: boolean
+                type: object
               lastReconcileTime:
                 format: date-time
                 type: string
