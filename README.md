@@ -63,6 +63,8 @@ helm upgrade --install ome-crd oci://ghcr.io/moirai-internal/charts/ome-crd --na
 helm upgrade --install ome oci://ghcr.io/moirai-internal/charts/ome-resources --namespace ome
 ```
 
+Moving an existing manifest install to these charts? See [Move a manifest install to the Helm charts](https://ome-projects.github.io/ome/docs/installation/#move-a-manifest-install-to-the-helm-charts) first.
+
 ### Option 2: Install from Source
 
 For development or customization:

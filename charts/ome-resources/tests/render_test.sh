@@ -647,3 +647,22 @@ for translator_resource in networking.istio.io/destinationrules gateway.envoypro
   role_grants "${translator_resource%/*}" "${translator_resource#*/}" ||
     fail "manager ClusterRole does not grant list+watch on ${translator_resource}, which a traffic translator watches"
 done
+
+# The preset mutator only changes runtimes that set ome.io/engine and passes
+# every other runtime through untouched, so the webhook must only be called for
+# those. Otherwise, while the service is still backed by a manager that does not
+# serve the preset path (an upgrade from v1.2.x), failurePolicy: Fail rejects
+# every ServingRuntime/ClusterServingRuntime write, including this chart's own
+# default-runtime.
+preset_webhook="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --show-only templates/ome-controller/webhooks/runtimepreset.yaml)"
+engine_preset_condition="expression: \"has(object.metadata.annotations) && 'ome.io/engine' in object.metadata.annotations && object.metadata.annotations['ome.io/engine'] != ''\""
+[ "$(grep -Fc -- "${engine_preset_condition}" <<<"${preset_webhook}")" -eq 2 ] ||
+  fail "preset webhooks are not scoped to runtimes that set ome.io/engine"
+default_runtime="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --show-only templates/ome-controller/default-runtime.yaml)"
+if grep -Fq 'ome.io/engine' <<<"${default_runtime}"; then
+  fail "default-runtime sets ome.io/engine, so installing it would depend on the preset webhook being served"
+fi

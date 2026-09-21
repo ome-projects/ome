@@ -7,6 +7,11 @@ metadata:
   annotations:
     cert-manager.io/inject-ca-from: ome/serving-cert
 webhooks:
+  # Both mutators only change runtimes that set ome.io/engine and pass every
+  # other runtime through, so has-engine-preset skips the call for those,
+  # including this chart's default-runtime. Otherwise, while the service still
+  # routes to a manager that does not serve these paths (an upgrade from
+  # v1.2.x), Fail rejects every ServingRuntime and ClusterServingRuntime write.
   - clientConfig:
       caBundle: Cg==
       service:
@@ -20,6 +25,8 @@ webhooks:
     matchConditions:
       - name: skip-deletion
         expression: "!has(object.metadata.deletionTimestamp)"
+      - name: has-engine-preset
+        expression: "has(object.metadata.annotations) && 'ome.io/engine' in object.metadata.annotations && object.metadata.annotations['ome.io/engine'] != ''"
     rules:
       - apiGroups:
           - ome.io
@@ -43,6 +50,8 @@ webhooks:
     matchConditions:
       - name: skip-deletion
         expression: "!has(object.metadata.deletionTimestamp)"
+      - name: has-engine-preset
+        expression: "has(object.metadata.annotations) && 'ome.io/engine' in object.metadata.annotations && object.metadata.annotations['ome.io/engine'] != ''"
     rules:
       - apiGroups:
           - ome.io

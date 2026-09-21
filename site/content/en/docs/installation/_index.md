@@ -19,6 +19,7 @@ description: >
   - [7. Clone OME repository](#7-clone-ome-repository)
 - [Install the latest development version](#install-the-latest-development-version)
   - [Uninstall](#uninstall)
+- [Move a manifest install to the Helm charts](#move-a-manifest-install-to-the-helm-charts)
 <!-- /toc -->
 
 ## Before you begin
@@ -162,4 +163,32 @@ To uninstall OME, run the following command:
 
 ```shell
 make uninstall
+```
+
+## Move a manifest install to the Helm charts
+
+Manifest installs (`make install`, or the release `manifests.yaml`) configure a
+conversion webhook on the `inferenceservices.ome.io` CRD that the manager no
+longer serves: a `spec.conversion` stanza, plus a
+`cert-manager.io/inject-ca-from` annotation that makes cert-manager keep writing
+a CA bundle into it. The `ome-crd` chart ships this CRD without a conversion
+webhook, and applying it over that stanza can be rejected, for example with
+`spec.conversion.strategy: Required value` or
+`spec.conversion.webhookClientConfig: Forbidden`.
+
+Before you install the `ome-crd` chart over a manifest install, remove the
+annotation first, so cert-manager stops re-injecting the CA bundle, and then the
+stanza:
+
+```shell
+kubectl annotate crd inferenceservices.ome.io cert-manager.io/inject-ca-from-
+kubectl patch crd inferenceservices.ome.io --type=json \
+  -p='[{"op":"remove","path":"/spec/conversion"}]'
+```
+
+The CRD serves a single version, so the webhook was never called and existing
+InferenceServices are unaffected. The conversion strategy then reads `None`:
+
+```shell
+kubectl get crd inferenceservices.ome.io -o jsonpath='{.spec.conversion.strategy}'
 ```
