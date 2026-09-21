@@ -299,6 +299,23 @@ func TestHfArtifactStartupLockErrorRetainsValidation(t *testing.T) {
 	assert.True(t, startup.needsValidation(parent.Key), "successful recovery must still validate bytes after startup")
 }
 
+func TestHfArtifactStartupReceiptRecoveryRefreshesDeferredPath(t *testing.T) {
+	h, input, _ := newRecoveryCoveragePendingDeletion(t)
+	startup := newHfArtifactStartup(h)
+	// The identity moved again after a previous attempt cached another path.
+	other := testHfArtifactTaskInput(t, t.TempDir(), "other-child").Parent
+	other.Status = HfArtifactStatusUpdating
+	other.LockID = "previous-owner"
+	startup.deferred[input.Parent.Key] = other
+	require.NoError(t, startup.recoverParentAtPath(context.Background(), input.Parent.Key, input.Parent.LocalPath))
+	parent, found, err := h.repository.Get(context.Background(), input.Parent.Identity)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, HfArtifactStatusFailed, parent.Status)
+	assert.Empty(t, parent.LockID)
+	assert.NotContains(t, startup.deferred, input.Parent.Key)
+}
+
 func TestHfArtifactStartupCorruptForeignRecordDoesNotBlockRecovery(t *testing.T) {
 	h, first, _ := newTestHfArtifactRepair(t)
 	c := h.repository.configMaps

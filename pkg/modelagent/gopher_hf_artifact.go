@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -32,6 +33,9 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 	}
 	handler := s.sharedHfArtifactHandler()
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
+	if _, waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, allowDownload); waiting || err != nil {
+		return true, waiting, err
+	}
 	stored, referenced, lookupErr := handler.repository.GetParentForChild(ctx, key)
 	if err := ctx.Err(); err != nil {
 		return true, false, err
@@ -50,7 +54,7 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 			return true, true, nil
 		}
 		oldInput := s.hfArtifactInputForChild(task, stored)
-		preserve, lookupErr := s.isPathReferencedByOtherModels(oldInput.ChildModelPath, task.BaseModel, task.ClusterBaseModel)
+		preserve, lookupErr := s.hfArtifactHasOtherPathUsers(oldInput)
 		if lookupErr != nil {
 			return true, false, lookupErr
 		}
@@ -66,7 +70,7 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 		}
 	}
 	if !eligible {
-		if !referenced && isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+		if isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
 			return true, false, fmt.Errorf("shared artifact symlink has no persisted child reference")
 		}
 		return false, false, nil
@@ -120,9 +124,102 @@ func (s *Gopher) sharedHfArtifactHandler() *hfArtifactTaskHandler {
 	s.hfArtifactHandlerOnce.Do(func() {
 		s.hfArtifactHandler = newHfArtifactTaskHandler(newHfArtifactRepository(s.configMapReconciler))
 		s.hfArtifactHandler.updateChildStatuses = s.updateHfArtifactChildLabels
+		s.hfArtifactHandler.hasOtherPathUsers = s.hfArtifactHasOtherPathUsers
+		s.hfArtifactHandler.isCurrentChildUID = s.hfArtifactIsCurrentChildUID
 		s.hfArtifactStartup = newHfArtifactStartup(s.hfArtifactHandler)
 	})
 	return s.hfArtifactHandler
+}
+
+func (s *Gopher) hfArtifactIsCurrentChildUID(input hfArtifactTaskInput) (bool, error) {
+	namespace, name, cluster, valid := constants.ParseModelInfoFromConfigMapKey(input.ChildModelKey)
+	if !valid || input.ChildModelUID == "" {
+		return false, fmt.Errorf("invalid shared artifact child key or UID %q", input.ChildModelKey)
+	}
+	if cluster {
+		if s.clusterBaseModelLister == nil {
+			return false, fmt.Errorf("ClusterBaseModel lister is unavailable for %s", input.ChildModelKey)
+		}
+		model, err := s.clusterBaseModelLister.Get(name)
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return model.UID == input.ChildModelUID, nil
+	}
+	if s.baseModelLister == nil {
+		return false, fmt.Errorf("BaseModel lister is unavailable for %s", input.ChildModelKey)
+	}
+	model, err := s.baseModelLister.BaseModels(namespace).Get(name)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return model.UID == input.ChildModelUID, nil
+}
+
+func (s *Gopher) hfArtifactHasOtherPathUsers(input hfArtifactTaskInput) (bool, error) {
+	namespace, name, cluster, valid := constants.ParseModelInfoFromConfigMapKey(input.ChildModelKey)
+	if !valid {
+		return false, fmt.Errorf("invalid shared artifact child key %q", input.ChildModelKey)
+	}
+	root, err := canonicalHfArtifactStoreRoot(input.ModelStoreRoot)
+	if err != nil {
+		return false, err
+	}
+	childPath, err := hfArtifactPathInRoot(input.ChildModelPath, input.ModelStoreRoot, root)
+	if err != nil {
+		return false, err
+	}
+	// CR paths need not use the canonical spelling stored in the parent index.
+	// Compare under the same root without following the child symlink itself.
+	matches := func(storage *v1beta1.StorageSpec) bool {
+		if storage == nil || storage.Path == nil || *storage.Path == "" {
+			return false
+		}
+		path, err := hfArtifactPathInRoot(filepath.Clean(*storage.Path), input.ModelStoreRoot, root)
+		return err == nil && path == childPath
+	}
+	if s.baseModelLister == nil || s.clusterBaseModelLister == nil {
+		return false, fmt.Errorf("model listers are unavailable for shared artifact cleanup")
+	}
+	models, err := s.baseModelLister.List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+	for _, model := range models {
+		if !cluster && model.Namespace == namespace && model.Name == name {
+			continue
+		}
+		// Deleting CRs are not future consumers. Persisted child references
+		// still protect their paths until cleanup removes those references.
+		if model.DeletionTimestamp != nil && !strings.EqualFold(model.Labels[constants.ReserveModelArtifact], "true") {
+			continue
+		}
+		if matches(model.Spec.Storage) {
+			return true, nil
+		}
+	}
+	clusterModels, err := s.clusterBaseModelLister.List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+	for _, model := range clusterModels {
+		if cluster && model.Name == name {
+			continue
+		}
+		if model.DeletionTimestamp != nil && !strings.EqualFold(model.Labels[constants.ReserveModelArtifact], "true") {
+			continue
+		}
+		if matches(model.Spec.Storage) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // lockHfChildStatus prevents ordinary task progress from publishing Ready or
@@ -294,6 +391,9 @@ func (s *Gopher) detachHfArtifactForDefaultDownload(ctx context.Context, task *G
 	if s.configMapReconciler == nil {
 		return false, nil
 	}
+	if _, waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, allowDownload); waiting || err != nil {
+		return waiting, err
+	}
 	handler := s.sharedHfArtifactHandler()
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
 	parent, found, err := handler.repository.GetParentForChild(ctx, key)
@@ -317,7 +417,7 @@ func (s *Gopher) detachHfArtifactForDefaultDownload(ctx context.Context, task *G
 		return true, nil
 	}
 	input := s.hfArtifactInputForChild(task, parent)
-	preserve, err := s.isPathReferencedByOtherModels(input.ChildModelPath, task.BaseModel, task.ClusterBaseModel)
+	preserve, err := s.hfArtifactHasOtherPathUsers(input)
 	if err != nil {
 		return false, err
 	}
@@ -327,6 +427,10 @@ func (s *Gopher) detachHfArtifactForDefaultDownload(ctx context.Context, task *G
 	result, err := s.releaseHfArtifactChild(ctx, input, preserve)
 	if err == nil && result.Outcome == hfArtifactTaskRetry {
 		return true, s.requeueHfArtifactTask(task, result)
+	}
+	// Cleanup may preserve the path for a consumer discovered after preflight.
+	if err == nil && isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+		return false, fmt.Errorf("cannot replace preserved shared artifact symlink")
 	}
 	return false, err
 }
@@ -340,8 +444,28 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 	if s.configMapReconciler == nil {
 		return false, false, nil
 	}
-	handler := s.sharedHfArtifactHandler()
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
+	uid := types.UID(getModelUID(task))
+	s.configMapReconciler.cacheMutex.RLock()
+	cached := s.configMapReconciler.modelCache[key]
+	invalidated := uid != "" && s.configMapReconciler.isModelUIDInvalidatedLocked(key, uid)
+	replaced := invalidated && cached != nil && cached.ModelUID != "" && cached.ModelUID != uid
+	_, evicted := s.configMapReconciler.evictedModels[key]
+	finalizing := invalidated && evicted
+	s.configMapReconciler.cacheMutex.RUnlock()
+	if replaced || s.isTaskModelReplaced(task) {
+		return true, false, fmt.Errorf("cannot delete superseded shared artifact child %s", key)
+	}
+	if finalizing {
+		// Final ConfigMap removal installs this UID fence after file cleanup.
+		// UID handoff retains a replacement cache owner instead. Retry only the
+		// final removal, even if its response was lost with the receipt.
+		return true, false, nil
+	}
+	handler := s.sharedHfArtifactHandler()
+	if handled, waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, true); handled || err != nil {
+		return true, waiting, err
+	}
 	parent, found, err := handler.repository.GetParentForChild(ctx, key)
 	if apierrors.IsNotFound(err) {
 		return false, false, nil
@@ -353,12 +477,73 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 		return false, false, nil
 	}
 	input := s.hfArtifactInputForChild(task, parent)
-	preserve, err := s.isPathReferencedByOtherModels(input.ChildModelPath, task.BaseModel, task.ClusterBaseModel)
+	preserve, err := s.hfArtifactHasOtherPathUsers(input)
 	if err != nil {
 		return true, false, err
 	}
+	input.RetainDeletionReceipt = true
 	preserve = preserve || s.isReservingModelArtifact(task)
 	result, err := s.releaseHfArtifactChild(ctx, input, preserve)
+	if err == nil && result.Outcome == hfArtifactTaskRetry {
+		return true, true, s.requeueHfArtifactTask(task, result)
+	}
+	return true, false, err
+}
+
+// resumeHfArtifactChildDeletion follows the persisted old path even when the
+// current CR has changed identity, source, path, or UID since cleanup began.
+// Completed cleanup remains handled so Delete cannot fall through to legacy
+// deletion; download callers may continue after cleanup finishes.
+func (s *Gopher) resumeHfArtifactChildDeletion(ctx context.Context, task *GopherTask, allowCleanup bool) (handled, waiting bool, err error) {
+	if s.configMapReconciler == nil {
+		return false, false, nil
+	}
+	handler := s.sharedHfArtifactHandler()
+	key := getModelID(task.BaseModel, task.ClusterBaseModel)
+	pending, err := handler.repository.pendingDeletion(ctx, key)
+	if err := ctx.Err(); err != nil {
+		return true, false, err
+	}
+	if apierrors.IsNotFound(err) {
+		return false, false, nil
+	}
+	if err != nil {
+		// Only never-shared directories can ignore unavailable cleanup state.
+		spec := taskModelSpec(task)
+		_, eligible, _ := newHfArtifactTaskInputForOCI(task, spec.Storage, s.modelRootDir)
+		if !task.SharedArtifact && !eligible && !isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+			return false, false, nil
+		}
+		return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(key, err))
+	}
+	if pending == nil {
+		return false, false, nil
+	}
+	if !allowCleanup {
+		s.demoteToNormalPriority(task)
+		return true, true, nil
+	}
+	input := s.hfArtifactInputForChild(task, pending.parentForChild(key))
+	input.RetainDeletionReceipt = task.TaskType == Delete
+	input.PreserveChildPath = task.TaskType == Delete && s.isReservingModelArtifact(task)
+	err = s.hfArtifactStartup.recover(ctx)
+	if err := ctx.Err(); err != nil {
+		return true, false, err
+	}
+	if err != nil {
+		return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, err))
+	}
+	err = s.hfArtifactStartup.recoverParentAtPath(ctx, input.Parent.Key, input.Parent.LocalPath)
+	if err := ctx.Err(); err != nil {
+		return true, false, err
+	}
+	if err != nil {
+		return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, err))
+	}
+	result, err := handler.handleDelete(ctx, input)
+	if err := ctx.Err(); err != nil {
+		return true, false, err
+	}
 	if err == nil && result.Outcome == hfArtifactTaskRetry {
 		return true, true, s.requeueHfArtifactTask(task, result)
 	}
@@ -412,7 +597,7 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 			input.Parent.Status = HfArtifactStatusReady
 			input.Parent.LockID = ""
 		}
-		removed, err := handler.repository.RemoveModelReference(ctx, input.Parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath)
+		removed, err := handler.repository.removeModelReference(ctx, input.Parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath, input.RetainDeletionReceipt)
 		if err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}

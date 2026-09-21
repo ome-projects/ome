@@ -38,7 +38,7 @@ type CacheEntry struct {
 	ModelUID      types.UID      // UID of the model resource that owns this entry
 	ModelStatus   ModelStatus    // Current status of the model
 	ModelMetadata *ModelMetadata // Model metadata if available
-	// ModelEntryJSON preserves committed shared model state.
+	// ModelEntryJSON preserves committed shared ownership and cleanup state.
 	// Ordinary models use the typed status and metadata fields for recovery.
 	ModelEntryJSON string
 }
@@ -367,10 +367,16 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 	defer c.configMapMutationMutex.Unlock()
 	c.cacheMutex.Lock()
 	if cached := c.modelCache[modelID]; cached != nil && cached.ModelUID != "" && modelUID != "" && cached.ModelUID != modelUID {
+		// A completed UID handoff stays fenced after the replacement opts out
+		// of reuse and no longer carries a shared reference or cleanup receipt.
+		if c.isModelUIDInvalidatedLocked(modelID, modelUID) {
+			c.cacheMutex.Unlock()
+			return fmt.Errorf("cannot delete model %s from a superseded UID", modelID)
+		}
 		// Shared ownership needs an explicit UID handoff. Ordinary entries,
 		// including completed opt-outs, retain their existing deletion behavior.
 		var child ModelEntry
-		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && child.HfArtifactKey != "" {
+		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil) {
 			c.cacheMutex.Unlock()
 			return fmt.Errorf("cannot delete shared model %s owned by another UID", modelID)
 		}
@@ -390,11 +396,11 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 		if !exists {
 			return false, nil
 		}
-		// Another process may attach a replacement after file cleanup.
-		// Recheck the shared reference on every final-removal CAS attempt.
+		// Another process can claim a cleanup receipt or attach the replacement
+		// after file cleanup. Check ownership on every final-removal CAS attempt.
 		var child ModelEntry
 		if json.Unmarshal([]byte(raw), &child) == nil {
-			if child.HfArtifactKey != "" {
+			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil && child.HfArtifactPendingDeletion.ModelUID != modelUID {
 				return false, fmt.Errorf("shared artifact ownership changed before deleting model %s", modelID)
 			}
 		}

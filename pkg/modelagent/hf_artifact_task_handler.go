@@ -50,6 +50,12 @@ type hfArtifactTaskInput struct {
 	// e.g. /models. Scans also find child symlinks
 	// whose ConfigMap references were never recorded.
 	ModelStoreRoot string
+
+	// Model deletion retains cleanup ownership until the child entry is removed.
+	// Source transitions clear the receipt so a new download can proceed.
+	RetainDeletionReceipt bool
+	// A reserve-artifact delete must preserve its symlink on cleanup retries too.
+	PreserveChildPath bool
 }
 
 func (input hfArtifactTaskInput) modelStoreRoot() (string, error) {
@@ -78,6 +84,12 @@ type hfArtifactTaskHandler struct {
 	// repair calls it before file writes and before publishing parent Ready,
 	// including retries of marker-backed completion.
 	updateChildStatuses func(context.Context, map[string]ModelStatus) error
+	// hasOtherPathUsers covers consumers outside the shared-parent index, such
+	// as local-storage CRs. Cleanup calls it while holding both filesystem locks.
+	hasOtherPathUsers func(hfArtifactTaskInput) (bool, error)
+	// isCurrentChildUID verifies same-name replacement against the CR lister,
+	// independently of the status cache that still belongs to the old UID.
+	isCurrentChildUID func(hfArtifactTaskInput) (bool, error)
 }
 
 func newHfArtifactTaskHandler(repository *HfArtifactRepository) *hfArtifactTaskHandler {

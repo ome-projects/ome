@@ -26,6 +26,9 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
+	if result, pending := h.resumeDeletionBeforeDownload(ctx, input); pending {
+		return result, nil
+	}
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}

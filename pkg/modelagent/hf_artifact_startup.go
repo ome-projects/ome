@@ -111,10 +111,16 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 // process after our startup snapshot. Only an available OS lock permits recovery;
 // a cached Updating record alone never proves that its owner has stopped.
 func (s *hfArtifactStartup) recoverParent(ctx context.Context, key string) error {
+	return s.recoverParentAtPath(ctx, key, "")
+}
+
+// Receipt-driven cleanup may recover only its original path, not a replacement
+// of the same identity under a different model store.
+func (s *hfArtifactStartup) recoverParentAtPath(ctx context.Context, key, path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	expected, deferred := s.deferred[key]
-	if !deferred {
+	if !deferred || path != "" {
 		exists, raw, err := s.handler.repository.configMaps.getDataEntryBasedOnModelKey(ctx, key)
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -131,6 +137,9 @@ func (s *hfArtifactStartup) recoverParent(ctx context.Context, key string) error
 		}
 		if err := validateHfArtifactIdentityAndPath(expected); err != nil {
 			return err
+		}
+		if path != "" && expected.LocalPath != path {
+			return nil
 		}
 		if expected.Status != HfArtifactStatusUpdating {
 			return nil
@@ -151,6 +160,9 @@ func (s *hfArtifactStartup) recoverParent(ctx context.Context, key string) error
 	parent, found, err := s.handler.repository.Get(ctx, expected.Identity)
 	if err != nil {
 		return err
+	}
+	if found && path != "" && parent.LocalPath != path {
+		return nil
 	}
 	if found && parent.LocalPath != expected.LocalPath {
 		s.deferred[key] = parent

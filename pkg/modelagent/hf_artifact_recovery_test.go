@@ -115,6 +115,48 @@ func TestHfArtifactRecoveryRestoresRelationshipsAsFailed(t *testing.T) {
 	}
 }
 
+func TestHfArtifactRecoveryRestoresPendingDeletionAfterConfigMapLoss(t *testing.T) {
+	h, input, pending := newRecoveryCoveragePendingDeletion(t)
+	ctx := context.Background()
+	c := h.repository.configMaps
+	require.NoError(t, c.kubeClient.CoreV1().ConfigMaps(c.namespace).Delete(ctx, c.nodeName, metav1.DeleteOptions{}))
+
+	// The process is still alive: its committed cache must restore cleanup
+	// intent without turning the detached child back into a live reference.
+	c.reconcileConfigMaps()
+
+	cm, err := c.getConfigMap(ctx)
+	require.NoError(t, err)
+	child, err := existingModelEntry(cm.Data, input.ChildModelKey)
+	require.NoError(t, err)
+	assert.Empty(t, child.HfArtifactKey)
+	require.Equal(t, pending, child.HfArtifactPendingDeletion)
+	parent, found, err := h.repository.Get(ctx, input.Parent.Identity)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Empty(t, parent.Children)
+	assert.Equal(t, HfArtifactStatusFailed, parent.Status)
+	assert.Empty(t, parent.LockID)
+	assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+
+	result, err := h.handleDelete(ctx, input)
+	require.NoError(t, err)
+	require.Equal(t, hfArtifactTaskDone, result.Outcome, "%v", result.RetryReason)
+	assertChildPathMissing(t, input.ChildModelPath)
+	assert.NoDirExists(t, input.Parent.LocalPath)
+	_, found, err = h.repository.Get(ctx, input.Parent.Identity)
+	require.NoError(t, err)
+	assert.False(t, found)
+	stored, err := h.repository.pendingDeletion(ctx, input.ChildModelKey)
+	require.NoError(t, err)
+	assert.Nil(t, stored)
+
+	c.reconcileConfigMaps()
+	_, found, err = h.repository.Get(ctx, input.Parent.Identity)
+	require.NoError(t, err)
+	assert.False(t, found, "completed cleanup must not restore the parent again")
+}
+
 func TestHfArtifactRecoveryPreservesRelationshipsWhenMutationRecreatesConfigMap(t *testing.T) {
 	h, first, second := newTestHfArtifactRepair(t)
 	c := h.repository.configMaps

@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// handleDelete removes this child's references and symlink. Only the final
-// recorded child acquires the lock needed to delete parent files.
+// handleDelete removes this child's references and symlink. Parent deletion
+// requires an exclusive lock and no remaining recorded or filesystem children.
 func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifactTaskInput) (hfArtifactTaskResult, error) {
 	unlock, acquired, err := h.tryArtifactOperation(input)
 	if err != nil || !acquired {
@@ -15,6 +15,13 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 	defer unlock()
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
+	pending, err := h.repository.pendingDeletion(ctx, input.ChildModelKey)
+	if err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
+	if pending != nil {
+		return h.resumePendingDeletion(ctx, input, pending)
 	}
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
@@ -49,15 +56,15 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 	}
 	// Validate the scan root before removing references: that removal may grant
 	// this task the parent deletion lock, which it must be able to finish.
-	root, err := input.modelStoreRoot()
+	_, err = input.modelStoreRoot()
 	if err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 
 	// Remove references first so the repository can reject a stale UID or path
 	// before this task touches the child symlink.
-	removal, err := h.repository.RemoveModelReference(
-		ctx, parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath,
+	removal, err := h.repository.removeModelReference(
+		ctx, parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath, true,
 	)
 	if err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
@@ -65,16 +72,12 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 	if !removal.ReferenceRemoved {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
-	if err := h.files.RemoveChildSymlink(input.ChildModelPath, parent.LocalPath); err != nil {
-		if removal.LastReferenceRemoved {
-			return h.markLockedParentFailed(ctx, removal.Artifact, err)
-		}
-		return newHfArtifactRetryResult(parent.Key, err), nil
-	}
-	if !removal.LastReferenceRemoved {
-		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
-	}
-	return h.deleteLockedParent(ctx, removal.Artifact, root, parent.Status == HfArtifactStatusReady)
+	return h.resumePendingDeletion(ctx, input, &HfArtifactPendingDeletion{
+		Identity: parent.Identity, ParentPath: parent.LocalPath,
+		ChildPath: input.ChildModelPath, ModelUID: input.ChildModelUID,
+		ParentLockID:   removal.Artifact.LockID,
+		ParentWasReady: parent.Status == HfArtifactStatusReady,
+	})
 }
 
 // removeUnreferencedChildSymlink removes only a matching local link. Without a
@@ -104,17 +107,20 @@ func (h *hfArtifactTaskHandler) removeUnreferencedChildSymlink(ctx context.Conte
 	return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 }
 
-// deleteLockedParent requires the deletion LockID returned by the last
-// reference removal and a previously validated modelStoreRoot.
+// deleteLockedParent requires the deletion LockID recorded with reference
+// removal or a resumed cleanup receipt, and a validated modelStoreRoot.
 func (h *hfArtifactTaskHandler) deleteLockedParent(
 	ctx context.Context,
 	parent HfArtifactEntry,
 	modelStoreRoot string,
 	wasReady bool,
 ) (hfArtifactTaskResult, error) {
+	if parent.Status != HfArtifactStatusUpdating || parent.LockID == "" || len(parent.Children) != 0 {
+		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("shared artifact %s is not locked for deletion", parent.Key)), nil
+	}
 	hasChildren, err := h.files.HasChildren(parent.LocalPath, modelStoreRoot)
 	if err != nil {
-		return h.markLockedParentFailed(ctx, parent, fmt.Errorf("scan child symlinks for shared Hugging Face parent %s: %w", parent.Key, err))
+		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("scan child symlinks for shared Hugging Face parent %s: %w", parent.Key, err)), nil
 	}
 	if hasChildren {
 		// Preserve files for an unrecorded child and end deletion ownership.
@@ -125,14 +131,14 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
 	if err := h.files.RemoveParentDirectory(parent.LocalPath); err != nil {
-		return h.markLockedParentFailed(ctx, parent, err)
+		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 	deleted, err := h.repository.DeleteIfUnreferenced(ctx, parent)
 	if err != nil {
-		return h.markLockedParentFailed(ctx, parent, err)
+		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 	if !deleted {
-		return h.markLockedParentFailed(ctx, parent, fmt.Errorf("shared Hugging Face parent %s changed during deletion", parent.Key))
+		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("shared Hugging Face parent %s changed during deletion", parent.Key)), nil
 	}
 	return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 }

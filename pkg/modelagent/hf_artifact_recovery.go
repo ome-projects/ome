@@ -76,7 +76,7 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.HfArtifactKey == "" && entry.ModelEntryJSON == "" {
+	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
 		// Only explicit ordinary writes may seed typed recovery. Observing
 		// unrelated records, including at startup, must not adopt them.
 		if modelID == "" && before[key] != raw && c.modelCache[key] == nil {
@@ -177,7 +177,7 @@ func (c *ConfigMapReconciler) cachedConfigMapEntries() (map[string]string, map[s
 }
 
 // Ordinary status/progress/metadata updates may replace malformed legacy JSON,
-// but must not erase a known shared relationship.
+// but must not erase a known shared relationship or interrupted cleanup receipt.
 func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]string, key string) error {
 	child, childErr := existingModelEntry(data, key)
 	for parentKey, raw := range data {
@@ -199,7 +199,8 @@ func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]st
 	if cachedJSON == "" || json.Unmarshal([]byte(cachedJSON), &cached) != nil {
 		return nil
 	}
-	if cached.HfArtifactKey != "" && (childErr != nil || child.HfArtifactKey == "") {
+	if cached.HfArtifactKey != "" && (childErr != nil || child.HfArtifactKey == "") ||
+		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) {
 		return fmt.Errorf("shared artifact state for model %s requires reconciliation", key)
 	}
 	return nil
