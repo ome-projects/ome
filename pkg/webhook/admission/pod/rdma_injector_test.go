@@ -1,6 +1,7 @@
 package pod
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,10 +92,8 @@ func TestRDMAInjector_InjectRDMA(t *testing.T) {
 								Capabilities: &v1.Capabilities{
 									Add: []v1.Capability{
 										"IPC_LOCK",
-										"CAP_SYS_ADMIN",
 									},
 								},
-								Privileged: &[]bool{true}[0],
 							},
 						},
 					},
@@ -172,10 +171,8 @@ func TestRDMAInjector_InjectRDMA(t *testing.T) {
 								Capabilities: &v1.Capabilities{
 									Add: []v1.Capability{
 										"IPC_LOCK",
-										"CAP_SYS_ADMIN",
 									},
 								},
-								Privileged: &[]bool{true}[0],
 							},
 						},
 					},
@@ -292,7 +289,6 @@ func TestRDMAInjector_InjectRDMA(t *testing.T) {
 									Add: []v1.Capability{
 										"NET_ADMIN",
 										"IPC_LOCK",
-										"CAP_SYS_ADMIN",
 									},
 								},
 							},
@@ -394,10 +390,8 @@ func TestRDMAInjector_InjectRDMA(t *testing.T) {
 								Capabilities: &v1.Capabilities{
 									Add: []v1.Capability{
 										"IPC_LOCK",
-										"CAP_SYS_ADMIN",
 									},
 								},
-								Privileged: &[]bool{true}[0],
 							},
 						},
 					},
@@ -475,10 +469,8 @@ func TestRDMAInjector_InjectRDMA(t *testing.T) {
 								Capabilities: &v1.Capabilities{
 									Add: []v1.Capability{
 										"IPC_LOCK",
-										"CAP_SYS_ADMIN",
 									},
 								},
-								Privileged: &[]bool{true}[0],
 							},
 						},
 					},
@@ -569,10 +561,8 @@ func TestRDMAInjector_injectRDMAConfig(t *testing.T) {
 						Capabilities: &v1.Capabilities{
 							Add: []v1.Capability{
 								"IPC_LOCK",
-								"CAP_SYS_ADMIN",
 							},
 						},
-						Privileged: &[]bool{true}[0],
 					},
 				},
 			},
@@ -959,4 +949,26 @@ func TestRDMAInjector_injectContainerConfig_EnvDedup(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, count, "NCCL_DEBUG must not be duplicated")
+}
+
+// A privileged container bypasses the device cgroup and sees every GPU on
+// the node instead of the ones the NVIDIA device plugin allocated to it, so
+// no shipped profile may ask for it. Capability names are checked here too:
+// Kubernetes spells them without the CAP_ prefix, and a misspelled one is
+// silently useless once the container is no longer privileged.
+func TestRDMAProfiles_AreNotPrivileged(t *testing.T) {
+	for name, profile := range RDMAProfiles {
+		if profile.SecurityContext == nil {
+			continue
+		}
+		assert.Nil(t, profile.SecurityContext.Privileged,
+			"profile %q sets privileged, which defeats GPU device isolation", name)
+		if profile.SecurityContext.Capabilities == nil {
+			continue
+		}
+		for _, capability := range profile.SecurityContext.Capabilities.Add {
+			assert.False(t, strings.HasPrefix(string(capability), "CAP_"),
+				"profile %q adds %q; Kubernetes capability names omit the CAP_ prefix", name, capability)
+		}
+	}
 }

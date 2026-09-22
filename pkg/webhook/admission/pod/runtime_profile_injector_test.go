@@ -229,5 +229,7 @@ func TestRDMAProfiles_cksGbSglang_HasExpectedShape(t *testing.T) {
 	assert.Len(t, p.Volumes, 2)
 	assert.Len(t, p.VolumeMounts, 2)
 	assert.NotNil(t, p.SecurityContext)
-	assert.True(t, *p.SecurityContext.Privileged)
+	// Not privileged: that would bypass the device cgroup and hand the pod
+	// every GPU on the node instead of its allocated ones (#833).
+	assert.Nil(t, p.SecurityContext.Privileged)
 }

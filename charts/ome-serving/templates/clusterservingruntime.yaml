@@ -69,6 +69,12 @@ spec:
 {{- end }}
     runner:
       name: ome-container
+{{- if and $isPdMode (or (eq $rdmaProfile "oci-roce") (eq $rdmaProfile "cks-gb-sglang")) }}
+      # These profiles no longer set privileged (#833); kept explicit here
+      # until PD runtimes request an RDMA device-plugin resource instead.
+      securityContext:
+        privileged: true
+{{- end }}
       image: {{ $model.runtime.image | default $.Values.defaults.image }}
       ports:
         - containerPort: 8080
@@ -170,6 +176,12 @@ spec:
     hostNetwork: true
     runner:
       name: ome-container
+{{- if and $isPdMode (or (eq $rdmaProfile "oci-roce") (eq $rdmaProfile "cks-gb-sglang")) }}
+      # These profiles no longer set privileged (#833); kept explicit here
+      # until PD runtimes request an RDMA device-plugin resource instead.
+      securityContext:
+        privileged: true
+{{- end }}
       image: {{ $model.runtime.image | default $.Values.defaults.image }}
       ports:
         - containerPort: 8080

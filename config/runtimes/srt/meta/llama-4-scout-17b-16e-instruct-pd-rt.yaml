@@ -41,6 +41,8 @@ spec:
     hostNetwork: true
     runner:
       name: ome-container
+      securityContext:
+        privileged: true
       image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
       ports:
         - containerPort: 8080
@@ -133,6 +135,8 @@ spec:
     hostNetwork: true
     runner:
       name: ome-container
+      securityContext:
+        privileged: true
       image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
       ports:
         - containerPort: 8080

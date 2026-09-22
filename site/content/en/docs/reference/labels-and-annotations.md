@@ -65,6 +65,20 @@ These annotations control model encryption and decryption:
 | `rdma.ome.io/profile`        | Specifies the RDMA profile to use                   |
 | `rdma.ome.io/container-name` | Specifies the container name for RDMA configuration |
 
+The profiles are `oci-roce` (the default), `cks-gb-sglang` and `cks-gb-rdma`.
+`oci-roce` injects NCCL/UCX environment variables. `cks-gb-sglang` injects NCCL
+environment variables. Both profiles inject a `/dev/shm` emptyDir, a
+`/dev/infiniband` hostPath mount and the `IPC_LOCK` capability; `cks-gb-rdma`
+adds Multus network attachments only. None of them run the container
+privileged: a privileged container bypasses the device cgroup and sees every
+GPU on the node rather than the ones allocated to it.
+
+A profile does not by itself grant access to the HCA device nodes. Request
+your cluster's RDMA device-plugin resource in the runtime's container
+resources (for example `rdma/hca_shared_devices_a: 1`), or set
+`privileged: true` on the container explicitly. Values already set on the
+container win over the profile.
+
 
 ### Runtime Revision and Pinning Annotations
 

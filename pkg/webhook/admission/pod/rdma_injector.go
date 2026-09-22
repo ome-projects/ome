@@ -80,14 +80,19 @@ var RDMAProfiles = map[string]RDMAProfile{
 				},
 			},
 		},
+		// IPC_LOCK is what RDMA verbs need for pinned memory. Opening the
+		// HCA device nodes is not granted here: the /dev/infiniband mount
+		// above only makes them visible, and the device cgroup still
+		// denies them. Runtimes get that access by requesting their
+		// cluster's RDMA device-plugin resource, or by setting privileged
+		// explicitly — values already on the container win over the
+		// profile. The profile itself is deliberately not privileged:
+		// that bypasses the device cgroup and hands the pod every GPU on
+		// the node, not the ones the NVIDIA device plugin allocated (#833).
 		SecurityContext: &v1.SecurityContext{
 			Capabilities: &v1.Capabilities{
-				Add: []v1.Capability{
-					"IPC_LOCK",
-					"CAP_SYS_ADMIN",
-				},
+				Add: []v1.Capability{"IPC_LOCK"},
 			},
-			Privileged: &[]bool{true}[0],
 		},
 	},
 	// cks-gb-sglang: SGLang PD-serving env baseline.
@@ -120,11 +125,11 @@ var RDMAProfiles = map[string]RDMAProfile{
 				},
 			},
 		},
+		// Not privileged, for the same reason as oci-roce above.
 		SecurityContext: &v1.SecurityContext{
 			Capabilities: &v1.Capabilities{
-				Add: []v1.Capability{"IPC_LOCK", "CAP_SYS_ADMIN"},
+				Add: []v1.Capability{"IPC_LOCK"},
 			},
-			Privileged: &[]bool{true}[0],
 		},
 	},
 	// cks-gb-rdma: Multus network attachments only (no env/volumes/security)
