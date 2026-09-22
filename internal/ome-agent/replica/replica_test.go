@@ -1203,7 +1203,7 @@ func TestReplicaAgent_WaitForTargetArtifactStateChangeDoesNotSleepPastDeadline(t
 		return targetArtifactState{UploadLocked: true}, nil
 	}
 
-	_, err := agent.waitForTargetArtifactStateChange(nowFunc().Add(agent.targetArtifactUploadLockTimeout()))
+	_, _, err := agent.waitForTargetArtifactStateChange(nowFunc().Add(agent.targetArtifactUploadLockTimeout()))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out waiting for target artifact completion marker")

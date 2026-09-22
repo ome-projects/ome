@@ -29,6 +29,9 @@ type Config struct {
 	HFDownloadTimeout              time.Duration `mapstructure:"hf_download_timeout"`
 	HFDownloadStaleProgressTimeout time.Duration `mapstructure:"hf_download_stale_progress_timeout"`
 	ArtifactUploadLockTimeout      time.Duration `mapstructure:"artifact_upload_lock_timeout"`
+	// The consumer supplies one ID for all retries of a replication operation.
+	// It must stop the previous uploader before starting another with the same ID.
+	ArtifactUploadLockOwnerID string `mapstructure:"artifact_upload_lock_owner_id"`
 
 	Source struct {
 		StorageURIStr  string `mapstructure:"storage_uri" validate:"required"`
@@ -129,6 +132,9 @@ func WithViper(v *viper.Viper) Option {
 }
 
 func (c *Config) Validate() error {
+	if err := c.validateArtifactLockOwner(); err != nil {
+		return err
+	}
 	validate := validator.New()
 	if err := validate.Struct(c); err != nil {
 		return err

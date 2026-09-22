@@ -142,6 +142,9 @@ func (r *ReplicaAgent) Start() (returnErr error) {
 	}
 	if uploadLock != nil {
 		defer func() {
+			// Clean up on returned errors too: the consumer may not retry a failure.
+			// If the process is killed before this defer runs, a later attempt
+			// with the same owner ID can reuse the leftover lock.
 			if releaseErr := r.releaseTargetArtifactUploadLock(*uploadLock); releaseErr != nil {
 				if returnErr != nil {
 					r.Logger.Errorf("Failed to release target artifact upload lock after replication error: %v", releaseErr)
@@ -236,7 +239,7 @@ func (r *ReplicaAgent) prepareTargetArtifactUpload() (*targetArtifactUploadLock,
 		}
 
 		r.Logger.Infof("Target artifact upload lock already exists; waiting for completion marker")
-		state, err = r.waitForTargetArtifactStateChange(waitDeadline)
+		state, uploadLock, err = r.waitForTargetArtifactStateChange(waitDeadline)
 		if err != nil {
 			return nil, false, err
 		}
@@ -244,6 +247,9 @@ func (r *ReplicaAgent) prepareTargetArtifactUpload() (*targetArtifactUploadLock,
 			r.Logger.Infof("Target artifact completed while waiting for upload lock; skipping replication")
 			r.logTargetArtifactSize(state)
 			return nil, true, nil
+		}
+		if uploadLock != nil {
+			return uploadLock, false, nil
 		}
 		if r.isTargetArtifactUploadLockStale(state) {
 			if err := r.deleteStaleTargetArtifactUploadLock(state); err != nil {
@@ -263,18 +269,22 @@ func (r *ReplicaAgent) logTargetArtifactSize(state targetArtifactState) {
 }
 
 func (r *ReplicaAgent) acquireTargetArtifactUploadLock() (*targetArtifactUploadLock, error) {
+	body, err := r.artifactUploadLockBody()
+	if err != nil {
+		return nil, err
+	}
 	lockURI := r.targetArtifactUploadLockURI()
 	r.Logger.Infof("Acquiring target artifact upload lock at oci://n/%s/b/%s/o/%s", lockURI.Namespace, lockURI.BucketName, lockURI.ObjectName)
 	etag, acquired, err := tryAcquireArtifactUploadLockFunc(
 		r.Config.Target.OCIOSDataStore,
-		constants.ArtifactUploadLockBody,
+		body,
 		lockURI,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire target artifact upload lock: %w", err)
 	}
 	if !acquired {
-		return nil, nil
+		return r.reuseOwnedUploadLock(), nil
 	}
 	if etag == "" {
 		return nil, fmt.Errorf("acquired target artifact upload lock without an etag")
@@ -306,11 +316,11 @@ func (r *ReplicaAgent) releaseTargetArtifactUploadLock(uploadLock targetArtifact
 	return nil
 }
 
-func (r *ReplicaAgent) waitForTargetArtifactStateChange(deadline time.Time) (targetArtifactState, error) {
+func (r *ReplicaAgent) waitForTargetArtifactStateChange(deadline time.Time) (targetArtifactState, *targetArtifactUploadLock, error) {
 	for {
 		remaining := deadline.Sub(nowFunc())
 		if remaining <= 0 {
-			return targetArtifactState{}, fmt.Errorf("timed out waiting for target artifact completion marker")
+			return targetArtifactState{}, nil, fmt.Errorf("timed out waiting for target artifact completion marker")
 		}
 		pollInterval := targetArtifactLockPollInterval
 		if remaining < pollInterval {
@@ -320,10 +330,18 @@ func (r *ReplicaAgent) waitForTargetArtifactStateChange(deadline time.Time) (tar
 
 		state, err := r.targetArtifactState()
 		if err != nil {
-			return targetArtifactState{}, fmt.Errorf("failed to inspect target artifact state while waiting for upload lock: %w", err)
+			return targetArtifactState{}, nil, fmt.Errorf("failed to inspect target artifact state while waiting for upload lock: %w", err)
 		}
-		if state.Complete || !state.UploadLocked || r.isTargetArtifactUploadLockStale(state) {
-			return state, nil
+		if state.Complete || !state.UploadLocked {
+			return state, nil, nil
+		}
+		// Retry the owner read too: a temporary Object Storage read failure must
+		// not make an attempt wait for a lock with the same owner ID to expire.
+		if uploadLock := r.reuseOwnedUploadLock(); uploadLock != nil {
+			return state, uploadLock, nil
+		}
+		if r.isTargetArtifactUploadLockStale(state) {
+			return state, nil, nil
 		}
 	}
 }
