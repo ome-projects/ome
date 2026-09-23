@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/ome/pkg/constants"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
 )
@@ -14,6 +15,9 @@ import (
 // entries, and reflect into Status.NodesReady/NodesFailed plus
 // LifeCycleState. Sharded + PVC backends bypass this path entirely.
 func ReconcileStatusFromConfigMaps(ctx context.Context, c client.Client, nodeReader client.Reader, log logr.Logger, obj client.Object, isClusterScoped bool, kind string) error {
+	if obj.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation] != "" {
+		return updateModelStatusWithRetry(ctx, c, nodeReader, log, obj, nil, nil, nil, false, kind)
+	}
 	var namespace string
 	if !isClusterScoped {
 		namespace = obj.GetNamespace()
@@ -28,7 +32,7 @@ func ReconcileStatusFromConfigMaps(ctx context.Context, c client.Client, nodeRea
 		})
 	}
 	statusUpdate := func(ctx context.Context, nodesReady, nodesFailed, nodesEvicted []string, inProgress bool) error {
-		return updateModelStatusWithRetry(ctx, c, log, obj, nodesReady, nodesFailed, nodesEvicted, inProgress, kind)
+		return updateModelStatusWithRetry(ctx, c, nodeReader, log, obj, nodesReady, nodesFailed, nodesEvicted, inProgress, kind)
 	}
 	return processModelStatus(ctx, c, nodeReader, log, namespace, obj.GetName(), isClusterScoped, specUpdate, statusUpdate)
 }

@@ -638,6 +638,83 @@ func TestInferenceServiceReconcile(t *testing.T) {
 // Status mutations is persisted to the apiserver in one call. If
 // updateStatus ever stops persisting those fields (e.g., a future
 // refactor that scopes the writes), this test fails immediately.
+func TestUpdateStatusLeavesRehydrationRetirementToProvisioningClient(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(v1beta1.AddToScheme(scheme)).To(gomega.Succeed())
+	existing := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "customer", UID: "uid", Generation: 1, Annotations: map[string]string{constants.ArtifactRehydrationGenerationAnnotation: "1", "keep": "value"}}}
+	c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).WithStatusSubresource(existing).Build()
+	r := &InferenceServiceReconciler{Client: c, APIReader: c, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
+	desired := existing.DeepCopy()
+	desired.Status.SetConditions(knapis.Conditions{{Type: knapis.ConditionReady, Status: v1.ConditionTrue}})
+	g.Expect(r.updateStatus(desired, constants.RawDeployment)).To(gomega.Succeed())
+	latest := &v1beta1.InferenceService{}
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(existing), latest)).To(gomega.Succeed())
+	g.Expect(latest.Annotations[constants.ArtifactRehydrationGenerationAnnotation]).To(gomega.Equal("1"))
+	g.Expect(latest.Annotations[constants.ArtifactRehydrationCompletedAtAnnotation]).To(gomega.BeEmpty())
+	g.Expect(latest.Status.GetCondition(knapis.ConditionReady).Status).To(gomega.Equal(v1.ConditionTrue))
+	g.Expect(latest.Annotations["keep"]).To(gomega.Equal("value"))
+}
+
+func TestUpdateStatusPreservesRehydrationCompletionAcrossGenerations(t *testing.T) {
+	for _, residency := range []string{constants.ModelArtifactResidencyEvicted, ""} {
+		t.Run(residency, func(t *testing.T) {
+			g := gomega.NewGomegaWithT(t)
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			g.Expect(v1beta1.AddToScheme(scheme)).To(gomega.Succeed())
+			const completedAt = "2026-09-18T12:00:00Z"
+			uri, path := "oci://n/ns/b/bucket/o/model", "/mnt/data/models/model"
+			model := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "customer", Annotations: map[string]string{
+				constants.ModelArtifactResidencyAnnotation:     residency,
+				constants.ModelArtifactRehydrationIDAnnotation: "request-1",
+			}}, Spec: v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &path}}}
+			service := &v1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "customer", UID: "uid", Generation: 2, Annotations: map[string]string{
+					constants.ArtifactRehydrationGenerationAnnotation:  "completed:1",
+					constants.ArtifactRehydrationCompletedAtAnnotation: completedAt,
+				}},
+				Spec: v1beta1.InferenceServiceSpec{Model: &v1beta1.ModelRef{Name: "model"}},
+			}
+			c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(model, service).WithStatusSubresource(service).Build()
+			r := &InferenceServiceReconciler{Client: c, APIReader: c, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
+			g.Expect(c.Get(ctx, client.ObjectKeyFromObject(service), service)).To(gomega.Succeed())
+			_, _, _, err := isvcutils.ReconcileBaseModelWithStatus(c, service)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+
+			for _, ready := range []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionFalse, v1.ConditionTrue} {
+				service.Status.SetConditions(knapis.Conditions{{Type: knapis.ConditionReady, Status: ready}})
+				g.Expect(r.updateStatus(service, constants.RawDeployment)).To(gomega.Succeed())
+				g.Expect(c.Get(ctx, client.ObjectKeyFromObject(service), service)).To(gomega.Succeed())
+				g.Expect(service.Annotations[constants.ArtifactRehydrationCompletedAtAnnotation]).To(gomega.Equal(completedAt))
+				g.Expect(service.Annotations[constants.ArtifactRehydrationGenerationAnnotation]).To(gomega.Equal("completed:1"))
+				g.Expect(service.Status.GetCondition(knapis.ConditionReady).Status).To(gomega.Equal(ready))
+			}
+		})
+	}
+}
+
+func TestEvictedModelWatchFindsExistingConsumers(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(v1beta1.AddToScheme(scheme)).To(gomega.Succeed())
+	primary := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "customer"}, Spec: v1beta1.InferenceServiceSpec{Model: &v1beta1.ModelRef{Name: "model"}}}
+	overlay := primary.DeepCopy()
+	overlay.Name = "overlay"
+	overlay.Spec.Model.Name = "other"
+	overlay.Spec.Model.Overlays = []v1beta1.ModelOverlayRef{{Name: "model"}}
+	otherNamespace := primary.DeepCopy()
+	otherNamespace.Namespace = "other"
+	c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(primary, overlay, otherNamespace).Build()
+	r := &InferenceServiceReconciler{Client: c, Log: ctrl.Log.WithName("test")}
+	model := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "customer", Annotations: map[string]string{constants.ModelArtifactResidencyAnnotation: constants.ModelArtifactResidencyEvicted}}}
+	g.Expect(r.isvcsReferencingEvictedModel(context.Background(), model)).To(gomega.HaveLen(2))
+	cluster := &v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Annotations: model.Annotations}}
+	g.Expect(r.isvcsReferencingEvictedModel(context.Background(), cluster)).To(gomega.HaveLen(3))
+	model.Annotations = nil
+	g.Expect(r.isvcsReferencingEvictedModel(context.Background(), model)).To(gomega.BeEmpty())
+}
+
 func TestUpdateStatusFlushesCoordinationWrites(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 

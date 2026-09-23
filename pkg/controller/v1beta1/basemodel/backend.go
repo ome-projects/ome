@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/backends/pernode"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/backends/pvc"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
@@ -47,7 +48,9 @@ func (b perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ct
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
-	if a.Status.State == v1beta1.LifeCycleStateImporting || a.Status.State == v1beta1.LifeCycleStateInTransit {
+	// A labeled hydration participant can leave without a ConfigMap event.
+	if a.Obj.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation] != "" ||
+		a.Status.State == v1beta1.LifeCycleStateImporting || a.Status.State == v1beta1.LifeCycleStateInTransit {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil

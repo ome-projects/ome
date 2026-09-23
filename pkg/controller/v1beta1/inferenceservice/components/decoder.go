@@ -333,7 +333,9 @@ func (d *Decoder) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *m
 	}
 
 	UpdatePodSpecVolumes(&d.BaseComponentFields, isvc, podSpec, objectMeta)
-	UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, podSpec, v1beta1.DecoderComponent)
+	if err := UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, podSpec, v1beta1.DecoderComponent); err != nil {
+		return nil, err
+	}
 	UpdateDecoderAffinity(&d.BaseComponentFields, isvc, podSpec)
 
 	d.Log.V(1).Info("Decoder PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
@@ -368,7 +370,9 @@ func (d *Decoder) reconcileWorkerPodSpec(isvc *v1beta1.InferenceService, objectM
 		return nil, err
 	}
 	UpdatePodSpecVolumes(&d.BaseComponentFields, isvc, workerPodSpec, objectMeta)
-	UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, workerPodSpec, v1beta1.DecoderComponent)
+	if err := UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, workerPodSpec, v1beta1.DecoderComponent); err != nil {
+		return nil, err
+	}
 	UpdateDecoderAffinity(&d.BaseComponentFields, isvc, workerPodSpec)
 
 	d.Log.V(1).Info("Decoder Worker PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)

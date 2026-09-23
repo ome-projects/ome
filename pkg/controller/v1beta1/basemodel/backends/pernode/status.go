@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 
 	"github.com/go-logr/logr"
@@ -144,13 +145,46 @@ func CalculateLifecycleState(nodesReady, nodesFailed []string) v1beta1.LifeCycle
 	return v1beta1.LifeCycleStateInTransit
 }
 
-func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, nodesReady, nodesFailed, nodesEvicted []string, inProgress bool, modelType string) error {
+func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, nodeReader client.Reader, log logr.Logger, obj client.Object, nodesReady, nodesFailed, nodesEvicted []string, inProgress bool, modelType string) error {
 	updateFunc := func(ctx context.Context, client client.Client, obj client.Object) error {
 		_, status, err := shared.ModelSpecAndStatus(obj)
 		if err != nil {
 			return err
 		}
 
+		previousRehydration := status.Rehydration
+		requestID := obj.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation]
+		if requestID != "" {
+			snapshot, err := readRehydrationSnapshot(ctx, nodeReader, obj, requestID)
+			if err != nil {
+				return err
+			}
+			// Retained requests still carry parsed model metadata. Apply only
+			// verified reports, using this retry's resource version and UID.
+			spec, _, err := shared.ModelSpecAndStatus(obj)
+			if err != nil {
+				return err
+			}
+			specChanged := false
+			for _, config := range snapshot.configs {
+				if shared.UpdateSpecWithConfig(spec, config) {
+					specChanged = true
+				}
+			}
+			if specChanged {
+				if err := client.Update(ctx, obj); err != nil {
+					return err
+				}
+			}
+			nodesReady, nodesFailed, nodesEvicted, inProgress = snapshot.ready, snapshot.failed, snapshot.evicted, snapshot.inProgress
+			status.Rehydration = &v1beta1.ModelRehydrationStatus{RequestID: requestID}
+			if previousRehydration != nil {
+				status.Rehydration.CompletedRequestID = previousRehydration.CompletedRequestID
+			}
+			if snapshot.complete && obj.GetAnnotations()[constants.ModelArtifactResidencyAnnotation] != constants.ModelArtifactResidencyEvicted {
+				status.Rehydration.CompletedRequestID = requestID
+			}
+		}
 		newState := CalculateLifecycleState(nodesReady, nodesFailed)
 		if newState == v1beta1.LifeCycleStateInTransit && len(nodesEvicted) > 0 && !inProgress {
 			newState = v1beta1.LifeCycleStateEvicted
@@ -158,7 +192,7 @@ func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, l
 		if slices.Equal(status.NodesReady, nodesReady) &&
 			slices.Equal(status.NodesFailed, nodesFailed) &&
 			slices.Equal(status.NodesEvicted, nodesEvicted) &&
-			status.State == newState {
+			status.State == newState && reflect.DeepEqual(previousRehydration, status.Rehydration) {
 			return nil
 		}
 

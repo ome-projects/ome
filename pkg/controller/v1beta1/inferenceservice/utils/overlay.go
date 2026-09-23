@@ -1,9 +1,11 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -41,7 +43,7 @@ func ResolveOverlays(cl client.Client, isvc *v1beta1.InferenceService) ([]Resolv
 	for _, ref := range isvc.Spec.Model.Overlays {
 		resolved := ResolvedOverlay{Ref: ref}
 
-		spec, modelMeta, status, err := GetBaseModelWithStatus(cl, ref.Name, isvc.Namespace)
+		spec, modelMeta, status, err := GetReferencedModel(context.Background(), cl, isvc.Namespace, ref.Name, ref.Kind, ref.APIGroup)
 		if err != nil {
 			if isModelNotFoundError(err) {
 				resolved.SkipReason = fmt.Sprintf("overlay %q not found", ref.Name)
@@ -83,5 +85,5 @@ func sanitizeOverlayName(name string) string {
 }
 
 func isModelNotFoundError(err error) bool {
-	return err != nil && strings.HasPrefix(err.Error(), "No BaseModel or ClusterBaseModel with the name:")
+	return apierrors.IsNotFound(err) || (err != nil && strings.HasPrefix(err.Error(), "No BaseModel or ClusterBaseModel with the name:"))
 }

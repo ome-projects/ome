@@ -25,7 +25,7 @@ func GetBaseModel(cl client.Client, name string, namespace string) (*v1beta1.Bas
 
 // GetBaseModelWithStatus retrieves a BaseModel or ClusterBaseModel by name and
 // returns its spec, metadata, and status.
-func GetBaseModelWithStatus(cl client.Client, name string, namespace string) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, *v1beta1.ModelStatusSpec, error) {
+func GetBaseModelWithStatus(cl client.Reader, name string, namespace string) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, *v1beta1.ModelStatusSpec, error) {
 	baseModel := &v1beta1.BaseModel{}
 	err := cl.Get(context.TODO(), client.ObjectKey{Name: name, Namespace: namespace}, baseModel)
 	if err == nil {
@@ -71,7 +71,7 @@ func ReconcileBaseModelWithStatus(cl client.Client, isvc *v1beta1.InferenceServi
 		return nil, nil, nil, nil
 	}
 
-	baseModel, baseModelMeta, baseModelStatus, err := GetBaseModelWithStatus(cl, isvc.Spec.Model.Name, isvc.Namespace)
+	baseModel, baseModelMeta, baseModelStatus, err := GetInferenceServiceModel(context.Background(), cl, isvc)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -79,7 +79,6 @@ func ReconcileBaseModelWithStatus(cl client.Client, isvc *v1beta1.InferenceServi
 	if baseModel.Disabled != nil && *baseModel.Disabled {
 		return nil, nil, nil, fmt.Errorf("specified base model %s is disabled", isvc.Spec.Model.Name)
 	}
-
 	return baseModel, baseModelMeta, baseModelStatus, nil
 }
 

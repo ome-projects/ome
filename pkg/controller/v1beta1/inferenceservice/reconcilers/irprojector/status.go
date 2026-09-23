@@ -176,6 +176,13 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 		cs := fresh.Status.Components[component]
 		cs.Lifecycle = desired.DeepCopy()
 		fresh.Status.Components[component] = cs
+		// Ingress and direct-engine checks ran this pass but are not flushed yet.
+		// Carry only aggregate-Ready prerequisites; an IR-managed engine supplies
+		// its own condition below. Missing caller conditions leave live values intact.
+		fresh.Status.SetCondition(v1beta1.IngressReady, isvc.Status.GetCondition(v1beta1.IngressReady))
+		if component != v1beta1.EngineComponent {
+			fresh.Status.SetCondition(v1beta1.EngineReady, isvc.Status.GetCondition(v1beta1.EngineReady))
+		}
 		// Emit the top-level component-ready condition in the same
 		// Status().Update round-trip as the subtree write. Without this,
 		// the OMENative counters land but no EngineReady / DecoderReady /

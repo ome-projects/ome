@@ -78,6 +78,13 @@ const (
 	ModelArtifactResidencyEvicted        = "Evicted"
 	ModelArtifactRehydrationIDAnnotation = "ome.io/artifact-rehydration-id"
 	ModelArtifactNodeUIDAnnotation       = "ome.io/artifact-node-uid"
+	ArtifactStartupGateAnnotation        = "ome.io/artifact-startup-gate"
+	ArtifactStartupGatePending           = "pending"
+	ArtifactStartupGateAdmitted          = "admitted"
+	ArtifactModelUIDAnnotation           = "ome.io/artifact-model-uid"
+	// Scoped to a particular service spec generation; consumed by provisioning clients.
+	ArtifactRehydrationGenerationAnnotation  = "ome.io/artifact-rehydration-generation"
+	ArtifactRehydrationCompletedAtAnnotation = "ome.io/artifact-rehydration-completed-at"
 )
 
 // ArtifactReadyLabelKey binds a node's acknowledgement to a Model incarnation.

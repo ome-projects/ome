@@ -432,10 +432,13 @@ func UpdateEnvVariables(b *BaseComponentFields, isvc *v1beta1.InferenceService, 
 }
 
 // UpdatePodSpecNodeSelector updates pod spec node selectors for scheduling.
-func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) {
+func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) error {
+	if err := isvcutils.ValidateArtifactBinding(isvc, b.BaseModelMeta); err != nil {
+		return err
+	}
 	if b.BaseModel == nil || b.BaseModelMeta == nil {
 		applyMergedNodeSelector(b.Runtime, b.AcceleratorClass, isvc, podSpec, componentType)
-		return
+		return nil
 	}
 
 	// Skip node selector for fine-tuned serving with merged weights
@@ -443,7 +446,7 @@ func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceSe
 	if b.FineTunedServingWithMergedWeights {
 		b.Log.V(2).Info("Skipping node selector for fine-tuned serving with merged weights",
 			"inferenceService", isvc.Name, "namespace", isvc.Namespace)
-		return
+		return nil
 	}
 
 	// Skip node selector for PVC-backed models. The model agent does not
@@ -453,7 +456,7 @@ func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceSe
 		b.Log.V(2).Info("Skipping model node selector for PVC-backed BaseModel; runtime/AcceleratorClass selectors still apply",
 			"inferenceService", isvc.Name, "namespace", isvc.Namespace)
 		applyMergedNodeSelector(b.Runtime, b.AcceleratorClass, isvc, podSpec, componentType)
-		return
+		return nil
 	}
 
 	// Add preferred node affinity for model readiness using the shared utility function
@@ -467,6 +470,21 @@ func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceSe
 	}
 
 	applyMergedNodeSelector(b.Runtime, b.AcceleratorClass, isvc, podSpec, componentType)
+	if !isShardedModel(b.BaseModel) && isvc.Annotations[constants.ArtifactStartupGateAnnotation] == constants.ArtifactStartupGateAdmitted {
+		key, err := constants.ArtifactReadyLabelKey(b.BaseModelMeta.UID)
+		if err != nil {
+			return err
+		}
+		// Safety selectors take precedence over runtime and user placement maps.
+		ordinaryKey := constants.GetBaseModelLabel(b.BaseModelMeta.Namespace, b.BaseModelMeta.Name)
+		if b.BaseModelMeta.Namespace == "" {
+			ordinaryKey = constants.GetClusterBaseModelLabel(b.BaseModelMeta.Name)
+		}
+		podSpec.NodeSelector[ordinaryKey] = "Ready"
+		if request := isvc.Annotations[constants.ModelArtifactRehydrationIDAnnotation]; request != "" {
+			podSpec.NodeSelector[key] = request
+		}
+	}
 
 	if !isShardedModel(b.BaseModel) {
 		b.Log.V(1).Info("Added preferred node affinity for model scheduling",
@@ -474,6 +492,7 @@ func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceSe
 			"namespace", b.BaseModelMeta.Namespace,
 			"inferenceService", isvc.Name)
 	}
+	return nil
 }
 
 func applyMergedNodeSelector(runtime *v1beta1.ServingRuntimeSpec, acceleratorClass *v1beta1.AcceleratorClassSpec, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) {

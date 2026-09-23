@@ -234,6 +234,22 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 		return reconcile.Result{}, err
 	}
+	// Hold before runtime resolution or any workload writes. Deletion must still
+	// reach finalizer handling. Admission is independent of all-node completion.
+	if isvc.DeletionTimestamp.IsZero() {
+		if gate, present := isvc.Annotations[constants.ArtifactStartupGateAnnotation]; present {
+			if gate == constants.ArtifactStartupGatePending {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			reader := r.APIReader
+			if reader == nil {
+				reader = r.Client
+			}
+			if err := isvcutils.ValidateArtifactStartupGate(ctx, reader, isvc); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
 	// Bind structured logging context for this reconcile pass: every
 	// per-step log line and every downstream callback that pulls from
 	// ctx inherits (namespace, isvc) without re-stamping per-line. The
@@ -1126,7 +1142,6 @@ func (r *InferenceServiceReconciler) clearRuntimeUnresolved(isvc *v1beta1.Infere
 
 func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType) error {
 	namespacedName := types.NamespacedName{Name: desiredService.Name, Namespace: desiredService.Namespace}
-
 	// Mirror the existing-status snapshot OUTSIDE the retry loop —
 	// "wasReady" is computed against what the caller observed at the
 	// top of reconcile, which is the right baseline for the Ready /
@@ -1563,6 +1578,10 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// this fan-out a runtime change never triggers a float ISVC's reconcile,
 	// so the edit silently fails to propagate — see isvcsReferencingRuntime.
 	ctrlBuilder = ctrlBuilder.
+		Watches(&v1beta1.BaseModel{},
+			handler.EnqueueRequestsFromMapFunc(r.isvcsReferencingEvictedModel)).
+		Watches(&v1beta1.ClusterBaseModel{},
+			handler.EnqueueRequestsFromMapFunc(r.isvcsReferencingEvictedModel)).
 		Watches(&v1beta1.ServingRuntime{},
 			handler.EnqueueRequestsFromMapFunc(r.isvcsReferencingRuntime)).
 		Watches(&v1beta1.ClusterServingRuntime{},

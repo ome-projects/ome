@@ -5149,6 +5149,20 @@
         }
       }
     },
+    "v1beta1.ModelRehydrationStatus": {
+      "description": "ModelRehydrationStatus separates current placement progress from prior completion.",
+      "type": "object",
+      "properties": {
+        "completedRequestID": {
+          "description": "CompletedRequestID retains the last completed request, even when new participants join and have not yet acknowledged that request.",
+          "type": "string"
+        },
+        "requestID": {
+          "description": "RequestID is the current request observed from the model annotation.",
+          "type": "string"
+        }
+      }
+    },
     "v1beta1.ModelRevisionStates": {
       "type": "object",
       "required": [
@@ -5260,6 +5274,10 @@
           "description": "ObservedGeneration is the .metadata.generation the controller last reconciled against. If this lags behind .metadata.generation, the controller has not yet observed the latest spec edit.",
           "type": "integer",
           "format": "int64"
+        },
+        "rehydration": {
+          "description": "Rehydration records acknowledgements of the retained model request.",
+          "$ref": "#/definitions/v1beta1.ModelRehydrationStatus"
         },
         "state": {
           "description": "Status of the model weight",

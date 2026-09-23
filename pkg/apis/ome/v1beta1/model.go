@@ -514,6 +514,9 @@ type ModelCacheStatus struct {
 
 // ModelStatusSpec defines the observed state of Model weight
 type ModelStatusSpec struct {
+	// Rehydration records acknowledgements of the retained model request.
+	// +optional
+	Rehydration *ModelRehydrationStatus `json:"rehydration,omitempty"`
 	// LifeCycle is an enum of Deprecated, Experiment, Public, Internal
 	LifeCycle *string `json:"lifecycle,omitempty"`
 
@@ -558,6 +561,17 @@ type ModelStatusSpec struct {
 	// distribution backend.
 	// +optional
 	Cache *ModelCacheStatus `json:"cache,omitempty"`
+}
+
+// ModelRehydrationStatus separates current placement progress from prior completion.
+type ModelRehydrationStatus struct {
+	// RequestID is the current request observed from the model annotation.
+	// +optional
+	RequestID string `json:"requestID,omitempty"`
+	// CompletedRequestID retains the last completed request, even when new
+	// participants join and have not yet acknowledged that request.
+	// +optional
+	CompletedRequestID string `json:"completedRequestID,omitempty"`
 }
 
 // BaseModel is the Schema for the basemodels API

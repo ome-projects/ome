@@ -4,7 +4,48 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
+
+func TestResolveOverlaysSkipsMissingModelKinds(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	baseKind, clusterKind, group := "BaseModel", "ClusterBaseModel", "ome.io"
+	for _, tc := range []struct {
+		name        string
+		kind, group *string
+	}{
+		{name: "legacy unqualified"},
+		{name: "explicit BaseModel", kind: &baseKind},
+		{name: "explicit ClusterBaseModel", kind: &clusterKind},
+		// CRD defaulting supplies both fields before the controller reads the ISVC.
+		{name: "defaulted ClusterBaseModel", kind: &clusterKind, group: &group},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			available := &v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "available"}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(available).Build()
+			isvc := &v1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns"},
+				Spec: v1beta1.InferenceServiceSpec{Model: &v1beta1.ModelRef{Overlays: []v1beta1.ModelOverlayRef{
+					{Name: "missing", Kind: tc.kind, APIGroup: tc.group},
+					{Name: "available", Kind: &clusterKind},
+				}}},
+			}
+			overlays, err := ResolveOverlays(c, isvc)
+			require.NoError(t, err)
+			require.Len(t, overlays, 2)
+			require.True(t, overlays[0].Skipped())
+			require.Equal(t, `overlay "missing" not found`, overlays[0].SkipReason)
+			require.False(t, overlays[1].Skipped())
+			require.Equal(t, "available", overlays[1].Meta.Name)
+		})
+	}
+}
 
 func TestOverlayEnvVarName(t *testing.T) {
 	tests := []struct {

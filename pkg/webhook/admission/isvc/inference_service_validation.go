@@ -441,7 +441,7 @@ func (v *InferenceServiceValidator) validateModelExists(ctx context.Context, isv
 	if isvc.Spec.Model == nil || isvc.Spec.Model.Name == "" {
 		return nil
 	}
-	spec, meta, err := isvcutils.GetBaseModel(v.Client, isvc.Spec.Model.Name, isvc.Namespace)
+	spec, meta, _, err := isvcutils.GetInferenceServiceModel(ctx, v.Client, isvc)
 	if err != nil {
 		return fmt.Errorf("referenced model %q not found in namespace %q: ensure a BaseModel exists in this namespace or a ClusterBaseModel exists cluster-wide with this name",
 			isvc.Spec.Model.Name, isvc.Namespace)
@@ -450,7 +450,7 @@ func (v *InferenceServiceValidator) validateModelExists(ctx context.Context, isv
 		return err
 	}
 	for _, ov := range isvc.Spec.Model.Overlays {
-		ovSpec, ovMeta, err := isvcutils.GetBaseModel(v.Client, ov.Name, isvc.Namespace)
+		ovSpec, ovMeta, _, err := isvcutils.GetReferencedModel(ctx, v.Client, isvc.Namespace, ov.Name, ov.Kind, ov.APIGroup)
 		if err != nil {
 			return fmt.Errorf("overlay %q not found in namespace %q: %w", ov.Name, isvc.Namespace, err)
 		}
@@ -578,7 +578,7 @@ func (v *InferenceServiceValidator) validateRuntimeOnlyAvailability(ctx context.
 }
 
 func (v *InferenceServiceValidator) resolveModelAndRuntime(ctx context.Context, isvc *v1beta1.InferenceService, warnings admission.Warnings) (admission.Warnings, error) {
-	baseModel, _, err := isvcutils.GetBaseModel(v.Client, isvc.Spec.Model.Name, isvc.Namespace)
+	baseModel, _, _, err := isvcutils.GetInferenceServiceModel(ctx, v.Client, isvc)
 	if err != nil {
 		return warnings, fmt.Errorf("failed to resolve model %s: %w", isvc.Spec.Model.Name, err)
 	}
