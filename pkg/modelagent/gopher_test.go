@@ -1152,6 +1152,8 @@ func TestWithModelVerificationConcurrencyCreatesSharedLimiter(t *testing.T) {
 func TestVerificationConcurrencyIsSharedAcrossModels(t *testing.T) {
 	g := &Gopher{}
 	WithModelVerificationConcurrency(3)(g)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	uris := make([]ociobjectstore.ObjectURI, 12)
 	for i := range uris {
@@ -1160,6 +1162,10 @@ func TestVerificationConcurrencyIsSharedAcrossModels(t *testing.T) {
 
 	var active atomic.Int32
 	var maxActive atomic.Int32
+	started := make(chan struct{}, len(uris))
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
 	validate := func(_ ociobjectstore.ObjectURI, _ string) (bool, error) {
 		current := active.Add(1)
 		for {
@@ -1168,26 +1174,51 @@ func TestVerificationConcurrencyIsSharedAcrossModels(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		started <- struct{}{}
+		<-release
 		active.Add(-1)
 		return true, nil
 	}
 
-	start := make(chan struct{})
-	var runs sync.WaitGroup
-	runs.Add(2)
-	for range 2 {
+	done := make(chan map[string]error, 2)
+	runModel := func(modelURIs []ociobjectstore.ObjectURI) {
 		go func() {
-			defer runs.Done()
-			<-start
-			errs := g.verifyDownloadedFilesWithValidator(context.Background(), uris, "/models", validate)
-			assert.Empty(t, errs)
+			done <- g.verifyDownloadedFilesWithValidator(ctx, modelURIs, "/models", validate)
 		}()
 	}
-	close(start)
-	runs.Wait()
+	waitForStart := func() {
+		t.Helper()
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for file verification to start")
+		}
+	}
+
+	// Hold one permit in model A before starting model B, ensuring both
+	// models are verifying files when the shared limit is reached.
+	runModel(uris[:1])
+	waitForStart()
+	runModel(uris[1:])
+	waitForStart()
+	waitForStart()
+	assert.Equal(t, int32(3), active.Load())
+	// Verify the occupied permits belong to the shared limiter, not to
+	// independent per-model limiters that happen to run sequentially.
+	assert.Len(t, g.modelVerificationLimiter.permits, 3)
+	unblock()
+	for range 2 {
+		select {
+		case errs := <-done:
+			assert.Empty(t, errs)
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for model verification to finish")
+		}
+	}
 
 	assert.Equal(t, int32(3), maxActive.Load())
+	assert.Zero(t, active.Load())
+	assert.Empty(t, g.modelVerificationLimiter.permits)
 }
 
 func TestVerifyDownloadedFilesWithValidatorReportsFailures(t *testing.T) {
