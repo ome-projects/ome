@@ -672,7 +672,9 @@ modelAgent:
   # Same shape and intent as ome.controller.podAnnotations above.
   podAnnotations: {}
   hostPath: /mnt/data/models
-  modelVerificationConcurrency: 1
+  # Pod-wide file verification limit; 0 follows --num-download-worker.
+  # A single model may use all available verification slots.
+  modelVerificationConcurrency: 0
   priorityClassName: system-node-critical
   serviceAccountName: ome-model-agent
   image:

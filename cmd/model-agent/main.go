@@ -49,6 +49,14 @@ type config struct {
 	logLevel                     string
 }
 
+// effectiveVerificationConcurrency resolves the pod-wide verification limit.
+func (c *config) effectiveVerificationConcurrency() int {
+	if c.modelVerificationConcurrency == 0 {
+		return max(1, c.numDownloadWorker)
+	}
+	return max(1, c.modelVerificationConcurrency)
+}
+
 // Logger type alias for zap.SugaredLogger
 type Logger = zap.SugaredLogger
 
@@ -74,7 +82,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.downloadRetry, "download-retry", 3, "Number of retries for downloading")
 	rootCmd.PersistentFlags().IntVar(&cfg.concurrency, "concurrency", 4, "Number of concurrent download workers per gopher")
 	rootCmd.PersistentFlags().IntVar(&cfg.multipartConcurrency, "multipart-concurrency", 4, "Number of concurrent multipart download workers per gopher")
-	rootCmd.PersistentFlags().IntVar(&cfg.modelVerificationConcurrency, "model-verification-concurrency", 1, "Maximum concurrent OCI model file integrity checks across the model-agent pod")
+	rootCmd.PersistentFlags().IntVar(&cfg.modelVerificationConcurrency, "model-verification-concurrency", 0, "Maximum concurrent OCI model file integrity checks across the model-agent pod (0 uses num-download-worker)")
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
@@ -276,7 +284,7 @@ func initializeComponents(
 		logger,
 		baseModelInformer.Lister(),
 		clusterBaseModelInformer.Lister(),
-		modelagent.WithModelVerificationConcurrency(cfg.modelVerificationConcurrency),
+		modelagent.WithModelVerificationConcurrency(cfg.effectiveVerificationConcurrency()),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)
