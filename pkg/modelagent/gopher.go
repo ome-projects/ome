@@ -55,23 +55,22 @@ type GopherTask struct {
 }
 
 type Gopher struct {
-	modelConfigParser            *modelparser.ModelConfigParser
-	configMapReconciler          *ConfigMapReconciler
-	downloadRetry                int
-	concurrency                  int
-	multipartConcurrency         int
-	modelVerificationConcurrency int
-	modelVerificationLimiter     *verificationLimiter
-	modelRootDir                 string
-	xetConfig                    *xet.Config
-	kubeClient                   kubernetes.Interface
-	gopherChan                   chan *GopherTask
-	nodeLabelReconciler          *NodeLabelReconciler
-	metrics                      *Metrics
-	logger                       *zap.SugaredLogger
-	configMapMutex               sync.Mutex // Mutex to coordinate ConfigMap access
-	baseModelLister              omev1beta1lister.BaseModelLister
-	clusterBaseModelLister       omev1beta1lister.ClusterBaseModelLister
+	modelConfigParser        *modelparser.ModelConfigParser
+	configMapReconciler      *ConfigMapReconciler
+	downloadRetry            int
+	concurrency              int
+	multipartConcurrency     int
+	modelVerificationLimiter *verificationLimiter
+	modelRootDir             string
+	xetConfig                *xet.Config
+	kubeClient               kubernetes.Interface
+	gopherChan               chan *GopherTask
+	nodeLabelReconciler      *NodeLabelReconciler
+	metrics                  *Metrics
+	logger                   *zap.SugaredLogger
+	configMapMutex           sync.Mutex // Mutex to coordinate ConfigMap access
+	baseModelLister          omev1beta1lister.BaseModelLister
+	clusterBaseModelLister   omev1beta1lister.ClusterBaseModelLister
 
 	taskTracker     gopherTaskTracker
 	artifactRouting gopherArtifactRouting
@@ -90,12 +89,10 @@ type GopherOption func(*Gopher)
 
 // WithModelVerificationConcurrency bounds concurrent OCI model file integrity
 // checks across all downloads handled by this model-agent process.
+// The same limit sizes each model's worker pool, so one model can use all
+// available permits while concurrent models share the process-wide budget.
 func WithModelVerificationConcurrency(concurrency int) GopherOption {
 	return func(gopher *Gopher) {
-		if concurrency < 1 {
-			concurrency = 1
-		}
-		gopher.modelVerificationConcurrency = concurrency
 		gopher.modelVerificationLimiter = newVerificationLimiter(concurrency)
 	}
 }
@@ -134,25 +131,24 @@ func NewGopher(
 	}
 
 	gopher := &Gopher{
-		modelConfigParser:            modelConfigParser,
-		configMapReconciler:          configMapReconciler,
-		downloadRetry:                downloadRetry,
-		concurrency:                  concurrency,
-		multipartConcurrency:         multipartConcurrency,
-		modelVerificationConcurrency: 1,
-		modelVerificationLimiter:     newVerificationLimiter(1),
-		modelRootDir:                 modelRootDir,
-		xetConfig:                    xetConfig,
-		kubeClient:                   kubeClient,
-		gopherChan:                   gopherChan,
-		nodeLabelReconciler:          nodeLabelReconciler,
-		metrics:                      metrics,
-		logger:                       logger,
-		baseModelLister:              baseModelLister,
-		clusterBaseModelLister:       clusterBaseModelLister,
-		taskQueue:                    newGopherTaskQueue(),
-		samePathWaitDelay:            defaultSamePathWaitDelay,
-		samePathWaitTimeout:          samePathWaitTimeout,
+		modelConfigParser:        modelConfigParser,
+		configMapReconciler:      configMapReconciler,
+		downloadRetry:            downloadRetry,
+		concurrency:              concurrency,
+		multipartConcurrency:     multipartConcurrency,
+		modelVerificationLimiter: newVerificationLimiter(1),
+		modelRootDir:             modelRootDir,
+		xetConfig:                xetConfig,
+		kubeClient:               kubeClient,
+		gopherChan:               gopherChan,
+		nodeLabelReconciler:      nodeLabelReconciler,
+		metrics:                  metrics,
+		logger:                   logger,
+		baseModelLister:          baseModelLister,
+		clusterBaseModelLister:   clusterBaseModelLister,
+		taskQueue:                newGopherTaskQueue(),
+		samePathWaitDelay:        defaultSamePathWaitDelay,
+		samePathWaitTimeout:      samePathWaitTimeout,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -1386,7 +1382,7 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 
 	// Perform final verification of all downloaded files
 	s.logger.Infof("Performing final integrity verification of %d downloaded files with pod-wide concurrency %d...",
-		len(objectUris), s.effectiveModelVerificationConcurrency())
+		len(objectUris), s.modelVerificationLimiter.limit())
 	verificationStartTime := time.Now()
 	verificationErrors := s.verifyDownloadedFiles(ctx, ociOSDataStore, objectUris, destPath, task)
 	if err := ctx.Err(); err != nil {
@@ -1448,11 +1444,8 @@ func (s *Gopher) verifyDownloadedFilesWithValidator(ctx context.Context, uris []
 		return errors
 	}
 
-	workerCount := min(s.effectiveModelVerificationConcurrency(), len(uris))
 	limiter := s.modelVerificationLimiter
-	if limiter == nil {
-		limiter = newVerificationLimiter(workerCount)
-	}
+	workerCount := min(limiter.limit(), len(uris))
 	jobs := make(chan ociobjectstore.ObjectURI)
 	results := make(chan verificationResult, len(uris))
 	var workers sync.WaitGroup
@@ -1475,6 +1468,8 @@ func (s *Gopher) verifyDownloadedFilesWithValidator(ctx context.Context, uris []
 					return
 				}
 
+				// Claim work before a permit so idle workers do not hold
+				// shared verification capacity while waiting for jobs.
 				if !limiter.acquire(ctx) {
 					return
 				}
@@ -1522,13 +1517,6 @@ func (s *Gopher) verifyDownloadedFilesWithValidator(ctx context.Context, uris []
 		}
 	}
 	return errors
-}
-
-func (s *Gopher) effectiveModelVerificationConcurrency() int {
-	if s.modelVerificationConcurrency < 1 {
-		return 1
-	}
-	return s.modelVerificationConcurrency
 }
 
 func (s *Gopher) deleteModel(destPath string, task *GopherTask) error {

@@ -1141,12 +1141,10 @@ func TestWithModelVerificationConcurrencyCreatesSharedLimiter(t *testing.T) {
 
 	WithModelVerificationConcurrency(8)(g)
 
-	assert.Equal(t, 8, g.modelVerificationConcurrency)
 	require.NotNil(t, g.modelVerificationLimiter)
 	assert.Equal(t, 8, g.modelVerificationLimiter.limit())
 
 	WithModelVerificationConcurrency(0)(g)
-	assert.Equal(t, 1, g.modelVerificationConcurrency)
 	require.NotNil(t, g.modelVerificationLimiter)
 	assert.Equal(t, 1, g.modelVerificationLimiter.limit())
 }
@@ -2254,7 +2252,7 @@ func TestVerificationStopsWhenAffinityCleanupCancelsDownload(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "second"), []byte("data"), 0600))
 	// A nil metrics collector makes accidental recording of cancellation as an
 	// integrity failure fail the test. Subsequent files must not be verified.
-	g := &Gopher{}
+	g := &Gopher{modelVerificationLimiter: newVerificationLimiter(1)}
 	_ = g.verifyDownloadedFiles(ctx, store, []ociobjectstore.ObjectURI{
 		{Namespace: "ns", BucketName: "bucket", ObjectName: "first"},
 		{Namespace: "ns", BucketName: "bucket", ObjectName: "second"},
