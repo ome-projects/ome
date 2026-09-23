@@ -10,6 +10,21 @@ import (
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
+// Check direct-HF admission before resolving a revision. Immutable identity and
+// path safety are validated when constructing the shared task input.
+func isDirectHfReuseEligible(task *GopherTask, spec *v1beta1.StorageSpec) bool {
+	return task != nil && spec != nil && spec.StorageUri != nil &&
+		strings.HasPrefix(*spec.StorageUri, "hf://") &&
+		spec.Path != nil && *spec.Path != "" &&
+		spec.DownloadPolicy != nil && *spec.DownloadPolicy == v1beta1.ReuseIfExists &&
+		!isHfArtifactShapeFiltered(task)
+}
+
+func isHfArtifactShapeFiltered(task *GopherTask) bool {
+	filter := task.TensorRTLLMShapeFilter
+	return filter != nil && filter.IsTensorrtLLMModel && filter.ModelType == string(constants.ServingBaseModel)
+}
+
 // newHfArtifactTaskInputForOCI plans a complete HF-origin OCI copy without I/O.
 // Ineligible sources use the legacy path (false, nil). Eligible sources with
 // unsafe local paths return an error instead of falling back to a download.
@@ -20,8 +35,7 @@ func newHfArtifactTaskInputForOCI(task *GopherTask, storageSpec *v1beta1.Storage
 		*storageSpec.DownloadPolicy != v1beta1.ReuseIfExists {
 		return hfArtifactTaskInput{}, false, nil
 	}
-	if filter := task.TensorRTLLMShapeFilter; filter != nil && filter.IsTensorrtLLMModel &&
-		filter.ModelType == string(constants.ServingBaseModel) {
+	if isHfArtifactShapeFiltered(task) {
 		return hfArtifactTaskInput{}, false, nil
 	}
 	storageType, err := storage.GetStorageType(*storageSpec.StorageUri)
@@ -36,6 +50,18 @@ func newHfArtifactTaskInputForOCI(task *GopherTask, storageSpec *v1beta1.Storage
 	if err != nil || objectURI.BucketName == "" ||
 		(strings.HasPrefix(*storageSpec.StorageUri, "oci://n/") && objectURI.Namespace == "") ||
 		!hfOCIArtifactPrefixMatches(objectURI.Prefix, identity) {
+		return hfArtifactTaskInput{}, false, nil
+	}
+	return newHfArtifactTaskInput(task, storageSpec, modelRootDir, identity)
+}
+
+// newHfArtifactTaskInput builds the same parent/child layout for OCI-origin and
+// direct HF sources after the source adapter has established immutable identity.
+func newHfArtifactTaskInput(task *GopherTask, storageSpec *v1beta1.StorageSpec, modelRootDir string, identity HfArtifactIdentity) (hfArtifactTaskInput, bool, error) {
+	if task == nil || (task.BaseModel == nil) == (task.ClusterBaseModel == nil) || storageSpec == nil {
+		return hfArtifactTaskInput{}, false, fmt.Errorf("shared artifact task requires one model and storage")
+	}
+	if isHfArtifactShapeFiltered(task) {
 		return hfArtifactTaskInput{}, false, nil
 	}
 	if storageSpec.Path == nil {

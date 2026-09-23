@@ -122,7 +122,11 @@ func TestCancellationCoverageSourceURIFailureHonorsContext(t *testing.T) {
 			}
 			var err error
 			if tc.uri == "hf://" {
-				err = g.processHuggingFaceModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
+				if tc.canceled {
+					_, err = g.processDirectHfModel(ctx, task, task.BaseModel.Spec, true)
+				} else {
+					err = g.processTask(task)
+				}
 			} else {
 				err = g.processLocalStorageModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
 			}
@@ -254,16 +258,18 @@ func TestCanceledUpdatingStopsNonOCITasks(t *testing.T) {
 	}
 }
 
-// Install a local snapshot stub so cancellation and pending progress can be
-// exercised without a network request or Rust transfer.
-func stubHfSnapshot(t *testing.T, download func(context.Context, *xet.DownloadConfig, xet.ProgressHandler, time.Duration) (string, error)) {
-	t.Helper()
-	oldFetch, oldDownload := fetchAttributeFromHfModelMetaData, snapshotDownloadWithProgress
-	fetchAttributeFromHfModelMetaData = func(context.Context, string, string) (interface{}, error) { return "sha", nil }
-	snapshotDownloadWithProgress = download
-	t.Cleanup(func() {
-		fetchAttributeFromHfModelMetaData, snapshotDownloadWithProgress = oldFetch, oldDownload
-	})
+// Exercise the direct-HF path with scoped dependencies and the production progress writer.
+func cancellationTestHfSource(g *Gopher, download func(context.Context, *xet.DownloadConfig, xet.ProgressHandler, time.Duration) (string, error)) directHfSource {
+	return directHfSource{
+		resolve: func(context.Context, string, string, string, string) (string, error) {
+			return strings.Repeat("a", 40), nil
+		},
+		download: func(ctx context.Context, task *GopherTask, config *xet.DownloadConfig) error {
+			return downloadDirectHfSnapshotWithProgress(ctx, config, download, func(flushCtx context.Context, progress *DownloadProgress) {
+				g.updateDirectHfProgress(flushCtx, task, progress)
+			})
+		},
+	}
 }
 
 // Fake client reactors do not expose request contexts, so intercept Secret.Get
@@ -339,15 +345,20 @@ func TestHfSecretLookupHonorsTaskCancellation(t *testing.T) {
 			}}
 			downloadCalled := false
 			downloadErr := errors.New("stop at snapshot download")
-			stubHfSnapshot(t, func(_ context.Context, config *xet.DownloadConfig, _ xet.ProgressHandler, _ time.Duration) (string, error) {
+			source := cancellationTestHfSource(g, func(_ context.Context, config *xet.DownloadConfig, _ xet.ProgressHandler, _ time.Duration) (string, error) {
 				downloadCalled = true
 				if !tc.canceled {
 					assert.Equal(t, tc.wantToken, config.Token)
 				}
 				return "", downloadErr
 			})
+			resolve := source.resolve
+			source.resolve = func(ctx context.Context, id, revision, token, endpoint string) (string, error) {
+				assert.False(t, tc.canceled, "canceled token lookup must not start a metadata request")
+				return resolve(ctx, id, revision, token, endpoint)
+			}
 
-			err := g.processHuggingFaceModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
+			_, err := source.process(ctx, g, task, task.BaseModel.Spec, true)
 			assert.True(t, lookupCalled)
 			if tc.canceled {
 				require.ErrorIs(t, err, context.Canceled)
@@ -361,7 +372,7 @@ func TestHfSecretLookupHonorsTaskCancellation(t *testing.T) {
 	}
 }
 
-func TestHfSnapshotCancellationSkipsFailureMetrics(t *testing.T) {
+func TestHfSnapshotCancellationAndFinalProgress(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		canceled bool
@@ -378,30 +389,43 @@ func TestHfSnapshotCancellationSkipsFailureMetrics(t *testing.T) {
 			g.modelConfigParser = modelparser.NewModelConfigParser(nil, g.logger)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			stubHfSnapshot(t, func(_ context.Context, config *xet.DownloadConfig, progress xet.ProgressHandler, _ time.Duration) (string, error) {
+			source := cancellationTestHfSource(g, func(_ context.Context, config *xet.DownloadConfig, progress xet.ProgressHandler, _ time.Duration) (string, error) {
 				progress(xet.ProgressUpdate{TotalBytes: 100, CompletedBytes: 50})
 				if tc.canceled {
 					cancel()
 				}
 				return config.LocalDir, tc.err
 			})
-			err := g.processHuggingFaceModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
+			_, err := source.process(ctx, g, task, task.BaseModel.Spec, true)
 			if tc.canceled {
 				require.ErrorIs(t, err, context.Canceled)
 				assertNoDownloadOutcome(t, g, task)
 			} else {
 				require.ErrorIs(t, err, tc.err)
-				assertCancellationCoverageStatus(t, g, task, ModelStatusFailed)
 				exists, raw, err := g.configMapReconciler.getDataEntryBasedOnModelKey(context.Background(), constants.GetModelConfigMapKey("default", "model", false))
 				require.NoError(t, err)
 				require.True(t, exists)
 				var entry ModelEntry
 				require.NoError(t, json.Unmarshal([]byte(raw), &entry))
-				assert.Nil(t, entry.Progress, "the final worker flush must not restore progress after Failed")
-				assert.Equal(t, float64(1), testutil.ToFloat64(g.metrics.modelDownloadsFailedTotal.WithLabelValues("BaseModel", "default", "model")))
+				require.NotNil(t, entry.Progress, "the worker must flush before the dispatcher publishes Failed")
+				assert.EqualValues(t, 50, entry.Progress.CompletedBytes)
 			}
 		})
 	}
+}
+
+func TestDirectHfDispatcherCancellationSkipsFailure(t *testing.T) {
+	g, task := newCancellationCoverageGopher(t, "hf://org/model")
+	core, _ := observer.New(zap.DebugLevel)
+	g.logger = zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if strings.HasPrefix(entry.Message, "Starting Hugging Face download") {
+			g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
+		}
+		return nil
+	})).Sugar()
+	require.ErrorIs(t, g.processTask(task), context.Canceled)
+	assertNoDownloadOutcome(t, g, task)
+	assertCancellationCoverageStatus(t, g, task, ModelStatusUpdating)
 }
 
 func TestHfFinalProgressFlushHonorsTaskCancellation(t *testing.T) {
@@ -417,7 +441,7 @@ func TestHfFinalProgressFlushHonorsTaskCancellation(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			client := g.configMapReconciler.kubeClient.(*k8sfake.Clientset)
-			stubHfSnapshot(t, func(_ context.Context, config *xet.DownloadConfig, progress xet.ProgressHandler, _ time.Duration) (string, error) {
+			source := cancellationTestHfSource(g, func(_ context.Context, config *xet.DownloadConfig, progress xet.ProgressHandler, _ time.Duration) (string, error) {
 				progress(xet.ProgressUpdate{TotalBytes: 100, CompletedBytes: 50})
 				if canceled {
 					cancel()
@@ -429,7 +453,7 @@ func TestHfFinalProgressFlushHonorsTaskCancellation(t *testing.T) {
 				}
 				return config.LocalDir, nil
 			})
-			err := g.processHuggingFaceModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
+			_, err := source.process(ctx, g, task, task.BaseModel.Spec, true)
 			if canceled {
 				require.ErrorIs(t, err, context.Canceled)
 				for _, action := range client.Actions() {
@@ -537,7 +561,7 @@ func TestHfProgressFlushSerializesWithAffinityCleanup(t *testing.T) {
 					}
 				}
 			}}
-			stubHfSnapshot(t, func(_ context.Context, config *xet.DownloadConfig, progress xet.ProgressHandler, _ time.Duration) (string, error) {
+			source := cancellationTestHfSource(g, func(_ context.Context, config *xet.DownloadConfig, progress xet.ProgressHandler, _ time.Duration) (string, error) {
 				progress(xet.ProgressUpdate{TotalBytes: 100, CompletedBytes: 50})
 				if cleanupFirst {
 					g.configMapMutex.Lock()
@@ -548,7 +572,8 @@ func TestHfProgressFlushSerializesWithAffinityCleanup(t *testing.T) {
 			})
 			done := make(chan error, 1)
 			go func() {
-				done <- g.processHuggingFaceModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
+				_, err := source.process(ctx, g, task, task.BaseModel.Spec, true)
+				done <- err
 			}()
 			if cleanupFirst {
 				waitForProgressEvent(t, ctx.started)
@@ -618,11 +643,12 @@ func TestCanceledConfigParsingIsNotOptional(t *testing.T) {
 			case "HF":
 				task.BaseModel.Spec.Storage.StorageUri = stringPtr("hf://org/model")
 				g.xetConfig = &xet.Config{}
-				stubHfSnapshot(t, func(_ context.Context, config *xet.DownloadConfig, _ xet.ProgressHandler, _ time.Duration) (string, error) {
+				source := cancellationTestHfSource(g, func(_ context.Context, config *xet.DownloadConfig, _ xet.ProgressHandler, _ time.Duration) (string, error) {
 					return config.LocalDir, nil
 				})
 				run = func() error {
-					return g.processHuggingFaceModel(ctx, task, task.BaseModel.Spec, "model", "BaseModel", "default", "model")
+					_, err := source.process(ctx, g, task, task.BaseModel.Spec, true)
+					return err
 				}
 			case "ordinary OCI":
 				task.BaseModel.Spec.Storage.StorageUri = stringPtr("oci://n/ns/b/bucket/o/model")
