@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	modelslister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -321,6 +322,8 @@ func newTestHfArtifactGopher(t *testing.T) (*Gopher, *GopherTask, hfArtifactTask
 	}}
 	gopher := &Gopher{configMapReconciler: repository.configMaps, modelRootDir: input.ModelStoreRoot,
 		logger: zap.NewNop().Sugar(), gopherChan: make(chan *GopherTask, 10), taskQueue: newGopherTaskQueue(),
+		kubeClient:             repository.configMaps.kubeClient,
+		modelClient:            omefake.NewSimpleClientset(task.BaseModel),
 		baseModelLister:        modelslister.NewBaseModelLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
 		clusterBaseModelLister: modelslister.NewClusterBaseModelLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))}
 	gopher.sharedHfArtifactHandler()
@@ -419,7 +422,7 @@ func TestGopherHfArtifactStatusWaitsForParentRepair(t *testing.T) {
 	unlock, acquired := handler.tryParentOperation(input.Parent.Key)
 	require.True(t, acquired)
 	for _, status := range []ModelStateOnNode{Ready, Updating} {
-		_, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: status})
+		_, _, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: status})
 		assert.ErrorContains(t, err, "active operation")
 	}
 	unlock()
@@ -429,7 +432,7 @@ func TestGopherHfArtifactStatusWaitsForParentRepair(t *testing.T) {
 	_, err = handler.repository.MarkChildrenFailedForRepair(context.Background(), parent)
 	require.NoError(t, err)
 	for _, status := range []ModelStateOnNode{Ready, Updating} {
-		_, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: status})
+		_, _, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: status})
 		assert.ErrorContains(t, err, "not ready")
 	}
 }

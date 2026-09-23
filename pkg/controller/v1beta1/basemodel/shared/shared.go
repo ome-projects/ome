@@ -29,6 +29,7 @@ const (
 	ModelStatusUpdating ModelStatus = "Updating"
 	ModelStatusFailed   ModelStatus = "Failed"
 	ModelStatusDeleted  ModelStatus = "Deleted"
+	ModelStatusEvicted  ModelStatus = "Evicted"
 )
 
 // ModelConfig is the structured per-model entry stored in per-node

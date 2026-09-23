@@ -304,6 +304,19 @@ func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input
 	}
 	referenced = referenced || input.PreserveChildPath
 	if !referenced {
+		_, childErr := os.Lstat(input.ChildModelPath)
+		if childErr != nil && !os.IsNotExist(childErr) {
+			return newHfArtifactRetryResult(input.Parent.Key, childErr), nil
+		}
+		if childErr == nil && h.hasChildConsumers != nil {
+			used, err := h.hasChildConsumers(ctx, input)
+			if err != nil {
+				return newHfArtifactRetryResult(input.Parent.Key, err), nil
+			}
+			if used {
+				return newHfArtifactRetryResult(input.Parent.Key, fmt.Errorf("shared artifact cleanup is blocked by a consuming pod")), nil
+			}
+		}
 		if err := h.files.RemoveChildSymlink(input.ChildModelPath, pending.ParentPath); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}

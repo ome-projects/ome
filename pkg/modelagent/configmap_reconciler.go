@@ -547,6 +547,29 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 		if err != nil {
 			return err
 		}
+		// Completing a retained shared deletion receipt also completes its
+		// verified UID handoff, before the new owner can publish status.
+		for key, oldRaw := range before {
+			var old ModelEntry
+			if json.Unmarshal([]byte(oldRaw), &old) != nil || old.HfArtifactPendingDeletion == nil {
+				continue
+			}
+			current, err := existingModelEntry(configMap.Data, key)
+			if err != nil || current.Name == "" || current.HfArtifactKey != "" || current.HfArtifactPendingDeletion != nil {
+				continue
+			}
+			c.cacheMutex.RLock()
+			owner := c.modelCache[key]
+			handoff := owner != nil && owner.ModelUID == old.HfArtifactPendingDeletion.ModelUID && c.isModelUIDInvalidatedLocked(key, old.ModelUID)
+			c.cacheMutex.RUnlock()
+			if handoff {
+				current.ModelUID = old.HfArtifactPendingDeletion.ModelUID
+				if _, err := writeModelEntry(configMap.Data, key, current); err != nil {
+					return err
+				}
+				changed = true
+			}
+		}
 		if changed || restored {
 			if needCreate {
 				_, err = c.kubeClient.CoreV1().ConfigMaps(c.namespace).Create(ctx, configMap, metav1.CreateOptions{})
@@ -582,12 +605,113 @@ func (c *ConfigMapReconciler) mutateModelEntryWithRetry(
 			configMap.Data = make(map[string]string)
 		}
 		if !allowDeleting {
+			if entry, err := existingModelEntry(configMap.Data, modelID); err == nil && entry.ModelUID != "" && entry.ModelUID != modelUID {
+				return false, fmt.Errorf("model %s is owned by UID %s, not %s", modelID, entry.ModelUID, modelUID)
+			}
 			if err := c.validateHfArtifactChildMutation(configMap.Data, modelID); err != nil {
 				return false, err
 			}
 		}
 		return mutate(configMap.Data)
 	})
+}
+
+// handoffOrdinaryModelOwner handles an offline delete/recreate without an old
+// delete event. Cleanup and shared ownership must finish through their own paths.
+// Live proof is repeated on every CAS retry; the old cache is fenced only after
+// the replacement owner is committed.
+func (c *ConfigMapReconciler) handoffOrdinaryModelOwner(ctx context.Context, key string, uid types.UID, verifyCurrent func() error) error {
+	c.configMapMutationMutex.Lock()
+	defer c.configMapMutationMutex.Unlock()
+	var oldUID types.UID
+	var replacement ModelEntry
+	err := c.mutateConfigMapWithModelUIDLocked(ctx, key, uid, func(cm *corev1.ConfigMap) (bool, error) {
+		oldUID = ""
+		if cm.Data[key] == "" {
+			return false, nil
+		}
+		entry, err := existingModelEntry(cm.Data, key)
+		if err != nil {
+			return false, err
+		}
+		c.cacheMutex.RLock()
+		invalidated := c.isModelUIDInvalidatedLocked(key, uid)
+		var cached CacheEntry
+		if current := c.modelCache[key]; current != nil {
+			cached = *current
+		}
+		c.cacheMutex.RUnlock()
+		if invalidated || uid == "" {
+			return false, fmt.Errorf("cannot hand off model %s to a stale or empty UID", key)
+		}
+		cachedReplacement := cached.ModelUID != "" && cached.ModelUID != uid
+		if entry.ModelUID == "" || entry.ModelUID == uid && !cachedReplacement {
+			return false, nil
+		}
+		if err := ordinaryModelOwnerCanBeReplaced(entry, key); err != nil {
+			return false, err
+		}
+		if cachedReplacement {
+			snapshot := ordinaryCachedModelEntry(&cached)
+			if cached.ModelEntryJSON != "" {
+				if err := json.Unmarshal([]byte(cached.ModelEntryJSON), &snapshot); err != nil {
+					return false, err
+				}
+			}
+			if err := ordinaryModelOwnerCanBeReplaced(snapshot, key); err != nil {
+				return false, err
+			}
+		}
+		// Also reject one-sided parent references that are absent from the child.
+		for parentKey, raw := range cm.Data {
+			if !isHfArtifactConfigMapKey(parentKey) {
+				continue
+			}
+			parent, err := decodeHfArtifactEntry(parentKey, raw)
+			if err != nil {
+				return false, err
+			}
+			if _, referenced := parent.Children[key]; referenced {
+				return false, fmt.Errorf("model %s still has a shared parent reference", key)
+			}
+		}
+		if verifyCurrent == nil {
+			return false, fmt.Errorf("model UID handoff requires live verification")
+		}
+		if err := verifyCurrent(); err != nil {
+			return false, err
+		}
+		if entry.ModelUID == uid {
+			// The previous CAS committed but its response was lost.
+			oldUID, replacement = cached.ModelUID, entry
+			return false, nil
+		}
+		oldUID = entry.ModelUID
+		replacement = ModelEntry{Name: entry.Name, ModelUID: uid, Status: ModelStatusUpdating}
+		return writeModelEntry(cm.Data, key, replacement)
+	})
+	if err != nil || oldUID == "" {
+		return err
+	}
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+	c.invalidateModelUIDAndEvictCacheLocked(key, oldUID)
+	c.modelCache[key] = &CacheEntry{ModelName: replacement.Name, ModelUID: uid, ModelStatus: replacement.Status}
+	delete(c.evictedModels, key)
+	return nil
+}
+
+func ordinaryModelOwnerCanBeReplaced(entry ModelEntry, key string) error {
+	if entry.ArtifactPendingEviction != nil || entry.HfArtifactPendingDeletion != nil || entry.HfArtifactKey != "" {
+		return fmt.Errorf("model %s still has cleanup or shared ownership", key)
+	}
+	if entry.Config != nil {
+		artifact := entry.Config.Artifact
+		if len(artifact.ChildrenPaths) != 0 || len(artifact.ParentPath) > 1 || len(artifact.ParentPath) == 1 && artifact.ParentPath[key] == "" {
+			return fmt.Errorf("model %s still has legacy shared ownership", key)
+		}
+	}
+	return nil
 }
 
 // invalidateModelUIDAndEvictCache atomically prevents further mutations from
@@ -708,7 +832,10 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 			}
 		}
 		modelEntry.Status = op.ModelStatus
-		if op.ModelStatus == ModelStatusReady || op.ModelStatus == ModelStatusFailed {
+		if op.ModelStatus == ModelStatusReady || modelEntry.ModelUID == "" {
+			modelEntry.ModelUID = modelUID
+		}
+		if op.ModelStatus == ModelStatusReady || op.ModelStatus == ModelStatusFailed || op.ModelStatus == ModelStatusEvicted {
 			modelEntry.Progress = nil
 		}
 
@@ -758,6 +885,9 @@ func (c *ConfigMapReconciler) updateModelMetadataInConfigMap(ctx context.Context
 			}
 		}
 		modelEntry.Config = modelConfig
+		if modelEntry.ModelUID == "" {
+			modelEntry.ModelUID = modelUID
+		}
 
 		entryJSON, err := json.Marshal(modelEntry)
 		if err != nil {

@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	modelslister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -467,6 +468,11 @@ func TestHfArtifactPendingDeletionGopherRecreatedUID(t *testing.T) {
 			}
 			current := input
 			current.ChildModelUID = "replacement-uid"
+			if cluster {
+				s.modelClient = omefake.NewSimpleClientset(task.ClusterBaseModel)
+			} else {
+				s.modelClient = omefake.NewSimpleClientset(task.BaseModel)
+			}
 			// This ordinary update cannot register the new UID while the old
 			// cache owner remains. The cleanup handoff must break that cycle.
 			require.NoError(t, s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
@@ -627,6 +633,7 @@ func TestHfArtifactPendingDeletionPreservesDifferentParentReplacement(t *testing
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	require.NoError(t, indexer.Add(otherModel))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
+	s.modelClient = omefake.NewSimpleClientset(otherModel)
 	result, err = s.runHfArtifactDownload(context.Background(), &GopherTask{TaskType: Download, BaseModel: otherModel}, other, true, nil, writeTestHfArtifactFiles)
 	require.NoError(t, err)
 	require.Equal(t, hfArtifactTaskDone, result.Outcome)

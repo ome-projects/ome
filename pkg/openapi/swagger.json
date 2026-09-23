@@ -5231,6 +5231,15 @@
           "description": "LifeCycle is an enum of Deprecated, Experiment, Public, Internal",
           "type": "string"
         },
+        "nodesEvicted": {
+          "description": "NodesEvicted records intentional local absence, distinct from download failure.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
         "nodesFailed": {
           "type": "array",
           "items": {

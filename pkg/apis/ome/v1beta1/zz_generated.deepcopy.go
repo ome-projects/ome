@@ -3872,6 +3872,11 @@ func (in *ModelStatusSpec) DeepCopyInto(out *ModelStatusSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.NodesEvicted != nil {
+		in, out := &in.NodesEvicted, &out.NodesEvicted
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

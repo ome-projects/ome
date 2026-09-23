@@ -148,6 +148,33 @@ func TestGopherTaskQueueDeleteSupersedesPendingDownloadsForSameModel(t *testing.
 	assert.Equal(t, 0, queue.len())
 }
 
+func TestGopherTaskQueueEvictPreservesPendingWork(t *testing.T) {
+	queue := newGopherTaskQueue()
+	defer queue.close()
+	model := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "service-ns", UID: "model-uid"}}
+	high := &GopherTask{TaskType: Download, BaseModel: model, Sequence: 1, SamePathWaitStartedAt: time.Now()}
+	normal := &GopherTask{TaskType: DownloadOverride, BaseModel: model, Sequence: 2}
+	revalidation := &GopherTask{TaskType: Download, BaseModel: model, Sequence: 3, RevalidationReplay: true}
+	eviction := &GopherTask{TaskType: Evict, BaseModel: model, Sequence: 4, ResidencyManaged: true}
+	for _, task := range []*GopherTask{high, normal, revalidation, eviction} {
+		queue.enqueue(task)
+	}
+
+	queued, ok := queue.popHighPriority()
+	require.True(t, ok)
+	require.Same(t, eviction, queued)
+	require.Equal(t, 3, queue.len(), "eviction must pass preflight before superseding pending work")
+	queued, ok = queue.popHighPriority()
+	require.True(t, ok)
+	require.Same(t, high, queued)
+	queued, ok = queue.popNormal()
+	require.True(t, ok)
+	require.Same(t, normal, queued)
+	queued, ok = queue.popNormal()
+	require.True(t, ok)
+	require.Same(t, revalidation, queued)
+}
+
 func TestGopherTaskQueueDeletePreemptsHighPriorityFIFO(t *testing.T) {
 	queue := newGopherTaskQueue()
 	wait := &GopherTask{

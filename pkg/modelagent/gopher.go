@@ -3,6 +3,7 @@ package modelagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/logging"
@@ -36,6 +38,7 @@ const (
 	Download         GopherTaskType = "Download"
 	DownloadOverride GopherTaskType = "DownloadOverride"
 	Delete           GopherTaskType = "Delete"
+	Evict            GopherTaskType = "Evict"
 )
 
 type GopherTask struct {
@@ -50,6 +53,8 @@ type GopherTask struct {
 	Sequence uint64
 	// SharedArtifact selects ownership-aware handling; ordinary tasks keep the legacy path.
 	SharedArtifact bool
+	// ResidencyManaged serializes artifact eviction with all work for this model UID.
+	ResidencyManaged bool
 	// Pin direct-HF moving refs across queue retries within this logical task.
 	HfResolvedRevision string
 }
@@ -63,6 +68,7 @@ type Gopher struct {
 	modelRootDir           string
 	xetConfig              *xet.Config
 	kubeClient             kubernetes.Interface
+	modelClient            omeclient.Interface
 	gopherChan             chan *GopherTask
 	nodeLabelReconciler    *NodeLabelReconciler
 	metrics                *Metrics
@@ -107,7 +113,8 @@ func NewGopher(
 	metrics *Metrics,
 	logger *zap.SugaredLogger,
 	baseModelLister omev1beta1lister.BaseModelLister,
-	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister) (*Gopher, error) {
+	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister,
+	modelClient omeclient.Interface) (*Gopher, error) {
 
 	if xetConfig == nil {
 		return nil, fmt.Errorf("xet hugging face config cannot be nil")
@@ -125,6 +132,7 @@ func NewGopher(
 		modelRootDir:           modelRootDir,
 		xetConfig:              xetConfig,
 		kubeClient:             kubeClient,
+		modelClient:            modelClient,
 		gopherChan:             gopherChan,
 		nodeLabelReconciler:    nodeLabelReconciler,
 		metrics:                metrics,
@@ -209,7 +217,7 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue()
 	}
-	if task.TaskType == Delete && task.SharedArtifact {
+	if task.TaskType == Delete && (task.SharedArtifact || task.ResidencyManaged) {
 		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
 		if result == gopherTaskStale {
 			return
@@ -270,11 +278,26 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 	}
 
 	// Mark the node label
-	unlock, err := s.lockHfChildStatus(ctx, op)
+	unlock, shared, err := s.lockHfChildStatus(ctx, op)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
+	// Check current ownership before publishing status for an evictable path.
+	checkRequest := shared || s.isBoundedDirectArtifactTask(task)
+	if checkRequest && (op.ModelStateOnNode == Ready || op.ModelStateOnNode == Updating || op.ModelStateOnNode == Failed) {
+		if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err != nil {
+			return fmt.Errorf("%w: %w", errArtifactStatusLiveValidation, err)
+		} else if skip {
+			return fmt.Errorf("%w: artifact request changed before status publication", errArtifactStatusLiveValidation)
+		}
+	}
+	if meta := taskModelMeta(task); meta != nil && meta.UID != "" && (op.ModelStateOnNode == Ready || op.ModelStateOnNode == Updating || op.ModelStateOnNode == Failed) {
+		if err := s.handoffOrdinaryArtifactOwner(ctx, task); err != nil {
+			return err
+		}
+	}
 	err = s.nodeLabelReconciler.ReconcileNodeLabels(op)
 	if err != nil {
 		return err
@@ -291,6 +314,8 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 			status = ModelStatusUpdating
 		case Failed:
 			status = ModelStatusFailed
+		case Evicted:
+			status = ModelStatusEvicted
 		case Deleted:
 			// For deletion, use the DeleteModelFromConfigMap method instead
 			return s.configMapReconciler.DeleteModelFromConfigMap(ctx, op.BaseModel, op.ClusterBaseModel)
@@ -364,9 +389,16 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	if err != nil || !proceed {
 		return err
 	}
+	ctx, releaseDirectArtifact := withDirectArtifactDownloadOperation(ctx)
+	defer releaseDirectArtifact()
 	keepDeleteBarrier := false
 	defer func() { finish(keepDeleteBarrier) }()
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
+	if task.TaskType == Evict {
+		waiting, err := s.processArtifactEviction(ctx, task)
+		keepDeleteBarrier = waiting
+		return err
+	}
 
 	// Get model type, namespace, and name for metrics
 	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
@@ -379,7 +411,13 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	}
 
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
-		if skip, runDeleteCleanup := s.shouldSkipStaleDownloadTask(task); skip {
+		skip, runDeleteCleanup, checkErr := s.shouldSkipStaleDownloadTask(ctx, task)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if checkErr != nil {
+			return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), checkErr))
+		} else if skip {
 			if runDeleteCleanup {
 				s.logger.Infof("Model %s is deleting, running cleanup instead of download", modelInfo)
 				return s.cleanupDeletingModel(task, &GopherTask{
@@ -391,6 +429,17 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			}
 			s.logger.Infof("Model %s no longer exists, skipping stale download task", modelInfo)
 			return nil
+		}
+		if task.ResidencyManaged {
+			if waiting, err := s.settleDirectArtifactEviction(ctx, task); waiting || err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if err != nil {
+					return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+				}
+				return err
+			}
 		}
 	}
 
@@ -409,7 +458,11 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 		if err != nil {
 			s.logger.Errorf("Failed to set model %s status to Updating: %v", modelInfo, err)
-			// Continue with download anyway
+			if task.ResidencyManaged || errors.Is(err, errArtifactStatusLiveValidation) {
+				// Retained Ready labels can admit consumers while files are repaired.
+				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+			// Ordinary current no-request downloads retain label-error behavior.
 		}
 	}
 
@@ -453,6 +506,14 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			if handled {
 				break
 			}
+			unlock, acquired, err := s.acquireDirectArtifactDownload(ctx, task)
+			if err != nil || !acquired {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+			defer unlock()
 			osUri, err := getTargetDirPath(&baseModelSpec)
 			destPath := getDestPath(&baseModelSpec, s.modelRootDir)
 			if err != nil {
@@ -566,7 +627,13 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		// Calculate download duration
 		downloadDuration := time.Since(downloadStartTime)
 
-		if skip, runDeleteCleanup := s.shouldSkipStaleDownloadTask(task); skip {
+		skip, runDeleteCleanup, checkErr := s.shouldSkipStaleDownloadTask(ctx, task)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if checkErr != nil {
+			return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), checkErr))
+		} else if skip {
 			if runDeleteCleanup {
 				s.logger.Infof("Model %s is deleting after download, running cleanup instead of marking Ready", modelInfo)
 				return s.cleanupDeletingModel(task, &GopherTask{
@@ -786,50 +853,58 @@ func shouldUseSamePathObjectStorageReuse(task *GopherTask) bool {
 	return task != nil && task.TaskType == Download
 }
 
-func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
+func (s *Gopher) shouldSkipStaleDownloadTask(ctx context.Context, task *GopherTask) (bool, bool, error) {
 	if task == nil {
-		return false, false
+		return false, false, nil
 	}
 
 	if task.BaseModel != nil {
 		if s.baseModelLister == nil {
-			return false, false
+			return false, false, nil
 		}
 		latestModel, err := s.baseModelLister.BaseModels(task.BaseModel.Namespace).Get(task.BaseModel.Name)
 		if apierrors.IsNotFound(err) {
-			return true, false
+			return true, false, nil
 		}
 		if err != nil {
 			s.logger.Warnf("Cannot check latest BaseModel %s/%s before download: %v", task.BaseModel.Namespace, task.BaseModel.Name, err)
-			return false, false
+			return false, false, nil
 		}
 		if task.SharedArtifact && latestModel.UID != task.BaseModel.UID {
-			return true, false
+			return true, false, nil
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
-		return isDeleting, isDeleting
+		if !isDeleting && modelEvictionRequested(&latestModel.ObjectMeta) {
+			blocked, err := s.shouldBlockDownloadForEviction(ctx, task)
+			return blocked, false, err
+		}
+		return isDeleting, isDeleting, nil
 	}
 
 	if task.ClusterBaseModel != nil {
 		if s.clusterBaseModelLister == nil {
-			return false, false
+			return false, false, nil
 		}
 		latestModel, err := s.clusterBaseModelLister.Get(task.ClusterBaseModel.Name)
 		if apierrors.IsNotFound(err) {
-			return true, false
+			return true, false, nil
 		}
 		if err != nil {
 			s.logger.Warnf("Cannot check latest ClusterBaseModel %s before download: %v", task.ClusterBaseModel.Name, err)
-			return false, false
+			return false, false, nil
 		}
 		if task.SharedArtifact && latestModel.UID != task.ClusterBaseModel.UID {
-			return true, false
+			return true, false, nil
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
-		return isDeleting, isDeleting
+		if !isDeleting && modelEvictionRequested(&latestModel.ObjectMeta) {
+			blocked, err := s.shouldBlockDownloadForEviction(ctx, task)
+			return blocked, false, err
+		}
+		return isDeleting, isDeleting, nil
 	}
 
-	return false, false
+	return false, false, nil
 }
 
 // isPathReferencedByOtherModels checks if the given path is still referenced by other BaseModel or ClusterBaseModel resources

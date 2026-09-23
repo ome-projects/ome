@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -125,6 +126,10 @@ func (s *Gopher) sharedHfArtifactHandler() *hfArtifactTaskHandler {
 		s.hfArtifactHandler = newHfArtifactTaskHandler(newHfArtifactRepository(s.configMapReconciler))
 		s.hfArtifactHandler.updateChildStatuses = s.updateHfArtifactChildLabels
 		s.hfArtifactHandler.hasOtherPathUsers = s.hfArtifactHasOtherPathUsers
+		s.hfArtifactHandler.hasParentConsumers = s.hfArtifactParentHasConsumers
+		s.hfArtifactHandler.hasChildConsumers = func(ctx context.Context, input hfArtifactTaskInput) (bool, error) {
+			return s.pathHasLocalPodConsumers(ctx, input.ChildModelPath)
+		}
 		s.hfArtifactHandler.isCurrentChildUID = s.hfArtifactIsCurrentChildUID
 		s.hfArtifactStartup = newHfArtifactStartup(s.hfArtifactHandler)
 	})
@@ -225,35 +230,43 @@ func (s *Gopher) hfArtifactHasOtherPathUsers(input hfArtifactTaskInput) (bool, e
 // lockHfChildStatus prevents ordinary task progress from publishing Ready or
 // Updating labels while repair may be replacing the shared files. The repair
 // callback writes labels directly while holding the same operation lock.
-func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func(), error) {
+func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (release func(), shared bool, err error) {
 	noop := func() {}
 	if s.configMapReconciler == nil || op.ModelStateOnNode == Deleted ||
 		(op.BaseModel == nil && op.ClusterBaseModel == nil) {
-		return noop, nil
+		return noop, false, nil
 	}
 	task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
 	spec := taskModelSpec(task)
+	operation := directArtifactDownloadOperationFromContext(ctx)
+	requireShared := op.ModelStateOnNode == Ready && operation != nil && operation.sharedCompleted
 	_, eligible, _ := newHfArtifactTaskInputForOCI(task, spec.Storage, s.modelRootDir)
 	sharedLink := spec.Storage != nil && spec.Storage.Path != nil && isSharedHfArtifactSymlink(*spec.Storage.Path)
-	if !eligible && !sharedLink {
-		return noop, nil
+	if !eligible && !sharedLink && !requireShared {
+		return noop, false, nil
 	}
 	handler := s.sharedHfArtifactHandler()
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
 	parent, found, err := handler.repository.GetParentForChild(ctx, key)
 	if apierrors.IsNotFound(err) {
-		return noop, nil
+		if requireShared || sharedLink && op.ModelStateOnNode == Ready {
+			return noop, true, fmt.Errorf("shared artifact link has no persisted owner")
+		}
+		return noop, sharedLink, nil
 	}
 	if err != nil || !found {
-		return noop, err
+		if err == nil && (requireShared || sharedLink && op.ModelStateOnNode == Ready) {
+			err = fmt.Errorf("shared artifact link has no persisted owner")
+		}
+		return noop, sharedLink, err
 	}
 	input := s.hfArtifactInputForChild(task, parent)
 	unlock, acquired, err := handler.tryParentFileOperation(parent, input.ModelStoreRoot)
 	if err != nil {
-		return noop, err
+		return noop, true, err
 	}
 	if !acquired {
-		return noop, fmt.Errorf("shared artifact %s has an active operation", parent.Key)
+		return noop, true, fmt.Errorf("shared artifact %s has an active operation", parent.Key)
 	}
 	lockedParentKey := parent.Key
 	parent, found, err = handler.repository.GetParentForChild(ctx, key)
@@ -266,15 +279,18 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	if err == nil {
 		err = input.validateFilesystemPaths(parent)
 	}
+	if err == nil && op.ModelStateOnNode == Ready && !handler.files.IsChildLinkedToParent(input.ChildModelPath, parent.LocalPath) {
+		err = fmt.Errorf("shared artifact child link is absent before Ready publication")
+	}
 	if err == nil && found && (op.ModelStateOnNode == Ready || len(parent.ChildStatusesBeforeRepair) != 0) &&
 		(parent.Status != HfArtifactStatusReady || !handler.files.ParentReadyMarkerExists(parent)) {
 		err = fmt.Errorf("shared artifact %s is not ready for child status %s", parent.Key, op.ModelStateOnNode)
 	}
 	if err != nil {
 		unlock()
-		return noop, err
+		return noop, true, err
 	}
-	return unlock, nil
+	return unlock, true, nil
 }
 
 // The repository updates ConfigMap statuses atomically with parent state. This
@@ -326,8 +342,55 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 
 // runHfArtifactDownload keeps expensive validation and writes on normal workers.
 // A Failed parent with children is repaired in place, never reset as a new copy.
-func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (hfArtifactTaskResult, error) {
+func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (result hfArtifactTaskResult, err error) {
+	input.validateDownload = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err != nil {
+			return err
+		} else if skip {
+			return fmt.Errorf("shared artifact task is no longer current")
+		}
+		return nil
+	}
+	defer func() {
+		if ctx.Err() != nil {
+			result, err = hfArtifactTaskResult{}, ctx.Err()
+			return
+		}
+		if err == nil && result.Outcome == hfArtifactTaskDone {
+			if operation := directArtifactDownloadOperationFromContext(ctx); operation != nil {
+				// Eligibility can fall back to direct files. Only a shared
+				// completion requires shared ownership at final publication.
+				operation.sharedCompleted = true
+			}
+		}
+	}()
 	handler := s.sharedHfArtifactHandler()
+	if originalValidate := validate; originalValidate != nil {
+		validate = func(path string) (bool, error) {
+			valid, err := originalValidate(path)
+			if err != nil {
+				return false, err
+			}
+			if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err != nil {
+				return false, err
+			} else if skip {
+				return false, fmt.Errorf("artifact task changed before repair")
+			}
+			if !valid {
+				used, err := s.pathHasLocalPodConsumers(ctx, path)
+				if err != nil {
+					return false, err
+				}
+				if used {
+					return false, fmt.Errorf("cannot repair shared artifact while a Pod uses %s", path)
+				}
+			}
+			return valid, nil
+		}
+	}
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
@@ -381,8 +444,29 @@ func (s *Gopher) hfArtifactInputForChild(task *GopherTask, parent HfArtifactEntr
 		hfArtifactInputPathWithin(s.modelRootDir, parent.Children[key]) {
 		root = s.modelRootDir
 	}
-	return hfArtifactTaskInput{Parent: parent, ChildModelKey: key, ChildModelUID: types.UID(getModelUID(task)),
+	input := hfArtifactTaskInput{Parent: parent, ChildModelKey: key, ChildModelUID: types.UID(getModelUID(task)),
 		ChildModelPath: parent.Children[key], ModelStoreRoot: root}
+	if task.TaskType == Evict {
+		input.beforeDelete = func(ctx context.Context) error {
+			current, path, err := s.prepareArtifactEviction(ctx, task)
+			if err != nil {
+				return err
+			}
+			if current == nil {
+				return fmt.Errorf("shared artifact eviction is no longer eligible")
+			}
+			expectedPath, err := safeArtifactEvictionPath(s.modelRootDir, input.ChildModelPath)
+			if err != nil {
+				return err
+			}
+			if path != expectedPath || !reflect.DeepEqual(taskModelSpec(current), taskModelSpec(task)) ||
+				!reflect.DeepEqual(taskModelMeta(current).Annotations, taskModelMeta(task).Annotations) {
+				return fmt.Errorf("model changed before shared eviction lock")
+			}
+			return nil
+		}
+	}
+	return input
 }
 
 // detachHfArtifactForDefaultDownload releases persisted shared ownership before
@@ -481,7 +565,9 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 	if err != nil {
 		return true, false, err
 	}
-	input.RetainDeletionReceipt = true
+	// CR deletion retains the receipt until the child entry is removed. Eviction
+	// keeps that entry, so completed cleanup must clear its receipt here.
+	input.RetainDeletionReceipt = task.TaskType == Delete
 	preserve = preserve || s.isReservingModelArtifact(task)
 	result, err := s.releaseHfArtifactChild(ctx, input, preserve)
 	if err == nil && result.Outcome == hfArtifactTaskRetry {
@@ -567,6 +653,11 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 			return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 		}
 		defer unlock()
+		if input.beforeDelete != nil {
+			if err := input.beforeDelete(ctx); err != nil {
+				return newHfArtifactRetryResult(input.Parent.Key, err), nil
+			}
+		}
 		if err := handler.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}
@@ -628,6 +719,17 @@ func (s *Gopher) requeueHfArtifactTask(task *GopherTask, result hfArtifactTaskRe
 // finishDownloadStatus reports whether Ready was published. A queued retry is
 // not a completed download and must not increment success metrics.
 func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op *NodeLabelOp) (bool, error) {
+	spec := taskModelSpec(task)
+	held := directArtifactDownloadOperationFromContext(ctx)
+	sharedCompleted := held != nil && held.sharedCompleted
+	if held != nil && held.release != nil {
+		if err := s.validateDirectArtifactPublication(ctx, task, held.path); err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		}
+	}
 	err := s.safeNodeLabelReconciliation(ctx, op)
 	// A canceled task must not be revived by the shared-parent retry path.
 	if ctx.Err() != nil {
@@ -637,8 +739,7 @@ func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op 
 		return true, nil
 	}
 	s.logger.Errorf("Failed to mark model %s as Ready: %v", getModelInfoForLogging(task), err)
-	spec := taskModelSpec(task)
-	if isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+	if sharedCompleted || isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
 		// A sibling may acquire the parent after this child attaches. Keep the
 		// successful task queued until its final Ready update is safe.
 		return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))

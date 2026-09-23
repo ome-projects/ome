@@ -56,6 +56,10 @@ type hfArtifactTaskInput struct {
 	RetainDeletionReceipt bool
 	// A reserve-artifact delete must preserve its symlink on cleanup retries too.
 	PreserveChildPath bool
+	// Eviction rechecks live intent while both filesystem locks are held.
+	beforeDelete func(context.Context) error
+	// Downloads and attachments recheck live child intent under both file locks.
+	validateDownload func(context.Context) error
 }
 
 func (input hfArtifactTaskInput) modelStoreRoot() (string, error) {
@@ -87,6 +91,11 @@ type hfArtifactTaskHandler struct {
 	// hasOtherPathUsers covers consumers outside the shared-parent index, such
 	// as local-storage CRs. Cleanup calls it while holding both filesystem locks.
 	hasOtherPathUsers func(hfArtifactTaskInput) (bool, error)
+	// hasParentConsumers preserves directly used parent bytes without blocking
+	// removal of an unused child. Called while holding the parent filesystem lock.
+	hasParentConsumers func(context.Context, HfArtifactEntry) (bool, error)
+	// Check before unlink: resolving Pod paths after unlink loses child consumers.
+	hasChildConsumers func(context.Context, hfArtifactTaskInput) (bool, error)
 	// isCurrentChildUID verifies same-name replacement against the CR lister,
 	// independently of the status cache that still belongs to the old UID.
 	isCurrentChildUID func(hfArtifactTaskInput) (bool, error)

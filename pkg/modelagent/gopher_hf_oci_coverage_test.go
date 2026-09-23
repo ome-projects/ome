@@ -134,7 +134,7 @@ func TestSharedOCIStatusRechecksReferenceAndReleasesLock(t *testing.T) {
 		require.NoError(t, err)
 		return true, cm, nil
 	})
-	_, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready})
+	_, _, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready})
 	require.ErrorContains(t, err, "reference changed")
 	unlock, acquired := handler.tryParentOperation(input.Parent.Key)
 	require.True(t, acquired, "a rejected status update must release its parent operation lock")

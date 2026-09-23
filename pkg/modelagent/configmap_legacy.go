@@ -1,6 +1,8 @@
 package modelagent
 
-import "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+import (
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+)
 
 // cacheOrdinaryModel keeps the legacy status/metadata cache independent of
 // progress and unrelated ConfigMap observations. Shared records are published
@@ -42,7 +44,7 @@ func (c *ConfigMapReconciler) cacheOrdinaryModel(base *v1beta1.BaseModel, cluste
 // ordinaryCachedModelEntry retains the legacy recovery field set. In
 // particular, transient progress is not a source of recoverable model state.
 func ordinaryCachedModelEntry(entry *CacheEntry) ModelEntry {
-	model := ModelEntry{Name: entry.ModelName, Status: entry.ModelStatus}
+	model := ModelEntry{Name: entry.ModelName, ModelUID: entry.ModelUID, Status: entry.ModelStatus}
 	if metadata := entry.ModelMetadata; metadata != nil {
 		model.Config = &ModelConfig{
 			ModelType: metadata.ModelType, ModelArchitecture: metadata.ModelArchitecture,

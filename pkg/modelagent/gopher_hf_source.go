@@ -216,6 +216,14 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 		s.demoteToNormalPriority(task)
 		return true, nil
 	}
+	unlock, acquired, err := s.acquireDirectArtifactDownload(ctx, task)
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), nil))
+	}
+	defer unlock()
 	if err := checkDirectHfDestinationAncestors(destination); err != nil {
 		return false, err
 	}

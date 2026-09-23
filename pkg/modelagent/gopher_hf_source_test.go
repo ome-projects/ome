@@ -25,6 +25,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/xet"
 )
@@ -34,6 +35,11 @@ func newTestDirectHfSource(t *testing.T) (*Gopher, *GopherTask, hfArtifactTaskIn
 	s, task, input := newTestHfArtifactGopher(t)
 	uri := "hf://" + input.Parent.Identity.ModelID + "@refs/pr/7"
 	task.BaseModel.Spec.Storage.StorageUri = &uri
+	// Source tests configure this task between calls; expose that configured
+	// Model through the live API used by ordinary bounded writers as well.
+	s.modelClient.(*omefake.Clientset).PrependReactor("get", "basemodels", func(action ktesting.Action) (bool, runtime.Object, error) {
+		return true, task.BaseModel.DeepCopy(), nil
+	})
 	s.xetConfig = &xet.Config{Token: "fallback-token", Endpoint: "https://hf.example.test/hub"}
 	contents := map[string]string{"config.json": "{}", "model.safetensors": "weights"}
 	manifest := testHfSnapshotManifest(contents)
@@ -332,6 +338,7 @@ func TestDirectHfDispatcherFailureMetrics(t *testing.T) {
 			require.NoError(t, err)
 			s = newGopherForProcessTask(cm)
 			s.modelRootDir = input.ModelStoreRoot
+			s.modelClient = omefake.NewSimpleClientset(task.BaseModel)
 			task.HfResolvedRevision = input.Parent.Identity.CommitSHA
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, "true", r.URL.Query().Get("blobs"))

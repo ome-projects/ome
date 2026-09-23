@@ -203,7 +203,7 @@ func TestOrphanCleanupErrorsPreserveFinalizerAndStatus(t *testing.T) {
 			updated := false
 			err = processModelStatus(ctx, c, reader, logr.Discard(), "default", "model", false,
 				func(context.Context, *shared.ModelConfig) error { updated = true; return nil },
-				func(context.Context, []string, []string) error { updated = true; return nil })
+				func(context.Context, []string, []string, []string, bool) error { updated = true; return nil })
 			g.Expect(err).To(gomega.HaveOccurred())
 			g.Expect(updated).To(gomega.BeFalse())
 		})

@@ -13,6 +13,11 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
+	if input.beforeDelete != nil {
+		if err := input.beforeDelete(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
@@ -129,6 +134,18 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 			return newHfArtifactRetryResult(parent.Key, err), nil
 		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
+	}
+	if h.hasParentConsumers != nil {
+		used, err := h.hasParentConsumers(ctx, parent)
+		if err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
+		if used {
+			if err := h.releaseParentDeletionLock(ctx, parent, wasReady); err != nil {
+				return newHfArtifactRetryResult(parent.Key, err), nil
+			}
+			return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
+		}
 	}
 	if err := h.files.RemoveParentDirectory(parent.LocalPath); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil

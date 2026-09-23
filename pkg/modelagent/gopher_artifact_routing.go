@@ -17,10 +17,11 @@ import (
 // The existing startup snapshot supplies this index without a per-task API
 // lookup for ordinary models. An unavailable snapshot is retried before routing.
 type gopherArtifactRouting struct {
-	mutex       sync.Mutex
-	known       bool
-	sharedState bool
-	children    map[string]bool
+	mutex           sync.Mutex
+	known           bool
+	sharedState     bool
+	children        map[string]bool
+	residencyModels map[string]bool
 }
 
 func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) error {
@@ -45,8 +46,16 @@ func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) er
 			continue
 		}
 		var child ModelEntry
-		if json.Unmarshal([]byte(raw), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil) {
-			routing.children[key] = true
+		if json.Unmarshal([]byte(raw), &child) == nil {
+			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil {
+				routing.children[key] = true
+			}
+			if child.ModelUID != "" && (child.ArtifactPendingEviction != nil || child.Status == ModelStatusEvicted) {
+				if routing.residencyModels == nil {
+					routing.residencyModels = make(map[string]bool)
+				}
+				routing.residencyModels[string(child.ModelUID)] = true
+			}
 		}
 	}
 	routing.known = true
@@ -91,6 +100,14 @@ func (s *Gopher) routeArtifactTaskLocked(task *GopherTask) {
 		return
 	}
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
+	uid := gopherTaskModelKey(task)
+	if task.TaskType == Evict || modelEvictionRequested(taskModelMeta(task)) {
+		if s.artifactRouting.residencyModels == nil {
+			s.artifactRouting.residencyModels = make(map[string]bool)
+		}
+		s.artifactRouting.residencyModels[uid] = true
+	}
+	task.ResidencyManaged = task.ResidencyManaged || s.artifactRouting.residencyModels[uid]
 	task.SharedArtifact = task.SharedArtifact || s.artifactRouting.children[key]
 	spec := taskModelSpec(task)
 	if spec.Storage == nil || spec.Storage.StorageUri == nil || spec.Storage.Path == nil {
@@ -126,11 +143,27 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 	if err := s.loadArtifactRouting(ctx); err != nil {
 		return ctx, func(bool) {}, false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
 	}
+	if task.TaskType == Evict {
+		latest, _, err := s.prepareArtifactEviction(ctx, task)
+		if err != nil {
+			waiting, retryErr := s.retryArtifactEviction(task, err)
+			if !waiting {
+				s.taskTracker.releasePendingDelete(gopherTaskModelKey(task), task.Sequence)
+			}
+			return ctx, func(bool) {}, false, retryErr
+		}
+		if latest == nil {
+			// A previously waiting eviction must not block hydration after its
+			// intent is withdrawn or a live consumer prevents cleanup.
+			s.taskTracker.releasePendingDelete(gopherTaskModelKey(task), task.Sequence)
+			return ctx, func(bool) {}, false, nil
+		}
+	}
 	s.artifactRouting.mutex.Lock()
 	s.routeArtifactTaskLocked(task)
 	defer s.artifactRouting.mutex.Unlock()
 	key := gopherTaskModelKey(task)
-	if !task.SharedArtifact {
+	if !task.SharedArtifact && !task.ResidencyManaged {
 		if task.TaskType == Delete {
 			s.taskTracker.cancelLegacyDownload(key)
 			attempt := s.taskTracker.beginLegacyTask(key, nil)
@@ -143,7 +176,7 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 	if s.isTaskModelReplaced(task) {
 		return ctx, func(bool) {}, false, nil
 	}
-	if task.TaskType == Delete {
+	if task.TaskType == Delete || task.TaskType == Evict {
 		attempt, outcome := s.taskTracker.beginDelete(key, task.Sequence)
 		if outcome != gopherTaskProceed {
 			err := s.waitForActiveTask(task, outcome)

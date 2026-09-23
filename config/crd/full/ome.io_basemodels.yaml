@@ -380,6 +380,11 @@ spec:
                 type: string
               lifecycle:
                 type: string
+              nodesEvicted:
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
               nodesFailed:
                 items:
                   type: string
@@ -401,6 +406,7 @@ spec:
                 - In_Training
                 - Ready
                 - Failed
+                - Evicted
                 type: string
             required:
             - state

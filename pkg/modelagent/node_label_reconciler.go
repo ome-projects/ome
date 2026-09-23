@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -56,6 +58,7 @@ const (
 	Failed ModelStateOnNode = "Failed"
 	// Deleted indicates the model was marked for deletion
 	Deleted ModelStateOnNode = "Deleted"
+	Evicted ModelStateOnNode = "Evicted"
 )
 
 // NewNodeLabelReconciler creates a new NodeLabelReconciler instance
@@ -77,6 +80,9 @@ func (n *NodeLabelReconciler) ReconcileNodeLabels(op *NodeLabelOp) error {
 
 // applyNodeLabelOperation applies model state changes to the node labels
 func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
+	if getModelResourceUID(op.BaseModel, op.ClusterBaseModel) != "" {
+		return n.applyArtifactNodeLabelOperation(op)
+	}
 	modelInfo := getNodeLabelModelInfo(op)
 	n.logger.Infof("Processing node label %s operation for %s in state: %s", op.ModelStateOnNode, modelInfo, op.ModelStateOnNode)
 
@@ -111,7 +117,7 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 			n.logger.Infof("Label %s already removed from node %s for %s - operation is idempotent", labelKey, n.nodeName, modelInfo)
 			return nil
 		}
-	case Ready, Updating, Failed:
+	case Ready, Updating, Failed, Evicted:
 		// For add/update operations, if the label already has the desired value, skip
 		if labelExists && currentValue == string(op.ModelStateOnNode) {
 			n.logger.Infof("Label %s already set to %s on node %s for %s - operation is idempotent",
@@ -174,6 +180,51 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	return nil
 }
 
+// Eviction status changes must not overwrite another worker's node labels.
+func (n *NodeLabelReconciler) applyArtifactNodeLabelOperation(op *NodeLabelOp) error {
+	key, err := getModelLabelKey(op)
+	if err != nil {
+		return err
+	}
+	node, err := n.kubeClient.CoreV1().Nodes().Get(context.TODO(), n.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	labels := maps.Clone(node.Labels)
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	switch op.ModelStateOnNode {
+	case Ready, Updating, Failed, Evicted:
+		labels[key] = string(op.ModelStateOnNode)
+	case Deleted:
+		delete(labels, key)
+	default:
+		return nil
+	}
+	if maps.Equal(labels, node.Labels) {
+		return nil
+	}
+	return patchNodeLabels(context.TODO(), n.kubeClient, node, labels)
+}
+
+func patchNodeLabels(ctx context.Context, client kubernetes.Interface, node *corev1.Node, labels map[string]string) error {
+	patch := []map[string]interface{}{}
+	if node.UID != "" {
+		patch = append(patch, map[string]interface{}{"op": "test", "path": "/metadata/uid", "value": string(node.UID)})
+	}
+	if node.ResourceVersion != "" {
+		patch = append(patch, map[string]interface{}{"op": "test", "path": "/metadata/resourceVersion", "value": node.ResourceVersion})
+	}
+	patch = append(patch, map[string]interface{}{"op": "add", "path": "/metadata/labels", "value": labels})
+	payload, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	_, err = client.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, payload, metav1.PatchOptions{})
+	return err
+}
+
 // getNodeLabelModelInfo returns a string identifying a model for logging
 func getNodeLabelModelInfo(op *NodeLabelOp) string {
 	if op.BaseModel != nil {
@@ -231,6 +282,12 @@ func getNodeLabelPatchPayloadBytes(op *NodeLabelOp) ([]byte, error) {
 			Op:    "add",
 			Path:  fmt.Sprintf("/metadata/labels/%s", strings.ReplaceAll(labelKey, "/", "~1")),
 			Value: string(Failed),
+		}}
+	case Evicted:
+		payload = []patchStringValue{{
+			Op:    "add",
+			Path:  fmt.Sprintf("/metadata/labels/%s", strings.ReplaceAll(labelKey, "/", "~1")),
+			Value: string(Evicted),
 		}}
 	case Deleted:
 		payload = []patchStringValue{{

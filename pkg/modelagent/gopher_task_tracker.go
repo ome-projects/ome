@@ -218,6 +218,18 @@ func (tracker *gopherTaskTracker) finishDelete(attempt *gopherDeleteAttempt, kee
 	state.deleteSequence = 0
 }
 
+// releasePendingDelete abandons only this task's idle barrier after eviction
+// preflight rejects a retry. It cannot release an active or newer delete owner.
+func (tracker *gopherTaskTracker) releasePendingDelete(modelUID string, sequence uint64) {
+	tracker.mutex.Lock()
+	defer tracker.mutex.Unlock()
+	state := tracker.models[modelUID]
+	if state != nil && state.deleteSequence == sequence && state.deleteAttempt == nil {
+		state.finishedDeleteSequence = sequence
+		state.deleteSequence = 0
+	}
+}
+
 func (tracker *gopherTaskTracker) modelStateLocked(modelUID string) *gopherModelTaskState {
 	if tracker.models == nil {
 		tracker.models = make(map[string]*gopherModelTaskState)

@@ -38,7 +38,7 @@ type Scout struct {
 	nodeName               string
 	nodeInfo               *v1.Node
 	nodeShapeAlias         string
-	kubeClient             *kubernetes.Clientset
+	kubeClient             kubernetes.Interface
 	logger                 *zap.SugaredLogger
 }
 
@@ -238,7 +238,23 @@ syncComplete:
 	// This ensures we catch any deletion requests that occurred while the agent was down
 	w.reconcilePendingDeletions()
 
-	<-stopCh
+	// Watches trigger promptly; the periodic pass preserves durable requests
+	// after a missed event or an exhausted transient retry budget.
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			goto shutdown
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+			if err := w.reconcileArtifactRequests(ctx); err != nil && ctx.Err() == nil {
+				w.logger.Warnf("Cannot reconcile artifact requests: %v", err)
+			}
+			cancel()
+		}
+	}
+shutdown:
 	close(w.gopherChan)
 	w.logger.Info("Shutting down scout")
 
@@ -274,6 +290,11 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 // enqueueBaseModelDownload uses the caller's eligibility decision without
 // adding a Node API request that could drop an otherwise valid update event.
 func (w *Scout) enqueueBaseModelDownload(baseModel *v1beta1.BaseModel) {
+	if modelEvictionRequested(&baseModel.ObjectMeta) {
+		// Retain startup replay if eviction is refused. Queue eviction last so
+		// its newer sequence fences this download when cleanup is admitted.
+		defer func() { w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: baseModel} }()
+	}
 	w.logger.Infof("Downloading BaseModel: %s in namespace %s", baseModel.Name, baseModel.Namespace)
 
 	IsTensorrtLLMModel := baseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
@@ -325,6 +346,10 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 // enqueueClusterBaseModelDownload shares normal task construction between add
 // events and newly eligible updates, which already checked node eligibility.
 func (w *Scout) enqueueClusterBaseModelDownload(clusterBaseModel *v1beta1.ClusterBaseModel) {
+	if modelEvictionRequested(&clusterBaseModel.ObjectMeta) {
+		// Match BaseModel replay and eviction sequence ordering.
+		defer func() { w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: clusterBaseModel} }()
+	}
 	w.logger.Infof("Downloading ClusterBaseModel: %s", clusterBaseModel.Name)
 
 	IsTensorrtLLMModel := clusterBaseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
@@ -378,13 +403,21 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	}
 
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnBM(oldBaseModel, newBaseModel)
+	if modelEvictionRequested(&newBaseModel.ObjectMeta) {
+		// Keep genuine refresh intent while preflight may refuse eviction.
+		// The newer eviction sequence fences it if cleanup is admitted.
+		defer func() { w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: newBaseModel} }()
+	} else if modelEvictionRequested(&oldBaseModel.ObjectMeta) {
+		w.enqueueBaseModelDownload(newBaseModel)
+		return
+	}
 
 	// Placement and download policy are handled separately above.
 	ignorePlacementAndPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy", "NodeAffinity", "NodeSelector")
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
-		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
+		{"Annotations", downloadAnnotations(oldBaseModel.Annotations), downloadAnnotations(newBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -435,13 +468,19 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	}
 
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel)
+	if modelEvictionRequested(&newClusterBaseModel.ObjectMeta) {
+		defer func() { w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: newClusterBaseModel} }()
+	} else if modelEvictionRequested(&oldClusterBaseModel.ObjectMeta) {
+		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
+		return
+	}
 
 	// Placement and download policy are handled separately above.
 	ignorePlacementAndPolicy := cmpopts.IgnoreFields(v1beta1.StorageSpec{}, "DownloadPolicy", "NodeAffinity", "NodeSelector")
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
-		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
+		{"Annotations", downloadAnnotations(oldClusterBaseModel.Annotations), downloadAnnotations(newClusterBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {

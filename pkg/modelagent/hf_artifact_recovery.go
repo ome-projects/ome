@@ -76,18 +76,27 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
+	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.ArtifactPendingEviction == nil && entry.ModelEntryJSON == "" {
 		// Only explicit ordinary writes may seed typed recovery. Observing
 		// unrelated records, including at startup, must not adopt them.
 		if modelID == "" && before[key] != raw && c.modelCache[key] == nil {
 			if _, evicted := c.evictedModels[key]; !evicted && !c.isModelUIDInvalidatedLocked(key, "") {
-				c.modelCache[key] = &CacheEntry{ModelName: model.Name, ModelStatus: model.Status}
+				c.modelCache[key] = &CacheEntry{ModelName: model.Name, ModelUID: model.ModelUID, ModelStatus: model.Status}
 			}
+		}
+		if current := c.modelCache[key]; current != nil && before[key] != raw {
+			current.ModelStatus = model.Status
 		}
 		return
 	}
-	if key == modelID && !c.isModelMutationBlockedLocked(key, modelUID) {
+	// A cleanup receipt may have explicitly transferred ownership while the
+	// old model identity remains in its non-Ready record until cleanup ends.
+	if model.ModelUID != "" && !c.isModelUIDInvalidatedLocked(key, model.ModelUID) {
+		entry.ModelUID = model.ModelUID
+	} else if model.ModelUID == "" && key == modelID && !c.isModelMutationBlockedLocked(key, modelUID) {
 		entry.ModelUID = modelUID
+	}
+	if key == modelID && entry.ModelUID == modelUID && !c.isModelMutationBlockedLocked(key, modelUID) {
 		delete(c.evictedModels, key)
 	}
 	if _, evicted := c.evictedModels[key]; evicted || c.isModelUIDInvalidatedLocked(key, entry.ModelUID) {

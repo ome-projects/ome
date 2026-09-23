@@ -420,7 +420,7 @@ type ObjectReference struct {
 }
 
 // LifeCycleState enum
-// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed
+// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed;Evicted
 type LifeCycleState string
 
 const (
@@ -430,6 +430,8 @@ const (
 	LifeCycleStateInTraining LifeCycleState = "In_Training"
 	LifeCycleStateReady      LifeCycleState = "Ready"
 	LifeCycleStateFailed     LifeCycleState = "Failed"
+	// Evicted is intentional local absence; the model remains available for hydration.
+	LifeCycleStateEvicted LifeCycleState = "Evicted"
 )
 
 const (
@@ -537,6 +539,11 @@ type ModelStatusSpec struct {
 
 	// +listType=atomic
 	NodesFailed []string `json:"nodesFailed,omitempty"`
+
+	// NodesEvicted records intentional local absence, distinct from download failure.
+	// +optional
+	// +listType=atomic
+	NodesEvicted []string `json:"nodesEvicted,omitempty"`
 
 	// Conditions describe cluster-wide model readiness and cache state.
 	// Sharded models report SourceReachable, MetadataExtracted, and Ready;

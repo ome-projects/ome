@@ -22,7 +22,7 @@ import (
 // non-nil Config).
 func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReader client.Reader, log logr.Logger, namespace, name string, isClusterScope bool,
 	specUpdateFunc func(context.Context, *shared.ModelConfig) error,
-	statusUpdateFunc func(context.Context, []string, []string) error) error {
+	statusUpdateFunc func(context.Context, []string, []string, []string, bool) error) error {
 
 	modelInfo := name
 	if !isClusterScope {
@@ -45,6 +45,8 @@ func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReade
 	var processedNodes, validNodes, readyNodes, failedNodes int
 	var nodesReady []string
 	var nodesFailed []string
+	var nodesEvicted []string
+	var inProgress bool
 	var specUpdateErrors []string
 	modelKey := constants.GetModelConfigMapKey(namespace, name, isClusterScope)
 
@@ -86,7 +88,11 @@ func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReade
 		case shared.ModelStatusFailed:
 			nodesFailed = addToSlice(nodesFailed, configMap.Name)
 			failedNodes++
-		case shared.ModelStatusUpdating, shared.ModelStatusDeleted:
+		case shared.ModelStatusEvicted:
+			nodesEvicted = addToSlice(nodesEvicted, configMap.Name)
+		case shared.ModelStatusUpdating:
+			inProgress = true
+		case shared.ModelStatusDeleted:
 		default:
 			log.V(1).Info("Unknown model status", "node", configMap.Name, "status", modelEntry.Status)
 		}
@@ -94,6 +100,7 @@ func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReade
 
 	slices.Sort(nodesReady)
 	slices.Sort(nodesFailed)
+	slices.Sort(nodesEvicted)
 
 	log.Info("Model status summary",
 		"readyNodes", readyNodes,
@@ -105,7 +112,7 @@ func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReade
 		log.Info("Some nodes failed spec updates", "failedNodes", specUpdateErrors)
 	}
 
-	return statusUpdateFunc(ctx, nodesReady, nodesFailed)
+	return statusUpdateFunc(ctx, nodesReady, nodesFailed, nodesEvicted, inProgress)
 }
 
 func updateModelSpecWithConfig(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, spec *v1beta1.BaseModelSpec, config *shared.ModelConfig, modelType string) error {
@@ -137,7 +144,7 @@ func CalculateLifecycleState(nodesReady, nodesFailed []string) v1beta1.LifeCycle
 	return v1beta1.LifeCycleStateInTransit
 }
 
-func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, nodesReady, nodesFailed []string, modelType string) error {
+func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, nodesReady, nodesFailed, nodesEvicted []string, inProgress bool, modelType string) error {
 	updateFunc := func(ctx context.Context, client client.Client, obj client.Object) error {
 		_, status, err := shared.ModelSpecAndStatus(obj)
 		if err != nil {
@@ -145,14 +152,19 @@ func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, l
 		}
 
 		newState := CalculateLifecycleState(nodesReady, nodesFailed)
+		if newState == v1beta1.LifeCycleStateInTransit && len(nodesEvicted) > 0 && !inProgress {
+			newState = v1beta1.LifeCycleStateEvicted
+		}
 		if slices.Equal(status.NodesReady, nodesReady) &&
 			slices.Equal(status.NodesFailed, nodesFailed) &&
+			slices.Equal(status.NodesEvicted, nodesEvicted) &&
 			status.State == newState {
 			return nil
 		}
 
 		status.NodesReady = nodesReady
 		status.NodesFailed = nodesFailed
+		status.NodesEvicted = nodesEvicted
 		status.State = newState
 		shared.StampObservedReconcile(obj, status)
 

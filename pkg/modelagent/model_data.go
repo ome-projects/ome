@@ -4,6 +4,8 @@ package modelagent
 import (
 	"encoding/json"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"sigs.k8s.io/ome/pkg/modelparser"
 )
 
@@ -20,6 +22,8 @@ const (
 	ModelStatusFailed ModelStatus = "Failed"
 	// ModelStatusDeleted indicates the model was deleted
 	ModelStatusDeleted ModelStatus = "Deleted"
+	// Evicted is a stable state while the CR requests intentional local absence.
+	ModelStatusEvicted ModelStatus = "Evicted"
 )
 
 // ConfigParsingAnnotation is the annotation key to skip config parsing
@@ -81,11 +85,14 @@ func (p *DownloadProgress) Percentage() float64 {
 // ModelEntry represents an entry in the node model ConfigMap
 // This is the top-level structure stored for each model in the ConfigMap
 type ModelEntry struct {
-	Name          string            `json:"name"`                    // Name of the model
-	Status        ModelStatus       `json:"status"`                  // Current status of the model on this node
-	Config        *ModelConfig      `json:"config,omitempty"`        // Model configuration, may be nil if just tracking status
-	Progress      *DownloadProgress `json:"progress,omitempty"`      // Download progress, nil when not downloading
-	HfArtifactKey string            `json:"hfArtifactKey,omitempty"` // ConfigMap key of the shared HF artifact used by this model
+	// ModelUID binds persisted state to the CR instance, not its reusable name.
+	ModelUID                types.UID                `json:"modelUID,omitempty"`
+	ArtifactPendingEviction *ArtifactPendingEviction `json:"artifactPendingEviction,omitempty"`
+	Name                    string                   `json:"name"`                    // Name of the model
+	Status                  ModelStatus              `json:"status"`                  // Current status of the model on this node
+	Config                  *ModelConfig             `json:"config,omitempty"`        // Model configuration, may be nil if just tracking status
+	Progress                *DownloadProgress        `json:"progress,omitempty"`      // Download progress, nil when not downloading
+	HfArtifactKey           string                   `json:"hfArtifactKey,omitempty"` // ConfigMap key of the shared HF artifact used by this model
 	// Pending cleanup survives reference removal until local and parent cleanup finish.
 	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
 }

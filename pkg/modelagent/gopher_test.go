@@ -1320,7 +1320,8 @@ func TestShouldSkipStaleDownloadTask_BaseModelDeletingRequestsCleanup(t *testing
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
 	g.baseModelLister = &mockBaseModelLister{models: []*v1beta1.BaseModel{latestModel}}
 
-	skip, runDeleteCleanup := g.shouldSkipStaleDownloadTask(&GopherTask{TaskType: Download, BaseModel: staleTaskModel})
+	skip, runDeleteCleanup, err := g.shouldSkipStaleDownloadTask(context.Background(), &GopherTask{TaskType: Download, BaseModel: staleTaskModel})
+	assert.NoError(t, err)
 
 	assert.True(t, skip)
 	assert.True(t, runDeleteCleanup)
@@ -1336,7 +1337,8 @@ func TestShouldSkipStaleDownloadTask_BaseModelDeletedSkipsWithoutCleanup(t *test
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
 	g.baseModelLister = &mockBaseModelLister{}
 
-	skip, runDeleteCleanup := g.shouldSkipStaleDownloadTask(&GopherTask{TaskType: Download, BaseModel: staleTaskModel})
+	skip, runDeleteCleanup, err := g.shouldSkipStaleDownloadTask(context.Background(), &GopherTask{TaskType: Download, BaseModel: staleTaskModel})
+	assert.NoError(t, err)
 
 	assert.True(t, skip)
 	assert.False(t, runDeleteCleanup)
@@ -1352,7 +1354,8 @@ func TestShouldSkipStaleDownloadTask_BaseModelActiveDoesNotSkip(t *testing.T) {
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
 	g.baseModelLister = &mockBaseModelLister{models: []*v1beta1.BaseModel{model}}
 
-	skip, runDeleteCleanup := g.shouldSkipStaleDownloadTask(&GopherTask{TaskType: Download, BaseModel: model})
+	skip, runDeleteCleanup, err := g.shouldSkipStaleDownloadTask(context.Background(), &GopherTask{TaskType: Download, BaseModel: model})
+	assert.NoError(t, err)
 
 	assert.False(t, skip)
 	assert.False(t, runDeleteCleanup)
@@ -1371,7 +1374,8 @@ func TestShouldSkipStaleDownloadTask_ClusterBaseModelDeletingRequestsCleanup(t *
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
 	g.clusterBaseModelLister = &mockClusterBaseModelLister{models: []*v1beta1.ClusterBaseModel{latestModel}}
 
-	skip, runDeleteCleanup := g.shouldSkipStaleDownloadTask(&GopherTask{TaskType: Download, ClusterBaseModel: staleTaskModel})
+	skip, runDeleteCleanup, err := g.shouldSkipStaleDownloadTask(context.Background(), &GopherTask{TaskType: Download, ClusterBaseModel: staleTaskModel})
+	assert.NoError(t, err)
 
 	assert.True(t, skip)
 	assert.True(t, runDeleteCleanup)
@@ -1387,7 +1391,8 @@ func TestShouldSkipStaleDownloadTask_ClusterBaseModelDeletedSkipsWithoutCleanup(
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
 	g.clusterBaseModelLister = &mockClusterBaseModelLister{}
 
-	skip, runDeleteCleanup := g.shouldSkipStaleDownloadTask(&GopherTask{TaskType: Download, ClusterBaseModel: staleTaskModel})
+	skip, runDeleteCleanup, err := g.shouldSkipStaleDownloadTask(context.Background(), &GopherTask{TaskType: Download, ClusterBaseModel: staleTaskModel})
+	assert.NoError(t, err)
 
 	assert.True(t, skip)
 	assert.False(t, runDeleteCleanup)

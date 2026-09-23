@@ -72,6 +72,10 @@ var (
 const (
 	AgentConfigMapKeyName = "agent"
 	TensorRTLLM           = "tensorrtllm"
+	// ModelArtifactResidencyAnnotation requests artifact eviction.
+	// Provisioning clients own intent; controllers only observe acknowledgement.
+	ModelArtifactResidencyAnnotation = "ome.io/artifact-residency"
+	ModelArtifactResidencyEvicted    = "Evicted"
 )
 
 // InferenceService Annotations

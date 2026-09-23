@@ -27,8 +27,8 @@ func ReconcileStatusFromConfigMaps(ctx context.Context, c client.Client, nodeRea
 			return updateModelSpecWithConfig(ctx, kubeClient, log, latest, latestSpec, config, kind)
 		})
 	}
-	statusUpdate := func(ctx context.Context, nodesReady, nodesFailed []string) error {
-		return updateModelStatusWithRetry(ctx, c, log, obj, nodesReady, nodesFailed, kind)
+	statusUpdate := func(ctx context.Context, nodesReady, nodesFailed, nodesEvicted []string, inProgress bool) error {
+		return updateModelStatusWithRetry(ctx, c, log, obj, nodesReady, nodesFailed, nodesEvicted, inProgress, kind)
 	}
 	return processModelStatus(ctx, c, nodeReader, log, namespace, obj.GetName(), isClusterScoped, specUpdate, statusUpdate)
 }

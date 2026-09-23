@@ -7,6 +7,12 @@ metadata:
     app.kubernetes.io/component: "ome-model-agent-daemonset"
 rules:
   - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "list" ]
+  - apiGroups: [ "ome.io" ]
+    resources: [ "inferenceservices" ]
+    verbs: [ "list" ]
+  - apiGroups: [ "" ]
     resources: [ "nodes" ]
     verbs: [ "watch", "list", "get", "patch", "update" ]
   - apiGroups: [ "" ]

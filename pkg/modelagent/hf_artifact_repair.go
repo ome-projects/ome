@@ -23,6 +23,11 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
+	if input.validateDownload != nil {
+		if err := input.validateDownload(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
