@@ -5179,6 +5179,23 @@
         }
       }
     },
+    "v1beta1.ModelServingStatus": {
+      "description": "ModelServingStatus is advisory usage history, not permission to delete files.",
+      "type": "object",
+      "required": [
+        "inUse"
+      ],
+      "properties": {
+        "inUse": {
+          "type": "boolean",
+          "default": false
+        },
+        "lastUsedTime": {
+          "description": "LastUsedTime is set once on a confirmed in-use to unused transition. It is absent while in use and for models never observed in use.",
+          "$ref": "#/definitions/v1.Time"
+        }
+      }
+    },
     "v1beta1.ModelSizeRangeSpec": {
       "description": "ModelSizeRangeSpec defines the range of model sizes supported by this runtime",
       "type": "object",
@@ -5278,6 +5295,10 @@
         "rehydration": {
           "description": "Rehydration records acknowledgements of the retained model request.",
           "$ref": "#/definitions/v1beta1.ModelRehydrationStatus"
+        },
+        "serving": {
+          "description": "Serving records observed service and surviving Pod demand.",
+          "$ref": "#/definitions/v1beta1.ModelServingStatus"
         },
         "state": {
           "description": "Status of the model weight",

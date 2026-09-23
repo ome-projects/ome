@@ -517,6 +517,9 @@ type ModelStatusSpec struct {
 	// Rehydration records acknowledgements of the retained model request.
 	// +optional
 	Rehydration *ModelRehydrationStatus `json:"rehydration,omitempty"`
+	// Serving records observed service and surviving Pod demand.
+	// +optional
+	Serving *ModelServingStatus `json:"serving,omitempty"`
 	// LifeCycle is an enum of Deprecated, Experiment, Public, Internal
 	LifeCycle *string `json:"lifecycle,omitempty"`
 
@@ -572,6 +575,15 @@ type ModelRehydrationStatus struct {
 	// participants join and have not yet acknowledged that request.
 	// +optional
 	CompletedRequestID string `json:"completedRequestID,omitempty"`
+}
+
+// ModelServingStatus is advisory usage history, not permission to delete files.
+type ModelServingStatus struct {
+	InUse bool `json:"inUse"`
+	// LastUsedTime is set once on a confirmed in-use to unused transition.
+	// It is absent while in use and for models never observed in use.
+	// +optional
+	LastUsedTime *metav1.Time `json:"lastUsedTime,omitempty"`
 }
 
 // BaseModel is the Schema for the basemodels API

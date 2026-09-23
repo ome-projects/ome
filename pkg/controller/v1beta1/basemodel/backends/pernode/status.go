@@ -152,6 +152,11 @@ func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, n
 			return err
 		}
 
+		serving, err := readModelServing(ctx, nodeReader, obj, status.Serving)
+		if err != nil {
+			return err
+		}
+
 		previousRehydration := status.Rehydration
 		requestID := obj.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation]
 		if requestID != "" {
@@ -192,10 +197,12 @@ func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, n
 		if slices.Equal(status.NodesReady, nodesReady) &&
 			slices.Equal(status.NodesFailed, nodesFailed) &&
 			slices.Equal(status.NodesEvicted, nodesEvicted) &&
-			status.State == newState && reflect.DeepEqual(previousRehydration, status.Rehydration) {
+			status.State == newState && reflect.DeepEqual(previousRehydration, status.Rehydration) &&
+			reflect.DeepEqual(status.Serving, serving) {
 			return nil
 		}
 
+		status.Serving = serving
 		status.NodesReady = nodesReady
 		status.NodesFailed = nodesFailed
 		status.NodesEvicted = nodesEvicted

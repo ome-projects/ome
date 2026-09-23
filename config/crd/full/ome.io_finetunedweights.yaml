@@ -299,6 +299,16 @@ spec:
                   requestID:
                     type: string
                 type: object
+              serving:
+                properties:
+                  inUse:
+                    type: boolean
+                  lastUsedTime:
+                    format: date-time
+                    type: string
+                required:
+                - inUse
+                type: object
               state:
                 enum:
                 - Creating

@@ -749,7 +749,8 @@ func TestClusterBaseModelReconcile(t *testing.T) {
 				g.Expect(err).To(gomega.HaveOccurred())
 			} else {
 				g.Expect(err).NotTo(gomega.HaveOccurred())
-				g.Expect(result).To(gomega.Equal(ctrl.Result{}))
+				// Consumer changes need periodic observation without ConfigMap events.
+				g.Expect(result).To(gomega.Equal(ctrl.Result{RequeueAfter: time.Minute}))
 
 				if tt.validate != nil {
 					tt.validate(t, c, tt.clusterBaseModel)

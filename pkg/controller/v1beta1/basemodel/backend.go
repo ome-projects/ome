@@ -53,7 +53,8 @@ func (b perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ct
 		a.Status.State == v1beta1.LifeCycleStateImporting || a.Status.State == v1beta1.LifeCycleStateInTransit {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	return ctrl.Result{}, nil
+	// Services and surviving Pods can change without a model ConfigMap event.
+	return ctrl.Result{RequeueAfter: time.Minute}, nil
 }
 
 func (b perNodeBackend) HandleDeletion(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {

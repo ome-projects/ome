@@ -141,6 +141,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef":                         schema_pkg_apis_ome_v1beta1_ModelRef(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus":           schema_pkg_apis_ome_v1beta1_ModelRehydrationStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRevisionStates":              schema_pkg_apis_ome_v1beta1_ModelRevisionStates(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelServingStatus":               schema_pkg_apis_ome_v1beta1_ModelServingStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelSizeRangeSpec":               schema_pkg_apis_ome_v1beta1_ModelSizeRangeSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelStatus":                      schema_pkg_apis_ome_v1beta1_ModelStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelStatusSpec":                  schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref),
@@ -9232,6 +9233,35 @@ func schema_pkg_apis_ome_v1beta1_ModelRevisionStates(ref common.ReferenceCallbac
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_ModelServingStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ModelServingStatus is advisory usage history, not permission to delete files.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"inUse": {
+						SchemaProps: spec.SchemaProps{
+							Default: false,
+							Type:    []string{"boolean"},
+							Format:  "",
+						},
+					},
+					"lastUsedTime": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LastUsedTime is set once on a confirmed in-use to unused transition. It is absent while in use and for models never observed in use.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+				},
+				Required: []string{"inUse"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_ModelSizeRangeSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -9309,6 +9339,12 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 						SchemaProps: spec.SchemaProps{
 							Description: "Rehydration records acknowledgements of the retained model request.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus"),
+						},
+					},
+					"serving": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Serving records observed service and surviving Pod demand.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelServingStatus"),
 						},
 					},
 					"lifecycle": {
@@ -9430,7 +9466,7 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelServingStatus"},
 	}
 }
 
