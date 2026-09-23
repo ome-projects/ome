@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -23,6 +25,8 @@ import (
 // NodeLabelOp represents an operation on node labels
 // This is used to pass model references to the NodeLabelReconciler
 type NodeLabelOp struct {
+	// NodeUID must match the ConfigMap's committed request Ready acknowledgement.
+	NodeUID          types.UID
 	ModelStateOnNode ModelStateOnNode
 	BaseModel        *v1beta1.BaseModel
 	ClusterBaseModel *v1beta1.ClusterBaseModel
@@ -31,10 +35,12 @@ type NodeLabelOp struct {
 // NodeLabelReconciler handles updating node labels œwith model status information
 // It provides a clean separation from ConfigMap operations
 type NodeLabelReconciler struct {
-	opRetry    int                  // Number of retries for operations
-	kubeClient kubernetes.Interface // Kubernetes client for node operations
-	nodeName   string               // The name of the node
-	logger     *zap.SugaredLogger   // Logger for recording operations
+	nodeUID      types.UID
+	nodeUIDMutex sync.RWMutex
+	opRetry      int                  // Number of retries for operations
+	kubeClient   kubernetes.Interface // Kubernetes client for node operations
+	nodeName     string               // The name of the node
+	logger       *zap.SugaredLogger   // Logger for recording operations
 }
 
 // patchStringValue represents a JSON patch operation for node labels
@@ -71,6 +77,17 @@ func NewNodeLabelReconciler(nodeName string, kubeClient kubernetes.Interface, op
 	}
 }
 
+// InitializeNodeUID pins the process identity before workers begin publication.
+func (n *NodeLabelReconciler) InitializeNodeUID(uid types.UID) error {
+	n.nodeUIDMutex.Lock()
+	defer n.nodeUIDMutex.Unlock()
+	if uid == "" || n.nodeUID != "" && n.nodeUID != uid {
+		return fmt.Errorf("cannot initialize node %s UID %q from %q", n.nodeName, uid, n.nodeUID)
+	}
+	n.nodeUID = uid
+	return nil
+}
+
 // ReconcileNodeLabels applies model state changes to node labels with retries
 func (n *NodeLabelReconciler) ReconcileNodeLabels(op *NodeLabelOp) error {
 	return utils.Retry(n.opRetry, 100*time.Millisecond, func() error {
@@ -80,7 +97,7 @@ func (n *NodeLabelReconciler) ReconcileNodeLabels(op *NodeLabelOp) error {
 
 // applyNodeLabelOperation applies model state changes to the node labels
 func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
-	if getModelResourceUID(op.BaseModel, op.ClusterBaseModel) != "" {
+	if getModelResourceUID(op.BaseModel, op.ClusterBaseModel) != "" || artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}) != "" {
 		return n.applyArtifactNodeLabelOperation(op)
 	}
 	modelInfo := getNodeLabelModelInfo(op)
@@ -180,15 +197,37 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	return nil
 }
 
-// Eviction status changes must not overwrite another worker's node labels.
+// Both labels move atomically, conditional on the exact node snapshot read.
 func (n *NodeLabelReconciler) applyArtifactNodeLabelOperation(op *NodeLabelOp) error {
-	key, err := getModelLabelKey(op)
+	n.nodeUIDMutex.RLock()
+	processNodeUID := n.nodeUID
+	n.nodeUIDMutex.RUnlock()
+	labelKey, err := getModelLabelKey(op)
 	if err != nil {
 		return err
+	}
+	requestKey, err := constants.ArtifactReadyLabelKey(getModelResourceUID(op.BaseModel, op.ClusterBaseModel))
+	if err != nil {
+		return err
+	}
+	request := artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel})
+	if op.ModelStateOnNode == Ready && request != "" {
+		if op.NodeUID == "" || processNodeUID == "" {
+			return fmt.Errorf("request Ready publication requires the committed NodeUID")
+		}
+		if problems := validation.IsValidLabelValue(request); len(problems) != 0 {
+			return fmt.Errorf("invalid artifact request label value: %v", problems)
+		}
 	}
 	node, err := n.kubeClient.CoreV1().Nodes().Get(context.TODO(), n.nodeName, metav1.GetOptions{})
 	if err != nil {
 		return err
+	}
+	if op.NodeUID != "" && node.UID != op.NodeUID {
+		return fmt.Errorf("node %s UID changed from %s to %s", n.nodeName, op.NodeUID, node.UID)
+	}
+	if processNodeUID != "" && node.UID != processNodeUID {
+		return fmt.Errorf("node %s UID changed from startup identity %s to %s", n.nodeName, processNodeUID, node.UID)
 	}
 	labels := maps.Clone(node.Labels)
 	if labels == nil {
@@ -196,11 +235,15 @@ func (n *NodeLabelReconciler) applyArtifactNodeLabelOperation(op *NodeLabelOp) e
 	}
 	switch op.ModelStateOnNode {
 	case Ready, Updating, Failed, Evicted:
-		labels[key] = string(op.ModelStateOnNode)
+		labels[labelKey] = string(op.ModelStateOnNode)
 	case Deleted:
-		delete(labels, key)
+		delete(labels, labelKey)
 	default:
 		return nil
+	}
+	delete(labels, requestKey)
+	if op.ModelStateOnNode == Ready && request != "" {
+		labels[requestKey] = request
 	}
 	if maps.Equal(labels, node.Labels) {
 		return nil

@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 
@@ -34,10 +35,11 @@ const (
 
 // CacheEntry represents an entry in the model cache for ConfigMap reconciliation.
 type CacheEntry struct {
-	ModelName     string         // Name of the model
-	ModelUID      types.UID      // UID of the model resource that owns this entry
-	ModelStatus   ModelStatus    // Current status of the model
-	ModelMetadata *ModelMetadata // Model metadata if available
+	ArtifactRehydrationID string         // Completed request acknowledgement survives ConfigMap recovery.
+	ModelName             string         // Name of the model
+	ModelUID              types.UID      // UID of the model resource that owns this entry
+	ModelStatus           ModelStatus    // Current status of the model
+	ModelMetadata         *ModelMetadata // Model metadata if available
 	// ModelEntryJSON preserves committed shared ownership and cleanup state.
 	// Ordinary models use the typed status and metadata fields for recovery.
 	ModelEntryJSON string
@@ -47,6 +49,7 @@ type CacheEntry struct {
 // It provides self-healing capabilities through periodic reconciliation to recover from
 // manual ConfigMap deletions or modifications without requiring agent restarts.
 type ConfigMapReconciler struct {
+	nodeUID         types.UID              // Immutable startup identity; guarded by configMapMutationMutex.
 	kubeClient      kubernetes.Interface   // Kubernetes client for ConfigMap CRUD operations
 	nodeName        string                 // The name of the node (used as ConfigMap name)
 	namespace       string                 // The namespace to store the ConfigMap in
@@ -71,6 +74,8 @@ type ConfigMapReconciler struct {
 // ConfigMapStatusOp represents an operation to update model status in ConfigMap.
 // It contains the necessary information to identify the model and its new status.
 type ConfigMapStatusOp struct {
+	// NodeUID is the committed Ready acknowledgement's node identity. Pass it to NodeLabelOp.
+	NodeUID          types.UID
 	ModelStatus      ModelStatus               // The updated status of the model
 	BaseModel        *v1beta1.BaseModel        // Reference to a namespace-scoped BaseModel (nil if using ClusterBaseModel)
 	ClusterBaseModel *v1beta1.ClusterBaseModel // Reference to a cluster-scoped BaseModel (nil if using BaseModel)
@@ -116,6 +121,17 @@ func NewConfigMapReconciler(nodeName string, namespace string, kubeClient kubern
 		reconcileInterval:    5 * time.Minute, // Perform reconciliation every 5 minutes by default
 		stopCh:               make(chan struct{}),
 	}
+}
+
+// InitializeNodeUID pins the process identity before reconciliation or workers start.
+func (c *ConfigMapReconciler) InitializeNodeUID(uid types.UID) error {
+	c.configMapMutationMutex.Lock()
+	defer c.configMapMutationMutex.Unlock()
+	if uid == "" || c.nodeUID != "" && c.nodeUID != uid {
+		return fmt.Errorf("cannot initialize node %s UID %q from %q", c.nodeName, uid, c.nodeUID)
+	}
+	c.nodeUID = uid
+	return nil
 }
 
 // StartReconciliation begins the periodic reconciliation of ConfigMaps.
@@ -529,6 +545,7 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 			configMap.Data = make(map[string]string)
 		}
 		before := maps.Clone(configMap.Data)
+		previousNodeUID := configMap.Annotations[constants.ModelArtifactNodeUIDAnnotation]
 		restored := false
 		if needCreate {
 			restored, err = c.restoreCachedConfigMapEntries(configMap.Data, "", false)
@@ -547,8 +564,8 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 		if err != nil {
 			return err
 		}
-		// Completing a retained shared deletion receipt also completes its
-		// verified UID handoff, before the new owner can publish status.
+		// Receipt removal completes an explicitly verified UID handoff. Only
+		// then may the replacement register a fresh acknowledgement.
 		for key, oldRaw := range before {
 			var old ModelEntry
 			if json.Unmarshal([]byte(oldRaw), &old) != nil || old.HfArtifactPendingDeletion == nil {
@@ -564,6 +581,7 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 			c.cacheMutex.RUnlock()
 			if handoff {
 				current.ModelUID = old.HfArtifactPendingDeletion.ModelUID
+				current.ArtifactRehydrationID = ""
 				if _, err := writeModelEntry(configMap.Data, key, current); err != nil {
 					return err
 				}
@@ -579,6 +597,9 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 			if err != nil {
 				return err
 			}
+		}
+		if previousNodeUID != configMap.Annotations[constants.ModelArtifactNodeUIDAnnotation] {
+			c.invalidateCachedReadyAcknowledgements()
 		}
 		c.cacheCommittedConfigMapEntries(before, configMap.Data, modelID, modelUID)
 		return nil
@@ -596,9 +617,14 @@ func (c *ConfigMapReconciler) mutateModelEntryWithRetry(
 	allowDeleting bool,
 	mutate modelEntryMutation,
 ) error {
+	return c.mutateModelConfigMapWithRetry(ctx, modelID, modelUID, allowDeleting, func(cm *corev1.ConfigMap) (bool, error) {
+		return mutate(cm.Data)
+	})
+}
+
+func (c *ConfigMapReconciler) mutateModelConfigMapWithRetry(ctx context.Context, modelID string, modelUID types.UID, allowDeleting bool, mutate configMapMutation) error {
 	return c.mutateConfigMapWithModelUID(ctx, modelID, modelUID, func(configMap *corev1.ConfigMap) (bool, error) {
 		if !allowDeleting && c.isModelMutationBlocked(modelID, modelUID) {
-			c.logger.Debugf("Skipping stale ConfigMap mutation for model %s", modelID)
 			return false, nil
 		}
 		if configMap.Data == nil {
@@ -612,7 +638,7 @@ func (c *ConfigMapReconciler) mutateModelEntryWithRetry(
 				return false, err
 			}
 		}
-		return mutate(configMap.Data)
+		return mutate(configMap)
 	})
 }
 
@@ -806,7 +832,11 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 	}
 
 	readyBlocked := false
-	err := c.mutateModelEntryWithRetry(ctx, key, modelUID, false, func(data map[string]string) (bool, error) {
+	op.NodeUID = ""
+	request := artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel})
+	var nodeUID types.UID
+	err := c.mutateModelConfigMapWithRetry(ctx, key, modelUID, false, func(cm *corev1.ConfigMap) (bool, error) {
+		data := cm.Data
 		readyBlocked = false
 		if op.ModelStatus == ModelStatusDeleted {
 			if _, exists := data[key]; !exists {
@@ -822,17 +852,79 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 				modelEntry = ModelEntry{Name: modelName}
 			}
 		}
+		bindingChanged := false
+		var node *corev1.Node
+		if op.ModelStatus == ModelStatusReady && (c.nodeUID != "" || request != "") {
+			if c.nodeUID == "" {
+				return false, fmt.Errorf("request Ready publication requires startup NodeUID")
+			}
+			var err error
+			node, err = c.kubeClient.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			if node.UID != c.nodeUID {
+				return false, fmt.Errorf("node %s UID changed from %s to %s", c.nodeName, c.nodeUID, node.UID)
+			}
+		}
+		if op.ModelStatus == ModelStatusReady && request != "" {
+			if _, err := constants.ArtifactReadyLabelKey(modelUID); err != nil {
+				return false, err
+			}
+			if problems := validation.IsValidLabelValue(request); len(problems) != 0 {
+				return false, fmt.Errorf("invalid artifact request label value: %v", problems)
+			}
+			nodeUID = node.UID
+			if cm.Annotations[constants.ModelArtifactNodeUIDAnnotation] != string(nodeUID) {
+				// A ConfigMap can outlive its node. Invalidate old request-bound
+				// acknowledgements without changing ordinary model readiness.
+				for otherKey := range data {
+					if _, _, _, modelKey := constants.ParseModelInfoFromConfigMapKey(otherKey); !modelKey {
+						continue
+					}
+					other, err := existingModelEntry(data, otherKey)
+					if err != nil {
+						return false, fmt.Errorf("cannot invalidate model %s for node replacement: %w", otherKey, err)
+					}
+					if other.Status == ModelStatusReady && other.ArtifactRehydrationID != "" {
+						other.Status = ModelStatusFailed
+						if _, err := writeModelEntry(data, otherKey, other); err != nil {
+							return false, err
+						}
+					}
+				}
+				labels := maps.Clone(node.Labels)
+				for labelKey := range labels {
+					if strings.HasPrefix(labelKey, "models.ome.io/ready-") {
+						delete(labels, labelKey)
+					}
+				}
+				if !maps.Equal(labels, node.Labels) {
+					if err := patchNodeLabels(ctx, c.kubeClient, node, labels); err != nil {
+						return false, err
+					}
+				}
+				if cm.Annotations == nil {
+					cm.Annotations = make(map[string]string)
+				}
+				cm.Annotations[constants.ModelArtifactNodeUIDAnnotation] = string(nodeUID)
+				bindingChanged = true
+			}
+		}
 		if op.ModelStatus == ModelStatusReady && modelEntry.HfArtifactKey != "" {
 			parent, valid := hfArtifactRecoveryParent(modelEntry.HfArtifactKey, data[modelEntry.HfArtifactKey])
 			if !valid || parent.Status != HfArtifactStatusReady {
 				// Commit any reconstructed Failed state, but do not let this
 				// stale completion bypass shared-parent validation in that CAS.
 				readyBlocked = true
-				return false, nil
+				return bindingChanged, nil
 			}
 		}
 		modelEntry.Status = op.ModelStatus
-		if op.ModelStatus == ModelStatusReady || modelEntry.ModelUID == "" {
+		if op.ModelStatus == ModelStatusReady {
+			modelEntry.ModelUID = modelUID
+			modelEntry.ArtifactRehydrationID = request
+		} else if _, exists := data[key]; !exists {
 			modelEntry.ModelUID = modelUID
 		}
 		if op.ModelStatus == ModelStatusReady || op.ModelStatus == ModelStatusFailed || op.ModelStatus == ModelStatusEvicted {
@@ -845,13 +937,16 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 		}
 		newValue := string(entryJSON)
 		if data[key] == newValue {
-			return false, nil
+			return bindingChanged, nil
 		}
 		data[key] = newValue
 		return true, nil
 	})
 	if err == nil && readyBlocked {
 		return fmt.Errorf("shared artifact for model %s requires validation before Ready", key)
+	}
+	if err == nil {
+		op.NodeUID = nodeUID
 	}
 	return err
 }
@@ -885,7 +980,7 @@ func (c *ConfigMapReconciler) updateModelMetadataInConfigMap(ctx context.Context
 			}
 		}
 		modelEntry.Config = modelConfig
-		if modelEntry.ModelUID == "" {
+		if modelEntry.ModelUID == "" && modelEntry.ArtifactRehydrationID == "" {
 			modelEntry.ModelUID = modelUID
 		}
 

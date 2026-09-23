@@ -122,6 +122,8 @@ func TestSharedEvictionRechecksWithdrawnIntentUnderLock(t *testing.T) {
 		baseModelLister:     g.baseModelLister, clusterBaseModelLister: g.clusterBaseModelLister,
 		logger: g.logger, taskQueue: newGopherTaskQueue(), gopherChan: make(chan *GopherTask, 10)}
 	defer second.taskQueue.close()
+	require.NoError(t, second.configMapReconciler.InitializeNodeUID("node-uid"))
+	require.NoError(t, second.nodeLabelReconciler.InitializeNodeUID("node-uid"))
 	result, err := second.runHfArtifactDownload(ctx, &restore, input, true, func(string) (bool, error) { return true, nil }, nil)
 	require.NoError(t, err)
 	require.Equal(t, hfArtifactTaskDone, result.Outcome)

@@ -219,6 +219,7 @@ func initializeComponents(
 	scout, err := modelagent.NewScout(
 		ctx,
 		cfg.nodeName,
+		cfg.namespace,
 		baseModelInformer,
 		clusterBaseModelInformer,
 		omeInformerFactory,
@@ -227,6 +228,12 @@ func initializeComponents(
 		logger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create scout: %w", err)
+	}
+	if err := configMapReconciler.InitializeNodeUID(scout.NodeUID()); err != nil {
+		return nil, nil, err
+	}
+	if err := nodeLabelReconciler.InitializeNodeUID(scout.NodeUID()); err != nil {
+		return nil, nil, err
 	}
 
 	// Add random jitter to prevent thundering herd when multiple agents start

@@ -345,6 +345,8 @@ func initializeArtifactEvictionTestNode(t *testing.T, g *Gopher) {
 	node.UID, node.ResourceVersion = "node-uid", "1"
 	_, err = g.kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 	require.NoError(t, err)
+	require.NoError(t, g.configMapReconciler.InitializeNodeUID(node.UID))
+	require.NoError(t, g.nodeLabelReconciler.InitializeNodeUID(node.UID))
 }
 
 func TestArtifactEvictionProtectsLocalURIConsumers(t *testing.T) {
@@ -533,10 +535,11 @@ func TestWithdrawnArtifactEvictionReleasesHydrationBarrier(t *testing.T) {
 	g.taskTracker.finishDelete(attempt, true)
 	model := eviction.BaseModel.DeepCopy()
 	delete(model.Annotations, constants.ModelArtifactResidencyAnnotation)
+	model.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "restore-1"
 	_, err := g.modelClient.OmeV1beta1().BaseModels(model.Namespace).Update(context.Background(), model, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	require.NoError(t, g.processTask(eviction))
-	download, outcome := g.taskTracker.beginDownload(gopherTaskModelKey(eviction), g.taskTracker.ensureSequence(0), nil)
+	download, outcome := g.taskTracker.beginDownload(gopherTaskModelKey(eviction), g.taskTracker.ensureSequence(0), nil, false)
 	require.Equal(t, gopherTaskProceed, outcome)
 	g.taskTracker.finishDownload(download)
 	require.FileExists(t, filepath.Join(path, "weights"))
@@ -675,6 +678,26 @@ func TestArtifactEvictionProtectsAliasedPathReferences(t *testing.T) {
 			require.FileExists(t, filepath.Join(path, "weights"))
 		})
 	}
+}
+
+func TestArtifactHydrationAcknowledgementSurvivesConfigMapRecovery(t *testing.T) {
+	g, task, _ := newArtifactEvictionTestModel(t)
+	model := task.BaseModel.DeepCopy()
+	delete(model.Annotations, constants.ModelArtifactResidencyAnnotation)
+	model.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "request-2"
+	_, err := g.modelClient.OmeV1beta1().BaseModels(model.Namespace).Update(context.Background(), model, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	key := getModelID(model, nil)
+	require.NoError(t, g.safeNodeLabelReconciliation(context.Background(), &NodeLabelOp{BaseModel: model, ModelStateOnNode: Ready}))
+	c := g.configMapReconciler
+	require.NoError(t, c.kubeClient.CoreV1().ConfigMaps(c.namespace).Delete(context.Background(), c.nodeName, metav1.DeleteOptions{}))
+	c.recreateConfigMap(context.Background())
+	cm, err := c.getConfigMap(context.Background())
+	require.NoError(t, err)
+	var entry ModelEntry
+	require.NoError(t, json.Unmarshal([]byte(cm.Data[key]), &entry))
+	require.Equal(t, ModelStatusReady, entry.Status)
+	require.Equal(t, "request-2", entry.ArtifactRehydrationID)
 }
 
 func TestArtifactEvictionProtectsDynamicPodSubpaths(t *testing.T) {

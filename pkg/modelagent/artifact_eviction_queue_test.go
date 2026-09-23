@@ -323,6 +323,7 @@ func TestAcceptedArtifactEvictionFencesQueuedDownload(t *testing.T) {
 	require.False(t, proceed, "completed eviction must fence older queued downloads")
 
 	delete(model.Annotations, constants.ModelArtifactResidencyAnnotation)
+	model.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "restore-1"
 	_, err = g.modelClient.OmeV1beta1().BaseModels(model.Namespace).Update(context.Background(), model, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	hydration := &GopherTask{TaskType: Download, BaseModel: model}

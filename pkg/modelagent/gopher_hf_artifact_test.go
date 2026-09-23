@@ -161,7 +161,7 @@ func TestGopherDeletePreflightErrorReleasesBarrier(t *testing.T) {
 	withNode.taskTracker.finishDelete(attempt, true)
 	require.Error(t, withNode.processTask(task))
 	next := withNode.taskTracker.ensureSequence(0)
-	download, result := withNode.taskTracker.beginDownload(gopherTaskModelKey(task), next, func() {})
+	download, result := withNode.taskTracker.beginDownload(gopherTaskModelKey(task), next, func() {}, false)
 	assert.Equal(t, gopherTaskProceed, result)
 	withNode.taskTracker.finishDownload(download)
 }

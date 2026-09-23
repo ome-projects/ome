@@ -62,6 +62,7 @@ func taskModelMeta(task *GopherTask) *metav1.ObjectMeta {
 func downloadAnnotations(annotations map[string]string) map[string]string {
 	copy := maps.Clone(annotations)
 	delete(copy, constants.ModelArtifactResidencyAnnotation)
+	delete(copy, constants.ModelArtifactRehydrationIDAnnotation)
 	if len(copy) == 0 {
 		return nil
 	}

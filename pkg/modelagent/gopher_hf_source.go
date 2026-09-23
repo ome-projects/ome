@@ -118,6 +118,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	}
 	var input hfArtifactTaskInput
 	var eligible bool
+	if artifactRehydrationID(task) != "" && resolved == "" {
+		return false, fmt.Errorf("HF rehydration requires an immutable revision")
+	}
 	if resolved != "" {
 		identity, identityErr := newHfArtifactIdentity(config.RepoID, resolved)
 		if identityErr != nil {
@@ -237,10 +240,61 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if len(artifact.ChildrenPaths) != 0 {
 		return false, fmt.Errorf("legacy HF artifact has descendants; use a different destination before replacing its contents")
 	}
-	if err := source.download(ctx, task, config); err != nil {
+	if artifactRehydrationID(task) != "" {
+		if err := source.restoreDirectCopy(ctx, s, task, config); err != nil {
+			return false, err
+		}
+	} else if err := source.download(ctx, task, config); err != nil {
 		return false, err
 	}
 	return false, s.parseDirectHfConfig(ctx, task, destination, artifact)
+}
+
+// Rehydration acknowledges verified contents, not Xet's same-size shortcut.
+// The caller holds the direct path lock until parsing finishes.
+func (source directHfSource) restoreDirectCopy(ctx context.Context, s *Gopher, task *GopherTask, config *xet.DownloadConfig) error {
+	if task.HfResolvedRevision == "" {
+		return fmt.Errorf("HF rehydration requires an immutable revision")
+	}
+	manifest, err := source.manifest(ctx, config.RepoID, config.Revision, config.Token, config.Endpoint)
+	if err != nil {
+		return err
+	}
+	if err := manifest.check(config.Revision); err != nil {
+		return err
+	}
+	return s.downloadRestoredArtifact(ctx, task, config.LocalDir, func(path string) error {
+		valid, err := manifest.validate(ctx, path)
+		if err != nil || valid {
+			return err
+		}
+		if err := s.checkCurrentArtifactRequest(ctx, task); err != nil {
+			return err
+		}
+		used, err := s.pathHasLocalPodConsumers(ctx, config.LocalDir)
+		if err != nil {
+			return err
+		}
+		if used {
+			return fmt.Errorf("HF artifact repair is blocked by a consuming pod")
+		}
+		if err := manifest.removeInvalidFiles(ctx, path); err != nil {
+			return err
+		}
+		copy := *config
+		copy.LocalDir = path
+		if err := source.download(ctx, task, &copy); err != nil {
+			return err
+		}
+		valid, err = manifest.validate(ctx, path)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return fmt.Errorf("restored HF snapshot failed content validation")
+		}
+		return nil
+	})
 }
 
 // Matching shared children stay attached. Only a policy/identity/path change

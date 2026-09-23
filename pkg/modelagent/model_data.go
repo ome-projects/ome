@@ -3,7 +3,6 @@ package modelagent
 
 import (
 	"encoding/json"
-
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/modelparser"
@@ -88,6 +87,7 @@ type ModelEntry struct {
 	// ModelUID binds persisted state to the CR instance, not its reusable name.
 	ModelUID                types.UID                `json:"modelUID,omitempty"`
 	ArtifactPendingEviction *ArtifactPendingEviction `json:"artifactPendingEviction,omitempty"`
+	ArtifactRehydrationID   string                   `json:"artifactRehydrationID,omitempty"`
 	Name                    string                   `json:"name"`                    // Name of the model
 	Status                  ModelStatus              `json:"status"`                  // Current status of the model on this node
 	Config                  *ModelConfig             `json:"config,omitempty"`        // Model configuration, may be nil if just tracking status

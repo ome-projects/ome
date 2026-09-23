@@ -2,6 +2,9 @@ package modelagent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -59,6 +62,7 @@ func (s *Gopher) validateDirectArtifactDownload(ctx context.Context, task *Gophe
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Unlike checkCurrentArtifactRequest, this also checks an empty captured R.
 	skip, _, err := s.shouldSkipArtifactTask(ctx, task)
 	if err != nil {
 		return err
@@ -90,7 +94,7 @@ func (s *Gopher) acquireDirectArtifactDownload(ctx context.Context, task *Gopher
 	noop := func() {}
 	path, err := s.directArtifactPath(task)
 	if err != nil {
-		if task.ResidencyManaged {
+		if artifactRehydrationID(task) != "" || task.ResidencyManaged {
 			return nil, false, err
 		}
 		spec := taskModelSpec(task)
@@ -434,4 +438,87 @@ func (s *Gopher) resumeDirectArtifactEviction(ctx context.Context, task *GopherT
 		return err
 	}
 	return s.mutateDirectArtifactReceipt(ctx, task, path, false)
+}
+
+// downloadRestoredArtifact runs under the caller's child lock. Existing real
+// directories retain ordinary downloader validation; new copies publish only
+// after validation and a fresh request/UID/source/placement check.
+func (s *Gopher) downloadRestoredArtifact(ctx context.Context, task *GopherTask, path string, download func(string) error) (resultErr error) {
+	target, err := s.directArtifactPath(task)
+	if err != nil {
+		return err
+	}
+	path, err = safeArtifactEvictionPath(s.modelRootDir, path)
+	if err != nil {
+		return err
+	}
+	if path != target {
+		return fmt.Errorf("restored artifact destination differs from model path")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return download(path)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	root, err := canonicalHfArtifactStoreRoot(s.modelRootDir)
+	if err != nil {
+		return err
+	}
+	identity, err := json.Marshal(struct {
+		UID         types.UID
+		Path        string
+		Spec        interface{}
+		Annotations map[string]string
+	}{taskModelMeta(task).UID, path, taskModelSpec(task), downloadAnnotations(taskModelMeta(task).Annotations)})
+	if err != nil {
+		return err
+	}
+	stage := filepath.Join(root, directArtifactStagingDirectory, directArtifactDownloadStages, fmt.Sprintf("%x", sha256.Sum256(identity)))
+	if err := validateHfArtifactPathAncestors(root, stage, true); err != nil {
+		return err
+	}
+	lock, acquired, err := tryHfArtifactFileLock(root, filepath.Join(root, hfArtifactLockDirectory), "staging:"+stage)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return fmt.Errorf("artifact staging cleanup is in progress")
+	}
+	defer func() {
+		// The synchronous downloader has stopped before cleanup. Successful
+		// publication moved the directory; failed or stale attempts discard it.
+		resultErr = errors.Join(resultErr, removeArtifactStage(root, stage), lock.Close())
+	}()
+	if err := os.MkdirAll(stage, 0755); err != nil {
+		return err
+	}
+	if err := download(stage); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	skip, deleting, err := s.shouldSkipArtifactTask(ctx, task)
+	if err != nil {
+		return err
+	}
+	if skip || deleting {
+		return fmt.Errorf("restored artifact request is no longer current")
+	}
+	if err := validateHfArtifactPathAncestors(root, stage, true); err != nil {
+		return err
+	}
+	if _, err := s.directArtifactPath(task); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		return fmt.Errorf("restored artifact target appeared before publication: %s (%v)", path, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.Rename(stage, path)
 }

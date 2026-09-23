@@ -27,6 +27,7 @@ type gopherModelTaskState struct {
 	legacyAttempts         map[*gopherLegacyAttempt]struct{}
 	latestLegacyDownload   *gopherLegacyAttempt
 	newestDownloadSequence uint64
+	newestExplicitSequence uint64
 	finishedDeleteSequence uint64
 	deleteSequence         uint64
 	deleteAttempt          *gopherDeleteAttempt
@@ -67,14 +68,18 @@ func (tracker *gopherTaskTracker) ensureSequence(existing uint64) uint64 {
 
 // beginDownload must precede Updating writes. A Wait or Stale result owns no
 // attempt and never replaces or cancels the active download's cancel function.
-func (tracker *gopherTaskTracker) beginDownload(modelUID string, sequence uint64, cancel context.CancelFunc) (*gopherDownloadAttempt, gopherTaskStartResult) {
+func (tracker *gopherTaskTracker) beginDownload(modelUID string, sequence uint64, cancel context.CancelFunc, replay bool) (*gopherDownloadAttempt, gopherTaskStartResult) {
 	if modelUID == "" || sequence == 0 {
 		return nil, gopherTaskStale
 	}
 	tracker.mutex.Lock()
 	defer tracker.mutex.Unlock()
 	state := tracker.modelStateLocked(modelUID)
-	if sequence <= state.finishedDeleteSequence || sequence < state.newestDownloadSequence {
+	newest := state.newestExplicitSequence
+	if replay {
+		newest = state.newestDownloadSequence
+	}
+	if sequence <= state.finishedDeleteSequence || sequence < newest {
 		return nil, gopherTaskStale
 	}
 	if state.deleteSequence != 0 {
@@ -88,9 +93,14 @@ func (tracker *gopherTaskTracker) beginDownload(modelUID string, sequence uint64
 	}
 	attempt := &gopherDownloadAttempt{modelUID: modelUID, sequence: sequence, cancel: cancel}
 	state.download = attempt
-	// Retain newer admitted intent even after completion (including failure).
-	// An older delayed delete must never become eligible when the slot clears.
-	state.newestDownloadSequence = sequence
+	// Replays can repair acknowledgement without validating an explicit refresh.
+	// They fence delayed deletes and older replays, but must not retire that work.
+	if !replay {
+		state.newestExplicitSequence = sequence
+	}
+	if sequence > state.newestDownloadSequence {
+		state.newestDownloadSequence = sequence
+	}
 	return attempt, gopherTaskProceed
 }
 

@@ -42,6 +42,8 @@ const (
 )
 
 type GopherTask struct {
+	// ArtifactRequestReplay rechecks durable completion before retrying a restore.
+	ArtifactRequestReplay  bool
 	TaskType               GopherTaskType
 	BaseModel              *v1beta1.BaseModel
 	ClusterBaseModel       *v1beta1.ClusterBaseModel
@@ -146,6 +148,9 @@ func NewGopher(
 }
 
 func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int, numHighPriorityWorker int) {
+	if err := s.cleanupArtifactStaging(); err != nil {
+		s.logger.Warnf("Artifact staging cleanup failed: %v", err)
+	}
 	startupSnapshotCtx, cancelStartupSnapshot := context.WithTimeout(context.Background(), defaultStartupReadySnapshotTimeout)
 	defer cancelStartupSnapshot()
 	s.captureStartupReadyModels(startupSnapshotCtx)
@@ -284,8 +289,9 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 	}
 	defer unlock()
 	task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
-	// Check current ownership before publishing status for an evictable path.
-	checkRequest := shared || s.isBoundedDirectArtifactTask(task)
+	// An empty captured request must not clear a newer agent's acknowledgement,
+	// including initial Updating and late Failed writes, not just final Ready.
+	checkRequest := artifactRehydrationID(task) != "" || shared || s.isBoundedDirectArtifactTask(task)
 	if checkRequest && (op.ModelStateOnNode == Ready || op.ModelStateOnNode == Updating || op.ModelStateOnNode == Failed) {
 		if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err != nil {
 			return fmt.Errorf("%w: %w", errArtifactStatusLiveValidation, err)
@@ -297,6 +303,29 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 		if err := s.handoffOrdinaryArtifactOwner(ctx, task); err != nil {
 			return err
 		}
+	}
+	if op.ModelStateOnNode == Ready && artifactRehydrationID(task) != "" {
+		spec := taskModelSpec(task)
+		if spec.Storage == nil || spec.Storage.Path == nil || spec.Storage.StorageUri == nil {
+			return fmt.Errorf("artifact acknowledgement requires an owned path")
+		}
+		info, err := os.Stat(getDestPath(&spec, s.modelRootDir))
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("artifact path is absent before Ready publication")
+		}
+		// The request-bound label admits workloads. Persist its validated
+		// acknowledgement before making either Ready label visible.
+		statusOp := &ConfigMapStatusOp{
+			ModelStatus: ModelStatusReady, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel,
+		}
+		if err := s.configMapReconciler.ReconcileModelStatus(ctx, statusOp); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		op.NodeUID = statusOp.NodeUID
+		return s.nodeLabelReconciler.ReconcileNodeLabels(op)
 	}
 	err = s.nodeLabelReconciler.ReconcileNodeLabels(op)
 	if err != nil {
@@ -430,7 +459,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			s.logger.Infof("Model %s no longer exists, skipping stale download task", modelInfo)
 			return nil
 		}
-		if task.ResidencyManaged {
+		if artifactRehydrationID(task) != "" || task.ResidencyManaged {
 			if waiting, err := s.settleDirectArtifactEviction(ctx, task); waiting || err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -439,6 +468,15 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
 				}
 				return err
+			}
+		}
+		if task.ArtifactRequestReplay && artifactRehydrationID(task) != "" {
+			ready, err := s.artifactRequestAlreadyReady(ctx, task)
+			if err != nil {
+				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+			if ready {
+				return nil
 			}
 		}
 	}
@@ -458,7 +496,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 		if err != nil {
 			s.logger.Errorf("Failed to set model %s status to Updating: %v", modelInfo, err)
-			if task.ResidencyManaged || errors.Is(err, errArtifactStatusLiveValidation) {
+			if artifactRehydrationID(task) != "" || task.ResidencyManaged || errors.Is(err, errArtifactStatusLiveValidation) {
 				// Retained Ready labels can admit consumers while files are repaired.
 				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
 			}
@@ -522,7 +560,13 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			}
 			downloadObjectStorageModel := func() error {
 				err = utils.Retry(s.downloadRetry, 100*time.Millisecond, func() error {
-					downloadErr := s.downloadModel(ctx, osUri, destPath, task)
+					download := func(path string) error { return s.downloadModel(ctx, osUri, path, task) }
+					var downloadErr error
+					if artifactRehydrationID(task) != "" {
+						downloadErr = s.downloadRestoredArtifact(ctx, task, destPath, download)
+					} else {
+						downloadErr = download(destPath)
+					}
 					if downloadErr != nil {
 						// Check if context was cancelled
 						if ctx.Err() != nil {
@@ -565,6 +609,9 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				} else if err := downloadObjectStorageModel(); err != nil {
 					return err
 				}
+			} else if !allowFallbackDownload {
+				s.demoteToNormalPriority(task)
+				return nil
 			} else if err := downloadObjectStorageModel(); err != nil {
 				return err
 			}
@@ -850,12 +897,15 @@ func (s *Gopher) isStartupRevalidation(task *GopherTask) bool {
 }
 
 func shouldUseSamePathObjectStorageReuse(task *GopherTask) bool {
-	return task != nil && task.TaskType == Download
+	return task != nil && task.TaskType == Download && artifactRehydrationID(task) == ""
 }
 
 func (s *Gopher) shouldSkipStaleDownloadTask(ctx context.Context, task *GopherTask) (bool, bool, error) {
 	if task == nil {
 		return false, false, nil
+	}
+	if artifactRehydrationID(task) != "" {
+		return s.shouldSkipArtifactTask(ctx, task)
 	}
 
 	if task.BaseModel != nil {
@@ -871,6 +921,9 @@ func (s *Gopher) shouldSkipStaleDownloadTask(ctx context.Context, task *GopherTa
 			return false, false, nil
 		}
 		if task.SharedArtifact && latestModel.UID != task.BaseModel.UID {
+			return true, false, nil
+		}
+		if latestModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] != "" {
 			return true, false, nil
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
@@ -894,6 +947,9 @@ func (s *Gopher) shouldSkipStaleDownloadTask(ctx context.Context, task *GopherTa
 			return false, false, nil
 		}
 		if task.SharedArtifact && latestModel.UID != task.ClusterBaseModel.UID {
+			return true, false, nil
+		}
+		if latestModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] != "" {
 			return true, false, nil
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
@@ -1409,6 +1465,12 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	case <-ctx.Done():
 		return fmt.Errorf("download cancelled before starting bulk download: %w", ctx.Err())
 	default:
+	}
+
+	if reused, err := s.reuseConsumedOCIArtifact(ctx, task, destPath, func() map[string]error {
+		return s.verifyDownloadedFiles(ctx, ociOSDataStore, objectUris, destPath, task)
+	}); err != nil || reused {
+		return err
 	}
 
 	// TODO: BulkDownload doesn't support context cancellation yet

@@ -50,7 +50,7 @@ func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) er
 			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil {
 				routing.children[key] = true
 			}
-			if child.ModelUID != "" && (child.ArtifactPendingEviction != nil || child.Status == ModelStatusEvicted) {
+			if child.ModelUID != "" && (child.ArtifactPendingEviction != nil || child.Status == ModelStatusEvicted || child.ArtifactRehydrationID != "") {
 				if routing.residencyModels == nil {
 					routing.residencyModels = make(map[string]bool)
 				}
@@ -101,7 +101,7 @@ func (s *Gopher) routeArtifactTaskLocked(task *GopherTask) {
 	}
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
 	uid := gopherTaskModelKey(task)
-	if task.TaskType == Evict || modelEvictionRequested(taskModelMeta(task)) {
+	if task.TaskType == Evict || modelEvictionRequested(taskModelMeta(task)) || artifactRehydrationID(task) != "" {
 		if s.artifactRouting.residencyModels == nil {
 			s.artifactRouting.residencyModels = make(map[string]bool)
 		}
@@ -186,7 +186,7 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 		return ctx, func(waiting bool) { s.taskTracker.finishDelete(attempt, waiting) }, true, nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	attempt, outcome := s.taskTracker.beginDownload(key, task.Sequence, cancel)
+	attempt, outcome := s.taskTracker.beginDownload(key, task.Sequence, cancel, task.ArtifactRequestReplay)
 	if outcome != gopherTaskProceed {
 		cancel()
 		return ctx, func(bool) {}, false, s.waitForActiveTask(task, outcome)

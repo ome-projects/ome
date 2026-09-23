@@ -21,13 +21,13 @@ func TestLegacyDownloadsDoNotWaitOnSharedTaskCoordinator(t *testing.T) {
 	first := tracker.beginLegacyTask("model", func() {})
 	second := tracker.beginLegacyTask("model", func() {})
 	require.NotSame(t, first, second)
-	_, outcome := tracker.beginDownload("model", tracker.ensureSequence(0), func() {})
+	_, outcome := tracker.beginDownload("model", tracker.ensureSequence(0), func() {}, false)
 	require.Equal(t, gopherTaskWait, outcome, "a shared transition must wait for legacy writers")
 	tracker.finishLegacyTask(first)
-	_, outcome = tracker.beginDownload("model", tracker.ensureSequence(0), func() {})
+	_, outcome = tracker.beginDownload("model", tracker.ensureSequence(0), func() {}, false)
 	require.Equal(t, gopherTaskWait, outcome)
 	tracker.finishLegacyTask(second)
-	_, outcome = tracker.beginDownload("model", tracker.ensureSequence(0), func() {})
+	_, outcome = tracker.beginDownload("model", tracker.ensureSequence(0), func() {}, false)
 	require.Equal(t, gopherTaskProceed, outcome)
 }
 

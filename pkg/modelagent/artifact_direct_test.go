@@ -49,6 +49,27 @@ func TestDirectArtifactOrdinaryOCIWaitsForPathLock(t *testing.T) {
 	require.FileExists(t, filepath.Join(path, "weights"))
 }
 
+func TestRestoredArtifactCreatesDestinationAncestors(t *testing.T) {
+	ctx := context.Background()
+	g, task, _ := newDirectArtifactTestModel(t)
+	path := filepath.Join(g.modelRootDir, "new-tenant", "model")
+	task.BaseModel.Spec.Storage.Path = &path
+	delete(task.BaseModel.Annotations, constants.ModelArtifactResidencyAnnotation)
+	task.BaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "restore-2"
+	task.TaskType = Download
+	_, err := g.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	unlock, acquired, err := g.acquireDirectArtifactPath(task)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer unlock()
+	err = g.downloadRestoredArtifact(ctx, task, path, func(stage string) error {
+		return os.WriteFile(filepath.Join(stage, "weights"), []byte("complete"), 0600)
+	})
+	require.NoError(t, err, "restoration on a new node must create destination ancestors")
+	require.FileExists(t, filepath.Join(path, "weights"))
+}
+
 func TestDirectArtifactOrdinaryHfWaitsForPathLock(t *testing.T) {
 	g, task, input, source, downloads := newTestDirectHfSource(t)
 	task.BaseModel.Spec.Storage.DownloadPolicy = nil
@@ -64,7 +85,7 @@ func TestDirectArtifactOrdinaryHfWaitsForPathLock(t *testing.T) {
 }
 
 func TestDirectArtifactOrdinaryHfRejectsStaleWork(t *testing.T) {
-	for _, change := range []string{"uid", "intent", "source", "path", "deleted"} {
+	for _, change := range []string{"uid", "request", "intent", "source", "path", "deleted"} {
 		t.Run(change, func(t *testing.T) {
 			g, task, _, source, downloads := newTestDirectHfSource(t)
 			task.BaseModel.Spec.Storage.DownloadPolicy = nil
@@ -72,6 +93,8 @@ func TestDirectArtifactOrdinaryHfRejectsStaleWork(t *testing.T) {
 			switch change {
 			case "uid":
 				live.UID = "replacement"
+			case "request":
+				live.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "new-request"
 			case "intent":
 				live.Annotations[constants.ModelArtifactResidencyAnnotation] = constants.ModelArtifactResidencyEvicted
 			case "source":
@@ -173,7 +196,7 @@ func TestDirectArtifactOrdinaryHfHoldsLockThroughReady(t *testing.T) {
 			assertLocked()
 			if changed {
 				live := task.BaseModel.DeepCopy()
-				live.Annotations[constants.ModelArtifactResidencyAnnotation] = constants.ModelArtifactResidencyEvicted
+				live.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "new-request"
 				_, err := g.modelClient.OmeV1beta1().BaseModels(live.Namespace).Update(ctx, live, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			}
@@ -552,6 +575,43 @@ func TestDirectArtifactEvictionResumesAfterRestartAndWithdrawal(t *testing.T) {
 	}
 }
 
+func TestDirectArtifactEvictionResumesWithWaitingPods(t *testing.T) {
+	for _, node := range []string{"", "node2", "node1"} {
+		t.Run("pod-node="+node, func(t *testing.T) {
+			ctx := context.Background()
+			g, task, path := newDirectArtifactTestModel(t)
+			seedDirectArtifactReceipt(t, g, task, ArtifactPendingEviction{ModelUID: task.BaseModel.UID, Path: path})
+			delete(task.BaseModel.Annotations, constants.ModelArtifactResidencyAnnotation)
+			task.BaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "restore-2"
+			_, err := g.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			label := constants.GetBaseModelLabel(task.BaseModel.Namespace, task.BaseModel.Name)
+			_, err = g.kubeClient.CoreV1().Pods(task.BaseModel.Namespace).Create(ctx, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "waiting-endpoint"},
+				Spec: corev1.PodSpec{NodeName: node, NodeSelector: map[string]string{label: string(Ready)},
+					Volumes: []corev1.Volume{{Name: "model", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path}}}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodPending},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+			release, acquired, err := g.acquireDirectArtifactPath(task)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			defer release()
+			err = g.resumeDirectArtifactEviction(ctx, task)
+			if node == "node1" {
+				require.ErrorContains(t, err, "consuming pod")
+				require.FileExists(t, filepath.Join(path, "weights"))
+				require.NotNil(t, directArtifactEntry(t, g, task).ArtifactPendingEviction)
+			} else {
+				require.NoError(t, err)
+				require.NoDirExists(t, path)
+				require.Nil(t, directArtifactEntry(t, g, task).ArtifactPendingEviction)
+			}
+		})
+	}
+}
+
 func TestDirectArtifactEvictionRejectsAmbiguousReceipt(t *testing.T) {
 	for _, scenario := range []string{"empty-uid", "other-uid", "empty-path", "outside-root", "root", "symlink", "consumer", "other-model"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -594,6 +654,83 @@ func TestDirectArtifactEvictionRejectsAmbiguousReceipt(t *testing.T) {
 			require.FileExists(t, protected)
 			if scenario != "symlink" {
 				require.FileExists(t, filepath.Join(path, "weights"))
+			}
+		})
+	}
+}
+
+func TestDownloadRestoredArtifactPublication(t *testing.T) {
+	for _, scenario := range []string{"success", "existing", "canceled", "stale-request", "changed-source", "replacement-target", "download-error", "deleted"} {
+		t.Run(scenario, func(t *testing.T) {
+			g, task, path := newDirectArtifactTestModel(t)
+			delete(task.BaseModel.Annotations, constants.ModelArtifactResidencyAnnotation)
+			task.BaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "restore-1"
+			task.TaskType = Download
+			_, err := g.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(context.Background(), task.BaseModel, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			if scenario != "existing" {
+				require.NoError(t, os.RemoveAll(path))
+			}
+			release, acquired, err := g.acquireDirectArtifactPath(task)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			defer release()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var stage string
+			err = g.downloadRestoredArtifact(ctx, task, path, func(destination string) error {
+				if scenario == "existing" {
+					require.Equal(t, path, destination)
+					require.FileExists(t, filepath.Join(destination, "weights"))
+					return nil
+				}
+				require.NotEqual(t, path, destination)
+				stage = destination
+				require.DirExists(t, destination)
+				require.NoError(t, os.WriteFile(filepath.Join(destination, "new-weights"), []byte("complete"), 0600))
+				// Another process can start while this attempt still owns its stage.
+				require.NoError(t, g.cleanupArtifactStaging())
+				require.FileExists(t, filepath.Join(destination, "new-weights"))
+				switch scenario {
+				case "canceled":
+					cancel()
+				case "stale-request", "changed-source":
+					latest := task.BaseModel.DeepCopy()
+					if scenario == "stale-request" {
+						latest.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = "restore-2"
+					} else {
+						latest.Spec.Storage.StorageUri = stringPtr("hf://other/model")
+					}
+					_, updateErr := g.modelClient.OmeV1beta1().BaseModels(latest.Namespace).Update(context.Background(), latest, metav1.UpdateOptions{})
+					require.NoError(t, updateErr)
+				case "replacement-target":
+					require.NoError(t, os.Mkdir(path, 0700))
+					require.NoError(t, os.WriteFile(filepath.Join(path, "other-owner"), []byte("keep"), 0600))
+				case "download-error":
+					return fmt.Errorf("incomplete download")
+				case "deleted":
+					require.NoError(t, g.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Delete(ctx, task.BaseModel.Name, metav1.DeleteOptions{}))
+				}
+				return nil
+			})
+			if stage != "" {
+				require.NoDirExists(t, stage, "completed or abandoned attempts must not leave unpublished files")
+			}
+			switch scenario {
+			case "success":
+				require.NoError(t, err)
+				require.FileExists(t, filepath.Join(path, "new-weights"))
+			case "existing":
+				require.NoError(t, err)
+				require.FileExists(t, filepath.Join(path, "weights"))
+			case "replacement-target":
+				require.Error(t, err)
+				require.FileExists(t, filepath.Join(path, "other-owner"))
+				require.NoFileExists(t, filepath.Join(path, "new-weights"))
+			default:
+				require.Error(t, err)
+				_, statErr := os.Lstat(path)
+				require.True(t, os.IsNotExist(statErr))
 			}
 		})
 	}

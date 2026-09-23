@@ -33,6 +33,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
@@ -1036,34 +1037,64 @@ func TestRequeueSamePathInFlightReuseWaitTimesOut(t *testing.T) {
 }
 
 func TestProcessTaskWithOptions_HighPriorityDemotesFallbackDownload(t *testing.T) {
-	storageURI := "oci://n/object-ns/b/model-bucket/o/models/large-model"
-	modelPath := filepath.Join(t.TempDir(), "large-model")
-	model := &v1beta1.BaseModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "large-model", Namespace: "service-ns", UID: "current-uid"},
-		Spec: v1beta1.BaseModelSpec{
-			Storage: &v1beta1.StorageSpec{
-				StorageUri: &storageURI,
-				Path:       &modelPath,
-			},
-		},
-	}
-	g := newGopherForProcessTask(makeConfigMap("node-1", map[string]string{}))
-	g.baseModelLister = &mockBaseModelLister{models: []*v1beta1.BaseModel{model}}
-	g.taskQueue = newGopherTaskQueue()
-	task := &GopherTask{
-		TaskType:              Download,
-		BaseModel:             model,
-		SamePathWaitStartedAt: time.Now(),
-	}
+	for _, tc := range []struct {
+		name    string
+		request string
+		replay  bool
+	}{
+		{name: "ordinary"},
+		{name: "rehydration", request: "restore-1"},
+		{name: "rehydration replay", request: "restore-1", replay: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			modelPath := filepath.Join(root, "large-model")
+			model := &v1beta1.BaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "large-model", Namespace: "service-ns", UID: "current-uid"},
+				Spec: v1beta1.BaseModelSpec{
+					Storage: &v1beta1.StorageSpec{
+						StorageUri: stringPtr("oci://n/object-ns/b/model-bucket/o/models/large-model"),
+						Path:       &modelPath,
+						// An accidental download must fail before network access.
+						Parameters: &map[string]string{"auth": "unsupported-test-auth"},
+					},
+				},
+			}
+			if tc.request != "" {
+				model.Annotations = map[string]string{constants.ModelArtifactRehydrationIDAnnotation: tc.request}
+			}
+			g := newGopherForProcessTask(makeConfigMap("node-1", map[string]string{}))
+			g.modelRootDir, g.kubeClient = root, g.configMapReconciler.kubeClient
+			g.modelClient = omefake.NewSimpleClientset(model)
+			g.baseModelLister = &mockBaseModelLister{models: []*v1beta1.BaseModel{model}}
+			g.metrics, g.downloadRetry = NewMetrics(prometheus.NewRegistry()), 1
+			g.taskQueue = newGopherTaskQueue()
+			t.Cleanup(g.taskQueue.close)
+			initializeArtifactEvictionTestNode(t, g)
+			task := &GopherTask{
+				TaskType:              Download,
+				BaseModel:             model,
+				SamePathWaitStartedAt: time.Now(),
+				ArtifactRequestReplay: tc.replay,
+			}
+			g.enqueueTask(task)
+			queued, ok := g.taskQueue.popHighPriority()
+			require.True(t, ok)
+			require.Same(t, task, queued)
 
-	err := g.processTaskWithOptions(task, false)
+			require.NoError(t, g.processTaskWithOptions(queued, false))
 
-	require.NoError(t, err)
-	queued, ok := g.taskQueue.popNormal()
-	require.True(t, ok)
-	assert.Equal(t, model.Name, queued.BaseModel.Name)
-	assert.True(t, queued.NormalPriorityOnly)
-	assert.Equal(t, 0, g.taskQueue.len())
+			require.True(t, task.NormalPriorityOnly)
+			require.False(t, shouldUseHighPriorityQueue(task))
+			require.Equal(t, 1, g.taskQueue.len())
+			queued, ok = g.taskQueue.popNormal()
+			require.True(t, ok)
+			require.Same(t, task, queued)
+			assert.Zero(t, g.taskQueue.len())
+			assert.NoDirExists(t, filepath.Join(root, directArtifactStagingDirectory))
+			assert.NoDirExists(t, modelPath)
+		})
+	}
 }
 
 func TestDemoteToNormalPriorityClassifiesRevalidationBeforeEnqueue(t *testing.T) {
@@ -1254,10 +1285,10 @@ func TestFinishActiveDownloadDoesNotRemoveNewerRegistration(t *testing.T) {
 	t.Cleanup(oldCancel)
 	t.Cleanup(newCancel)
 	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
-	oldAttempt, result := g.taskTracker.beginDownload(modelUID, 1, oldCancel)
+	oldAttempt, result := g.taskTracker.beginDownload(modelUID, 1, oldCancel, false)
 	require.Equal(t, gopherTaskProceed, result)
 	g.taskTracker.finishDownload(oldAttempt)
-	newAttempt, result := g.taskTracker.beginDownload(modelUID, 2, newCancel)
+	newAttempt, result := g.taskTracker.beginDownload(modelUID, 2, newCancel, false)
 	require.Equal(t, gopherTaskProceed, result)
 	t.Cleanup(func() { g.taskTracker.finishDownload(newAttempt) })
 	g.taskTracker.finishDownload(oldAttempt)

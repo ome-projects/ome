@@ -3,12 +3,14 @@ package modelagent
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -333,6 +335,41 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 			}
 			op.BaseModel = model
 		}
+		if status == ModelStatusReady {
+			task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel, ArtifactRequestReplay: true}
+			if artifactRehydrationID(task) != "" {
+				spec := taskModelSpec(task)
+				modelType := spec.AdditionalMetadata["type"]
+				if modelType == "" {
+					modelType = string(constants.ServingBaseModel)
+				}
+				task.TensorRTLLMShapeFilter = &TensorRTLLMShapeFilter{
+					IsTensorrtLLMModel: spec.ModelFormat.Name == constants.TensorRTLLM, ModelType: modelType,
+				}
+				if isHfArtifactShapeFiltered(task) {
+					if s.kubeClient == nil || s.configMapReconciler == nil || s.configMapReconciler.nodeName == "" {
+						return fmt.Errorf("TensorRT-LLM replay requires current node identity")
+					}
+					node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+					if err != nil {
+						return err
+					}
+					instanceType, ok := node.Labels[constants.NodeInstanceShapeLabel]
+					if !ok {
+						instanceType = node.Labels[constants.DeprecatedNodeInstanceShapeLabel]
+					}
+					task.TensorRTLLMShapeFilter.ShapeAlias, err = utils.GetInstanceTypeShortName(instanceType)
+					if err != nil {
+						return err
+					}
+				}
+				// Repair restores persisted child state after this callback. Let
+				// each child confirm its own request instead of copying a newer
+				// CR annotation onto an older completion.
+				s.enqueueTask(task)
+				continue
+			}
+		}
 		if err := s.nodeLabelReconciler.ReconcileNodeLabels(op); err != nil {
 			return err
 		}
@@ -368,16 +405,27 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 		}
 	}()
 	handler := s.sharedHfArtifactHandler()
-	if originalValidate := validate; originalValidate != nil {
+	requestValidation, err := s.artifactRequestNeedsValidation(ctx, task)
+	if err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
+	originalDownload, originalValidate := download, validate
+	if originalDownload != nil {
+		download = func(path string) error {
+			if err := input.validateDownload(ctx); err != nil {
+				return err
+			}
+			return originalDownload(path)
+		}
+	}
+	if originalValidate != nil {
 		validate = func(path string) (bool, error) {
 			valid, err := originalValidate(path)
 			if err != nil {
 				return false, err
 			}
-			if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err != nil {
+			if err := input.validateDownload(ctx); err != nil {
 				return false, err
-			} else if skip {
-				return false, fmt.Errorf("artifact task changed before repair")
 			}
 			if !valid {
 				used, err := s.pathHasLocalPodConsumers(ctx, path)
@@ -412,7 +460,7 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 	if handler.childPathConflictsWithParent(input.ChildModelPath, input.Parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
-	needsRepair := task.TaskType == DownloadOverride || (found && parent.Status != HfArtifactStatusUpdating &&
+	needsRepair := task.TaskType == DownloadOverride || requestValidation || (found && parent.Status != HfArtifactStatusUpdating &&
 		(parent.Status == HfArtifactStatusFailed || !handler.files.ParentReadyMarkerExists(parent)))
 	startupValidation := s.hfArtifactStartup.needsValidation(input.Parent.Key)
 	if !allowDownload && (needsRepair || !found || startupValidation) {
@@ -728,6 +776,29 @@ func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op 
 				return false, ctx.Err()
 			}
 			return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		}
+	} else if !sharedCompleted && artifactRehydrationID(task) != "" && spec.Storage != nil && spec.Storage.StorageUri != nil &&
+		strings.HasPrefix(*spec.Storage.StorageUri, "hf://") && !isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+		// Standalone callers without a task-scoped lock reacquire for publication.
+		// Normal processTask execution retains its lock continuously through Ready.
+		unlock, acquired, err := s.acquireDirectArtifactPath(task)
+		if err != nil || !acquired {
+			return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		}
+		defer unlock()
+		cm, err := s.configMapReconciler.getConfigMap(ctx)
+		if err != nil {
+			return false, err
+		}
+		entry, err := existingModelEntry(cm.Data, getModelID(task.BaseModel, task.ClusterBaseModel))
+		if err != nil {
+			return false, err
+		}
+		if entry.ArtifactPendingEviction != nil || entry.Status == ModelStatusEvicted {
+			return false, fmt.Errorf("direct artifact cleanup interrupted Ready publication")
+		}
+		if info, err := os.Lstat(getDestPath(&spec, s.modelRootDir)); err != nil || !info.IsDir() {
+			return false, fmt.Errorf("direct HF artifact is absent before Ready publication")
 		}
 	}
 	err := s.safeNodeLabelReconciliation(ctx, op)

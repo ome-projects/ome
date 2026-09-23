@@ -76,7 +76,7 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.ArtifactPendingEviction == nil && entry.ModelEntryJSON == "" {
+	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.ArtifactPendingEviction == nil && model.ArtifactRehydrationID == "" && entry.ModelEntryJSON == "" {
 		// Only explicit ordinary writes may seed typed recovery. Observing
 		// unrelated records, including at startup, must not adopt them.
 		if modelID == "" && before[key] != raw && c.modelCache[key] == nil {
@@ -93,7 +93,7 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 	// old model identity remains in its non-Ready record until cleanup ends.
 	if model.ModelUID != "" && !c.isModelUIDInvalidatedLocked(key, model.ModelUID) {
 		entry.ModelUID = model.ModelUID
-	} else if model.ModelUID == "" && key == modelID && !c.isModelMutationBlockedLocked(key, modelUID) {
+	} else if model.ModelUID == "" && model.ArtifactRehydrationID == "" && key == modelID && !c.isModelMutationBlockedLocked(key, modelUID) {
 		entry.ModelUID = modelUID
 	}
 	if key == modelID && entry.ModelUID == modelUID && !c.isModelMutationBlockedLocked(key, modelUID) {
@@ -104,8 +104,29 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 	}
 	entry.ModelName = model.Name
 	entry.ModelStatus = model.Status
+	entry.ArtifactRehydrationID = model.ArtifactRehydrationID
 	entry.ModelEntryJSON = raw
 	c.modelCache[key] = &entry
+}
+
+func (c *ConfigMapReconciler) invalidateCachedReadyAcknowledgements() {
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+	for _, entry := range c.modelCache {
+		if entry == nil || entry.ModelStatus != ModelStatusReady || entry.ArtifactRehydrationID == "" {
+			continue
+		}
+		entry.ModelStatus = ModelStatusFailed
+		if entry.ModelEntryJSON != "" {
+			var model ModelEntry
+			if json.Unmarshal([]byte(entry.ModelEntryJSON), &model) == nil {
+				model.Status = ModelStatusFailed
+				if raw, err := json.Marshal(model); err == nil {
+					entry.ModelEntryJSON = string(raw)
+				}
+			}
+		}
+	}
 }
 
 // cacheCommittedHfParentLocked excludes evicted children from the recovery

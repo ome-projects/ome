@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -36,11 +37,15 @@ type Scout struct {
 	informerFactory        omev1beta1informers.SharedInformerFactory
 	gopherChan             chan<- *GopherTask
 	nodeName               string
+	configMapNamespace     string
 	nodeInfo               *v1.Node
 	nodeShapeAlias         string
 	kubeClient             kubernetes.Interface
 	logger                 *zap.SugaredLogger
 }
+
+// NodeUID is the node incarnation observed before this agent starts workers.
+func (w *Scout) NodeUID() types.UID { return w.nodeInfo.UID }
 
 type TensorRTLLMShapeFilter struct {
 	IsTensorrtLLMModel bool
@@ -59,7 +64,7 @@ type downloadOverrideInputs struct {
 	TensorRTLLMModelType string
 }
 
-func NewScout(ctx context.Context, nodeName string,
+func NewScout(ctx context.Context, nodeName, configMapNamespace string,
 	baseModelInformer omev1beta1.BaseModelInformer,
 	clusterBaseModelInformer omev1beta1.ClusterBaseModelInformer,
 	informerFactory omev1beta1informers.SharedInformerFactory,
@@ -99,6 +104,7 @@ func NewScout(ctx context.Context, nodeName string,
 		informerFactory:        informerFactory,
 		gopherChan:             gopherChan,
 		nodeName:               nodeName,
+		configMapNamespace:     configMapNamespace,
 		kubeClient:             kubeClient,
 		logger:                 logger,
 	}
@@ -407,7 +413,8 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		// Keep genuine refresh intent while preflight may refuse eviction.
 		// The newer eviction sequence fences it if cleanup is admitted.
 		defer func() { w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: newBaseModel} }()
-	} else if modelEvictionRequested(&oldBaseModel.ObjectMeta) {
+	} else if modelEvictionRequested(&oldBaseModel.ObjectMeta) ||
+		newBaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] != oldBaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] {
 		w.enqueueBaseModelDownload(newBaseModel)
 		return
 	}
@@ -470,7 +477,8 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	policyChanged := w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel)
 	if modelEvictionRequested(&newClusterBaseModel.ObjectMeta) {
 		defer func() { w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: newClusterBaseModel} }()
-	} else if modelEvictionRequested(&oldClusterBaseModel.ObjectMeta) {
+	} else if modelEvictionRequested(&oldClusterBaseModel.ObjectMeta) ||
+		newClusterBaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] != oldClusterBaseModel.Annotations[constants.ModelArtifactRehydrationIDAnnotation] {
 		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
 		return
 	}

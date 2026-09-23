@@ -38,6 +38,7 @@ func TestSharedPublicationNoRequestRejectsCompletedEviction(t *testing.T) {
 			_, err := g.kubeClient.CoreV1().Nodes().Create(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: g.configMapReconciler.nodeName, UID: "node-uid"}}, metav1.CreateOptions{})
 			require.NoError(t, err)
 			require.True(t, isSharedHfArtifactSymlink(input.ChildModelPath))
+			require.Empty(t, artifactRehydrationID(task))
 			live := task.BaseModel.DeepCopy()
 			live.Annotations[constants.ModelArtifactResidencyAnnotation] = constants.ModelArtifactResidencyEvicted
 			g.modelClient = omefake.NewSimpleClientset(live)

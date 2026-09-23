@@ -74,9 +74,24 @@ const (
 	TensorRTLLM           = "tensorrtllm"
 	// ModelArtifactResidencyAnnotation requests artifact eviction.
 	// Provisioning clients own intent; controllers only observe acknowledgement.
-	ModelArtifactResidencyAnnotation = "ome.io/artifact-residency"
-	ModelArtifactResidencyEvicted    = "Evicted"
+	ModelArtifactResidencyAnnotation     = "ome.io/artifact-residency"
+	ModelArtifactResidencyEvicted        = "Evicted"
+	ModelArtifactRehydrationIDAnnotation = "ome.io/artifact-rehydration-id"
+	ModelArtifactNodeUIDAnnotation       = "ome.io/artifact-node-uid"
 )
+
+// ArtifactReadyLabelKey binds a node's acknowledgement to a Model incarnation.
+func ArtifactReadyLabelKey(uid types.UID) (string, error) {
+	value := strings.ReplaceAll(string(uid), "-", "")
+	key := "models.ome.io/ready-" + value
+	if value == "" {
+		return "", fmt.Errorf("model UID is required for artifact readiness")
+	}
+	if errs := k8svalidation.IsQualifiedName(key); len(errs) != 0 {
+		return "", fmt.Errorf("invalid artifact readiness label for UID %q: %s", uid, strings.Join(errs, "; "))
+	}
+	return key, nil
+}
 
 // InferenceService Annotations
 var (
