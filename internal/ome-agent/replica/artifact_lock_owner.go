@@ -58,6 +58,9 @@ func (r *ReplicaAgent) reuseOwnedUploadLock() *targetArtifactUploadLock {
 		r.Logger.Warnf("Cannot read upload lock owner; will check again while waiting: %v", err)
 		return nil
 	}
+	if response.Content == nil {
+		return nil
+	}
 	defer response.Content.Close()
 	// Keep the ETag from the same response as the owner. Cleanup must not delete
 	// a different owner's lock if ownership changes before this upload finishes.

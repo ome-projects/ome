@@ -177,6 +177,25 @@ func TestOwnedUploadLockDoesNotReuseOtherOrUnidentifiedOwners(t *testing.T) {
 	}
 }
 
+func TestOwnedUploadLockRejectsMissingContent(t *testing.T) {
+	agent, cleanup := newTestAgentForCompletionMarker(t)
+	defer cleanup()
+	agent.Config.ArtifactUploadLockOwnerID = "operation-a"
+	agent.Config.Target.OCIOSDataStore = newTargetArtifactStateDataStore("")
+	agent.Config.Target.OCIOSDataStore.Client.HTTPClient = targetArtifactStateRequestFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+				"Etag":         []string{"original-etag"},
+			},
+			Request: request,
+		}, nil
+	})
+
+	assert.Nil(t, agent.reuseOwnedUploadLock())
+}
+
 func TestOwnedUploadLockRetriesOwnerRead(t *testing.T) {
 	agent, cleanup := newTestAgentForCompletionMarker(t)
 	defer cleanup()
