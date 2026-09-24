@@ -199,6 +199,7 @@ func TestCancellationCoverageDuringFinalFileVerification(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g, task := newCancellationCoverageGopher(t, "oci://n/ns/b/bucket/o/model")
+			WithModelVerificationConcurrency(1)(g)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			dispatcher := &cancelVerificationDispatcher{cancel: func() {}}

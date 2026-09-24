@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1135,6 +1136,116 @@ func TestEnqueueTaskClassifiesStartupReadyLocalPathAsRevalidation(t *testing.T) 
 	assert.Equal(t, 0, g.taskQueue.len())
 }
 
+func TestWithModelVerificationConcurrencyCreatesSharedLimiter(t *testing.T) {
+	g := &Gopher{}
+
+	WithModelVerificationConcurrency(8)(g)
+
+	require.NotNil(t, g.modelVerificationLimiter)
+	assert.Equal(t, 8, g.modelVerificationLimiter.limit())
+
+	WithModelVerificationConcurrency(0)(g)
+	require.NotNil(t, g.modelVerificationLimiter)
+	assert.Equal(t, 1, g.modelVerificationLimiter.limit())
+}
+
+func TestVerificationConcurrencyIsSharedAcrossModels(t *testing.T) {
+	g := &Gopher{}
+	WithModelVerificationConcurrency(3)(g)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	uris := make([]ociobjectstore.ObjectURI, 12)
+	for i := range uris {
+		uris[i] = ociobjectstore.ObjectURI{ObjectName: fmt.Sprintf("model/file-%02d", i), Prefix: "model"}
+	}
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	started := make(chan struct{}, len(uris))
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	validate := func(_ ociobjectstore.ObjectURI, _ string) (bool, error) {
+		current := active.Add(1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed || maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		active.Add(-1)
+		return true, nil
+	}
+
+	done := make(chan map[string]error, 2)
+	runModel := func(modelURIs []ociobjectstore.ObjectURI) {
+		go func() {
+			done <- g.verifyDownloadedFilesWithValidator(ctx, modelURIs, "/models", validate)
+		}()
+	}
+	waitForStart := func() {
+		t.Helper()
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for file verification to start")
+		}
+	}
+
+	// Hold one permit in model A before starting model B, ensuring both
+	// models are verifying files when the shared limit is reached.
+	runModel(uris[:1])
+	waitForStart()
+	runModel(uris[1:])
+	waitForStart()
+	waitForStart()
+	assert.Equal(t, int32(3), active.Load())
+	// Verify the occupied permits belong to the shared limiter, not to
+	// independent per-model limiters that happen to run sequentially.
+	assert.Len(t, g.modelVerificationLimiter.permits, 3)
+	unblock()
+	for range 2 {
+		select {
+		case errs := <-done:
+			assert.Empty(t, errs)
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for model verification to finish")
+		}
+	}
+
+	assert.Equal(t, int32(3), maxActive.Load())
+	assert.Zero(t, active.Load())
+	assert.Empty(t, g.modelVerificationLimiter.permits)
+}
+
+func TestVerifyDownloadedFilesWithValidatorReportsFailures(t *testing.T) {
+	g := &Gopher{}
+	WithModelVerificationConcurrency(2)(g)
+	uris := []ociobjectstore.ObjectURI{
+		{ObjectName: "model/valid", Prefix: "model"},
+		{ObjectName: "model/mismatch", Prefix: "model"},
+		{ObjectName: "model/error", Prefix: "model"},
+	}
+
+	errs := g.verifyDownloadedFilesWithValidator(context.Background(), uris, "/models", func(obj ociobjectstore.ObjectURI, _ string) (bool, error) {
+		switch obj.ObjectName {
+		case "model/mismatch":
+			return false, nil
+		case "model/error":
+			return false, errors.New("read failed")
+		default:
+			return true, nil
+		}
+	})
+
+	require.Len(t, errs, 2)
+	assert.ErrorContains(t, errs["model/mismatch"], "MD5 or size mismatch")
+	assert.EqualError(t, errs["model/error"], "read failed")
+}
+
 func TestCaptureStartupReadyModelsCapturesOnlyReadyEntries(t *testing.T) {
 	readyKey := constants.GetModelConfigMapKey("service-ns", "ready-model", false)
 	updatingKey := constants.GetModelConfigMapKey("service-ns", "updating-model", false)
@@ -2172,7 +2283,7 @@ func TestVerificationStopsWhenAffinityCleanupCancelsDownload(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "second"), []byte("data"), 0600))
 	// A nil metrics collector makes accidental recording of cancellation as an
 	// integrity failure fail the test. Subsequent files must not be verified.
-	g := &Gopher{}
+	g := &Gopher{modelVerificationLimiter: newVerificationLimiter(1)}
 	_ = g.verifyDownloadedFiles(ctx, store, []ociobjectstore.ObjectURI{
 		{Namespace: "ns", BucketName: "bucket", ObjectName: "first"},
 		{Namespace: "ns", BucketName: "bucket", ObjectName: "second"},

@@ -113,6 +113,7 @@ func TestDefaultConfig(t *testing.T) {
 	testCmd.Flags().IntVar(&cfg.downloadRetry, "download-retry", 3, "retry times for model download")
 	testCmd.Flags().StringVar(&cfg.downloadAuthType, "download-auth-type", "instance-principal", "authentication method for model download")
 	testCmd.Flags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 3, "number of download workers")
+	testCmd.Flags().IntVar(&cfg.modelVerificationConcurrency, "model-verification-concurrency", 0, "model verification concurrency")
 	testCmd.Flags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "number of high-priority workers")
 	testCmd.Flags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "same-path wait timeout")
 	testCmd.Flags().StringVar(&cfg.namespace, "namespace", "ome", "the namespace of the ome model agents daemon set")
@@ -129,9 +130,31 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 3, cfg.downloadRetry)
 	assert.Equal(t, "instance-principal", cfg.downloadAuthType)
 	assert.Equal(t, 3, cfg.numDownloadWorker)
+	assert.Equal(t, 0, cfg.modelVerificationConcurrency)
+	assert.Equal(t, 3, cfg.effectiveVerificationConcurrency())
 	assert.Equal(t, 1, cfg.numHighPriorityWorker)
 	assert.Equal(t, 30*time.Minute, cfg.samePathWaitTimeout)
 	assert.Equal(t, "ome", cfg.namespace)
+}
+
+func TestEffectiveVerificationConcurrency(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		workers, configured, want int
+	}{
+		{"chart default", 2, 0, 2},
+		{"CLI default", 5, 0, 5},
+		{"custom worker count", 10, 0, 10},
+		{"explicit higher limit", 2, 8, 8},
+		{"explicit lower limit", 2, 1, 1},
+		{"negative limit", 2, -1, 1},
+		{"invalid worker count", 0, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config{numDownloadWorker: tc.workers, modelVerificationConcurrency: tc.configured}
+			assert.Equal(t, tc.want, c.effectiveVerificationConcurrency())
+		})
+	}
 }
 
 func TestInitializeLogger(t *testing.T) {

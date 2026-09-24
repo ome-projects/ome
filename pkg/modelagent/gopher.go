@@ -55,21 +55,22 @@ type GopherTask struct {
 }
 
 type Gopher struct {
-	modelConfigParser      *modelparser.ModelConfigParser
-	configMapReconciler    *ConfigMapReconciler
-	downloadRetry          int
-	concurrency            int
-	multipartConcurrency   int
-	modelRootDir           string
-	xetConfig              *xet.Config
-	kubeClient             kubernetes.Interface
-	gopherChan             chan *GopherTask
-	nodeLabelReconciler    *NodeLabelReconciler
-	metrics                *Metrics
-	logger                 *zap.SugaredLogger
-	configMapMutex         sync.Mutex // Mutex to coordinate ConfigMap access
-	baseModelLister        omev1beta1lister.BaseModelLister
-	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister
+	modelConfigParser        *modelparser.ModelConfigParser
+	configMapReconciler      *ConfigMapReconciler
+	downloadRetry            int
+	concurrency              int
+	multipartConcurrency     int
+	modelVerificationLimiter *verificationLimiter
+	modelRootDir             string
+	xetConfig                *xet.Config
+	kubeClient               kubernetes.Interface
+	gopherChan               chan *GopherTask
+	nodeLabelReconciler      *NodeLabelReconciler
+	metrics                  *Metrics
+	logger                   *zap.SugaredLogger
+	configMapMutex           sync.Mutex // Mutex to coordinate ConfigMap access
+	baseModelLister          omev1beta1lister.BaseModelLister
+	clusterBaseModelLister   omev1beta1lister.ClusterBaseModelLister
 
 	taskTracker     gopherTaskTracker
 	artifactRouting gopherArtifactRouting
@@ -82,6 +83,18 @@ type Gopher struct {
 	hfArtifactHandlerOnce sync.Once
 	hfArtifactHandler     *hfArtifactTaskHandler
 	hfArtifactStartup     *hfArtifactStartup
+}
+
+type GopherOption func(*Gopher)
+
+// WithModelVerificationConcurrency bounds concurrent OCI model file integrity
+// checks across all downloads handled by this model-agent process.
+// The same limit sizes each model's worker pool, so one model can use all
+// available permits while concurrent models share the process-wide budget.
+func WithModelVerificationConcurrency(concurrency int) GopherOption {
+	return func(gopher *Gopher) {
+		gopher.modelVerificationLimiter = newVerificationLimiter(concurrency)
+	}
 }
 
 const (
@@ -107,7 +120,8 @@ func NewGopher(
 	metrics *Metrics,
 	logger *zap.SugaredLogger,
 	baseModelLister omev1beta1lister.BaseModelLister,
-	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister) (*Gopher, error) {
+	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister,
+	options ...GopherOption) (*Gopher, error) {
 
 	if xetConfig == nil {
 		return nil, fmt.Errorf("xet hugging face config cannot be nil")
@@ -116,25 +130,32 @@ func NewGopher(
 		samePathWaitTimeout = defaultSamePathWaitTimeout
 	}
 
-	return &Gopher{
-		modelConfigParser:      modelConfigParser,
-		configMapReconciler:    configMapReconciler,
-		downloadRetry:          downloadRetry,
-		concurrency:            concurrency,
-		multipartConcurrency:   multipartConcurrency,
-		modelRootDir:           modelRootDir,
-		xetConfig:              xetConfig,
-		kubeClient:             kubeClient,
-		gopherChan:             gopherChan,
-		nodeLabelReconciler:    nodeLabelReconciler,
-		metrics:                metrics,
-		logger:                 logger,
-		baseModelLister:        baseModelLister,
-		clusterBaseModelLister: clusterBaseModelLister,
-		taskQueue:              newGopherTaskQueue(),
-		samePathWaitDelay:      defaultSamePathWaitDelay,
-		samePathWaitTimeout:    samePathWaitTimeout,
-	}, nil
+	gopher := &Gopher{
+		modelConfigParser:        modelConfigParser,
+		configMapReconciler:      configMapReconciler,
+		downloadRetry:            downloadRetry,
+		concurrency:              concurrency,
+		multipartConcurrency:     multipartConcurrency,
+		modelVerificationLimiter: newVerificationLimiter(1),
+		modelRootDir:             modelRootDir,
+		xetConfig:                xetConfig,
+		kubeClient:               kubeClient,
+		gopherChan:               gopherChan,
+		nodeLabelReconciler:      nodeLabelReconciler,
+		metrics:                  metrics,
+		logger:                   logger,
+		baseModelLister:          baseModelLister,
+		clusterBaseModelLister:   clusterBaseModelLister,
+		taskQueue:                newGopherTaskQueue(),
+		samePathWaitDelay:        defaultSamePathWaitDelay,
+		samePathWaitTimeout:      samePathWaitTimeout,
+	}
+	for _, option := range options {
+		if option != nil {
+			option(gopher)
+		}
+	}
+	return gopher, nil
 }
 
 func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int, numHighPriorityWorker int) {
@@ -1360,7 +1381,8 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	}
 
 	// Perform final verification of all downloaded files
-	s.logger.Info("Performing final integrity verification of all downloaded files...")
+	s.logger.Infof("Performing final integrity verification of %d downloaded files with pod-wide concurrency %d...",
+		len(objectUris), s.modelVerificationLimiter.limit())
 	verificationStartTime := time.Now()
 	verificationErrors := s.verifyDownloadedFiles(ctx, ociOSDataStore, objectUris, destPath, task)
 	if err := ctx.Err(); err != nil {
@@ -1396,26 +1418,7 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 }
 
 func (s *Gopher) verifyDownloadedFiles(ctx context.Context, ociOSDataStore *ociobjectstore.OCIOSDataStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
-	errors := make(map[string]error)
-	for _, obj := range uris {
-		if ctx.Err() != nil {
-			return errors
-		}
-		relativeName := filepath.Join(destPath, ociobjectstore.TrimObjectPrefix(obj.ObjectName, obj.Prefix))
-		// Fallback: if relativeName is empty, use the object name directly
-		if relativeName == "" {
-			relativeName = obj.ObjectName
-		}
-
-		valid, err := ociOSDataStore.IsLocalCopyValid(obj, relativeName)
-		if err != nil {
-			errors[obj.ObjectName] = err
-			continue
-		}
-		if !valid {
-			errors[obj.ObjectName] = fmt.Errorf("MD5 or size mismatch for %s", obj.ObjectName)
-		}
-	}
+	errors := s.verifyDownloadedFilesWithValidator(ctx, uris, destPath, ociOSDataStore.IsLocalCopyValid)
 
 	if ctx.Err() != nil {
 		return errors
@@ -1425,6 +1428,94 @@ func (s *Gopher) verifyDownloadedFiles(ctx context.Context, ociOSDataStore *ocio
 	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
 	s.metrics.RecordVerification(modelType, namespace, name, len(errors) == 0)
 
+	return errors
+}
+
+type localCopyValidator func(ociobjectstore.ObjectURI, string) (bool, error)
+
+type verificationResult struct {
+	objectName string
+	err        error
+}
+
+func (s *Gopher) verifyDownloadedFilesWithValidator(ctx context.Context, uris []ociobjectstore.ObjectURI, destPath string, validate localCopyValidator) map[string]error {
+	errors := make(map[string]error)
+	if len(uris) == 0 || ctx.Err() != nil {
+		return errors
+	}
+
+	limiter := s.modelVerificationLimiter
+	workerCount := min(limiter.limit(), len(uris))
+	jobs := make(chan ociobjectstore.ObjectURI)
+	results := make(chan verificationResult, len(uris))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for {
+				var obj ociobjectstore.ObjectURI
+				var ok bool
+				select {
+				case <-ctx.Done():
+					return
+				case obj, ok = <-jobs:
+					if !ok {
+						return
+					}
+				}
+				if ctx.Err() != nil {
+					return
+				}
+
+				// Claim work before a permit so idle workers do not hold
+				// shared verification capacity while waiting for jobs.
+				if !limiter.acquire(ctx) {
+					return
+				}
+				if ctx.Err() != nil {
+					limiter.release()
+					return
+				}
+				relativeName := filepath.Join(destPath, ociobjectstore.TrimObjectPrefix(obj.ObjectName, obj.Prefix))
+				if relativeName == "" {
+					relativeName = obj.ObjectName
+				}
+				valid, err := validate(obj, relativeName)
+				limiter.release()
+				if err == nil && !valid {
+					err = fmt.Errorf("MD5 or size mismatch for %s", obj.ObjectName)
+				}
+				select {
+				case results <- verificationResult{objectName: obj.ObjectName, err: err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, obj := range uris {
+			select {
+			case jobs <- obj:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		if result.err != nil {
+			errors[result.objectName] = result.err
+		}
+	}
 	return errors
 }
 
