@@ -16,7 +16,7 @@
 /charts/ @slin1237 @XinyueZhang369
 
 # cmd
-/cmd/ @slin1237 @pallasathena92 @beiguo218
+/cmd/ @slin1237 @pallasathena92 @beiguo218 @op109lvb
 
 # config
 /config/ @slin1237 @CatherineSue @XinyueZhang369
@@ -28,7 +28,7 @@
 /hack/ @slin1237
 
 # internal
-/internal/ @slin1237 @pallasathena92 @beiguo218
+/internal/ @slin1237 @pallasathena92 @beiguo218 @op109lvb
 
 # oeps (OME Enhancement Proposals)
 /oeps/ @slin1237
@@ -56,15 +56,15 @@
 /pkg/hfutil/ @slin1237 @pallasathena92 @beiguo218
 /pkg/imds/ @slin1237
 /pkg/logging/ @slin1237
-/pkg/modelagent/ @slin1237 @pallasathena92 @beiguo218 @truddy0
+/pkg/modelagent/ @slin1237 @pallasathena92 @beiguo218 @truddy0 @op109lvb
 /pkg/modelver/ @slin1237 @pallasathena92 @beiguo218
-/pkg/ociobjectstore/ @slin1237 @pallasathena92 @speedmancs @chengjieyao @davidsnahm @heymrbox @frankzhouhr @beiguo218
-/pkg/principals/ @slin1237 @pallasathena92 @speedmancs @chengjieyao @davidsnahm @heymrbox @frankzhouhr @beiguo218
+/pkg/ociobjectstore/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218
+/pkg/principals/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218
 /pkg/runtimeselector/ @slin1237 @pallasathena92
 /pkg/storage/ @slin1237
 /pkg/utils/ @slin1237
 /pkg/utils/storage/ @slin1237 @beiguo218
-/pkg/vault/ @slin1237 @pallasathena92 @speedmancs @chengjieyao @davidsnahm @heymrbox @frankzhouhr @beiguo218
+/pkg/vault/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218
 /pkg/version/ @slin1237
 /pkg/webhook/ @slin1237 @pallasathena92 @beiguo218
 /pkg/xet/ @slin1237 @pallasathena92 @beiguo218
