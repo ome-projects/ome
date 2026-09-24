@@ -135,6 +135,51 @@ All environment variables ***must*** start the prefix `OME_AGENT_` to be recogni
 | `model.object_name`                           | `OME_AGENT_MODEL_OBJECT_NAME`                           | equals to `training_name` | no                                                                                   |
 |
 
+### Reusing upload locks across replication retries
+
+For OCI targets, `target_artifact_reuse_allowed` controls artifact reuse and
+upload locking. It defaults to `false`. When enabled, the agent reuses completed
+artifacts or manages an Object Storage upload lock when replication is needed.
+Consumers do not need to implement lock operations themselves.
+
+| `target_artifact_reuse_allowed` | `artifact_upload_lock_owner_id` | Upload lock behavior |
+| --- | --- | --- |
+| `false` (default) | Unset or provided | No artifact upload lock. |
+| `true` | Unset | The agent manages a lock, but retries cannot reuse a leftover lock by ownership. |
+| `true` | Provided | The agent manages a lock, and retries with the same owner ID can reuse it. |
+
+Omitting the owner ID does not disable locking when artifact reuse is enabled.
+To allow lock reuse across retries, the consumer can set
+`artifact_upload_lock_owner_id` or its environment variable:
+
+```bash
+export OME_AGENT_TARGET_ARTIFACT_REUSE_ALLOWED=true
+export OME_AGENT_ARTIFACT_UPLOAD_LOCK_OWNER_ID=replication-operation-123
+```
+
+Use the same ID for retries of one replication operation and a new, unique ID
+for each independent operation. The agent stores `{"ownerID":"..."}` in the lock.
+If an attempt is interrupted and leaves the lock behind, a retry with the same
+ID can continue uploading with the existing lock and ETag, without deleting or
+recreating it. Attempts with different IDs wait for the artifact to complete or
+the lock to be released or expire.
+
+The consumer schedules retries and must ensure the previous uploader has stopped
+before starting another with the same ID. The agent only compares IDs; it does
+not check whether another process is still running.
+
+All consumers targeting the same artifact should use the same
+`artifact_upload_lock_timeout` (default 120 hours), longer than the maximum
+duration of any replication operation, including retries. Each agent uses its
+own configured timeout to decide whether an existing lock is stale. A consumer
+with a shorter timeout could delete another consumer's lock while that upload
+is still running. Reusing a lock does not reset its age.
+
+On a normal return, including an error, the agent attempts to release its lock
+using the ETag. If the process exits before cleanup runs, the lock remains
+available for a retry with the same ID. Locks without an owner ID retain the
+existing wait/timeout behavior.
+
 ### Usage
 OME-Agent uses subcommands to run specific tasks. Use the following commands:=
 ```bash
