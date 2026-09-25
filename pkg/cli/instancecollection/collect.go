@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/instanceannouncement"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
@@ -74,22 +75,25 @@ type Limits struct {
 // single-instance status command. A zero value disables detail copying so the
 // existing instance-list boundary remains unchanged.
 type DetailLimits struct {
-	MaxConditions        int
-	MaxScannedConditions int
-	MaxNodeHints         int
-	MaxScannedNodeHints  int
-	MaxMigrations        int
-	MaxScannedMigrations int
-	SelectedComponent    omev1beta1.ComponentType
-	SelectedIndex        int32
+	MaxConditions           int
+	MaxScannedConditions    int
+	MaxNodeHints            int
+	MaxScannedNodeHints     int
+	MaxMigrations           int
+	MaxScannedMigrations    int
+	MaxAnnouncements        int
+	MaxScannedAnnouncements int
+	SelectedComponent       omev1beta1.ComponentType
+	SelectedIndex           int32
 }
 
 type DetailKind string
 
 const (
-	DetailConditions DetailKind = "Conditions"
-	DetailNodeHints  DetailKind = "NodeHints"
-	DetailMigrations DetailKind = "Migrations"
+	DetailConditions    DetailKind = "Conditions"
+	DetailNodeHints     DetailKind = "NodeHints"
+	DetailMigrations    DetailKind = "Migrations"
+	DetailAnnouncements DetailKind = "Announcements"
 )
 
 type DetailTruncation struct {
@@ -249,7 +253,8 @@ func CollectRelated(
 	decoder := irstatus.NewDecoder(maxDecodedStatusRows)
 	for _, item := range accepted {
 		// Decode only accepted sources on a private shallow copy. The decoder
-		// replaces the representation fields without mutating their payloads.
+		// validates the complete representation and returns independent logical
+		// rows for ColumnarV2 without mutating the captured API object.
 		// Validate before applying the smaller aggregate output budget so a
 		// malformed source cannot be mistaken for ordinary truncation.
 		normalized := *item
@@ -388,6 +393,16 @@ func boundedReplicaCopy(
 				failure.Message = ""
 				row.LastFailure = &failure
 			}
+			if detailLimits.MaxAnnouncements > 0 {
+				var announcementsTruncated, announcementsMalformed bool
+				row.Announced, announcementsTruncated, announcementsMalformed = copyAnnouncements(source, detailLimits)
+				if announcementsTruncated {
+					truncations = appendDetailTruncation(truncations, ir, source.Index, DetailAnnouncements)
+				}
+				if announcementsMalformed {
+					malformed = append(malformed, DetailMalformed{Name: ir.Name, Component: ir.Spec.Component, Index: source.Index, Kind: DetailAnnouncements})
+				}
+			}
 		} else if !detailLimits.enabled() {
 			if source.Operation != nil {
 				row.Operation = &omev1beta1.InstanceOperation{}
@@ -402,6 +417,41 @@ func boundedReplicaCopy(
 		result.Status.Migrations, truncations = copyMigrations(ir.Status.Migrations, detailLimits, ir, truncations)
 	}
 	return copyBoundedRetryBlocks(result, ir, copyRetryBlocks), truncations, malformed
+}
+
+func copyAnnouncements(
+	row *omev1beta1.OMENativeInstanceStatus,
+	limits DetailLimits,
+) ([]string, bool, bool) {
+	if row == nil || len(row.Announced) == 0 {
+		return []string{}, false, false
+	}
+	if len(row.Announced) > limits.MaxScannedAnnouncements {
+		return nil, true, false
+	}
+	seen := make(map[string]struct{}, len(row.Announced))
+	announcements := make([]string, 0, min(len(row.Announced), limits.MaxAnnouncements))
+	malformed := false
+	for _, raw := range row.Announced {
+		value, ok := instanceannouncement.Parse(raw)
+		if !ok {
+			malformed = true
+			continue
+		}
+		marker := value.Reason + "@" + value.Episode
+		if _, duplicate := seen[marker]; duplicate {
+			malformed = true
+			continue
+		}
+		seen[marker] = struct{}{}
+		announcements = append(announcements, marker)
+	}
+	sort.Strings(announcements)
+	truncated := len(announcements) > limits.MaxAnnouncements
+	if truncated {
+		announcements = announcements[:limits.MaxAnnouncements]
+	}
+	return announcements, truncated, malformed
 }
 
 func copyMigrations(
@@ -470,6 +520,8 @@ func validDetailLimits(limits DetailLimits) bool {
 		limits.MaxNodeHints > 0 && limits.MaxScannedNodeHints >= limits.MaxNodeHints &&
 		((limits.MaxMigrations == 0 && limits.MaxScannedMigrations == 0) ||
 			(limits.MaxMigrations > 0 && limits.MaxScannedMigrations >= limits.MaxMigrations)) &&
+		((limits.MaxAnnouncements == 0 && limits.MaxScannedAnnouncements == 0) ||
+			(limits.MaxAnnouncements > 0 && limits.MaxScannedAnnouncements >= limits.MaxAnnouncements)) &&
 		validDetailComponent(limits.SelectedComponent) && limits.SelectedIndex >= 0
 }
 
@@ -477,6 +529,7 @@ func (limits DetailLimits) enabled() bool {
 	return limits.MaxConditions != 0 || limits.MaxScannedConditions != 0 ||
 		limits.MaxNodeHints != 0 || limits.MaxScannedNodeHints != 0 ||
 		limits.MaxMigrations != 0 || limits.MaxScannedMigrations != 0 ||
+		limits.MaxAnnouncements != 0 || limits.MaxScannedAnnouncements != 0 ||
 		limits.SelectedComponent != "" || limits.SelectedIndex != 0
 }
 

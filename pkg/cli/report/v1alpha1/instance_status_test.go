@@ -24,6 +24,10 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 		Instance: &InstanceStatusInstance{
 			InferenceReplica: "chat-engine", Index: 2, Incarnation: 7, Phase: InstancePhaseReady,
 			RunningRevision: "chat-engine-a", TargetRevision: "chat-engine-b",
+			Announcements: []InstanceStatusAnnouncement{
+				{Reason: "RepairHeld", Episode: "update-2-9"},
+				{Reason: "GangSplitRisk", Episode: "#7"},
+			},
 			Conditions: []InstanceStatusCondition{
 				{Type: "Zeta", Status: "True", Reason: unsafe},
 				{Type: "AllPodsReady", Status: "True", Reason: "Ready"},
@@ -55,6 +59,10 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 	assert.Equal(t, "pod-a", canonical.Content.Pods[0].Name)
 	assert.Equal(t, "InferenceReplica", canonical.Content.Events[0].TargetKind)
 	assert.Equal(t, []string{"node-a", "node-b"}, canonical.Content.Instance.Operation.TargetNodeHints)
+	assert.Equal(t, []InstanceStatusAnnouncement{
+		{Reason: "GangSplitRisk", Episode: "#7"},
+		{Reason: "RepairHeld", Episode: "update-2-9"},
+	}, canonical.Content.Instance.Announcements)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.ID)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.Step)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.Waiting)
@@ -65,7 +73,38 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 	assert.Equal(t, "pod-z", input.Pods[0].Name, "Canonical must not mutate the caller")
 	assert.Equal(t, unsafe, input.Instance.Operation.ID)
 	report.Content.Instance.Operation.TargetNodeHints[0] = "mutated"
+	report.Content.Instance.Announcements[0].Reason = "mutated"
 	assert.Equal(t, "node-a", canonical.Content.Instance.Operation.TargetNodeHints[0])
+	assert.Equal(t, "GangSplitRisk", canonical.Content.Instance.Announcements[0].Reason)
+}
+
+func TestInstanceStatusAnnouncementsRenderAcrossFormats(t *testing.T) {
+	t.Parallel()
+
+	report := NewInstanceStatusReport(Metadata{Namespace: "prod", Name: "chat"}, InstanceStatusContent{
+		Summary: InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine, Index: 2},
+		Instance: &InstanceStatusInstance{Announcements: []InstanceStatusAnnouncement{
+			{Reason: "RepairHeld", Episode: "update-2-9"},
+			{Reason: "GangSplitRisk", Episode: "#7"},
+		}},
+	}, ClockFunc(func() time.Time { return time.Unix(0, 0) }))
+
+	assert.Contains(t, report.Table().Rows, []string{"announced", "GangSplitRisk@#7"})
+	assert.Contains(t, report.Table().Rows, []string{"announced", "RepairHeld@update-2-9"})
+	assert.Contains(t, report.WideTable().Rows, []string{"announcement[0] reason", "GangSplitRisk"})
+	assert.Contains(t, report.WideTable().Rows, []string{"announcement[0] episode", "#7"})
+	assert.Contains(t, report.WideTable().Rows, []string{"announcement[1] reason", "RepairHeld"})
+	assert.Contains(t, report.WideTable().Rows, []string{"announcement[1] episode", "update-2-9"})
+
+	jsonData, err := json.Marshal(report)
+	require.NoError(t, err)
+	yamlData, err := yaml.Marshal(report)
+	require.NoError(t, err)
+	for _, output := range []string{string(jsonData), string(yamlData)} {
+		assert.Contains(t, output, "announcements")
+		assert.Contains(t, output, "GangSplitRisk")
+		assert.Contains(t, output, "update-2-9")
+	}
 }
 
 func TestInstanceStatusOperationBlockerCanonicalAndRendering(t *testing.T) {

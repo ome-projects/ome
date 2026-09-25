@@ -320,6 +320,51 @@ func TestProjectOperationBlockerIsEquivalentAcrossStatusEncodings(t *testing.T) 
 	assert.Equal(t, "SurgeThenDrain", dense.Content.Instance.Operation.Strategy)
 }
 
+func TestProjectAnnouncementsAreEquivalentAcrossStatusEncodings(t *testing.T) {
+	t.Parallel()
+
+	started := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	operation := &omev1beta1.InstanceOperation{
+		ID: "update-2-9", Type: omev1beta1.InstanceOperationUpdate, Step: "WaitReady",
+		StartedAt: started, LastProgressAt: started,
+	}
+	announced := []string{"RepairHeld@update-2-9", "GangSplitRisk@#7"}
+
+	dense := projectEncodedAnnouncements(t, false, operation, announced)
+	columnar := projectEncodedAnnouncements(t, true, operation, announced)
+	require.NotNil(t, dense.Content.Instance)
+	require.NotNil(t, columnar.Content.Instance)
+	assert.Equal(t, mustJSON(t, dense.Content.Instance.Announcements), mustJSON(t, columnar.Content.Instance.Announcements))
+	assert.Equal(t, []reportv1alpha1.InstanceStatusAnnouncement{
+		{Reason: "GangSplitRisk", Episode: "#7"},
+		{Reason: "RepairHeld", Episode: "update-2-9"},
+	}, dense.Content.Instance.Announcements)
+	assert.NotContains(t, issueCodes(dense), reportv1alpha1.InstanceStatusIssueAnnouncementInvalid)
+	assert.NotContains(t, issueCodes(dense), reportv1alpha1.InstanceStatusIssueAnnouncementsTruncated)
+}
+
+func TestProjectRejectsUnvalidatedAnnouncementPayload(t *testing.T) {
+	t.Parallel()
+
+	input := statusInput()
+	input.Collection.Items[0].Status.InstanceStatuses[0].Announced = []string{
+		"Password=private@#7",
+		"GangSplitRisk@#07",
+	}
+	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+	require.NoError(t, err)
+	require.NotNil(t, got.Content.Instance)
+	assert.Empty(t, got.Content.Instance.Announcements)
+	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueAnnouncementInvalid)
+
+	for _, format := range []report.Format{report.FormatTable, report.FormatJSON, report.FormatYAML} {
+		var output bytes.Buffer
+		require.NoError(t, report.Write(&output, format, got))
+		assert.NotContains(t, output.String(), "private")
+		assert.NotContains(t, output.String(), "#07")
+	}
+}
+
 func TestProjectOperationWaitingKnownValues(t *testing.T) {
 	t.Parallel()
 
@@ -654,7 +699,11 @@ func TestProjectReportsAuthoritativeDetailTruncationPrecisely(t *testing.T) {
 	input.Collection.DetailsTruncated = []instancecollection.DetailTruncation{
 		{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailConditions},
 		{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailNodeHints},
+		{Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailAnnouncements},
 	}
+	input.Collection.DetailsMalformed = []instancecollection.DetailMalformed{{
+		Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailAnnouncements,
+	}}
 	input.Collection.Rejected = []instancecollection.Rejection{{Name: "hostile", Reason: instancecollection.RejectionMetadata}}
 
 	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
@@ -664,6 +713,8 @@ func TestProjectReportsAuthoritativeDetailTruncationPrecisely(t *testing.T) {
 	assert.True(t, got.Content.Summary.Truncated)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueConditionsTruncated)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationDetailsTruncated)
+	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueAnnouncementsTruncated)
+	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueAnnouncementInvalid)
 	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueIdentityRejected)
 }
 
@@ -1015,6 +1066,7 @@ func TestProjectRejectsInvalidArguments(t *testing.T) {
 		func(value *instancestatusprojection.Limits) { value.MaxContainerStatuses = 0 },
 		func(value *instancestatusprojection.Limits) { value.MaxPodConditions = 0 },
 		func(value *instancestatusprojection.Limits) { value.MaxEvents = 0 },
+		func(value *instancestatusprojection.Limits) { value.MaxAnnouncements = 0 },
 	} {
 		limits := statusLimits()
 		mutate(&limits)
@@ -1531,8 +1583,43 @@ func projectEncodedOperation(t *testing.T, columnar bool, operation *omev1beta1.
 	return got
 }
 
+func projectEncodedAnnouncements(
+	t *testing.T,
+	columnar bool,
+	operation *omev1beta1.InstanceOperation,
+	announced []string,
+) reportv1alpha1.InstanceStatusReport {
+	t.Helper()
+	input := statusInput()
+	replica := input.Collection.Items[0]
+	replica.Status.InstanceStatuses[0].Operation = operation.DeepCopy()
+	replica.Status.InstanceStatuses[0].Announced = append([]string{}, announced...)
+	if columnar {
+		columns, err := irstatus.EncodeColumns(replica.Status.InstanceStatuses, 100)
+		require.NoError(t, err)
+		encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+		replica.Status.InstanceStatusEncoding = &encoding
+		replica.Status.InstanceStatusColumns = columns
+		replica.Status.InstanceStatuses = nil
+	}
+	collection, err := instancecollection.CollectRelated(context.Background(), conditionLister{replica}, input.InferenceService, instancecollection.Limits{
+		Paging:        paging.Limits{PageSize: 20, MaxItems: 60, MaxPages: 3, RequestTimeout: time.Second},
+		MaxStatusRows: 100,
+		Details: instancecollection.DetailLimits{
+			MaxConditions: 16, MaxScannedConditions: 64, MaxNodeHints: 16, MaxScannedNodeHints: 64,
+			MaxMigrations: 16, MaxScannedMigrations: 64, MaxAnnouncements: 16, MaxScannedAnnouncements: 64,
+			SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+		},
+	})
+	require.NoError(t, err)
+	input.Collection = collection
+	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+	require.NoError(t, err)
+	return got
+}
+
 func statusLimits() instancestatusprojection.Limits {
-	return instancestatusprojection.Limits{MaxInstances: 100, MaxPods: 8, MaxContainerStatuses: 16, MaxPodConditions: 16, MaxEvents: 32}
+	return instancestatusprojection.Limits{MaxInstances: 100, MaxPods: 8, MaxContainerStatuses: 16, MaxPodConditions: 16, MaxEvents: 32, MaxAnnouncements: 16}
 }
 
 func fixedClock() reportv1alpha1.Clock {

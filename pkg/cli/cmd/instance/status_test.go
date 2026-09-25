@@ -46,6 +46,7 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 
 	isvc := commandISVC()
 	ir := commandIR(isvc)
+	ir.Status.InstanceStatuses[0].Announced = []string{"GangSplitRisk@#1"}
 	pod := commandStatusPod(isvc, ir, "chat-engine-0")
 	events := []corev1.Event{
 		commandStatusEvent("pod-warning", "Pod", pod.Name, pod.UID),
@@ -59,7 +60,7 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 	out, err := executeStatus(t, factory.Static{OME: ome, Kube: kube, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine")
 
 	require.NoError(t, err)
-	for _, want := range []string{"FIELD", "VALUE", "Reported", "chat-engine", pod.Name, "FailedMount"} {
+	for _, want := range []string{"FIELD", "VALUE", "Reported", "chat-engine", pod.Name, "FailedMount", "announced", "GangSplitRisk@#1"} {
 		assert.Contains(t, out, want)
 	}
 	require.Len(t, ome.Actions(), 2)
@@ -81,6 +82,34 @@ func TestStatusReadsExactBoundedSourcesAndRendersUsefulTable(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, eventRequests)
+}
+
+func TestStatusNeverRendersCredentialShapedAnnouncementEpisodes(t *testing.T) {
+	t.Parallel()
+	for _, output := range []string{"table", "wide", "json", "yaml"} {
+		output := output
+		t.Run(output, func(t *testing.T) {
+			t.Parallel()
+			isvc := commandISVC()
+			ir := commandIR(isvc)
+			ir.Status.InstanceStatuses[0].Announced = []string{
+				"GangSplitRisk@#1",
+				"RepairHeld@migrate-" + statusSlackCredential("xoxb") + "-1790300000",
+			}
+			out, err := executeStatus(t, factory.Static{
+				OME: omefake.NewSimpleClientset(isvc, ir), Kube: kubefake.NewSimpleClientset(), NS: "prod",
+			}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", output)
+			require.NoError(t, err)
+			assert.Contains(t, out, "GangSplitRisk")
+			assert.Contains(t, out, "AnnouncementInvalid")
+			assert.NotContains(t, out, "xoxb-")
+			assert.NotContains(t, out, "abcdefghijklmnopqrstuvwx")
+		})
+	}
+}
+
+func statusSlackCredential(prefix string) string {
+	return prefix + "-" + "123456789012-1234567890123-abcdefghijklmnopqrstuvwx"
 }
 
 func TestStatusRendersColumnarReplicaWithEncodingProvenance(t *testing.T) {
@@ -639,7 +668,8 @@ func TestStatusHelpDefinesFieldsBoundsAndReadOnlyBehavior(t *testing.T) {
 	for _, want := range []string{
 		"IR status is authoritative", "serving readiness gate", "Event messages are never shown",
 		"POD restarts", "table, wide, json or yaml", "read-only", "--ome-namespace",
-		"ControllerRevision", "migration", "encoding", "DenseV1", "ColumnarV2",
+		"ControllerRevision", "migration", "announcement", "encoding", "DenseV1", "ColumnarV2",
+		"prior operation episodes may", "remain until a later announcement prunes them",
 	} {
 		assert.Contains(t, out.String(), want)
 	}
@@ -718,14 +748,14 @@ func statusCommandDependencies() statusDependencies {
 		clock: commandClock,
 		irLimits: instancecollection.Limits{
 			Paging: paging.Limits{PageSize: 2, MaxItems: 6, MaxPages: 3, RequestTimeout: time.Second}, MaxStatusRows: 100,
-			Details: instancecollection.DetailLimits{MaxConditions: 8, MaxScannedConditions: 16, MaxNodeHints: 8, MaxScannedNodeHints: 16, MaxMigrations: 8, MaxScannedMigrations: 16},
+			Details: instancecollection.DetailLimits{MaxConditions: 8, MaxScannedConditions: 16, MaxNodeHints: 8, MaxScannedNodeHints: 16, MaxMigrations: 8, MaxScannedMigrations: 16, MaxAnnouncements: 8, MaxScannedAnnouncements: 16},
 		},
 		podLimits:     paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
 		runtimeLimits: paging.Limits{PageSize: 4, MaxItems: 8, MaxPages: 2, RequestTimeout: time.Second},
 		eventLimits: observation.EventLimits{
 			Paging: paging.Limits{PageSize: 3, MaxItems: 6, MaxPages: 2, RequestTimeout: time.Second}, MaxTargets: 9, MaxConcurrent: 2,
 		},
-		projectionLimits: instancestatusprojection.Limits{MaxInstances: 100, MaxPods: 8, MaxContainerStatuses: 16, MaxPodConditions: 16, MaxEvents: 32},
+		projectionLimits: instancestatusprojection.Limits{MaxInstances: 100, MaxPods: 8, MaxContainerStatuses: 16, MaxPodConditions: 16, MaxEvents: 32, MaxAnnouncements: 8},
 	}
 }
 

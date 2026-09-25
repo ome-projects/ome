@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -516,6 +517,194 @@ func TestCollectRelatedCopiesSelectedLifecycleAndRelevantMigrationsOnly(t *testi
 	encoded, err := json.Marshal(got.Items[0])
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "NONSELECTED_SENTINEL")
+}
+
+func TestCollectRelatedCopiesBoundedSelectedAnnouncements(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{
+		Index: 2, Incarnation: 7, Phase: omev1beta1.OMENativeInstanceUpdating,
+		Operation: &omev1beta1.InstanceOperation{ID: "update-2-9"},
+		Announced: []string{
+			"RepairHeld@update-2-9",
+			"MaybeNoGangScheduler@#7",
+			"GangSplitRisk@#7",
+		},
+	}}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{
+		MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8,
+		MaxAnnouncements: 2, MaxScannedAnnouncements: 4,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+	}
+	collect := func(source omev1beta1.InferenceReplica) instancecollection.Result {
+		got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+			return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+		}), isvc, limits)
+		require.NoError(t, err)
+		return got
+	}
+
+	got := collect(ir)
+	reversed := *ir.DeepCopy()
+	for i, j := 0, len(reversed.Status.InstanceStatuses[0].Announced)-1; i < j; i, j = i+1, j-1 {
+		reversed.Status.InstanceStatuses[0].Announced[i], reversed.Status.InstanceStatuses[0].Announced[j] =
+			reversed.Status.InstanceStatuses[0].Announced[j], reversed.Status.InstanceStatuses[0].Announced[i]
+	}
+	assert.Equal(t, got, collect(reversed), "announcement selection must not inherit API order")
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, []string{"GangSplitRisk@#7", "MaybeNoGangScheduler@#7"}, got.Items[0].Status.InstanceStatuses[0].Announced)
+	assert.Contains(t, got.DetailsTruncated, instancecollection.DetailTruncation{
+		Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailAnnouncements,
+	})
+	ir.Status.InstanceStatuses[0].Announced[0] = "mutated"
+	assert.Equal(t, "GangSplitRisk@#7", got.Items[0].Status.InstanceStatuses[0].Announced[0])
+}
+
+func TestCollectRelatedRejectsMalformedAnnouncementsWithoutDroppingValidEvidence(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{
+		Index: 2, Incarnation: 7, Phase: omev1beta1.OMENativeInstanceUpdating,
+		Operation: &omev1beta1.InstanceOperation{ID: "update-2-9"},
+		Announced: []string{
+			"RepairHeld@update-2-9",
+			"Password=private@#7",
+			"RepairHeld@" + announcementSlackCredential("xoxb"),
+			"RepairHeld@migrate-" + announcementSlackCredential("xoxp") + "-1790300000",
+			"GangSplitRisk@#07",
+			"RepairHeld@update-2-9",
+		},
+	}}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{
+		MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8,
+		MaxAnnouncements: 4, MaxScannedAnnouncements: 8,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+	}
+
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+	}), isvc, limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"RepairHeld@update-2-9"}, got.Items[0].Status.InstanceStatuses[0].Announced)
+	assert.Contains(t, got.DetailsMalformed, instancecollection.DetailMalformed{
+		Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailAnnouncements,
+	})
+	encoded, err := json.Marshal(got.Items)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "private")
+	assert.NotContains(t, string(encoded), "xoxb-")
+	assert.NotContains(t, string(encoded), "xoxp-")
+	assert.NotContains(t, string(encoded), "#07")
+}
+
+func announcementSlackCredential(prefix string) string {
+	return prefix + "-" + "123456789012-1234567890123-abcdefghijklmnopqrstuvwx"
+}
+
+func TestCollectRelatedBoundsColumnarAnnouncementsAfterCanonicalDecode(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	source := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	oversizedSelected := make([]string, 65)
+	for i := range oversizedSelected {
+		oversizedSelected[i] = fmt.Sprintf("Selected%d@#7", i)
+	}
+	oversizedUnselected := make([]string, 4096)
+	for i := range oversizedUnselected {
+		oversizedUnselected[i] = fmt.Sprintf("Unselected%d@#8", i)
+	}
+	rows := []omev1beta1.OMENativeInstanceStatus{
+		{Index: 2, Incarnation: 7, Phase: omev1beta1.OMENativeInstanceReady, Announced: oversizedSelected},
+		{Index: 3, Incarnation: 8, Phase: omev1beta1.OMENativeInstanceReady, Announced: oversizedUnselected},
+	}
+	columns, err := irstatus.EncodeColumns(rows, 2)
+	require.NoError(t, err)
+	encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+	source.Status.Replicas = 2
+	source.Status.InstanceStatusEncoding = &encoding
+	source.Status.InstanceStatusColumns = columns
+	original := source.DeepCopy()
+	limits := collectionLimits()
+	limits.MaxStatusRows = 2
+	limits.Details = instancecollection.DetailLimits{
+		MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8,
+		MaxAnnouncements: 16, MaxScannedAnnouncements: 64,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+	}
+
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{source}}, nil
+	}), isvc, limits)
+
+	require.NoError(t, err)
+	require.Len(t, got.Items, 1)
+	require.Len(t, got.Items[0].Status.InstanceStatuses, 2)
+	assert.Empty(t, got.Items[0].Status.InstanceStatuses[0].Announced)
+	assert.Empty(t, got.Items[0].Status.InstanceStatuses[1].Announced)
+	assert.Contains(t, got.DetailsTruncated, instancecollection.DetailTruncation{
+		Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailAnnouncements,
+	})
+	assert.Equal(t, original, source.DeepCopy(), "canonical decode and bounding must not mutate the API object")
+	encoded, err := json.Marshal(got.Items)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "Selected64")
+	assert.NotContains(t, string(encoded), "Unselected4095")
+}
+
+func TestCollectRelatedDropsAnnouncementsBeyondIndependentScanBound(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	ir := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
+	ir.Status.InstanceStatuses = []omev1beta1.OMENativeInstanceStatus{{
+		Index: 2, Incarnation: 7, Phase: omev1beta1.OMENativeInstanceReady,
+		Announced: []string{"A@#7", "B@#7", "SECRET@#7"},
+	}}
+	limits := collectionLimits()
+	limits.Details = instancecollection.DetailLimits{
+		MaxConditions: 4, MaxScannedConditions: 8, MaxNodeHints: 4, MaxScannedNodeHints: 8,
+		MaxAnnouncements: 1, MaxScannedAnnouncements: 2,
+		SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+	}
+
+	got, err := instancecollection.CollectRelated(context.Background(), listerFunc(func(context.Context, metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		return &omev1beta1.InferenceReplicaList{Items: []omev1beta1.InferenceReplica{ir}}, nil
+	}), isvc, limits)
+
+	require.NoError(t, err)
+	assert.Empty(t, got.Items[0].Status.InstanceStatuses[0].Announced)
+	assert.Contains(t, got.DetailsTruncated, instancecollection.DetailTruncation{
+		Name: "chat-engine", Component: omev1beta1.EngineComponent, Index: 2, Kind: instancecollection.DetailAnnouncements,
+	})
+	encoded, err := json.Marshal(got.Items)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "SECRET")
+}
+
+func TestCollectRelatedRejectsInvalidAnnouncementLimitsBeforeListing(t *testing.T) {
+	t.Parallel()
+	isvc := collectionISVC()
+	for name, pair := range map[string][2]int{
+		"retain without scan": {1, 0},
+		"scan without retain": {0, 1},
+		"scan below retain":   {2, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			limits := collectionLimits()
+			limits.Details = instancecollection.DetailLimits{
+				MaxConditions: 1, MaxScannedConditions: 1, MaxNodeHints: 1, MaxScannedNodeHints: 1,
+				MaxAnnouncements: pair[0], MaxScannedAnnouncements: pair[1],
+				SelectedComponent: omev1beta1.EngineComponent,
+			}
+			_, err := instancecollection.CollectRelated(context.Background(), panicLister{}, isvc, limits)
+			require.ErrorIs(t, err, instancecollection.ErrDetailLimitsInvalid)
+		})
+	}
 }
 
 func TestCollectRelatedDropsMigrationDetailsBeyondScanBound(t *testing.T) {
