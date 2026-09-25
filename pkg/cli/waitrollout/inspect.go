@@ -272,6 +272,12 @@ func (b *payloadBudget) inspect(v reflect.Value, depth int, field string) bool {
 			}
 		}
 	case reflect.Slice, reflect.Array:
+		// Opaque payloads such as managed FieldsV1.Raw consume bytes, not
+		// rollout-record slots or a reflected node for every byte.
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			b.bytes += v.Len()
+			return b.bytes <= 2*1024*1024
+		}
 		if v.Len() > 2048 {
 			return false
 		}
