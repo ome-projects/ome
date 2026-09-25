@@ -3,6 +3,7 @@ package irprojector
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -131,7 +132,10 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 			isvc.Namespace, name, component, err)
 	}
 
-	desired := IRStatusToComponentStatus(ir)
+	// ObservedGeneration is settled against the live ISVC inside the retry
+	// closure; the caller's snapshot only seeds it for the early-return
+	// paths that never read the live object.
+	desired := IRStatusToComponentStatus(ir, isvc.Status.Components[component].Lifecycle)
 	// topCond is the standard top-level Component-ready condition
 	// (EngineReady / DecoderReady / RouterReady) derived from the
 	// OMENative counters. Computed once
@@ -174,6 +178,10 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 		// unchanged, so an unchanged status DeepEquals its prior snapshot.
 		before := fresh.Status.DeepCopy()
 		cs := fresh.Status.Components[component]
+		// The carried generation must come from this attempt's read of the
+		// live ISVC, not from the caller's snapshot, so a conflict retry
+		// never rolls it back.
+		desired.ObservedGeneration = lifecycleObservedGeneration(ir, cs.Lifecycle)
 		cs.Lifecycle = desired.DeepCopy()
 		fresh.Status.Components[component] = cs
 		// Emit the top-level component-ready condition in the same
@@ -233,16 +241,19 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 
 // IRStatusToComponentStatus projects the IR.Status fields onto a
 // fresh LifecycleStatus. 1:1 field mapping — IR.Status and the
-// per-Component LifecycleStatus were intentionally shaped identically.
+// per-Component LifecycleStatus were intentionally shaped identically —
+// except ObservedGeneration, which reports the parent ISVC generation
+// (see lifecycleObservedGeneration). live is the Lifecycle block already
+// on the ISVC for this Component, nil when there is none.
 //
 // Returns a non-nil pointer even when every field is zero; the
 // presence of the pointer is itself a signal that the IR-managed
 // path is driving the Component, and downstream consumers (the
 // controller's preserveLifecycleStatus helper) treat the nil/non-nil
 // boundary as load-bearing.
-func IRStatusToComponentStatus(ir *v1beta1.InferenceReplica) *v1beta1.LifecycleStatus {
+func IRStatusToComponentStatus(ir *v1beta1.InferenceReplica, live *v1beta1.LifecycleStatus) *v1beta1.LifecycleStatus {
 	out := &v1beta1.LifecycleStatus{
-		ObservedGeneration:   ir.Status.ObservedGeneration,
+		ObservedGeneration:   lifecycleObservedGeneration(ir, live),
 		Replicas:             ir.Status.Replicas,
 		ReadyReplicas:        ir.Status.ReadyReplicas,
 		ServingReplicas:      ir.Status.ServingReplicas,
@@ -267,6 +278,35 @@ func IRStatusToComponentStatus(ir *v1beta1.InferenceReplica) *v1beta1.LifecycleS
 		copy(out.Conditions, ir.Status.Conditions)
 	}
 	return out
+}
+
+// lifecycleObservedGeneration decides the ISVC generation the Lifecycle
+// block reports. The projector stamps the parent ISVC generation on the
+// IR with every projection, so once the IR has reconciled its current
+// spec the stamp is the generation this block reflects. Until then the
+// value already live on the ISVC is carried (zero when there is none).
+// The IR's own generation is never reported: it also moves on IR-only
+// spec changes (migration mailbox annotations, pause/unpause, canary
+// steps, autoscaler replica edits) that leave the ISVC generation
+// untouched, which would strand consumers comparing this field against
+// ISVC.metadata.generation.
+func lifecycleObservedGeneration(ir *v1beta1.InferenceReplica, live *v1beta1.LifecycleStatus) int64 {
+	var carried int64
+	if live != nil {
+		carried = live.ObservedGeneration
+	}
+	if ir.Status.ObservedGeneration != ir.Generation {
+		return carried
+	}
+	raw, ok := ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]
+	if !ok {
+		return carried
+	}
+	stamp, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return carried
+	}
+	return stamp
 }
 
 // allDeclaredComponents returns the ComponentTypes that have a
