@@ -50,7 +50,11 @@ OME Resources and Controller
 | ome.controller.topologySpreadConstraints | list | `[]` |  |
 | ome.metricsaggregator.enableMetricAggregation | string | `"false"` |  |
 | ome.metricsaggregator.enablePrometheusScraping | string | `"false"` |  |
-| ome.multiclusterAccess.enabled | bool | `true` | Install ServiceAccount, token Secret, and scoped RBAC for InferenceDeploymentOperator. |
+| ome.multiclusterAccess.enabled | bool | `false` | Install the remote placement ClusterRole. |
+| ome.multiclusterAccess.subjects | list | `[]` | Bind existing identities; empty leaves bindings to the platform. |
+| ome.multicluster.config.routing.publisher.name | string | `""` | TrafficMap publisher name; empty or `gatewayapi` uses the built-in Gateway API publisher. |
+| ome.multicluster.config.routing.publisher.options | object | `{}` | Options interpreted by the selected publisher. |
+| ome.multicluster.config.routing.publisher.resyncInterval | string | `"1m"` | Periodic TrafficMap publication reconciliation backstop. |
 | ome.omeAgent.authType | string | `"InstancePrincipal"` |  |
 | ome.omeAgent.compartmentId | string | `"ocid1.compartment.oc1..dummy-compartment"` |  |
 | ome.omeAgent.fineTunedAdapter.cpuLimit | int | `15` |  |
@@ -219,14 +223,99 @@ For long-term observability, deploy a separate full Prometheus stack
 
 ## Multicluster Access
 
-`ome.multiclusterAccess.enabled=true` installs a ServiceAccount and long-lived
-token Secret that a control-plane InferenceDeploymentOperator can use to manage
-OME resources in this workload cluster. The RBAC is scoped to writing derived
-`InferenceService` resources, plus read-only access to the `InferenceReplica`,
-`ClusterServingRuntime`, `Pod` and `PodGroup` resources the control plane reads
-to observe admission. Placement stalls in `Racing` without the
-`InferenceReplica` read: the per-component IR status is the admission signal
-that selects a winner.
+`ome.multiclusterAccess.enabled=true` installs the `ome-multicluster-access`
+ClusterRole. It grants derived `InferenceService` CRUD and the reads used for
+admission and endpoint discovery. Authentication belongs to the platform and
+is selected by each `WorkloadCluster` kubeconfig; this chart creates no remote
+ServiceAccount or token Secret. The controller's own local ServiceAccount is
+independent and remains required.
+
+An empty `subjects` list installs only the role, allowing a separate GitOps
+application to own the platform binding. To let this chart own the binding:
+
+```yaml
+ome:
+  multiclusterAccess:
+    enabled: true
+    subjects:
+      - kind: Group
+        name: placement-controllers
+```
+
+Subjects may be existing Users, Groups, or ServiceAccounts. ServiceAccount
+subjects require an explicit namespace and do not cause account creation.
+
+### Upgrading token-based installs
+
+Earlier chart versions enabled remote access by default and created
+`ome-multicluster-access`, its ServiceAccount binding, and
+`ome-multicluster-access-token`. Before upgrading, explicitly enable the role
+where it is needed and move credential ownership to the platform. This includes
+any InferenceDeploymentOperator client still using that token: establish and
+verify its replacement identity or arrange ownership transfer of the existing
+account and token before Helm removes them. `subjects: []` also removes the
+chart-owned binding; preserve access through an external binding or explicitly
+list the existing identity. With Argo CD, verify the effective pruning policy
+and resource ownership before removing obsolete objects.
+
+The role name and permissions stay stable, so independently managed
+workload-identity bindings continue to reference the same role. For a full
+review of the related settings, see [the multicluster option audit](multicluster-options.md).
+
+## Multi-cluster routing
+
+TrafficMap routing runs only on a multi-cluster control plane. Enable all three
+required values together:
+
+```yaml
+ome:
+  multicluster:
+    enabled: true
+    role: control-plane
+    config:
+      routing:
+        enabled: true
+```
+
+The chart refuses to render when routing is enabled without both topology
+prerequisites. The manager reads the multi-cluster ConfigMap block once at
+startup. Helm rolls the controller when that block changes; direct ConfigMap
+edits require a manager restart.
+
+## TrafficMap publishing
+
+The chart configures a one-minute publisher resync interval even when the
+built-in Gateway API publisher is selected by an empty name or `gatewayapi`.
+The manager has no fallback cadence: installations that enable TrafficMap
+routing outside this chart must set `routing.publisher.resyncInterval`
+explicitly. Cleanup while disabled is event-driven and does not require a
+resync interval.
+
+Earlier chart releases represented an unset publisher as `publisher: []`.
+During an upgrade, the chart accepts that legacy value (and `publisher: null`)
+and normalizes it to the built-in Gateway API publisher with the chart's
+one-minute resync interval. New values files should use the mapping form shown
+in `values.yaml` so the selected publisher and cadence remain explicit.
+
+Upgrading from the legacy InferenceService-owned Gateway publisher requires a
+drain by the old binary:
+
+1. Set `routing.enabled=false` and clear `endpoint.globalGateway`. Routing alone
+   does not stop legacy endpoint publication. Keep `endpoint.routeNamespace`
+   unchanged so the old publisher can locate its resources. If configured,
+   also turn off gateway-backend feature flags that require a global Gateway;
+   cleanup discovers their existing resources by source labels.
+2. Wait until every InferenceService has released the
+   `ome.io/placement-endpoint` finalizer and all legacy HTTPRoutes, Services,
+   EndpointSlices, and BackendTLSPolicies have been removed.
+3. Upgrade the manager, restore `endpoint.globalGateway`, and enable routing.
+
+To switch TrafficMap publishers, keep the old `publisher.name`, disable
+routing, and wait until its external state is gone and TrafficMaps have
+released the `ome.io/trafficmap-publisher` finalizer. Then select the new
+publisher and re-enable routing. Changing the publisher name before the drain
+can leave state that the replacement publisher cannot safely identify or
+remove.
 
 ## Default Runtime
 

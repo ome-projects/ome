@@ -1,55 +1,12 @@
 {{- if .Values.quotaManager.remoteAccess.enabled }}
-{{- $name := .Values.quotaManager.remoteAccess.name }}
-{{- $sa := .Values.quotaManager.remoteAccess.serviceAccount }}
+{{- $name := required "quotaManager.remoteAccess.name is required" .Values.quotaManager.remoteAccess.name }}
 {{- $subjects := .Values.quotaManager.remoteAccess.subjects }}
-{{- if and (not $sa.create) (not $subjects) }}
-{{- fail "quotaManager.remoteAccess is enabled but binds to nobody: set serviceAccount.create=true or list subjects" }}
+{{- if hasKey .Values.quotaManager.remoteAccess "serviceAccount" }}
+{{- fail "quotaManager.remoteAccess.serviceAccount was removed; provision authentication outside the chart and bind existing identities through quotaManager.remoteAccess.subjects" }}
 {{- end }}
-# Installed on a WORKLOAD cluster, and used by nothing that runs there. This is
-# what a management plane is allowed to do when it projects quota nodes onto
-# this member: the member issues the grant, so the member decides its extent.
-#
-# This template defines PERMISSIONS, not an authentication method. How the
-# management plane proves who it is belongs to the platform rather than to a
-# chart — the transport accepts exec credential plugins, so a cloud workload
-# identity authenticates with nothing stored anywhere. Bind the role to whatever
-# identity that produces through `subjects`.
-#
-# Deliberately NOT a widening of ome-multicluster-access. That role is the
-# placement plane's — InferenceService CRUD plus reads on pods, podgroups and
-# runtimes — and the two planes should not be able to use each other's
-# credentials. Keeping them apart means a leaked quota credential cannot start
-# work, and a leaked placement credential cannot rewrite budgets.
-{{- if $sa.create }}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ $name | quote }}
-  namespace: {{ .Release.Namespace | quote }}
-  labels:
-    {{- include "ome-quota-manager.labels" . | nindent 4 }}
-    ome.io/component: quota-remote-access
-{{- end }}
-{{- if and $sa.create $sa.staticToken }}
----
-# A ServiceAccount token that never expires and never rotates, readable by
-# anyone who can read Secrets in this namespace. Opt-in, and the opposite of
-# what a production cluster should carry: prefer `kubectl create token`, which
-# issues a token with a lifetime, or an exec credential plugin, which stores no
-# credential at all.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ printf "%s-token" $name | quote }}
-  namespace: {{ .Release.Namespace | quote }}
-  labels:
-    {{- include "ome-quota-manager.labels" . | nindent 4 }}
-    ome.io/component: quota-remote-access
-  annotations:
-    kubernetes.io/service-account.name: {{ $name | quote }}
-type: kubernetes.io/service-account-token
-{{- end }}
+# Member-side permissions for a remote quota projector. Authentication and
+# credential rotation belong to the platform. Placement and quota have separate
+# roles so an operator can grant either capability independently.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -81,6 +38,7 @@ rules:
 # management plane never measures this cluster and never materializes here; it
 # learns capacity from the root node's status, which the local manager derives.
 # Kueue write access on a member belongs to the process running beside Kueue.
+{{- if $subjects }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -94,19 +52,17 @@ roleRef:
   kind: ClusterRole
   name: {{ $name | quote }}
 subjects:
-{{- if $sa.create }}
-- kind: ServiceAccount
-  name: {{ $name | quote }}
-  namespace: {{ .Release.Namespace | quote }}
-{{- end }}
 {{- range $subjects }}
+{{- if not (has .kind (list "User" "Group" "ServiceAccount")) }}
+{{- fail "quotaManager.remoteAccess.subjects kind must be User, Group or ServiceAccount" }}
+{{- end }}
 - kind: {{ .kind | quote }}
-  name: {{ .name | quote }}
-  {{- if .namespace }}
-  namespace: {{ .namespace | quote }}
-  {{- end }}
-  {{- if ne .kind "ServiceAccount" }}
+  name: {{ required "quotaManager.remoteAccess.subjects name is required" .name | quote }}
+  {{- if eq .kind "ServiceAccount" }}
+  namespace: {{ required "quotaManager.remoteAccess ServiceAccount subject namespace is required" .namespace | quote }}
+  {{- else }}
   apiGroup: rbac.authorization.k8s.io
   {{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

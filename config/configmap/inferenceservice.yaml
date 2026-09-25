@@ -3,6 +3,11 @@ kind: ConfigMap
 metadata:
   name: inferenceservice-config
   namespace: ome
+# Kustomize does not restart the manager when this ConfigMap changes. After
+# `kubectl apply -k config/default`, restart the manager for settings documented
+# below as startup-only:
+#   kubectl -n ome rollout restart deployment/ome-controller-manager
+#   kubectl -n ome rollout status deployment/ome-controller-manager
 data:
   ingress: |-
     {
@@ -23,6 +28,28 @@ data:
   deploy: |-
     {
       "defaultDeploymentMode": "RawDeployment"
+    }
+
+  # The scale-up and scale-down Pod batch sizes bound create and delete work in
+  # Pod-equivalent units. Each Instance or gang is selected atomically, and a
+  # first eligible Instance larger than its budget proceeds alone. Omitting a
+  # batch field preserves that direction's unbounded selection. The scale-down
+  # requeue interval polls while destructive work remains in flight; omitting
+  # it leaves progress to watched resources and exact configured lifecycle
+  # deadlines. These settings are read once at manager startup; invalid values
+  # prevent startup, and a direct ConfigMap edit requires a manager restart.
+  #
+  # instanceReadyTimeout is how long a newly created Instance may take to become
+  # Ready before its in-flight operation is failed; a per-Component
+  # spec.<component>.lifecycle.instanceReadyTimeout always wins. The binary has
+  # NO built-in window — omit it and a Component that sets none of its own opens
+  # operations with no deadline and reports it as a condition plus an event.
+  lifecycle: |-
+    {
+      "scaleUpPodBatchSize": 100,
+      "scaleDownPodBatchSize": 100,
+      "scaleDownRequeueInterval": "5s",
+      "instanceReadyTimeout": "30m"
     }
 
   # How the manager stores InferenceReplica per-Instance status. Read once at

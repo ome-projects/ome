@@ -40,11 +40,14 @@ ome:
   #     - sourceLabels: ["__meta_kubernetes_namespace"]
   #       targetLabel: k8s_namespace_name
   podMonitor: {}
-  # multiclusterAccess installs the long-lived ServiceAccount token used by
-  # InferenceDeploymentOperator to manage OME resources from a control-plane
-  # cluster.
+  # Permissions for a remote placement controller. Authentication is supplied
+  # by the platform through the WorkloadCluster kubeconfig.
   multiclusterAccess:
-    enabled: true
+    enabled: false
+    # Empty installs only the ClusterRole, for bindings managed outside Helm.
+    # Otherwise bind existing User, Group or ServiceAccount identities here.
+    # ServiceAccount subjects require a namespace; no accounts or tokens are created.
+    subjects: []
   # multicluster enables the control-plane fan-out placement controllers.
   # Alpha; default off. On the CONTROL-PLANE cluster set enabled: true and
   # role: control-plane (this disables the local InferenceService->pods reconciler
@@ -68,10 +71,12 @@ ome:
     # delete another's deriveds. Leave empty for a single control plane.
     placementControlPlaneID: ""
     # config holds the multi-cluster TUNABLES, rendered into the
-    # inferenceservice-config ConfigMap's "multicluster" block (NOT manager
-    # flags, so an edit applies on the next config load, not a restart). Every
-    # field is optional: leave a duration "" or a number 0 to use the manager's
-    # built-in default. Durations are Go duration strings ("1m", "30s", "250ms").
+    # inferenceservice-config ConfigMap's "multicluster" block. The manager reads
+    # this block once at startup. Helm rolls the controller when the rendered
+    # block changes; direct ConfigMap edits require a manager restart. Most fields
+    # are optional: leave a duration "" or a number 0 to use the manager's built-in
+    # default. Routing observer limits are explicit and required when routing is
+    # enabled. Durations are Go duration strings ("1m", "30s", "250ms").
     config:
       # workloadCluster: remote-cluster connection/transport + the status funnel.
       workloadCluster:
@@ -99,7 +104,7 @@ ome:
         dispatcherMode: ""          # "AllAtOnce" (default) or "Incremental"
         dispatcherStepSize: 0       # candidates Incremental adds per round (0 => one)
         dispatcherRoundTimeout: ""  # Incremental round dwell ("" => no dwell)
-        localQueue: ""              # one Kueue LocalQueue name stamped on EVERY derived workload ("" => no queue label, so Kueue does not gate them). Empty by default: a LocalQueue is named for the quota leaf it belongs to, so one global name cannot address more than one tenant
+        localQueue: ""              # fallback only when the source has no ome.io/local-queue annotation; leave empty for per-service quota selection
       # endpoint: the global endpoint publisher (Gateway API HTTPRoute to the winner).
       endpoint:
         globalHostTemplate: ""  # text/template for the global host ("" => only annotated ISVCs publish)
@@ -116,17 +121,28 @@ ome:
             addressRefreshInterval: ""    # required refresh cadence when EndpointSlices are enabled
       # routing: the TrafficMap routing controller (control plane only), which
       # projects a placed InferenceService into a capacity-aware, health-gated
-      # TrafficMap a gateway consumes. Alpha; default off.
+      # TrafficMap a gateway consumes. Alpha; default off. Enabling routing
+      # requires multicluster.enabled=true and role=control-plane; the chart
+      # rejects any other topology.
       routing:
         enabled: false          # generate TrafficMaps for placed InferenceServices
-        publisher: []
+        # observer bounds the controller and HTTP resources consumed by all
+        # per-InferenceService probe and capacity policies.
+        observer:
+          maxConcurrentReconciles: 8
+          maxConcurrentRequests: 16
+          maxResponseBytes: 65536
+          minPeriod: 1s
+          maxSamples: 100
         # publisher replaces the default Gateway API backend with an optional
         # adapter compiled into the manager. To remove a stateful publisher,
-        # first set enabled=false and wait for it to drain.
-        # publisher:
-        #   name: example
-        #   options:
-        #     key: value
+        # first set enabled=false and wait for it to drain. The resync interval
+        # applies to both the built-in and selected publishers; the binary has
+        # no default for this safety cadence.
+        publisher:
+          name: ""              # empty or "gatewayapi" selects the built-in publisher
+          resyncInterval: 1m    # periodic reconciliation backstop while routing is enabled
+          options: {}           # interpreted only by a non-empty named publisher
         probe: []
         # probe actively checks each TrafficMap entry's client-facing endpoint.
         # Every field is required. Statuses omitted from both lists are
@@ -140,6 +156,20 @@ ome:
         #   timeout: 3s
         #   failureThreshold: 3
         #   successThreshold: 2
+        #   allFailedPolicy: PreserveTraffic # set Drain to preserve all-zero weights
+        capacity: {}
+        # capacity polls each TrafficMap entry's client-facing endpoint for a
+        # reported servable count, applied only as a ceiling on planned capacity.
+        # capacity:
+        #   path: /capacity
+        #   method: GET
+        #   format: Report
+        #   options: {}
+        #   samples: 10
+        #   quorum: 2
+        #   period: 10s
+        #   timeout: 3s
+        #   maxAge: 30s
   # autoscalerPolicy is the single gate for the reusable AutoscalerPolicy
   # feature: the manager's policy RBAC, the policy validating webhook, and the
   # autoscalerPolicy config block all install together on this one value —
@@ -480,6 +510,12 @@ ome:
       # has NO built-in default: removing this field disables pruning
       # entirely for ISVCs without the annotation (revisions accumulate).
       revisionHistoryLimit: 10
+      # retryBlockHistoryLimit caps how many RetryBlocks for SUPERSEDED target
+      # revisions an InferenceReplica keeps as historical failure evidence; the
+      # block for the current target is never pruned, and the oldest historical
+      # block (by lastFailureAt) goes first. The OME binary has NO built-in
+      # cap: removing this field keeps every historical block.
+      retryBlockHistoryLimit: 3
       # updateRetry bounds automatic same-target update retries (RetryBlock).
       # A rollout that fails toward an UNCHANGED target revision backs off
       # exponentially (initialDelay * multiplier^(attempt-1), capped at
@@ -492,11 +528,64 @@ ome:
         initialDelay: 1m
         maxDelay: 30m
         multiplier: 2.0
+      # instanceReadyTimeout is how long a newly created Instance may take to
+      # become Ready before its in-flight operation (create, rollout, restart,
+      # migration, drain) is failed. A per-Component
+      # spec.<component>.lifecycle.instanceReadyTimeout always wins. The OME
+      # binary has NO built-in window: removing this field leaves a Component
+      # that sets none of its own opening operations with NO deadline — an
+      # Instance that never becomes Ready then waits for an operator, and the
+      # Component reports an InstanceReadyTimeoutUnconfigured condition plus a
+      # warning event.
+      instanceReadyTimeout: 30m
       # stuckPodGracePeriod is the wait window after pod creation before a
       # terminal kubelet waiting state escalates to Phase=Failed. Removing
       # this field disables fast escalation (the InstanceReadyTimeout backstop
       # still fires).
       stuckPodGracePeriod: 60s
+      # unschedulableGracePeriod is how long a pod may sit with
+      # PodScheduled=False/Unschedulable — measured from that condition's last
+      # transition — before its Instance is failed as environment-caused (the
+      # scheduler message is recorded; the revision is never blamed). While the
+      # pod is unschedulable the InstanceReadyTimeout clock is parked either
+      # way. Removing this field disables the escalation, so an unplaceable pod
+      # waits for an operator instead.
+      unschedulableGracePeriod: 15m
+      # gangScheduleTimeout bounds the PodGroup scheduleTimeoutSeconds a
+      # multi-pod Instance derives from its Component's instanceReadyTimeout,
+      # so gang admission releases an infeasible attempt on a cluster-wide
+      # schedule. min also covers Components whose instanceReadyTimeout is
+      # unusable as a gang deadline. Both fields are required when the block
+      # is present. The OME binary has NO built-in bounds: removing this block
+      # passes the derived timeout to the scheduler unclamped.
+      gangScheduleTimeout:
+        min: 60s
+        max: 600s
+      # audit bounds migration EXECUTION on one InferenceService: how many
+      # migrations may be executing at once, how many may be started inside
+      # the trailing window, and the window itself. The window also bounds
+      # status.migrations — terminal records completed longer ago than this
+      # are pruned. All three fields are required when the block is present.
+      # The OME binary has NO built-in caps, and the caps are the only bound
+      # on destructive migration churn: with this block removed a migration
+      # request is HELD — deferred with a warning event and a
+      # MigrationPolicyUnconfigured condition, and admitted as soon as the
+      # block is set — instead of executing unbounded.
+      audit:
+        maxInFlightMigrations: 3
+        maxMigrationsPerWindow: 10
+        window: 1h
+      # requeue is the OMENative dispatcher's wake-up cadence: operation
+      # paces the passes that re-check an in-flight Create, Update, Restart,
+      # or Migrate, and gate paces a pass a rollout gate is denying (shorter,
+      # because the peer Component that releases it may catch up on the next
+      # reconcile). Both fields are required when the block is present. The
+      # OME binary has NO built-in intervals: removing this block leaves a
+      # pass with work left to Pod/EndpointSlice/PodGroup watch events and the
+      # controller's rate-limited backoff.
+      requeue:
+        operation: 5s
+        gate: 3s
       # autoMigrate configures the deadline-disposition relocation budget.
       # Removing this block disables the relocation branch.
       autoMigrate:

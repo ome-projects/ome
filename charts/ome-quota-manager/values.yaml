@@ -366,40 +366,20 @@ quotaManager:
   # manager; a management plane has nothing to project onto itself, and a
   # single-cluster install never needs it because the tree is authored locally.
   #
-  # This grants PERMISSIONS. It does not decide how the management plane
-  # authenticates, which belongs to the platform: the transport accepts exec
-  # credential plugins (aws, gke-gcloud-auth-plugin and kubelogin are permitted
-  # by default), so a cloud workload identity needs no credential stored
-  # anywhere. Bind the role to whatever identity that produces via `subjects`.
-  #
-  # Separate from ome-multicluster-access on purpose. That is the placement
-  # plane's credential and can create workloads; this one can only write
-  # budgets. Neither should be able to do the other's job.
+  # Authentication belongs to the platform. The WorkloadCluster kubeconfig
+  # selects it; exec plugins require the projector's explicit allowlist above.
+  # Placement and quota have separate roles so either can be granted independently.
   remoteAccess:
     enabled: false
     name: ome-quota-access
 
-    # Identities to bind the role to, beyond the ServiceAccount below. Use this
-    # for an identity your platform already issues and rotates — a cloud IAM
-    # principal, an OIDC subject, a client-certificate user:
+    # Empty installs only the ClusterRole, for bindings managed outside Helm.
+    # Otherwise bind identities your platform already issues and rotates:
     #
     #   subjects:
     #   - kind: User
     #     name: quota-projector@example.iam.gserviceaccount.com
     #
     # kind is User, Group or ServiceAccount; a ServiceAccount subject also needs
-    # a namespace.
+    # a namespace. No ServiceAccounts or token Secrets are created.
     subjects: []
-
-    serviceAccount:
-      # Create an in-cluster ServiceAccount of `name` and bind the role to it.
-      # Turn this off when `subjects` names an external identity instead.
-      create: true
-
-      # Also mint a ServiceAccount token Secret. It never expires, never
-      # rotates, and is readable by anyone who can read Secrets here, so it is
-      # off: it exists for simulators and for clusters predating TokenRequest.
-      #
-      # Without it, get a token with a lifetime when you need one:
-      #   kubectl -n <ns> create token ome-quota-access --duration=24h
-      staticToken: false

@@ -430,8 +430,7 @@ for empty in 'env:' 'volumes:' 'volumeMounts:'; do
     fail "rendered an empty ${empty} block with no webhook and no extras"
   fi
 done
-# --- remote access is off unless asked for, grants narrowly, and mints no
-# --- non-expiring credential unless explicitly told to ---
+# --- remote access grants permissions without provisioning credentials ---
 
 for unwanted in ome-quota-access quota-remote-access; do
   if grep -Fq "${unwanted}" <<<"${default}"; then
@@ -457,32 +456,41 @@ for wanted in \
     fail "enabling remote access did not render ${wanted}"
 done
 
-# A token that never expires is the thing this chart should not hand out by
-# default. It is available for simulators, and only when asked for twice.
-if grep -Fq 'service-account-token' <<<"${remote}"; then
-  fail "enabling remote access minted a non-expiring token without being asked"
-fi
-grep -Fq 'service-account-token' \
-  <<<"$(remote_only --set quotaManager.remoteAccess.serviceAccount.staticToken=true)" ||
-  fail "opting into staticToken did not mint the token Secret"
+# A separately managed platform binding needs only the role.
+for forbidden in 'kind: ServiceAccount' 'kind: Secret' 'kind: ClusterRoleBinding'; do
+  if grep -Fq "$forbidden" <<<"$remote"; then
+    fail "role-only remote access rendered $forbidden"
+  fi
+done
 
-# The role must be bindable to an identity the platform already rotates, with
-# no in-cluster ServiceAccount at all.
 external="$(remote_only \
-  --set quotaManager.remoteAccess.serviceAccount.create=false \
   --set 'quotaManager.remoteAccess.subjects[0].kind=User' \
   --set 'quotaManager.remoteAccess.subjects[0].name=projector@example.com')"
-grep -Fq 'kind: "User"' <<<"${external}" ||
-  fail "an external subject was not bound"
-if grep -Fq 'kind: ServiceAccount' <<<"${external}"; then
-  fail "serviceAccount.create=false still rendered a ServiceAccount"
+grep -Fq 'kind: "User"' <<<"${external}" || fail "external subject was not bound"
+grep -Fq 'kind: ClusterRoleBinding' <<<"${external}" || fail "external binding missing"
+if grep -Eq '^kind: (ServiceAccount|Secret)$' <<<"${external}"; then
+  fail "external remote access provisioned credentials"
 fi
 
-# A role bound to nobody is a silent no-op, so it must not render at all.
-if render --set quotaManager.mode=workload \
-  --set quotaManager.remoteAccess.enabled=true \
-  --set quotaManager.remoteAccess.serviceAccount.create=false >/dev/null 2>&1; then
-  fail "remote access bound to nobody rendered instead of failing"
+# Credential-provisioning values must not be silently ignored during upgrades.
+if remote_only --set quotaManager.remoteAccess.serviceAccount.staticToken=true >/dev/null 2>&1; then
+  fail "removed serviceAccount values did not fail with migration guidance"
+fi
+for invalid in \
+  'quotaManager.remoteAccess.subjects[0].kind=Robot' \
+  'quotaManager.remoteAccess.subjects[0].kind=User' \
+  'quotaManager.remoteAccess.subjects[0].kind=ServiceAccount,quotaManager.remoteAccess.subjects[0].name=existing'; do
+  if remote_only --set "$invalid" >/dev/null 2>&1; then
+    fail "invalid remote access subject rendered: $invalid"
+  fi
+done
+existing="$(remote_only \
+  --set 'quotaManager.remoteAccess.subjects[0].kind=ServiceAccount' \
+  --set 'quotaManager.remoteAccess.subjects[0].name=existing' \
+  --set 'quotaManager.remoteAccess.subjects[0].namespace=identity')"
+grep -Fq 'namespace: "identity"' <<<"$existing" || fail "existing account namespace missing"
+if grep -Eq '^kind: (ServiceAccount|Secret)$' <<<"$existing"; then
+  fail "binding an existing account provisioned credentials"
 fi
 
 # The whole point of a separate credential is that it can only write budgets.

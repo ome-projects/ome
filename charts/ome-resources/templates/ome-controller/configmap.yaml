@@ -1,3 +1,8 @@
+{{- $routingEnabled := .Values.ome.multicluster.config.routing.enabled | default false -}}
+{{- if and $routingEnabled (or (not .Values.ome.multicluster.enabled) (ne (.Values.ome.multicluster.role | default "") "control-plane")) -}}
+{{- fail "ome.multicluster.config.routing.enabled=true requires ome.multicluster.enabled=true and ome.multicluster.role=control-plane" -}}
+{{- end -}}
+{{- $routingPublisher := .Values.ome.multicluster.config.routing.publisher | default dict -}}
 {{- /* enigma init container's INSTANCE_TYPE_MAP env: single source in values.yaml (modelAgent.instanceTypeMap) via the ome.instanceTypeMap helper. */ -}}
 {{- $instanceTypeMap := include "ome.instanceTypeMap" . -}}
 apiVersion: v1
@@ -103,11 +108,29 @@ data:
   {{- if hasKey . "revisionHistoryLimit" }}
   {{- $fields = append $fields (dict "revisionHistoryLimit" .revisionHistoryLimit) }}
   {{- end }}
+  {{- if hasKey . "retryBlockHistoryLimit" }}
+  {{- $fields = append $fields (dict "retryBlockHistoryLimit" .retryBlockHistoryLimit) }}
+  {{- end }}
   {{- with .updateRetry }}
   {{- $fields = append $fields (dict "updateRetry" (dict "maxAttempts" .maxAttempts "initialDelay" .initialDelay "maxDelay" .maxDelay "multiplier" .multiplier)) }}
   {{- end }}
+  {{- with .instanceReadyTimeout }}
+  {{- $fields = append $fields (dict "instanceReadyTimeout" .) }}
+  {{- end }}
   {{- with .stuckPodGracePeriod }}
   {{- $fields = append $fields (dict "stuckPodGracePeriod" .) }}
+  {{- end }}
+  {{- with .unschedulableGracePeriod }}
+  {{- $fields = append $fields (dict "unschedulableGracePeriod" .) }}
+  {{- end }}
+  {{- with .gangScheduleTimeout }}
+  {{- $fields = append $fields (dict "gangScheduleTimeout" (dict "min" .min "max" .max)) }}
+  {{- end }}
+  {{- with .audit }}
+  {{- $fields = append $fields (dict "audit" (dict "maxInFlightMigrations" .maxInFlightMigrations "maxMigrationsPerWindow" .maxMigrationsPerWindow "window" .window)) }}
+  {{- end }}
+  {{- with .requeue }}
+  {{- $fields = append $fields (dict "requeue" (dict "operation" .operation "gate" .gate)) }}
   {{- end }}
   {{- with .autoMigrate }}
   {{- $fields = append $fields (dict "autoMigrate" (dict "maxAttempts" .maxAttempts)) }}
@@ -175,7 +198,14 @@ data:
         }
       },
       "routing": {
-        "enabled": {{ .Values.ome.multicluster.config.routing.enabled | default false }}{{- with .Values.ome.multicluster.config.routing.probe }},
+        "enabled": {{ .Values.ome.multicluster.config.routing.enabled | default false }},
+        "observer": {
+          "maxConcurrentReconciles": {{ .Values.ome.multicluster.config.routing.observer.maxConcurrentReconciles | default 0 }},
+          "maxConcurrentRequests": {{ .Values.ome.multicluster.config.routing.observer.maxConcurrentRequests | default 0 }},
+          "maxResponseBytes": {{ .Values.ome.multicluster.config.routing.observer.maxResponseBytes | default 0 }},
+          "minPeriod": {{ .Values.ome.multicluster.config.routing.observer.minPeriod | default "" | quote }},
+          "maxSamples": {{ .Values.ome.multicluster.config.routing.observer.maxSamples | default 0 }}
+        }{{- with .Values.ome.multicluster.config.routing.probe }},
         "probe": {
           "path": {{ .path | quote }},
           "method": {{ .method | quote }},
@@ -184,12 +214,25 @@ data:
           "period": {{ .period | quote }},
           "timeout": {{ .timeout | quote }},
           "failureThreshold": {{ .failureThreshold | default 0 }},
-          "successThreshold": {{ .successThreshold | default 0 }}
-        }{{- end }}{{- with .Values.ome.multicluster.config.routing.publisher }},
+          "successThreshold": {{ .successThreshold | default 0 }},
+          "allFailedPolicy": {{ .allFailedPolicy | quote }}
+        }{{- end }}{{- with .Values.ome.multicluster.config.routing.capacity }},
+        "capacity": {
+          "path": {{ .path | quote }},
+          "method": {{ .method | quote }},
+          "format": {{ .format | default "" | quote }},
+          "options": {{ .options | default dict | toJson }},
+          "samples": {{ .samples | default 0 }},
+          "quorum": {{ .quorum | default 0 }},
+          "period": {{ .period | quote }},
+          "timeout": {{ .timeout | quote }},
+          "maxAge": {{ .maxAge | quote }}
+        }{{- end }},
         "publisher": {
-          "name": {{ .name | quote }},
-          "options": {{ .options | default dict | toJson }}
-        }{{- end }}
+          "name": {{ $routingPublisher.name | default "" | quote }},
+          "resyncInterval": {{ $routingPublisher.resyncInterval | default "1m" | quote }},
+          "options": {{ $routingPublisher.options | default dict | toJson }}
+        }
       }
     }
 {{- if .Values.ome.autoscalerPolicy.enabled }}
@@ -217,32 +260,6 @@ data:
   acceleratorResources: |-
     {{- toJson .Values.ome.controller.acceleratorResources | nindent 4 }}
 {{- end }}
-  servingSidecar: |-
-    {
-        "image": "{{ include "ome.imageWithHub" (dict "values" .Values "repository" .Values.ome.omeAgent.image "tag" .Values.ome.omeAgent.tag) }}",
-        "memoryRequest": "2Gi",
-        "memoryLimit": "4Gi",
-        "cpuRequest": "1",
-        "cpuLimit": "2",
-        "compartmentId": "{{ .Values.ome.omeAgent.compartmentId }}",
-        "authType" : "{{ .Values.ome.omeAgent.authType }}",
-        "region": "{{ .Values.ome.omeAgent.region }}"
-    }
-  omeAgent: |-
-    {
-        "image": "{{ include "ome.imageWithHub" (dict "values" .Values "repository" .Values.ome.omeAgent.image "tag" .Values.ome.omeAgent.tag) }}",
-        "serviceAccount": "{{ .Values.ome.omeAgent.metadataJob.serviceAccount }}",
-        "memoryRequest": "{{ .Values.ome.omeAgent.metadataJob.memoryRequest }}",
-        "memoryLimit": "{{ .Values.ome.omeAgent.metadataJob.memoryLimit }}",
-        "cpuRequest": "{{ .Values.ome.omeAgent.metadataJob.cpuRequest }}",
-        "cpuLimit": "{{ .Values.ome.omeAgent.metadataJob.cpuLimit }}",
-        "backoffLimit": {{ .Values.ome.omeAgent.metadataJob.backoffLimit | default 2 }},
-        "ttlSecondsAfterFinished": {{ .Values.ome.omeAgent.metadataJob.ttlSecondsAfterFinished | default 3600 }},
-        "nodeSelector": {{ .Values.ome.omeAgent.metadataJob.nodeSelector | default dict | toJson }},
-        "tolerations": {{ .Values.ome.omeAgent.metadataJob.tolerations | default list | toJson }},
-        "affinity": {{ .Values.ome.omeAgent.metadataJob.affinity | default dict | toJson }},
-        "priorityClassName": "{{ .Values.ome.omeAgent.metadataJob.priorityClassName | default "" }}"
-    }
   modelInit: |-
     {
         "image":  "{{ include "ome.imageWithHub" (dict "values" .Values "repository" .Values.ome.omeAgent.image "tag" .Values.ome.omeAgent.tag) }}",

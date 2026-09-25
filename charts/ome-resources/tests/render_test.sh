@@ -9,6 +9,48 @@ fail() {
   exit 1
 }
 
+assert_default_trafficmap_publisher() {
+  local rendered_config="$1"
+  local scenario="$2"
+  local multicluster_json
+  local compact_multicluster_json
+
+  multicluster_json="$(awk '
+    /^  multicluster: \|-$/ { capture = 1; next }
+    capture && /^  [[:alnum:]_-]+: \|-$/ { exit }
+    capture { sub(/^    /, ""); print }
+  ' <<<"${rendered_config}")"
+  compact_multicluster_json="$(tr -d '[:space:]' <<<"${multicluster_json}")"
+  grep -Fq '"publisher":{"name":"","resyncInterval":"1m","options":{}}' \
+    <<<"${compact_multicluster_json}" ||
+    fail "${scenario} did not normalize to the default TrafficMap publisher"
+}
+
+render_legacy_publisher_default() {
+  local legacy_value="$1"
+  local fixture_name="$2"
+  local fixture_dir="${legacy_chart_fixtures}/${fixture_name}"
+
+  cp -R "${chart_dir}" "${fixture_dir}"
+  awk -v legacy_value="${legacy_value}" '
+    /^        publisher:$/ {
+      print "        publisher: " legacy_value
+      replacing = 1
+      replacements++
+      next
+    }
+    replacing && /^        probe:/ { replacing = 0 }
+    !replacing { print }
+    END { if (replacements != 1) exit 1 }
+  ' "${fixture_dir}/values.yaml" >"${fixture_dir}/values.yaml.next" ||
+    fail "could not construct ${fixture_name} publisher values fixture"
+  mv "${fixture_dir}/values.yaml.next" "${fixture_dir}/values.yaml"
+
+  "${helm_bin}" template ome-resources "${fixture_dir}" \
+    --namespace ome \
+    --show-only templates/ome-controller/configmap.yaml
+}
+
 rendered="$("${helm_bin}" template ome-resources "${chart_dir}" --namespace ome)"
 controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
@@ -347,11 +389,12 @@ fi
 # The control plane selects a placement winner from the per-component
 # InferenceReplica status it reads on each workload cluster, so the
 # multicluster-access ClusterRole must grant it. Without the grant every read is
-# forbidden, fan-out still succeeds, and placement never leaves Racing — a
+# forbidden, fan-out still succeeds, and placement never leaves Admitting — a
 # failure mode no lane in the test matrix reproduces, because they all
-# authenticate as cluster-admin rather than as this ServiceAccount.
+# authenticate as cluster-admin rather than exercising this role.
 multicluster_access="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
+  --set ome.multiclusterAccess.enabled=true \
   --show-only templates/ome-controller/rbac/multicluster_access.yaml)"
 grep -Fqx '  - inferencereplicas' <<<"${multicluster_access}" ||
   fail "multicluster-access ClusterRole does not grant inferencereplicas"
@@ -361,6 +404,48 @@ grep -Fqx '  - gateways' <<<"${multicluster_access}" ||
   fail "multicluster-access ClusterRole does not grant gateways"
 grep -Fqx '  - httproutes' <<<"${multicluster_access}" ||
   fail "multicluster-access ClusterRole does not grant httproutes"
+
+routing_topology_error='ome.multicluster.config.routing.enabled=true requires ome.multicluster.enabled=true and ome.multicluster.role=control-plane'
+
+if routing_without_multicluster="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.config.routing.enabled=true \
+  --set-string ome.multicluster.role=control-plane 2>&1)"; then
+  fail "routing was rendered without multi-cluster enabled"
+fi
+grep -Fq "${routing_topology_error}" <<<"${routing_without_multicluster}" ||
+  fail "routing without multi-cluster enabled did not report the topology requirement"
+
+if routing_without_control_plane_role="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.config.routing.enabled=true \
+  --set ome.multicluster.enabled=true 2>&1)"; then
+  fail "routing was rendered without the control-plane role"
+fi
+grep -Fq "${routing_topology_error}" <<<"${routing_without_control_plane_role}" ||
+  fail "routing without the control-plane role did not report the topology requirement"
+
+if routing_with_wrong_role="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.config.routing.enabled=true \
+  --set ome.multicluster.enabled=true \
+  --set-string ome.multicluster.role=worker 2>&1)"; then
+  fail "routing was rendered with a non-control-plane role"
+fi
+grep -Fq "${routing_topology_error}" <<<"${routing_with_wrong_role}" ||
+  fail "routing with a non-control-plane role did not report the topology requirement"
+
+routing_control_plane="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.config.routing.enabled=true \
+  --set ome.multicluster.enabled=true \
+  --set-string ome.multicluster.role=control-plane)"
+grep -Fq $'"routing": {\n        "enabled": true' <<<"${routing_control_plane}" ||
+  fail "control-plane routing was not enabled in the controller ConfigMap"
+grep -Fq -- '--enable-multicluster' <<<"${routing_control_plane}" ||
+  fail "control-plane routing did not enable multi-cluster mode"
+grep -Fq -- '--multicluster-role=control-plane' <<<"${routing_control_plane}" ||
+  fail "control-plane routing did not set the control-plane role"
 
 gateway_backend_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
@@ -378,8 +463,51 @@ for expected in \
     fail "gateway backend setting was not rendered: ${expected}"
 done
 
+for expected in \
+  '"maxConcurrentReconciles": 8' \
+  '"maxConcurrentRequests": 16' \
+  '"maxResponseBytes": 65536' \
+  '"minPeriod": "1s"' \
+  '"maxSamples": 100'; do
+  grep -Fq "${expected}" <<<"${controller_config}" ||
+    fail "default routing observer setting was not rendered: ${expected}"
+done
+
+routing_observer_args=(
+  --set ome.multicluster.config.routing.observer.maxConcurrentReconciles=4
+  --set ome.multicluster.config.routing.observer.maxConcurrentRequests=12
+  --set ome.multicluster.config.routing.observer.maxResponseBytes=131072
+  --set-string ome.multicluster.config.routing.observer.minPeriod=2s
+  --set ome.multicluster.config.routing.observer.maxSamples=64
+)
+routing_observer_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_observer_args[@]}" \
+  --show-only templates/ome-controller/configmap.yaml)"
+for expected in \
+  '"maxConcurrentReconciles": 4' \
+  '"maxConcurrentRequests": 12' \
+  '"maxResponseBytes": 131072' \
+  '"minPeriod": "2s"' \
+  '"maxSamples": 64'; do
+  grep -Fq "${expected}" <<<"${routing_observer_config}" ||
+    fail "routing observer override was not rendered: ${expected}"
+done
+routing_observer_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_observer_args[@]}" \
+  --show-only templates/ome-controller/deployment.yaml)"
+routing_observer_checksum="$(grep -m1 'checksum/config:' <<<"${routing_observer_controller}" | awk '{print $2}')"
+[[ -n "${routing_observer_checksum}" ]] ||
+  fail "routing observer controller checksum was not rendered"
+[[ "${default_controller_checksum}" != "${routing_observer_checksum}" ]] ||
+  fail "changing routing observer limits did not roll the controller checksum"
+
 if grep -Fq '"probe"' <<<"${controller_config}"; then
   fail "routing probe was rendered when disabled"
+fi
+if grep -Fq '"capacity": {' <<<"${controller_config}"; then
+  fail "routing capacity was rendered when disabled"
 fi
 
 routing_probe_args=(
@@ -391,6 +519,7 @@ routing_probe_args=(
   --set-string ome.multicluster.config.routing.probe.timeout=3s
   --set ome.multicluster.config.routing.probe.failureThreshold=3
   --set ome.multicluster.config.routing.probe.successThreshold=2
+  --set-string ome.multicluster.config.routing.probe.allFailedPolicy=Drain
 )
 routing_probe_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
@@ -404,7 +533,8 @@ for expected in \
   '"period": "10s"' \
   '"timeout": "3s"' \
   '"failureThreshold": 3' \
-  '"successThreshold": 2'; do
+  '"successThreshold": 2' \
+  '"allFailedPolicy": "Drain"'; do
   grep -Fq "${expected}" <<<"${routing_probe_config}" ||
     fail "routing probe setting was not rendered: ${expected}"
 done
@@ -419,12 +549,66 @@ routing_probe_checksum="$(grep -m1 'checksum/config:' <<<"${routing_probe_contro
 [[ "${default_controller_checksum}" != "${routing_probe_checksum}" ]] ||
   fail "enabling the routing probe did not roll the controller checksum"
 
-if grep -Fq '"publisher"' <<<"${controller_config}"; then
-  fail "TrafficMap publisher was rendered when disabled"
-fi
+routing_capacity_args=(
+  --set-string ome.multicluster.config.routing.capacity.path=/capacity
+  --set-string ome.multicluster.config.routing.capacity.method=GET
+  --set-string ome.multicluster.config.routing.capacity.format=Report
+  --set ome.multicluster.config.routing.capacity.samples=20
+  --set ome.multicluster.config.routing.capacity.quorum=3
+  --set-string ome.multicluster.config.routing.capacity.period=5s
+  --set-string ome.multicluster.config.routing.capacity.timeout=2s
+  --set-string ome.multicluster.config.routing.capacity.maxAge=30s
+)
+routing_capacity_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_capacity_args[@]}" \
+  --show-only templates/ome-controller/configmap.yaml)"
+for expected in \
+  '"path": "/capacity"' \
+  '"method": "GET"' \
+  '"format": "Report"' \
+  '"options": {}' \
+  '"samples": 20' \
+  '"quorum": 3' \
+  '"period": "5s"' \
+  '"timeout": "2s"' \
+  '"maxAge": "30s"'; do
+  grep -Fq "${expected}" <<<"${routing_capacity_config}" ||
+    fail "routing capacity setting was not rendered: ${expected}"
+done
+
+routing_capacity_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  "${routing_capacity_args[@]}" \
+  --show-only templates/ome-controller/deployment.yaml)"
+routing_capacity_checksum="$(grep -m1 'checksum/config:' <<<"${routing_capacity_controller}" | awk '{print $2}')"
+[[ -n "${routing_capacity_checksum}" ]] ||
+  fail "routing capacity controller checksum was not rendered"
+[[ "${default_controller_checksum}" != "${routing_capacity_checksum}" ]] ||
+  fail "enabling routing capacity did not roll the controller checksum"
+
+for expected in \
+  '"publisher": {' \
+  '"name": ""' \
+  '"resyncInterval": "1m"' \
+  '"options": {}'; do
+  grep -Fq "${expected}" <<<"${controller_config}" ||
+    fail "default TrafficMap publisher setting was not rendered: ${expected}"
+done
+assert_default_trafficmap_publisher "${controller_config}" "default values"
+
+legacy_chart_fixtures="$(mktemp -d "${TMPDIR:-/tmp}/ome-resources-legacy-publisher.XXXXXX")"
+trap 'rm -rf -- "${legacy_chart_fixtures}"' EXIT
+
+legacy_publisher_list_config="$(render_legacy_publisher_default '[]' list)"
+assert_default_trafficmap_publisher "${legacy_publisher_list_config}" "legacy publisher list"
+
+legacy_publisher_null_config="$(render_legacy_publisher_default 'null' null)"
+assert_default_trafficmap_publisher "${legacy_publisher_null_config}" "null publisher"
 
 routing_publisher_args=(
   --set-string ome.multicluster.config.routing.publisher.name=test-publisher
+  --set-string ome.multicluster.config.routing.publisher.resyncInterval=30s
   --set-json 'ome.multicluster.config.routing.publisher.options={"key":"value"}'
 )
 routing_publisher_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
@@ -433,6 +617,7 @@ routing_publisher_config="$("${helm_bin}" template ome-resources "${chart_dir}" 
   --show-only templates/ome-controller/configmap.yaml)"
 for expected in \
   '"name": "test-publisher"' \
+  '"resyncInterval": "30s"' \
   '"key":"value"'; do
   grep -Fq "${expected}" <<<"${routing_publisher_config}" ||
     fail "TrafficMap publisher setting was not rendered: ${expected}"
@@ -665,4 +850,45 @@ default_runtime="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --show-only templates/ome-controller/default-runtime.yaml)"
 if grep -Fq 'ome.io/engine' <<<"${default_runtime}"; then
   fail "default-runtime sets ome.io/engine, so installing it would depend on the preset webhook being served"
+fi
+
+# Remote placement access is an optional member-side grant, with platform-owned authentication.
+if grep -Fq 'ome.io/component: multicluster-access' <<<"$rendered"; then
+  fail "remote placement access rendered by default"
+fi
+placement_access() {
+  "${helm_bin}" template ome-resources "${chart_dir}" --namespace ome \
+    --set ome.multiclusterAccess.enabled=true \
+    --show-only templates/ome-controller/rbac/multicluster_access.yaml "$@"
+}
+access="$(placement_access)"
+grep -Fq 'kind: ClusterRole' <<<"$access" || fail "placement role missing"
+for forbidden in 'kind: ServiceAccount' 'kind: Secret' 'kind: ClusterRoleBinding'; do
+  if grep -Fq "$forbidden" <<<"$access"; then
+    fail "role-only placement access rendered $forbidden"
+  fi
+done
+bound_access="$(placement_access \
+  --set 'ome.multiclusterAccess.subjects[0].kind=Group' \
+  --set 'ome.multiclusterAccess.subjects[0].name=placement-controllers')"
+grep -Fq 'kind: ClusterRoleBinding' <<<"$bound_access" || fail "placement binding missing"
+grep -Fq 'name: "placement-controllers"' <<<"$bound_access" || fail "placement group missing"
+if grep -Eq '^kind: (ServiceAccount|Secret)$' <<<"$bound_access"; then
+  fail "placement group access provisioned credentials"
+fi
+for invalid in \
+  'ome.multiclusterAccess.subjects[0].kind=Robot' \
+  'ome.multiclusterAccess.subjects[0].kind=User' \
+  'ome.multiclusterAccess.subjects[0].kind=ServiceAccount,ome.multiclusterAccess.subjects[0].name=existing'; do
+  if placement_access --set "$invalid" >/dev/null 2>&1; then
+    fail "invalid placement access subject rendered: $invalid"
+  fi
+done
+existing_access="$(placement_access \
+  --set 'ome.multiclusterAccess.subjects[0].kind=ServiceAccount' \
+  --set 'ome.multiclusterAccess.subjects[0].name=existing' \
+  --set 'ome.multiclusterAccess.subjects[0].namespace=identity')"
+grep -Fq 'namespace: "identity"' <<<"$existing_access" || fail "existing account namespace missing"
+if grep -Eq '^kind: (ServiceAccount|Secret)$' <<<"$existing_access"; then
+  fail "placement binding provisioned credentials"
 fi
