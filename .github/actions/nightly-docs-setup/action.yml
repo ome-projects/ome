@@ -1,0 +1,29 @@
+name: Set up nightly documentation tools
+description: Prepare Python, gh, and the runner-provided Anthropic key
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+    - name: Export API key from pod environment
+      shell: bash
+      run: |
+        : "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the ome-runner-cpu pod environment}"
+        echo "::add-mask::${ANTHROPIC_API_KEY}"
+        echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+    - name: Install gh CLI if needed
+      shell: bash
+      run: |
+        if ! command -v gh &>/dev/null; then
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64|arm64) arch=arm64 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+          version=2.74.0
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_linux_${arch}.tar.gz" \
+            | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${version}_linux_${arch}/bin/gh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        fi

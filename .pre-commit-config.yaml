@@ -36,6 +36,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: nightly-docs-contract
+        name: nightly documentation scope and publication contract
+        entry: python3 -m unittest discover -s hack/nightly-docs -p '*_test.py'
+        language: system
+        files: ^(hack/nightly-docs/|\.github/workflows/nightly-docs\.yml|\.github/actions/nightly-docs-setup/)
+        pass_filenames: false
+
       - id: dev-images-contract
         name: dev image and chart contract
         description: Verify the complete dev image matrix and SHA-pinned chart preparation.
