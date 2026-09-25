@@ -77,12 +77,15 @@ func TestAutoscaleStatusIssueAndWarningCodesAreStable(t *testing.T) {
 		string(v1alpha1.AutoscaleIssueScaleTargetInvalid),
 		string(v1alpha1.AutoscaleIssueConditionInvalid),
 		string(v1alpha1.AutoscaleIssueConditionConflict),
+		string(v1alpha1.AutoscaleIssuePolicyEvidenceInvalid),
+		string(v1alpha1.AutoscaleIssuePolicyConditionConflict),
 	}
 	assert.Equal(t, []string{
 		"UnknownComponentStatus", "AutoscalerNotReported", "ScaleTargetNotReported",
 		"ClassInvalid", "ManagedByInvalid", "OwnershipMismatch", "SpecSourceInvalid",
 		"UnexpectedScalerEvidence", "ReplicaEvidenceAmbiguous", "ReplicaEvidenceInvalid",
 		"ScaleTargetInvalid", "ConditionInvalid", "ConditionConflict",
+		"PolicyEvidenceInvalid", "PolicyConditionConflict",
 	}, issues)
 
 	warnings := []string{string(v1alpha1.AutoscaleWarningPartialData)}
@@ -337,6 +340,8 @@ func TestAutoscaleStatusCompactIssueAliasesAreDistinctAndBounded(t *testing.T) {
 		{code: v1alpha1.AutoscaleIssueScaleTargetInvalid, want: "BadTarget"},
 		{code: v1alpha1.AutoscaleIssueConditionInvalid, want: "BadCondition"},
 		{code: v1alpha1.AutoscaleIssueConditionConflict, want: "CondConflict"},
+		{code: v1alpha1.AutoscaleIssuePolicyEvidenceInvalid, want: "BadPolicy"},
+		{code: v1alpha1.AutoscaleIssuePolicyConditionConflict, want: "PolicyClash"},
 	}
 
 	seen := make(map[string]v1alpha1.AutoscaleIssueCode, len(tests))

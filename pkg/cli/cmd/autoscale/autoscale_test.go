@@ -120,6 +120,8 @@ as UTC MonDD HH:MMZ. ISSUES uses compact aliases:
   BadTarget=ScaleTargetInvalid
   BadCondition=ConditionInvalid
   CondConflict=ConditionConflict
+  BadPolicy=PolicyEvidenceInvalid
+  PolicyClash=PolicyConditionConflict
 Unknown or future issue codes use X# followed by a stable 10-digit hex digest.
 Use -o wide for exact issue codes, complete identities, and timestamps.
 

@@ -159,7 +159,8 @@ func statusAutoscaleIssueKnown(code AutoscaleIssueCode) bool {
 		AutoscaleIssueSpecSourceInvalid, AutoscaleIssueUnexpectedScalerEvidence,
 		AutoscaleIssueReplicaEvidenceAmbiguous, AutoscaleIssueReplicaEvidenceInvalid,
 		AutoscaleIssueScaleTargetInvalid, AutoscaleIssueConditionInvalid,
-		AutoscaleIssueConditionConflict:
+		AutoscaleIssueConditionConflict, AutoscaleIssuePolicyEvidenceInvalid,
+		AutoscaleIssuePolicyConditionConflict:
 		return true
 	default:
 		return false

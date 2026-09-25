@@ -427,8 +427,12 @@ func TestProjectAcceptsEveryKnownSpecSource(t *testing.T) {
 func TestProjectPolicySpecSourceRemainsReported(t *testing.T) {
 	status := reportedHPA()
 	status.SpecSource = "policy"
+	status.Policy = validPolicyProvenance()
+	status.Conditions = append(status.Conditions, autoscalerResolved(
+		metav1.ConditionTrue, omev1beta1.AutoscalerResolvedReasonRenderedFromPolicy,
+	))
 
-	got, err := Project(inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status), fixedClock())
+	got, err := Project(inferenceServiceWithDeclaredPolicy(status), fixedClock())
 	require.NoError(t, err)
 	require.Len(t, got.Content.Components, 1)
 	assert.Equal(t, reportv1alpha1.AutoscaleComponentReported, got.Content.Components[0].State)
@@ -585,10 +589,13 @@ func TestProjectKEDAConditionsUseTheirOwnFixedOrder(t *testing.T) {
 func TestProjectIgnoresValidAutoscalerResolvedPolicyCondition(t *testing.T) {
 	transition := metav1.NewTime(time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC))
 	status := reportedHPA()
+	status.SpecSource = "isvc"
 	status.Conditions = append(status.Conditions, metav1.Condition{
 		Type: omev1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionTrue,
-		Reason: omev1beta1.AutoscalerResolvedReasonInlinePrecedence, LastTransitionTime: transition,
+		Reason: omev1beta1.AutoscalerResolvedReasonInlinePrecedence, ObservedGeneration: 7,
+		LastTransitionTime: transition,
 	})
+	status.ShadowedPolicyRef = &omev1beta1.ShadowedAutoscalerPolicy{Name: "shadowed-policy"}
 	isvc := inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status)
 	isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{
 		Autoscaler:          &omev1beta1.ComponentAutoscaler{Class: omev1beta1.AutoscalerHPA},
@@ -606,7 +613,7 @@ func TestProjectIgnoresValidAutoscalerResolvedPolicyCondition(t *testing.T) {
 	assert.NotContains(t, issueCodes(got.Content.Issues), reportv1alpha1.AutoscaleIssueConditionInvalid)
 
 	status.Conditions = status.Conditions[1:]
-	got, err = Project(inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status), fixedClock())
+	got, err = Project(isvc, fixedClock())
 	require.NoError(t, err)
 	assert.Equal(t, reportv1alpha1.AutoscaleConditionsNotReported, got.Content.Components[0].Conditions.State)
 	assert.Empty(t, got.Content.Components[0].Conditions.Items)
@@ -626,9 +633,11 @@ func TestProjectIgnoresValidAutoscalerResolvedForExternalAndNone(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			status := &omev1beta1.ComponentAutoscalerStatus{
 				Class: test.class, ManagedBy: test.managed, SpecSource: "isvc",
+				ShadowedPolicyRef: &omev1beta1.ShadowedAutoscalerPolicy{Name: "shadowed-policy"},
 				Conditions: []metav1.Condition{{
 					Type: omev1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionTrue,
-					Reason: omev1beta1.AutoscalerResolvedReasonInlinePrecedence, LastTransitionTime: transition,
+					Reason: omev1beta1.AutoscalerResolvedReasonInlinePrecedence, ObservedGeneration: 7,
+					LastTransitionTime: transition,
 				}},
 			}
 			isvc := inferenceServiceWithAutoscaler(omev1beta1.EngineComponent, status)
@@ -664,9 +673,12 @@ func TestProjectMalformedExternalConditionDegradesToPartialUnavailable(t *testin
 
 	require.NoError(t, err)
 	require.Len(t, got.Content.Components, 1)
-	assert.Equal(t, reportv1alpha1.AutoscaleComponentPartial, got.Content.Components[0].State)
+	assert.Equal(t, reportv1alpha1.AutoscaleComponentInvalid, got.Content.Components[0].State)
 	assert.Equal(t, reportv1alpha1.AutoscaleConditionsUnavailable, got.Content.Components[0].Conditions.State)
-	assert.Equal(t, []reportv1alpha1.AutoscaleIssueCode{reportv1alpha1.AutoscaleIssueConditionInvalid}, issueCodes(got.Content.Issues))
+	assert.Equal(t, []reportv1alpha1.AutoscaleIssueCode{
+		reportv1alpha1.AutoscaleIssueConditionInvalid,
+		reportv1alpha1.AutoscaleIssuePolicyEvidenceInvalid,
+	}, issueCodes(got.Content.Issues))
 	encoded, err := json.Marshal(got)
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "SECRET")

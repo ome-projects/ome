@@ -31,8 +31,9 @@ var knownComponents = []struct {
 }
 
 // Project reports only evidence already mirrored onto the parent
-// InferenceService. It performs no child-object reads and makes no freshness
-// claim about that evidence.
+// InferenceService. It performs no child-object reads and makes no wall-clock
+// freshness claim. Policy evidence is accepted only when it is bound to the
+// current parent generation and declared component policy intent.
 func Project(
 	isvc *omev1beta1.InferenceService,
 	clock reportv1alpha1.Clock,
@@ -68,7 +69,13 @@ func Project(
 		if !ok {
 			continue
 		}
-		projected, issues := projectComponent(isvc.Namespace, component.report, status)
+		projected, issues := projectComponent(
+			isvc.Namespace,
+			isvc.Generation,
+			componentExtension(isvc, component.api),
+			component.report,
+			status,
+		)
 		content.Components = append(content.Components, projected)
 		content.Issues = append(content.Issues, issues...)
 	}
@@ -96,6 +103,8 @@ func Project(
 
 func projectComponent(
 	namespace string,
+	isvcGeneration int64,
+	extension *omev1beta1.ComponentExtensionSpec,
 	componentType reportv1alpha1.RuntimeComponentType,
 	status omev1beta1.ComponentStatusSpec,
 ) (reportv1alpha1.AutoscaleComponentStatus, []reportv1alpha1.AutoscaleIssue) {
@@ -173,6 +182,13 @@ func projectComponent(
 		specSourceOK = false
 		addIssue(reportv1alpha1.AutoscaleIssueSpecSourceInvalid)
 	}
+	policyOK := true
+	var policyIssue reportv1alpha1.AutoscaleIssueCode
+	component.Policy, policyIssue = projectPolicy(autoscaler, isvcGeneration, extension)
+	if policyIssue != "" {
+		policyOK = false
+		addIssue(policyIssue)
+	}
 
 	matrixOK := classOK && managedByOK && ownershipMatches(component.Class, component.ManagedBy)
 	if classOK && managedByOK && !matrixOK {
@@ -223,11 +239,32 @@ func projectComponent(
 		addIssue(reportv1alpha1.AutoscaleIssueUnexpectedScalerEvidence)
 	}
 
-	component.State = summarizeComponent(component, classOK && managedByOK && specSourceOK && matrixOK)
+	component.State = summarizeComponent(component, classOK && managedByOK && specSourceOK && matrixOK && policyOK)
 	if malformedConditions && component.State == reportv1alpha1.AutoscaleComponentReported {
 		component.State = reportv1alpha1.AutoscaleComponentPartial
 	}
 	return component, issues
+}
+
+func componentExtension(
+	isvc *omev1beta1.InferenceService,
+	component omev1beta1.ComponentType,
+) *omev1beta1.ComponentExtensionSpec {
+	switch component {
+	case omev1beta1.EngineComponent:
+		if isvc.Spec.Engine != nil {
+			return &isvc.Spec.Engine.ComponentExtensionSpec
+		}
+	case omev1beta1.DecoderComponent:
+		if isvc.Spec.Decoder != nil {
+			return &isvc.Spec.Decoder.ComponentExtensionSpec
+		}
+	case omev1beta1.RouterComponent:
+		if isvc.Spec.Router != nil {
+			return &isvc.Spec.Router.ComponentExtensionSpec
+		}
+	}
+	return nil
 }
 
 func classifyNonOMEConditions(conditions []metav1.Condition) (unexpected, malformed bool) {

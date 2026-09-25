@@ -74,6 +74,32 @@ const (
 	AutoscaleSpecSourceUnknown AutoscaleSpecSource = "Unknown"
 )
 
+// AutoscalePolicyState distinguishes active provenance from retained
+// last-known-good provenance and non-active policy evidence.
+type AutoscalePolicyState string
+
+const (
+	AutoscalePolicyCurrent     AutoscalePolicyState = "Current"
+	AutoscalePolicyHeld        AutoscalePolicyState = "Held"
+	AutoscalePolicyShadowed    AutoscalePolicyState = "Shadowed"
+	AutoscalePolicyUnresolved  AutoscalePolicyState = "Unresolved"
+	AutoscalePolicyUnsupported AutoscalePolicyState = "Unsupported"
+)
+
+// AutoscalePolicyResolution is the closed, message-free projection of the
+// controller's AutoscalerResolved condition reason.
+type AutoscalePolicyResolution string
+
+const (
+	AutoscalePolicyRenderedFromPolicy AutoscalePolicyResolution = "RenderedFromPolicy"
+	AutoscalePolicyInlinePrecedence   AutoscalePolicyResolution = "InlinePrecedence"
+	AutoscalePolicyNotFound           AutoscalePolicyResolution = "PolicyNotFound"
+	AutoscalePolicyInvalid            AutoscalePolicyResolution = "PolicyInvalid"
+	AutoscalePolicyAuthNotFound       AutoscalePolicyResolution = "AuthNotFound"
+	AutoscalePolicyClassUnavailable   AutoscalePolicyResolution = "ClassUnavailable"
+	AutoscalePolicyUnsupportedMode    AutoscalePolicyResolution = "UnsupportedDeploymentMode"
+)
+
 type AutoscaleTargetState string
 
 const (
@@ -145,6 +171,8 @@ const (
 	AutoscaleIssueScaleTargetInvalid       AutoscaleIssueCode = "ScaleTargetInvalid"
 	AutoscaleIssueConditionInvalid         AutoscaleIssueCode = "ConditionInvalid"
 	AutoscaleIssueConditionConflict        AutoscaleIssueCode = "ConditionConflict"
+	AutoscaleIssuePolicyEvidenceInvalid    AutoscaleIssueCode = "PolicyEvidenceInvalid"
+	AutoscaleIssuePolicyConditionConflict  AutoscaleIssueCode = "PolicyConditionConflict"
 )
 
 type AutoscaleWarningCode string
@@ -265,12 +293,25 @@ type AutoscaleConditionsStatus struct {
 	Items []AutoscaleCondition     `json:"items"`
 }
 
+// AutoscalePolicyStatus contains only bounded policy evidence mirrored onto
+// the parent InferenceService. RenderDigest is the active/retained resolved
+// digest for Current/Held and the would-render preview for Shadowed.
+type AutoscalePolicyStatus struct {
+	State          AutoscalePolicyState      `json:"state"`
+	Resolution     AutoscalePolicyResolution `json:"resolution"`
+	Name           string                    `json:"name,omitempty"`
+	Generation     int64                     `json:"generation,omitempty"`
+	PortableDigest string                    `json:"portableDigest,omitempty"`
+	RenderDigest   string                    `json:"renderDigest,omitempty"`
+}
+
 type AutoscaleComponentStatus struct {
 	Type       RuntimeComponentType      `json:"type"`
 	State      AutoscaleComponentState   `json:"state"`
 	Class      AutoscaleClass            `json:"class"`
 	ManagedBy  AutoscaleManagedBy        `json:"managedBy"`
 	SpecSource AutoscaleSpecSource       `json:"specSource"`
+	Policy     *AutoscalePolicyStatus    `json:"policy,omitempty"`
 	Target     AutoscaleTarget           `json:"target"`
 	Replicas   AutoscaleReplicaStatus    `json:"replicas"`
 	LiveScale  *AutoscaleLiveScale       `json:"liveScale,omitempty"`
@@ -405,6 +446,8 @@ func (c AutoscaleStatusContent) Table() report.Table {
 		"CLASS",
 		"MANAGED-BY",
 		"SPEC-SOURCE",
+		"POLICY-STATE",
+		"POLICY",
 		"TARGET-KIND",
 		"TARGET-NAME",
 		"TARGET-EVIDENCE",
@@ -498,6 +541,12 @@ func compactAutoscaleComponentValues(component AutoscaleComponentStatus) map[str
 		"REPLICA-EVIDENCE": string(component.Replicas.State),
 		"LAST-SCALE":       compactAutoscaleTimeCell(component.Replicas.LastScaleTime),
 		"COND-EVIDENCE":    string(component.Conditions.State),
+	}
+	if component.Policy != nil {
+		values["POLICY-STATE"] = string(component.Policy.State)
+		if component.Policy.Name != "" {
+			values["POLICY"] = printers.BoundedMiddleCell(component.Policy.Name, compactAutoscaleCellWidth)
+		}
 	}
 	if component.LiveScale != nil {
 		values["LIVE-EVIDENCE"] = string(component.LiveScale.Evidence)
@@ -661,6 +710,10 @@ func compactAutoscaleIssueAlias(code AutoscaleIssueCode) string {
 		return "BadCondition"
 	case AutoscaleIssueConditionConflict:
 		return "CondConflict"
+	case AutoscaleIssuePolicyEvidenceInvalid:
+		return "BadPolicy"
+	case AutoscaleIssuePolicyConditionConflict:
+		return "PolicyClash"
 	default:
 		// Future values are outside the closed issue vocabulary. Avoid
 		// echoing an untrusted value while retaining a stable 40-bit identity.
@@ -677,11 +730,19 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 		"STATE", "COMPONENT", "COMPONENT-STATE", "CLASS", "MANAGED-BY", "SPEC-SOURCE",
 		"TARGET", "TARGET-EVIDENCE", "CURRENT", "DESIRED", "REPLICA-EVIDENCE", "LAST-SCALE", "CONDITION-EVIDENCE", "CONDITIONS", "ISSUES",
 	}, Rows: [][]string{}}
+	policyRequested := false
 	liveRequested := false
 	scalerRequested := false
 	for _, component := range canonical.Components {
+		policyRequested = policyRequested || component.Policy != nil
 		liveRequested = liveRequested || component.LiveScale != nil
 		scalerRequested = scalerRequested || component.LiveScaler != nil
+	}
+	if policyRequested {
+		table.Headers = slices.Insert(table.Headers, 6,
+			"POLICY-STATE", "POLICY", "POLICY-RESOLUTION", "POLICY-GENERATION",
+			"POLICY-PORTABLE", "POLICY-RENDER",
+		)
 	}
 	if liveRequested {
 		table.Headers = append(table.Headers, "LIVE-EVIDENCE", "LIVE-SPEC", "LIVE-CURRENT", "LIVE-COUNT")
@@ -700,12 +761,25 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 		row := []string{
 			string(canonical.Summary.State), string(component.Type), string(component.State),
 			string(component.Class), string(component.ManagedBy), string(component.SpecSource),
+		}
+		if policyRequested {
+			if component.Policy == nil {
+				row = append(row, "-", "-", "-", "-", "-", "-")
+			} else {
+				row = append(row,
+					string(component.Policy.State), autoscaleStringCell(component.Policy.Name),
+					string(component.Policy.Resolution), autoscaleGenerationCell(component.Policy.Generation),
+					autoscaleStringCell(component.Policy.PortableDigest), autoscaleStringCell(component.Policy.RenderDigest),
+				)
+			}
+		}
+		row = append(row,
 			autoscaleTargetCell(component.Target), string(component.Target.State), autoscaleInt32Cell(component.Replicas.CurrentReplicas),
 			autoscaleInt32Cell(component.Replicas.DesiredReplicas), string(component.Replicas.State),
 			autoscaleTimeCell(component.Replicas.LastScaleTime), string(component.Conditions.State),
 			autoscaleConditionsCell(component.Conditions.Items),
 			autoscaleIssuesCell(component.Type, canonical.Issues),
-		}
+		)
 		if liveRequested {
 			live := component.LiveScale
 			if live == nil {
@@ -733,6 +807,10 @@ func (c AutoscaleStatusContent) WideTable() report.Table {
 
 func canonicalAutoscaleComponent(component AutoscaleComponentStatus) AutoscaleComponentStatus {
 	result := component
+	if component.Policy != nil {
+		copy := *component.Policy
+		result.Policy = &copy
+	}
 	if component.LiveScaler != nil {
 		copy := *component.LiveScaler
 		copy.CurrentReplicas = copyInt32(component.LiveScaler.CurrentReplicas)
@@ -835,11 +913,33 @@ func compareAutoscaleComponents(a, b AutoscaleComponentStatus) int {
 		cmp.Compare(a.Class, b.Class),
 		cmp.Compare(a.ManagedBy, b.ManagedBy),
 		cmp.Compare(a.SpecSource, b.SpecSource),
+		compareAutoscalePolicies(a.Policy, b.Policy),
 		compareAutoscaleTargets(a.Target, b.Target),
 		compareAutoscaleReplicas(a.Replicas, b.Replicas),
 		compareAutoscaleLiveScale(a.LiveScale, b.LiveScale),
 		compareAutoscaleLiveScaler(a.LiveScaler, b.LiveScaler),
 		compareAutoscaleConditions(a.Conditions, b.Conditions),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareAutoscalePolicies(a, b *AutoscalePolicyStatus) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	}
+	for _, result := range []int{
+		cmp.Compare(a.State, b.State), cmp.Compare(a.Resolution, b.Resolution),
+		cmp.Compare(a.Name, b.Name), cmp.Compare(a.Generation, b.Generation),
+		cmp.Compare(a.PortableDigest, b.PortableDigest), cmp.Compare(a.RenderDigest, b.RenderDigest),
 	} {
 		if result != 0 {
 			return result
@@ -1051,6 +1151,20 @@ func autoscaleInt32Cell(value *int32) string {
 		return "-"
 	}
 	return strconv.FormatInt(int64(*value), 10)
+}
+
+func autoscaleGenerationCell(value int64) string {
+	if value == 0 {
+		return "-"
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func autoscaleStringCell(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func autoscaleTimeCell(value *time.Time) string {
