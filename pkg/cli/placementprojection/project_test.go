@@ -49,7 +49,7 @@ func TestProjectStatusPreservesAdmittingPhases(t *testing.T) {
 	}{
 		{"admitting", ome.PlacementPhaseAdmitting, ome.CandidatePhaseAdmitting, "Admitting", "Admitting"},
 		{"legacy-racing-admitted", "Racing", "Admitted", "Racing", "Admitted"},
-		{"placed", ome.PlacementPhasePlaced, ome.CandidatePhasePlaced, "Placed", "Placed"},
+		{"placed", ome.PlacementPhasePlaced, ome.CandidatePhasePlaced, "Placed", "Placed"}, //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
 		{"empty", "", "", "NotRecorded", "NotRecorded"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -165,7 +165,7 @@ func TestProjectStatusDiscardsCandidatePhaseIssuesOnInvalidHomes(t *testing.T) {
 		wantState v.PlacementValue
 	}{
 		{"malformed", ome.CandidatePlacement{Cluster: "east", Phase: "FutureCandidate\ncontrol-text\x1b[2J"}, "MalformedPayload"},
-		{"conflicting-duplicate", ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced}, "ConflictingDuplicates"},
+		{"conflicting-duplicate", ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced}, "ConflictingDuplicates"}, //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := fixture(t)
@@ -253,7 +253,7 @@ func TestProjectStatusDiscardsCandidateDerivedIssuesOnRejectedCandidateSet(t *te
 		},
 		{
 			name:      "conflicting-duplicate",
-			candidate: ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced},
+			candidate: ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced}, //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
 			wantState: "ConflictingDuplicates",
 		},
 	}
@@ -341,7 +341,7 @@ func TestProjectStatusAggregatesUnknownCandidatePhasesAcrossBounds(t *testing.T)
 			s := fixture(t)
 			candidates := make([]ome.CandidatePlacement, tc.unique)
 			for i := range candidates {
-				phase := ome.CandidatePhasePlaced
+				phase := ome.CandidatePhasePlaced //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
 				if i >= tc.unknownFrom {
 					phase = "FutureCandidate"
 				}
