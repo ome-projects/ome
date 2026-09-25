@@ -111,10 +111,11 @@ func TestWaitSourcePreservesAuthWrappersAndWarningOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if wrapped.Load() != 1 || warnings.calls.Load() != 0 {
-		t.Fatal("wrapper/warning boundary changed")
-	}
-	if config.WarningHandler != warnings || config.WarningHandlerWithContext != warnings || config.Timeout != 40*time.Millisecond || source.config.Timeout != 40*time.Millisecond {
-		t.Fatal("caller configuration ownership changed")
-	}
+	require.Equal(t, int32(1), wrapped.Load())
+	require.Zero(t, warnings.calls.Load())
+	require.Same(t, warnings, config.WarningHandler)
+	require.Same(t, warnings, config.WarningHandlerWithContext)
+	require.Equal(t, 40*time.Millisecond, config.Timeout)
+	require.Equal(t, 40*time.Millisecond, source.requestTimeout)
+	require.Zero(t, source.config.Timeout)
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -34,10 +35,14 @@ func TestRealWireNamedGetAndExactWatch(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Query().Get("watch") == "true" {
 			require.Equal(t, "/apis/ome.io/v1beta1/namespaces/work/inferenceservices", r.URL.Path)
-			require.Equal(t, "metadata.name=service", r.URL.Query().Get("fieldSelector"))
-			require.Equal(t, "opaque:rv", r.URL.Query().Get("resourceVersion"))
-			require.Equal(t, "10s", r.URL.Query().Get("timeout"))
-			require.Len(t, r.URL.Query(), 4)
+			require.Equal(t, url.Values{
+				"allowWatchBookmarks": {"true"},
+				"fieldSelector":       {"metadata.name=service"},
+				"resourceVersion":     {"opaque:rv"},
+				"timeout":             {"5m0s"},
+				"timeoutSeconds":      {"300"},
+				"watch":               {"true"},
+			}, r.URL.Query())
 			require.NoError(t, json.NewEncoder(w).Encode(struct {
 				Type   string                `json:"type"`
 				Object *ome.InferenceService `json:"object"`
@@ -123,13 +128,18 @@ func TestUnknownLengthBodyBoundAndCallerWrapperPreserved(t *testing.T) {
 	require.Nil(t, cfg.GroupVersion)
 	require.Empty(t, cfg.APIPath)
 	require.NotNil(t, old)
-	require.Equal(t, 3*time.Second, s.config.Timeout)
+	require.Equal(t, 3*time.Second, s.requestTimeout)
+	require.Zero(t, s.config.Timeout)
 }
 func TestRequestTimeoutCapAndInvalidConstruction(t *testing.T) {
 	for _, tc := range []struct{ input, want time.Duration }{{0, 10 * time.Second}, {time.Minute, 10 * time.Second}, {time.Second, time.Second}} {
 		s, err := NewInferenceService(&rest.Config{Host: "http://localhost", Timeout: tc.input}, "work", "service")
 		require.NoError(t, err)
-		require.Equal(t, tc.want, s.config.Timeout)
+		require.Equal(t, tc.want, s.requestTimeout)
+		require.Zero(t, s.config.Timeout)
+		client, ok := s.client.(*rest.RESTClient)
+		require.True(t, ok)
+		require.Zero(t, client.Client.Timeout)
 	}
 	for _, tc := range []struct {
 		cfg      *rest.Config
