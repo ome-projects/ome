@@ -252,6 +252,39 @@ func TestFactoryClientsSendSameProductUserAgent(t *testing.T) {
 	require.Equal(t, 300, config.Burst)
 }
 
+func TestRESTConfigCachedAccessDoesNotRaceConfigCopies(t *testing.T) {
+	config := &rest.Config{UserAgent: "operations-console/2"}
+	f := &defaultFactory{rest: config}
+	got, err := f.RESTConfig()
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for range 4 {
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			<-start
+			for range 10_000 {
+				if _, err := f.RESTConfig(); err != nil {
+					t.Errorf("RESTConfig() error = %v", err)
+					return
+				}
+			}
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			for range 10_000 {
+				_ = protobufConfig(got)
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	require.Equal(t, "operations-console/2 kubectl-ome/unknown", got.UserAgent)
+}
+
 func setGitVersion(t *testing.T, gitVersion string) {
 	t.Helper()
 	previous := omeversion.GitVersion

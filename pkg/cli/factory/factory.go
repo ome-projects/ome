@@ -49,18 +49,22 @@ func New(flags *genericclioptions.ConfigFlags) Factory {
 type defaultFactory struct {
 	flags *genericclioptions.ConfigFlags
 
-	mu      sync.Mutex
-	rest    *rest.Config
-	kube    kubernetes.Interface
-	ome     versioned.Interface
-	runtime ctrlclient.Client
+	mu                 sync.Mutex
+	rest               *rest.Config
+	restUserAgentReady bool
+	kube               kubernetes.Interface
+	ome                versioned.Interface
+	runtime            ctrlclient.Client
 }
 
 func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.rest != nil {
-		addProductUserAgent(f.rest, omeversion.GitVersion)
+		if !f.restUserAgentReady {
+			addProductUserAgent(f.rest, omeversion.GitVersion)
+			f.restUserAgentReady = true
+		}
 		return f.rest, nil
 	}
 	cfg, err := f.flags.ToRESTConfig()
@@ -76,6 +80,7 @@ func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	cfg.Burst = 300
 	addProductUserAgent(cfg, omeversion.GitVersion)
 	f.rest = cfg
+	f.restUserAgentReady = true
 	return cfg, nil
 }
 
