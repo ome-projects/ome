@@ -131,6 +131,7 @@ func Run[T any](ctx context.Context, source Source[T], predicate Predicate[T], o
 	defer func() { cancel(nil); timer.Stop(); <-done }()
 	s := runState[T]{ctx: child, parent: ctx, source: source, predicate: predicate, options: options,
 		getBudget: int((options.Timeout+options.PollInterval-1)/options.PollInterval) + 2,
+		deadline:  start.Add(options.Timeout),
 		result:    Result[T]{Method: MethodInitialGET}}
 	err := s.run()
 	s.result.Elapsed = options.Clock.Since(start)
@@ -163,6 +164,7 @@ type runState[T any] struct {
 	predicate   Predicate[T]
 	options     Options
 	getBudget   int
+	deadline    time.Time
 	uid         types.UID
 	rv          string
 	result      Result[T]
@@ -171,6 +173,10 @@ type runState[T any] struct {
 func (s *runState[T]) canceled() (bool, error) {
 	if s.parent.Err() != nil {
 		return true, &Error{Reason: ReasonCanceled}
+	}
+	if !s.deadline.IsZero() && !s.options.Clock.Now().Before(s.deadline) {
+		s.result.Outcome = OutcomeTimedOut
+		return true, nil
 	}
 	if s.ctx.Err() == nil {
 		return false, nil
