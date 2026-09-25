@@ -45,6 +45,7 @@ type ActionResult struct {
 	FollowUp     string                `json:"followUp,omitempty"`
 	Scale        *ScaleActionDetails   `json:"scale,omitempty"`
 	Traffic      *TrafficActionDetails `json:"traffic,omitempty"`
+	Rollout      *RolloutActionDetails `json:"rollout,omitempty"`
 }
 
 // NewActionResult creates an unapplied result using an injectable clock.
@@ -78,6 +79,10 @@ func (r ActionResult) Canonical() ActionResult {
 		copy := *r.Traffic
 		result.Traffic = &copy
 	}
+	if r.Rollout != nil {
+		copy := *r.Rollout
+		result.Rollout = &copy
+	}
 	if result.DryRun != DryRunNone {
 		result.Applied = false
 	}
@@ -95,6 +100,9 @@ func (r ActionResult) Table() report.Table {
 	if r.Traffic != nil {
 		return r.trafficTable(false)
 	}
+	if r.Rollout != nil {
+		return r.rolloutTable(false)
+	}
 	rows := [][]string{{"action", r.Action}, {"target", r.Target.displayName()}, {"dry-run", string(r.DryRun)}, {"accepted", yesNo(r.Accepted)}, {"applied", yesNo(r.Applied)}, {"request-id", orDash(r.RequestID)}, {"revision-hash", orDash(r.RevisionHash)}, {"message", orDash(r.Message)}, {"follow-up", orDash(r.FollowUp)}, {"hint", "Use -o json or -o yaml for full values."}}
 	for i := range rows {
 		rows[i][1] = printers.BoundedCell(rows[i][1], 56)
@@ -109,6 +117,9 @@ func (r ActionResult) WideTable() report.Table {
 	}
 	if r.Traffic != nil {
 		return r.trafficTable(true)
+	}
+	if r.Rollout != nil {
+		return r.rolloutTable(true)
 	}
 	return r.Table()
 }

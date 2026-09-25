@@ -105,6 +105,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome rollout history",
 		"ome rollout pause",
 		"ome rollout promote",
+		"ome rollout repin",
 		"ome rollout resume",
 		"ome rollout rollback",
 		"ome rollout status",
@@ -136,6 +137,10 @@ func TestRootCommandTree(t *testing.T) {
 		if err != nil || command.Use != action+" INFERENCESERVICE" || !strings.Contains(command.Long, "RestartPolicy repair continues") {
 			t.Fatalf("guarded rollout %s is not registered with current semantics", action)
 		}
+	}
+	repin, _, err := root.Find([]string{"rollout", "repin"})
+	if err != nil || repin.Use != "repin INFERENCESERVICE" || !strings.Contains(repin.Long, "one bounded uncached GET") {
+		t.Fatalf("guarded rollout repin is not registered with its bounded read contract")
 	}
 	explain, _, err := root.Find([]string{"runtime", "explain"})
 	if err != nil {

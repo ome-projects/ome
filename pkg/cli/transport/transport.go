@@ -4,6 +4,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -27,8 +28,9 @@ var (
 	transportParameterCodec = runtime.NewParameterCodec(transportScheme)
 )
 
-// ErrResponseIdentity means a response cannot prove mutation acceptance.
-// The request may already have applied; callers must not replay it.
+// ErrResponseIdentity means a response cannot prove the exact resource and
+// response identity a guarded operation requested. A mutation may already have
+// applied; mutation callers must not replay it.
 var ErrResponseIdentity = errors.New("API response identity is invalid or ambiguous; outcome unknown")
 
 func init() {
@@ -170,6 +172,40 @@ func (c *Client) GetInferenceReplica(ctx context.Context, namespace, name string
 		Do(ctx).
 		Into(result)
 	return result, err
+}
+
+// GetInferenceService performs one uncached, non-retrying GET through the
+// transport's redirect and response-size guards. Identity-envelope ambiguity
+// is rejected before the typed object is returned to a guarded action.
+func (c *Client) GetInferenceService(ctx context.Context, namespace, name string, options metav1.GetOptions) (*v1beta1.InferenceService, error) {
+	result := c.rest.Get().
+		Namespace(namespace).
+		Resource("inferenceservices").
+		Name(name).
+		VersionedParams(&options, transportParameterCodec).
+		WarningHandlerWithContext(rest.NoWarnings{}).
+		MaxRetries(0).
+		Do(ctx)
+	if err := result.Error(); err != nil {
+		return nil, err
+	}
+	raw, err := result.Raw()
+	if err != nil {
+		return nil, err
+	}
+	if !unambiguousResponseIdentity(raw) || !unambiguousTypedFields(raw, v1beta1.InferenceService{}) {
+		return nil, ErrResponseIdentity
+	}
+	service := &v1beta1.InferenceService{}
+	if err := json.Unmarshal(raw, service); err != nil {
+		return nil, err
+	}
+	if service.APIVersion != v1beta1.SchemeGroupVersion.String() ||
+		service.Kind != "InferenceService" ||
+		service.Name != name || service.Namespace != namespace {
+		return nil, ErrResponseIdentity
+	}
+	return service, nil
 }
 
 // GetInferenceReplicaScale returns an InferenceReplica's scale subresource.
