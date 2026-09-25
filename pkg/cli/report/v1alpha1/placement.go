@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"sigs.k8s.io/ome/pkg/cli/printers"
@@ -178,29 +179,36 @@ type PlacementExplainContent struct {
 }
 
 type PlacementCapacity struct {
-	Allocated   PlacementCount `json:"allocated"`
-	Ready       PlacementCount `json:"ready"`
-	Factor      string         `json:"factor,omitempty"`
-	FactorState PlacementValue `json:"factorState"`
-	Source      PlacementValue `json:"source"`
-	Reported    PlacementCount `json:"reported"`
+	Allocated      PlacementCount `json:"allocated"`
+	Ready          PlacementCount `json:"ready"`
+	Factor         string         `json:"factor,omitempty"`
+	FactorState    PlacementValue `json:"factorState"`
+	Source         PlacementValue `json:"source"`
+	Reported       PlacementCount `json:"reported"`
+	FallbackReason PlacementValue `json:"fallbackReason"`
 }
 
 type PlacementProbe struct {
 	Result              PlacementValue    `json:"result"`
+	PolicyDigest        string            `json:"policyDigest,omitempty"`
+	PolicyDigestState   PlacementValue    `json:"policyDigestState"`
+	Gated               bool              `json:"gated"`
+	GatedState          PlacementValue    `json:"gatedState"`
 	LastAttemptTime     *time.Time        `json:"lastAttemptTime,omitempty"`
 	ConsecutiveFailures PlacementCount    `json:"consecutiveFailures"`
 	Source              PlacementEvidence `json:"source"`
 }
 
 type PlacementRoute struct {
-	Cluster  string             `json:"cluster"`
-	Address  PlacementAddress   `json:"address"`
-	Weight   int32              `json:"weight"`
-	Healthy  bool               `json:"healthy"`
-	Capacity *PlacementCapacity `json:"capacity,omitempty"`
-	Probe    PlacementProbe     `json:"probe"`
-	Source   PlacementEvidence  `json:"source"`
+	Cluster      string             `json:"cluster"`
+	Address      PlacementAddress   `json:"address"`
+	Weight       int32              `json:"weight"`
+	Healthy      bool               `json:"healthy"`
+	DrainRefs    []string           `json:"drainRefs"`
+	DrainPreview PlacementPreview   `json:"drainPreview"`
+	Capacity     *PlacementCapacity `json:"capacity,omitempty"`
+	Probe        PlacementProbe     `json:"probe"`
+	Source       PlacementEvidence  `json:"source"`
 }
 
 type PlacementGateway struct {
@@ -218,6 +226,8 @@ type PlacementRouting struct {
 	EntryPreview          PlacementPreview     `json:"entryPreview"`
 	ProbePreview          PlacementPreview     `json:"probePreview"`
 	Routable              PlacementCondition   `json:"routable"`
+	OverrideActive        PlacementCondition   `json:"overrideActive"`
+	CapacityFallback      PlacementCondition   `json:"capacityFallback"`
 	Acknowledgement       PlacementValue       `json:"acknowledgement"`
 	AcknowledgementSource PlacementEvidence    `json:"acknowledgementSource"`
 	Published             PlacementCondition   `json:"published"`
@@ -277,6 +287,8 @@ func (c PlacementEndpointContent) Canonical() PlacementEndpointContent {
 	c.Entries = append([]PlacementRoute{}, c.Entries...)
 	for i := range c.Entries {
 		e := &c.Entries[i]
+		e.DrainRefs = append([]string{}, e.DrainRefs...)
+		sort.Strings(e.DrainRefs)
 		if e.Capacity != nil {
 			capacity := *e.Capacity
 			capacity.Allocated = placementCopyCount(capacity.Allocated)
@@ -427,19 +439,43 @@ func (c PlacementEndpointContent) Table() report.Table {
 func (c PlacementEndpointContent) placementEndpointTable(wide bool) report.Table {
 	rows := placementSummary(c.Status)
 	rows = append(rows, placementAcquisitionRows("TrafficMap", c.Routing.Acquisition)...)
-	rows = append(rows, []string{"Entry inspection", placementPreviewCell(c.Routing.EntryPreview)}, []string{"Probe inspection", placementPreviewCell(c.Routing.ProbePreview)}, []string{"Condition inspect", placementPreviewCell(c.ConditionPreview)}, []string{"Routing freshness", string(c.Routing.Source.Freshness)}, []string{"Routable", string(c.Routing.Routable.Status) + ": " + string(c.Routing.Routable.Reason)}, []string{"Routable freshness", string(c.Routing.Routable.Source.Freshness) + ": " + string(c.Routing.Routable.Source.Reason)}, []string{"Publisher", string(c.Routing.Acknowledgement)}, []string{"Publisher fresh", string(c.Routing.AcknowledgementSource.Freshness)})
+	rows = append(rows,
+		[]string{"Entry inspection", placementPreviewCell(c.Routing.EntryPreview)},
+		[]string{"Probe inspection", placementPreviewCell(c.Routing.ProbePreview)},
+		[]string{"Condition inspect", placementPreviewCell(c.ConditionPreview)},
+		[]string{"Routing freshness", string(c.Routing.Source.Freshness)},
+		[]string{"Traffic override", placementConditionCell(c.Routing.OverrideActive)},
+		[]string{"Capacity fallback", placementConditionCell(c.Routing.CapacityFallback)},
+		[]string{"Routable", string(c.Routing.Routable.Status) + ": " + string(c.Routing.Routable.Reason)},
+		[]string{"Routable freshness", string(c.Routing.Routable.Source.Freshness) + ": " + string(c.Routing.Routable.Source.Reason)},
+		[]string{"Published", placementConditionCell(c.Routing.Published)},
+		[]string{"Publisher", string(c.Routing.Acknowledgement)},
+		[]string{"Publisher fresh", string(c.Routing.AcknowledgementSource.Freshness)},
+	)
 	entries := c.Canonical().Entries
 	if !wide && len(entries) > 4 {
 		rows = append(rows, []string{"Route preview", "4/" + strconv.Itoa(len(entries)) + "; use -o wide or json"})
 		entries = entries[:4]
 	}
 	for _, e := range entries {
-		rows = append(rows, []string{"Route home", e.Cluster}, []string{"Endpoint origin", placementAddressCell(e.Address)}, []string{"Final weight", strconv.Itoa(int(e.Weight)) + "; healthy=" + strconv.FormatBool(e.Healthy)}, []string{"Recorded probe", string(e.Probe.Result)})
+		rows = append(rows,
+			[]string{"Route home", e.Cluster},
+			[]string{"Endpoint origin", placementAddressCell(e.Address)},
+			[]string{"Final weight", strconv.Itoa(int(e.Weight)) + "; healthy=" + strconv.FormatBool(e.Healthy)},
+			[]string{"Recorded probe", string(e.Probe.Result)},
+			[]string{"Route evidence", placementRouteEvidenceCell(e)},
+			[]string{"Probe policy", placementProbePolicyCell(e.Probe)},
+		)
 		if wide {
 			if e.Capacity != nil {
 				rows = append(rows, []string{"Capacity provenance", string(e.Capacity.Source)}, []string{"Allocated count", placementCountCell(e.Capacity.Allocated)}, []string{"Ready count", placementCountCell(e.Capacity.Ready)})
 			}
-			rows = append(rows, []string{"Probe freshness", string(e.Probe.Source.Freshness)})
+			rows = append(rows,
+				[]string{"Probe freshness", string(e.Probe.Source.Freshness)},
+				[]string{"Drain refs", placementDrainRefsCell(e)},
+				[]string{"Probe gate", placementProbeGateCell(e.Probe)},
+				[]string{"Home cap fallback", placementCapacityFallbackCell(e.Capacity)},
+			)
 		}
 	}
 	rows = append(rows, placementIssueRows(c.Issues)...)
@@ -454,4 +490,79 @@ func placementCountCell(count PlacementCount) string {
 		return string(count.State)
 	}
 	return strconv.Itoa(int(*count.Value)) + " (" + string(count.State) + ")"
+}
+
+func placementConditionCell(condition PlacementCondition) string {
+	return string(condition.Status) + ": " + string(condition.Reason) + " (" + string(condition.Source.Freshness) + ")"
+}
+
+func placementRouteEvidenceCell(route PlacementRoute) string {
+	gate := string(route.Probe.GatedState)
+	if route.Probe.GatedState == "Reported" {
+		gate = placementBoolCell(route.Probe.Gated)
+	}
+	return "drains=" + placementDrainSummaryCell(route.DrainPreview) + "; gate=" + gate + "; fallback=" + placementCapacityFallbackCell(route.Capacity)
+}
+
+func placementDrainSummaryCell(preview PlacementPreview) string {
+	switch preview.State {
+	case "Validated":
+		return strconv.Itoa(preview.Total)
+	case "MalformedPayload", "BudgetExceeded", "Unavailable", "ConflictingDuplicates":
+		return string(preview.State)
+	case "", "NotRecorded":
+		return "NotRecorded"
+	default:
+		return "Unavailable"
+	}
+}
+
+func placementDrainRefsCell(route PlacementRoute) string {
+	if len(route.DrainRefs) > 0 {
+		return strings.Join(route.DrainRefs, ", ")
+	}
+	if route.DrainPreview.State != "" {
+		return string(route.DrainPreview.State)
+	}
+	return "NotRecorded"
+}
+
+func placementProbePolicyCell(probe PlacementProbe) string {
+	switch probe.PolicyDigestState {
+	case "Reported":
+		if probe.PolicyDigest != "" {
+			return probe.PolicyDigest
+		}
+		return "Unavailable"
+	case "NotRecorded", "Unavailable":
+		return string(probe.PolicyDigestState)
+	case "":
+		return "NotRecorded"
+	default:
+		return "Unavailable"
+	}
+}
+
+func placementProbeGateCell(probe PlacementProbe) string {
+	if probe.GatedState == "Reported" {
+		return placementBoolCell(probe.Gated) + " (Reported)"
+	}
+	if probe.GatedState != "" {
+		return string(probe.GatedState)
+	}
+	return "NotRecorded"
+}
+
+func placementCapacityFallbackCell(capacity *PlacementCapacity) string {
+	if capacity != nil && capacity.FallbackReason != "" {
+		return string(capacity.FallbackReason)
+	}
+	return "NotRecorded"
+}
+
+func placementBoolCell(value bool) string {
+	if value {
+		return "True"
+	}
+	return "False"
 }

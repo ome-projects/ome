@@ -523,7 +523,7 @@ func TestAcknowledgementFalseDefaultDoesNotContradictTrueCondition(t *testing.T)
 		{false, metav1.ConditionTrue, 4, "ReportedTrue"},
 		{true, metav1.ConditionFalse, 4, "Invalid"},
 		{true, metav1.ConditionTrue, 4, "ReportedTrue"},
-		{false, metav1.ConditionFalse, 4, "ReportedFalse"},
+		{false, metav1.ConditionFalse, 4, "Invalid"},
 		{true, metav1.ConditionTrue, 3, "Invalid"},
 	} {
 		s := fixture(t)

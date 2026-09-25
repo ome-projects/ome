@@ -43,38 +43,119 @@ func conditionValue(conditions []v.PlacementCondition, kind v.PlacementValue) v.
 	return v.PlacementCondition{Type: kind, Status: "Unknown", Reason: "NotRecorded", Source: reported()}
 }
 
-func projectConditions(raw []metav1.Condition, generation int64, clock time.Time) ([]v.PlacementCondition, v.PlacementPreview) {
+type conditionRule struct {
+	Type    v.PlacementValue
+	Reasons map[string]struct{}
+}
+
+var (
+	workloadClusterReadyRule = conditionRule{
+		Type: "Ready",
+		Reasons: conditionReasons(
+			"ProbeFailedRetrying",
+			"ProbeSucceeded",
+			"Connected",
+			"ConnectionFailed",
+			"ProbeFailed",
+			"Ready",
+			"NotReady",
+			"UnsupportedClusterSource",
+			"UnsupportedProfileSource",
+			"ClusterProfileUnsupported",
+		),
+	}
+	trafficMapRoutableRule = conditionRule{
+		Type: "Routable",
+		Reasons: conditionReasons(
+			"Routable",
+			"NotPlaced",
+			"NoAddressableHome",
+			"AllHomesUnready",
+			"NoRoutableCapacity",
+			"AllHomesProbeFailed",
+			"TrafficDrain",
+		),
+	}
+	trafficMapPublishedRule = conditionRule{
+		Type: "Published",
+		Reasons: conditionReasons(
+			"Published",
+			"Withdrawn",
+			"InvalidOwner",
+			"InvalidOptions",
+			"InvalidPlan",
+			"LegacyLifecycleActive",
+			"ClaimRejected",
+			"DrainFailed",
+			"ApplyFailed",
+			"UnpublishFailed",
+			"PublisherChanged",
+			"Unpublished",
+		),
+	}
+	trafficMapOverrideActiveRule = conditionRule{
+		Type:    "OverrideActive",
+		Reasons: conditionReasons("OverridesApplied", "OverridesPending", "NoOverrides"),
+	}
+	trafficMapCapacityFallbackRule = conditionRule{
+		Type: "CapacityFallback",
+		Reasons: conditionReasons(
+			"CapacityPollingDisabled",
+			"NoCapacityTargets",
+			"EndpointCapacityAvailable",
+			"EndpointCapacityUnavailable",
+		),
+	}
+)
+
+func conditionReasons(values ...string) map[string]struct{} {
+	reasons := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		reasons[value] = struct{}{}
+	}
+	return reasons
+}
+
+func projectConditions(raw []metav1.Condition, generation int64, clock time.Time, rules ...conditionRule) ([]v.PlacementCondition, v.PlacementPreview) {
 	preview := v.PlacementPreview{State: "Validated", Total: len(raw)}
 	out := []v.PlacementCondition{}
 	if len(raw) > 64 {
-		return []v.PlacementCondition{invalidCondition("Ready", "BudgetExceeded"), invalidCondition("Routable", "BudgetExceeded"), invalidCondition("Published", "BudgetExceeded")}, v.PlacementPreview{State: "BudgetExceeded", Total: len(raw)}
+		for _, rule := range rules {
+			out = append(out, invalidCondition(rule.Type, "BudgetExceeded"))
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Type < out[j].Type })
+		return out, v.PlacementPreview{State: "BudgetExceeded", Total: len(raw)}
 	}
 	seen := map[string]*metav1.Condition{}
 	invalid := map[string]v.PlacementValue{}
 	for i := range raw {
 		x := &raw[i]
-		if len(x.Type) > 253 || len(x.Reason) > 1024 || len(x.Message) > 4096 {
+		typeWithinBudget := len(x.Type) <= 253
+		if typeWithinBudget {
+			if prior, ok := seen[x.Type]; ok && !reflect.DeepEqual(prior, x) {
+				recordConditionIssue(invalid, x.Type, "ConflictingDuplicates")
+			}
+			seen[x.Type] = x
+		}
+		if !typeWithinBudget || len(x.Reason) > 1024 || len(x.Message) > 4096 {
 			preview.State = "MalformedPayload"
-			if len(x.Type) <= 253 {
-				invalid[x.Type] = "MalformedCondition"
+			if typeWithinBudget {
+				recordConditionIssue(invalid, x.Type, "MalformedCondition")
 			}
 			continue
 		}
 		if len(metavalidation.ValidateCondition(*x, field.NewPath("condition"))) != 0 || x.LastTransitionTime.Time.After(clock) {
-			invalid[x.Type] = "MalformedCondition"
+			recordConditionIssue(invalid, x.Type, "MalformedCondition")
 		}
-		if prior, ok := seen[x.Type]; ok && !reflect.DeepEqual(prior, x) {
-			invalid[x.Type] = "ConflictingDuplicates"
-		}
-		seen[x.Type] = x
 	}
-	for _, kind := range []string{"Ready", "Routable", "Published"} {
+	for _, rule := range rules {
+		kind := string(rule.Type)
 		if issue, ok := invalid[kind]; ok {
-			out = append(out, invalidCondition(v.PlacementValue(kind), issue))
+			out = append(out, invalidCondition(rule.Type, issue))
 			continue
 		}
 		if x, ok := seen[kind]; ok {
-			out = append(out, v.PlacementCondition{Type: v.PlacementValue(kind), Status: v.PlacementValue(x.Status), Reason: conditionReason(x.Reason), Source: freshness(x.ObservedGeneration, generation)})
+			out = append(out, v.PlacementCondition{Type: rule.Type, Status: v.PlacementValue(x.Status), Reason: conditionReason(x.Reason, rule.Reasons), Source: freshness(x.ObservedGeneration, generation)})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Type < out[j].Type })
@@ -85,14 +166,19 @@ func projectConditions(raw []metav1.Condition, generation int64, clock time.Time
 	return out, preview
 }
 
+func recordConditionIssue(invalid map[string]v.PlacementValue, conditionType string, issue v.PlacementValue) {
+	if invalid[conditionType] == "ConflictingDuplicates" && issue != "ConflictingDuplicates" {
+		return
+	}
+	invalid[conditionType] = issue
+}
+
 func invalidCondition(kind, reason v.PlacementValue) v.PlacementCondition {
 	return v.PlacementCondition{Type: kind, Status: "Unknown", Reason: reason, Source: v.PlacementEvidence{Evidence: v.EvidenceUnavailable, Freshness: "Invalid", Reason: reason}}
 }
-func conditionReason(reason string) v.PlacementValue {
-	switch reason {
-	case "Routable", "NotPlaced", "NoAddressableHome", "AllHomesUnready", "ProbeFailedRetrying", "ProbeSucceeded", "Connected", "ConnectionFailed", "ProbeFailed", "Published", "Withdrawn", "Unpublished", "Ready", "NotReady", "UnsupportedClusterSource", "UnsupportedProfileSource", "ClusterProfileUnsupported":
+func conditionReason(reason string, reasons map[string]struct{}) v.PlacementValue {
+	if _, ok := reasons[reason]; ok {
 		return v.PlacementValue(reason)
-	default:
-		return "OtherReportedReason"
 	}
+	return "OtherReportedReason"
 }

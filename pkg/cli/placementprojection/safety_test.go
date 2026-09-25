@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -179,6 +180,30 @@ func TestIndependentMalformedProbeAndProvenanceGroups(t *testing.T) {
 	status, _ := ProjectStatus(s, fixtureClock)
 	if len(status.Content.Placement.Homes) != 2 || status.Content.Placement.Homes[0].Provenance.State != "MalformedPayload" {
 		t.Fatalf("bad provenance=%+v", status.Content.Placement)
+	}
+}
+
+func TestRouteEvidenceProjectionDoesNotMutateSource(t *testing.T) {
+	snapshot := fixture(t)
+	entry := &snapshot.TrafficMap.Spec.Entries[0]
+	entry.DrainRefs = []string{"maintenance-a", "drain-a"}
+	entry.Probe.PolicyDigest = "sha256:" + strings.Repeat("a", 64)
+	entry.Probe.Gated = true
+	entry.Capacity.FallbackReason = "capacity endpoint unreachable: private-source"
+	before := snapshot.TrafficMap.DeepCopy()
+
+	reportValue, err := ProjectEndpoint(snapshot, fixtureClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range placementEndpointOutputs(t, reportValue) {
+	}
+	if !reflect.DeepEqual(before, snapshot.TrafficMap) {
+		t.Fatal("routing evidence projection or rendering mutated the TrafficMap")
+	}
+	route := placementRouteByCluster(t, reportValue.Content.Entries, "demo-a")
+	if !reflect.DeepEqual(route.DrainRefs, []string{"drain-a", "maintenance-a"}) || route.Probe.PolicyDigestState != "Reported" || route.Capacity.FallbackReason != "Unreachable" {
+		t.Fatalf("routing evidence was not projected canonically: %+v", route)
 	}
 }
 

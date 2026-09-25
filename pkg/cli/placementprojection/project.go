@@ -57,7 +57,7 @@ func ProjectExplain(snapshot c.Result, clock v.Clock) (v.PlacementExplainReport,
 		} else {
 			for _, w := range seen {
 				row := v.PlacementCluster{Name: w.Name, ComputedSelectorCompatible: "Unknown", ReportedHome: "Unknown", ConnectionSource: connectionSource(w)}
-				conditions, inspection := projectConditions(w.Status.Conditions, w.Generation, now(clock))
+				conditions, inspection := projectConditions(w.Status.Conditions, w.Generation, now(clock), workloadClusterReadyRule)
 				row.ConditionPreview = inspection
 				if inspection.State != "Validated" {
 					addIssue(&content.Issues, "WorkloadClusterConditions", inspection.State)
