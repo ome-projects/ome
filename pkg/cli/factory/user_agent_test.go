@@ -95,6 +95,36 @@ func TestRESTConfigAddsBoundedProductUserAgent(t *testing.T) {
 			existing: "operations-console/2 kubectl-ome-helper/v4",
 			want:     "operations-console/2 kubectl-ome-helper/v4 kubectl-ome/v1.2.3",
 		},
+		{
+			name:     "product text in multiword comment remains caller owned",
+			version:  "v1.2.3",
+			existing: "operations-console/2 (delegates through kubectl-ome/v0.9.0 safely)",
+			want:     "operations-console/2 (delegates through kubectl-ome/v0.9.0 safely) kubectl-ome/v1.2.3",
+		},
+		{
+			name:     "nested and escaped comment remains byte exact",
+			version:  "v1.2.3",
+			existing: `operations-console/2 (outer (inner kubectl-ome/v0.9.0) escaped \( kubectl-ome/v0.8.0 \)) audit-client/4`,
+			want:     `operations-console/2 (outer (inner kubectl-ome/v0.9.0) escaped \( kubectl-ome/v0.8.0 \)) audit-client/4 kubectl-ome/v1.2.3`,
+		},
+		{
+			name:     "top-level product changes without touching comment",
+			version:  "v1.2.3",
+			existing: "operations-console/2 (delegates through kubectl-ome/v0.8.0 safely) kubectl-ome/v0.9.0 audit-client/4",
+			want:     "operations-console/2 (delegates through kubectl-ome/v0.8.0 safely) kubectl-ome/v1.2.3 audit-client/4",
+		},
+		{
+			name:     "unclosed comment is preserved conservatively",
+			version:  "v1.2.3",
+			existing: "operations-console/2 (delegates through kubectl-ome/v0.9.0 safely",
+			want:     "operations-console/2 kubectl-ome/v1.2.3 (delegates through kubectl-ome/v0.9.0 safely",
+		},
+		{
+			name:     "invalid product-like element remains caller owned",
+			version:  "v1.2.3",
+			existing: "operations-console/2 kubectl-ome/v0.9.0(comment)",
+			want:     "operations-console/2 kubectl-ome/v0.9.0(comment) kubectl-ome/v1.2.3",
+		},
 	}
 
 	for _, tt := range tests {
