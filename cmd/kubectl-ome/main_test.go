@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -39,5 +40,21 @@ func TestRunReturnsErrorCodeWithoutExiting(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "error: unknown command") {
 		t.Fatalf("stderr = %q, want unknown-command diagnostic", stderr.String())
+	}
+}
+
+func TestRunContextPropagatesCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	streams := genericiooptions.IOStreams{Out: &stdout, ErrOut: &stderr}
+	args := []string{"--kubeconfig=" + t.TempDir() + "/missing", "cluster", "status"}
+	if code := runContext(ctx, args, streams); code != 1 {
+		t.Fatalf("runContext() = %d, want 1", code)
+	}
+	if stdout.Len() != 0 || stderr.String() != "error: context canceled\n" {
+		t.Fatalf("canceled command stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }

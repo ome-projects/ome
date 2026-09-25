@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -13,11 +14,17 @@ import (
 // ExecuteCommand executes cmd, writes one user-facing error, and returns the
 // stable process exit code without terminating the process.
 func ExecuteCommand(cmd *cobra.Command, stderr io.Writer) int {
+	return ExecuteCommandContext(context.Background(), cmd, stderr)
+}
+
+// ExecuteCommandContext executes cmd with ctx, writes one user-facing error,
+// and returns the stable process exit code without terminating the process.
+func ExecuteCommandContext(ctx context.Context, cmd *cobra.Command, stderr io.Writer) int {
 	cmd.SilenceErrors = true
 	cmd.SilenceUsage = true
 	cmd.SetErr(stderr)
 
-	err := cmd.Execute()
+	err := cmd.ExecuteContext(ctx)
 	if err == nil {
 		return exitcode.Success
 	}
@@ -29,7 +36,12 @@ func ExecuteCommand(cmd *cobra.Command, stderr io.Writer) int {
 
 // Run constructs and executes the production command tree for args.
 func Run(args []string, streams genericiooptions.IOStreams) int {
+	return RunContext(context.Background(), args, streams)
+}
+
+// RunContext constructs and executes the production command tree with ctx.
+func RunContext(ctx context.Context, args []string, streams genericiooptions.IOStreams) int {
 	cmd := NewRootCmd(streams)
 	cmd.SetArgs(args)
-	return ExecuteCommand(cmd, streams.ErrOut)
+	return ExecuteCommandContext(ctx, cmd, streams.ErrOut)
 }
