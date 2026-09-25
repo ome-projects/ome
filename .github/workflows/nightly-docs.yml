@@ -218,7 +218,7 @@ jobs:
           HUGO_ENVIRONMENT: production
           HUGO_BASEURL: https://ome-projects.github.io/ome/
         run: |
-          (cd hack/internal/tools && GOBIN="$RUNNER_TEMP/nightly-docs-bin" CGO_ENABLED=1 go install -tags extended github.com/gohugoio/hugo@v0.157.0)
+          python3 hack/nightly-docs/install_hugo.py "$RUNNER_TEMP/nightly-docs-bin"
           # Hugo resolves Docsy modules into go.mod/go.sum. Build a copy so those
           # generated files cannot contaminate the strictly docs-only PR.
           cp -a site "$RUNNER_TEMP/nightly-docs-site"
