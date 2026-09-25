@@ -21,7 +21,7 @@ import (
 
 const explainEffectiveValueWidth = 54
 
-const explainEffectiveTerminalWidth = 80
+const explainTerminalWidth = 80
 
 type explainWidthWriter struct {
 	io.Writer
@@ -31,15 +31,12 @@ type explainWidthWriter struct {
 func (w explainWidthWriter) TerminalWidth() (int, bool) { return w.width, true }
 
 func (o *explainOptions) writeSelectorTable(table printers.Table) error {
-	if !o.WithEffective {
-		return table.Write(o.Out)
-	}
-	width := explainEffectiveTerminalWidth
+	width := explainTerminalWidth
 	if terminalWidth, terminal := printers.TerminalWidth(o.Out); terminal && terminalWidth < width {
 		width = terminalWidth
 	}
-	// The opt-in view reuses the terminal renderer, which wraps rather than
-	// truncating the original selector reason and keeps every line bounded.
+	// The terminal renderer wraps rather than truncating selector evidence and
+	// keeps every human-readable explanation within the CLI width contract.
 	return table.Write(explainWidthWriter{Writer: o.Out, width: width})
 }
 

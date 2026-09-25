@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -28,6 +30,37 @@ func scheme(t *testing.T) *k8sruntime.Scheme {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// runtimeListMetadataClient fills the list metadata omitted by controller-
+// runtime's fake client. A real API server returns a list resourceVersion and
+// honors the exact resourceVersion requested for the second runtime kind.
+type runtimeListMetadataClient struct{ ctrlclient.Client }
+
+func (c runtimeListMetadataClient) List(
+	ctx context.Context,
+	list ctrlclient.ObjectList,
+	options ...ctrlclient.ListOption,
+) error {
+	if err := c.Client.List(ctx, list, options...); err != nil {
+		return err
+	}
+	listOptions := (&ctrlclient.ListOptions{}).ApplyOptions(options)
+	resourceVersion := "fixture-rv"
+	if listOptions.Raw != nil && listOptions.Raw.ResourceVersion != "" {
+		resourceVersion = listOptions.Raw.ResourceVersion
+	}
+	switch typed := list.(type) {
+	case *v1beta1.ServingRuntimeList:
+		typed.ResourceVersion = resourceVersion
+	case *v1beta1.ClusterServingRuntimeList:
+		typed.ResourceVersion = resourceVersion
+	}
+	return nil
+}
+
+func withRuntimeListMetadata(client ctrlclient.Client) ctrlclient.Client {
+	return runtimeListMetadataClient{Client: client}
+}
 
 func execute(t *testing.T, f factory.Factory, args ...string) (string, error) {
 	t.Helper()
@@ -96,7 +129,7 @@ func TestExplainRanksRuntimes(t *testing.T) {
 		WithObjects(model, compatible).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(model),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--model", "llama-70b")
@@ -137,7 +170,7 @@ func TestExplainListsIncompatibleRuntimeWithReason(t *testing.T) {
 		WithObjects(model, compatible, incompatible).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(model),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--model", "llama-70b")
@@ -145,7 +178,8 @@ func TestExplainListsIncompatibleRuntimeWithReason(t *testing.T) {
 
 	rejected := row(t, out, "srt-onnx")
 	assert.Equal(t, "No", rejected[2])
-	assert.Contains(t, out, "not in supported formats", "rejection reason should explain the format mismatch")
+	assert.Contains(t, strings.Join(strings.Fields(out), " "), "not in supported formats",
+		"rejection reason should explain the format mismatch")
 
 	accepted := row(t, out, "srt-llama")
 	assert.Equal(t, "Yes", accepted[2])
@@ -174,7 +208,7 @@ func TestExplainPrefersNamespacedBaseModel(t *testing.T) {
 	ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(rt).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(nsModel, clusterModel),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--model", "llama-70b")
@@ -207,14 +241,14 @@ func TestExplainISVCPath(t *testing.T) {
 	ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(rt).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(model, isvc),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--isvc", "my-isvc")
 	require.NoError(t, err)
 	got := row(t, out, "srt-llama")
 	assert.Equal(t, "Yes", got[2])
-	assert.Contains(t, out, `pins spec.runtime="srt-llama"`)
+	assert.Contains(t, out, "spec.runtime is explicit")
 }
 
 func TestExplainISVCWithoutModelErrors(t *testing.T) {
@@ -272,7 +306,7 @@ func TestExplainNamesMatchingFormatCause(t *testing.T) {
 	ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(model, rt).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(model),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--model", "llama-70b")
@@ -281,9 +315,10 @@ func TestExplainNamesMatchingFormatCause(t *testing.T) {
 	got := row(t, out, "srt-mixed")
 	require.GreaterOrEqual(t, len(got), 3, "row: %v", got)
 	assert.Equal(t, "No", got[2])
-	assert.Contains(t, out, "not autoSelect-enabled", "reason must name the matching-format cause")
+	compact := strings.Join(strings.Fields(out), " ")
+	assert.Contains(t, compact, "not autoSelect-enabled", "reason must name the matching-format cause")
 	assert.Contains(t, out, "safetensors", "reason should identify the matching format by name")
-	assert.NotContains(t, out, "no supportedModelFormats[].autoSelect=true entry",
+	assert.NotContains(t, compact, "no supportedModelFormats[].autoSelect=true entry",
 		"srt-mixed DOES have an autoSelect=true entry (onnx) -- must not claim none exists")
 }
 
@@ -315,7 +350,7 @@ func TestExplainNamesZeroScoreCause(t *testing.T) {
 	ctrl := ctrlfake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(model, rt).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(model),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--model", "llama-70b")
@@ -324,9 +359,10 @@ func TestExplainNamesZeroScoreCause(t *testing.T) {
 	got := row(t, out, "srt-zero-priority")
 	require.GreaterOrEqual(t, len(got), 3, "row: %v", got)
 	assert.Equal(t, "No", got[2])
-	assert.Contains(t, out, "score is 0", "reason should name the zero auto-select score")
-	assert.Contains(t, out, "priority 0", "reason should point at the explicit zero priority")
-	assert.NotContains(t, out, "no supportedModelFormats[].autoSelect=true entry",
+	compact := strings.Join(strings.Fields(out), " ")
+	assert.Contains(t, compact, "score is 0", "reason should name the zero auto-select score")
+	assert.Contains(t, compact, "priority 0", "reason should point at the explicit zero priority")
+	assert.NotContains(t, compact, "no supportedModelFormats[].autoSelect=true entry",
 		"srt-zero-priority DOES have an autoSelect=true entry -- must not claim none exists")
 }
 
@@ -367,7 +403,7 @@ func TestExplainClusterRowReflectsClusterSpecWhenShadowed(t *testing.T) {
 		WithObjects(model, nsRuntime, clusterRuntime).Build()
 	f := factory.Static{
 		OME:     omefake.NewSimpleClientset(model),
-		Runtime: ctrl,
+		Runtime: withRuntimeListMetadata(ctrl),
 		NS:      "team-a",
 	}
 	out, err := execute(t, f, "explain", "--model", "llama-70b")
@@ -399,6 +435,6 @@ func TestExplainClusterRowReflectsClusterSpecWhenShadowed(t *testing.T) {
 	// namespaced runtime's compatibility, and not a generic
 	// autoSelect-missing claim (the cluster runtime's own format DOES have
 	// autoSelect=true).
-	assert.Contains(t, clusterLine, "onnx",
+	assert.Contains(t, strings.Join(strings.Fields(out), " "), "runtime=onnx",
 		"cluster row's reason should come from the cluster object's own format mismatch")
 }

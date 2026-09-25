@@ -38,7 +38,9 @@ func explainEffectiveFixture(t *testing.T) (*acquisitionFactory, *recordingRunti
 	isvc.Spec.Model = &v1beta1.ModelRef{Name: "model"}
 	_, err = f.ome.OmeV1beta1().InferenceServices("team-a").Update(context.Background(), isvc, metav1.UpdateOptions{})
 	require.NoError(t, err)
-	runtimeClient := &recordingRuntimeClient{Client: f.runtime}
+	runtimeClient := &recordingRuntimeClient{
+		Client: withRuntimeListMetadata(f.runtime),
+	}
 	f.runtime = runtimeClient
 	return f, runtimeClient
 }
@@ -47,9 +49,13 @@ func TestExplainWithEffectivePreservesSelectorVerdictAndAddsBoundedContext(t *te
 	baselineFactory, baselineReads := explainEffectiveFixture(t)
 	baseline, err := execute(t, baselineFactory, "explain", "--isvc", "service")
 	require.NoError(t, err)
-	assert.Equal(t, "Note: InferenceService \"service\" pins spec.runtime=\"cluster-runtime\"; the table below shows what automatic selection would choose, which may differ from what is currently deployed.\n"+
-		"RUNTIME           SCOPE     COMPATIBLE   PRIORITY   WEIGHT   REASON\n"+
-		"cluster-runtime   Cluster   No           -          -        model format 'mt:safetensors' not in supported formats: no supported formats defined\n", baseline)
+	assert.Contains(t, baseline, "spec.runtime is explicit")
+	assert.Equal(t, "No", row(t, baseline, "cluster-runtime")[2])
+	assert.Contains(t, strings.Join(strings.Fields(baseline), " "),
+		"not in supported formats: no supported formats defined")
+	for _, line := range strings.Split(strings.TrimSpace(baseline), "\n") {
+		assert.LessOrEqual(t, len(line), 80, "selector output line is too wide: %q", line)
+	}
 	baselineLists := countRuntimeLists(baselineReads.operations)
 
 	contextFactory, contextReads := explainEffectiveFixture(t)
@@ -159,6 +165,7 @@ func TestExplainEffectivePropagatesCancellation(t *testing.T) {
 
 type continuedRuntimeCandidateClient struct {
 	ctrlclient.Client
+	boundedCalls int
 	boundedPages int
 }
 
@@ -169,7 +176,16 @@ func (c *continuedRuntimeCandidateClient) List(
 ) error {
 	options := &ctrlclient.ListOptions{}
 	options.ApplyOptions(opts)
+	if options.Limit > 0 {
+		c.boundedCalls++
+	}
 	if candidates, ok := list.(*v1beta1.ServingRuntimeList); ok && options.Limit > 0 {
+		// runtime explain's first two bounded calls acquire the selector's
+		// ServingRuntime and ClusterServingRuntime snapshot. Only the later
+		// independent --with-effective auto-selection scan is truncated.
+		if c.boundedCalls <= 2 {
+			return c.Client.List(ctx, list, opts...)
+		}
 		c.boundedPages++
 		candidates.Items = []v1beta1.ServingRuntime{{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("page-%d", c.boundedPages), Namespace: options.Namespace},
@@ -187,11 +203,10 @@ func TestExplainWithEffectiveTruncatedAutoSelectionKeepsSelectorVerdict(t *testi
 	isvc.Spec.Runtime = nil
 	_, err = f.ome.OmeV1beta1().InferenceServices("team-a").Update(context.Background(), isvc, metav1.UpdateOptions{})
 	require.NoError(t, err)
-	continued := &continuedRuntimeCandidateClient{Client: f.runtime}
-	f.runtime = continued
-
 	baseline, err := execute(t, f, "explain", "--isvc", "service")
 	require.NoError(t, err)
+	continued := &continuedRuntimeCandidateClient{Client: f.runtime}
+	f.runtime = continued
 	output, err := execute(t, f, "explain", "--isvc", "service", "--with-effective")
 	require.NoError(t, err)
 	assert.Equal(t, row(t, baseline, "cluster-runtime")[2], row(t, output, "cluster-runtime")[2])

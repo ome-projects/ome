@@ -3,21 +3,19 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
-	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/namespace"
+	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/cli/printers"
-	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 )
 
@@ -27,10 +25,14 @@ type explainOptions struct {
 	ISVC             string
 	WithEffective    bool
 	namespaceOptions *namespace.Options
+	candidateLimits  paging.Limits
 }
 
 func newExplainCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
-	o := &explainOptions{IOStreams: streams, namespaceOptions: namespace.NewOptions()}
+	o := &explainOptions{
+		IOStreams: streams, namespaceOptions: namespace.NewOptions(),
+		candidateLimits: defaultRuntimeExplainLimits(),
+	}
 	cmd := &cobra.Command{
 		Use:   "explain (--model NAME | --isvc NAME)",
 		Short: "Explain which serving runtimes match a model and why",
@@ -39,12 +41,16 @@ against the live cluster and prints every namespace-scoped and cluster-scoped
 serving runtime it considered, whether each is compatible with the model, and
 why -- including runtimes that were rejected.
 
+Runtime candidates come from one all-or-nothing snapshot limited to 1,000
+objects across 4 pages. Every snapshot API request has a 10-second timeout.
+Selector ranking and any downstream selector reads use that immutable snapshot,
+so the explanation cannot mix runtime revisions or issue one API read per
+candidate.
+
 With --isvc --with-effective, append independent live and active runtime
 evidence. This does not change the selector verdict or imply rollout
-convergence. Named runtime reads are bounded; an auto-selected runtime may
-require an additional candidate scan limited to 1,000 items across 2 pages
-with a 10-second request timeout. Unavailable effective evidence is shown
-without hiding the selector result.`,
+convergence. Unavailable effective evidence is shown without hiding the
+selector result.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := o.Validate(); err != nil {
@@ -79,24 +85,26 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 	if err != nil {
 		return err
 	}
-	if o.ISVC != "" && isvc.Spec.Runtime != nil {
-		if o.WithEffective {
-			fmt.Fprintln(o.ErrOut, "Note: spec.runtime is explicit; selector verdict is hypothetical.")
-		} else {
-			fmt.Fprintf(o.ErrOut, "Note: InferenceService %q pins spec.runtime=%q; the table below shows what automatic selection would choose, which may differ from what is currently deployed.\n", o.ISVC, isvc.Spec.Runtime.Name)
-		}
-	}
 
 	ctrl, err := f.RuntimeClient()
 	if err != nil {
 		return err
 	}
-	selector := runtimeselector.New(ctrl)
+	snapshot, err := collectRuntimeCandidateSnapshot(
+		ctx, ctrl, ns, o.candidateLimits,
+	)
+	if err != nil {
+		return apierror.Friendly(err)
+	}
+	if err := snapshot.validate(); err != nil {
+		return err
+	}
+	selector := runtimeselector.New(snapshot.client)
 	// A standalone matcher/scorer pair, built from the exact same defaults
 	// runtimeselector.New wires up internally, so explain.go can recompute
 	// compatibility/auto-select/score details for a specific spec instead of
 	// only getting a yes/no verdict out of the Selector interface.
-	cfg := runtimeselector.NewConfig(ctrl)
+	cfg := runtimeselector.NewConfig(snapshot.client)
 	matcherImpl := runtimeselector.NewDefaultRuntimeMatcher(cfg)
 	scorerImpl := runtimeselector.NewDefaultRuntimeScorer(cfg)
 
@@ -108,21 +116,25 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 		return apierror.Friendly(err)
 	}
 
-	// GetCompatibleRuntimes silently drops everything that isn't a match --
-	// disabled runtimes, format/size mismatches, and runtimes with no
-	// autoSelect-enabled format never appear in its result at all. The OEP
-	// requires rejected runtimes to show up too, with a reason, so list every
-	// runtime the selector could have considered and re-validate whichever
-	// ones didn't make the cut.
-	candidates, err := listCandidateRuntimes(ctx, ctrl, ns)
-	if err != nil {
-		return apierror.Friendly(err)
+	// GetCompatibleRuntimes silently drops everything that isn't a match.
+	// The complete rejected set comes from the same immutable snapshot that
+	// backed the selector, rather than a second live LIST.
+	candidates := snapshot.candidates
+	if o.ISVC != "" && isvc.Spec.Runtime != nil {
+		if _, err := fmt.Fprintln(
+			o.ErrOut,
+			"Note: spec.runtime is explicit; automatic selection below is hypothetical.",
+		); err != nil {
+			return err
+		}
 	}
 	if len(matches) == 0 && len(candidates) == 0 {
+		message := "No serving runtimes found in the selected namespace or at cluster scope."
 		if o.WithEffective {
-			fmt.Fprintln(o.ErrOut, "No serving runtimes found for selector.")
-		} else {
-			fmt.Fprintf(o.ErrOut, "No serving runtimes found in namespace %q or at cluster scope.\n", ns)
+			message = "No serving runtimes found for selector."
+		}
+		if _, err := fmt.Fprintln(o.ErrOut, message); err != nil {
+			return err
 		}
 		if o.WithEffective {
 			return o.writeEffectiveContext(ctx, f, ctrl, ns, isvc)
@@ -141,14 +153,15 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 			printers.OrDash(strings.Join(m.MatchDetails.Reasons, "; ")),
 		})
 	}
-	// Cluster-scoped candidates whose name is shadowed by a namespace-scoped
-	// runtime of the same name need special handling below (defect b).
-	shadowed := shadowedClusterNames(candidates)
 	for _, c := range candidates {
 		if matched[runtimeKey(c)] {
 			continue
 		}
-		reason := candidateReason(ctx, selector, ctrl, matcherImpl, scorerImpl, c, shadowed[c.name], ns, modelSpec, isvc)
+		spec := snapshot.rawSpec(c)
+		if spec == nil {
+			return errRuntimeSnapshotInconsistent
+		}
+		reason := evaluateReason(matcherImpl, scorerImpl, spec, modelSpec, isvc, c.name)
 		table.Rows = append(table.Rows, []string{c.name, scopeLabel(c.isCluster), "No", "-", "-", reason})
 	}
 
@@ -206,136 +219,6 @@ type runtimeKey struct {
 type runtimeCandidate struct {
 	name      string
 	isCluster bool
-}
-
-// listCandidateRuntimes enumerates every runtime GetCompatibleRuntimes could
-// have considered: namespace-scoped runtimes in ns, plus every cluster-scoped
-// runtime. This mirrors pkg/runtimeselector's own fetch (namespace runtimes
-// always precede cluster ones) so rejected runtimes can be re-validated for a
-// reason instead of silently vanishing from the table.
-func listCandidateRuntimes(ctx context.Context, c ctrlclient.Client, ns string) ([]runtimeCandidate, error) {
-	var out []runtimeCandidate
-
-	nsRuntimes := &v1beta1.ServingRuntimeList{}
-	if err := c.List(ctx, nsRuntimes, ctrlclient.InNamespace(ns)); err != nil {
-		return nil, err
-	}
-	for _, rt := range nsRuntimes.Items {
-		out = append(out, runtimeCandidate{name: rt.Name})
-	}
-
-	clusterRuntimes := &v1beta1.ClusterServingRuntimeList{}
-	if err := c.List(ctx, clusterRuntimes); err != nil {
-		return nil, err
-	}
-	for _, rt := range clusterRuntimes.Items {
-		out = append(out, runtimeCandidate{name: rt.Name, isCluster: true})
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].isCluster != out[j].isCluster {
-			return !out[i].isCluster // namespace-scoped first, matching GetCompatibleRuntimes' ordering
-		}
-		return out[i].name < out[j].name
-	})
-	return out, nil
-}
-
-// rejectionReason extracts a human-readable, non-redundant reason from the
-// errors ValidateRuntime returns. Unrecognized error types fall back to
-// err.Error() so the table always has something to show.
-func rejectionReason(err error) string {
-	switch e := err.(type) {
-	case *runtimeselector.RuntimeCompatibilityError:
-		return e.Reason
-	case *runtimeselector.RuntimeDisabledError:
-		return "runtime is disabled"
-	default:
-		return err.Error()
-	}
-}
-
-// shadowedClusterNames returns the set of names that identify both a
-// cluster-scoped and a namespace-scoped candidate in candidates.
-// pkg/runtimeinheritance documents name-based shadowing as an intentional
-// pattern (a namespace-scoped runtime overrides a cluster-scoped one of the
-// same name), but it also defeats ValidateRuntime's name-only,
-// namespaced-first resolution (pkg/runtimeselector/fetcher.go GetRuntime)
-// for the cluster-scoped side -- see candidateReason.
-func shadowedClusterNames(candidates []runtimeCandidate) map[string]bool {
-	nsNames := make(map[string]bool)
-	for _, c := range candidates {
-		if !c.isCluster {
-			nsNames[c.name] = true
-		}
-	}
-	shadowed := make(map[string]bool)
-	for _, c := range candidates {
-		if c.isCluster && nsNames[c.name] {
-			shadowed[c.name] = true
-		}
-	}
-	return shadowed
-}
-
-// candidateReason produces the REASON text for a candidate GetCompatibleRuntimes
-// did not return. Two defects made this text unreliable before:
-//
-//   - (a) A hardcoded "no autoSelect entry" reason was shown whenever
-//     ValidateRuntime returned nil, but ValidateRuntime only checks
-//     compatibility. GetCompatibleRuntimes' evaluateRuntime
-//     (pkg/runtimeselector/selector.go) additionally requires an
-//     autoSelect-enabled *matching* format and a positive score
-//     (pkg/runtimeselector/scorer.go CalculateScore), so a compatible
-//     runtime can be excluded for reasons the hardcoded text never
-//     considered: the matching format specifically isn't autoSelect-enabled
-//     (even though a different format on the same runtime is), or its score
-//     computes to 0 (e.g. an explicit Priority of 0).
-//   - (b) ValidateRuntime resolves a runtime by name only, namespaced first
-//     (pkg/runtimeselector/fetcher.go GetRuntime), so re-validating a
-//     cluster-scoped candidate whose name collides with a namespace-scoped
-//     runtime of the same name silently validated the WRONG object.
-//
-// shadowedByNamespaced (only meaningful when c.isCluster) signals case (b).
-func candidateReason(
-	ctx context.Context,
-	sel runtimeselector.Selector,
-	ctrl ctrlclient.Client,
-	matcher runtimeselector.RuntimeMatcher,
-	scorer runtimeselector.RuntimeScorer,
-	c runtimeCandidate,
-	shadowedByNamespaced bool,
-	ns string,
-	model *v1beta1.BaseModelSpec,
-	isvc *v1beta1.InferenceService,
-) string {
-	if c.isCluster && shadowedByNamespaced {
-		// fetcher.GetRuntime (used by both ValidateRuntime and
-		// Selector.GetRuntime) always checks the namespace-scoped runtime of
-		// this name first, so calling either here would silently grade the
-		// NAMESPACED object and report its reason on this CLUSTER row.
-		// ResolveClusterRuntime only ever Gets a ClusterServingRuntime, so
-		// it cannot be shadowed the same way -- resolve (with inheritance,
-		// same as ValidateRuntime would apply) and evaluate directly.
-		spec, _, err := runtimeinheritance.ResolveClusterRuntime(ctx, ctrl, c.name)
-		if err != nil {
-			return fmt.Sprintf("shadowed by a namespaced runtime of the same name, so it could not be re-validated by name; resolving the cluster runtime directly also failed: %v", err)
-		}
-		return evaluateReason(matcher, scorer, spec, model, isvc, c.name)
-	}
-
-	if err := sel.ValidateRuntime(ctx, c.name, model, isvc); err != nil {
-		return rejectionReason(err)
-	}
-
-	// ValidateRuntime agrees the runtime is compatible, yet it is missing
-	// from GetCompatibleRuntimes -- defect (a): recompute the real
-	// auto-select/score cause instead of assuming "no autoSelect entry".
-	spec, _, err := sel.GetRuntime(ctx, c.name, ns, "")
-	if err != nil {
-		return "runtime is compatible but was not auto-selected, and the exact cause could not be recomputed: " + err.Error()
-	}
-	return evaluateReason(matcher, scorer, spec, model, isvc, c.name)
 }
 
 // evaluateReason evaluates spec against model/isvc directly with the exported
