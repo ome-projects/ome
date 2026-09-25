@@ -354,6 +354,25 @@ func TestProjectOperationStrategyKnownValues(t *testing.T) {
 	}
 }
 
+func TestProjectRejectsOperationStrategyOutsideUpdate(t *testing.T) {
+	t.Parallel()
+
+	started := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	got := projectEncodedOperation(t, false, &omev1beta1.InstanceOperation{
+		ID: "op-1", Type: omev1beta1.InstanceOperationRestart, Step: "DeletePods",
+		StartedAt: started, LastProgressAt: started, Strategy: "SurgeThenDrain",
+	})
+	require.NotNil(t, got.Content.Instance)
+	assert.Nil(t, got.Content.Instance.Operation)
+	assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationInvalid)
+
+	for _, format := range []report.Format{report.FormatTable, report.FormatJSON, report.FormatYAML} {
+		var output bytes.Buffer
+		require.NoError(t, report.Write(&output, format, got))
+		assert.NotContains(t, output.String(), "SurgeThenDrain")
+	}
+}
+
 func TestProjectCapacityRefusedWithoutWaitingRemainsVisible(t *testing.T) {
 	t.Parallel()
 

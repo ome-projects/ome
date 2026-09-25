@@ -776,6 +776,7 @@ func validConditionStatus(status metav1.ConditionStatus) bool {
 func validOperation(operation *omev1beta1.InstanceOperation) bool {
 	if operation == nil || operation.ID == "" || operation.Step == "" || operation.RetryCount < 0 ||
 		(operation.SurgeIndex != nil && *operation.SurgeIndex < 0) ||
+		(operation.Strategy != "" && operation.Type != omev1beta1.InstanceOperationUpdate) ||
 		operation.StartedAt.IsZero() || operation.LastProgressAt.IsZero() ||
 		operation.LastProgressAt.Before(&operation.StartedAt) ||
 		(!operation.Deadline.IsZero() && operation.Deadline.Before(&operation.StartedAt)) ||
