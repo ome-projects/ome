@@ -24,10 +24,22 @@ the existing release-driven Pages workflow publishes the website separately.
    deduplicate retries and remember closed-unmerged proposals as declined.
    Semantic duplicate detection across different source commits/slugs also
    relies on the planner reading existing PRs; it is not a text-matching proof.
-5. Independently review each diff for accuracy and a single concern, build the
-   production Hugo site, recheck live PRs, sign off one commit, and open one PR.
+5. Transfer only a JSON bundle of documentation text to a **separate publisher
+   job with a fresh checkout**. Revalidate the bundle with pristine guards before
+   writing allowed documentation paths. No writer scripts, Git metadata, hooks,
+   configuration, or review verdicts cross this boundary.
+6. Independently review each diff with read-only Fable tools for accuracy and a
+   single concern, build the production Hugo site, recheck live PRs, sign off
+   one commit, and open one PR. Git commands disable hooks, including pre-push.
    Nothing is merged automatically. Empty or failed edits publish no PR.
-   `fail-fast: false` lets other concerns finish when one fails.
+   `fail-fast: false` lets other concerns finish when one fails. The publisher
+   skips concerns whose writer failed to produce an artifact.
+
+The writer has a read-only GitHub token and cannot publish. The planner and
+publisher's reviewer have only Read, Glob, and Grep tools (no shell, editing, or
+agent tools); source diffs are prepared by the workflow. The publisher does not
+trust any checks run inside the writer's checkout. PR titles must be a nonempty,
+single printable line, validated before any branch is pushed.
 
 Every PR starts from the planner's default-branch snapshot, not from another
 documentation branch. Run-level concurrency prevents overlapping nightlies.
@@ -41,6 +53,7 @@ reopen/rework it; the nightly does not silently recreate it.
 
 - Runner pods must expose `ANTHROPIC_API_KEY` with access to `claude-fable-5`,
   and support the same Linux/Go/Node/Hugo build used by the Pages workflow.
+  Use ephemeral, single-job runner pods so jobs do not share mutable host state.
 - Enable **Allow GitHub Actions to create and approve pull requests** in the
   repository's Actions settings (organization policy must allow it).
 - Publication uses the scoped `GITHUB_TOKEN` (`contents: write` and

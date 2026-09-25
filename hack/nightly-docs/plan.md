@@ -6,6 +6,8 @@ Use the complete first-parent code-change history in the context as discovery
 evidence, not as proof that documentation is missing. Inspect code, tests, related
 OEP status, and relevant docs before selecting a gap. Include older undocumented
 changes, not just yesterday's commits. Balance recent regressions with older gaps.
+Read source_diffs/<sha>.patch from the context's source_diffs directory when
+examining a commit; the workflow supplies these diffs so no shell tool is needed.
 Internal refactors without a user-visible documentation impact need no PR.
 Do not describe planned or partially implemented features as working features.
 

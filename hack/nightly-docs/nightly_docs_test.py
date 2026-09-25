@@ -86,6 +86,13 @@ class PlanningTests(unittest.TestCase):
             with self.subTest(slug=slug), self.assertRaises(ValueError):
                 docs.validate_item(proposal(concern=slug))
 
+    def test_title_must_be_one_printable_nonempty_line(self):
+        for title in ["[Docs] ", "[Docs]   ", "[Docs] x\ny", "[Docs] x\r", "[Docs] x\t",
+                      "[Docs] x\x00", "[Docs] x\x1b", "[Docs] " + "x" * 114]:
+            with self.subTest(title=title), self.assertRaisesRegex(ValueError, "single-line"):
+                docs.validate_item(proposal(title=title))
+        docs.validate_item(proposal(title="[Docs] Explain café model names"))
+
     def test_fail_closed_on_review_rejection_or_malformed_output(self):
         for value in [{}, {"single_concern": True, "accurate": False},
                       {"single_concern": "true", "accurate": True}]:
@@ -188,12 +195,74 @@ class GitGuardTests(unittest.TestCase):
             remote.assert_not_called()
 
     def test_rejected_scope_never_pushes(self):
+        self.origin()
         Path("source.go").write_text("package changed\n")
-        with patch.object(docs, "existing_prs", return_value=[]), \
-                patch.object(docs, "run", wraps=docs.run) as commands:
+        with patch.object(docs, "existing_prs", return_value=[]):
             with self.assertRaisesRegex(ValueError, "allowlist"):
                 docs.publish(self.item, "test/repo", self.base, "main")
-            self.assertFalse(any(call.args[:2] == ("git", "push") for call in commands.call_args_list))
+        self.assertEqual(self.git("ls-remote", "--heads", "origin"), "")
+
+    def bundle(self, files, **changes):
+        return json.dumps({"base_sha": self.base, "key": self.item["key"], "files": files, **changes})
+
+    def test_bundle_roundtrip_revalidates_in_clean_tree(self):
+        self.path.write_text("Updated documentation.\n")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "bundle.json"
+            docs.export_bundle(self.item, self.base, output)
+            self.git("reset", "--hard", self.base)
+            self.assertTrue(docs.import_bundle(self.item, self.base, output.read_text()))
+        self.assertEqual(self.path.read_text(), "Updated documentation.\n")
+
+    def test_planner_gets_source_patches_without_shell_tools(self):
+        Path("pkg").mkdir()
+        Path("pkg/example.go").write_text("package example\n")
+        self.git("add", "pkg/example.go")
+        self.git("commit", "-qm", "Add example")
+        source = self.git("rev-parse", "HEAD")
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(docs, "existing_prs", return_value=[]):
+            output = Path(directory) / "context.json"
+            docs.prepare("test/repo", output)
+            context = json.loads(output.read_text())
+            self.assertEqual(context["base_sha"], source)
+            self.assertEqual(context["max_prs"], 100)
+            self.assertTrue(any(line.startswith(source) for line in context["code_history"]))
+            patch_file = Path(context["source_diffs"]) / f"{source}.patch"
+            self.assertIn("+package example", patch_file.read_text())
+
+    def test_bundle_cannot_replace_guard_or_install_git_hook(self):
+        for path in ["hack/nightly-docs/nightly_docs.py", ".git/hooks/pre-push",
+                     ".git/config", docs.DOC_ROOT + "../../../../.git/config"]:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "allowlist"):
+                docs.import_bundle(self.item, self.base, self.bundle({str(self.path): "Changed\n", path: "payload"}))
+            self.assertEqual(self.path.read_text(), "Original documentation.\n")
+
+    def test_bundle_cannot_reuse_other_concern_or_base(self):
+        for changes in [{"base_sha": "b" * 40}, {"key": "other-concern"}]:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "does not match"):
+                docs.import_bundle(self.item, self.base, self.bundle({}, **changes))
+
+    def test_bundle_cannot_bypass_line_guard_or_supply_binary(self):
+        with self.assertRaisesRegex(ValueError, "under 1000"):
+            docs.import_bundle(self.item, self.base, self.bundle({str(self.path): "new\n" * 999}))
+        with self.assertRaisesRegex(ValueError, "Invalid"):
+            docs.import_bundle(self.item, self.base, self.bundle({str(self.path): "\x00"}))
+
+    def test_git_publication_never_executes_hooks(self):
+        self.origin()
+        marker = Path(self.temp.name) / "hook-ran"
+        for name in ["pre-commit", "post-checkout", "pre-push"]:
+            hook = Path(".git/hooks") / name
+            hook.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+            hook.chmod(0o755)
+        self.path.write_text("Updated documentation.\n")
+        calls = []
+        with patch.object(docs, "existing_prs", return_value=[]), \
+                patch.object(docs, "run", side_effect=self.publisher_commands(calls)):
+            docs.publish(self.item, "test/repo", self.base, "main")
+        self.assertFalse(marker.exists())
+        self.assertEqual(len(calls), 1)
 
     def origin(self):
         remote = tempfile.TemporaryDirectory()

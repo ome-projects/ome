@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Bound and publish one-concern documentation updates (standard library only)."""
 
 import argparse
@@ -26,7 +25,11 @@ def run(*args):
 
 
 def git(*args):
-    return run("git", *args)
+    return run("git", "-c", "core.hooksPath=/dev/null", *args)
+
+
+def mutate_git(*args):
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], check=True)
 
 
 def pages(endpoint):
@@ -46,8 +49,10 @@ def validate_item(item):
             raise ValueError(f"Invalid {key} slug")
     if not re.fullmatch(r"[0-9a-f]{40}", item["source_sha"]):
         raise ValueError("Expected a full source commit SHA")
-    if not item["title"].startswith("[Docs] ") or len(item["title"]) > 120:
-        raise ValueError("Expected a concise [Docs] title")
+    title = item["title"]
+    if (not title.startswith("[Docs] ") or not title[7:].strip()
+            or len(title) > 120 or not title.isprintable()):
+        raise ValueError("Expected a concise single-line [Docs] title")
     for key in ("question", "evidence"):
         if not isinstance(item[key], str) or not item[key].strip():
             raise ValueError(f"Missing {key}")
@@ -93,8 +98,17 @@ def prepare(repo, output):
     # Full history, no moving date cutoff or success cursor: failures and capped
     # work stay eligible on the next night, including the initial docs backlog.
     history = git("log", "--first-parent", "--format=%H %cs %s", "HEAD", "--", *CODE_PATHS)
+    sources = Path(output).parent / "nightly-docs-sources"
+    sources.mkdir(exist_ok=True)
+    for line in history.splitlines():
+        sha = line.split()[0]
+        with (sources / f"{sha}.patch").open("w") as patch:
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "show",
+                            "--first-parent", "--no-ext-diff", "--no-textconv",
+                            sha, "--", *CODE_PATHS], stdout=patch, check=True)
     context = {"base_sha": git("rev-parse", "HEAD"), "max_prs": MAX_PRS,
-               "code_history": history.splitlines(), "existing_prs": existing_prs(repo)}
+               "code_history": history.splitlines(), "source_diffs": str(sources),
+               "existing_prs": existing_prs(repo)}
     Path(output).write_text(json.dumps(context, indent=2) + "\n")
 
 
@@ -133,7 +147,7 @@ def validate_diff(item, base):
             raise ValueError("Deleted files and symbolic links are not allowed")
         if p.stat().st_mode & 0o111:
             raise ValueError("Documentation must not be executable")
-    subprocess.run(["git", "add", "--", *sorted(changed)], check=True)
+    mutate_git("add", "--", *sorted(changed))
     total = 0
     for line in git("diff", "--cached", "--numstat", base).splitlines():
         added, removed, _ = line.split("\t", 2)
@@ -142,8 +156,41 @@ def validate_diff(item, base):
         total += int(added) + int(removed)
     if total >= MAX_LINES:
         raise ValueError(f"Documentation diff must be under {MAX_LINES} changed lines")
-    subprocess.run(["git", "diff", "--cached", "--check", base], check=True)
+    mutate_git("diff", "--cached", "--check", base)
     return total > 0
+
+
+def export_bundle(item, base, output):
+    """Writer output is untrusted data; never transfer its scripts or .git."""
+    validate_diff(item, base)
+    changed = git("diff", "--cached", "--name-only", base).splitlines()
+    payload = {"base_sha": base, "key": item["key"],
+               "files": {path: Path(path).read_text() for path in changed}}
+    Path(output).write_text(json.dumps(payload) + "\n")
+
+
+def import_bundle(item, base, raw):
+    """Revalidate writer output using the publisher's pristine default-branch code."""
+    if len(raw.encode()) > 10 * 1024 * 1024:
+        raise ValueError("Documentation bundle exceeds 10 MiB")
+    payload = json.loads(raw)
+    if payload["base_sha"] != base or payload["key"] != item["key"]:
+        raise ValueError("Bundle does not match this concern and base")
+    files = payload["files"]
+    if not isinstance(files, dict) or not set(files) <= set(item["doc_paths"]):
+        raise ValueError("Bundle contains paths outside the documentation allowlist")
+    # Validate the entire payload before writing anything. Neither hooks nor
+    # executable scripts/configuration from the writer are ever imported.
+    for path, content in files.items():
+        p = Path(path)
+        if (not doc_path(path) or not isinstance(content, str) or "\x00" in content
+                or any(parent.is_symlink() for parent in (p, *p.parents))):
+            raise ValueError("Invalid documentation bundle entry")
+    for path, content in files.items():
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    return validate_diff(item, base)
 
 
 def review_passes(raw):
@@ -167,17 +214,17 @@ def publish(item, repo, base, base_branch):
     tree = git("write-tree")
     remote = git("ls-remote", "--heads", "origin", f"refs/heads/{branch}")
     if remote:
-        subprocess.run(["git", "fetch", "origin", f"refs/heads/{branch}"], check=True)
+        mutate_git("fetch", "origin", f"refs/heads/{branch}")
         if git("rev-parse", "FETCH_HEAD^{tree}") != tree or git("rev-parse", "FETCH_HEAD^") != base:
             raise ValueError(f"Existing branch {branch} differs; inspect it before retrying")
     else:
-        subprocess.run(["git", "switch", "-c", branch], check=True)
+        mutate_git("switch", "-c", branch)
         # The publisher, rather than the model, owns commit metadata and DCO.
         git("config", "user.name", "github-actions[bot]")
         git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
         message = f'[Docs] Update {item["concern"]}'[:52]
-        subprocess.run(["git", "commit", "-s", "-m", message], check=True)
-        subprocess.run(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], check=True)
+        mutate_git("commit", "-s", "-m", message)
+        mutate_git("push", "origin", f"HEAD:refs/heads/{branch}")
     body = f'''{MARKER}{item["key"]} -->
 ## What this PR does
 
@@ -216,7 +263,7 @@ Scope: **{item["area"]} / {item["concern"]}**. Other concerns are deferred.
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["context", "plan", "check", "publish"])
+    parser.add_argument("command", choices=["context", "plan", "evidence", "check", "export", "import", "publish"])
     args = parser.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
     if args.command == "context":
@@ -230,10 +277,20 @@ def main():
     else:
         item = validate_item(json.loads(os.environ["ITEM_JSON"]))
         base = os.environ["BASE_SHA"]
-        if args.command == "check":
-            changed = validate_diff(item, base)
+        if args.command == "evidence":
+            path = Path(os.environ["NIGHTLY_ITEM"])
+            path.write_text(json.dumps(item) + "\n")
+            patch = git("show", "--first-parent", "--no-ext-diff", "--no-textconv", item["source_sha"])
+            path.with_name("nightly-docs-source.patch").write_text(patch + "\n")
+        elif args.command in ("check", "import"):
+            if args.command == "import":
+                changed = import_bundle(item, base, Path(os.environ["BUNDLE_PATH"]).read_text())
+            else:
+                changed = validate_diff(item, base)
             with open(os.environ["GITHUB_OUTPUT"], "a") as out:
                 out.write(f"changed={str(changed).lower()}\n")
+        elif args.command == "export":
+            export_bundle(item, base, os.environ["BUNDLE_PATH"])
         else:
             review_passes(os.environ["REVIEW_JSON"])
             publish(item, repo, base, os.environ["BASE_BRANCH"])
