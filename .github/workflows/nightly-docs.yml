@@ -1,0 +1,167 @@
+name: Nightly Documentation Updates
+
+on:
+  schedule:
+    - cron: '23 9 * * *' # 09:23 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+# Serialize the entire run, including publication. A retry must not race another
+# planner over the same gaps. Every run rechecks live PRs before publishing.
+concurrency:
+  group: nightly-docs
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.repository == 'ome-projects/ome'
+    runs-on: ome-runner-cpu
+    timeout-minutes: 45
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+      - name: Gather code history and existing documentation PRs
+        env:
+          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
+        run: |
+          python3 hack/nightly-docs/nightly_docs.py context
+      - name: Identify separate documentation concerns
+        id: discover
+        uses: anthropics/claude-code-action@v1
+        env:
+          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
+        with:
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: Read and follow hack/nightly-docs/plan.md. The context file is ${{ runner.temp }}/nightly-docs-context.json.
+          claude_args: >-
+            --model claude-fable-5
+            --effort xhigh
+            --max-turns 60
+            --allowedTools "Read,Glob,Grep,Bash(git show:*),Bash(git log:*),Bash(git diff:*)"
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":4,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_sha":{"type":"string"},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string"}}},"required":["area","concern","source_sha","title","question","evidence","doc_paths"]}}},"required":["concerns"]}'
+      - name: Validate plan and remove duplicate concerns
+        id: plan
+        env:
+          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
+          PLAN_JSON: ${{ steps.discover.outputs.structured_output }}
+        run: python3 hack/nightly-docs/nightly_docs.py plan
+      - name: Planning summary
+        env:
+          COUNT: ${{ steps.plan.outputs.count }}
+        run: echo "Selected ${COUNT} separate documentation concerns (maximum 4)." >> "$GITHUB_STEP_SUMMARY"
+
+  update:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ome-runner-cpu
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: 'Document: ${{ matrix.concern }}'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      ITEM_JSON: ${{ toJSON(matrix) }}
+    steps:
+      # Every concern starts from the same clean default-branch snapshot, never
+      # from another documentation PR's branch.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+      - name: Save the single concern
+        env:
+          NIGHTLY_ITEM: ${{ runner.temp }}/nightly-docs-item.json
+        run: |
+          python3 -c 'import os, pathlib; pathlib.Path(os.environ["NIGHTLY_ITEM"]).write_text(os.environ["ITEM_JSON"])'
+      - name: Update documentation for this concern only
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: Read and follow hack/nightly-docs/write.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json.
+          claude_args: >-
+            --model claude-fable-5
+            --effort xhigh
+            --max-turns 40
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git show:*),Bash(git log:*),Bash(git diff:*)"
+      - name: Enforce documentation file and diff limits
+        id: scope
+        run: python3 hack/nightly-docs/nightly_docs.py check
+      - name: Independently review accuracy and scope
+        if: steps.scope.outputs.changed == 'true'
+        id: review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: Read and follow hack/nightly-docs/review.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json. Review git diff HEAD (including staged changes).
+          claude_args: >-
+            --model claude-fable-5
+            --effort xhigh
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Bash(git show:*),Bash(git log:*),Bash(git diff:*)"
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"}},"required":["single_concern","accurate","reason"]}'
+      - name: Require a passing review
+        if: steps.scope.outputs.changed == 'true'
+        env:
+          REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
+        run: |
+          python3 -c 'import os, sys; sys.path.insert(0, "hack/nightly-docs"); from nightly_docs import review_passes; review_passes(os.environ["REVIEW_JSON"])'
+      - uses: actions/setup-go@v6
+        if: steps.scope.outputs.changed == 'true'
+        with:
+          go-version: '1.26'
+          cache-dependency-path: hack/internal/tools/go.sum
+      - uses: actions/setup-node@v6
+        if: steps.scope.outputs.changed == 'true'
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Build the documentation site
+        if: steps.scope.outputs.changed == 'true'
+        env:
+          HUGO_ENVIRONMENT: production
+          HUGO_BASEURL: https://ome-projects.github.io/ome/
+        run: |
+          (cd hack/internal/tools && GOBIN="$RUNNER_TEMP/nightly-docs-bin" CGO_ENABLED=1 go install -tags extended github.com/gohugoio/hugo@v0.157.0)
+          # Hugo resolves Docsy modules into go.mod/go.sum. Build a copy so those
+          # generated files cannot contaminate the strictly docs-only PR.
+          cp -a site "$RUNNER_TEMP/nightly-docs-site"
+          (cd "$RUNNER_TEMP/nightly-docs-site" && npm ci && "$RUNNER_TEMP/nightly-docs-bin/hugo" --gc --minify --enableGitInfo=false)
+      - name: Publish one documentation PR
+        if: steps.scope.outputs.changed == 'true'
+        env:
+          REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
+        run: |
+          gh auth setup-git
+          python3 hack/nightly-docs/nightly_docs.py publish
+      - name: No-op summary
+        if: steps.scope.outputs.changed == 'false'
+        run: echo "No supported documentation change remained for this concern; no PR created." >> "$GITHUB_STEP_SUMMARY"
