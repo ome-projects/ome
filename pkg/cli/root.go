@@ -54,7 +54,7 @@ Inspect migration, placement, quota, and traffic.
 Explain runtime selection and review accelerator-selection evidence.
 Stream component logs.
 
-Action families include rollout pause/resume/promote/rollback,
+Action families include rollout pause/resume/promote/rollback/repin,
 migration start, traffic drain/undrain, transient scale, instance release-held,
 and runtime sync.
 Wait for reported readiness and workflow state.

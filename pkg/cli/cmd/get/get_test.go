@@ -162,6 +162,36 @@ func TestGetISVCTable(t *testing.T) {
 	assertGolden(t, "isvc_list.golden", []byte(out))
 }
 
+func TestGetExplicitTableOutput(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		t.Run(fmt.Sprintf("named=%t", named), func(t *testing.T) {
+			f := factory.Static{
+				OME: omefake.NewSimpleClientset(fixtureISVC("a-isvc", "team-a")),
+				NS:  "team-a",
+			}
+			args := []string{"isvc"}
+			if named {
+				args = append(args, "a-isvc")
+			}
+			out, stderr, err := executeSeparate(t, f, append(args, "-o", "table")...)
+			require.NoError(t, err)
+			assert.Empty(t, stderr)
+			assert.Contains(t, out, "NAME")
+			assert.Contains(t, out, "a-isvc")
+			assert.Contains(t, out, "llama-3-3-70b")
+			assert.NotContains(t, out, "NAMESPACE")
+		})
+	}
+}
+
+func TestGetExplicitTableEmptyList(t *testing.T) {
+	f := factory.Static{OME: omefake.NewSimpleClientset(), NS: "team-a"}
+	out, stderr, err := executeSeparate(t, f, "isvc", "-o", "table")
+	require.NoError(t, err)
+	assert.Empty(t, out)
+	assert.Contains(t, stderr, `No inferenceservices found in namespace "team-a".`)
+}
+
 func TestGetRolloutPolicyUsesRuntimeClientAndSelector(t *testing.T) {
 	selected := fixtureRolloutPolicy("guarded", "team-a")
 	unselected := fixtureRolloutPolicy("other", "team-a")
@@ -363,7 +393,7 @@ func TestGetEmptyClusterScopedMessageHasNoNamespaceClause(t *testing.T) {
 func TestGetInvalidOutputFormat(t *testing.T) {
 	_, err := execute(t, factory.Static{NS: "team-a"}, "isvc", "-o", "toml")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "supported: wide, json, yaml")
+	assert.Contains(t, err.Error(), "supported: table, wide, json, yaml")
 }
 
 func TestGetNameWithAllNamespacesRejected(t *testing.T) {

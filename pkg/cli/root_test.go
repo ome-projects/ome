@@ -400,7 +400,7 @@ func TestRootTrafficActionsRegistrationAndClosedParser(t *testing.T) {
 				}
 				args := []string{"traffic", action, "chat", "--id=maintenance-a"}
 				if action == "drain" {
-					args = append(args, "--cluster=worker-a", "--reason=maintenance")
+					args = append(args, "--workload-cluster=worker-a", "--reason=maintenance")
 				}
 				root.SetArgs(append(args, flag))
 				if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || f.calls != 0 || stderr.String() != "error: invalid traffic action flags; use --help\n" {
