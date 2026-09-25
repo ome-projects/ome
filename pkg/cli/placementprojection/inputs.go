@@ -5,6 +5,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	validation "k8s.io/apimachinery/pkg/util/validation"
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -81,6 +82,15 @@ func validLabels(values map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func workloadClusterSelectorSet(cluster *ome.WorkloadCluster) labels.Set {
+	set := make(labels.Set, len(cluster.Labels)+1)
+	for key, value := range cluster.Labels {
+		set[key] = value
+	}
+	set[metav1.ObjectNameField] = cluster.Name
+	return set
 }
 
 func publicName(value string) bool {

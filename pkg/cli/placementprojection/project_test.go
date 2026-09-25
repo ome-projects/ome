@@ -470,7 +470,11 @@ func TestModesAndFailedSingleRetainedAddress(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Content.Placement.Phase != "Failed" || got.Content.Placement.Address.State != "Present" || got.Content.Placement.Homes[0].AdmittedReplicas.State != "NotApplicable" {
+		wantCountState := v.PlacementValue("Reported")
+		if mode == "Future" {
+			wantCountState = "NotApplicable"
+		}
+		if got.Content.Placement.Phase != "Failed" || got.Content.Placement.Address.State != "Present" || got.Content.Placement.Homes[0].AdmittedReplicas.State != wantCountState {
 			t.Fatalf("failed/mode=%+v", got.Content)
 		}
 		if mode == "" && (got.Content.Inputs.Mode != "Single" || got.Content.Inputs.ModeEvidence != "Defaulted") {

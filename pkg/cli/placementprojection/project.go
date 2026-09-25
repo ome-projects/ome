@@ -66,7 +66,7 @@ func ProjectExplain(snapshot c.Result, clock v.Clock) (v.PlacementExplainReport,
 				if status.Inputs.RequirementsState == "NoRequirements" {
 					row.ComputedSelectorCompatible = "NotApplicable"
 				} else if selector != nil && validLabels(w.Labels) {
-					row.ComputedSelectorCompatible = truth(selector.Matches(labels.Set(w.Labels)))
+					row.ComputedSelectorCompatible = truth(selector.Matches(workloadClusterSelectorSet(w)))
 				}
 				if status.Placement.HomePreview.State == "Validated" {
 					row.ReportedHome = "False"
@@ -190,7 +190,8 @@ func projectStatus(parent *ome.InferenceService) (v.PlacementStatusContent, labe
 		if h.Phase != "" && phase == "Unknown" {
 			addIssue(&candidateIssues, "CandidatePhase", "UnknownValue")
 		}
-		projected[h.Cluster] = v.PlacementHome{Cluster: h.Cluster, Phase: phase, Address: address(h.Endpoint), Source: reported(), AdmittedReplicas: count(h.AdmittedReplicas, inputs.Mode == "Split"), ReadyReplicas: count(h.ReadyReplicas, inputs.Mode == "Split"), Provenance: prov}
+		countsApplicable := inputs.Mode == "Single" || inputs.Mode == "All" || inputs.Mode == "Split"
+		projected[h.Cluster] = v.PlacementHome{Cluster: h.Cluster, Phase: phase, Address: address(h.Endpoint), Source: reported(), AdmittedReplicas: count(h.AdmittedReplicas, countsApplicable), ReadyReplicas: count(h.ReadyReplicas, countsApplicable), Provenance: prov}
 	}
 	content.Issues = append(content.Issues, candidateIssues...)
 	names := make([]string, 0, len(seen))
