@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,8 +20,22 @@ import (
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/transport"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
+
+func TestActionReadClientsBoundEveryHTTPResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, strings.Repeat("x", actionReadResponseLimit+1))
+	}))
+	defer server.Close()
+	f := &defaultFactory{rest: &rest.Config{Host: server.URL}}
+	client, err := f.OMEClientForAction(context.Background())
+	require.NoError(t, err)
+	_, err = client.OmeV1beta1().InferenceServices("team-a").Get(context.Background(), "service", metav1.GetOptions{})
+	require.ErrorIs(t, err, transport.ErrResponseTooLarge)
+}
 
 type actionReadsCapability interface {
 	OMEClientForAction(context.Context) (versioned.Interface, error)

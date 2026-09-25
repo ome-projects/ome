@@ -31,19 +31,20 @@ type ActionTarget struct {
 // ActionResult is the separate, versioned stdout contract shared by guarded
 // mutating commands. Preview, confirmation, and warnings remain on stderr.
 type ActionResult struct {
-	APIVersion   string              `json:"apiVersion"`
-	Kind         string              `json:"kind"`
-	CollectedAt  time.Time           `json:"collectedAt"`
-	Action       string              `json:"action"`
-	Target       ActionTarget        `json:"target"`
-	DryRun       DryRunMode          `json:"dryRun"`
-	RequestID    string              `json:"requestID,omitempty"`
-	RevisionHash string              `json:"revisionHash,omitempty"`
-	Accepted     bool                `json:"accepted"`
-	Applied      bool                `json:"applied"`
-	Message      string              `json:"message,omitempty"`
-	FollowUp     string              `json:"followUp,omitempty"`
-	Scale        *ScaleActionDetails `json:"scale,omitempty"`
+	APIVersion   string                `json:"apiVersion"`
+	Kind         string                `json:"kind"`
+	CollectedAt  time.Time             `json:"collectedAt"`
+	Action       string                `json:"action"`
+	Target       ActionTarget          `json:"target"`
+	DryRun       DryRunMode            `json:"dryRun"`
+	RequestID    string                `json:"requestID,omitempty"`
+	RevisionHash string                `json:"revisionHash,omitempty"`
+	Accepted     bool                  `json:"accepted"`
+	Applied      bool                  `json:"applied"`
+	Message      string                `json:"message,omitempty"`
+	FollowUp     string                `json:"followUp,omitempty"`
+	Scale        *ScaleActionDetails   `json:"scale,omitempty"`
+	Traffic      *TrafficActionDetails `json:"traffic,omitempty"`
 }
 
 // NewActionResult creates an unapplied result using an injectable clock.
@@ -73,6 +74,10 @@ func (r ActionResult) Canonical() ActionResult {
 		copy := r.Scale.canonical()
 		result.Scale = &copy
 	}
+	if r.Traffic != nil {
+		copy := *r.Traffic
+		result.Traffic = &copy
+	}
 	if result.DryRun != DryRunNone {
 		result.Applied = false
 	}
@@ -87,6 +92,9 @@ func (r ActionResult) Table() report.Table {
 	if r.Scale != nil {
 		return r.scaleTable(false)
 	}
+	if r.Traffic != nil {
+		return r.trafficTable(false)
+	}
 	rows := [][]string{{"action", r.Action}, {"target", r.Target.displayName()}, {"dry-run", string(r.DryRun)}, {"accepted", yesNo(r.Accepted)}, {"applied", yesNo(r.Applied)}, {"request-id", orDash(r.RequestID)}, {"revision-hash", orDash(r.RevisionHash)}, {"message", orDash(r.Message)}, {"follow-up", orDash(r.FollowUp)}, {"hint", "Use -o json or -o yaml for full values."}}
 	for i := range rows {
 		rows[i][1] = printers.BoundedCell(rows[i][1], 56)
@@ -98,6 +106,9 @@ func (r ActionResult) Table() report.Table {
 func (r ActionResult) WideTable() report.Table {
 	if r.Scale != nil {
 		return r.scaleTable(true)
+	}
+	if r.Traffic != nil {
+		return r.trafficTable(true)
 	}
 	return r.Table()
 }

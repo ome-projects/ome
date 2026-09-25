@@ -41,6 +41,13 @@ func NewBoundedDynamic(config *rest.Config, limit int64) (dynamic.Interface, err
 	return dynamic.NewForConfigAndClient(cfg, &isolated)
 }
 
+// WithBoundedResponses returns an owned config whose non-streaming response
+// bodies fail after limit bytes. It preserves every existing transport wrapper
+// and is intended for typed clients that do not use Client directly.
+func WithBoundedResponses(config *rest.Config, limit int64) (*rest.Config, error) {
+	return boundedConfig(config, limit)
+}
+
 func boundedConfig(config *rest.Config, limit int64) (*rest.Config, error) {
 	if config == nil || limit < 1 || limit > 64*1024*1024 {
 		return nil, errors.New("transport: bounded response configuration is invalid")

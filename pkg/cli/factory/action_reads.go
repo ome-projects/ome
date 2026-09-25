@@ -8,8 +8,12 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	"sigs.k8s.io/ome/pkg/cli/transport"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
+
+const actionReadResponseLimit = 16 * 1024 * 1024
 
 // ActionReadClientsResolver optionally provides action-owned, uncached GET/LIST
 // clients. Injected Static/custom factories keep their explicit clients.
@@ -47,6 +51,10 @@ func (f *defaultFactory) actionConfigAndClient(ctx context.Context) (*rest.Confi
 	owned.Wrap(func(inner http.RoundTripper) http.RoundTripper {
 		return &actionContextTransport{inner: inner, ctx: ctx}
 	})
+	owned, err = transport.WithBoundedResponses(owned, actionReadResponseLimit)
+	if err != nil {
+		return nil, nil, err
+	}
 	client, err := rest.HTTPClientFor(owned)
 	if err != nil {
 		return nil, nil, err

@@ -1,4 +1,5 @@
-// Package traffic implements read-only controller-reported traffic inspection.
+// Package traffic implements controller-reported traffic inspection and
+// guarded manual drain actions.
 package traffic
 
 import (
@@ -14,7 +15,7 @@ import (
 func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "traffic",
-		Short: "Inspect controller-reported traffic evidence",
+		Short: "Inspect traffic evidence and manage guarded drains",
 	}
 	cmd.AddCommand(newStatusCmd(f, streams, statusDependencies{
 		clock:   reportv1alpha1.SystemClock{},
@@ -24,5 +25,7 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 		clock:   reportv1alpha1.SystemClock{},
 		project: trafficprojection.ProjectExplain,
 	}))
+	cmd.AddCommand(newActionCmd(f, streams, reportv1alpha1.SystemClock{}, "drain"))
+	cmd.AddCommand(newActionCmd(f, streams, reportv1alpha1.SystemClock{}, "undrain"))
 	return cmd
 }

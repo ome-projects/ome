@@ -55,7 +55,8 @@ Explain runtime selection and review accelerator-selection evidence.
 Stream component logs.
 
 Action families include rollout pause/resume/promote/rollback,
-migration start, transient scale, instance release-held, and runtime sync.
+migration start, traffic drain/undrain, transient scale, instance release-held,
+and runtime sync.
 Wait for reported readiness and workflow state.
 See each subcommand's help for flags and safeguards.`,
 		SilenceUsage:  true,

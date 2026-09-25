@@ -118,8 +118,10 @@ func TestRootCommandTree(t *testing.T) {
 		"ome scale",
 		"ome status",
 		"ome traffic",
+		"ome traffic drain",
 		"ome traffic explain",
 		"ome traffic status",
+		"ome traffic undrain",
 		"ome version",
 		"ome wait",
 	}
@@ -281,6 +283,7 @@ func TestRootHelpOverviewFitsTerminalAndNamesCurrentActions(t *testing.T) {
 		"placement", "quota", "traffic", "cluster", "control-plane evidence",
 		"accelerator-selection evidence",
 		"rollout pause/resume/promote/rollback", "migration start",
+		"traffic drain/undrain",
 		"transient scale", "instance release-held", "runtime sync",
 		"Wait for reported readiness",
 		"See each subcommand's help for flags and safeguards.",
@@ -368,8 +371,38 @@ func TestRootHelpListsTrafficEvidenceCommand(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !bytes.Contains(output.Bytes(), []byte("  traffic     Inspect controller-reported traffic evidence\n")) {
+	if !bytes.Contains(output.Bytes(), []byte("  traffic     Inspect traffic evidence and manage guarded drains\n")) {
 		t.Fatalf("root help does not list traffic command:\n%s", output.String())
+	}
+}
+
+func TestRootTrafficActionsRegistrationAndClosedParser(t *testing.T) {
+	const credential = "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, action := range []string{"drain", "undrain"} {
+		for _, flag := range []string{"--yes=" + credential, "--insecure-skip-tls-verify=" + credential, "--" + credential, "--dry-run"} {
+			t.Run(action+"/"+flag, func(t *testing.T) {
+				var out, stderr bytes.Buffer
+				f := &waitFlagFactory{}
+				root := NewRootCmdWithFactory(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
+				command, _, err := root.Find([]string{"traffic", action})
+				if err != nil || command.Use != action+" INFERENCESERVICE" || !strings.Contains(command.Long, "not TrafficMap convergence") {
+					t.Fatalf("traffic %s registration or acceptance contract changed", action)
+				}
+				for _, name := range []string{"id", "dry-run", "yes", "output"} {
+					if command.Flags().Lookup(name) == nil {
+						t.Fatalf("traffic %s flag %s is missing", action, name)
+					}
+				}
+				args := []string{"traffic", action, "chat", "--id=maintenance-a"}
+				if action == "drain" {
+					args = append(args, "--cluster=worker-a", "--reason=maintenance")
+				}
+				root.SetArgs(append(args, flag))
+				if code := ExecuteCommand(root, &stderr); code != 1 || out.Len() != 0 || f.calls != 0 || stderr.String() != "error: invalid traffic action flags; use --help\n" {
+					t.Fatalf("closed traffic parser: code=%d acquisitions=%d stdout=%q stderr=%q", code, f.calls, out.String(), stderr.String())
+				}
+			})
+		}
 	}
 }
 
