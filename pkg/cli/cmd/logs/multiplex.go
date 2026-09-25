@@ -15,18 +15,37 @@ type namedStream struct {
 
 // multiplex copies every stream to out line-by-line, prefixing each line,
 // serialized by a mutex so lines never interleave mid-line. Blocks until all
-// streams hit EOF (or error); reader close is guaranteed.
+// workers exit; the first failure closes every reader. Reader close is also
+// guaranteed on successful EOF.
 func multiplex(streams []namedStream, out io.Writer) error {
 	var (
-		mu   sync.Mutex
-		wg   sync.WaitGroup
-		errs = make([]error, len(streams))
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		stopOnce sync.Once
+		firstErr error
 	)
+	closed := make([]sync.Once, len(streams))
+	closeStream := func(i int) {
+		closed[i].Do(func() { _ = streams[i].Reader.Close() })
+	}
+	closeAll := func(err error) {
+		if err == nil {
+			return
+		}
+		stopOnce.Do(func() {
+			// Preserve the triggering error before closing siblings unblocks
+			// their scanners, which may report errors caused by the close.
+			firstErr = err
+			for i := range streams {
+				closeStream(i)
+			}
+		})
+	}
 	for i, s := range streams {
 		wg.Add(1)
 		go func(i int, s namedStream) {
 			defer wg.Done()
-			defer s.Reader.Close()
+			defer closeStream(i)
 			scanner := bufio.NewScanner(s.Reader)
 			scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 			for scanner.Scan() {
@@ -34,18 +53,13 @@ func multiplex(streams []namedStream, out io.Writer) error {
 				_, werr := io.WriteString(out, s.Prefix+scanner.Text()+"\n")
 				mu.Unlock()
 				if werr != nil {
-					errs[i] = werr
+					closeAll(werr)
 					return
 				}
 			}
-			errs[i] = scanner.Err()
+			closeAll(scanner.Err())
 		}(i, s)
 	}
 	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return firstErr
 }
