@@ -4,6 +4,7 @@
 package factory
 
 import (
+	"strings"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,6 +17,13 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
+	omeversion "sigs.k8s.io/ome/pkg/version"
+)
+
+const (
+	userAgentProduct          = "kubectl-ome"
+	unknownUserAgentVersion   = "unknown"
+	maxUserAgentVersionLength = 64
 )
 
 type Factory interface {
@@ -52,6 +60,7 @@ func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.rest != nil {
+		addProductUserAgent(f.rest, omeversion.GitVersion)
 		return f.rest, nil
 	}
 	cfg, err := f.flags.ToRESTConfig()
@@ -65,8 +74,53 @@ func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	// the API server.
 	cfg.QPS = 50
 	cfg.Burst = 300
+	addProductUserAgent(cfg, omeversion.GitVersion)
 	f.rest = cfg
 	return cfg, nil
+}
+
+// addProductUserAgent appends kubectl-ome/<version> as a distinct HTTP
+// product token. It preserves a caller-supplied User-Agent byte-for-byte and
+// is idempotent for an already appended token. rest.AddUserAgent is not used
+// because it replaces a caller-supplied value instead of extending it.
+func addProductUserAgent(config *rest.Config, gitVersion string) {
+	product := userAgentProduct + "/" + canonicalUserAgentVersion(gitVersion)
+	for _, token := range strings.Fields(config.UserAgent) {
+		if token == product {
+			return
+		}
+	}
+	if config.UserAgent == "" {
+		config.UserAgent = rest.DefaultKubernetesUserAgent()
+	}
+	config.UserAgent += " " + product
+}
+
+// canonicalUserAgentVersion accepts only a bounded HTTP token. Unsafe linker
+// input is never reflected into request headers; it collapses to a stable,
+// non-sensitive fallback instead.
+func canonicalUserAgentVersion(gitVersion string) string {
+	if len(gitVersion) == 0 || len(gitVersion) > maxUserAgentVersionLength {
+		return unknownUserAgentVersion
+	}
+	for i := range len(gitVersion) {
+		if !isHTTPTokenByte(gitVersion[i]) {
+			return unknownUserAgentVersion
+		}
+	}
+	return gitVersion
+}
+
+func isHTTPTokenByte(value byte) bool {
+	if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' {
+		return true
+	}
+	switch value {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
 }
 
 // protobufConfig returns a COPY of cfg negotiating protobuf the way kubectl

@@ -52,7 +52,7 @@ func TestRESTConfigBurstMatchesKubectlParity(t *testing.T) {
 // protobuf negotiation for core-type traffic, in isolation from any real
 // REST config loading.
 func TestProtobufConfigNegotiatesProtobufWithoutMutatingInput(t *testing.T) {
-	base := &rest.Config{Host: "https://cluster.example:6443", Burst: 300}
+	base := &rest.Config{Host: "https://cluster.example:6443", Burst: 300, UserAgent: "operations-console/2 kubectl-ome/v1.2.3"}
 
 	got := protobufConfig(base)
 
@@ -61,11 +61,13 @@ func TestProtobufConfigNegotiatesProtobufWithoutMutatingInput(t *testing.T) {
 	// Same server, same rate limits -- only content negotiation changed.
 	assert.Equal(t, base.Host, got.Host)
 	assert.Equal(t, base.Burst, got.Burst)
+	assert.Equal(t, base.UserAgent, got.UserAgent)
 	// The input must come back untouched: OMEClient/RuntimeClient share the
 	// same underlying *rest.Config and must keep negotiating JSON (CRDs
 	// don't serve protobuf).
 	assert.Empty(t, base.AcceptContentTypes)
 	assert.Empty(t, base.ContentType)
+	assert.Equal(t, "operations-console/2 kubectl-ome/v1.2.3", base.UserAgent)
 }
 
 // TestKubeClientDoesNotLeakProtobufIntoSharedConfig is the end-to-end
