@@ -53,6 +53,7 @@ type Options struct {
 	Tail           int64
 	Since          time.Duration
 	MaxLogRequests int
+	LimitBytes     int64
 
 	instanceSet  bool
 	revisionHash string
@@ -93,6 +94,7 @@ func newCmdWithDependencies(f factory.Factory, streams genericiooptions.IOStream
 	cmd.Flags().Int64Var(&o.Tail, "tail", o.Tail, "Lines of recent log to show per pod (-1 for all)")
 	cmd.Flags().DurationVar(&o.Since, "since", 0, "Only logs newer than this duration (e.g. 10m)")
 	cmd.Flags().IntVar(&o.MaxLogRequests, "max-log-requests", o.MaxLogRequests, "Maximum number of concurrent log streams to follow")
+	cmd.Flags().Int64Var(&o.LimitBytes, "limit-bytes", 0, "Maximum bytes of logs to request per pod for one-shot reads (0 for no limit)")
 	return cmd
 }
 
@@ -112,6 +114,12 @@ func (o *Options) Validate() error {
 	}
 	if o.MaxLogRequests <= 0 {
 		return fmt.Errorf("--max-log-requests must be greater than 0")
+	}
+	if o.LimitBytes < 0 {
+		return fmt.Errorf("--limit-bytes must be greater than or equal to 0")
+	}
+	if o.Follow && o.LimitBytes > 0 {
+		return fmt.Errorf("--limit-bytes cannot be used with --follow")
 	}
 	if o.Revision == "" {
 		if o.instanceSet && o.Component == "" {
@@ -195,6 +203,10 @@ func (o *Options) run(ctx context.Context, f factory.Factory, deps dependencies)
 		if o.Since > 0 {
 			seconds := int64(o.Since.Seconds())
 			options.SinceSeconds = &seconds
+		}
+		if o.LimitBytes > 0 {
+			limitBytes := o.LimitBytes
+			options.LimitBytes = &limitBytes
 		}
 		prefix := ""
 		if len(pods) > 1 {

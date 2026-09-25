@@ -317,6 +317,72 @@ func TestLogsHelpDocumentsFollowRequestLimit(t *testing.T) {
 	assert.Contains(t, flag.Usage, "concurrent log streams")
 }
 
+func TestLogsLimitBytesUsesPerPodLogOption(t *testing.T) {
+	kube := kubefake.NewSimpleClientset(
+		pod("chat-decoder-0", "chat", "decoder"),
+		pod("chat-engine-0", "chat", "engine"),
+	)
+	out, err := execute(t, factory.Static{Kube: kube, NS: "team-a"},
+		"chat", "--limit-bytes=2048", "--tail=7", "--since=30s")
+	require.NoError(t, err)
+	assert.Contains(t, out, "[decoder/chat-decoder-0] fake logs")
+	assert.Contains(t, out, "[engine/chat-engine-0] fake logs")
+
+	var logActions int
+	for _, action := range kube.Actions() {
+		if action.GetSubresource() != "log" {
+			continue
+		}
+		generic, ok := action.(k8stesting.GenericAction)
+		require.True(t, ok)
+		options, ok := generic.GetValue().(*corev1.PodLogOptions)
+		require.True(t, ok)
+		assert.False(t, options.Follow)
+		require.NotNil(t, options.LimitBytes)
+		assert.Equal(t, int64(2048), *options.LimitBytes)
+		require.NotNil(t, options.TailLines)
+		assert.Equal(t, int64(7), *options.TailLines)
+		require.NotNil(t, options.SinceSeconds)
+		assert.Equal(t, int64(30), *options.SinceSeconds)
+		logActions++
+	}
+	assert.Equal(t, 2, logActions)
+}
+
+func TestLogsRejectsInvalidLimitBytesBeforeFactoryAccess(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "negative",
+			args: []string{"chat", "--limit-bytes=-1"},
+			want: "--limit-bytes must be greater than or equal to 0",
+		},
+		{
+			name: "follow",
+			args: []string{"chat", "--follow", "--limit-bytes=1"},
+			want: "--limit-bytes cannot be used with --follow",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := execute(t, factory.Static{}, tt.args...)
+			require.EqualError(t, err, tt.want)
+		})
+	}
+}
+
+func TestLogsHelpDocumentsOneShotByteLimit(t *testing.T) {
+	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{})
+	flag := cmd.Flags().Lookup("limit-bytes")
+	require.NotNil(t, flag)
+	assert.Equal(t, "0", flag.DefValue)
+	assert.Contains(t, flag.Usage, "per pod")
+	assert.Contains(t, flag.Usage, "one-shot")
+}
+
 func sixPods(isvc string) []runtime.Object {
 	objects := make([]runtime.Object, 0, 6)
 	for i := range 6 {
