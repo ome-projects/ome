@@ -38,6 +38,125 @@ func fixture(t *testing.T) c.Result {
 	return c.Result{InferenceService: &parent, WorkloadClusters: []ome.WorkloadCluster{cluster}, Fleet: v.PlacementAcquisition{State: "Observed", Returned: 1, Admitted: 1, Pages: 1, Complete: true}, TrafficMap: &tm, TrafficMapAcquisition: v.PlacementAcquisition{State: "Observed", Returned: 1, Admitted: 1, Pages: 1, Complete: true}}
 }
 
+func TestProjectStatusPreservesAdmittingPhases(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		placement     ome.PlacementPhase
+		candidate     ome.CandidatePlacementPhase
+		wantPlacement v.PlacementValue
+		wantCandidate v.PlacementValue
+	}{
+		{"admitting", ome.PlacementPhaseAdmitting, ome.CandidatePhaseAdmitting, "Admitting", "Admitting"},
+		{"legacy-racing-admitted", "Racing", "Admitted", "Racing", "Admitted"},
+		{"placed", ome.PlacementPhasePlaced, ome.CandidatePhasePlaced, "Placed", "Placed"},
+		{"empty", "", "", "NotRecorded", "NotRecorded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			s.InferenceService.Status.Placement.Phase = tc.placement
+			s.InferenceService.Status.Placement.Candidates = []ome.CandidatePlacement{{Cluster: "west", Phase: tc.candidate}}
+			got, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Content.Placement.Phase != tc.wantPlacement {
+				t.Errorf("placement phase=%q want %q", got.Content.Placement.Phase, tc.wantPlacement)
+			}
+			if len(got.Content.Placement.Homes) != 1 {
+				t.Fatalf("homes=%+v", got.Content.Placement.Homes)
+			}
+			if got.Content.Placement.Homes[0].Phase != tc.wantCandidate {
+				t.Errorf("candidate phase=%q want %q", got.Content.Placement.Homes[0].Phase, tc.wantCandidate)
+			}
+			if len(got.Content.Issues) != 0 {
+				t.Errorf("unexpected issues=%+v", got.Content.Issues)
+			}
+		})
+	}
+}
+
+func TestProjectStatusFlagsUnknownPhasesWithoutEchoingThem(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		placement string
+		candidate string
+		malformed bool
+	}{
+		{"future", "FuturePlacement", "FutureCandidate", false},
+		{"placement-control-text", "FuturePlacement\nplacement-control\x1b[31m", "FutureCandidate", false},
+		{"candidate-control-text", "FuturePlacement", "FutureCandidate\rcandidate-control\x1b[2J", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			s.InferenceService.Status.Placement.Phase = ome.PlacementPhase(tc.placement)
+			s.InferenceService.Status.Placement.Candidates = []ome.CandidatePlacement{
+				{Cluster: "west", Phase: ome.CandidatePlacementPhase(tc.candidate)},
+				{Cluster: "east", Phase: ome.CandidatePlacementPhase(tc.candidate)},
+				{Cluster: "empty"},
+			}
+			got, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Content.Placement.Phase != "Unknown" {
+				t.Errorf("placement phase=%q want Unknown", got.Content.Placement.Phase)
+			}
+			wantHomes := 3
+			if tc.malformed {
+				wantHomes = 0
+				if got.Content.Placement.HomePreview.State != "MalformedPayload" {
+					t.Errorf("home preview=%+v want MalformedPayload", got.Content.Placement.HomePreview)
+				}
+			}
+			if len(got.Content.Placement.Homes) != wantHomes {
+				t.Fatalf("homes=%+v", got.Content.Placement.Homes)
+			}
+			for _, home := range got.Content.Placement.Homes {
+				want := v.PlacementValue("Unknown")
+				if home.Cluster == "empty" {
+					want = "NotRecorded"
+				}
+				if home.Phase != want {
+					t.Errorf("home %s phase=%q want %q", home.Cluster, home.Phase, want)
+				}
+			}
+			wantIssues := []v.PlacementIssue{
+				{Group: "CandidatePhase", Code: "UnknownValue", Count: 2},
+				{Group: "PlacementPhase", Code: "UnknownValue", Count: 1},
+			}
+			if tc.malformed {
+				wantIssues = wantIssues[1:]
+			}
+			if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+				t.Errorf("issues=%+v want %+v", got.Content.Issues, wantIssues)
+			}
+			candidates := s.InferenceService.Status.Placement.Candidates
+			candidates[0], candidates[2] = candidates[2], candidates[0]
+			reordered, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+				var out, reorderedOut bytes.Buffer
+				if err := report.Write(&out, format, got); err != nil {
+					t.Fatal(err)
+				}
+				if err := report.Write(&reorderedOut, format, reordered); err != nil {
+					t.Fatal(err)
+				}
+				if out.String() != reorderedOut.String() {
+					t.Errorf("%s output changed after reordering candidates", format)
+				}
+				for _, raw := range []string{tc.placement, tc.candidate, "FuturePlacement", "FutureCandidate", "placement-control", "candidate-control", "\x1b"} {
+					if strings.Contains(out.String(), raw) {
+						t.Errorf("%s output leaked %q: %s", format, raw, out.String())
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestSplitReportedNotFloorFulfillmentAndOriginPrivacy(t *testing.T) {
 	snapshot := fixture(t)
 	before := snapshot.InferenceService.DeepCopy()
