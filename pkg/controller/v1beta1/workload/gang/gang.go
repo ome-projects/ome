@@ -10,29 +10,18 @@ package gang
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podgroup"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
-
-// maybeNoGangSchedulerSeen tracks which (owner, Component) pairs have
-// already received the MaybeNoGangScheduler Warning event so the
-// reconciler does not re-emit it on every reconcile. Keyed by
-// "<namespace>/<name>/<component>". Process-scoped — controller
-// restart re-fires the warning, which is fine since operators re-read
-// events on restart.
-//
-// sync.Map because reads dominate writes: an owner that has already
-// warned does a lookup-only pass per reconcile.
-var maybeNoGangSchedulerSeen sync.Map
 
 // ErrPodGroupTerminating is returned when a planned gang's deterministic
 // PodGroup name is still occupied by an owned object being deleted. Callers
@@ -102,13 +91,20 @@ func EnsureSurgePodGroupWithState(deps workload.Deps, state PodGroupReconcileSta
 		}
 		if inv != nil {
 			existing, found := inv.ByName(name)
+			// Classify before writing, for the same reason the top-level
+			// pass does: the surge index may not be pinned in the plan yet,
+			// so this is the first place the row's PodGroup is read at all
+			// and the only chance to record why its members are withheld.
+			input.Gangs.Record(inst.Index,
+				podgroup.ObserveGang(name, existing, found, input.OwnerObject.GetUID()))
 			key, reconciled, err := podgroup.EnsurePodGroupForPodsFromObservation(ctx, deps.Client,
 				input.OwnerObject, input.OwnerGVK, input.Key.OwnerName, plan, inst,
 				pods, existing, found)
 			if err == nil {
 				inv.recordReconciled(reconciled)
+				return key, nil
 			}
-			return key, err
+			return "", unusableNameError(err)
 		}
 		return podgroup.EnsurePodGroupForPodsWithReader(ctx, deps.Client, reader, input.OwnerObject, input.OwnerGVK, input.Key.OwnerName, plan, inst, pods)
 	}
@@ -255,7 +251,12 @@ func EnsurePodGroupsWithState(ctx context.Context, deps workload.Deps, input wor
 	}
 
 	terminalOwned := terminalOwnedIndices(input.ObservedState.InstanceStatuses, state.TerminalOwned)
+	// ensuredIndex is the first Instance whose group this pass ensured AND
+	// whose row already exists: the heuristic warning below is recorded on
+	// a row, so it waits for one rather than announcing into a slot the
+	// create pass has not opened yet.
 	ensured := false
+	ensuredIndex := int32(0)
 	for _, inst := range plan.Instances {
 		if !podgroup.IsMultiPodInstance(inst) {
 			continue
@@ -265,24 +266,133 @@ func EnsurePodGroupsWithState(ctx context.Context, deps workload.Deps, input wor
 		}
 		name := query.PodGroupName(input.Key.OwnerName, plan.Component, inst.Index)
 		existing, found := inv.ByName(name)
+		// Classify what the object says about this gang before touching
+		// it. A name this owner cannot write is a fact about one Instance,
+		// not about the Component: recording it here lets the pass finish
+		// the other gangs, keeps members off the unusable name, and hands
+		// the row itself to the escalation pass.
+		obs := podgroup.ObserveGang(name, existing, found, input.OwnerObject.GetUID())
+		input.Gangs.Record(inst.Index, obs)
+		if obs.State == workload.GangStateFailed && resettableIndex(input.ObservedState, inst.Index) {
+			// The gang scheduler's Failed verdict is absorbing: its
+			// controller stops reconciling the object, and this pass only
+			// reconciles labels, ownership and size — so the group can never
+			// be admitted again under that name. Delete it and let the next
+			// pass build a fresh one. Members are withheld meanwhile, and
+			// the row is untouched: a failure that resets itself must not
+			// end an attempt, or the reset and the rebuild would chase each
+			// other through Failed forever.
+			//
+			// A dead member still on the name holds the reset back. The
+			// group's phase is derived from its members, so rebuilding
+			// around one would hand the replacement the same verdict; the
+			// create pass recycles it first and the reset lands on the
+			// pass after.
+			if anyTerminalMember(podsByGroup[name]) {
+				continue
+			}
+			if derr := inv.DeleteOwnedName(ctx, deps.Client, name); derr != nil {
+				return nil, fmt.Errorf("EnsurePodGroups: reset instance %d: %w", inst.Index, derr)
+			}
+			if werr := warnPodGroupReset(ctx, deps, input, plan.Component, inst.Index, obs); werr != nil {
+				return nil, werr
+			}
+			continue
+		}
 		key, reconciled, err := podgroup.EnsurePodGroupForPodsFromObservation(ctx, deps.Client,
 			input.OwnerObject, input.OwnerGVK, input.Key.OwnerName, plan, inst,
 			podsByGroup[name], existing, found)
 		if err != nil {
+			if errors.Is(err, podgroup.ErrPodGroupTerminating) ||
+				errors.Is(err, podgroup.ErrPodGroupOwnershipConflict) {
+				// No topology override is published for this index. The only
+				// consumers of one are the renderer and the PodGroup builder,
+				// and neither runs for an index whose members are withheld;
+				// an absent entry also reads as the Component's desired key,
+				// which is what a fresh gang at this name would get anyway.
+				continue
+			}
 			return nil, fmt.Errorf("EnsurePodGroups: instance %d: %w", inst.Index, err)
 		}
 		inv.recordReconciled(reconciled)
 		effectiveTopology[inst.Index] = key
-		ensured = true
+		if !ensured && input.ObservedState.Instance(inst.Index) != nil {
+			ensuredIndex = inst.Index
+			ensured = true
+		}
 	}
 
 	// Heuristic warning when the rendered pod template uses the
 	// default scheduler — see EventReasonMaybeNoGangScheduler. Wired
 	// AFTER EnsurePodGroup so PodGroup-create failures take precedence.
 	if ensured {
-		maybeWarnNoGangScheduler(deps.Recorder, input, plan.Component, input.DesiredSpec.PodSpec, input.DesiredSpec.WorkerPodSpec)
+		if err := maybeWarnNoGangScheduler(ctx, deps, input, plan.Component, ensuredIndex,
+			input.DesiredSpec.PodSpec, input.DesiredSpec.WorkerPodSpec); err != nil {
+			return nil, err
+		}
 	}
 	return effectiveTopology, nil
+}
+
+// unusableNameError re-spells the two reasons a deterministic name
+// cannot be written as the workload-level sentinel, so the op that
+// invoked this callback can defer to the escalation pass without
+// importing the optional gang-scheduling API. Anything else is a real
+// failure and travels unchanged.
+func unusableNameError(err error) error {
+	if errors.Is(err, podgroup.ErrPodGroupTerminating) ||
+		errors.Is(err, podgroup.ErrPodGroupOwnershipConflict) {
+		return fmt.Errorf("%w: %w", workload.ErrGangNameUnusable, err)
+	}
+	return err
+}
+
+// warnPodGroupReset announces the one rebuild an operator would
+// otherwise have no trace of: the Instance is never failed for a failed
+// group, so this event is where the gang scheduler's own explanation
+// survives. Announced once per episode on the Instance's own row.
+func warnPodGroupReset(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, component workload.ComponentType, idx int32, obs workload.GangObservation) error {
+	target := workload.EventTarget(input)
+	if deps.Recorder == nil || target == nil {
+		return nil
+	}
+	announced, err := status.Announce(ctx, input, idx, workload.EventReasonPodGroupReset)
+	if err != nil || !announced {
+		return err
+	}
+	deps.Recorder.Eventf(target, corev1.EventTypeWarning, string(workload.EventReasonPodGroupReset),
+		"OMENative component=%s: deleting PodGroup %s so the gang can be admitted again (%s)",
+		component, obs.Name, obs.Message)
+	return nil
+}
+
+// resettableIndex reports whether this owner may rebuild the group at
+// idx. A teardown belongs to DeleteBatch and a migration to its record;
+// deleting the group under either would pull the gang contract out from
+// under pods the other machine is still driving.
+func resettableIndex(observed workload.WorkloadObservedState, idx int32) bool {
+	row := observed.Instance(idx)
+	if row == nil {
+		return true
+	}
+	switch workload.OwnerOfOperation(row.Operation) {
+	case workload.OwnerDelete, workload.OwnerMigrate:
+		return false
+	}
+	return true
+}
+
+// anyTerminalMember reports whether the group still holds a member the
+// kubelet has finished with. Such a pod occupies its stable name until
+// the create pass recycles it, and the gang controller derives the
+// group's phase from exactly these.
+func anyTerminalMember(pods []*corev1.Pod) bool {
+	for _, pod := range pods {
+		if pod != nil && pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodFailed {
+			return true
+		}
+	}
+	return false
 }
 
 func terminalOwnedIndices(observed []workload.InstanceStatus, explicit map[int32]struct{}) map[int32]struct{} {
@@ -292,8 +402,10 @@ func terminalOwnedIndices(observed []workload.InstanceStatus, explicit map[int32
 	}
 	for i := range observed {
 		s := &observed[i]
-		if s.Phase == workload.InstancePhaseDeleting && s.Operation != nil &&
-			s.Operation.Type == workload.InstanceOperationDelete {
+		// A row DeleteBatch owns keeps its group until the teardown
+		// removes it; re-ensuring one here would recreate a contract the
+		// teardown is dismantling.
+		if workload.Owner(s) == workload.OwnerDelete {
 			out[s.Index] = struct{}{}
 		}
 	}
@@ -364,30 +476,29 @@ func gangSchedulingUnavailableCondition(crdPresent, anyMultiPodInstance bool, ge
 // scheduler-plugins installed AS the default scheduler from inside
 // the controller, so accept the false-positive cost there.
 //
-// Dedup'd per (owner, Component) per process. Restart re-fires once,
-// which is acceptable.
+// The warning is about the Component's template, so one delivery per
+// episode is what an operator needs; idx is the first Instance whose
+// group this pass ensured, and its row carries the record.
 //
 // nil-safe: nil recorder, nil owner, nil pod template are no-ops.
-func maybeWarnNoGangScheduler(rec record.EventRecorder, input workload.ReconcileInput, component workload.ComponentType, leaderSpec, workerSpec *corev1.PodSpec) {
-	target := eventTarget(input)
-	if target == nil {
-		return
+func maybeWarnNoGangScheduler(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, component workload.ComponentType, idx int32, leaderSpec, workerSpec *corev1.PodSpec) error {
+	target := workload.EventTarget(input)
+	if target == nil || deps.Recorder == nil {
+		return nil
 	}
 	name := effectiveSchedulerName(leaderSpec, workerSpec)
 	if name != "" && name != corev1.DefaultSchedulerName {
 		// Operator opted in to a non-default scheduler — trust them.
-		return
+		return nil
 	}
-	key := fmt.Sprintf("%s/%s/%s", target.GetNamespace(), target.GetName(), component)
-	if _, alreadyWarned := maybeNoGangSchedulerSeen.LoadOrStore(key, struct{}{}); alreadyWarned {
-		return
+	announced, err := status.Announce(ctx, input, idx, workload.EventReasonMaybeNoGangScheduler)
+	if err != nil || !announced {
+		return err
 	}
-	if rec == nil {
-		return
-	}
-	rec.Eventf(target, corev1.EventTypeWarning, string(workload.EventReasonMaybeNoGangScheduler),
+	deps.Recorder.Eventf(target, corev1.EventTypeWarning, string(workload.EventReasonMaybeNoGangScheduler),
 		"OMENative component=%s created scheduler-plugins PodGroup objects but pod template's spec.schedulerName is %q (default kube-scheduler does not enforce PodGroup gang); set runtime.spec.schedulerName to a gang-aware scheduler (e.g. scheduler-plugins-scheduler) or install scheduler-plugins as a plugin in the default scheduler",
 		component, name)
+	return nil
 }
 
 // effectiveSchedulerName returns the leader's spec.schedulerName when
@@ -402,27 +513,4 @@ func effectiveSchedulerName(leaderSpec, workerSpec *corev1.PodSpec) string {
 		return workerSpec.SchedulerName
 	}
 	return ""
-}
-
-// resetMaybeNoGangSchedulerSeen clears the per-process dedup map.
-// Test-only helper exported lowercase so the table-driven dedup test
-// can reset between cases without leaking state across runs. Not
-// used by production code.
-func resetMaybeNoGangSchedulerSeen() {
-	maybeNoGangSchedulerSeen.Range(func(k, _ any) bool {
-		maybeNoGangSchedulerSeen.Delete(k)
-		return true
-	})
-}
-
-// eventTarget returns the object emitted events should be stamped
-// against — input.EventTarget when set, falling back to OwnerObject.
-// Local copy of the same helper in workload/ops/events.go so this
-// file is callable from workload without taking a transitive
-// workload/ops dep.
-func eventTarget(input workload.ReconcileInput) client.Object {
-	if input.EventTarget != nil {
-		return input.EventTarget
-	}
-	return input.OwnerObject
 }

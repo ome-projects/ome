@@ -56,11 +56,9 @@ type Options struct {
 
 // For renders every object that belongs on one cluster.
 //
-// A leaf is on a cluster when it was apportioned something there. A share of
-// zero is not "something": under Proportional a cluster with none of the
-// budgeted flavor takes exactly zero, and projecting it would create a queue
-// that can admit nothing and a tenant wondering why. The arithmetic decides the
-// matched set; nothing selects it.
+// A leaf is on a cluster when it has allowances there, zero or not. Which
+// clusters those are is Resolve's decision, made from the split and the
+// capacity each member reports; nothing here selects them.
 //
 // The result is ordered parent-first, then by name. That order is a contract,
 // not presentation: the caller applies the copies one at a time, and a member
@@ -91,10 +89,7 @@ func For(t *tree.Tree, cluster string, allowances []Allowance, opts Options) ([]
 	}
 
 	include := map[string]*tree.Node{}
-	for name, given := range byNode {
-		if !anyNonZero(given) {
-			continue
-		}
+	for name := range byNode {
 		node, _ := t.Node(name)
 		include[name] = node
 		// Every tier between the leaf and the root, so parentRef resolves on the
@@ -222,15 +217,6 @@ func projectBudgets(src *v1beta1.AcceleratorQuota, given []Allowance) ([]v1beta1
 }
 
 type key struct{ resource, flavor string }
-
-func anyNonZero(given []Allowance) bool {
-	for _, a := range given {
-		if !a.Nominal.IsZero() {
-			return true
-		}
-	}
-	return false
-}
 
 func copyQuantity(q *resource.Quantity) *resource.Quantity {
 	if q == nil {

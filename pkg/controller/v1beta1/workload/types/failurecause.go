@@ -48,7 +48,9 @@ package types
 //
 // EXCLUDED — ambiguous scope (could be the revision OR the
 // device/node): CrashLoopBackOff, RunContainerError,
-// CreateContainerError. A repeated process exit or a runtime start
+// CreateContainerError, and the readiness limbo a pod reaches when it
+// runs every container yet never reports ContainersReady
+// (ReasonContainersNotReady). A repeated process exit or a runtime start
 // rejection can equally be a broken binary (revision fault) or a dead
 // GPU / broken driver / node-local runtime damage (placement fault).
 // For those, a wrong suppression (holding the revision) is an

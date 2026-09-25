@@ -64,6 +64,13 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 			},
 			wantOK: true,
 		},
+		{
+			name: "valid traffic drain map",
+			annotations: map[string]string{
+				constants.TrafficDrainAnnotation: `{"drain-1":{"cluster":"cluster-a","reason":"planned maintenance"}}`,
+			},
+			wantOK: true,
+		},
 
 		// Type-coercion failures.
 		{
@@ -147,6 +154,20 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 				constants.RolloutPromoteAnnotation: "full",
 			},
 			wantContains: "InvalidRolloutPromoteTarget",
+		},
+		{
+			name: "traffic drain malformed JSON",
+			annotations: map[string]string{
+				constants.TrafficDrainAnnotation: `{"drain-1":`,
+			},
+			wantContains: "InvalidTrafficDrain",
+		},
+		{
+			name: "traffic drain missing reason",
+			annotations: map[string]string{
+				constants.TrafficDrainAnnotation: `{"drain-1":{"cluster":"cluster-a"}}`,
+			},
+			wantContains: "InvalidTrafficDrain",
 		},
 	}
 	for _, tc := range tests {

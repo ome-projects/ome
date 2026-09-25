@@ -11,17 +11,18 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
-// PeerEndpointEnv is the set of peer-discovery env vars OMENative can
-// stamp on a pod for one peer Component:
+// PeerEndpointEnv is the set of peer-discovery env vars OMENative
+// stamps on a pod for one peer Component:
 //
 //   - OME_<PEER>_ENDPOINT carries the generic, revision-agnostic
-//     Service DNS name. Always emitted; this is the var runtimes
-//     consume for cross-Component serving calls.
+//     Service DNS name. Always emitted; it spans every revision of the
+//     peer, so a runtime that reads it may pair across revisions
+//     mid-rollout.
 //   - OME_<PEER>_REVISION_ENDPOINT carries the per-revision Service
-//     DNS name. Emitted only when the caller supplies a revision hash
-//     for the peer. No production caller does: a peer's revision hash
-//     is unknowable at render time (each Component hashes its own
-//     template), so pods carry only the generic form.
+//     DNS name of the peer revision this pod is paired with. Emitted
+//     whenever the caller can resolve that revision (see
+//     PeerRevisionFunc); a runtime that prefers it only ever reaches
+//     peers of its own pairing.
 //
 // Env vars are read-once at pod startup which matches the LLM-runtime
 // pattern.
@@ -46,8 +47,23 @@ type PeerEndpointEnv struct {
 	RevisionValue string
 }
 
+// PeerRevisionFunc resolves the revision hash of the PEER that a pod
+// rendered for podRevisionHash pairs with. Each Component hashes its own
+// template, so the rendered pod's own hash never names a peer revision;
+// the adapter resolves the pairing from the peer's authoritative state
+// instead. Returning "" for a peer emits only that peer's generic form.
+type PeerRevisionFunc func(peer v1beta1.ComponentType, podRevisionHash string) string
+
+// PeerEnvDeclared reports whether the ISVC's pods carry peer-discovery
+// env vars at all: only when the ISVC declares a rollout (any groups).
+// Peer membership itself is serving topology (ServingPeers), not
+// grouping; the rollout declaration is the opt-in to the whole contract.
+func PeerEnvDeclared(isvc *v1beta1.InferenceService) bool {
+	return isvc != nil && isvc.Spec.Rollout != nil && len(isvc.Spec.Rollout.Groups) > 0
+}
+
 // BuildPeerEndpointEnv computes the env vars OMENative injects into a
-// pod for one peer Component. podRevisionHash, when non-empty, must be
+// pod for one peer Component. peerRevisionHash, when non-empty, must be
 // a revision hash of the PEER — each Component hashes its own
 // template, so the rendered pod's own hash never names a peer
 // revision. Callers without a peer hash pass "" and get only the
@@ -55,14 +71,14 @@ type PeerEndpointEnv struct {
 //
 // isvc + namespace identify the InferenceService; the function does
 // not do I/O.
-func BuildPeerEndpointEnv(isvcName, namespace string, peer v1beta1.ComponentType, podRevisionHash string) PeerEndpointEnv {
+func BuildPeerEndpointEnv(isvcName, namespace string, peer v1beta1.ComponentType, peerRevisionHash string) PeerEndpointEnv {
 	upper := strings.ToUpper(string(peer))
 	return PeerEndpointEnv{
 		Peer:          peer,
 		GenericName:   fmt.Sprintf("OME_%s_ENDPOINT", upper),
 		GenericValue:  genericPeerDNS(isvcName, peer, namespace),
 		RevisionName:  fmt.Sprintf("OME_%s_REVISION_ENDPOINT", upper),
-		RevisionValue: revisionPeerDNS(isvcName, peer, podRevisionHash, namespace),
+		RevisionValue: revisionPeerDNS(isvcName, peer, peerRevisionHash, namespace),
 	}
 }
 
@@ -88,11 +104,9 @@ func revisionPeerDNS(isvc string, peer v1beta1.ComponentType, revisionHash, name
 // with the same Name are replaced — coordination's values are
 // authoritative.
 //
-// If revisionHashFor is nil — the production wiring, since a peer's
-// revision hash is unknowable at render time — only the generic env
-// var is emitted. A non-nil revisionHashFor must return a revision
-// hash of the PEER it is called with (or "" to skip that peer's
-// revision form).
+// If revisionHashFor is nil only the generic env var is emitted. A
+// non-nil revisionHashFor must return a revision hash of the PEER it is
+// called with (or "" to skip that peer's revision form).
 //
 // The peers slice should be deduplicated and stable in order;
 // callers typically pass coordination.ServingPeers(...).

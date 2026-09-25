@@ -134,7 +134,7 @@ func modeValue(mode ome.PlacementMode) v.PlacementValue {
 }
 func placementPhase(phase ome.PlacementPhase) v.PlacementValue {
 	switch phase {
-	case ome.PlacementPhasePending, ome.PlacementPhaseRacing, ome.PlacementPhasePlaced, ome.PlacementPhaseFailed:
+	case ome.PlacementPhasePending, ome.PlacementPhaseRacing, ome.PlacementPhasePlaced, ome.PlacementPhaseFailed: //nolint:staticcheck // legacy wire values an older controller may still write
 		return v.PlacementValue(phase)
 	case "":
 		return "NotRecorded"
@@ -144,7 +144,7 @@ func placementPhase(phase ome.PlacementPhase) v.PlacementValue {
 }
 func candidatePhase(phase ome.CandidatePlacementPhase) v.PlacementValue {
 	switch phase {
-	case ome.CandidatePhasePlaced, ome.CandidatePhaseAdmitted:
+	case ome.CandidatePhasePlaced, ome.CandidatePhaseAdmitted: //nolint:staticcheck // legacy wire value an older controller may still write
 		return v.PlacementValue(phase)
 	case "":
 		return "NotRecorded"

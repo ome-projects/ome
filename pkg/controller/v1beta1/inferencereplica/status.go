@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,12 +21,16 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // InferenceReplicaConditionReady is the top-level condition type written
@@ -43,6 +48,17 @@ const InferenceReplicaConditionReady = "Ready"
 // invisible wedge (rollout stuck at N/total) for operators + dashboards.
 const InferenceReplicaConditionRolloutStalled = "RolloutStalled"
 
+// InferenceReplicaConditionDrainOverdue is an ADVISORY condition that is
+// True while at least one Instance on its way out is past the deadline
+// of the delete operation draining it. Nothing about the scale-down
+// changes while it is True — the drain keeps running and the wedged pod
+// is removed only under a configured force-delete policy — so like
+// RolloutStalled it is not a dependent of Ready: it exists to make a
+// stalled drain visible to operators and dashboards instead of leaving
+// the elapsed deadline unreported. It clears when no Instance is
+// overdue.
+const InferenceReplicaConditionDrainOverdue = "DrainOverdue"
+
 const (
 	// ReasonInstancesFailing — RolloutStalled=True: >=1 Instance recorded a
 	// terminal failure while not yet on the target revision.
@@ -50,6 +66,15 @@ const (
 	// ReasonRolloutProgressing — RolloutStalled=False: rollout in flight with
 	// no failing Instances, or no rollout in flight.
 	ReasonRolloutProgressing = "Progressing"
+)
+
+const (
+	// ReasonDrainsOverdue — DrainOverdue=True: >=1 Instance is draining
+	// past the deadline of the delete operation that owns it.
+	ReasonDrainsOverdue = "DrainsOverdue"
+	// ReasonDrainsWithinDeadline — DrainOverdue=False: every drain in
+	// flight is inside its deadline, or none is in flight.
+	ReasonDrainsWithinDeadline = "DrainsWithinDeadline"
 )
 
 // Reason strings for the InferenceReplicaConditionReady condition. Kept
@@ -67,8 +92,9 @@ const (
 	// short-circuit while a rollout is mid-flight.
 	ReasonRolloutInProgress = "RolloutInProgress"
 	// ReasonStaged is stamped when the IR has converged to a static
-	// rollingUpdate.partition — (replicas-partition) Instances on the target
-	// revision and `partition` held on the prior one, all Ready. Ready=True:
+	// partition (a projected canary step or a user rollingUpdate partition)
+	// — (replicas-partition) Instances on the target revision and
+	// `partition` held on the prior one, all Ready. Ready=True:
 	// a partitioned rollout is intentionally complete-and-holding, not
 	// "in progress". Distinct from AllInstancesReady (fully rolled).
 	ReasonStaged = "Staged"
@@ -110,21 +136,20 @@ const (
 // inside the spec.minReadySeconds window becomes Available (0 when none is
 // pending). That raises the Available counters without any watch event, so
 // the caller folds it into the reconcile result to publish them on time.
-func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.InferenceReplica, plan workload.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workload.RolloutHold) (time.Duration, error) {
+func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold) (time.Duration, error) {
 	if r.Client == nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: nil client")
 	}
 	key := client.ObjectKeyFromObject(ir)
 	ownerUID := ir.UID
 	ownerGeneration := ir.Generation
-	desiredByIdx := workload.DesiredPodCountByInstance(plan)
+	desiredByIdx := workloadstatus.DesiredPodCountByInstance(plan)
 	component := v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component)
 
 	// List pods + EndpointSlices via the CACHED client (r.Client), outside
 	// the retry closure: both reads are idempotent (no apiserver-side
 	// mutation), so on a status conflict we just re-stamp the same counters
-	// onto the re-read IR. Mirrors the omenative direct path which reads pods
-	// + availability once at the top of AggregateAndWriteStatus.
+	// onto the re-read IR.
 	//
 	// This aggregator is observability-only COUNTING — the manager cache is
 	// scoped to OME pods, has the OMENative Pod field index registered, and
@@ -141,7 +166,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 	byIndex := query.BucketPodsByInstanceIdx(pods)
 	podObservation := workload.NewCachedSelectorPodObservation(pods, byIndex)
 	serviceName := query.HeadlessServiceName(ir.Spec.ParentRef.Name, component)
-	availableByPod, err := workload.AvailablePodSet(ctx, r.Client, ir.Namespace, serviceName)
+	availableByPod, err := workloadstatus.AvailablePodSet(ctx, r.Client, ir.Namespace, serviceName)
 	if err != nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: compute availability: %w", err)
 	}
@@ -165,7 +190,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 			return nil
 		}
 		if fresh.Generation != ownerGeneration {
-			return workload.ErrStatusMutationPrecondition
+			return workloadtypes.ErrStatusMutationPrecondition
 		}
 
 		// Snapshot the live status before recomputation so a no-op
@@ -182,7 +207,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 			v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses),
 			podObservation,
 			availableByPod,
-			workload.AvailabilityWindow{MinReadySeconds: plan.MinReadySeconds, Now: r.now()},
+			workloadstatus.AvailabilityWindow{MinReadySeconds: plan.MinReadySeconds, Now: r.now()},
 		)
 		if err != nil {
 			return fmt.Errorf("aggregateAndWriteStatus: build publication observation: %w", err)
@@ -244,6 +269,11 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		// failing Instances (e.g. new-rev CrashLoopBackOff) without affecting
 		// the Ready condition above (old-rev pods keep serving).
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, computeRolloutStalledCondition(&fresh.Status))
+		// Advisory DrainOverdue condition — surfaces Instances stuck on
+		// their way out past the deadline of the delete operation
+		// draining them. Derived from the rows themselves, so it clears
+		// on its own once no Instance is overdue.
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, computeDrainOverdueCondition(&fresh.Status))
 		now := r.now()
 		fresh.Status.RolloutHold = nextRolloutHold(fresh.Status.RolloutHold,
 			effectiveRolloutHold(holdObserved, hold, &fresh.Status, now), metav1.NewTime(now))
@@ -274,7 +304,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 	}); err != nil {
 		// A generation change replans without a write outcome. Other terminal
 		// retry failures retain their status-write classification.
-		if !errors.Is(err, workload.ErrStatusMutationPrecondition) {
+		if !errors.Is(err, workloadtypes.ErrStatusMutationPrecondition) {
 			if apierrors.IsConflict(err) {
 				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultConflict)
 			} else {
@@ -303,7 +333,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 // mirrorBack copies Component fields and transient publication counters onto
 // the caller's in-memory IR. Lifecycle fields remain owned by workload
 // operations and are left untouched.
-func mirrorBack(ir, fresh *v1beta1.InferenceReplica, publication []workload.InstanceStatus) {
+func mirrorBack(ir, fresh *v1beta1.InferenceReplica, publication []workloadtypes.InstanceStatus) {
 	ir.Status.Replicas = fresh.Status.Replicas
 	ir.Status.ReadyReplicas = fresh.Status.ReadyReplicas
 	ir.Status.ServingReplicas = fresh.Status.ServingReplicas
@@ -339,7 +369,7 @@ func (r *Reconciler) reconcileHeldDeadlines(ctx context.Context, ir *v1beta1.Inf
 	held := make(map[int32]bool, len(byIndex))
 	for idx, pods := range byIndex {
 		for _, p := range pods {
-			if workload.PodAdmissionGated(p) {
+			if workloadtypes.PodAdmissionGated(p) {
 				held[idx] = true
 				break
 			}
@@ -363,19 +393,19 @@ func (r *Reconciler) reconcileHeldDeadlines(ctx context.Context, ir *v1beta1.Inf
 			held[ir.Status.InstanceStatuses[i].Index] = true
 		}
 	}
-	return workload.ReconcileGatedDeadlines(ctx, r.buildDeadlineParkInput(ir),
+	return escalation.ReconcileGatedDeadlines(ctx, r.buildDeadlineParkInput(ir),
 		v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses), held, timeout)
 }
 
 // buildDeadlineParkInput builds the minimal workload.ReconcileInput the
-// InstanceReadyTimeout parking step (workload.ReconcileGatedDeadlines)
+// InstanceReadyTimeout parking step (escalation.ReconcileGatedDeadlines)
 // consumes: the deadline write goes through MutateInstance (same retry +
 // in-memory-mirror semantics as dispatch-time writes) and the clock seam
 // supplies now. The remaining callbacks satisfy the ReconcileInput
 // must-be-set contract as explicit no-ops — parking never removes
 // instances, writes conditions, or emits events.
-func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) workload.ReconcileInput {
-	return workload.ReconcileInput{
+func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) workloadtypes.ReconcileInput {
+	return workloadtypes.ReconcileInput{
 		OwnerObject:             ir,
 		OwnerGVK:                irGVK,
 		Key:                     buildKey(ir),
@@ -390,11 +420,11 @@ func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) worklo
 
 // mirrorInstanceCounters copies transient Pod counters by Instance index.
 // Lifecycle and admission fields remain untouched.
-func mirrorInstanceCounters(status *v1beta1.InferenceReplicaStatus, publication []workload.InstanceStatus) {
+func mirrorInstanceCounters(status *v1beta1.InferenceReplicaStatus, publication []workloadtypes.InstanceStatus) {
 	if status == nil {
 		return
 	}
-	publicationByIdx := make(map[int32]workload.InstanceStatus, len(publication))
+	publicationByIdx := make(map[int32]workloadtypes.InstanceStatus, len(publication))
 	for _, instance := range publication {
 		publicationByIdx[instance.Index] = instance
 	}
@@ -448,13 +478,17 @@ func hasFailedInstance(insts []v1beta1.OMENativeInstanceStatus) bool {
 // responsible for invoking apimeta.SetStatusCondition to merge the
 // returned condition into status.Conditions (which handles
 // LastTransitionTime correctly).
-// effectivePartition returns the IR's static rollingUpdate.partition, or 0
-// when unset.
-func effectivePartition(pacing *v1beta1.InferenceReplicaPacing) int32 {
-	if pacing == nil || pacing.Partition == nil {
+// effectivePartition returns the partition the IR holds Instances at — the
+// projected spec.pacing.partition when set, else the user's lifecycle
+// rollingUpdate partition — or 0 when neither is set. It is the same source
+// order the workload engine plans with, so the condition below describes the
+// shape the engine actually converges to.
+func effectivePartition(lifecycle *v1beta1.LifecycleSpec, pacing *v1beta1.InferenceReplicaPacing) int32 {
+	p := irprojector.EffectivePartition(lifecycle, pacing)
+	if p == nil {
 		return 0
 	}
-	return *pacing.Partition
+	return *p
 }
 
 // stagedAtPartition reports whether the IR has converged to a static,
@@ -462,12 +496,12 @@ func effectivePartition(pacing *v1beta1.InferenceReplicaPacing) int32 {
 // revision and `partition` Instances held Ready on the prior one. Zero
 // partition (full rollout) is not staged — it converges via the normal
 // promotion path.
-func stagedAtPartition(status *v1beta1.InferenceReplicaStatus, pacing *v1beta1.InferenceReplicaPacing) bool {
-	part := effectivePartition(pacing)
+func stagedAtPartition(status *v1beta1.InferenceReplicaStatus, lifecycle *v1beta1.LifecycleSpec, pacing *v1beta1.InferenceReplicaPacing) bool {
+	part := effectivePartition(lifecycle, pacing)
 	if part <= 0 {
 		return false
 	}
-	return workload.ReachedDesiredShape(
+	return workloadstatus.ReachedDesiredShape(
 		v1beta1convert.InstanceStatusSliceToWorkload(status.InstanceStatuses),
 		status.UpdateRevision, part, status.Replicas)
 }
@@ -502,6 +536,12 @@ func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) meta
 		if s.LastFailure == nil || s.RunningRevision == status.UpdateRevision {
 			continue
 		}
+		// An announced overdue drain is a visibility record on a row
+		// leaving the Component, not a rollout failure; it carries its
+		// own condition.
+		if s.LastFailure.Reason == workloadtypes.DrainOverdueReason {
+			continue
+		}
 		// It failed before this attempt began, so it is retrying, not stuck.
 		if op := s.Operation; op != nil && !op.StartedAt.Before(&s.LastFailure.Time) {
 			continue
@@ -520,6 +560,44 @@ func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) meta
 	cond.Reason = ReasonInstancesFailing
 	cond.Message = fmt.Sprintf("%d/%d Instance(s) failing rollout to %s (%s)",
 		stalled, status.Replicas, status.UpdateRevision, summarizeFailureReasons(reasons))
+	return cond
+}
+
+// computeDrainOverdueCondition derives the advisory DrainOverdue
+// condition (see InferenceReplicaConditionDrainOverdue) from the
+// announcement records the delete pass leaves on the rows it is still
+// waiting on. True while any Instance is Deleting past the deadline of
+// the delete operation draining it, counting them so an operator sees
+// how much of the scale-down is wedged.
+//
+// Derived, not written: the row's own disappearance at the end of the
+// drain clears the condition, and nothing has to remember to retract it.
+func computeDrainOverdueCondition(status *v1beta1.InferenceReplicaStatus) metav1.Condition {
+	cond := metav1.Condition{
+		Type:               InferenceReplicaConditionDrainOverdue,
+		ObservedGeneration: status.ObservedGeneration,
+		Status:             metav1.ConditionFalse,
+		Reason:             ReasonDrainsWithinDeadline,
+		Message:            "no drain is past its deadline",
+	}
+	overdue := make([]string, 0)
+	for i := range status.InstanceStatuses {
+		s := status.InstanceStatuses[i]
+		if s.Phase != v1beta1.OMENativeInstanceDeleting || s.LastFailure == nil {
+			continue
+		}
+		if s.LastFailure.Reason != workloadtypes.DrainOverdueReason {
+			continue
+		}
+		overdue = append(overdue, strconv.Itoa(int(s.Index)))
+	}
+	if len(overdue) == 0 {
+		return cond
+	}
+	cond.Status = metav1.ConditionTrue
+	cond.Reason = ReasonDrainsOverdue
+	cond.Message = fmt.Sprintf("%d Instance(s) draining past their deadline (%s)",
+		len(overdue), strings.Join(overdue, ", "))
 	return cond
 }
 
@@ -554,7 +632,7 @@ func summarizeFailureReasons(reasons map[string]int) string {
 // candidate Instance was denied before reaching it, most commonly a
 // same-target RetryBlock — the persisted RetryBlock/Held state is the
 // only available signal.
-func effectiveRolloutHold(holdObserved bool, hold *workload.RolloutHold, status *v1beta1.InferenceReplicaStatus, now time.Time) *v1beta1.RolloutHold {
+func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, status *v1beta1.InferenceReplicaStatus, now time.Time) *v1beta1.RolloutHold {
 	if status.UpdateRevision == "" || status.CurrentRevision == status.UpdateRevision {
 		return nil
 	}
@@ -631,11 +709,11 @@ func computeReadyCondition(status *v1beta1.InferenceReplicaStatus, desiredReplic
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = ReasonInstanceFailed
 		cond.Message = "At least one Instance has Phase=Failed"
-	case stagedAtPartition(status, pacing):
+	case stagedAtPartition(status, lifecycle, pacing):
 		// Converged to a static partition: intentionally holding old-revision
 		// Instances, all Ready. Ready=True (not RolloutInProgress/Unknown) —
 		// the rollout is complete for the configured partition.
-		part := effectivePartition(pacing)
+		part := effectivePartition(lifecycle, pacing)
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = ReasonStaged
 		cond.Message = fmt.Sprintf("Staged at partition %d: %d/%d Instances on %s, %d held on the prior revision",

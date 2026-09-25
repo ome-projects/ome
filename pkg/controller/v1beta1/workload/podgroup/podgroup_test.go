@@ -135,12 +135,12 @@ func TestBuildPodGroup_Shape(t *testing.T) {
 		t.Errorf("MinMember: got %d want 4", pg.Spec.MinMember)
 	}
 
-	// ScheduleTimeoutSeconds: 15m = 900s, clamped down to 600.
+	// ScheduleTimeoutSeconds: 15m = 900s, unclamped (no operator bounds).
 	if pg.Spec.ScheduleTimeoutSeconds == nil {
 		t.Fatal("ScheduleTimeoutSeconds: nil pointer")
 	}
-	if *pg.Spec.ScheduleTimeoutSeconds != 600 {
-		t.Errorf("ScheduleTimeoutSeconds: got %d want 600 (clamped from 900)", *pg.Spec.ScheduleTimeoutSeconds)
+	if *pg.Spec.ScheduleTimeoutSeconds != 900 {
+		t.Errorf("ScheduleTimeoutSeconds: got %d want 900", *pg.Spec.ScheduleTimeoutSeconds)
 	}
 
 	// Labels: same keys the pod renderer / headless Service selector use,
@@ -217,16 +217,21 @@ func TestBuildPodGroup_TopologyKeyAnnotation(t *testing.T) {
 }
 
 func TestBuildPodGroup_TimeoutClamp(t *testing.T) {
+	clamp := &workload.GangScheduleTimeoutClamp{Min: time.Minute, Max: 10 * time.Minute}
 	cases := []struct {
 		name    string
+		clamp   *workload.GangScheduleTimeoutClamp
 		in      time.Duration
 		wantSec int32
+		wantSet bool
 	}{
-		{"zero defaults to 60s floor", 0, minScheduleTimeoutSeconds},
-		{"30s rounded up to 60s floor", 30 * time.Second, minScheduleTimeoutSeconds},
-		{"3 minutes pass through", 3 * time.Minute, 180},
-		{"10 minutes ceiling", 10 * time.Minute, maxScheduleTimeoutSeconds},
-		{"30 minutes clamped to 10m ceiling", 30 * time.Minute, maxScheduleTimeoutSeconds},
+		{"zero takes the configured floor", clamp, 0, 60, true},
+		{"30s rounded up to the floor", clamp, 30 * time.Second, 60, true},
+		{"3 minutes pass through", clamp, 3 * time.Minute, 180, true},
+		{"10 minutes at the ceiling", clamp, 10 * time.Minute, 600, true},
+		{"30 minutes lowered to the ceiling", clamp, 30 * time.Minute, 600, true},
+		{"unconfigured passes the derived value through", nil, 30 * time.Minute, 1800, true},
+		{"unconfigured sub-second leaves the field unset", nil, 0, 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,6 +239,7 @@ func TestBuildPodGroup_TimeoutClamp(t *testing.T) {
 			plan := core.ComponentPlan{
 				Component:            workload.ComponentEngine,
 				InstanceReadyTimeout: tc.in,
+				GangScheduleTimeout:  tc.clamp,
 			}
 			inst := core.InstancePlan{
 				Index: 0,
@@ -245,6 +251,13 @@ func TestBuildPodGroup_TimeoutClamp(t *testing.T) {
 			pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
 			if err != nil {
 				t.Fatalf("BuildPodGroup: %v", err)
+			}
+			if !tc.wantSet {
+				if pg.Spec.ScheduleTimeoutSeconds != nil {
+					t.Fatalf("ScheduleTimeoutSeconds: got %d want unset (the scheduler default)",
+						*pg.Spec.ScheduleTimeoutSeconds)
+				}
+				return
 			}
 			if pg.Spec.ScheduleTimeoutSeconds == nil {
 				t.Fatal("ScheduleTimeoutSeconds: nil")

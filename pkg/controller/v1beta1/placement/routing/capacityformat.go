@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // CapacityFormat names the response shape a home's capacity endpoint answers
@@ -12,9 +13,9 @@ import (
 type CapacityFormat string
 
 // FormatReport is the built-in shape: an absolute servable count plus an
-// observedAt stamp the home sets itself. It is the default, the only format
-// this repository guarantees, and the one a producer should emit unless it
-// needs a different shape.
+// observedAt stamp the home sets itself. It is the only format this repository
+// guarantees and the one a producer should select unless it needs a different
+// shape.
 const FormatReport CapacityFormat = "Report"
 
 // CapacityFormatPlugin is one response shape the poller can read.
@@ -30,7 +31,8 @@ type CapacityFormatPlugin struct {
 	// Decode turns a response body into a report in servable units, or returns
 	// the reason the control-plane plan should stand instead. It must never
 	// return a report it is unsure of: a plausible wrong ceiling silently
-	// mis-weights a home, where falling open merely keeps the plan.
+	// mis-weights a home, where falling open merely keeps the plan. The supplied
+	// config, including Options, is a private copy for this invocation.
 	Decode func(body []byte, cfg CapacityConfig) (CapacityReport, string)
 
 	// Validate rejects a configuration this format cannot serve, at startup
@@ -112,16 +114,22 @@ func init() {
 
 // decodeReport reads the built-in shape, which carries its own stamp.
 func decodeReport(body []byte, _ CapacityConfig) (CapacityReport, string) {
-	var report CapacityReport
-	if err := json.Unmarshal(body, &report); err != nil {
-		return report, fmt.Sprintf("capacity response is not a valid report: %v", err)
+	var wire struct {
+		Servable   *int32    `json:"servable"`
+		ObservedAt time.Time `json:"observedAt"`
 	}
-	if report.ObservedAt.IsZero() {
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return CapacityReport{}, fmt.Sprintf("capacity response is not a valid report: %v", err)
+	}
+	if wire.Servable == nil {
+		return CapacityReport{}, "capacity report has no servable count"
+	}
+	if wire.ObservedAt.IsZero() {
 		// Without a stamp a frozen reporter is indistinguishable from a fresh
 		// one, so the staleness guard could never fire.
-		return report, "capacity report has no observedAt stamp"
+		return CapacityReport{}, "capacity report has no observedAt stamp"
 	}
-	return report, ""
+	return CapacityReport{Servable: *wire.Servable, ObservedAt: wire.ObservedAt}, ""
 }
 
 // validateReport rejects options this format has no use for. The report already

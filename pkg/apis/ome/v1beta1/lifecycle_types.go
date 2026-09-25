@@ -278,6 +278,25 @@ type OMENativeInstanceStatus struct {
 	// overwritten by a clean rollout.
 	// +optional
 	LastFailure *InstanceTermination `json:"lastFailure,omitempty"`
+
+	// Announced records the once-only messages this Instance has already
+	// emitted, one entry per message: the event reason it was emitted
+	// under and the episode it was emitted in, joined by "@". A warning
+	// an operator needs to see once — the gang has no co-location term,
+	// the PodGroup was rebuilt, a repair is held, a drain is past its
+	// deadline — is emitted only when its entry is absent, and is
+	// stamped in the same write that emits it. Recording it on the
+	// Instance rather than in controller memory is what makes the
+	// once-only property hold per workload rather than per process, and
+	// survive a controller restart.
+	//
+	// The episode is the in-flight operation, or the incarnation when
+	// there is none: a new attempt or a rebuilt Instance has its own
+	// messages to deliver, and the entries of the episode it replaced no
+	// longer match.
+	// +optional
+	// +listType=set
+	Announced []string `json:"announced,omitempty"`
 }
 
 // InstanceTermination captures the container-termination diagnostics of
@@ -371,6 +390,26 @@ type InstanceOperation struct {
 	// belongs in the Event, not in status.
 	// +optional
 	Waiting string `json:"waiting,omitempty"`
+
+	// CapacityRefusedAt is when admission last refused one of the
+	// operation's pod creates for lack of quota. The refusal is an
+	// apiserver answer to a call the create pass made, so it cannot be
+	// read off the cluster on a later pass: it is recorded here, and the
+	// hold pass converts it into the Waiting token and the deadline park
+	// on every pass it stands. Cleared by a create that completes with no
+	// refusal. Empty means the last create was not refused for capacity.
+	// +optional
+	CapacityRefusedAt *metav1.Time `json:"capacityRefusedAt,omitempty"`
+
+	// Strategy is the update strategy the operation runs under, pinned
+	// when the operation opens. UpdateStrategy is not part of the revision
+	// payload, so editing it retargets nothing: an attempt keeps the
+	// mechanism it started with — a patch already under way is not
+	// re-dispatched as a recreate, a surge already spent is not unwound —
+	// and the edit reaches the Instance at its next admitted attempt.
+	// Set only when Type=Update.
+	// +optional
+	Strategy string `json:"strategy,omitempty"`
 
 	// SurgeIndex is the Instance index allocated for a surge replacement.
 	// Set only when Type=Migrate.
@@ -489,7 +528,10 @@ type LifecycleSpec struct {
 	// RestartPolicy controls what OMENative does when a managed pod fails.
 	// Distinct from the inlined corev1.PodSpec.RestartPolicy: that one tells
 	// kubelet whether to restart a container in-place; this one tells the
-	// OMENative controller whether to recreate the whole Instance.
+	// OMENative controller whether to recreate the whole Instance. Unset
+	// inherits the ServingRuntime's value; when neither sets it, multi-pod
+	// Instances use RecreateInstanceOnPodRestart and single-pod Instances
+	// use None.
 	// +optional
 	RestartPolicy *InstanceRestartPolicy `json:"restartPolicy,omitempty"`
 
@@ -502,7 +544,9 @@ type LifecycleSpec struct {
 	// the underlying pods. None is accepted only for single-pod Instances,
 	// where it is equivalent to AllPodReady; admission rejects None on
 	// multi-pod OMENative Components because per-pod readiness reporting
-	// is not supported.
+	// is not supported. Unset inherits the ServingRuntime's value; when
+	// neither sets it, multi-pod Instances use AllPodReady and single-pod
+	// Instances use None.
 	// +optional
 	ReadyPolicy *InstanceReadyPolicy `json:"readyPolicy,omitempty"`
 
@@ -522,12 +566,9 @@ type LifecycleSpec struct {
 	// maxUnavailable budgets stay held for the whole window, and
 	// availableReplicas / availablePodCount count only Available pods.
 	// Unset or 0 means Available as soon as Ready. A value authored on the
-	// InferenceService always wins. Clusters may supply an admission-time
-	// default through the inferenceservice-config ConfigMap; it is stamped
-	// onto the InferenceService, so it also takes precedence over a value
-	// authored in the ServingRuntime's engineConfig / decoderConfig /
-	// routerConfig lifecycle (the InferenceService overrides the runtime
-	// when the two merge), as terminationGracePeriodSeconds does.
+	// InferenceService wins; an unset value inherits the ServingRuntime's;
+	// when neither sets it, the cluster default from the
+	// inferenceservice-config ConfigMap applies.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MinReadySeconds *int32 `json:"minReadySeconds,omitempty"`
@@ -556,8 +597,10 @@ const (
 // UpdateStrategy controls how OMENative rolls template changes
 // across an Instance's pods.
 type UpdateStrategy struct {
-	// Type selects the rollout mechanism. Defaults to SurgeThenDrain
-	// for safety — preserves serving capacity throughout the rollout.
+	// Type selects the rollout mechanism. Unset inherits the
+	// ServingRuntime's value, then the cluster default from the
+	// inferenceservice-config ConfigMap, then SurgeThenDrain, which
+	// preserves serving capacity throughout the rollout.
 	// +optional
 	Type UpdateStrategyType `json:"type,omitempty"`
 
@@ -605,6 +648,9 @@ type RollingUpdate struct {
 	// absolute integer count (e.g. 2) or a percent string (e.g. "25%").
 	// Percent values resolve to ceil(replicas * percent / 100) at
 	// reconcile time so the budget scales with the Component's replica count.
+	// Unset inherits the ServingRuntime's value; when neither sets it and
+	// the strategy is not SurgeThenDrain, the cluster default applies, and
+	// without one this layer sets no cap.
 	// +optional
 	// +kubebuilder:validation:XIntOrString
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
@@ -620,26 +666,27 @@ type RollingUpdate struct {
 	//
 	// When the Component participates in a RolloutCoordinationGroup with a
 	// non-zero CoordinationPacing.MaxSurge, the group-wide ceiling caps the
-	// per-Component MaxSurge.
+	// per-Component MaxSurge. Unset inherits the ServingRuntime's value;
+	// when neither sets it and the strategy is SurgeThenDrain, the cluster
+	// default applies, and without one this layer sets no cap.
 	// +optional
 	// +kubebuilder:validation:XIntOrString
 	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
 }
 
-// InPlaceUpdateStrategy tunes per-pod lifecycle drain timing.
+// InPlaceUpdateStrategy tunes the per-pod in-place update sequence.
 type InPlaceUpdateStrategy struct {
-	// GracePeriodSeconds is the time OMENative waits between marking the
-	// pod not-ready and applying an in-place mutation. SurgeThenDrain also
-	// waits this long after EndpointSlice removal before deleting the old pod,
-	// allowing persistent load-balancer connections to drain while its workers
-	// remain available.
+	// GracePeriodSeconds is accepted so manifests that set it keep validating
+	// and has no effect on the roll: a drained pod is deleted as soon as it
+	// leaves rotation, and its own terminationGracePeriodSeconds and preStop
+	// hooks cover the in-flight work it still owes.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	GracePeriodSeconds *int32 `json:"gracePeriodSeconds,omitempty"`
 
 	// MarkNotReadyDuringLifecycle, when true, flips ome.io/serving=False on
 	// the pod before the in-place mutation so EndpointSlice drains traffic
-	// first. Defaults to true.
+	// first. Unset inherits the ServingRuntime's value, then true.
 	// +optional
 	MarkNotReadyDuringLifecycle *bool `json:"markNotReadyDuringLifecycle,omitempty"`
 }
@@ -665,7 +712,8 @@ const (
 // (both automatic deadline-disposition relocation and explicit annotation-triggered migration).
 type MigrationPolicy struct {
 	// Mode gates migration: Auto enables both deadline-disposition relocation and
-	// explicit migration requests; Never disables both. Defaults to Auto.
+	// explicit migration requests; Never disables both. Unset inherits the
+	// ServingRuntime's value, then Auto.
 	// +optional
 	Mode MigrationPolicyMode `json:"mode,omitempty"`
 }

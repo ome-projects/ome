@@ -16,13 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 )
-
-// testRevisionRetention is the retention cap the tests configure —
-// via the fake operator ConfigMap (config-default path) or the IR spec
-// (annotation-projection path). The binary itself carries no default.
-const testRevisionRetention = 10
 
 // withRetentionConfig wires a fake clientset serving an
 // inferenceservice-config ConfigMap whose lifecycle block carries the
@@ -39,39 +33,6 @@ func withRetentionConfig(r *Reconciler, limit int32) {
 		},
 	}
 	r.Clientset = kubefake.NewSimpleClientset(cm)
-}
-
-// seedControllerRevision builds a ControllerRevision carrying the IR's
-// revision Key label set and a monotonic .Revision number, named like a
-// real CR (`<parent>-<component>-<suffix>`). Seeded directly into the
-// fake client so the retention sweep has history to trim. Data is left
-// empty — retention keys only on name + .Revision + the live-name union,
-// never on the payload.
-func seedControllerRevision(ir *v1beta1.InferenceReplica, suffix string, rev int64) *appsv1.ControllerRevision {
-	key := irRevisionKey(ir)
-	return &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      revision.Name(key, suffix),
-			Namespace: ir.Namespace,
-			Labels:    revision.Labels(key),
-		},
-		Revision: rev,
-	}
-}
-
-// listRevisionNames returns the surviving CR names in the IR's namespace
-// for assertion readability.
-func listRevisionNames(t *testing.T, c client.Client, namespace string) map[string]struct{} {
-	t.Helper()
-	list := &appsv1.ControllerRevisionList{}
-	if err := c.List(context.Background(), list, client.InNamespace(namespace)); err != nil {
-		t.Fatalf("list ControllerRevisions: %v", err)
-	}
-	out := make(map[string]struct{}, len(list.Items))
-	for _, cr := range list.Items {
-		out[cr.Name] = struct{}{}
-	}
-	return out
 }
 
 // TestReconcile_RetainsControllerRevisions is the end-to-end retention

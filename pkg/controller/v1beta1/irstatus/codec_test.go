@@ -430,6 +430,7 @@ var rowFieldDispositions = map[string]string{
 	"operation":         "entries",
 	"activeOrdinal":     "activeOrdinalOne",
 	"lastFailure":       "entries",
+	"announced":         "entries",
 }
 
 func TestEveryRowFieldHasACodecDisposition(t *testing.T) {

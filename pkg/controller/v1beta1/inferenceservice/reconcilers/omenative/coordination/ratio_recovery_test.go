@@ -9,7 +9,6 @@ import (
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -301,7 +300,7 @@ func TestCheckRatio_CapacityRecoveryCountsPersistedSurge(t *testing.T) {
 		Phase: v1beta1.OMENativeInstanceUpdating,
 		Operation: &v1beta1.InstanceOperation{
 			Type: v1beta1.InstanceOperationUpdate,
-			Step: workloadops.UpdateStepSurge,
+			Step: workloadtypes.UpdateStepSurge,
 		},
 	}}
 	client := fakeClientForISVCWithInstances(isvc, map[v1beta1.ComponentType][]v1beta1.OMENativeInstanceStatus{

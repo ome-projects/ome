@@ -135,22 +135,17 @@ func TestForSelectsTheMatchedSet(t *testing.T) {
 			want: []string{"org", "team-a", "team-b"},
 		},
 		{
-			// Under Proportional a cluster with none of the flavor is apportioned
-			// exactly zero. Projecting it would create a queue that admits
-			// nothing; the arithmetic is what excludes it.
-			name:       "a leaf apportioned nothing is not projected",
+			// Resolve hands over a zero share only where the leaf belongs, so it
+			// is rendered like any other.
+			name:       "a leaf with a zero share is projected",
 			allowances: []Allowance{{Node: "team-a", ResourceName: tpu, ResourceFlavor: flavor, Nominal: qty("0")}},
-			want:       []string{},
+			want:       []string{"org", "team-a"},
 		},
 		{
-			// And its ancestors go with it: an org tier alone would be topology
-			// for a tenant that is not there.
-			name: "a cluster with nothing matched receives nothing at all",
-			allowances: []Allowance{
-				{Node: "team-a", ResourceName: tpu, ResourceFlavor: flavor, Nominal: qty("0")},
-				{Node: "team-b", ResourceName: tpu, ResourceFlavor: flavor, Nominal: qty("0")},
-			},
-			want: []string{},
+			// An org tier alone would be topology for a tenant that is not there.
+			name:       "a cluster with no allowances receives nothing at all",
+			allowances: nil,
+			want:       []string{},
 		},
 	}
 

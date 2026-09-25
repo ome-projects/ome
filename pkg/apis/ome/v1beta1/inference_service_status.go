@@ -14,7 +14,8 @@ type InferenceServiceStatus struct {
 	// - DecoderReady: decoder readiness condition; <br/>
 	// - RouterReady: router readiness condition; <br/>
 	// - IngressReady: ingress resource readiness; <br/>
-	// - Ready: aggregated condition; <br/>
+	// - Ready: component aggregate on workload clusters, or placement serving
+	//   readiness on a multi-cluster control-plane source; <br/>
 	duckv1.Status `json:",inline"`
 	// Addressable endpoint for the InferenceService
 	// +optional
@@ -428,8 +429,10 @@ type FailureInfo struct {
 }
 
 // InferenceService component conditions
-// The overall Ready condition is managed by the conditionSet which only requires IngressReady
-// Component-specific ready conditions (EngineReady, DecoderReady) are managed separately
+// The workload-cluster Ready condition is managed by the conditionSet, which
+// requires IngressReady. Component-specific ready conditions (EngineReady,
+// DecoderReady) are managed separately. On a multi-cluster control-plane source,
+// the placement controller directly projects serving readiness into Ready.
 var conditionSet = apis.NewLivingConditionSet(
 	IngressReady,
 	EngineReady,
@@ -491,36 +494,48 @@ func (ss *InferenceServiceStatus) SetCondition(conditionType apis.ConditionType,
 }
 
 // PlacementPhase is the coarse state of an InferenceService's multi-cluster placement.
-// +kubebuilder:validation:Enum=Pending;Racing;Placed;Failed
+// +kubebuilder:validation:Enum=Pending;Admitting;Racing;Placed;Failed
 type PlacementPhase string
 
 const (
 	// PlacementPhasePending: no candidate cluster matched, or none connected yet.
 	PlacementPhasePending PlacementPhase = "Pending"
-	// PlacementPhaseRacing: fanned out to candidates; no cluster has admitted yet.
+	// PlacementPhaseAdmitting: fanned out to candidates; no cluster has admitted yet.
+	PlacementPhaseAdmitting PlacementPhase = "Admitting"
+	// PlacementPhaseRacing is the legacy predecessor of PlacementPhaseAdmitting.
+	//
+	// Deprecated: retained as a distinct wire value so status written by an older
+	// controller remains valid during rolling upgrades. New controllers must emit
+	// PlacementPhaseAdmitting instead.
 	PlacementPhaseRacing PlacementPhase = "Racing"
-	// PlacementPhasePlaced: a candidate was admitted and won the race.
+	// PlacementPhasePlaced: one or more candidates have admitted the workload.
 	PlacementPhasePlaced PlacementPhase = "Placed"
 	// PlacementPhaseFailed: the winning placement failed terminally.
 	PlacementPhaseFailed PlacementPhase = "Failed"
 )
 
 // CandidatePlacementPhase is the per-cluster state of a fan-out candidate.
-// +kubebuilder:validation:Enum=Placed;Admitted
+// +kubebuilder:validation:Enum=Admitting;Placed;Admitted
 type CandidatePlacementPhase string
 
 const (
-	// CandidatePhasePlaced: derived ISVC created on this candidate; racing.
+	// CandidatePhaseAdmitting: derived ISVC created; waiting for admission.
+	CandidatePhaseAdmitting CandidatePlacementPhase = "Admitting"
+	// CandidatePhasePlaced is the legacy predecessor of CandidatePhaseAdmitting.
+	//
+	// Deprecated: retained as a distinct wire value so status written by an older
+	// controller remains valid during rolling upgrades. New controllers must emit
+	// CandidatePhaseAdmitting instead.
 	CandidatePhasePlaced CandidatePlacementPhase = "Placed"
-	// CandidatePhaseAdmitted: this candidate's Kueue admitted the pods (won).
+	// CandidatePhaseAdmitted: this candidate's admission authority admitted the workload.
 	CandidatePhaseAdmitted CandidatePlacementPhase = "Admitted"
 )
 
-// PlacementStatus is the multi-cluster placement status: which workload
-// cluster an InferenceService is placed on and a coarse phase.
+// PlacementStatus is the multi-cluster placement status: its coarse phase and
+// the candidate clusters participating in placement.
 type PlacementStatus struct {
-	// Cluster is the WorkloadCluster the ISVC is currently placed on. Empty
-	// while pending (no candidate yet, or transport not connected).
+	// Cluster is the winning WorkloadCluster in Single mode. It is empty before
+	// admission and in All/Split modes, where Candidates is authoritative.
 	// +optional
 	Cluster string `json:"cluster,omitempty"`
 
@@ -528,24 +543,22 @@ type PlacementStatus struct {
 	// +optional
 	Phase PlacementPhase `json:"phase,omitempty"`
 
-	// Endpoint is the externally-addressable URL of the winning cluster's
-	// placement, mirrored from the derived InferenceService's status.url once it
-	// is admitted AND addressable. Empty while pending/racing/failed or before
-	// the winner reports a URL. An external global LB/DNS consumes this to route
-	// traffic to the winning cluster.
+	// Endpoint is the externally-addressable URL of the winning cluster in Single
+	// mode, mirrored from the derived InferenceService's status.url once it is
+	// admitted AND addressable. It is empty before the winner reports a URL and in
+	// All/Split modes, where per-candidate endpoints are authoritative.
 	// +optional
 	Endpoint *apis.URL `json:"endpoint,omitempty"`
 
-	// Candidates are the clusters this ISVC has been fanned out to during the
-	// placement race. Populated by the control plane.
+	// Candidates are the clusters this ISVC has been fanned out to during
+	// placement. Populated by the control plane.
 	// +optional
 	// +listType=map
 	// +listMapKey=cluster
 	Candidates []CandidatePlacement `json:"candidates,omitempty"`
 }
 
-// CandidatePlacement is the per-cluster state of a fan-out candidate in the
-// placement race.
+// CandidatePlacement is the per-cluster state of a fan-out candidate.
 type CandidatePlacement struct {
 	// Cluster is the WorkloadCluster name.
 	Cluster string `json:"cluster"`
@@ -562,17 +575,14 @@ type CandidatePlacement struct {
 	// +optional
 	Endpoint *apis.URL `json:"endpoint,omitempty"`
 
-	// AdmittedReplicas is how many replicas this home's Kueue has admitted (only
-	// meaningful in Split, where a home serves a fraction of the desired count).
-	// It drives global accounting — the control plane sums it across homes to
-	// decide whether the desired count is met. Zero/unset outside Split.
+	// AdmittedReplicas is how many replicas this home's Kueue has admitted. In
+	// Split it also drives global accounting: the control plane sums it across
+	// homes to decide whether the desired count is met.
 	// +optional
 	AdmittedReplicas int32 `json:"admittedReplicas,omitempty"`
 
-	// ReadyReplicas is how many of this home's replicas are serving traffic. In
-	// Split it is the weight an external LB uses to split traffic across homes
-	// (traffic follows where the replicas actually landed). Zero/unset outside
-	// Split.
+	// ReadyReplicas is how many of this home's replicas are serving traffic. It
+	// is the live count basis and health gate for routing across homes.
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 

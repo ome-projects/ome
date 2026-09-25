@@ -58,6 +58,13 @@ type ReconcileInput struct {
 	// MutateInstance.
 	ObservedState WorkloadObservedState
 
+	// Owned is the pass's rows grouped by owner, built once by the
+	// decision layer and handed down so every pass reads the same
+	// answer. Read it through OwnedRows, never directly: a pass invoked
+	// outside a reconcile leaves this nil and derives the grouping from
+	// ObservedState instead.
+	Owned *OwnedRows
+
 	// MutateInstance applies the mutate callback to the idx-th
 	// InstanceStatus entry. Callers wrap persistence (apiserver round-
 	// trip under retry.RetryOnConflict, in-memory mirror) inside the
@@ -225,6 +232,40 @@ type ReconcileInput struct {
 	// escalation (the InstanceReadyTimeout backstop still fires).
 	StuckPodGrace time.Duration
 
+	// UnschedulableGrace is how long a pod may carry
+	// PodScheduled=False/Unschedulable — or an Instance's PodGroup report
+	// that the gang has no placement — before the escalation pass fails
+	// that Instance as environment-caused. Operator config
+	// (lifecycle.unschedulableGracePeriod); zero or negative disables that
+	// escalation entirely, leaving the hold to park the
+	// InstanceReadyTimeout clock for as long as it lasts.
+	UnschedulableGrace time.Duration
+
+	// MigrationAudit bounds migration admission against the owner's
+	// migration records. nil = unconfigured → a request is held until
+	// the caps exist (they are the only thing bounding destructive
+	// churn), never admitted unbounded and never failed for it.
+	MigrationAudit *MigrationAuditPolicy
+
+	// Requeue is the per-pass wake-up cadence. Zero fields (unconfigured)
+	// leave progress to watch events and the controller's rate-limited
+	// backoff.
+	Requeue RequeueIntervals
+
+	// PassWake collects a wake-up an op pass owes for work held on
+	// operator configuration, which raises no watch event of its own.
+	// The dispatcher allocates it per pass and folds it into the result.
+	PassWake *PassWake
+
+	// Gangs carries what each multi-pod Instance's PodGroup says about
+	// its gang, recorded by the PodGroup pass that runs ahead of the
+	// dispatcher. The pod-create choke point reads it to keep members off
+	// a group name this owner cannot use, and the escalation pass reads
+	// it as the gang's own failure evidence. Nil is safe (every method
+	// no-ops): a caller that wires no observation simply sees a gang that
+	// reports nothing.
+	Gangs *GangObservations
+
 	// Pacing collects the wake-up the apiserver itself asked for while
 	// refusing writes during this pass. The op entry points report
 	// progress as (done, error) and have no result channel of their own,
@@ -233,6 +274,14 @@ type ReconcileInput struct {
 	// pass; nil is safe (every method no-ops) for adapters and tests that
 	// call an op directly.
 	Pacing *APIPacing
+
+	// PromoteWindow collects the shortest minReadySeconds remainder a
+	// promote is waiting out this pass, for the same reason Pacing exists:
+	// the window elapsing produces no watch event, so the waiting path
+	// deposits the remainder here and the dispatcher folds it into the
+	// pass's requeue. Reconcile allocates one per pass; nil is safe (every
+	// method no-ops) for adapters and tests that call an op directly.
+	PromoteWindow *PromoteWindow
 
 	// Disposition carries the operator-config inputs the terminal-failure
 	// disposition (DisposeExpiredAttempt) branches on. The zero value
@@ -354,6 +403,59 @@ type ForceDeletePolicy struct {
 	// LastTransitionTime, or the Node object gone) before the
 	// escalation may act.
 	NodeUnreachableThreshold time.Duration
+}
+
+// RequeueIntervals paces the passes that must re-check progress no watch
+// event will announce: an operation still converging, and a gate denying
+// work while nothing in the cluster changes. Config-driven (chart values
+// → inferenceservice-config); a zero field means unconfigured and the
+// pass returns a plain requeue that rides the controller's rate-limited
+// backoff instead of a cadence the binary invented.
+type RequeueIntervals struct {
+	// Operation is the wait between passes while a Create, Update,
+	// Restart, or Migrate operation is in flight.
+	Operation time.Duration
+	// Gate is the wait while a rollout gate denies the pass — shorter
+	// than Operation, because the peer that releases it may catch up on
+	// the very next reconcile.
+	Gate time.Duration
+}
+
+// MigrationAuditPolicy bounds how much migration EXECUTION one owner may
+// have in flight and how fast new work may be admitted, and how far back
+// the owner's terminal migration records are kept. Config-driven (chart
+// values → inferenceservice-config); nil means unconfigured, and because
+// the caps are what stop a requester from flooding the destructive-action
+// pipeline, an unconfigured policy holds requests rather than admitting
+// them without a bound. Every field is > 0 when the policy is non-nil (config
+// validation rejects anything else).
+type MigrationAuditPolicy struct {
+	// MaxInFlight is the ceiling on EXECUTING migration records on the
+	// owner — non-terminal with an allocated surge.
+	MaxInFlight int32
+	// MaxPerWindow is the ceiling on migration records of any phase whose
+	// surge was allocated inside the trailing Window.
+	MaxPerWindow int32
+	// Window is the trailing window MaxPerWindow counts over. The
+	// status-record trim shares it: terminal records completed longer ago
+	// than this are pruned from the owner's status.
+	Window time.Duration
+}
+
+// GangScheduleTimeoutClamp bounds the ScheduleTimeoutSeconds a multi-pod
+// Instance's PodGroup derives from InstanceReadyTimeout, so gang
+// admission releases an infeasible attempt on a cluster-wide schedule
+// rather than on whatever readiness ceiling a Component happens to set.
+// Config-driven (chart values → inferenceservice-config); nil means
+// unconfigured and the derived value is passed through. Both durations
+// are > 0 and Min <= Max when the clamp is non-nil (config validation
+// rejects anything else).
+type GangScheduleTimeoutClamp struct {
+	// Min is the floor the derived timeout is raised to, and the value a
+	// Component with no usable InstanceReadyTimeout gets.
+	Min time.Duration
+	// Max is the ceiling the derived timeout is lowered to.
+	Max time.Duration
 }
 
 // Now returns the injected clock's time, or time.Now() when no clock

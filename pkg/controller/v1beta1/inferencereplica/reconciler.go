@@ -31,6 +31,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -52,10 +53,11 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
-	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	workloadpodgroup "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podgroup"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	workloadservice "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/service"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
@@ -132,7 +134,7 @@ type Reconciler struct {
 	// controller-runtime watch has confirmed prior writes. Optional;
 	// when nil the workload-level DefaultExpectations singleton is
 	// used.
-	Expectations *workload.Expectations
+	Expectations *workloadtypes.Expectations
 
 	// GangSchedulingAvailable is the cached cluster-discovery boolean —
 	// true when the scheduler-plugins PodGroup CRD is installed. Set once
@@ -199,7 +201,7 @@ type scaleDownSeriesIdentity struct {
 // delegates lifecycle dispatch to workload.Reconcile, and
 // aggregates the per-Component counters onto IR.Status.
 //
-// Loop (mirrors the omenative.ReconcileComponent shape):
+// Loop:
 //
 //  1. Get IR. NotFound → no-op (background owner-ref GC handles
 //     children).
@@ -330,10 +332,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// failing the reconcile.
 	parent := r.resolveParent(ctx, ir)
 
+	// Resolve the operator lifecycle tunables ONCE per reconcile. A zero
+	// field (absent/invalid config) fails safe by disabling that window
+	// or bound: the stuck-pod fast path leaves the row to the
+	// InstanceReadyTimeout backstop, an unplaceable pod only parks the
+	// clock instead of being failed on a window nobody configured, and a
+	// pass with work left rides the rate-limited backoff.
+	settings := r.resolveLifecycleSettings(log)
+
 	// Operator release mailbox for Held RetryBlocks. Consumed before the
 	// workload input is built so this pass's ObservedState already
 	// excludes a just-released block.
-	if requeue, rerr := r.consumeReleaseHeldRequest(ctx, log, ir, parent); rerr != nil {
+	if requeue, rerr := r.consumeReleaseHeldRequest(ctx, log, ir, parent, settings.RetryBlockHistoryLimit); rerr != nil {
 		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: consume release-held request: %w", rerr)
 	} else if requeue {
 		return ctrl.Result{Requeue: true}, nil
@@ -353,11 +363,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// safe: the workload layer Holds on the first same-target failure.
 	retryPolicy := r.resolveUpdateRetryPolicy(log)
 
-	// Resolve the stuck-pod grace period from the operator lifecycle config.
-	// Zero (absent/invalid config) fails safe: the escalator skips fast
-	// escalation this pass and only the InstanceReadyTimeout backstop fires.
-	stuckPodGrace := r.resolveStuckPodGrace(log)
-
 	// Resolve the auto-migrate relocation budget from the operator lifecycle
 	// config. Zero (absent/invalid config) fails safe: the deadline
 	// disposition's relocation branch is disabled and non-workload-caused
@@ -374,7 +379,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// the ISVC-side coordination reconciler.
 	coordDefaults := r.resolveCoordinationGroupDefaults(log)
 
-	input := r.buildReconcileInput(ctx, ir, parent, retryPolicy, forceDeletePolicy, stuckPodGrace, autoMigrateBudget, coordDefaults)
+	input := r.buildReconcileInput(ctx, ir, parent, retryPolicy, forceDeletePolicy, settings, autoMigrateBudget, coordDefaults)
 	input.ScaleUpPodBatchSize = r.ScaleUpPodBatchSize
 	input.ScaleDownPodBatchSize = r.ScaleDownPodBatchSize
 	input.ScaleDownRequeueInterval = r.ScaleDownRequeueInterval
@@ -386,9 +391,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// persisted RetryBlock/Held state instead).
 	var (
 		execHoldObserved bool
-		execHold         *workload.RolloutHold
+		execHold         *workloadtypes.RolloutHold
 	)
-	input.RecordRolloutHold = func(hold *workload.RolloutHold) {
+	input.RecordRolloutHold = func(hold *workloadtypes.RolloutHold) {
 		execHoldObserved = true
 		execHold = hold
 	}
@@ -412,9 +417,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// InstanceReadyTimeout the per-op writers read from ComponentPlan;
 	// the mode is the same effective MigrationMode the dispatcher reads
 	// from ComponentPlan (Never rejects at accept instead of parking).
-	migrationTimeout := workload.InstanceReadyTimeoutOrDefault(input.DesiredSpec.Lifecycle.InstanceReadyTimeout)
+	instanceReadyTimeout := workload.ResolveInstanceReadyTimeout(
+		input.DesiredSpec.Lifecycle.InstanceReadyTimeout, settings.InstanceReadyTimeout)
+	migrationTimeout := instanceReadyTimeout
 	migrationMode := workload.MigrationModeOrDefault(input.DesiredSpec.Lifecycle.MigrationPolicy)
-	if serr := r.syncMigrationEntries(ctx, log, ir, parent, migrationTimeout); serr != nil {
+	// The horizon the status-record trim ages against. Zero
+	// (unconfigured) ages out nothing.
+	var recordWindow time.Duration
+	if settings.MigrationAudit != nil {
+		recordWindow = settings.MigrationAudit.Window
+	}
+	if serr := r.syncMigrationEntries(ctx, log, ir, parent, migrationTimeout, recordWindow); serr != nil {
 		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: sync migration entries: %w", serr)
 	}
 	if requeue, merr := r.consumeMigrationRequests(ctx, log, ir, parent, migrationMode, migrationTimeout); merr != nil {
@@ -493,6 +506,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: build plan (ir=%s/%s): %w",
 			ir.Namespace, ir.Name, perr)
 	}
+	// Gang admission bound for this Component's PodGroups. Nil
+	// (unconfigured) leaves the derived timeout unclamped.
+	plan.GangScheduleTimeout = settings.GangScheduleTimeout
+	// Readiness backstop for this Component's operations: BuildPlan carries
+	// only the per-resource value, so the operator-configured fallback is
+	// overlaid here. Zero (neither set) opens operations with no deadline.
+	plan.InstanceReadyTimeout = instanceReadyTimeout
 	if !scaleDownPodObservationRequired(input, plan) {
 		obsmetrics.SetScaleDownActivePods(ir.Namespace, ir.Spec.ParentRef.Name, string(ir.Spec.Component), 0)
 		obsmetrics.SetScaleDownDeferredInstances(ir.Namespace, ir.Spec.ParentRef.Name, string(ir.Spec.Component), 0)
@@ -515,7 +535,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// tolerance matches the aggregator: requeue, don't error.
 		if specTarget != nil {
 			if perr := buildPromoteCurrentRevision(r.statusWriter(), r.liveReader(), ir)(ctx, specTarget.Name); perr != nil {
-				if errors.Is(perr, workload.ErrStatusMutationPrecondition) {
+				if errors.Is(perr, workloadtypes.ErrStatusMutationPrecondition) {
 					result, err = ctrl.Result{Requeue: true}, nil
 					return
 				}
@@ -532,7 +552,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			}
 		}
 		nextAvailableIn, serr := r.aggregateAndWriteStatus(ctx, ir, plan, specTarget, execHoldObserved, execHold)
-		if errors.Is(serr, workload.ErrStatusMutationPrecondition) {
+		if errors.Is(serr, workloadtypes.ErrStatusMutationPrecondition) {
 			result, err = ctrl.Result{Requeue: true}, nil
 			return
 		}
@@ -584,14 +604,40 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				"InferenceReplica reconciler: authoritative scale-down snapshot contains %d UID-owned component pod(s) without a valid %s label; refusing scale-down effects",
 				invalid, query.LabelInstanceIdx)
 		}
-		input.AuthoritativePods = &workload.ComponentPodSnapshot{
+		input.AuthoritativePods = &workloadtypes.ComponentPodSnapshot{
 			OwnerUID:   ir.UID,
 			Pods:       owned,
 			ByInstance: query.BucketPodsByInstanceIdx(owned),
 		}
 	}
 
-	deps := workload.Deps{
+	// Past every fail-closed guard, so a pass that refuses to act writes
+	// nothing at all: report whether this Component has a readiness window.
+	r.reportInstanceReadyTimeout(ctx, log, ir, input, plan.InstanceReadyTimeout)
+
+	// Peer revision pairing for every pod rendered this pass: resolve each
+	// serving peer's roll-target revision and create that revision's
+	// per-revision Services before any pod that names them exists. While a
+	// peer's projection or status lags this Component's parent generation
+	// the pairing is unknowable, so the pass renders nothing (status is
+	// still written by the deferred aggregator) and retries.
+	var peerRevisionFor coordination.PeerRevisionFunc
+	if coordination.PeerEnvDeclared(parent) {
+		peers, hold, perr := r.resolvePeerRevisions(ctx, ir, parent, rollTarget)
+		if perr != nil {
+			return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: resolve peer revisions (component=%s): %w", ir.Spec.Component, perr)
+		}
+		if hold != "" {
+			log.V(1).Info("Holding dispatch until peer revisions are resolvable", "reason", hold)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if serr := r.ensurePeerRevisionServices(ctx, parent, peers); serr != nil {
+			return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: ensure peer per-revision services (component=%s): %w", ir.Spec.Component, serr)
+		}
+		peerRevisionFor = peers.hashFor
+	}
+
+	deps := workloadtypes.Deps{
 		Client:       r.Client,
 		APIReader:    r.APIReader,
 		Recorder:     r.Recorder,
@@ -600,12 +646,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// Wire peer-env injection on the IR-managed (live) path.
 		// ISVCRenderHook overlays OME_<PEER>_ENDPOINT / _REVISION_ENDPOINT
 		// onto each rendered pod so PD components (engine <-> decoder) can
-		// address each other by stable DNS. It returns nil when the parent
+		// address each other by stable DNS and by the per-revision Service of
+		// the peer revision they pair with. It returns nil when the parent
 		// ISVC has no rollout groups, so single-component / non-rollout
 		// boxes are unaffected. parent may be nil when the
 		// parent ISVC is unresolved (foreground-GC window) — the hook handles
 		// nil by returning nil.
-		RenderHook: omenativecore.ISVCRenderHook(parent),
+		RenderHook: omenativecore.ISVCRenderHook(parent, peerRevisionFor),
 		// Ensure a gang surge's PodGroup inline, just before its pods —
 		// closes the window where the surge index hasn't yet landed in the
 		// plan the top-level EnsurePodGroups keys off (a gang scheduler
@@ -647,11 +694,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// on DesiredSpec.GangSchedulingAvailable, stamps GangSchedulingUnavailable,
 	// and returns. Runs before the revision/dispatch so the gang is announced
 	// ahead of pod creation.
+	// A name this owner cannot write is classified onto the Instance that
+	// wanted it rather than returned here, so one unusable PodGroup never
+	// stalls the whole Component.
 	effectiveTopology, gerr := workloadgang.EnsurePodGroupsWithState(ctx, deps, input, plan, podGroupState)
 	if gerr != nil {
-		if errors.Is(gerr, workloadgang.ErrPodGroupTerminating) {
-			return scaleDownRequeueResult(r.ScaleDownRequeueInterval), nil
-		}
 		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: ensure pod groups (component=%s): %w", ir.Spec.Component, gerr)
 	}
 	plan.InstanceTopologyKeys = effectiveTopology
@@ -672,7 +719,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// surface them when the dispatcher succeeded. Same pattern the deferred
 	// status-write uses above; log the suppressed error at V(1) so the
 	// double-failure case is grep-able.
-	if serr := workload.ReconcileHeadlessService(ctx, r.Client, buildHeadlessServiceSpec(ir)); serr != nil {
+	if serr := workloadservice.ReconcileHeadlessService(ctx, r.Client, buildHeadlessServiceSpec(ir)); serr != nil {
 		if err == nil {
 			// Error-driven requeue: clear any non-zero dispatcher result
 			// (controller-runtime ignores the result when err != nil).
@@ -690,7 +737,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 // or unloadable config resolves to nil — the workload layer fails safe
 // (the first same-target failure Holds) — with one V(1) log naming the
 // cause; there is never a silent in-code fallback policy.
-func (r *Reconciler) resolveUpdateRetryPolicy(log logr.Logger) *workload.RetryPolicy {
+func (r *Reconciler) resolveUpdateRetryPolicy(log logr.Logger) *workloadtypes.RetryPolicy {
 	if r.Clientset == nil {
 		log.V(1).Info("update retry policy unresolved: no clientset wired; failing safe (Held on first same-target failure)")
 		return nil
@@ -712,12 +759,12 @@ func (r *Reconciler) resolveUpdateRetryPolicy(log logr.Logger) *workload.RetryPo
 	return policy
 }
 
-func scaleDownPodObservationRequired(input workload.ReconcileInput, plan workload.ComponentPlan) bool {
-	if len(workload.ExtraInstanceIndices(input.ObservedState.InstanceStatuses, plan, false)) > 0 {
+func scaleDownPodObservationRequired(input workloadtypes.ReconcileInput, plan workloadtypes.ComponentPlan) bool {
+	if len(workload.ScaleDownExtras(input.ObservedState.InstanceStatuses, plan)) > 0 {
 		return true
 	}
 	for _, status := range input.ObservedState.InstanceStatuses {
-		if status.Phase == workload.InstancePhaseDeleting && status.Operation != nil && status.Operation.Type == workload.InstanceOperationDelete {
+		if status.Phase == workloadtypes.InstancePhaseDeleting && status.Operation != nil && status.Operation.Type == workloadtypes.InstanceOperationDelete {
 			return true
 		}
 	}
@@ -764,8 +811,8 @@ func foldRequeueAfter(result ctrl.Result, requeueAfter time.Duration) ctrl.Resul
 // the owner-UID cache index while preserving live proofs for lifecycle work.
 func (r *Reconciler) requiresAuthoritativePodGroupInventory(
 	ctx context.Context,
-	input workload.ReconcileInput,
-	plan workload.ComponentPlan,
+	input workloadtypes.ReconcileInput,
+	plan workloadtypes.ComponentPlan,
 ) (bool, error) {
 	for _, instance := range plan.Instances {
 		if instance.TotalPods() > 1 {
@@ -798,8 +845,8 @@ func podsControlledBy(pods []*corev1.Pod, ownerUID types.UID) []*corev1.Pod {
 func (r *Reconciler) reconcileStaleSinglePodGroups(
 	ctx context.Context,
 	ir *v1beta1.InferenceReplica,
-	input *workload.ReconcileInput,
-	plan workload.ComponentPlan,
+	input *workloadtypes.ReconcileInput,
+	plan workloadtypes.ComponentPlan,
 	inventory *workloadgang.PodGroupInventory,
 ) (bool, error) {
 	if inventory == nil || !inventory.Available() {
@@ -832,7 +879,7 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 			return false, fmt.Errorf("InferenceReplica reconciler: observe pods for stale PodGroup cleanup: %w", err)
 		}
 		owned := podsControlledBy(pods, ir.UID)
-		input.AuthoritativePods = &workload.ComponentPodSnapshot{
+		input.AuthoritativePods = &workloadtypes.ComponentPodSnapshot{
 			OwnerUID:   ir.UID,
 			Pods:       owned,
 			ByInstance: query.BucketPodsByInstanceIdx(owned),
@@ -888,10 +935,10 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 	return blocked, nil
 }
 
-func terminalFinalizationOwned(observed workload.WorkloadObservedState) map[int32]struct{} {
+func terminalFinalizationOwned(observed workloadtypes.WorkloadObservedState) map[int32]struct{} {
 	owned := make(map[int32]struct{})
 	for _, record := range observed.Migrations {
-		if record.Phase == workload.MigrationPhaseDraining {
+		if record.Phase == workloadtypes.MigrationPhaseDraining {
 			owned[record.SourceInstance] = struct{}{}
 		}
 	}
@@ -899,17 +946,17 @@ func terminalFinalizationOwned(observed workload.WorkloadObservedState) map[int3
 		if status.Operation == nil {
 			continue
 		}
-		if status.Phase == workload.InstancePhaseDeleting && status.Operation.Type == workload.InstanceOperationDelete {
+		if status.Phase == workloadtypes.InstancePhaseDeleting && status.Operation.Type == workloadtypes.InstanceOperationDelete {
 			owned[status.Index] = struct{}{}
 		}
-		if status.Operation.Type == workload.InstanceOperationUpdate && status.Operation.Step == workload.UpdateStepGangSurgeTargetCleanup {
+		if status.Operation.Type == workloadtypes.InstanceOperationUpdate && status.Operation.Step == workloadtypes.UpdateStepGangSurgeTargetCleanup {
 			owned[status.Index] = struct{}{}
 		}
-		if status.Operation.Type == workload.InstanceOperationUpdate && status.Operation.SurgeIndex != nil {
-			if status.Operation.Step == workloadops.UpdateStepSurgeDrain || status.Operation.Step == workloadops.UpdateStepSurgeDrainSettle {
+		if status.Operation.Type == workloadtypes.InstanceOperationUpdate && status.Operation.SurgeIndex != nil {
+			if status.Operation.Step == workloadtypes.UpdateStepSurgeDrain || status.Operation.Step == workloadtypes.UpdateStepSurgeDrainSettle {
 				owned[status.Index] = struct{}{}
 			}
-			if status.Phase == workload.InstancePhaseFailed {
+			if status.Phase == workloadtypes.InstancePhaseFailed {
 				owned[*status.Operation.SurgeIndex] = struct{}{}
 			}
 		}
@@ -917,34 +964,168 @@ func terminalFinalizationOwned(observed workload.WorkloadObservedState) map[int3
 	return owned
 }
 
-// resolveStuckPodGrace loads lifecycle.stuckPodGracePeriod from the
-// operator ConfigMap. Parse failure or absent config resolves to 0 —
-// the escalator skips fast escalation this pass (the
-// InstanceReadyTimeout backstop still fires) — with one V(1) log.
-func (r *Reconciler) resolveStuckPodGrace(log logr.Logger) time.Duration {
-	if r.Clientset == nil {
-		log.V(1).Info("stuck-pod grace unresolved: no clientset wired; skipping fast escalation this pass")
+// lifecycleSettings are the tunables one reconcile resolves from the
+// operator ConfigMap. Every field is zero when unconfigured, which each
+// consumer reads as "this window does not exist"; there are no in-code
+// defaults behind them.
+type lifecycleSettings struct {
+	// InstanceReadyTimeout is the operator-wide readiness backstop a
+	// Component that sets no lifecycle.instanceReadyTimeout of its own
+	// falls back to. Zero leaves the Component opening operations with no
+	// deadline.
+	InstanceReadyTimeout time.Duration
+	// StuckPod bounds a pod parked in a terminal kubelet waiting state.
+	// Zero skips fast escalation; the InstanceReadyTimeout backstop still
+	// fires.
+	StuckPod time.Duration
+	// Unschedulable bounds a pod the scheduler cannot place. Zero leaves
+	// the hold parking the clock until an operator resolves it.
+	Unschedulable time.Duration
+	// GangScheduleTimeout bounds the PodGroup schedule timeout derived
+	// from InstanceReadyTimeout. Nil passes the derived value through to
+	// the scheduler.
+	GangScheduleTimeout *workloadtypes.GangScheduleTimeoutClamp
+	// MigrationAudit bounds migration admission and the status-record
+	// horizon. Nil holds every migration request and ages out no record.
+	MigrationAudit *workloadtypes.MigrationAuditPolicy
+	// Requeue is the dispatcher's wake-up cadence. Zero fields leave a
+	// pass with work left to the controller's rate-limited backoff.
+	Requeue workloadtypes.RequeueIntervals
+	// RetryBlockHistoryLimit caps the RetryBlocks kept for superseded
+	// revisions. Nil keeps every historical block.
+	RetryBlockHistoryLimit *int32
+}
+
+// resolveLifecycleSettings loads the tunables from the operator ConfigMap
+// in one read. Absent, invalid, or unloadable config resolves the
+// affected field to 0 — that window is then disabled — with one V(1) log
+// naming the cause; unconfigured is never an error, and there is never a
+// silent in-code fallback value.
+func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings {
+	cfg, err := r.loadLifecycleConfig(log, "lifecycle settings")
+	if cfg == nil || err != nil {
+		return lifecycleSettings{}
+	}
+	var settings lifecycleSettings
+	settings.InstanceReadyTimeout = r.resolveConfiguredInstanceReadyTimeout(log)
+	if settings.StuckPod, err = cfg.ToGracePeriod(); err != nil {
+		log.V(1).Info("stuck-pod grace invalid; skipping fast escalation this pass", "error", err.Error())
+	}
+	if settings.Unschedulable, err = cfg.ToUnschedulableGracePeriod(); err != nil {
+		log.V(1).Info("unschedulable grace invalid; scheduler-hold escalation disabled this pass", "error", err.Error())
+	}
+	if settings.StuckPod == 0 {
+		log.V(1).Info("stuck-pod grace unconfigured (no lifecycle.stuckPodGracePeriod); skipping fast escalation this pass")
+	}
+	if settings.Unschedulable == 0 {
+		log.V(1).Info("unschedulable grace unconfigured (no lifecycle.unschedulableGracePeriod); scheduler-hold escalation disabled this pass")
+	}
+	if settings.GangScheduleTimeout, err = cfg.GangScheduleTimeout.ToClamp(); err != nil {
+		log.V(1).Info("gang schedule timeout invalid; the derived timeout is unclamped this pass", "error", err.Error())
+	}
+	if settings.MigrationAudit, err = cfg.Audit.ToPolicy(); err != nil {
+		log.V(1).Info("migration audit policy invalid; no migration is admitted this pass", "error", err.Error())
+	}
+	if settings.Requeue, err = cfg.Requeue.ToIntervals(); err != nil {
+		log.V(1).Info("requeue cadence invalid; passes fall back to rate-limited backoff", "error", err.Error())
+	}
+	if settings.RetryBlockHistoryLimit, err = cfg.ToRetryBlockHistoryLimit(); err != nil {
+		log.V(1).Info("retry-block history limit invalid; historical blocks are kept this pass", "error", err.Error())
+	}
+	if settings.GangScheduleTimeout == nil {
+		log.V(1).Info("gang schedule timeout unconfigured (no lifecycle.gangScheduleTimeout); the timeout derived from InstanceReadyTimeout reaches the scheduler unclamped")
+	}
+	if settings.MigrationAudit == nil {
+		log.V(1).Info("migration capacity unconfigured (no lifecycle.audit); migration requests are held until it is set and terminal records are not aged out")
+	}
+	if settings.Requeue.Operation == 0 || settings.Requeue.Gate == 0 {
+		log.V(1).Info("requeue cadence unconfigured (no lifecycle.requeue); a pass with work left requeues on rate-limited backoff")
+	}
+	if settings.RetryBlockHistoryLimit == nil {
+		log.V(1).Info("retry-block history unconfigured (no lifecycle.retryBlockHistoryLimit); blocks for superseded revisions are kept")
+	}
+	return settings
+}
+
+// instanceReadyTimeoutUnsetMessage explains the Component-scoped
+// InstanceReadyTimeoutUnconfigured condition and the Warning event that
+// raises it.
+const instanceReadyTimeoutUnsetMessage = "no instanceReadyTimeout is set on the Component or in lifecycle.instanceReadyTimeout; operations open with no readiness deadline"
+
+// reportInstanceReadyTimeout surfaces the Component's effective readiness
+// backstop as a condition: True (degraded) when neither the per-resource
+// lifecycle value nor the operator's supplies one, False once either does.
+// An unset window is legal — an Instance that never becomes Ready then waits
+// for an operator instead of being failed — so it is reported, never an
+// error. The Warning is edge-triggered off the standing condition, so it
+// fires once per episode rather than every pass.
+func (r *Reconciler) reportInstanceReadyTimeout(ctx context.Context, log logr.Logger,
+	ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput, timeout time.Duration) {
+	cond := metav1.Condition{
+		Type:               string(workloadtypes.ConditionInstanceReadyTimeoutUnconfigured),
+		Status:             metav1.ConditionFalse,
+		Reason:             string(workloadtypes.ReasonInstanceReadyTimeoutConfigured),
+		Message:            fmt.Sprintf("Instance readiness deadline is %s", timeout),
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: ir.Generation,
+	}
+	if timeout <= 0 {
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = string(workloadtypes.ReasonInstanceReadyTimeoutUnconfigured)
+		cond.Message = instanceReadyTimeoutUnsetMessage
+		if !apimeta.IsStatusConditionTrue(ir.Status.Conditions, cond.Type) {
+			workloadtypes.RecordWarning(r.Recorder, workloadtypes.EventTarget(input),
+				workloadtypes.EventReasonInstanceReadyTimeoutUnconfigured,
+				"OMENative component=%s: %s", ir.Spec.Component, instanceReadyTimeoutUnsetMessage)
+		}
+	}
+	if input.WriteAggregateCondition == nil {
+		return
+	}
+	if err := input.WriteAggregateCondition(ctx, cond); err != nil {
+		log.V(1).Info("could not record the instance-ready timeout condition", "error", err.Error())
+	}
+}
+
+// resolveConfiguredInstanceReadyTimeout loads lifecycle.instanceReadyTimeout
+// from the operator ConfigMap. Absent, invalid, or unloadable config
+// resolves to 0 — a Component that sets no readiness window of its own then
+// opens operations with no deadline — with one V(1) log naming the cause;
+// there is never an in-code fallback window.
+func (r *Reconciler) resolveConfiguredInstanceReadyTimeout(log logr.Logger) time.Duration {
+	cfg, err := r.loadLifecycleConfig(log, "instance-ready timeout")
+	if cfg == nil || err != nil {
 		return 0
+	}
+	timeout, terr := cfg.ToInstanceReadyTimeout()
+	if terr != nil {
+		log.V(1).Info("instance-ready timeout invalid; no operator-wide readiness backstop this pass", "error", terr.Error())
+		return 0
+	}
+	if timeout == 0 {
+		log.V(1).Info("instance-ready timeout unconfigured (no lifecycle.instanceReadyTimeout); a Component that sets none of its own opens operations with no deadline")
+	}
+	return timeout
+}
+
+// loadLifecycleConfig fetches the lifecycle block through the shared
+// short-TTL cache, logging once at V(1) and returning nil when it cannot
+// be read. purpose names the caller in that log so an operator can tell
+// which resolver went unconfigured.
+func (r *Reconciler) loadLifecycleConfig(log logr.Logger, purpose string) (*controllerconfig.LifecycleConfig, error) {
+	if r.Clientset == nil {
+		log.V(1).Info("lifecycle config unresolved: no clientset wired", "purpose", purpose)
+		return nil, nil
 	}
 	cfg, err := controllerconfig.NewLifecycleConfigCached(r.ConfigCache, r.Clientset)
 	if err != nil {
-		log.V(1).Info("stuck-pod grace unresolved: lifecycle config load failed; skipping fast escalation this pass", "error", err.Error())
-		return 0
+		log.V(1).Info("lifecycle config load failed", "purpose", purpose, "error", err.Error())
+		return nil, err
 	}
 	if cfg == nil {
-		log.V(1).Info("stuck-pod grace unconfigured (no lifecycle block in inferenceservice-config); skipping fast escalation this pass")
-		return 0
+		log.V(1).Info("no lifecycle block in inferenceservice-config", "purpose", purpose)
 	}
-	grace, err := cfg.ToGracePeriod()
-	if err != nil {
-		log.V(1).Info("stuck-pod grace invalid; skipping fast escalation this pass", "error", err.Error())
-		return 0
-	}
-	if grace == 0 {
-		log.V(1).Info("stuck-pod grace unconfigured (no lifecycle.stuckPodGracePeriod); skipping fast escalation this pass")
-		return 0
-	}
-	return grace
+	return cfg, nil
 }
 
 // resolveAutoMigrateBudget loads lifecycle.autoMigrate.maxAttempts from
@@ -978,7 +1159,7 @@ func (r *Reconciler) resolveAutoMigrateBudget(log logr.Logger) int32 {
 // or unloadable config resolves to nil — the stuck-Terminating
 // force-delete escalation is disabled this pass — with one V(1) log
 // naming the cause; there is never a silent in-code fallback policy.
-func (r *Reconciler) resolveForceDeletePolicy(log logr.Logger) *workload.ForceDeletePolicy {
+func (r *Reconciler) resolveForceDeletePolicy(log logr.Logger) *workloadtypes.ForceDeletePolicy {
 	if r.Clientset == nil {
 		log.V(1).Info("force-delete policy unresolved: no clientset wired; escalation disabled this pass")
 		return nil
@@ -1195,12 +1376,12 @@ func (r *Reconciler) stampAutoRelocationSuccess(ctx context.Context, ir *v1beta1
 		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				return workload.ErrStatusOwnerGone
+				return workloadtypes.ErrStatusOwnerGone
 			}
 			return fmt.Errorf("re-read IR: %w", err)
 		}
 		if ownerUID == "" || fresh.UID != ownerUID {
-			return workload.ErrStatusOwnerGone
+			return workloadtypes.ErrStatusOwnerGone
 		}
 		changed := false
 		for idx := range readyIdx {
@@ -1219,7 +1400,7 @@ func (r *Reconciler) stampAutoRelocationSuccess(ctx context.Context, ir *v1beta1
 		}
 		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
-				return workload.ErrStatusOwnerGone
+				return workloadtypes.ErrStatusOwnerGone
 			}
 			return fmt.Errorf("update IR status: %w", err)
 		}
@@ -1266,7 +1447,7 @@ func newestUnsucceededAutoMigration(migrations []v1beta1.MigrationStatus, idx in
 // affinity, so a non-empty current topology requires recovery from live pods;
 // ambiguity fails closed rather than rendering a split gang. When current
 // topology is empty, absence remains a non-blocking topology-free rollback.
-func (r *Reconciler) applyRollbackPayload(ctx context.Context, ir *v1beta1.InferenceReplica, desired *workload.WorkloadDesiredSpec, payload *revision.DataPayload, target *appsv1.ControllerRevision) error {
+func (r *Reconciler) applyRollbackPayload(ctx context.Context, ir *v1beta1.InferenceReplica, desired *workloadtypes.WorkloadDesiredSpec, payload *revision.DataPayload, target *appsv1.ControllerRevision) error {
 	if desired == nil || payload == nil {
 		return nil
 	}
@@ -1387,12 +1568,7 @@ func irRevisionKey(ir *v1beta1.InferenceReplica) revision.Key {
 // Data (or foreign-ownership) collision, bump
 // IR.Status.CollisionCount, persist, and retry the EnsureControllerRevision
 // with the new salt. The retry yields a different hash and lands.
-//
-// Mirrors the ISVC-side ensureRevisionWithCollisionRetry byte-for-byte
-// except for: (a) the v1beta1.InferenceReplica handle, (b) the
-// owner-ref shape (IR is owner), (c) collision-counter persistence
-// goes to IR.Status.CollisionCount instead of the per-Component status.
-func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v1beta1.InferenceReplica, input workload.ReconcileInput) (*appsv1.ControllerRevision, error) {
+func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput) (*appsv1.ControllerRevision, error) {
 	revKey := irRevisionKey(ir)
 
 	// scopeUID = parent ISVC's UID so the IR-managed path partitions the
@@ -1462,7 +1638,7 @@ func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v
 // revisionHash memoizes the canonical revision payload. Generation covers spec-derived inputs;
 // the excluded annotation list, collision count, and scope UID cover the remaining hash inputs.
 // Cached raw bytes are immutable and only read by revision creation.
-func (r *Reconciler) revisionHash(ir *v1beta1.InferenceReplica, input workload.ReconcileInput, collisionCount *int32, scopeUID types.UID) (string, []byte, error) {
+func (r *Reconciler) revisionHash(ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput, collisionCount *int32, scopeUID types.UID) (string, []byte, error) {
 	cc := utils.DerefInt32(collisionCount)
 	cacheKey := client.ObjectKeyFromObject(ir)
 	excludedAnnotationKeys := ir.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey]
@@ -1616,12 +1792,12 @@ func (r *Reconciler) bumpCollisionCount(ctx context.Context, ir *v1beta1.Inferen
 		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				return workload.ErrStatusOwnerGone
+				return workloadtypes.ErrStatusOwnerGone
 			}
 			return fmt.Errorf("re-read IR for CollisionCount bump: %w", err)
 		}
 		if ownerUID == "" || fresh.UID != ownerUID {
-			return workload.ErrStatusOwnerGone
+			return workloadtypes.ErrStatusOwnerGone
 		}
 		next = int32(1)
 		if fresh.Status.CollisionCount != nil {
@@ -1630,7 +1806,7 @@ func (r *Reconciler) bumpCollisionCount(ctx context.Context, ir *v1beta1.Inferen
 		fresh.Status.CollisionCount = &next
 		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
-				return workload.ErrStatusOwnerGone
+				return workloadtypes.ErrStatusOwnerGone
 			}
 			return fmt.Errorf("persist CollisionCount: %w", err)
 		}
@@ -1640,7 +1816,7 @@ func (r *Reconciler) bumpCollisionCount(ctx context.Context, ir *v1beta1.Inferen
 		return nil, err
 	}
 	// Mirror onto the cached IR so the immediate retry sees the bumped
-	// value. Same mirror shape the ISVC adapter uses.
+	// value.
 	ir.Status.CollisionCount = &next
 	return &next, nil
 }

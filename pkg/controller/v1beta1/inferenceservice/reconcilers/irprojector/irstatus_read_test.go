@@ -146,3 +146,58 @@ func TestComponentIRPartition_ReadErrorPropagatesWrapped(t *testing.T) {
 		t.Errorf("error should wrap the IR key and cause: %v", err)
 	}
 }
+
+// TestEffectivePartition_PacingWinsOverLifecycle pins the source order every
+// partition reader shares with the engine: the projected pacing partition
+// wins when set — including an explicit 0, which releases every Instance
+// over a user partition — and only a nil pacing partition defers to the
+// user's lifecycle rollingUpdate partition.
+func TestEffectivePartition_PacingWinsOverLifecycle(t *testing.T) {
+	p := func(v int32) *int32 { return &v }
+	lifecycle := &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
+		RollingUpdate: &v1beta1.RollingUpdate{Partition: p(1)}}}
+	cases := map[string]struct {
+		lifecycle *v1beta1.LifecycleSpec
+		pacing    *v1beta1.InferenceReplicaPacing
+		want      *int32
+	}{
+		"neither":                         {nil, nil, nil},
+		"lifecycle only":                  {lifecycle, nil, p(1)},
+		"pacing only":                     {nil, &v1beta1.InferenceReplicaPacing{Partition: p(2)}, p(2)},
+		"pacing wins":                     {lifecycle, &v1beta1.InferenceReplicaPacing{Partition: p(2)}, p(2)},
+		"pacing 0 releases over user":     {lifecycle, &v1beta1.InferenceReplicaPacing{Partition: p(0)}, p(0)},
+		"pacing without partition defers": {lifecycle, &v1beta1.InferenceReplicaPacing{}, p(1)},
+	}
+	for name, tc := range cases {
+		got := EffectivePartition(tc.lifecycle, tc.pacing)
+		switch {
+		case got == nil && tc.want == nil:
+		case got == nil || tc.want == nil || *got != *tc.want:
+			t.Errorf("%s: EffectivePartition = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// TestComponentIRPartition_ReadsPacingFirst pins that the coordination-side
+// reader sees the same number the engine holds at: a projected canary
+// partition on spec.pacing is reported even when the user's lifecycle
+// carries a different partition.
+func TestComponentIRPartition_ReadsPacingFirst(t *testing.T) {
+	user, canary := int32(1), int32(3)
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: InferenceReplicaName("svc", v1beta1.EngineComponent)},
+		Spec: v1beta1.InferenceReplicaSpec{
+			Lifecycle: &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
+				RollingUpdate: &v1beta1.RollingUpdate{Partition: &user}}},
+			Pacing: &v1beta1.InferenceReplicaPacing{Partition: &canary},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ir).Build()
+	got, err := ComponentIRPartition(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("partition: got %d want 3 (the projected pacing partition)", got)
+	}
+}

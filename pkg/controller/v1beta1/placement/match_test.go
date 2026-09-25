@@ -59,6 +59,15 @@ func TestMatchCandidates(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"cluster-b"}, got)
 
+	// metadata.name is available without a duplicate WorkloadCluster label and
+	// remains AND-ed with the capability requirement.
+	got, _, err = MatchCandidates(isvcReq(
+		"gpu=gb300",
+		"metadata.name in (cluster-a-h100,cluster-a-down,cluster-b)",
+	), clusters)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"cluster-b"}, got)
+
 	// Guard: an ISVC with NO requirement must NOT fan out to every
 	// Ready cluster — it matches NOTHING with reason NoRequirements.
 	got, reason, err = MatchCandidates(isvcReq("", ""), clusters)
@@ -84,6 +93,23 @@ func TestMatchCandidates(t *testing.T) {
 	_, reason, err = MatchCandidates(isvcReq("!!!", ""), clusters)
 	assert.Error(t, err)
 	assert.Equal(t, MatchReasonMalformedSelector, reason)
+}
+
+func TestMatchCandidatesMetadataNameIsAuthoritative(t *testing.T) {
+	clusters := []v1beta1.WorkloadCluster{
+		wc("cluster-real", true, map[string]string{"metadata.name": "cluster-spoofed"}),
+	}
+
+	got, _, err := MatchCandidates(isvcReq("", "metadata.name=cluster-real"), clusters)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"cluster-real"}, got)
+	assert.Equal(t, "cluster-spoofed", clusters[0].Labels["metadata.name"],
+		"selector evaluation must not mutate the WorkloadCluster labels")
+
+	got, reason, err := MatchCandidates(isvcReq("", "metadata.name=cluster-spoofed"), clusters)
+	assert.NoError(t, err)
+	assert.Nil(t, got)
+	assert.Equal(t, MatchReasonNoMatch, reason)
 }
 
 // isvcPlacement builds a source ISVC whose candidate matching is driven by the
@@ -120,6 +146,13 @@ func TestMatchCandidates_PlacementSpec(t *testing.T) {
 	got, _, err = MatchCandidates(isvcPlacement(&v1beta1.PlacementSpec{ClusterSelector: "provider=prov-a"}), clusters)
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"cluster-a"}, got)
+
+	// A structured clusterSelector can select directly by immutable object name.
+	got, _, err = MatchCandidates(isvcPlacement(&v1beta1.PlacementSpec{
+		ClusterSelector: "metadata.name=cluster-b",
+	}), clusters)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"cluster-b"}, got)
 
 	// empty spec.placement (mode only) declares no requirement -> no fan-out.
 	_, reason, err = MatchCandidates(isvcPlacement(&v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeSingle}), clusters)
@@ -159,4 +192,5 @@ func TestDeclaresPlacementRequirement_StructAndAnnotations(t *testing.T) {
 	assert.False(t, declaresPlacementRequirement(isvcPlacement(&v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeAll})))
 	assert.False(t, declaresPlacementRequirement(isvcPlacement(nil)))
 	assert.True(t, declaresPlacementRequirement(isvcReq("gpu=gb300", "")))
+	assert.True(t, IsPlacementEligible(isvcReq("gpu=gb300", "")))
 }

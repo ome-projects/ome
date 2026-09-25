@@ -199,7 +199,7 @@ func (p *GatewayAPIPublisher) buildBackendTLSPolicy(
 
 func (p *GatewayAPIPublisher) applyEndpointSlice(ctx context.Context, isvc *v1beta1.InferenceService, desired *discoveryv1.EndpointSlice) error {
 	existing := &discoveryv1.EndpointSlice{}
-	err := p.client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	err := p.apiReader.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if apierrors.IsNotFound(err) {
 		if err := p.client.Create(ctx, desired); err != nil {
 			return fmt.Errorf("create global backend EndpointSlice %s/%s: %w", desired.Namespace, desired.Name, err)
@@ -212,7 +212,11 @@ func (p *GatewayAPIPublisher) applyEndpointSlice(ctx context.Context, isvc *v1be
 	if !p.ownsResource(existing, isvc) {
 		return fmt.Errorf("global backend EndpointSlice %s/%s belongs to another InferenceService", desired.Namespace, desired.Name)
 	}
+	if err := requireActiveGatewayResource(existing, "backend EndpointSlice"); err != nil {
+		return err
+	}
 	desired.ResourceVersion = existing.ResourceVersion
+	desired.Finalizers = append([]string(nil), existing.Finalizers...)
 	if desired.AddressType == existing.AddressType &&
 		equality.Semantic.DeepEqual(desired.Endpoints, existing.Endpoints) &&
 		equality.Semantic.DeepEqual(desired.Ports, existing.Ports) &&
@@ -227,7 +231,7 @@ func (p *GatewayAPIPublisher) applyEndpointSlice(ctx context.Context, isvc *v1be
 
 func (p *GatewayAPIPublisher) applyBackendTLSPolicy(ctx context.Context, isvc *v1beta1.InferenceService, desired *gatewayapiv1.BackendTLSPolicy) error {
 	existing := &gatewayapiv1.BackendTLSPolicy{}
-	err := p.client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	err := p.apiReader.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if apierrors.IsNotFound(err) {
 		if err := p.client.Create(ctx, desired); err != nil {
 			return fmt.Errorf("create global BackendTLSPolicy %s/%s: %w", desired.Namespace, desired.Name, err)
@@ -240,7 +244,11 @@ func (p *GatewayAPIPublisher) applyBackendTLSPolicy(ctx context.Context, isvc *v
 	if !p.ownsResource(existing, isvc) {
 		return fmt.Errorf("global BackendTLSPolicy %s/%s belongs to another InferenceService", desired.Namespace, desired.Name)
 	}
+	if err := requireActiveGatewayResource(existing, "BackendTLSPolicy"); err != nil {
+		return err
+	}
 	desired.ResourceVersion = existing.ResourceVersion
+	desired.Finalizers = append([]string(nil), existing.Finalizers...)
 	if equality.Semantic.DeepEqual(desired.Spec, existing.Spec) && maps.Equal(desired.Labels, existing.Labels) {
 		return nil
 	}
@@ -250,34 +258,42 @@ func (p *GatewayAPIPublisher) applyBackendTLSPolicy(ctx context.Context, isvc *v
 	return nil
 }
 
-func (p *GatewayAPIPublisher) ownedEndpointSlices(ctx context.Context, isvc *v1beta1.InferenceService) ([]discoveryv1.EndpointSlice, error) {
+func (p *GatewayAPIPublisher) sourceEndpointSlices(
+	ctx context.Context,
+	routeNamespace string,
+	sourceKey types.NamespacedName,
+) ([]discoveryv1.EndpointSlice, error) {
 	list := &discoveryv1.EndpointSliceList{}
-	if err := p.client.List(ctx, list, p.ownedListOptions(isvc)...); err != nil {
-		return nil, fmt.Errorf("list global backend EndpointSlices for %s/%s: %w", isvc.Namespace, isvc.Name, err)
+	if err := p.apiReader.List(ctx, list, sourceListOptions(routeNamespace, sourceKey)...); err != nil {
+		return nil, fmt.Errorf("list global backend EndpointSlices for %s/%s: %w", sourceKey.Namespace, sourceKey.Name, err)
 	}
 	return list.Items, nil
 }
 
-func (p *GatewayAPIPublisher) ownedBackendTLSPolicies(ctx context.Context, isvc *v1beta1.InferenceService) ([]gatewayapiv1.BackendTLSPolicy, error) {
+func (p *GatewayAPIPublisher) sourceBackendTLSPolicies(
+	ctx context.Context,
+	routeNamespace string,
+	sourceKey types.NamespacedName,
+) ([]gatewayapiv1.BackendTLSPolicy, error) {
 	list := &gatewayapiv1.BackendTLSPolicyList{}
-	if err := p.client.List(ctx, list, p.ownedListOptions(isvc)...); err != nil {
+	if err := p.apiReader.List(ctx, list, sourceListOptions(routeNamespace, sourceKey)...); err != nil {
 		// The policy CRD is optional. Absence means there is no policy object to
 		// clean up. The enabled create path reports a missing CRD explicitly.
 		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
 			return []gatewayapiv1.BackendTLSPolicy{}, nil
 		}
-		return nil, fmt.Errorf("list global BackendTLSPolicies for %s/%s: %w", isvc.Namespace, isvc.Name, err)
+		return nil, fmt.Errorf("list global BackendTLSPolicies for %s/%s: %w", sourceKey.Namespace, sourceKey.Name, err)
 	}
 	return list.Items, nil
 }
 
-func (p *GatewayAPIPublisher) ownedListOptions(isvc *v1beta1.InferenceService) []client.ListOption {
+func sourceListOptions(routeNamespace string, sourceKey types.NamespacedName) []client.ListOption {
 	return []client.ListOption{
-		client.InNamespace(p.routeNamespace(isvc)),
+		client.InNamespace(routeNamespace),
 		client.MatchingLabels{
 			ManagedByLabel:                      ManagedByValue,
-			PlacementEndpointISVCLabel:          isvc.Name,
-			PlacementEndpointISVCNamespaceLabel: isvc.Namespace,
+			PlacementEndpointISVCLabel:          sourceKey.Name,
+			PlacementEndpointISVCNamespaceLabel: sourceKey.Namespace,
 		},
 	}
 }
@@ -288,8 +304,24 @@ func (p *GatewayAPIPublisher) pruneGatewayBackendResources(
 	desiredSlices map[string]struct{},
 	desiredPolicies map[string]struct{},
 ) error {
+	return p.pruneGatewayBackendResourcesForSource(
+		ctx,
+		p.routeNamespace(isvc),
+		types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name},
+		desiredSlices,
+		desiredPolicies,
+	)
+}
+
+func (p *GatewayAPIPublisher) pruneGatewayBackendResourcesForSource(
+	ctx context.Context,
+	routeNamespace string,
+	sourceKey types.NamespacedName,
+	desiredSlices map[string]struct{},
+	desiredPolicies map[string]struct{},
+) error {
 	var errs []error
-	slices, err := p.ownedEndpointSlices(ctx, isvc)
+	slices, err := p.sourceEndpointSlices(ctx, routeNamespace, sourceKey)
 	if err != nil {
 		errs = append(errs, err)
 	} else {
@@ -297,12 +329,12 @@ func (p *GatewayAPIPublisher) pruneGatewayBackendResources(
 			if _, keep := desiredSlices[slices[i].Name]; keep {
 				continue
 			}
-			if err := p.client.Delete(ctx, &slices[i]); err != nil && !apierrors.IsNotFound(err) {
+			if err := p.deleteObservedObject(ctx, &slices[i]); err != nil {
 				errs = append(errs, fmt.Errorf("delete stale global backend EndpointSlice %s/%s: %w", slices[i].Namespace, slices[i].Name, err))
 			}
 		}
 	}
-	policies, err := p.ownedBackendTLSPolicies(ctx, isvc)
+	policies, err := p.sourceBackendTLSPolicies(ctx, routeNamespace, sourceKey)
 	if err != nil {
 		errs = append(errs, err)
 	} else {
@@ -310,7 +342,7 @@ func (p *GatewayAPIPublisher) pruneGatewayBackendResources(
 			if _, keep := desiredPolicies[policies[i].Name]; keep {
 				continue
 			}
-			if err := p.client.Delete(ctx, &policies[i]); err != nil && !apierrors.IsNotFound(err) {
+			if err := p.deleteObservedObject(ctx, &policies[i]); err != nil {
 				errs = append(errs, fmt.Errorf("delete stale global BackendTLSPolicy %s/%s: %w", policies[i].Namespace, policies[i].Name, err))
 			}
 		}
@@ -318,6 +350,16 @@ func (p *GatewayAPIPublisher) pruneGatewayBackendResources(
 	return errors.Join(errs...)
 }
 
-func (p *GatewayAPIPublisher) deleteGatewayBackendResources(ctx context.Context, isvc *v1beta1.InferenceService) error {
-	return p.pruneGatewayBackendResources(ctx, isvc, map[string]struct{}{}, map[string]struct{}{})
+func (p *GatewayAPIPublisher) deleteGatewayBackendResourcesForSource(
+	ctx context.Context,
+	routeNamespace string,
+	sourceKey types.NamespacedName,
+) error {
+	return p.pruneGatewayBackendResourcesForSource(
+		ctx,
+		routeNamespace,
+		sourceKey,
+		map[string]struct{}{},
+		map[string]struct{}{},
+	)
 }

@@ -28,8 +28,16 @@ func whole(capacity []Capacity) Fleet {
 	return Fleet{Registered: names, Reported: names, Capacity: capacity}
 }
 
+// cap3 is a member whose installed capacity is all schedulable.
 func cap3(cluster, nominal string) Capacity {
-	return Capacity{Cluster: cluster, ResourceName: tpu, ResourceFlavor: flavor, Allocatable: qty(nominal)}
+	return Capacity{Cluster: cluster, ResourceName: tpu, ResourceFlavor: flavor,
+		Allocatable: qty(nominal), HighWaterMark: qty(nominal)}
+}
+
+// parked is a member whose chips are all on cordoned or NotReady nodes.
+func parked(cluster, installed string) Capacity {
+	return Capacity{Cluster: cluster, ResourceName: tpu, ResourceFlavor: flavor,
+		Allocatable: qty("0"), HighWaterMark: qty(installed)}
 }
 
 func allow(node, nominal string) Allowance {
@@ -95,15 +103,49 @@ func TestResolve(t *testing.T) {
 			},
 		},
 		{
-			// A cluster reporting none of the flavor takes zero, which is what
-			// keeps the projector from creating a queue that admits nothing.
-			name: "a cluster without the flavor is apportioned zero",
+			// A queue there would admit nothing, so there is none.
+			name: "a cluster that never had the flavor is left out",
 			budgets: []v1beta1.AcceleratorBudget{budget("100",
 				withPolicy(v1beta1.AcceleratorQuotaDistributionProportional))},
 			capacity: []Capacity{cap3("member-a", "8"), cap3("member-b", "0")},
 			want: map[string][]Allowance{
 				"member-a": {allow("team", "100")},
+			},
+		},
+		{
+			// Its queue still holds the tenant's work, so it stays, admitting
+			// nothing new until the nodes come back.
+			name: "a cluster whose nodes are all parked keeps a zero share",
+			budgets: []v1beta1.AcceleratorBudget{budget("100",
+				withPolicy(v1beta1.AcceleratorQuotaDistributionProportional))},
+			capacity: []Capacity{cap3("member-a", "8"), parked("member-b", "8")},
+			want: map[string][]Allowance{
+				"member-a": {allow("team", "100")},
 				"member-b": {allow("team", "0")},
+			},
+		},
+		{
+			// The flavor is installed on both, and which one takes the remainder
+			// depends on capacity; the queue must not come and go with it.
+			name: "a share rounded down to zero keeps its cluster",
+			budgets: []v1beta1.AcceleratorBudget{budget("1",
+				withPolicy(v1beta1.AcceleratorQuotaDistributionProportional))},
+			capacity: []Capacity{cap3("member-a", "8"), cap3("member-b", "8")},
+			want: map[string][]Allowance{
+				"member-a": {allow("team", "1")},
+				"member-b": {allow("team", "0")},
+			},
+		},
+		{
+			// The admin wrote zero for that cluster; installed hardware does not
+			// override an authored split.
+			name: "an explicit zero share is left out",
+			budgets: []v1beta1.AcceleratorBudget{budget("100",
+				withPolicy(v1beta1.AcceleratorQuotaDistributionExplicit),
+				withPerCluster([2]string{"member-a", "100"}, [2]string{"member-b", "0"}))},
+			capacity: []Capacity{cap3("member-a", "8"), cap3("member-b", "8")},
+			want: map[string][]Allowance{
+				"member-a": {allow("team", "100")},
 			},
 		},
 	}
@@ -402,59 +444,6 @@ func TestResolveHoldsAnIncompleteBasis(t *testing.T) {
 				}
 				return
 			}
-			if len(got.Unresolved) != 0 {
-				t.Fatalf("Resolve() left nodes unresolved: %v", got.Unresolved)
-			}
-			if diff := cmp.Diff(tc.want, got.ByCluster, cmpQuantity); diff != "" {
-				t.Errorf("Resolve() mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-// Allocatable moves whenever a node is cordoned or replaced. Splitting against
-// it would move every tenant's share on the whole fleet whenever one node
-// anywhere was drained, which is what the damped mark exists to prevent -- and
-// what shares.Weight documents its snapshot contract for.
-func TestResolveSplitsOnTheHighWaterMark(t *testing.T) {
-	mark := func(cluster, allocatable, hwm string) Capacity {
-		c := cap3(cluster, allocatable)
-		c.HighWaterMark = qty(hwm)
-		return c
-	}
-
-	tests := []struct {
-		name     string
-		capacity []Capacity
-		want     map[string][]Allowance
-	}{
-		{
-			// member-a is half drained. Its mark, and so its share, holds.
-			name:     "a drained member keeps the share its mark earned",
-			capacity: []Capacity{mark("member-a", "1", "2"), mark("member-b", "1", "1")},
-			want: map[string][]Allowance{
-				"member-a": {allow("team", "80")},
-				"member-b": {allow("team", "40")},
-			},
-		},
-		{
-			// No mark reported: allocatable is all there is to go on.
-			name:     "allocatable stands in where no mark is reported",
-			capacity: []Capacity{cap3("member-a", "2"), cap3("member-b", "1")},
-			want: map[string][]Allowance{
-				"member-a": {allow("team", "80")},
-				"member-b": {allow("team", "40")},
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := Resolve(oneLeaf(t, v1beta1.AcceleratorBudget{
-				ResourceName: tpu, ResourceFlavor: flavor, Nominal: qty("120"),
-			}), whole(tc.capacity), ResolveOptions{
-				DefaultPolicy: v1beta1.AcceleratorQuotaDistributionProportional,
-			})
 			if len(got.Unresolved) != 0 {
 				t.Fatalf("Resolve() left nodes unresolved: %v", got.Unresolved)
 			}

@@ -16,7 +16,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // Plan is the pure decision layer: the tests below assert the Decision
@@ -27,13 +29,13 @@ import (
 
 // forbidMutations wires every mutation callback on input to a t.Error
 // recorder, so any write attempted during Plan fails the test.
-func forbidMutations(t *testing.T, input *workload.ReconcileInput) {
+func forbidMutations(t *testing.T, input *types.ReconcileInput) {
 	t.Helper()
-	input.MutateInstance = func(_ context.Context, idx int32, _ func(*workload.InstanceStatus) bool) error {
+	input.MutateInstance = func(_ context.Context, idx int32, _ func(*types.InstanceStatus) bool) error {
 		t.Errorf("Plan must not call MutateInstance (idx=%d)", idx)
 		return nil
 	}
-	input.ApplyInstanceMutations = func(_ context.Context, muts []workload.InstanceMutation) error {
+	input.ApplyInstanceMutations = func(_ context.Context, muts []types.InstanceMutation) error {
 		t.Errorf("Plan must not call ApplyInstanceMutations (%d mutations)", len(muts))
 		return nil
 	}
@@ -51,19 +53,19 @@ func forbidMutations(t *testing.T, input *workload.ReconcileInput) {
 	input.WarnRetryHeld = func(rev string, _ int32, _ string) {
 		t.Errorf("Plan must not call WarnRetryHeld (%s)", rev)
 	}
-	input.MutateMigration = func(_ context.Context, uuid string, _ func(*workload.MigrationRecord) bool) error {
+	input.MutateMigration = func(_ context.Context, uuid string, _ func(*types.MigrationRecord) bool) error {
 		t.Errorf("Plan must not call MutateMigration (%s)", uuid)
 		return nil
 	}
-	input.AppendMigration = func(_ context.Context, rec workload.MigrationRecord) error {
+	input.AppendMigration = func(_ context.Context, rec types.MigrationRecord) error {
 		t.Errorf("Plan must not call AppendMigration (%s)", rec.RequestUUID)
 		return nil
 	}
-	input.MutateRetryBlock = func(_ context.Context, rev string, _ func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+	input.MutateRetryBlock = func(_ context.Context, rev string, _ func(*types.RetryBlock) types.RetryBlockDisposition) error {
 		t.Errorf("Plan must not call MutateRetryBlock (%s)", rev)
 		return nil
 	}
-	input.UpdateGate = func(_ workload.UpdateStrategyType, _, _ int32) (bool, workload.RolloutHoldGate, string) {
+	input.UpdateGate = func(_ types.UpdateStrategyType, _, _ int32) (bool, types.RolloutHoldGate, string) {
 		t.Error("Plan must not consult UpdateGate (Execute owns the consult)")
 		return true, "", ""
 	}
@@ -71,19 +73,19 @@ func forbidMutations(t *testing.T, input *workload.ReconcileInput) {
 
 // planSnapshot builds a snapshot over pre-bucketed pods (both read
 // sources) so Plan needs no client.
-func planSnapshot(input workload.ReconcileInput, byIdx map[int32][]*corev1.Pod) *workload.ObservedSnapshot {
+func planSnapshot(input types.ReconcileInput, byIdx map[int32][]*corev1.Pod) *workload.ObservedSnapshot {
 	return workload.SnapshotWithPodsForTest(input, byIdx)
 }
 
 // planOrFail runs Plan (nil target) and fails the test on error.
-func planOrFail(t *testing.T, input workload.ReconcileInput, plan workload.ComponentPlan, snapshot *workload.ObservedSnapshot) workload.Decision {
+func planOrFail(t *testing.T, input types.ReconcileInput, plan types.ComponentPlan, snapshot *workload.ObservedSnapshot) workload.Decision {
 	t.Helper()
 	return planTargetOrFail(t, input, plan, nil, snapshot)
 }
 
 // planTargetOrFail runs Plan against a target ControllerRevision and
 // fails the test on error.
-func planTargetOrFail(t *testing.T, input workload.ReconcileInput, plan workload.ComponentPlan, target *appsv1.ControllerRevision, snapshot *workload.ObservedSnapshot) workload.Decision {
+func planTargetOrFail(t *testing.T, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, snapshot *workload.ObservedSnapshot) workload.Decision {
 	t.Helper()
 	d, err := workload.Plan(context.Background(), input, plan, target, snapshot)
 	if err != nil {
@@ -130,9 +132,9 @@ func findAction(d workload.Decision, kind workload.ActionKind) *workload.Planned
 func TestPlan_ScaleDown_SelectsExtras(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Phase: workload.InstancePhaseReady},
-		{Index: 1, Phase: workload.InstancePhaseReady}, // extra
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Phase: types.InstancePhaseReady},
+		{Index: 1, Phase: types.InstancePhaseReady}, // extra
 	}
 	plan := minimalPlan() // covers only index 0
 
@@ -157,9 +159,9 @@ func TestPlan_DeleteOwnedDesiredIndexFinishesBeforeRecreate(t *testing.T) {
 	input := minimalInput(t)
 	forbidMutations(t, &input)
 	plan := minimalPlan()
-	input.ObservedState.InstanceStatuses = []workload.InstanceStatus{{
-		Index: 0, Incarnation: 3, Phase: workload.InstancePhaseDeleting,
-		Operation: &workload.InstanceOperation{ID: "delete-0", Type: workload.InstanceOperationDelete, Step: "Drain"},
+	input.ObservedState.InstanceStatuses = []types.InstanceStatus{{
+		Index: 0, Incarnation: 3, Phase: types.InstancePhaseDeleting,
+		Operation: &types.InstanceOperation{ID: "delete-0", Type: types.InstanceOperationDelete, Step: "Drain"},
 	}}
 	decision := planOrFail(t, input, plan, planSnapshot(input, nil))
 	if len(decision.Actions) == 0 || decision.Actions[0].Kind != workload.ActionScaleDown {
@@ -177,17 +179,17 @@ func TestPlan_DeleteOwnedDesiredIndexFinishesBeforeRecreate(t *testing.T) {
 func TestPlan_Restart_SelectsTriggeredInstances(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady},
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady},
 	}
-	plan := workload.ComponentPlan{
-		Component:     workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component:     types.ComponentEngine,
 		Replicas:      2,
-		RestartPolicy: workload.RestartPolicyRecreateInstance,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		RestartPolicy: types.RestartPolicyRecreateInstance,
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 	// Index 0 has its pod; index 1 lost its pod (restart trigger).
@@ -221,12 +223,12 @@ func TestPlan_Restart_SelectsTriggeredInstances(t *testing.T) {
 func TestPlan_ScaleDownPrecedesRestart(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady}, // pod lost → restart
-		{Index: 5, Incarnation: 1, Phase: workload.InstancePhaseReady}, // extra → scale-down
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady}, // pod lost → restart
+		{Index: 5, Incarnation: 1, Phase: types.InstancePhaseReady}, // extra → scale-down
 	}
 	plan := minimalPlan()
-	plan.RestartPolicy = workload.RestartPolicyRecreateInstance
+	plan.RestartPolicy = types.RestartPolicyRecreateInstance
 
 	d := planOrFail(t, in, plan, planSnapshot(in, nil))
 	want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionRestart, workload.ActionCreate}
@@ -247,23 +249,23 @@ func TestPlan_FullPrecedenceOrder(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
 	in.Clock = clocktesting.NewFakeClock(now)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
 		// Pod lost → restart trigger; prior revision → update trigger.
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 		// Extra → scale-down.
-		{Index: 9, Incarnation: 1, Phase: workload.InstancePhaseReady},
+		{Index: 9, Incarnation: 1, Phase: types.InstancePhaseReady},
 	}
-	in.ObservedState.Migrations = []workload.MigrationRecord{
-		{RequestUUID: "u-expired", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+	in.ObservedState.Migrations = []types.MigrationRecord{
+		{RequestUUID: "u-expired", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 			Deadline: metav1.NewTime(now.Add(-time.Minute))},
-		{RequestUUID: "u-drive", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+		{RequestUUID: "u-drive", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 			StartedAt: metav1.NewTime(now.Add(-time.Hour))},
 	}
 	plan := minimalPlan()
-	plan.RestartPolicy = workload.RestartPolicyRecreateInstance
-	plan.MigrationMode = workload.MigrationModeAuto
+	plan.RestartPolicy = types.RestartPolicyRecreateInstance
+	plan.MigrationMode = types.MigrationModeAuto
 
 	d := planTargetOrFail(t, in, plan, target, planSnapshot(in, nil))
 	want := []workload.ActionKind{
@@ -312,16 +314,16 @@ func TestPlan_MigrateExpiry_SelectedFromDeadline(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
 	in.Clock = clocktesting.NewFakeClock(now)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Phase: workload.InstancePhaseReady},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Phase: types.InstancePhaseReady},
 	}
-	in.ObservedState.Migrations = []workload.MigrationRecord{{
-		RequestUUID: "u-expired", Trigger: workload.MigrationTriggerManual,
-		Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+	in.ObservedState.Migrations = []types.MigrationRecord{{
+		RequestUUID: "u-expired", Trigger: types.MigrationTriggerManual,
+		Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 		Deadline: metav1.NewTime(now.Add(-time.Minute)),
 	}}
 	plan := minimalPlan()
-	plan.MigrationMode = workload.MigrationModeNever
+	plan.MigrationMode = types.MigrationModeNever
 
 	d := planOrFail(t, in, plan, planSnapshot(in, nil))
 	if findAction(d, workload.ActionMigrateExpiry) == nil {
@@ -347,25 +349,25 @@ func TestPlan_Migrate_SelectsOldestManualRecord(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
 	in.Clock = clocktesting.NewFakeClock(now)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Phase: workload.InstancePhaseReady},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Phase: types.InstancePhaseReady},
 	}
-	in.ObservedState.Migrations = []workload.MigrationRecord{
-		{RequestUUID: "u-done", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseCompleted, SourceInstance: 0},
-		{RequestUUID: "u-auto", Trigger: workload.MigrationTriggerAuto,
-			Phase: workload.MigrationPhaseRelocated, SourceInstance: 0},
-		{RequestUUID: "u-newer", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+	in.ObservedState.Migrations = []types.MigrationRecord{
+		{RequestUUID: "u-done", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseCompleted, SourceInstance: 0},
+		{RequestUUID: "u-auto", Trigger: types.MigrationTriggerAuto,
+			Phase: types.MigrationPhaseRelocated, SourceInstance: 0},
+		{RequestUUID: "u-newer", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 			StartedAt: metav1.NewTime(now.Add(-time.Minute)),
 			// Expired: also plans the expiry action ahead of the drive.
 			Deadline: metav1.NewTime(now.Add(-time.Second))},
-		{RequestUUID: "u-older", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseSurgePending, SourceInstance: 0,
+		{RequestUUID: "u-older", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseSurgePending, SourceInstance: 0,
 			StartedAt: metav1.NewTime(now.Add(-time.Hour))},
 	}
 	plan := minimalPlan()
-	plan.MigrationMode = workload.MigrationModeAuto
+	plan.MigrationMode = types.MigrationModeAuto
 
 	d := planOrFail(t, in, plan, planSnapshot(in, nil))
 	kinds := actionKinds(d)
@@ -405,36 +407,36 @@ func TestPlan_MigrationSurgeWaitsForUpdateSurge(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			input := minimalInput(t)
 			forbidMutations(t, &input)
-			statuses := []workload.InstanceStatus{
-				{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-				{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-				{Index: 2, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+			statuses := []types.InstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+				{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+				{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 			}
 			if test.updateStep != "" {
-				statuses[0].Phase = workload.InstancePhaseUpdating
-				statuses[0].Operation = &workload.InstanceOperation{
-					Type: workload.InstanceOperationUpdate,
+				statuses[0].Phase = types.InstancePhaseUpdating
+				statuses[0].Operation = &types.InstanceOperation{
+					Type: types.InstanceOperationUpdate,
 					Step: test.updateStep,
 				}
 			}
 			input.ObservedState.InstanceStatuses = statuses
-			phase := workload.MigrationPhaseAccepted
+			phase := types.MigrationPhaseAccepted
 			if test.surgeInstance != nil && *test.surgeInstance >= 0 {
-				phase = workload.MigrationPhaseSurgePending
+				phase = types.MigrationPhaseSurgePending
 			}
-			input.ObservedState.Migrations = []workload.MigrationRecord{{
+			input.ObservedState.Migrations = []types.MigrationRecord{{
 				RequestUUID:    "migration-during-update",
-				Trigger:        workload.MigrationTriggerManual,
+				Trigger:        types.MigrationTriggerManual,
 				Phase:          phase,
 				SourceInstance: 2,
 				SurgeInstance:  test.surgeInstance,
 			}}
-			plan := workload.ComponentPlan{
-				Component:      workload.ComponentEngine,
+			plan := types.ComponentPlan{
+				Component:      types.ComponentEngine,
 				Replicas:       3,
-				MigrationMode:  workload.MigrationModeAuto,
-				UpdateStrategy: workload.UpdateStrategy{Type: workload.UpdateStrategySurgeThenDrain},
-				Instances: []workload.InstancePlan{
+				MigrationMode:  types.MigrationModeAuto,
+				UpdateStrategy: types.UpdateStrategy{Type: types.UpdateStrategySurgeThenDrain},
+				Instances: []types.InstancePlan{
 					{Index: 0, Incarnation: 1},
 					{Index: 1, Incarnation: 1},
 					{Index: 2, Incarnation: 1},
@@ -462,13 +464,13 @@ func updateTarget() *appsv1.ControllerRevision {
 
 func TestPlan_RemovableInlineFieldsDoNotChangeDecision(t *testing.T) {
 	target := updateTarget()
-	plan := workload.ComponentPlan{
-		Component:     workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component:     types.ComponentEngine,
 		Replicas:      1,
-		RestartPolicy: workload.RestartPolicyRecreateInstance,
-		Instances: []workload.InstancePlan{{
+		RestartPolicy: types.RestartPolicyRecreateInstance,
+		Instances: []types.InstancePlan{{
 			Index: 0, Incarnation: 1,
-			Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}},
+			Runners: []types.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}},
 		}},
 	}
 	podA := enginePod("llama-70b", "prod", 0)
@@ -481,13 +483,13 @@ func TestPlan_RemovableInlineFieldsDoNotChangeDecision(t *testing.T) {
 	tests := []struct {
 		name         string
 		live         map[int32][]*corev1.Pod
-		inlineFields workload.InstanceStatus
+		inlineFields types.InstanceStatus
 		wantActions  []workload.ActionKind
 	}{
 		{
 			name: "persisted observation leads partial live gang",
 			live: map[int32][]*corev1.Pod{0: {podA}},
-			inlineFields: workload.InstanceStatus{
+			inlineFields: types.InstanceStatus{
 				ReadyPodCount: 2, ScheduledPodCount: 2, NodesOccupied: []string{"node-a", "node-b"},
 			},
 			wantActions: []workload.ActionKind{workload.ActionRestart, workload.ActionUpdate, workload.ActionCreate},
@@ -495,7 +497,7 @@ func TestPlan_RemovableInlineFieldsDoNotChangeDecision(t *testing.T) {
 		{
 			name: "persisted observation trails complete live gang",
 			live: map[int32][]*corev1.Pod{0: {podA, podB}},
-			inlineFields: workload.InstanceStatus{
+			inlineFields: types.InstanceStatus{
 				ReadyPodCount: 1, ScheduledPodCount: 1, NodesOccupied: []string{"node-a"},
 			},
 			wantActions: []workload.ActionKind{workload.ActionUpdate, workload.ActionCreate},
@@ -505,8 +507,8 @@ func TestPlan_RemovableInlineFieldsDoNotChangeDecision(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			withoutFields := minimalInput(t)
 			forbidMutations(t, &withoutFields)
-			withoutFields.ObservedState.InstanceStatuses = []workload.InstanceStatus{{
-				Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, PodCount: 2,
+			withoutFields.ObservedState.InstanceStatuses = []types.InstanceStatus{{
+				Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, PodCount: 2,
 			}}
 			withFields := minimalInput(t)
 			forbidMutations(t, &withFields)
@@ -514,7 +516,7 @@ func TestPlan_RemovableInlineFieldsDoNotChangeDecision(t *testing.T) {
 			row.ReadyPodCount = test.inlineFields.ReadyPodCount
 			row.ScheduledPodCount = test.inlineFields.ScheduledPodCount
 			row.NodesOccupied = test.inlineFields.NodesOccupied
-			withFields.ObservedState.InstanceStatuses = []workload.InstanceStatus{row}
+			withFields.ObservedState.InstanceStatuses = []types.InstanceStatus{row}
 
 			withoutDecision := planTargetOrFail(t, withoutFields, plan, target,
 				workload.SnapshotWithDistinctPodsForTest(withoutFields, test.live, cached))
@@ -551,13 +553,13 @@ func TestPlanObservationReadFailureFailsClosed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			input := minimalInput(t)
 			forbidMutations(t, &input)
-			input.ObservedState.InstanceStatuses = []workload.InstanceStatus{{
-				Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-revision",
+			input.ObservedState.InstanceStatuses = []types.InstanceStatus{{
+				Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-revision",
 			}}
 			plan := minimalPlan()
-			deps := workload.Deps{Client: failing, APIReader: healthy}
+			deps := types.Deps{Client: failing, APIReader: healthy}
 			if test.liveFail {
-				plan.RestartPolicy = workload.RestartPolicyRecreateInstance
+				plan.RestartPolicy = types.RestartPolicyRecreateInstance
 				deps.Client, deps.APIReader = healthy, failing
 			}
 			snapshot := workload.NewObservedSnapshot(deps, input, plan.Component, input.ObservedState.InstanceStatuses)
@@ -581,18 +583,18 @@ func TestPlan_Update_SelectsTriggeredInstances(t *testing.T) {
 	target := updateTarget()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseUpdating, RunningRevision: "prior-rev"},
-		{Index: 2, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: target.Name},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseUpdating, RunningRevision: "prior-rev"},
+		{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: target.Name},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  3,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 2, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 2, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 
@@ -609,10 +611,10 @@ func TestPlan_Update_SelectsTriggeredInstances(t *testing.T) {
 	}
 	// Empty strategy Type resolves to the SurgeThenDrain default; nil
 	// RollingUpdate leaves both per-Component budgets uncapped.
-	if ua.Update.Strategy != workload.UpdateStrategySurgeThenDrain {
+	if ua.Update.Strategy != types.UpdateStrategySurgeThenDrain {
 		t.Errorf("strategy = %q, want SurgeThenDrain default", ua.Update.Strategy)
 	}
-	if ua.Update.SurgeBudget != workload.BudgetNoLimit || ua.Update.UnavailBudget != workload.BudgetNoLimit {
+	if ua.Update.SurgeBudget != escalation.BudgetNoLimit || ua.Update.UnavailBudget != escalation.BudgetNoLimit {
 		t.Errorf("budgets = (%d, %d), want BudgetNoLimit for nil RollingUpdate",
 			ua.Update.SurgeBudget, ua.Update.UnavailBudget)
 	}
@@ -633,13 +635,13 @@ func TestPlan_Update_RetryBlockWait(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
 	in.Clock = clocktesting.NewFakeClock(now)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 	}
 	wake := metav1.NewTime(now.Add(30 * time.Second))
-	in.ObservedState.RetryBlocks = []workload.RetryBlock{{
+	in.ObservedState.RetryBlocks = []types.RetryBlock{{
 		TargetRevision: target.Name,
-		State:          workload.RetryBlockBackoff,
+		State:          types.RetryBlockBackoff,
 		NextRetryAt:    &wake,
 	}}
 	plan := minimalPlan()
@@ -661,20 +663,20 @@ func TestPlan_Update_HeldByPartition(t *testing.T) {
 	partition := int32(1)
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  2,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
-		UpdateStrategy: workload.UpdateStrategy{
-			Type:          workload.UpdateStrategySurgeThenDrain,
-			RollingUpdate: &workload.RollingUpdate{Partition: &partition},
+		UpdateStrategy: types.UpdateStrategy{
+			Type:          types.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &types.RollingUpdate{Partition: &partition},
 		},
 	}
 
@@ -693,11 +695,70 @@ func TestPlan_Update_HeldByPartition(t *testing.T) {
 	// next old-revision Instance, preserving the Partition count: index
 	// 1 is held instead, so exactly one Instance stays on the old
 	// revision when the roll settles.
-	in.ObservedState.InstanceStatuses[0].Phase = workload.InstancePhaseUpdating
+	in.ObservedState.InstanceStatuses[0].Phase = types.InstancePhaseUpdating
 	d = planTargetOrFail(t, in, plan, target, planSnapshot(in, nil))
 	ua = findAction(d, workload.ActionUpdate)
 	if ua == nil || len(ua.Update.Items) != 1 || ua.Update.Items[0].Instance.Index != 0 {
 		t.Errorf("mid-surge Instance must stay selected and the hold must fall to index 1; got %+v", ua)
+	}
+}
+
+// TestPlan_Update_PacingPartitionPrecedence asserts where the hold reads
+// its partition: the projected pacing partition (a canary step) holds
+// even when the user's rollingUpdate carries none, an explicit pacing 0
+// releases every Instance over a user partition, and a nil pacing
+// partition defers to the user's rollingUpdate partition.
+func TestPlan_Update_PacingPartitionPrecedence(t *testing.T) {
+	target := updateTarget()
+	part := func(n int32) *int32 { return &n }
+	newPlan := func(ru *types.RollingUpdate) types.ComponentPlan {
+		return types.ComponentPlan{
+			Component: types.ComponentEngine,
+			Replicas:  2,
+			Instances: []types.InstancePlan{
+				{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+				{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			},
+			UpdateStrategy: types.UpdateStrategy{Type: types.UpdateStrategySurgeThenDrain, RollingUpdate: ru},
+		}
+	}
+	cases := []struct {
+		name        string
+		pacing      *types.WorkloadPacing
+		ru          *types.RollingUpdate
+		wantIndices []int32
+	}{
+		{"pacing holds with no user partition", &types.WorkloadPacing{Partition: part(1)}, nil, []int32{1}},
+		{"pacing 0 releases over user partition", &types.WorkloadPacing{Partition: part(0)}, &types.RollingUpdate{Partition: part(1)}, []int32{0, 1}},
+		{"nil pacing defers to user partition", &types.WorkloadPacing{}, &types.RollingUpdate{Partition: part(1)}, []int32{1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := minimalInput(t)
+			forbidMutations(t, &in)
+			in.DesiredSpec.Pacing = tc.pacing
+			in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+				{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+			}
+			d := planTargetOrFail(t, in, newPlan(tc.ru), target, planSnapshot(in, nil))
+			ua := findAction(d, workload.ActionUpdate)
+			if ua == nil {
+				t.Fatalf("expected an Update action, got %v", actionKinds(d))
+			}
+			var got []int32
+			for _, item := range ua.Update.Items {
+				got = append(got, item.Instance.Index)
+			}
+			if len(got) != len(tc.wantIndices) {
+				t.Fatalf("update items = %v, want %v", got, tc.wantIndices)
+			}
+			for i := range got {
+				if got[i] != tc.wantIndices[i] {
+					t.Fatalf("update items = %v, want %v", got, tc.wantIndices)
+				}
+			}
+		})
 	}
 }
 
@@ -713,20 +774,20 @@ func TestPlan_Update_PartitionHoldsCountOnSparseIndices(t *testing.T) {
 	partition := int32(1)
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-		{Index: 2, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  2,
-		Instances: []workload.InstancePlan{
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 2, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 2, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
-		UpdateStrategy: workload.UpdateStrategy{
-			Type:          workload.UpdateStrategySurgeThenDrain,
-			RollingUpdate: &workload.RollingUpdate{Partition: &partition},
+		UpdateStrategy: types.UpdateStrategy{
+			Type:          types.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &types.RollingUpdate{Partition: &partition},
 		},
 	}
 
@@ -762,23 +823,23 @@ func TestPlan_Update_PartitionHoldSurvivesGangSurgeReindex(t *testing.T) {
 	partition := int32(1)
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
 		// The promoted gang-surge replacement: landed at the freed
 		// lowest index, already on the target revision.
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: target.Name},
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: target.Name},
 		// The canary hold: still on the old revision.
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  2,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
-		UpdateStrategy: workload.UpdateStrategy{
-			Type:          workload.UpdateStrategySurgeThenDrain,
-			RollingUpdate: &workload.RollingUpdate{Partition: &partition},
+		UpdateStrategy: types.UpdateStrategy{
+			Type:          types.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &types.RollingUpdate{Partition: &partition},
 		},
 	}
 
@@ -797,18 +858,18 @@ func TestPlan_Update_StartingFresh_FailedByOperationType(t *testing.T) {
 	target := updateTarget()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: "prior-rev",
-			Operation: &workload.InstanceOperation{Type: workload.InstanceOperationRestart, Step: "Drain"}},
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: "prior-rev",
-			Operation: &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: "Drain"}},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationRestart, Step: "Drain"}},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: "Drain"}},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  2,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 
@@ -836,23 +897,23 @@ func TestPlan_Update_CoordGateExempt_FailedZeroServing(t *testing.T) {
 	target := updateTarget()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: "prior-rev",
-			Operation: &workload.InstanceOperation{Type: workload.InstanceOperationRestart, Step: "Drain"}},
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: "prior-rev",
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationRestart, Step: "Drain"}},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
 			PodCount: 1, ServingPodCount: 1},
-		{Index: 2, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev",
+		{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev",
 			PodCount: 1, ServingPodCount: 1},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  3,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 2, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 2, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
-		UpdateStrategy: workload.UpdateStrategy{Type: workload.UpdateStrategyRecreatePod},
+		UpdateStrategy: types.UpdateStrategy{Type: types.UpdateStrategyRecreatePod},
 	}
 
 	d := planTargetOrFail(t, in, plan, target, planSnapshot(in, nil))
@@ -875,25 +936,25 @@ func TestPlan_Update_CoordGateExempt_FailedZeroServing(t *testing.T) {
 	}
 }
 
-// TestPlan_Update_CoordGateExempt_SurgeKeepsConsult asserts the
+// TestPlan_UpdateCoordGateExemptSurgeKeepsConsult asserts the
 // exemption never applies under SurgeThenDrain: the surge-side gates
 // count surge pods, not serving loss, and a Failed Instance's
 // recreate-via-surge genuinely adds one.
-func TestPlan_Update_CoordGateExempt_SurgeKeepsConsult(t *testing.T) {
+func TestPlan_UpdateCoordGateExemptSurgeKeepsConsult(t *testing.T) {
 	target := updateTarget()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: "prior-rev",
-			Operation: &workload.InstanceOperation{Type: workload.InstanceOperationRestart, Step: "Drain"}},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationRestart, Step: "Drain"}},
 	}
-	plan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
 		Replicas:  1,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
-		UpdateStrategy: workload.UpdateStrategy{Type: workload.UpdateStrategySurgeThenDrain},
+		UpdateStrategy: types.UpdateStrategy{Type: types.UpdateStrategySurgeThenDrain},
 	}
 
 	d := planTargetOrFail(t, in, plan, target, planSnapshot(in, nil))
@@ -907,19 +968,20 @@ func TestPlan_Update_CoordGateExempt_SurgeKeepsConsult(t *testing.T) {
 }
 
 // TestPlan_Update_AdoptRevision asserts the empty-RunningRevision
-// adoption selection: runtime-ready pods that already match the target
-// select the backfill stamp as an Item (the write itself belongs to
-// the executor — forbidMutations proves Plan never performs it).
+// adoption selection: runtime-ready pods already carrying the target
+// revision's hash select the backfill stamp as an Item (the write
+// itself belongs to the executor — forbidMutations proves Plan never
+// performs it).
 func TestPlan_Update_AdoptRevision(t *testing.T) {
 	target := updateTarget()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady},
 	}
 	plan := minimalPlan()
 	pod := enginePod("llama-70b", "prod", 0)
-	pod.Spec = *in.DesiredSpec.PodSpec.DeepCopy()
+	pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(target.Name)
 	pod.Status.Conditions = []corev1.PodCondition{{
 		Type: corev1.ContainersReady, Status: corev1.ConditionTrue,
 	}}
@@ -933,12 +995,17 @@ func TestPlan_Update_AdoptRevision(t *testing.T) {
 		t.Errorf("update items = %+v, want a single AdoptRevision item", ua.Update.Items)
 	}
 
-	// Same shape with a NOT-runtime-ready pod: no adoption (Ready is
-	// only stamped on proof), no trigger.
+	// Same shape with a NOT-runtime-ready pod: no adoption (Ready is only
+	// stamped on proof) — the row takes the ordinary roll instead, which
+	// is the recovery its strategy resolves.
 	pod.Status.Conditions = nil
 	d = planTargetOrFail(t, in, plan, target, planSnapshot(in, map[int32][]*corev1.Pod{0: {pod}}))
-	if findAction(d, workload.ActionUpdate) != nil {
-		t.Errorf("unproven pods must not be adopted, got %v", actionKinds(d))
+	ua = findAction(d, workload.ActionUpdate)
+	if ua == nil {
+		t.Fatalf("an unproven pod set must select the ordinary roll, got %v", actionKinds(d))
+	}
+	if len(ua.Update.Items) != 1 || ua.Update.Items[0].AdoptRevision {
+		t.Errorf("update items = %+v, want a single non-adopting item", ua.Update.Items)
 	}
 }
 
@@ -952,8 +1019,8 @@ func TestPlan_Update_CleanupOnly_RollBackWreckage(t *testing.T) {
 	target := updateTarget()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: target.Name},
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: target.Name},
 	}
 	plan := minimalPlan()
 
@@ -983,10 +1050,10 @@ func TestPlan_Update_CleanupOnly_RollBackWreckage(t *testing.T) {
 	// targets a superseded revision is wreckage even with no alien pod
 	// in its own bucket — the abandon continuation must dispatch.
 	k := int32(1)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseFailed, RunningRevision: target.Name,
-			Operation: &workload.InstanceOperation{
-				Type: workload.InstanceOperationUpdate, Step: "Surge", SurgeIndex: &k,
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: target.Name,
+			Operation: &types.InstanceOperation{
+				Type: types.InstanceOperationUpdate, Step: "Surge", SurgeIndex: &k,
 				TargetRevision: "llama-70b-engine-deadrev1",
 			}},
 	}
@@ -1020,20 +1087,20 @@ func TestPlan_LiveSurgeUntouchedByCleanup(t *testing.T) {
 			in := minimalInput(t)
 			forbidMutations(t, &in)
 			k := int32(1)
-			in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-				{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseUpdating,
+			in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: types.InstancePhaseUpdating,
 					RunningRevision: "llama-70b-engine-priorrev",
-					Operation: &workload.InstanceOperation{
-						Type: workload.InstanceOperationUpdate, Step: "Surge",
+					Operation: &types.InstanceOperation{
+						Type: types.InstanceOperationUpdate, Step: "Surge",
 						SurgeIndex: &k, TargetRevision: pinned.Name,
 					}},
-				{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseCreating,
-					Operation: &workload.InstanceOperation{
-						Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepGangSurgeTarget,
+				{Index: 1, Incarnation: 1, Phase: types.InstancePhaseCreating,
+					Operation: &types.InstanceOperation{
+						Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget,
 						TargetRevision: pinned.Name,
 					}},
 			}
-			plan, err := workload.BuildPlan(workload.ComponentEngine, in.DesiredSpec, in.ObservedState)
+			plan, err := workload.BuildPlan(types.ComponentEngine, in.DesiredSpec, in.ObservedState)
 			if err != nil {
 				t.Fatalf("BuildPlan: %v", err)
 			}
@@ -1073,26 +1140,26 @@ func TestPlan_Paused_RepairRunsFleetChangesDoNot(t *testing.T) {
 	// The all-passes fixture: pod-lost + prior-revision Instance
 	// (restart + update triggers), an extra index (scale-down), an
 	// expired and a drivable Manual migration record.
-	build := func(t *testing.T) (workload.ReconcileInput, workload.ComponentPlan) {
+	build := func(t *testing.T) (types.ReconcileInput, types.ComponentPlan) {
 		in := minimalInput(t)
 		forbidMutations(t, &in)
 		in.Clock = clocktesting.NewFakeClock(now)
-		in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-			{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-			{Index: 9, Incarnation: 1, Phase: workload.InstancePhaseReady}, // extra
+		in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+			{Index: 9, Incarnation: 1, Phase: types.InstancePhaseReady}, // extra
 		}
-		in.ObservedState.Migrations = []workload.MigrationRecord{
-			{RequestUUID: "u-expired", Trigger: workload.MigrationTriggerManual,
-				Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+		in.ObservedState.Migrations = []types.MigrationRecord{
+			{RequestUUID: "u-expired", Trigger: types.MigrationTriggerManual,
+				Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 				Deadline: metav1.NewTime(now.Add(-time.Minute))},
-			{RequestUUID: "u-drive", Trigger: workload.MigrationTriggerManual,
-				Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+			{RequestUUID: "u-drive", Trigger: types.MigrationTriggerManual,
+				Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 				StartedAt: metav1.NewTime(now.Add(-time.Hour))},
 		}
 		plan := minimalPlan()
 		plan.Paused = true
-		plan.RestartPolicy = workload.RestartPolicyRecreateInstance
-		plan.MigrationMode = workload.MigrationModeAuto
+		plan.RestartPolicy = types.RestartPolicyRecreateInstance
+		plan.MigrationMode = types.MigrationModeAuto
 		return in, plan
 	}
 
@@ -1160,35 +1227,35 @@ func TestPlan_Paused_RepairRunsFleetChangesDoNot(t *testing.T) {
 // drivable Manual migration record, prior-revision Instances (update),
 // and a covering plan (create closes every non-paused decision). Every
 // mutation callback is wired to the forbidMutations recorder.
-func maximalPlanInput(t *testing.T, now time.Time) (workload.ReconcileInput, workload.ComponentPlan) {
+func maximalPlanInput(t *testing.T, now time.Time) (types.ReconcileInput, types.ComponentPlan) {
 	t.Helper()
 	in := minimalInput(t)
 	forbidMutations(t, &in)
 	in.Clock = clocktesting.NewFakeClock(now)
-	in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
 		// Prior revision → update trigger; index 1 also lost its pod →
 		// restart trigger.
-		{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
-		{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
 		// Extra → scale-down.
-		{Index: 9, Incarnation: 1, Phase: workload.InstancePhaseReady},
+		{Index: 9, Incarnation: 1, Phase: types.InstancePhaseReady},
 	}
-	in.ObservedState.Migrations = []workload.MigrationRecord{
-		{RequestUUID: "u-expired", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+	in.ObservedState.Migrations = []types.MigrationRecord{
+		{RequestUUID: "u-expired", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 			Deadline: metav1.NewTime(now.Add(-time.Minute))},
-		{RequestUUID: "u-drive", Trigger: workload.MigrationTriggerManual,
-			Phase: workload.MigrationPhaseAccepted, SourceInstance: 0,
+		{RequestUUID: "u-drive", Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseAccepted, SourceInstance: 0,
 			StartedAt: metav1.NewTime(now.Add(-time.Hour))},
 	}
-	plan := workload.ComponentPlan{
-		Component:     workload.ComponentEngine,
+	plan := types.ComponentPlan{
+		Component:     types.ComponentEngine,
 		Replicas:      2,
-		RestartPolicy: workload.RestartPolicyRecreateInstance,
-		MigrationMode: workload.MigrationModeAuto,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
-			{Index: 1, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		RestartPolicy: types.RestartPolicyRecreateInstance,
+		MigrationMode: types.MigrationModeAuto,
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 	return in, plan
@@ -1288,7 +1355,7 @@ func TestPlan_MaximalFixture_NoWrites(t *testing.T) {
 		WithObjects(enginePod("llama-70b", "prod", 0)).
 		WithInterceptorFuncs(funcs).
 		Build()
-	deps := workload.Deps{Client: c, APIReader: c}
+	deps := types.Deps{Client: c, APIReader: c}
 	snapshot := workload.NewObservedSnapshot(deps, in, plan.Component, in.ObservedState.InstanceStatuses)
 
 	d, err := workload.Plan(context.Background(), in, plan, target, snapshot)
@@ -1314,11 +1381,11 @@ func TestPlan_MaximalFixture_NoWrites(t *testing.T) {
 // Ready-with-pod-loss), never for Instances with pods or an Operation,
 // and never for scale-down extras.
 func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
-	unbacked := func(t *testing.T) workload.ReconcileInput {
+	unbacked := func(t *testing.T) types.ReconcileInput {
 		in := minimalInput(t)
 		forbidMutations(t, &in)
-		in.ObservedState.InstanceStatuses = []workload.InstanceStatus{
-			{Index: 0, Incarnation: 1, Phase: workload.InstancePhaseReady},
+		in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady},
 		}
 		return in
 	}
@@ -1360,7 +1427,7 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 		in := unbacked(t)
 		plan := minimalPlan()
 		plan.Paused = true
-		plan.RestartPolicy = workload.RestartPolicyRecreateInstance
+		plan.RestartPolicy = types.RestartPolicyRecreateInstance
 		d := planOrFail(t, in, plan, planSnapshot(in, nil))
 		if findAction(d, workload.ActionDemote) != nil {
 			t.Errorf("RecreateInstance must leave Ready-with-pod-loss to the restart pass, got %v", actionKinds(d))
@@ -1383,8 +1450,8 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 
 	t.Run("an in-flight Operation keeps ownership", func(t *testing.T) {
 		in := unbacked(t)
-		in.ObservedState.InstanceStatuses[0].Operation = &workload.InstanceOperation{
-			ID: "u-1", Type: workload.InstanceOperationUpdate, Step: "Surge",
+		in.ObservedState.InstanceStatuses[0].Operation = &types.InstanceOperation{
+			ID: "u-1", Type: types.InstanceOperationUpdate, Step: "Surge",
 		}
 		plan := minimalPlan()
 		plan.Paused = true
@@ -1396,12 +1463,329 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 
 	t.Run("non-Ready phases are never touched", func(t *testing.T) {
 		in := unbacked(t)
-		in.ObservedState.InstanceStatuses[0].Phase = workload.InstancePhasePending
+		in.ObservedState.InstanceStatuses[0].Phase = types.InstancePhasePending
 		plan := minimalPlan()
 		plan.Paused = true
 		d := planOrFail(t, in, plan, planSnapshot(in, nil))
 		if findAction(d, workload.ActionDemote) != nil {
 			t.Errorf("only Ready demotes, got %v", actionKinds(d))
+		}
+	})
+}
+
+func TestPlan_Paused_AdvancesInFlightAttemptsOnly(t *testing.T) {
+	build := func(t *testing.T) (types.ReconcileInput, types.ComponentPlan) {
+		in := minimalInput(t)
+		forbidMutations(t, &in)
+		in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+			// Recreate in flight: the old pods are gone and the new ones
+			// are not created yet.
+			{Index: 0, Incarnation: 2, Phase: types.InstancePhaseUpdating, RunningRevision: "prior-rev",
+				Operation: &types.InstanceOperation{
+					ID: "update-0", Type: types.InstanceOperationUpdate, Step: "Drain",
+					TargetRevision: updateTarget().Name,
+				}},
+			// Off-target but idle: a fresh start.
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+			// Create committed to this target: the set is half materialized.
+			{Index: 2, Incarnation: 1, Phase: types.InstancePhaseCreating,
+				Operation: &types.InstanceOperation{
+					ID: "create-2", Type: types.InstanceOperationCreate, Step: "CreatePods",
+					TargetRevision: updateTarget().Name,
+				}},
+		}
+		plan := minimalPlan()
+		plan.Replicas = 3
+		plan.Instances = append(plan.Instances,
+			types.InstancePlan{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			types.InstancePlan{Index: 2, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+		)
+		return in, plan
+	}
+	// Index 1 is backed, so the truth pass has nothing to correct and the
+	// decision is exactly the lifecycle selection under test.
+	pods := func(in types.ReconcileInput) map[int32][]*corev1.Pod {
+		return map[int32][]*corev1.Pod{1: {enginePod(in.Key.OwnerName, in.Key.Namespace, 1)}}
+	}
+
+	t.Run("paused selects the open attempts only", func(t *testing.T) {
+		in, plan := build(t)
+		plan.Paused = true
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
+		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionUpdate, workload.ActionCreate}) {
+			t.Fatalf("paused decision = %v, want [Update Create]", actionKinds(d))
+		}
+		ua := findAction(d, workload.ActionUpdate)
+		if len(ua.Update.Items) != 1 || ua.Update.Items[0].Instance.Index != 0 {
+			t.Errorf("update selection = %+v, want the in-flight index 0 only", ua.Update.Items)
+		}
+		if ua.Update.Items[0].StartingFresh {
+			t.Errorf("a paused selection must never start fresh: %+v", ua.Update.Items[0])
+		}
+		if d.Escalate {
+			t.Errorf("paused decision must suspend escalation")
+		}
+	})
+
+	t.Run("no committed create means no Create pass", func(t *testing.T) {
+		in, plan := build(t)
+		plan.Paused = true
+		in.ObservedState.InstanceStatuses = in.ObservedState.InstanceStatuses[:2]
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
+		if findAction(d, workload.ActionCreate) != nil {
+			t.Errorf("paused decision with nothing committed must not plan Create, got %v", actionKinds(d))
+		}
+	})
+
+	t.Run("unpause restores the fresh start", func(t *testing.T) {
+		in, plan := build(t)
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
+		ua := findAction(d, workload.ActionUpdate)
+		if ua == nil || len(ua.Update.Items) != 2 {
+			t.Fatalf("unpaused update selection = %+v, want both indices", ua)
+		}
+		if !ua.Update.Items[1].StartingFresh {
+			t.Errorf("index 1 = %+v, want a fresh start once the pause is cleared", ua.Update.Items[1])
+		}
+	})
+}
+
+// TestPlan_Paused_ReDrivesAFailedUpdateContinuation: a paused Component
+// whose only Update row is Failed with the operation preserved — the
+// deadline backstop's stamp on a multi-pod roll — is still selected, and
+// selected as a continuation. The claim decides, not the owner: nobody
+// may advance a Failed row, but the operation it carries is an Update
+// half-done, and a pause parks new work rather than leaving a roll
+// wedged until the unpause.
+func TestPlan_Paused_ReDrivesAFailedUpdateContinuation(t *testing.T) {
+	in := minimalInput(t)
+	forbidMutations(t, &in)
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 2, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{
+				ID: "update-0", Type: types.InstanceOperationUpdate, Step: "Drain",
+				TargetRevision: updateTarget().Name,
+			}},
+	}
+	plan := minimalPlan()
+	plan.Paused = true
+	d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
+	ua := findAction(d, workload.ActionUpdate)
+	if ua == nil || len(ua.Update.Items) != 1 || ua.Update.Items[0].Instance.Index != 0 {
+		t.Fatalf("paused decision = %v, want the Failed row's Update continuation selected", actionKinds(d))
+	}
+	if ua.Update.Items[0].StartingFresh {
+		t.Errorf("a Failed row with a preserved Update is a continuation, got %+v", ua.Update.Items[0])
+	}
+}
+
+// TestPlan_PauseFreeze_AdvancesOpenRepairOnly: a frozen pause suspends
+// the repair pass — a fresh pod-loss trigger is not selected — but a
+// repair already under way is still driven, so the pods it deleted are
+// recreated instead of staying missing for the length of the hold. A
+// standard pause keeps starting repairs.
+func TestPlan_PauseFreeze_AdvancesOpenRepairOnly(t *testing.T) {
+	build := func(t *testing.T) (types.ReconcileInput, types.ComponentPlan) {
+		in := minimalInput(t)
+		forbidMutations(t, &in)
+		in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+			{Index: 0, Incarnation: 2, Phase: types.InstancePhaseRestarting,
+				Operation: &types.InstanceOperation{
+					ID: "restart-0", Type: types.InstanceOperationRestart, Step: "Drain",
+				}},
+			// Ready with no pods: a fresh pod-loss repair trigger.
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady},
+		}
+		plan := minimalPlan()
+		plan.Replicas = 2
+		plan.RestartPolicy = types.RestartPolicyRecreateInstance
+		plan.Paused = true
+		plan.Instances = append(plan.Instances,
+			types.InstancePlan{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+		)
+		return in, plan
+	}
+
+	t.Run("frozen pause drives the open repair only", func(t *testing.T) {
+		in, plan := build(t)
+		plan.PauseFreeze = true
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
+		ra := findAction(d, workload.ActionRestart)
+		if ra == nil || len(ra.Restarts) != 1 || ra.Restarts[0].Instance.Index != 0 {
+			t.Fatalf("frozen restart selection = %+v, want the open repair on index 0 only", ra)
+		}
+	})
+
+	t.Run("frozen pause with nothing open plans no repair", func(t *testing.T) {
+		in, plan := build(t)
+		plan.PauseFreeze = true
+		in.ObservedState.InstanceStatuses = in.ObservedState.InstanceStatuses[1:]
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
+		if findAction(d, workload.ActionRestart) != nil {
+			t.Errorf("frozen decision must not start a repair, got %v", actionKinds(d))
+		}
+	})
+
+	t.Run("standard pause keeps repairing", func(t *testing.T) {
+		in, plan := build(t)
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
+		ra := findAction(d, workload.ActionRestart)
+		if ra == nil || len(ra.Restarts) != 2 {
+			t.Fatalf("paused restart selection = %+v, want both the open repair and the fresh one", ra)
+		}
+	})
+}
+
+// TestPlan_PauseFreeze_AdvancesTheOpenRollOnly: a freeze suspends repair
+// on top of what a standard pause withholds, but neither withholds a
+// step already under way. A recreate mid-gap and an in-place patch
+// mid-flight are both still selected as continuations — never as fresh
+// starts — and clearing the pause adds the fresh start back without
+// disturbing either of them.
+func TestPlan_PauseFreeze_AdvancesTheOpenRollOnly(t *testing.T) {
+	build := func(t *testing.T) (types.ReconcileInput, types.ComponentPlan) {
+		t.Helper()
+		now := time.Now()
+		in := minimalInput(t)
+		forbidMutations(t, &in)
+		in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+			rollInFlight(0, "Drain", 2, now.Add(30*time.Minute)),
+			rollInFlight(1, "InPlace", 1, now.Add(30*time.Minute)),
+			// Off-target with no attempt open: the fresh start a pause
+			// of either kind withholds.
+			{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+		}
+		plan := minimalPlan()
+		plan.Replicas = 3
+		plan.Instances = append(plan.Instances,
+			types.InstancePlan{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			types.InstancePlan{Index: 2, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+		)
+		return in, plan
+	}
+	// Index 2 is backed, so the truth pass has nothing to correct and the
+	// decision is exactly the lifecycle selection under test.
+	pods := func(in types.ReconcileInput) map[int32][]*corev1.Pod {
+		return map[int32][]*corev1.Pod{2: {enginePod(in.Key.OwnerName, in.Key.Namespace, 2)}}
+	}
+
+	openIndices := func(t *testing.T, d workload.Decision) []int32 {
+		t.Helper()
+		ua := findAction(d, workload.ActionUpdate)
+		if ua == nil {
+			t.Fatalf("no Update action selected; got %v", actionKinds(d))
+		}
+		var out []int32
+		for _, item := range ua.Update.Items {
+			out = append(out, item.Instance.Index)
+		}
+		return out
+	}
+
+	t.Run("frozen pause drives both open rolls and starts nothing", func(t *testing.T) {
+		in, plan := build(t)
+		plan.Paused, plan.PauseFreeze = true, true
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
+		got := openIndices(t, d)
+		if len(got) != 2 || got[0] != 0 || got[1] != 1 {
+			t.Fatalf("frozen update selection = %v, want the two open rolls [0 1]", got)
+		}
+		for _, item := range findAction(d, workload.ActionUpdate).Update.Items {
+			if item.StartingFresh {
+				t.Errorf("index %d = %+v, want a continuation under a freeze", item.Instance.Index, item)
+			}
+		}
+		if d.Escalate {
+			t.Errorf("a frozen decision must suspend escalation")
+		}
+	})
+
+	t.Run("unpause adds the fresh start and leaves the open rolls alone", func(t *testing.T) {
+		in, plan := build(t)
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
+		got := openIndices(t, d)
+		if len(got) != 3 {
+			t.Fatalf("unpaused update selection = %v, want all three indices", got)
+		}
+		for _, item := range findAction(d, workload.ActionUpdate).Update.Items {
+			fresh := item.Instance.Index == 2
+			if item.StartingFresh != fresh {
+				t.Errorf("index %d StartingFresh = %v, want %v (the unpause restamps no open roll)",
+					item.Instance.Index, item.StartingFresh, fresh)
+			}
+		}
+	})
+}
+
+// TestPlan_PauseFreeze_AdvancesTheOpenDrain: a drain step is past the
+// point where a hold is free — the source is already out of rotation and
+// the replacement is the Instance's only capacity — so neither a standard
+// pause nor a freeze withholds it. It is selected as a continuation, and
+// clearing the pause adds back the fresh start it was withholding without
+// disturbing the drain.
+func TestPlan_PauseFreeze_AdvancesTheOpenDrain(t *testing.T) {
+	build := func(t *testing.T) (types.ReconcileInput, types.ComponentPlan) {
+		t.Helper()
+		now := time.Now()
+		in := minimalInput(t)
+		forbidMutations(t, &in)
+		in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+			rollInFlight(0, types.UpdateStepSurgeDrain, 1, now.Add(30*time.Minute)),
+			// Off-target with no attempt open: the fresh start a pause of
+			// either kind withholds.
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"},
+		}
+		plan := minimalPlan()
+		plan.Replicas = 2
+		plan.Instances = append(plan.Instances,
+			types.InstancePlan{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}})
+		return in, plan
+	}
+	pods := func(in types.ReconcileInput) map[int32][]*corev1.Pod {
+		return map[int32][]*corev1.Pod{1: {enginePod(in.Key.OwnerName, in.Key.Namespace, 1)}}
+	}
+	openIndices := func(t *testing.T, d workload.Decision) []int32 {
+		t.Helper()
+		ua := findAction(d, workload.ActionUpdate)
+		if ua == nil {
+			t.Fatalf("no Update action selected; got %v", actionKinds(d))
+		}
+		var out []int32
+		for _, item := range ua.Update.Items {
+			out = append(out, item.Instance.Index)
+		}
+		return out
+	}
+
+	t.Run("frozen pause drives the open drain and starts nothing", func(t *testing.T) {
+		in, plan := build(t)
+		plan.Paused, plan.PauseFreeze = true, true
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
+		got := openIndices(t, d)
+		if len(got) != 1 || got[0] != 0 {
+			t.Fatalf("frozen update selection = %v, want the open drain [0]", got)
+		}
+		if findAction(d, workload.ActionUpdate).Update.Items[0].StartingFresh {
+			t.Errorf("the open drain was restamped as a fresh attempt under a freeze")
+		}
+		if d.Escalate {
+			t.Errorf("a frozen decision must suspend escalation")
+		}
+	})
+
+	t.Run("unpause adds the fresh start and leaves the drain alone", func(t *testing.T) {
+		in, plan := build(t)
+		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
+		got := openIndices(t, d)
+		if len(got) != 2 {
+			t.Fatalf("unpaused update selection = %v, want both indices", got)
+		}
+		for _, item := range findAction(d, workload.ActionUpdate).Update.Items {
+			fresh := item.Instance.Index == 1
+			if item.StartingFresh != fresh {
+				t.Errorf("index %d StartingFresh = %v, want %v (the unpause restamps no open roll)",
+					item.Instance.Index, item.StartingFresh, fresh)
+			}
 		}
 	})
 }

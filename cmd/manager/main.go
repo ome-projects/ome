@@ -756,23 +756,19 @@ func main() {
 			Handler: &rolloutpolicywebhook.Validator{Client: mgr.GetClient(), Decoder: admission.NewDecoder(mgr.GetScheme()), MaxPlanBytes: rolloutMaxPlanBytes},
 		})
 
-		// The InferenceService defaulter/validator runtime-selects
-		// against the LOCAL cluster's runtime/model catalog. On the control
-		// plane that catalog is empty (runtimes/models live on the workload
-		// clusters), so running this webhook here would reject or mis-default
-		// every user-authored ISVC. The placement controller derives and fans
-		// the ISVC out to workload clusters, where their own webhook validates
-		// it against the real catalog. Skip the ISVC webhook on the control plane.
+		// The InferenceService validator runtime-selects against the LOCAL
+		// cluster's runtime/model catalog. On the control plane that catalog
+		// is empty (runtimes/models live on the workload clusters), so running
+		// this webhook here would reject every user-authored ISVC. The
+		// placement controller derives and fans the ISVC out to workload
+		// clusters, where their own webhook validates it against the real
+		// catalog. Skip the ISVC webhook on the control plane.
 		if isControlPlane {
-			setupLog.Info("control-plane role: InferenceService defaulter/validator webhook disabled (runtime selection runs on workload clusters)")
+			setupLog.Info("control-plane role: InferenceService validator webhook disabled (runtime selection runs on workload clusters)")
 		} else {
 			runtimeSelector := runtimeselector.New(mgr.GetClient())
 
 			if err = ctrl.NewWebhookManagedBy(mgr, &v1beta1.InferenceService{}).
-				WithDefaulter(&isvc.InferenceServiceDefaulter{
-					Client:    mgr.GetClient(),
-					ClientSet: clientSet,
-				}).
 				WithValidator(&isvc.InferenceServiceValidator{
 					Client:          mgr.GetClient(),
 					RuntimeSelector: runtimeSelector,

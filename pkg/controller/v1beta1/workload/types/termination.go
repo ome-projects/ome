@@ -7,6 +7,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// DrainOverdueReason is the LastFailure.Reason that records an
+// announced overdue drain. It is not a failure: the row keeps draining
+// and keeps its phase, and the record exists so the announcement is
+// made exactly once per episode and so readers of the status can see
+// which Instances are past their drain deadline. Time carries the
+// elapsed deadline, which both keys the episode and keeps the record
+// byte-stable across reconciles.
+const DrainOverdueReason = "DrainOverdue"
+
 // PodTermination extracts the most operator-relevant container failure
 // diagnostics from pod into an *InstanceTermination. Returns nil only when
 // pod is nil.
@@ -61,7 +70,7 @@ func PodTermination(pod *corev1.Pod, now metav1.Time) *InstanceTermination {
 	// the prior crash in LastTerminationState — prefer that over `now` so
 	// the record is stable across observations.
 	for _, cs := range allStatuses {
-		if cs.State.Waiting != nil && isTerminalWaitingReason(cs.State.Waiting.Reason) {
+		if cs.State.Waiting != nil && IsTerminalWaitingReason(cs.State.Waiting.Reason) {
 			return &InstanceTermination{
 				PodName:       pod.Name,
 				ContainerName: cs.Name,
@@ -165,24 +174,6 @@ func finishedAtOr(t *corev1.ContainerStateTerminated, fallback metav1.Time) meta
 // container has one from the crash that put it there.
 func lastTerminationTimeOr(cs corev1.ContainerStatus, fallback metav1.Time) metav1.Time {
 	return finishedAtOr(cs.LastTerminationState.Terminated, fallback)
-}
-
-// isTerminalWaitingReason mirrors the workload escalator's
-// terminalPullFailureReasons set. Duplicated here (rather than imported
-// from the root workload package) to keep workload/types free of an import
-// edge back to its parent — the set is small and changes rarely.
-func isTerminalWaitingReason(reason string) bool {
-	switch reason {
-	case "ErrImagePull",
-		"ImagePullBackOff",
-		"InvalidImageName",
-		"CreateContainerConfigError",
-		"CreateContainerError",
-		"CrashLoopBackOff",
-		"RunContainerError":
-		return true
-	}
-	return false
 }
 
 // ShortString renders an InstanceTermination as a compact, grep-friendly

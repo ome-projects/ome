@@ -231,7 +231,7 @@ const spreadPolicyRequired = "Required"
 // policy shapes future placements (creates, repairs, migrations, rollouts)
 // without rolling a healthy fleet.
 func injectTopologySpread(pod *corev1.Pod, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, isvcName string) {
-	if plan.TopologySpread == "" || runner.Name == "worker" {
+	if plan.TopologySpread == "" || runner.Name == workload.RunnerWorker {
 		return
 	}
 	key := plan.TopologySpreadKey
@@ -592,7 +592,7 @@ func instancePodRank(inst workload.InstancePlan, runner workload.RunnerPlan, ord
 // needing to discover the cluster's actual DNS domain.
 func leaderAddressForInstance(isvcName string, component workload.ComponentType, inst workload.InstancePlan) string {
 	for _, r := range inst.Runners {
-		if r.Name == "leader" {
+		if r.Name == workload.RunnerLeader {
 			return fmt.Sprintf("%s.%s",
 				query.PodName(isvcName, component, inst.Index, "leader", 0),
 				query.HeadlessServiceName(isvcName, component),
@@ -681,7 +681,7 @@ func buildInstancePeerHostnames(isvcName string, component workload.ComponentTyp
 func injectGangDomainAffinity(pod *corev1.Pod, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, isvcName string) {
 	// Only multi-node gang workers need this. Leader / single-pod get
 	// nothing (the leader is the domain anchor; single-pod runs on one host).
-	if runner.Name != "worker" || !instanceHasLeader(inst) {
+	if runner.Name != workload.RunnerWorker || !instanceHasLeader(inst) {
 		return
 	}
 
@@ -729,7 +729,7 @@ func injectGangDomainAffinity(pod *corev1.Pod, plan workload.ComponentPlan, inst
 // "leader" Runner. Single-pod Instances have one "default" Runner and no leader.
 func instanceHasLeader(inst workload.InstancePlan) bool {
 	for _, r := range inst.Runners {
-		if r.Name == "leader" {
+		if r.Name == workload.RunnerLeader {
 			return true
 		}
 	}

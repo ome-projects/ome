@@ -42,17 +42,18 @@ type PlacementSpec struct {
 
 	// Requirements is the intrinsic capability selector a candidate workload
 	// cluster MUST satisfy, expressed as a Kubernetes label-selector string
-	// matched against WorkloadCluster labels (e.g. "accelerator in (gb300,
-	// tpu7x)"). It is the structured equivalent of the
-	// ome.io/accelerator-requirements annotation. Empty means no intrinsic
-	// requirement.
+	// matched against WorkloadCluster labels plus the virtual, immutable
+	// metadata.name key (e.g. "accelerator in (gb300, tpu7x)"). It is the
+	// structured equivalent of the ome.io/accelerator-requirements annotation.
+	// Empty means no intrinsic requirement.
 	// +optional
 	Requirements string `json:"requirements,omitempty"`
 
 	// ClusterSelector is an optional operator-imposed routing overlay
 	// (label-selector string) AND-ed onto Requirements to further narrow
-	// candidates (e.g. "provider=cloud-a"). Structured equivalent of the
-	// ome.io/cluster-selector annotation.
+	// candidates. It can select WorkloadCluster labels (e.g. "provider=cloud-a")
+	// or immutable object names (e.g. "metadata.name in (cluster-a,cluster-c)").
+	// Structured equivalent of the ome.io/cluster-selector annotation.
 	// +optional
 	ClusterSelector string `json:"clusterSelector,omitempty"`
 
@@ -71,6 +72,8 @@ type PlacementSpec struct {
 	// absent from the map (or the whole field unset) uses the identity factor 1.
 	// This is a routing weight only — it does not influence placement or how many
 	// replicas a cluster admits.
+	//
+	// Deprecated: use spec.routing.capacityFactors.
 	// +optional
 	CapacityFactors map[string]resource.Quantity `json:"capacityFactors,omitempty"`
 }

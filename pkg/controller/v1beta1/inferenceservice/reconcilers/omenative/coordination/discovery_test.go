@@ -132,3 +132,21 @@ func envValue(env []corev1.EnvVar, name string) string {
 	}
 	return ""
 }
+
+func TestPeerEnvDeclared(t *testing.T) {
+	if PeerEnvDeclared(nil) {
+		t.Error("nil ISVC must not declare peer env")
+	}
+	bare := &v1beta1.InferenceService{}
+	if PeerEnvDeclared(bare) {
+		t.Error("ISVC without rollout groups must not declare peer env")
+	}
+	grouped := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+		Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		}}},
+	}}
+	if !PeerEnvDeclared(grouped) {
+		t.Error("ISVC with a rollout group must declare peer env")
+	}
+}

@@ -5,20 +5,23 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -225,9 +228,10 @@ func TestUpdate_InPlace_RestampsRevisionHashLabel(t *testing.T) {
 
 // TestUpdate_InPlaceConverges_MarksReadyWithRunningRevision pins the
 // in-place terminator: when the pod is already on the target image,
-// runtime-ready, and NOT yet serving (because a previous pass drained
-// it), Update flips serving=True and stamps Phase=Ready with the new
-// RunningRevision.
+// runtime-ready, and NOT yet serving (because a previous pass drained it),
+// Update flips serving=True and then holds at the promote bar until kubelet
+// folds that gate into PodReady; the pass that observes PodReady stamps
+// Phase=Ready with the new RunningRevision.
 func TestUpdate_InPlaceConverges_MarksReadyWithRunningRevision(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
@@ -236,7 +240,7 @@ func TestUpdate_InPlaceConverges_MarksReadyWithRunningRevision(t *testing.T) {
 		Incarnation: 1,
 		Phase:       v1beta1.OMENativeInstanceUpdating,
 		Operation: &v1beta1.InstanceOperation{
-			Type: v1beta1.InstanceOperationUpdate, Step: updateStepInPlace,
+			Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepInPlace,
 		},
 	}
 	isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
@@ -267,14 +271,24 @@ func TestUpdate_InPlaceConverges_MarksReadyWithRunningRevision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if !done {
-		t.Fatalf("expected done=true: pod is ready on target image")
+	if done {
+		t.Fatalf("expected done=false: the gate was only just written, so the pod is not PodReady yet")
 	}
 
 	got := &corev1.Pod{}
 	_ = c.Get(context.Background(), client.ObjectKeyFromObject(pod), got)
 	if !podreadiness.IsServing(got) {
 		t.Errorf("serving should have been flipped True after in-place convergence")
+	}
+
+	legacyFoldServingIntoPodReady(t, c, pod, time.Now())
+	input = legacyTestInput(isvc, c, workload.ComponentEngine)
+	done, err = Update(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	if err != nil {
+		t.Fatalf("Update after PodReady: %v", err)
+	}
+	if !done {
+		t.Fatalf("expected done=true: the pod is PodReady on the target image")
 	}
 
 	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
@@ -305,7 +319,7 @@ func TestUpdate_InPlaceWaitsForRuntimeImageRoll(t *testing.T) {
 		Incarnation: 1,
 		Phase:       v1beta1.OMENativeInstanceUpdating,
 		Operation: &v1beta1.InstanceOperation{
-			Type: v1beta1.InstanceOperationUpdate, Step: updateStepInPlace,
+			Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepInPlace,
 		},
 	}
 	isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
@@ -349,85 +363,6 @@ func TestUpdate_InPlaceWaitsForRuntimeImageRoll(t *testing.T) {
 	}
 }
 
-// TestPodImagesMatch_InjectedSidecarIgnored pins the container-subset
-// compare: live containers absent from the target spec (istio/linkerd
-// style injections) are not OMENative-owned and must not block the
-// match — counting them would fail podImagesMatch and podRuntimeImagesMatch
-// forever, livelocking the in-place update with the pod held drained.
-// A TARGET container missing from the pod still fails both.
-func TestPodImagesMatch_InjectedSidecarIgnored(t *testing.T) {
-	target := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "llama:v2"}}}
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{Containers: []corev1.Container{
-			{Name: "main", Image: "llama:v2"},
-			{Name: "istio-proxy", Image: "istio/proxyv2:1.20"},
-		}},
-		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
-			{Name: "main", Image: "llama:v2"},
-			{Name: "istio-proxy", Image: "istio/proxyv2:1.20"},
-		}},
-	}
-	if !podImagesMatch(pod, target) {
-		t.Errorf("podImagesMatch: injected sidecar must be ignored")
-	}
-	if !podRuntimeImagesMatch(pod, target) {
-		t.Errorf("podRuntimeImagesMatch: injected sidecar status must be ignored")
-	}
-	stale := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "llama:v3"}}}
-	if podImagesMatch(pod, stale) {
-		t.Errorf("podImagesMatch: diverged target image must still mismatch")
-	}
-	foreign := &corev1.PodSpec{Containers: []corev1.Container{{Name: "other", Image: "x:v1"}}}
-	if podImagesMatch(pod, foreign) {
-		t.Errorf("podImagesMatch: target container missing from pod must mismatch")
-	}
-	if podRuntimeImagesMatch(pod, foreign) {
-		t.Errorf("podRuntimeImagesMatch: target container without a status must mismatch")
-	}
-}
-
-// TestPatchPodImages_ReportsIssued pins the issued-return contract: a
-// no-diff patch must report issued=false (the caller only requeues for
-// a kubelet roll when a patch actually went out), a real diff true.
-func TestPatchPodImages_ReportsIssued(t *testing.T) {
-	isvc, _ := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
-	pod := legacyPodAtIncarnation(isvc, 0, 1, true, true)
-	pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v1"}}
-	c := legacyNewFakeClient(t, pod)
-	stored := &corev1.Pod{}
-	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), stored); err != nil {
-		t.Fatalf("get pod: %v", err)
-	}
-	pod = stored
-
-	issued, err := patchPodImages(context.Background(), c, pod, &corev1.PodSpec{
-		Containers: []corev1.Container{{Name: "main", Image: "llama:v1"}},
-	})
-	if err != nil {
-		t.Fatalf("patchPodImages (no diff): %v", err)
-	}
-	if issued {
-		t.Errorf("issued: got true want false when nothing needs patching")
-	}
-
-	issued, err = patchPodImages(context.Background(), c, pod, &corev1.PodSpec{
-		Containers: []corev1.Container{{Name: "main", Image: "llama:v2"}},
-	})
-	if err != nil {
-		t.Fatalf("patchPodImages (diff): %v", err)
-	}
-	if !issued {
-		t.Errorf("issued: got false want true for a real image diff")
-	}
-	got := &corev1.Pod{}
-	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), got); err != nil {
-		t.Fatalf("get pod: %v", err)
-	}
-	if got.Spec.Containers[0].Image != "llama:v2" {
-		t.Errorf("pod image: got %q want llama:v2", got.Spec.Containers[0].Image)
-	}
-}
-
 // TestUpdate_InPlace_InjectedSidecar_Converges is the end-to-end
 // livelock guard: a pod already on the target image but carrying
 // a webhook-injected sidecar (spec + status) absent from the target
@@ -442,7 +377,7 @@ func TestUpdate_InPlace_InjectedSidecar_Converges(t *testing.T) {
 		Incarnation: 1,
 		Phase:       v1beta1.OMENativeInstanceUpdating,
 		Operation: &v1beta1.InstanceOperation{
-			Type: v1beta1.InstanceOperationUpdate, Step: updateStepInPlace,
+			Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepInPlace,
 		},
 	}
 	isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
@@ -471,9 +406,14 @@ func TestUpdate_InPlace_InjectedSidecar_Converges(t *testing.T) {
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 	legacyStampPodRevisionHash(t, c, pod, tcr.Name)
 
+	if _, err := Update(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	legacyFoldServingIntoPodReady(t, c, pod, time.Now())
+	input = legacyTestInput(isvc, c, workload.ComponentEngine)
 	done, err := Update(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
 	if err != nil {
-		t.Fatalf("Update: %v", err)
+		t.Fatalf("Update after PodReady: %v", err)
 	}
 	if !done {
 		t.Fatalf("expected done=true: pod is on the target image; the sidecar must not block convergence")
@@ -589,7 +529,7 @@ func TestUpdate_StrategyChangeMidRollout_RecreateStillBumpsIncarnation(t *testin
 	ir2.Status.InstanceStatuses[0].TargetRevision = tcr.Name
 	ir2.Status.InstanceStatuses[0].Operation = &v1beta1.InstanceOperation{
 		Type:           v1beta1.InstanceOperationUpdate,
-		Step:           updateStepInPlace,
+		Step:           workload.UpdateStepInPlace,
 		TargetRevision: tcr.Name,
 	}
 	if err := c.Status().Update(context.Background(), ir2); err != nil {
@@ -617,7 +557,7 @@ func TestUpdate_StrategyChangeMidRollout_RecreateStillBumpsIncarnation(t *testin
 	if s.Incarnation != 2 {
 		t.Errorf("Incarnation: got %d want 2 (recreate must bump even though in-place wrote first)", s.Incarnation)
 	}
-	if s.Operation == nil || s.Operation.Step != updateStepDrain {
+	if s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
 		t.Errorf("Operation.Step: got %+v want Step=Drain", s.Operation)
 	}
 }
@@ -1006,7 +946,7 @@ func TestDetectUpdateTrigger_PhaseUpdatingAlwaysTrue(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v1")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1028,7 +968,7 @@ func TestDetectUpdateTrigger_PhaseMigratingSuppressed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1054,12 +994,47 @@ func TestDetectUpdateTrigger_OperationMigrateSuppressed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
 	if trigger {
 		t.Errorf("Operation.Type=Migrate must suppress Update")
+	}
+}
+
+// TestDetectUpdateTrigger_FailedMigrateRowStaysClaimed: a pair row that
+// escalated keeps its Migrate operation while it reads Failed, and the
+// record still owns its end. The trigger reads the claim, not the owner,
+// so the corrective-revision path that re-drives a plain Failed row does
+// not start an Update over the migration; the wreckage scan leaves the
+// row alone for the same reason.
+func TestDetectUpdateTrigger_FailedMigrateRowStaysClaimed(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	st := ir.Status.InstanceStatuses
+	st[0].Phase = v1beta1.OMENativeInstanceFailed
+	st[0].RunningRevision = "llama-70b-engine-oldrev"
+	st[0].Operation = &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationMigrate, Step: "CreatePods"}
+	c := legacyNewFakeClient(t, isvc, ir)
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+	target := legacyTargetSpecImage("llama:v2")
+	tcr := legacyEnsureTargetCR(t, c, isvc, target)
+
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if trigger {
+		t.Errorf("a Failed row with a Migrate operation is the record's; no Update may start on it")
+	}
+	failed := &workload.InstanceStatus{
+		Index: 0, Phase: workload.InstancePhaseFailed, RunningRevision: "llama-70b-engine-oldrev",
+		Operation: &workload.InstanceOperation{Type: workload.InstanceOperationMigrate, Step: "CreatePods"},
+	}
+	if EvaluateWreckage(failed, tcr, nil) {
+		t.Errorf("the wreckage scan must leave a migrate-claimed row alone")
 	}
 }
 
@@ -1085,7 +1060,7 @@ func TestDetectUpdateTrigger_GangSurgeTargetMarkerSuppressed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1110,7 +1085,7 @@ func TestDetectUpdateTrigger_RunningRevisionMatchesTarget(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1138,7 +1113,7 @@ func TestDetectUpdateTrigger_PhaseFailedRetriggersOnMismatch(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1147,49 +1122,73 @@ func TestDetectUpdateTrigger_PhaseFailedRetriggersOnMismatch(t *testing.T) {
 	}
 }
 
-// TestDetectUpdateTrigger_PodImageDiffersTriggersUpdate: no
-// RunningRevision recorded, observed pod has image v1 but target spec
-// is v2 — must trigger.
-func TestDetectUpdateTrigger_PodImageDiffersTriggersUpdate(t *testing.T) {
+// TestDetectUpdateTrigger_PodOnOtherRevisionTriggersUpdate: no
+// RunningRevision recorded and the observed pod carries a different
+// revision's hash — must trigger the ordinary roll.
+func TestDetectUpdateTrigger_PodOnOtherRevisionTriggersUpdate(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
 	pod := legacyRunningPodAtRevision(isvc, 0, 1, "llama:v1")
 	c := legacyNewFakeClient(t, isvc, ir, pod)
-	target := legacyTargetSpecImage("llama:v2")
-	tcr := legacyEnsureTargetCR(t, c, isvc, target)
+	priorCR := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("llama:v1"))
+	legacyStampPodRevisionHash(t, c, pod, priorCR.Name)
+	tcr := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("llama:v2"))
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
 	if !trigger {
-		t.Errorf("pod image mismatch should trigger update")
+		t.Errorf("a pod on another revision should trigger update")
 	}
 }
 
-// TestDetectUpdateTrigger_LegacyMatchedPodsBackfillRunningRevision:
-// Status has no RunningRevision, pod already runs the target image.
-// DetectUpdateTrigger must NOT trigger an update, and as a side effect
-// should backfill RunningRevision so future reconciles take the cheap
-// fast-path.
-func TestDetectUpdateTrigger_LegacyMatchedPodsBackfillRunningRevision(t *testing.T) {
+// TestDetectUpdateTrigger_UnlabelledPodTriggersUpdate: a pod carrying no
+// revision-hash label cannot be proven on the target, so it is rolled
+// rather than adopted.
+func TestDetectUpdateTrigger_UnlabelledPodTriggersUpdate(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	pod := legacyRunningPodAtRevision(isvc, 0, 1, "llama:v1")
+	delete(pod.Labels, query.LabelRevisionHash)
+	c := legacyNewFakeClient(t, isvc, ir, pod)
+	tcr := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("llama:v1"))
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("an unlabelled pod must not be adopted; it should trigger update")
+	}
+}
+
+// TestDetectUpdateTrigger_TargetRevisionPodsBackfillRunningRevision:
+// Status has no RunningRevision but the pods carry the target
+// revision's hash. DetectUpdateTrigger must NOT trigger an update, and
+// as a side effect should backfill RunningRevision so future reconciles
+// take the cheap fast-path.
+func TestDetectUpdateTrigger_TargetRevisionPodsBackfillRunningRevision(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
 	target := legacyTargetSpecImage("llama:v1")
 	pod := legacyRunningPodAtRevision(isvc, 0, 1, "llama:v1")
 	c := legacyNewFakeClient(t, isvc, ir, pod)
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
+	legacyStampPodRevisionHash(t, c, pod, tcr.Name)
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
 	if trigger {
-		t.Errorf("matched legacy pods must NOT trigger update")
+		t.Errorf("pods on the target revision must NOT trigger update")
 	}
 
 	// Backfill should have happened.
@@ -1211,34 +1210,12 @@ func TestDetectUpdateTrigger_PhaseCreatingNotInterruptible(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, target)
+	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
 	if trigger {
 		t.Errorf("Phase=Creating must not be interruptible by Update")
-	}
-}
-
-// TestPodImagesMatch pins the spec-image equality check.
-func TestPodImagesMatch(t *testing.T) {
-	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
-		{Name: "main", Image: "llama:v2"},
-		{Name: "sidecar", Image: "metrics:v1"},
-	}}}
-	matching := &corev1.PodSpec{Containers: []corev1.Container{
-		{Name: "main", Image: "llama:v2"},
-		{Name: "sidecar", Image: "metrics:v1"},
-	}}
-	mismatching := &corev1.PodSpec{Containers: []corev1.Container{
-		{Name: "main", Image: "llama:v3"},
-		{Name: "sidecar", Image: "metrics:v1"},
-	}}
-	if !podImagesMatch(pod, matching) {
-		t.Errorf("matching images should report true")
-	}
-	if podImagesMatch(pod, mismatching) {
-		t.Errorf("differing images should report false")
 	}
 }
 
@@ -1252,7 +1229,7 @@ func TestPatchInstanceStatusReadyOnRevision_SkipsWriteWhenIdempotent(t *testing.
 	c := legacyNewFakeClient(t, isvc, ir)
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	// Already in the target shape — write should be a no-op.
-	if err := patchInstanceStatusReadyOnRevision(context.Background(), input, 0, "rev-abc"); err != nil {
+	if err := status.StampReadyOnRevision(context.Background(), input, 0, "rev-abc"); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
 }
@@ -1288,48 +1265,6 @@ func TestDrainServiceForPod_EmptyWhenLabelMissing(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
 	if got := drainServiceForPod(input, plan, pod); got != "" {
 		t.Errorf("got %q want empty", got)
-	}
-}
-
-// TestCanonicalImage_NormalizesDockerHubReferences covers the qualified
-// forms container runtimes report for short Docker Hub references.
-func TestCanonicalImage_NormalizesDockerHubReferences(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"implicit library tag", "fake-serving:v1", "fake-serving:v1"},
-		{"runtime-stamped library tag", "docker.io/library/fake-serving:v1", "fake-serving:v1"},
-		{"explicit registry round-trip", "ghcr.io/foo/bar:v1", "ghcr.io/foo/bar:v1"},
-		{"runtime-stamped namespaced tag", "docker.io/myuser/myimg:v1", "myuser/myimg:v1"},
-		{"empty string", "", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := canonicalImage(tc.in); got != tc.want {
-				t.Errorf("canonicalImage(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestPodRuntimeImagesMatch_RegistryNormalization: `fake-serving:v1`
-// (spec) and `docker.io/library/fake-serving:v1` (runtime) MUST
-// compare equal so in-place updates against KIND or any cluster whose
-// runtime fully-qualifies implicit Docker Hub references converge.
-func TestPodRuntimeImagesMatch_RegistryNormalization(t *testing.T) {
-	target := &corev1.PodSpec{Containers: []corev1.Container{
-		{Name: "main", Image: "fake-serving:v2"},
-	}}
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "fake-serving:v2"}}},
-		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
-			{Name: "main", Image: "docker.io/library/fake-serving:v2"},
-		}},
-	}
-	if !podRuntimeImagesMatch(pod, target) {
-		t.Errorf("expected match between spec %q and runtime %q after canonicalImage normalization",
-			target.Containers[0].Image, pod.Status.ContainerStatuses[0].Image)
 	}
 }
 
@@ -1634,96 +1569,6 @@ func TestUpdate_InPlaceUpdate_LifecycleAnnotationFilterStillWorks(t *testing.T) 
 	}
 }
 
-// TestAnnotationsDiff_Cases exercises the helper directly to pin each
-// branch of the (add | update | delete | leave-alone) decision matrix.
-// These cases compose into the per-pod patches but are easier to reason
-// about in isolation than via the full Update fixture.
-func TestAnnotationsDiff_Cases(t *testing.T) {
-	cases := []struct {
-		name                string
-		pod, previous, want map[string]string
-		expect              map[string]any
-	}{
-		{
-			name:     "no diff: nothing to patch",
-			pod:      map[string]string{"a": "1"},
-			previous: map[string]string{"a": "1"},
-			want:     map[string]string{"a": "1"},
-			expect:   map[string]any{},
-		},
-		{
-			name:     "add new key from target",
-			pod:      map[string]string{"a": "1"},
-			previous: map[string]string{"a": "1"},
-			want:     map[string]string{"a": "1", "b": "2"},
-			expect:   map[string]any{"b": "2"},
-		},
-		{
-			name:     "update existing target key with new value",
-			pod:      map[string]string{"a": "1"},
-			previous: map[string]string{"a": "1"},
-			want:     map[string]string{"a": "2"},
-			expect:   map[string]any{"a": "2"},
-		},
-		{
-			name:     "delete key the user removed (previous owned it)",
-			pod:      map[string]string{"a": "1", "b": "2"},
-			previous: map[string]string{"a": "1", "b": "2"},
-			want:     map[string]string{"a": "1"},
-			expect:   map[string]any{"b": nil},
-		},
-		{
-			name:     "leave foreign key alone (in pod, not in previous or target)",
-			pod:      map[string]string{"a": "1", "linkerd.io/inject": "enabled"},
-			previous: map[string]string{"a": "1"},
-			want:     map[string]string{"a": "1"},
-			expect:   map[string]any{},
-		},
-		{
-			name:     "delete only if pod actually has the key (no spurious null patch)",
-			pod:      map[string]string{"a": "1"},
-			previous: map[string]string{"a": "1", "b": "2"},
-			want:     map[string]string{"a": "1"},
-			expect:   map[string]any{},
-		},
-		{
-			name:     "nil-as-empty across all inputs",
-			pod:      nil,
-			previous: nil,
-			want:     nil,
-			expect:   map[string]any{},
-		},
-		{
-			name:     "first revision: previous nil, target adds key, pod empty",
-			pod:      nil,
-			previous: nil,
-			want:     map[string]string{"a": "1"},
-			expect:   map[string]any{"a": "1"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := annotationsDiff(tc.pod, tc.previous, tc.want)
-			if len(got) != len(tc.expect) {
-				t.Fatalf("diff length: got %d (%+v) want %d (%+v)", len(got), got, len(tc.expect), tc.expect)
-			}
-			for k, want := range tc.expect {
-				gv, ok := got[k]
-				if !ok {
-					t.Errorf("missing key %q in diff", k)
-					continue
-				}
-				if want == nil && gv != nil {
-					t.Errorf("key %q: got %+v want nil", k, gv)
-				}
-				if want != nil && gv != want {
-					t.Errorf("key %q: got %+v want %+v", k, gv, want)
-				}
-			}
-		})
-	}
-}
-
 // Keep imports live in case a helper above grows / shrinks: fmt is
 // reachable through the inline format strings in test assertions; query
 // is reachable through legacy_test_helpers; metav1 is reachable through
@@ -1843,4 +1688,1243 @@ func anyContains(events []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// RetryBlock gate tests: DetectUpdateTrigger consults the
+// persisted RetryBlock for the CURRENT target revision before firing a
+// FRESH trigger. Held / RetryInProgress / not-yet-due Backoff deny; a
+// due Backoff allows WITHOUT flipping state — the RetryInProgress flip
+// happens at attempt-stamp time (status.RetryBlockAttemptStarted), after
+// the dispatcher's budget/coordination gates admit the start. A block
+// for a DIFFERENT target revision is a different RetrySubject and never
+// gates, and a Failed-continuation (teardown/abandon of a failed
+// candidate) is exempt.
+
+// retryBlockCall records one MutateRetryBlock invocation.
+type retryBlockCall struct {
+	rev         string
+	disposition workload.RetryBlockDisposition
+	block       workload.RetryBlock
+}
+
+// retryGateFixture builds the steady-state from which an Update trigger
+// fires absent a RetryBlock: Instance 0 Ready on an OLD revision while
+// the target CR captures a different image. MutateRetryBlock is a
+// recorder that snapshots (rev, disposition, mutated block).
+func retryGateFixture(t *testing.T, t0 time.Time) (*workload.ReconcileInput, workload.ComponentPlan, *appsv1.ControllerRevision, *[]retryBlockCall, client.Client, *v1beta1.InferenceService) {
+	t.Helper()
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	c := legacyNewFakeClient(t, isvc, ir)
+	tcr := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("llama:v2"))
+	// Ready on a NON-target revision → the fast-path fires absent a block.
+	ir.Status.InstanceStatuses[0].RunningRevision = "llama-70b-engine-oldrev"
+	if err := c.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	input.Clock = clocktesting.NewFakeClock(t0)
+	calls := &[]retryBlockCall{}
+	input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+		var b workload.RetryBlock
+		if existing := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev); existing != nil {
+			b = *existing
+		} else {
+			b = workload.RetryBlock{TargetRevision: rev}
+		}
+		d := mutate(&b)
+		*calls = append(*calls, retryBlockCall{rev: rev, disposition: d, block: b})
+		return nil
+	}
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+	return &input, plan, tcr, calls, c, isvc
+}
+
+// TestDetectUpdate_RetryBlockHeld_Denies: a Held block for the current
+// target denies the trigger with no wake-up and no writes of any kind.
+func TestDetectUpdate_RetryBlockHeld_Denies(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := retryGateFixture(t, t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockHeld},
+	}
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if trigger {
+		t.Errorf("Held block for the current target must deny the trigger")
+	}
+	if retryAfter != 0 {
+		t.Errorf("Held is not time-bounded: retryAfter got %v want 0", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("MutateRetryBlock must not be called on Held denial: %d calls", len(*calls))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceReady {
+		t.Errorf("instance status mutated on denial: phase got %q want %q", s.Phase, v1beta1.OMENativeInstanceReady)
+	}
+}
+
+// TestDetectUpdate_RetryBlockBackoffNotDue_DeniesWithRequeue: a Backoff
+// block whose NextRetryAt is in the future denies AND reports exactly
+// when to re-evaluate (fake clock → exact remaining interval).
+func TestDetectUpdate_RetryBlockBackoffNotDue_DeniesWithRequeue(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	next := metav1.NewTime(t0.Add(37 * time.Second))
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, NextRetryAt: &next},
+	}
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if trigger {
+		t.Errorf("not-yet-due Backoff must deny the trigger")
+	}
+	if retryAfter != 37*time.Second {
+		t.Errorf("retryAfter: got %v want exactly 37s", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("MutateRetryBlock must not be called before NextRetryAt: %d calls", len(*calls))
+	}
+}
+
+// TestDetectUpdate_RetryBlockDue_AllowsWithoutFlip: a due Backoff block
+// lets the trigger fire but the GATE records nothing — the
+// RetryInProgress flip belongs to attempt-stamp time, after the
+// dispatcher budgets admit the start.
+func TestDetectUpdate_RetryBlockDue_AllowsWithoutFlip(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	next := metav1.NewTime(t0.Add(-1 * time.Second))
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, AttemptsStarted: 1, NextRetryAt: &next},
+	}
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("due Backoff must allow the trigger")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0 on allowed fire", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("the gate must not flip state (attempt-stamp time owns the flip): %d calls", len(*calls))
+	}
+}
+
+// TestDetectUpdate_RetryBlockDueBoundaryExact: at exactly NextRetryAt
+// the block is due — now.Before(next) is false at equality.
+func TestDetectUpdate_RetryBlockDueBoundaryExact(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	next := metav1.NewTime(t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, NextRetryAt: &next},
+	}
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("block at exactly NextRetryAt is due — trigger must fire")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0 at the due boundary", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("gate must not write at the due boundary: %d calls", len(*calls))
+	}
+}
+
+// TestDetectUpdate_RetryBlockInProgress_DeniesSecondAttempt: while an
+// authorized attempt is in flight the gate denies any further fresh
+// trigger — exactly-one-attempt semantics.
+func TestDetectUpdate_RetryBlockInProgress_DeniesSecondAttempt(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockRetryInProgress, AttemptsStarted: 1},
+	}
+	// A LIVE authorization: some Instance carries an in-flight Update
+	// Operation at the target revision.
+	input.ObservedState.InstanceStatuses = append(input.ObservedState.InstanceStatuses, workload.InstanceStatus{
+		Index: 7, Phase: workload.InstancePhaseUpdating,
+		Operation: &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, TargetRevision: tcr.Name},
+	})
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if trigger {
+		t.Errorf("RetryInProgress with a live in-flight attempt must deny a second attempt")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("MutateRetryBlock must not be called on RetryInProgress denial: %d calls", len(*calls))
+	}
+}
+
+// TestDetectUpdate_RetryBlockInProgressLeaked_SelfHeals: RetryInProgress
+// with NO in-flight Update attempt at the revision (superseded surge,
+// scale-down, crash) is a leaked authorization — the gate treats it as
+// due so a later rollback to that revision is not silently denied
+// forever.
+func TestDetectUpdate_RetryBlockInProgressLeaked_SelfHeals(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockRetryInProgress, AttemptsStarted: 1},
+	}
+	// No instance carries an in-flight Update Operation at tcr.Name.
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("leaked RetryInProgress (no in-flight attempt) must self-heal and allow the trigger")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("gate must not write on self-heal (stamp re-confirms): %d calls", len(*calls))
+	}
+}
+
+// TestDetectUpdate_NewRevisionPassesGate: a block for a DIFFERENT
+// (older) target revision never gates the new target: a corrective
+// revision must roll even when the prior revision Held.
+func TestDetectUpdate_NewRevisionPassesGate(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: "some-OTHER-rev", State: workload.RetryBlockHeld},
+	}
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("a Held block for a different revision must NOT gate the new target")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("MutateRetryBlock must not be called for an unrelated block: %d calls", len(*calls))
+	}
+}
+
+// TestDetectUpdate_FailedContinuationPassesGate: Phase=Failed with an
+// in-flight Update Operation is a CONTINUATION (teardown/abandon of the
+// failed candidate) and must proceed regardless of the block — a Held
+// block must not freeze the candidate gang mid-teardown. Mirrors the dispatcher's startingFresh carve-out.
+func TestDetectUpdate_FailedContinuationPassesGate(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, _ := retryGateFixture(t, t0)
+	input.ObservedState.InstanceStatuses[0].Phase = workload.InstancePhaseFailed
+	input.ObservedState.InstanceStatuses[0].Operation = &workload.InstanceOperation{
+		ID:             "update-0-1",
+		Type:           workload.InstanceOperationUpdate,
+		Step:           workload.UpdateStepSurge,
+		TargetRevision: tcr.Name,
+	}
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockHeld},
+	}
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("Failed-continuation must pass the gate even when Held")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0", retryAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("gate must not write on the continuation exemption: %d calls", len(*calls))
+	}
+}
+
+// TestPatchSurgingForUpdate_FlipsBackoffOnAttemptStart: the attempt-
+// stamp helper owns the RetryInProgress flip — an existing Backoff
+// block flips (exactly one Persist) when the fresh Update Operation is
+// stamped, and NOTHING is recorded when no block exists (a fresh start
+// with no prior failure needs no block).
+func TestPatchSurgingForUpdate_FlipsBackoffOnAttemptStart(t *testing.T) {
+	t.Run("existing Backoff block flips to RetryInProgress", func(t *testing.T) {
+		t0 := time.Now()
+		input, _, tcr, calls, _, _ := retryGateFixture(t, t0)
+		next := metav1.NewTime(t0.Add(-1 * time.Second))
+		input.ObservedState.RetryBlocks = []workload.RetryBlock{
+			{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, AttemptsStarted: 1, NextRetryAt: &next},
+		}
+
+		if err := status.StampSurging(context.Background(), *input, 0, tcr.Name, workload.UpdateStrategySurgeThenDrain, 30*time.Minute); err != nil {
+			t.Fatalf("stamp: %v", err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("MutateRetryBlock calls: got %d want exactly 1", len(*calls))
+		}
+		call := (*calls)[0]
+		if call.rev != tcr.Name {
+			t.Errorf("mutate rev: got %q want %q", call.rev, tcr.Name)
+		}
+		if call.disposition != workload.RetryBlockPersist {
+			t.Errorf("disposition: got %v want Persist", call.disposition)
+		}
+		if call.block.State != workload.RetryBlockRetryInProgress {
+			t.Errorf("mutated state: got %q want %q", call.block.State, workload.RetryBlockRetryInProgress)
+		}
+	})
+
+	t.Run("no block records nothing", func(t *testing.T) {
+		t0 := time.Now()
+		input, _, tcr, calls, _, _ := retryGateFixture(t, t0)
+
+		if err := status.StampSurging(context.Background(), *input, 0, tcr.Name, workload.UpdateStrategySurgeThenDrain, 30*time.Minute); err != nil {
+			t.Fatalf("stamp: %v", err)
+		}
+		for _, call := range *calls {
+			if call.disposition != workload.RetryBlockUnchanged {
+				t.Errorf("no-block start must persist nothing: disposition got %v want Unchanged", call.disposition)
+			}
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// RetryBlock writer tests: recordUpdateFailureInRetryBlock counts
+// attempts per WAVE — an existing Backoff block means this wave
+// already recorded, so only the evidence refreshes. Policy nil (unconfigured)
+// or exhausted → Held + WarnRetryHeld exactly once at the transition.
+// These drive workload-caused waves (the charged arm); the uncharged,
+// environment-caused arm is pinned in the types package and the gang
+// abandon tests.
+// ---------------------------------------------------------------------------
+
+// retryHeldWarning records one WarnRetryHeld invocation.
+type retryHeldWarning struct {
+	rev      string
+	attempts int32
+	reason   string
+}
+
+// retryWriterInput builds the minimal ReconcileInput the writer needs: a
+// fake clock, the recording MutateRetryBlock closure backed by
+// ObservedState.RetryBlocks, an optional policy, and a WarnRetryHeld
+// recorder. Same recording-closure pattern as retryGateFixture, without
+// the fake-client scaffolding the pure writer doesn't touch.
+func retryWriterInput(t0 time.Time, existing []workload.RetryBlock, policy *workload.RetryPolicy) (*workload.ReconcileInput, *[]retryBlockCall, *[]retryHeldWarning) {
+	input := &workload.ReconcileInput{
+		Clock:             clocktesting.NewFakeClock(t0),
+		UpdateRetryPolicy: policy,
+	}
+	input.ObservedState.RetryBlocks = existing
+	calls := &[]retryBlockCall{}
+	warns := &[]retryHeldWarning{}
+	input.WarnRetryHeld = func(rev string, attempts int32, reason string) {
+		*warns = append(*warns, retryHeldWarning{rev: rev, attempts: attempts, reason: reason})
+	}
+	input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+		var b workload.RetryBlock
+		if existing := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev); existing != nil {
+			b = *existing
+		} else {
+			b = workload.RetryBlock{TargetRevision: rev}
+		}
+		d := mutate(&b)
+		*calls = append(*calls, retryBlockCall{rev: rev, disposition: d, block: b})
+		return nil
+	}
+	return input, calls, warns
+}
+
+// retryTestPolicy is the canonical test policy: 3 attempts, 1m initial
+// delay, 30m cap, multiplier 2.
+func retryTestPolicy() *workload.RetryPolicy {
+	return &workload.RetryPolicy{MaxAttempts: 3, InitialDelay: time.Minute, MaxDelay: 30 * time.Minute, Multiplier: 2}
+}
+
+// TestRecordUpdateFailure_FirstFailureBacksOff: (a) first same-target
+// failure creates the block — AttemptsStarted=1, Backoff, persisted
+// NextRetryAt = now + InitialDelay, both failure timestamps stamped.
+func TestRecordUpdateFailure_FirstFailureBacksOff(t *testing.T) {
+	t0 := time.Now()
+	input, calls, warns := retryWriterInput(t0, nil, retryTestPolicy())
+
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "ImagePullBackOff", true); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	b := (*calls)[0]
+	if b.rev != "rev-bad" || b.disposition != workload.RetryBlockPersist {
+		t.Errorf("call: got (rev=%q, disposition=%v) want (rev-bad, Persist)", b.rev, b.disposition)
+	}
+	if b.block.State != workload.RetryBlockBackoff {
+		t.Errorf("state: got %q want Backoff", b.block.State)
+	}
+	if b.block.AttemptsStarted != 1 {
+		t.Errorf("AttemptsStarted: got %d want 1", b.block.AttemptsStarted)
+	}
+	if b.block.NextRetryAt == nil || !b.block.NextRetryAt.Time.Equal(t0.Add(time.Minute)) {
+		t.Errorf("NextRetryAt: got %v want %v", b.block.NextRetryAt, t0.Add(time.Minute))
+	}
+	if b.block.FirstFailureAt == nil || !b.block.FirstFailureAt.Time.Equal(t0) {
+		t.Errorf("FirstFailureAt: got %v want %v", b.block.FirstFailureAt, t0)
+	}
+	if b.block.LastFailureAt == nil || !b.block.LastFailureAt.Time.Equal(t0) {
+		t.Errorf("LastFailureAt: got %v want %v", b.block.LastFailureAt, t0)
+	}
+	if b.block.Reason != "ImagePullBackOff" {
+		t.Errorf("Reason: got %q want ImagePullBackOff", b.block.Reason)
+	}
+	if len(*warns) != 0 {
+		t.Errorf("WarnRetryHeld: got %d calls want 0 (attempts remain)", len(*warns))
+	}
+}
+
+// TestRecordUpdateFailure_SecondWaveCounts: (b) the authorized retry
+// (block RetryInProgress) failed — counts as a new wave: AttemptsStarted
+// 1→2, back to Backoff with NextRetryAt = now + InitialDelay*Multiplier,
+// FirstFailureAt preserved.
+func TestRecordUpdateFailure_SecondWaveCounts(t *testing.T) {
+	t0 := time.Now()
+	first := metav1.NewTime(t0.Add(-10 * time.Minute))
+	input, calls, warns := retryWriterInput(t0, []workload.RetryBlock{{
+		TargetRevision:  "rev-bad",
+		State:           workload.RetryBlockRetryInProgress,
+		AttemptsStarted: 1,
+		FirstFailureAt:  &first,
+		Reason:          "old evidence",
+	}}, retryTestPolicy())
+
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "still ImagePullBackOff", true); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	b := (*calls)[0].block
+	if b.AttemptsStarted != 2 {
+		t.Errorf("AttemptsStarted: got %d want 2 (RetryInProgress failure counts the wave)", b.AttemptsStarted)
+	}
+	if b.State != workload.RetryBlockBackoff {
+		t.Errorf("state: got %q want Backoff", b.State)
+	}
+	if b.NextRetryAt == nil || !b.NextRetryAt.Time.Equal(t0.Add(2*time.Minute)) {
+		t.Errorf("NextRetryAt: got %v want %v (1m * 2^1)", b.NextRetryAt, t0.Add(2*time.Minute))
+	}
+	if b.FirstFailureAt == nil || !b.FirstFailureAt.Time.Equal(first.Time) {
+		t.Errorf("FirstFailureAt: got %v want preserved %v", b.FirstFailureAt, first.Time)
+	}
+	if b.Reason != "still ImagePullBackOff" {
+		t.Errorf("Reason: got %q want refreshed", b.Reason)
+	}
+	if len(*warns) != 0 {
+		t.Errorf("WarnRetryHeld: got %d calls want 0", len(*warns))
+	}
+}
+
+// TestRecordUpdateFailure_SameWaveRefreshOnly: (c) a sibling instance's
+// failure in the SAME wave finds the block already Backoff — evidence
+// refresh only: no increment, no NextRetryAt recompute.
+func TestRecordUpdateFailure_SameWaveRefreshOnly(t *testing.T) {
+	t0 := time.Now()
+	next := metav1.NewTime(t0.Add(-30 * time.Second)) // set by the wave's first failure
+	first := metav1.NewTime(t0.Add(-90 * time.Second))
+	input, calls, warns := retryWriterInput(t0, []workload.RetryBlock{{
+		TargetRevision:  "rev-bad",
+		State:           workload.RetryBlockBackoff,
+		AttemptsStarted: 1,
+		NextRetryAt:     &next,
+		FirstFailureAt:  &first,
+		Reason:          "first instance failed",
+	}}, retryTestPolicy())
+
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "second instance failed", true); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	b := (*calls)[0]
+	if b.disposition != workload.RetryBlockPersist {
+		t.Errorf("disposition: got %v want Persist (evidence refresh)", b.disposition)
+	}
+	if b.block.AttemptsStarted != 1 {
+		t.Errorf("AttemptsStarted: got %d want 1 (same wave — no increment)", b.block.AttemptsStarted)
+	}
+	if b.block.NextRetryAt == nil || !b.block.NextRetryAt.Time.Equal(next.Time) {
+		t.Errorf("NextRetryAt: got %v want unchanged %v", b.block.NextRetryAt, next.Time)
+	}
+	if b.block.Reason != "second instance failed" {
+		t.Errorf("Reason: got %q want refreshed", b.block.Reason)
+	}
+	if b.block.LastFailureAt == nil || !b.block.LastFailureAt.Time.Equal(t0) {
+		t.Errorf("LastFailureAt: got %v want refreshed to %v", b.block.LastFailureAt, t0)
+	}
+	if len(*warns) != 0 {
+		t.Errorf("WarnRetryHeld: got %d calls want 0", len(*warns))
+	}
+}
+
+// TestRecordUpdateFailure_ExhaustionHolds: (d) the third counted wave
+// exhausts MaxAttempts=3 → Held, NextRetryAt cleared, WarnRetryHeld
+// exactly once with attempts=3. A later failure against the Held block
+// refreshes evidence only — no second warning, no increment.
+func TestRecordUpdateFailure_ExhaustionHolds(t *testing.T) {
+	t0 := time.Now()
+	input, calls, warns := retryWriterInput(t0, []workload.RetryBlock{{
+		TargetRevision:  "rev-bad",
+		State:           workload.RetryBlockRetryInProgress,
+		AttemptsStarted: 2,
+	}}, retryTestPolicy())
+
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "third strike", true); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	b := (*calls)[0].block
+	if b.State != workload.RetryBlockHeld {
+		t.Errorf("state: got %q want Held (3 >= MaxAttempts)", b.State)
+	}
+	if b.AttemptsStarted != 3 {
+		t.Errorf("AttemptsStarted: got %d want 3", b.AttemptsStarted)
+	}
+	if b.NextRetryAt != nil {
+		t.Errorf("NextRetryAt: got %v want nil (Held has no time bound)", b.NextRetryAt)
+	}
+	if len(*warns) != 1 {
+		t.Fatalf("WarnRetryHeld: got %d calls want exactly 1 (at the Held transition)", len(*warns))
+	}
+	if w := (*warns)[0]; w.rev != "rev-bad" || w.attempts != 3 || w.reason != "third strike" {
+		t.Errorf("warning: got %+v want {rev-bad 3 third strike}", w)
+	}
+
+	// A subsequent failure against the persisted Held block: refresh only.
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{b}
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "post-hold noise", true); err != nil {
+		t.Fatalf("record on Held: %v", err)
+	}
+	held := (*calls)[1].block
+	if held.State != workload.RetryBlockHeld || held.AttemptsStarted != 3 {
+		t.Errorf("Held refresh: got (state=%q, attempts=%d) want (Held, 3)", held.State, held.AttemptsStarted)
+	}
+	if held.Reason != "post-hold noise" {
+		t.Errorf("Held refresh Reason: got %q want refreshed", held.Reason)
+	}
+	if len(*warns) != 1 {
+		t.Errorf("WarnRetryHeld after Held refresh: got %d calls want still 1", len(*warns))
+	}
+}
+
+// TestRecordUpdateFailure_NilPolicyHoldsFirstFailure: (e) unconfigured
+// policy fails safe — Held on the FIRST failure, never Backoff.
+func TestRecordUpdateFailure_NilPolicyHoldsFirstFailure(t *testing.T) {
+	t0 := time.Now()
+	input, calls, warns := retryWriterInput(t0, nil, nil)
+
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "no policy configured", true); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	b := (*calls)[0].block
+	if b.State != workload.RetryBlockHeld {
+		t.Errorf("state: got %q want Held (nil policy is always exhausted)", b.State)
+	}
+	if b.AttemptsStarted != 1 {
+		t.Errorf("AttemptsStarted: got %d want 1", b.AttemptsStarted)
+	}
+	if b.NextRetryAt != nil {
+		t.Errorf("NextRetryAt: got %v want nil", b.NextRetryAt)
+	}
+	if len(*warns) != 1 || (*warns)[0].attempts != 1 {
+		t.Errorf("WarnRetryHeld: got %+v want exactly one call with attempts=1", *warns)
+	}
+}
+
+// TestRecordUpdateFailure_UnwiredNoOp: (f) nil MutateRetryBlock (adapter
+// opted out) and empty targetRev are both silent no-ops — no panic.
+func TestRecordUpdateFailure_UnwiredNoOp(t *testing.T) {
+	t0 := time.Now()
+
+	unwired := &workload.ReconcileInput{Clock: clocktesting.NewFakeClock(t0)}
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *unwired, "rev-bad", "x", true); err != nil {
+		t.Fatalf("nil closure must no-op: %v", err)
+	}
+
+	input, calls, _ := retryWriterInput(t0, nil, retryTestPolicy())
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "", "x", true); err != nil {
+		t.Fatalf("empty targetRev must no-op: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("empty targetRev: got %d MutateRetryBlock calls want 0", len(*calls))
+	}
+}
+
+// TestInstanceFailureReason pins the call-site evidence extraction:
+// LastFailure.Message wins, ShortString covers message-less stuck-pod
+// escalations, and the fallback covers a Failed instance with no
+// recorded termination.
+func TestInstanceFailureReason(t *testing.T) {
+	if got := instanceFailureReason(nil, "fallback"); got != "fallback" {
+		t.Errorf("nil status: got %q want fallback", got)
+	}
+	s := &workload.InstanceStatus{}
+	if got := instanceFailureReason(s, "fallback"); got != "fallback" {
+		t.Errorf("nil LastFailure: got %q want fallback", got)
+	}
+	s.LastFailure = &workload.InstanceTermination{PodName: "p-0", Reason: "ImagePullBackOff"}
+	if got := instanceFailureReason(s, "fallback"); got != "pod p-0 stuck (ImagePullBackOff)" {
+		t.Errorf("ShortString path: got %q", got)
+	}
+	s.LastFailure.Message = "DeadlineExceeded: Update/Surge exceeded InstanceReadyTimeout"
+	if got := instanceFailureReason(s, "fallback"); got != s.LastFailure.Message {
+		t.Errorf("Message path: got %q want %q", got, s.LastFailure.Message)
+	}
+}
+
+// TestInstanceFailureWorkloadCaused pins the call-site cause attribution:
+// only a LastFailure whose Reason is in the workload-caused set charges
+// the ladder; an elapsed deadline, an ambiguous kubelet reason, and
+// missing evidence do not.
+func TestInstanceFailureWorkloadCaused(t *testing.T) {
+	if instanceFailureWorkloadCaused(nil) {
+		t.Error("nil status must not be workload-caused")
+	}
+	s := &workload.InstanceStatus{}
+	if instanceFailureWorkloadCaused(s) {
+		t.Error("nil LastFailure must not be workload-caused")
+	}
+	for reason, want := range map[string]bool{
+		"ImagePullBackOff":           true,
+		"ErrImagePull":               true,
+		"InvalidImageName":           true,
+		"CreateContainerConfigError": true,
+		"DeadlineExceeded":           false,
+		"CrashLoopBackOff":           false,
+		"RunContainerError":          false,
+		"":                           false,
+	} {
+		s.LastFailure = &workload.InstanceTermination{PodName: "p-0", Reason: reason}
+		if got := instanceFailureWorkloadCaused(s); got != want {
+			t.Errorf("reason %q: got %v want %v", reason, got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Success prune: the promote helpers remove the promoted revision's block.
+// ---------------------------------------------------------------------------
+
+// TestPatchReadyOnRevision_PrunesBlock: promoting Ready on rev removes
+// that rev's block (disposition Remove observed).
+func TestPatchReadyOnRevision_PrunesBlock(t *testing.T) {
+	t0 := time.Now()
+	input, _, tcr, calls, _, _ := retryGateFixture(t, t0)
+
+	if err := status.StampReadyOnRevision(context.Background(), *input, 0, tcr.Name); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	if c := (*calls)[0]; c.rev != tcr.Name || c.disposition != workload.RetryBlockRemove {
+		t.Errorf("prune: got (rev=%q, disposition=%v) want (%q, Remove)", c.rev, c.disposition, tcr.Name)
+	}
+}
+
+// disposedBackfillFixture builds the deadline-disposed shape the
+// empty-RunningRevision backfill can encounter: Instance 0 is
+// Phase=Failed with NO Operation and NO RunningRevision, a Backoff
+// RetryBlock for the target revision is already due, and the wedged
+// attempt's pods are still present carrying the target revision's hash.
+// podReady controls whether those pods carry ContainersReady. Returns
+// the pod separately so the caller threads it through instancePods.
+func disposedBackfillFixture(t *testing.T, t0 time.Time, podReady bool) (*workload.ReconcileInput, workload.ComponentPlan, *appsv1.ControllerRevision, *[]retryBlockCall, client.Client, *v1beta1.InferenceService, *corev1.Pod) {
+	t.Helper()
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	// Deadline disposition left: Failed, Operation cleared, no
+	// RunningRevision ever stamped (initial create never converged).
+	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceFailed
+	c := legacyNewFakeClient(t, isvc, ir)
+	tcr := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("llama:v2"))
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	input.Clock = clocktesting.NewFakeClock(t0)
+	due := metav1.NewTime(t0.Add(-1 * time.Second))
+	calls := recordRetryBlockCalls(&input, []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, AttemptsStarted: 1, NextRetryAt: &due},
+	})
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+
+	// The wedged attempt's pod: labelled with the target revision (a bad
+	// image ref always carries the hash of its own bad revision).
+	pod := legacyPodForInstance(isvc, 0, podReady, false)
+	pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(tcr.Name)
+	pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v2"}}
+	if !podReady {
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "main",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}},
+		}}
+	}
+	return &input, plan, tcr, calls, c, isvc, pod
+}
+
+// TestDetectUpdate_BackfillRefusesWedgedPods: the empty-RunningRevision
+// backfill must NOT stamp Ready / prune the target's RetryBlock off a
+// revision-match alone. A deadline-disposed create (Failed, no Operation,
+// pods present in a kubelet waiting reason) carries the very revision
+// that wedged it; stamping Ready here would prune the block and defuse
+// the retry machinery while nothing is actually serving. The row is not
+// left alone either: refusing the stamp hands it back to the ordinary
+// roll, which is the retry its RetryBlock paces.
+func TestDetectUpdate_BackfillRefusesWedgedPods(t *testing.T) {
+	for _, reason := range []string{"ImagePullBackOff", "CrashLoopBackOff"} {
+		t.Run(reason, func(t *testing.T) {
+			t0 := time.Now()
+			input, plan, tcr, calls, c, isvc, pod := disposedBackfillFixture(t, t0, false /* podReady */)
+			pod.Status.ContainerStatuses[0].State.Waiting.Reason = reason
+
+			trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod})
+			if err != nil {
+				t.Fatalf("detect: %v", err)
+			}
+			if !trigger {
+				t.Errorf("a wedged pod on the target revision must take the ordinary retry roll")
+			}
+			if retryAfter != 0 {
+				t.Errorf("retryAfter: got %v want 0 (the block is due)", retryAfter)
+			}
+			if len(*calls) != 0 {
+				t.Errorf("MutateRetryBlock calls: got %d want 0 (detect stamps nothing; the flip belongs to attempt-stamp time)", len(*calls))
+			}
+			s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+			if s.Phase != v1beta1.OMENativeInstanceFailed {
+				t.Errorf("phase: got %q want still Failed (no Ready stamp without proof)", s.Phase)
+			}
+			if s.RunningRevision != "" {
+				t.Errorf("RunningRevision: got %q want empty (no backfill without proof)", s.RunningRevision)
+			}
+		})
+	}
+}
+
+// TestDetectUpdate_WedgedPodsReachHeld: the retry ladder is reachable
+// end to end from the roll a wedged on-target row keeps. Each pass
+// re-triggers, the attempt stamp flips the block, the failure charges
+// the ladder — and the count reaches Held, after which the gate denies
+// and the churn stops. An on-target row left alone instead of rolled
+// opens no further attempt, so the block would sit at Backoff forever.
+func TestDetectUpdate_WedgedPodsReachHeld(t *testing.T) {
+	const maxAttempts = 3
+	t0 := time.Now()
+	input, plan, tcr, _, c, isvc, pod := disposedBackfillFixture(t, t0, false /* podReady */)
+	plan.UpdateStrategy.Type = workload.UpdateStrategyRecreatePod
+	clock := clocktesting.NewFakeClock(t0)
+	input.Clock = clock
+	policy := &workload.RetryPolicy{
+		MaxAttempts:  maxAttempts,
+		InitialDelay: 5 * time.Second,
+		MaxDelay:     20 * time.Second,
+		Multiplier:   2,
+	}
+	input.UpdateRetryPolicy = policy
+	// Start from the first failure wave, with the ladder persisted back
+	// into the observed state so each pass reads what the last one wrote.
+	input.ObservedState.RetryBlocks = nil
+	input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+		b := workload.RetryBlock{TargetRevision: rev}
+		if found := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev); found != nil {
+			b = *found
+		}
+		if mutate(&b) == workload.RetryBlockRemove {
+			input.ObservedState.RetryBlocks = nil
+			return nil
+		}
+		input.ObservedState.RetryBlocks = []workload.RetryBlock{b}
+		return nil
+	}
+
+	ctx := context.Background()
+	for attempt := int32(1); attempt <= maxAttempts; attempt++ {
+		trigger, _, err := DetectUpdateTriggerWithPods(ctx, legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod})
+		if err != nil {
+			t.Fatalf("detect (attempt %d): %v", attempt, err)
+		}
+		if !trigger {
+			t.Fatalf("attempt %d: the wedged row must re-trigger so the ladder can advance", attempt)
+		}
+		if _, err := status.StampRecreating(ctx, *input, 0, tcr.Name,
+			recreateRevisionCause(*input, 0, tcr.Name), workload.UpdateStrategyRecreatePod, time.Hour); err != nil {
+			t.Fatalf("stamp attempt %d: %v", attempt, err)
+		}
+		// The attempt wedges on the same bad image: the disposition charges
+		// the revision's ladder and disposes the row back to Failed with the
+		// Operation cleared.
+		if err := recordUpdateFailureInRetryBlock(ctx, *input, tcr.Name, "ImagePullBackOff", true /* workloadCaused */); err != nil {
+			t.Fatalf("record failure %d: %v", attempt, err)
+		}
+		if err := input.MutateInstance(ctx, 0, func(s *workload.InstanceStatus) bool {
+			s.Phase = workload.InstancePhaseFailed
+			s.Operation = nil
+			return true
+		}); err != nil {
+			t.Fatalf("dispose attempt %d: %v", attempt, err)
+		}
+		input.ObservedState.InstanceStatuses = legacyInstanceStatuses(c, isvc, workload.ComponentEngine)
+
+		b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, tcr.Name)
+		if b == nil {
+			t.Fatalf("attempt %d: no RetryBlock recorded", attempt)
+		}
+		if b.AttemptsStarted != attempt {
+			t.Fatalf("attempt %d: AttemptsStarted got %d want %d", attempt, b.AttemptsStarted, attempt)
+		}
+		// Wait out the rung so the next pass is not denied by the backoff.
+		clock.Step(policy.MaxDelay + time.Second)
+	}
+
+	b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, tcr.Name)
+	if b.State != workload.RetryBlockHeld {
+		t.Fatalf("after %d charged attempts: state got %q want Held", maxAttempts, b.State)
+	}
+	if b.NextRetryAt != nil {
+		t.Errorf("Held has no time bound: NextRetryAt got %v want nil", b.NextRetryAt)
+	}
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(ctx, legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod})
+	if err != nil {
+		t.Fatalf("detect after Held: %v", err)
+	}
+	if trigger {
+		t.Errorf("Held must stop the churn: no further attempt may be opened")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter after Held: got %v want 0 (Held has no time bound)", retryAfter)
+	}
+}
+
+// TestDetectUpdate_StuckPodOnTargetRelocates: a node-scoped fault parks
+// the pod Running-but-unready with no kubelet waiting reason, and the
+// deadline disposition answers it with a terminal AutoRecover directive
+// — recorded as the instance's node exclusion, executed by the ordinary
+// rebuild. That rebuild is the roll this trigger opens: an on-target row
+// left alone is never recreated, so the pod keeps its node and its UID.
+func TestDetectUpdate_StuckPodOnTargetRelocates(t *testing.T) {
+	const suspectNode = "node-suspect"
+	t0 := time.Now()
+	input, plan, tcr, _, c, isvc, pod := disposedBackfillFixture(t, t0, false /* podReady */)
+	// A node-scoped fault leaves the container Running: no waiting reason,
+	// just never ContainersReady.
+	pod.Status.ContainerStatuses = nil
+	pod.Status.Phase = corev1.PodRunning
+	pod.Spec.NodeName = suspectNode
+	pod.Labels[query.LabelInstanceIncarnation] = "1"
+	plan.UpdateStrategy.Type = workload.UpdateStrategyRecreatePod
+	plan.Instances[0].ExcludedNodes = []string{suspectNode}
+
+	ctx := context.Background()
+	trigger, _, err := DetectUpdateTriggerWithPods(ctx, legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod})
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Fatalf("a stuck pod on the target revision must take the roll the relocation rides on")
+	}
+
+	if err := c.Create(ctx, pod); err != nil {
+		t.Fatalf("seed stuck pod: %v", err)
+	}
+	deps := legacyTestDeps(c)
+	if _, err := recreateUpdate(ctx, deps, *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod}); err != nil {
+		t.Fatalf("recreate (drain pass): %v", err)
+	}
+	live := &corev1.Pod{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(pod), live); !apierrors.IsNotFound(err) {
+		t.Fatalf("stuck pod must be deleted by the relocation rebuild: get err=%v", err)
+	}
+
+	// Next pass: the index is rebuilt at the bumped incarnation, steered
+	// off the recorded node by the exclusion overlay.
+	input.ObservedState.InstanceStatuses = legacyInstanceStatuses(c, isvc, workload.ComponentEngine)
+	legacyResetExpectations(t)
+	if _, err := recreateUpdate(ctx, deps, *input, plan, plan.Instances[0], tcr, nil); err != nil {
+		t.Fatalf("recreate (rebuild pass): %v", err)
+	}
+	rebuilt := &corev1.Pod{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(pod), rebuilt); err != nil {
+		t.Fatalf("rebuilt pod: %v", err)
+	}
+	if got := rebuilt.Labels[query.LabelInstanceIncarnation]; got != "2" {
+		t.Errorf("rebuilt pod incarnation: got %q want \"2\" (the stuck pod was replaced, not reused)", got)
+	}
+	if got := hostnameNotInValues(rebuilt); len(got) != 1 || got[0] != suspectNode {
+		t.Errorf("rebuilt pod hostname NotIn values: got %v want [%s]", got, suspectNode)
+	}
+}
+
+// TestDetectUpdate_BackfillAdoptsRuntimeReadyPods: the backfill's
+// legitimate purpose survives the guard — pods genuinely running the
+// target (runtime-ready) with a lost/never-written status record are
+// adopted: Ready stamped, RunningRevision backfilled, and the target's
+// block pruned (success at rev is real proof here).
+func TestDetectUpdate_BackfillAdoptsRuntimeReadyPods(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc, pod := disposedBackfillFixture(t, t0, true /* podReady */)
+
+	trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod})
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if trigger {
+		t.Errorf("runtime-ready pods on the target revision must not trigger an update")
+	}
+	if retryAfter != 0 {
+		t.Errorf("retryAfter: got %v want 0", retryAfter)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1 (success-prune)", len(*calls))
+	}
+	if call := (*calls)[0]; call.rev != tcr.Name || call.disposition != workload.RetryBlockRemove {
+		t.Errorf("prune: got (rev=%q, disposition=%v) want (%q, Remove)", call.rev, call.disposition, tcr.Name)
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceReady {
+		t.Errorf("phase: got %q want Ready (legitimate adoption)", s.Phase)
+	}
+	if s.RunningRevision != tcr.Name {
+		t.Errorf("RunningRevision: got %q want %q (backfilled)", s.RunningRevision, tcr.Name)
+	}
+}
+
+// TestDetectUpdate_BackfillAdoptsEngineRenderedPods: the adoption path
+// has to recognise the pods the engine itself writes. The renderer adds
+// hostname, subdomain and the serving readiness gate on top of the
+// desired template, so the pod under test is produced by the renderer
+// rather than hand-built — a comparison that cannot see past those
+// additions leaves this path unreachable in production.
+func TestDetectUpdate_BackfillAdoptsEngineRenderedPods(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc, _ := disposedBackfillFixture(t, t0, true /* podReady */)
+
+	inst := plan.Instances[0]
+	rendered, err := testRenderWithRevision(isvc, legacyTargetSpecImage("llama:v2"), nil, plan, inst,
+		inst.Runners[0], 0, query.RevisionHashFromControllerRevisionName(tcr.Name))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	rendered.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(t0),
+	}}
+
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, inst, tcr, []*corev1.Pod{rendered})
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if trigger {
+		t.Fatalf("an engine-rendered pod on the target revision must be adopted, not re-surged")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1 (success-prune)", len(*calls))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceReady || s.RunningRevision != tcr.Name {
+		t.Errorf("adoption stamp: got (phase=%q, runningRevision=%q) want (%q, %q)",
+			s.Phase, s.RunningRevision, v1beta1.OMENativeInstanceReady, tcr.Name)
+	}
+}
+
+// TestDetectUpdate_BackfillRollsPodSetWithAForeignRevision: adoption is
+// all-or-nothing over the Instance's pod set. One member on another
+// revision means the Instance is not on the target, so the row takes the
+// ordinary roll and nothing is stamped.
+func TestDetectUpdate_BackfillRollsPodSetWithAForeignRevision(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc, onTarget := disposedBackfillFixture(t, t0, true /* podReady */)
+
+	foreign := onTarget.DeepCopy()
+	foreign.Name = onTarget.Name + "-peer"
+	foreign.Labels[query.LabelRevisionHash] = "0badf00d"
+
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{onTarget, foreign})
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if !trigger {
+		t.Errorf("a pod set with a member on another revision must take the ordinary roll")
+	}
+	if len(*calls) != 0 {
+		t.Errorf("MutateRetryBlock calls: got %d want 0 (nothing adopted, nothing pruned)", len(*calls))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceFailed || s.RunningRevision != "" {
+		t.Errorf("row mutated: got (phase=%q, runningRevision=%q) want (%q, empty)",
+			s.Phase, s.RunningRevision, v1beta1.OMENativeInstanceFailed)
+	}
+}
+
+// TestPatchReadyOnRevisionWithOrdinal_PrunesBlock: the surge-promote
+// variant prunes likewise.
+func TestPatchReadyOnRevisionWithOrdinal_PrunesBlock(t *testing.T) {
+	t0 := time.Now()
+	input, _, tcr, calls, _, _ := retryGateFixture(t, t0)
+
+	if err := status.StampReadyAtOrdinal(context.Background(), *input, 0, tcr.Name, 1); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("MutateRetryBlock calls: got %d want 1", len(*calls))
+	}
+	if c := (*calls)[0]; c.rev != tcr.Name || c.disposition != workload.RetryBlockRemove {
+		t.Errorf("prune: got (rev=%q, disposition=%v) want (%q, Remove)", c.rev, c.disposition, tcr.Name)
+	}
+}
+
+// The update strategy an attempt runs under is fixed when its operation
+// opens. UpdateStrategy is not part of the revision payload, so editing it
+// retargets nothing: the attempt in flight keeps its mechanism and the edit
+// is picked up by the next attempt this Instance is admitted for. The tests
+// below drive each in-flight step with the strategy already flipped and
+// assert the attempt does not change mechanism.
+
+// TestUpdateWithPods_InPlacePatchIgnoresAStrategyEdit: a patch already
+// applied to a live pod cannot be taken back, so dispatching the recreate
+// machine over it would tear down a pod that is already converging — and
+// bump its Incarnation out from under the patch.
+func TestUpdateWithPods_InPlacePatchIgnoresAStrategyEdit(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir, op := inPlaceRollWithoutPods(t)
+	ir.Status.InstanceStatuses[0].Operation.Strategy = string(v1beta1.UpdateStrategyInPlaceIfPossible)
+	target := legacyTargetSpecImage("llama:v2")
+	pod := legacyPodAtIncarnation(isvc, 0, 1, false /* not ready */, false /* not serving */)
+	pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v1"}}
+	c := legacyNewFakeClient(t, isvc, ir, pod)
+	legacySeedRunningRevision(t, c, isvc, workload.ComponentEngine, 0, legacyTargetSpecImage("llama:v1"))
+	tcr := legacyEnsureTargetCR(t, c, isvc, target)
+	// The attempt is already converging on the target, so the in-place stamp
+	// recognizes its own state and the attempt's identity is observable.
+	live := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), live); err != nil {
+		t.Fatalf("re-read IR: %v", err)
+	}
+	live.Status.InstanceStatuses[0].TargetRevision = tcr.Name
+	live.Status.InstanceStatuses[0].Operation.TargetRevision = tcr.Name
+	if err := c.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("seed the attempt's target: %v", err)
+	}
+
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	// The desired strategy now says recreate; the pinned one still says
+	// in place.
+	plan := legacyComponentPlan(workload.UpdateStrategyRecreatePod, nil)
+	deps := workload.Deps{Client: c, Recorder: record.NewFakeRecorder(16)}
+
+	if _, err := UpdateWithPods(context.Background(), deps, input, plan, plan.Instances[0], tcr, target,
+		[]*corev1.Pod{pod}); err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Operation == nil || s.Operation.Step != workload.UpdateStepInPlace {
+		t.Fatalf("Operation: got %+v, want the patch still on Step=%s", s.Operation, workload.UpdateStepInPlace)
+	}
+	if s.Operation.ID != op.ID {
+		t.Errorf("Operation.ID: got %q want %q (the same attempt)", s.Operation.ID, op.ID)
+	}
+	if s.Operation.Strategy != string(v1beta1.UpdateStrategyInPlaceIfPossible) {
+		t.Errorf("Operation.Strategy: got %q, want the pin the attempt opened with", s.Operation.Strategy)
+	}
+	if s.Incarnation != 1 {
+		t.Errorf("Incarnation: got %d want 1 — a recreate ran over the in-flight patch", s.Incarnation)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Errorf("the patched pod is gone (%v): the edit flipped the attempt to recreate", err)
+	}
+}
+
+// TestUpdateWithPods_FailedRowPicksUpTheEditedStrategy: a Failed row holds
+// no attempt, so there is nothing to keep on a mechanism. Editing the
+// strategy is the operator's rescue lever out of a mode that cannot make
+// progress, and the next admitted attempt has to honour it.
+func TestUpdateWithPods_FailedRowPicksUpTheEditedStrategy(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 1,
+		Phase:       v1beta1.OMENativeInstanceFailed,
+		Operation: &v1beta1.InstanceOperation{
+			ID:             "update-0-1",
+			Type:           v1beta1.InstanceOperationUpdate,
+			Step:           workload.UpdateStepSurge,
+			Strategy:       string(v1beta1.UpdateStrategySurgeThenDrain),
+			StartedAt:      metav1.NewTime(time.Now().Add(-time.Hour)),
+			LastProgressAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+	}
+	target := legacyTargetSpecImage("llama:v2")
+	pod := legacyPodAtIncarnation(isvc, 0, 1, true /* ready */, true /* serving */)
+	pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v1"}}
+	c := legacyNewFakeClient(t, isvc, ir, pod)
+	legacySeedRunningRevision(t, c, isvc, workload.ComponentEngine, 0, legacyTargetSpecImage("llama:v1"))
+	tcr := legacyEnsureTargetCR(t, c, isvc, target)
+
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	plan := legacyComponentPlan(workload.UpdateStrategyRecreatePod, nil)
+	deps := workload.Deps{Client: c, Recorder: record.NewFakeRecorder(16)}
+
+	if _, err := UpdateWithPods(context.Background(), deps, input, plan, plan.Instances[0], tcr, target,
+		[]*corev1.Pod{pod}); err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Operation == nil {
+		t.Fatalf("no attempt was admitted off the Failed row")
+	}
+	if s.Operation.Strategy != string(v1beta1.UpdateStrategyRecreatePod) {
+		t.Errorf("Operation.Strategy: got %q, want the edited %q",
+			s.Operation.Strategy, v1beta1.UpdateStrategyRecreatePod)
+	}
+	if s.Operation.Step != workload.UpdateStepDrain {
+		t.Errorf("Operation.Step: got %q, want the recreate's %q", s.Operation.Step, workload.UpdateStepDrain)
+	}
+}
+
+// TestUpdateWithPods_RecreateDrainIgnoresAStrategyEdit: past the Incarnation
+// bump the old materialization is already being torn down. Handing the row to
+// the in-place patcher now would patch a pod that is on its way out and leave
+// the recreate's replacement unbuilt.
+func TestUpdateWithPods_RecreateDrainIgnoresAStrategyEdit(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 2)
+	target := legacyTargetSpecImage("llama:v2")
+	pod := legacyPodAtIncarnation(isvc, 0, 1, true /* ready */, true /* serving */)
+	pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v1"}}
+	c := legacyNewFakeClient(t, isvc, ir, pod)
+	legacySeedRunningRevision(t, c, isvc, workload.ComponentEngine, 0, legacyTargetSpecImage("llama:v1"))
+	tcr := legacyEnsureTargetCR(t, c, isvc, target)
+
+	live := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), live); err != nil {
+		t.Fatalf("re-read IR: %v", err)
+	}
+	live.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceUpdating
+	live.Status.InstanceStatuses[0].Incarnation = 2
+	live.Status.InstanceStatuses[0].TargetRevision = tcr.Name
+	live.Status.InstanceStatuses[0].Operation = &v1beta1.InstanceOperation{
+		ID:             "update-0-1",
+		Type:           v1beta1.InstanceOperationUpdate,
+		Step:           workload.UpdateStepDrain,
+		TargetRevision: tcr.Name,
+		Strategy:       string(v1beta1.UpdateStrategyRecreatePod),
+		StartedAt:      metav1.NewTime(time.Now().Add(-time.Minute)),
+		LastProgressAt: metav1.NewTime(time.Now().Add(-time.Minute)),
+		Deadline:       metav1.NewTime(time.Now().Add(29 * time.Minute)),
+	}
+	if err := c.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("seed the in-flight recreate: %v", err)
+	}
+
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	plan := legacyComponentPlan(workload.UpdateStrategyInPlaceIfPossible, nil)
+	deps := workload.Deps{Client: c, Recorder: record.NewFakeRecorder(16)}
+
+	if _, err := UpdateWithPods(context.Background(), deps, input, plan, plan.Instances[0], tcr, target,
+		[]*corev1.Pod{pod}); err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
+		t.Fatalf("Operation: got %+v, want the recreate still on Step=%s", s.Operation, workload.UpdateStepDrain)
+	}
+	if s.Operation.ID != "update-0-1" {
+		t.Errorf("Operation.ID: got %q want %q (the same attempt)", s.Operation.ID, "update-0-1")
+	}
+	if s.Operation.Strategy != string(v1beta1.UpdateStrategyRecreatePod) {
+		t.Errorf("Operation.Strategy: got %q, want the pin the attempt opened with", s.Operation.Strategy)
+	}
+	fresh := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), fresh); err == nil {
+		if got := fresh.Spec.Containers[0].Image; got != "llama:v1" {
+			t.Errorf("the draining pod was patched to %q: the edit flipped the attempt to in place", got)
+		}
+	}
+}
+
+// The replacement gang's marker index is driven entirely by the source's
+// gang surge. These tests pin the three consequences that show up inside
+// the ops package: the update strategy the pair runs under is the one
+// pinned when it started, the restart trigger does not treat the marker
+// as a row of its own, and the promote is what hands the index back to
+// the ordinary repair path.
+
+// gangMarkerRevision is the replacement gang's target.
+const gangMarkerRevision = "llama-70b-engine-gangtgt1"
+
+// TestEffectiveUpdateStrategy_GangSurgePairStaysOnThePinnedStrategy: the
+// strategy is pinned on the operation when the attempt starts, so a
+// strategy edit mid-surge does not switch the pair into another mode
+// halfway through. The gang surge stays in control and finishes under
+// SurgeThenDrain; the edit reaches the pair at its next admitted
+// attempt.
+func TestEffectiveUpdateStrategy_GangSurgePairStaysOnThePinnedStrategy(t *testing.T) {
+	surgeIndex := int32(2)
+	source := &workload.InstanceStatus{
+		Index:           0,
+		Incarnation:     1,
+		Phase:           workload.InstancePhaseUpdating,
+		RunningRevision: "llama-70b-engine-priorrev",
+		TargetRevision:  gangMarkerRevision,
+		Operation: &workload.InstanceOperation{
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepSurge,
+			Strategy:       workload.UpdateStrategySurgeThenDrain,
+			SurgeIndex:     &surgeIndex,
+			TargetRevision: gangMarkerRevision,
+		},
+	}
+	for _, edited := range []workload.UpdateStrategyType{
+		workload.UpdateStrategyRecreatePod,
+		workload.UpdateStrategyInPlaceOnly,
+	} {
+		t.Run(string(edited), func(t *testing.T) {
+			if got := effectiveUpdateStrategy(source, edited); got != workload.UpdateStrategySurgeThenDrain {
+				t.Errorf("effective strategy: got %q want the pinned SurgeThenDrain", got)
+			}
+		})
+	}
+
+	// Counter-case: with no attempt pinning it, the edit takes effect at
+	// once — so the pin above is the operation's doing, not a constant.
+	idle := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady}
+	if got := effectiveUpdateStrategy(idle, workload.UpdateStrategyRecreatePod); got != workload.UpdateStrategyRecreatePod {
+		t.Errorf("idle row effective strategy: got %q want the edited RecreatePod", got)
+	}
 }

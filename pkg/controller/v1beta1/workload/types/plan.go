@@ -2,7 +2,23 @@ package types
 
 import (
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// DeadlineAt is the Operation.Deadline an operation opening at now runs
+// under. A non-positive timeout means no readiness backstop is in force —
+// neither the per-Component spec.lifecycle.instanceReadyTimeout nor the
+// operator's lifecycle.instanceReadyTimeout is set — and yields the zero
+// Time, which the deadline predicate reads as "never expires". Without
+// this the operation would open on a deadline equal to its own start and
+// expire on the next pass.
+func DeadlineAt(now metav1.Time, timeout time.Duration) metav1.Time {
+	if timeout <= 0 {
+		return metav1.Time{}
+	}
+	return metav1.NewTime(now.Add(timeout))
+}
 
 // ComponentPlan is the desired Component → Instance → Runner → Pod
 // shape computed each reconcile from desired + observed state. Not
@@ -34,8 +50,17 @@ type ComponentPlan struct {
 	ReadyPolicy InstanceReadyPolicy
 
 	// InstanceReadyTimeout is the wait ceiling on a newly-created
-	// Instance becoming Ready.
+	// Instance becoming Ready: the per-Component
+	// spec.lifecycle.instanceReadyTimeout, else the operator's
+	// lifecycle.instanceReadyTimeout. Zero means neither is configured and
+	// operations open with no deadline.
 	InstanceReadyTimeout time.Duration
+
+	// GangScheduleTimeout bounds the per-PodGroup schedule timeout that a
+	// multi-pod Instance derives from InstanceReadyTimeout. Operator
+	// config (lifecycle.gangScheduleTimeout); nil means unconfigured and
+	// the derived value reaches the scheduler unclamped.
+	GangScheduleTimeout *GangScheduleTimeoutClamp
 
 	// MinReadySeconds is how long a newly Ready pod must stay Ready before
 	// it is Available. Rollout drains and promotions wait on Available
@@ -47,15 +72,18 @@ type ComponentPlan struct {
 	// never).
 	MigrationMode MigrationMode
 
-	// Paused stops the dispatcher from starting or advancing Migration,
-	// Update, or Create operations. Scale-down remains active so a reduced
-	// desired replica count can still release capacity, and the restart pass
-	// keeps repairing existing Instances at their current revision unless
-	// PauseFreeze is also set.
+	// Paused stops the dispatcher from starting a new operation or a new
+	// STEP: no Migration, Update, or Create work begins, while an attempt
+	// already in flight runs the step it is on to that step's boundary,
+	// so a hold never leaves an Instance mid-step. Scale-down remains
+	// active so a reduced desired replica count can still release
+	// capacity, and the restart pass keeps repairing existing Instances
+	// at their current revision unless PauseFreeze is also set.
 	Paused bool
 
-	// PauseFreeze deepens Paused to a full stop: the restart pass is
-	// suspended too. Meaningless unless Paused is true.
+	// PauseFreeze deepens Paused onto the restart pass: no repair starts,
+	// and one already under way only finishes its step. Meaningless
+	// unless Paused is true.
 	PauseFreeze bool
 
 	// TopologyKey is the resolved gang co-location node-label key for
@@ -164,9 +192,18 @@ type MigrationOverlay struct {
 	HintTargetNodes []string
 }
 
+// Runner names. A single-pod Instance has one RunnerDefault; a multi-pod
+// Instance has one RunnerLeader of size 1 and one RunnerWorker of the
+// configured worker size. The name is a segment of every pod name.
+const (
+	RunnerDefault = "default"
+	RunnerLeader  = "leader"
+	RunnerWorker  = "worker"
+)
+
 // RunnerPlan is the desired state for one Runner within an Instance.
 type RunnerPlan struct {
-	// Name is "leader", "worker", or "default" (single-pod).
+	// Name is RunnerLeader, RunnerWorker, or RunnerDefault (single-pod).
 	Name string
 	// Size is the number of pods of this Runner within the Instance.
 	Size int32

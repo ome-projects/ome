@@ -19,7 +19,7 @@ import (
 var (
 	placementPhase = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ome_isvc_placement_phase",
-		Help: "Always 1, labelled with the InferenceService's current multi-cluster placement phase (Pending, Racing, Placed, Failed). Exactly one series per ISVC.",
+		Help: "Always 1, labelled with the InferenceService's current multi-cluster placement phase (Pending, Admitting, Placed, Failed; legacy Racing may appear during upgrades). Exactly one series per ISVC.",
 	}, []string{"namespace", "isvc", "phase"})
 
 	placementWinner = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -29,7 +29,7 @@ var (
 
 	placementCandidate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ome_isvc_placement_candidate",
-		Help: "Always 1 per (ISVC, candidate cluster) the control plane has fanned out to, labelled with that candidate's phase (Placed, Admitted).",
+		Help: "Always 1 per (ISVC, candidate cluster) the control plane has fanned out to, labelled with that candidate's phase (Admitting, Admitted; legacy Placed may appear during upgrades).",
 	}, []string{"namespace", "isvc", "cluster", "phase"})
 
 	placementCandidateAdmitted = prometheus.NewGaugeVec(prometheus.GaugeOpts{

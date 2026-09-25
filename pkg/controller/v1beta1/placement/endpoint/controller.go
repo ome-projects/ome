@@ -2,11 +2,11 @@ package endpoint
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
 	"sort"
-	"time"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,28 +20,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	placementcontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/placement"
 )
 
 // Reconciler watches InferenceServices and their TrafficMaps on the control
-// plane and drives the selected publisher through one shared lifecycle.
+// plane and realizes the Gateway API publication lifecycle.
 type Reconciler struct {
 	client.Client
-	Log logr.Logger
-	// Publisher is the selected traffic backend. Required.
+	// APIReader provides the authoritative TrafficMap view used to serialize
+	// legacy endpoint effects behind TrafficMap publisher cleanup.
+	APIReader client.Reader
+	Log       logr.Logger
+	// Publisher is the Gateway API traffic backend. Required.
 	Publisher EndpointPublisher
 	// Config supplies the config-driven host/gateway/port/namespace inputs.
 	Config Config
-	// Active overrides Config.IsEnabled when set. Deployment-specific
-	// publishers use it to share this reconciler without requiring Gateway API
-	// configuration.
-	Active *bool
-	// UseTrafficMap makes the generated TrafficMap, including an empty map, the
-	// publisher's exact desired input instead of overlaying its weights on the
-	// placement-derived homes used by the Gateway API compatibility path.
-	UseTrafficMap bool
-	// RequeueAfter periodically reasserts external publisher state. Zero keeps
-	// the Gateway API publisher's existing refresh behavior.
-	RequeueAfter time.Duration
 }
 
 // +kubebuilder:rbac:groups=ome.io,resources=inferenceservices,verbs=get;list;watch;update;patch
@@ -60,12 +53,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return ctrl.Result{}, err
 	}
+	handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, req.NamespacedName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if handoffPending {
+		return ctrl.Result{}, nil
+	}
 
 	// Backend not configured: tear down anything already published — it carries no
 	// OwnerReferences, so dropping the finalizer without unpublishing leaks it —
 	// and release the object, deleted or not.
-	if !r.isActive() {
+	if !r.Config.IsEnabled() {
 		if controllerutil.ContainsFinalizer(isvc, EndpointFinalizer) {
+			handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if handoffPending {
+				return ctrl.Result{}, nil
+			}
 			if err := r.Publisher.Unpublish(ctx, isvc); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -81,22 +88,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.reconcileDelete(ctx, isvc)
 	}
 
-	var target Target
-	var ok bool
-	var err error
-	if r.UseTrafficMap {
-		target, ok, err = r.trafficMapTarget(ctx, isvc)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-	} else {
-		target, ok, err = r.resolveTarget(isvc, r.trafficMapWeights(ctx, isvc))
-		if err != nil {
-			// An invalid global-host template is an operator configuration error;
-			// surface it and retry on the next change rather than hot-looping.
-			r.Log.Error(err, "endpoint: resolve target failed", "isvc", req.String())
-			return ctrl.Result{}, nil
-		}
+	target, ok, err := r.resolveTarget(isvc, nil)
+	if err != nil {
+		// An invalid global-host template is an operator configuration error;
+		// surface it and retry on the next change rather than hot-looping.
+		r.Log.Error(err, "endpoint: resolve target failed", "isvc", req.String())
+		return ctrl.Result{}, nil
 	}
 
 	if !ok {
@@ -109,58 +106,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err := r.ensureFinalizer(ctx, isvc); err != nil {
 		return requeueOnConflict(err)
 	}
+	handoffPending, err = r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if handoffPending {
+		return ctrl.Result{}, nil
+	}
 	if err := r.Publisher.Publish(ctx, isvc, target); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.Log.Info("endpoint published", "isvc", req.String(), "backend", r.Publisher.Name(),
 		"globalHost", target.GlobalHost, "homes", len(target.Homes))
-	if r.RequeueAfter > 0 {
-		return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
-	}
 	if r.Config.GatewayBackend.EndpointSlices.Enabled && r.Config.GatewayBackend.EndpointSlices.AddressRefreshInterval > 0 {
 		return ctrl.Result{RequeueAfter: r.Config.GatewayBackend.EndpointSlices.AddressRefreshInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) isActive() bool {
-	if r.Active != nil {
-		return *r.Active
-	}
-	return r.Config.IsEnabled()
-}
-
-// trafficMapTarget resolves the exact routing table for a deployment-specific
-// publisher. A missing or empty map for a multi-cluster service is still a
-// valid empty target, allowing a stateful publisher to hold retired homes at
-// zero instead of restoring a static fallback.
-func (r *Reconciler) trafficMapTarget(ctx context.Context, isvc *v1beta1.InferenceService) (Target, bool, error) {
-	if isvc.Spec.Placement == nil {
-		return Target{}, false, nil
-	}
-	tm := &v1beta1.TrafficMap{}
-	err := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, tm)
-	if apierrors.IsNotFound(err) {
-		return Target{}, true, nil
-	}
-	if err != nil {
-		return Target{}, false, err
-	}
-
-	homes := make([]Home, 0, len(tm.Spec.Entries))
-	for _, entry := range tm.Spec.Entries {
-		if entry.Endpoint == nil || entry.Endpoint.Host == "" {
-			return Target{}, false, fmt.Errorf("TrafficMap entry %q has no endpoint host", entry.Cluster)
-		}
-		homes = append(homes, Home{
-			Cluster:     entry.Cluster,
-			Endpoint:    entry.Endpoint.String(),
-			BackendHost: hostOnly(entry.Endpoint.Host),
-			Weight:      entry.Weight,
-		})
-	}
-	sort.Slice(homes, func(i, j int) bool { return homes[i].Cluster < homes[j].Cluster })
-	return Target{Service: tm.Spec.Service, Homes: homes}, true, nil
+func routingOptedOut(isvc *v1beta1.InferenceService) bool {
+	return isvc.Spec.Routing != nil && isvc.Spec.Routing.Enabled != nil && !*isvc.Spec.Routing.Enabled
 }
 
 // resolveTarget builds the publication Target from status.placement. ok is false
@@ -185,46 +150,62 @@ func (r *Reconciler) resolveTarget(isvc *v1beta1.InferenceService, weights map[s
 		// Placed but no home is addressable yet — nothing concrete to point at.
 		return Target{}, false, nil
 	}
-	applyTrafficMapWeights(homes, weights)
-	return Target{Service: isvc.Name, GlobalHost: host, Homes: homes}, true, nil
+	weightsAuthoritative := applyTrafficMapWeights(homes, weights)
+	return Target{
+		Service:              isvc.Name,
+		GlobalHost:           host,
+		Homes:                homes,
+		WeightsAuthoritative: weightsAuthoritative,
+	}, true, nil
 }
 
-// trafficMapWeights returns the per-cluster apply-verbatim weights the routing
-// controller published for the ISVC in its TrafficMap, keyed by cluster, or nil
-// when no TrafficMap exists (routing disabled, or not yet generated). The
-// TrafficMap is an optional input: a missing map — or a read that fails — leaves
-// the reactive ready-replica weights in place, so the publisher works unchanged
-// when routing is off.
-func (r *Reconciler) trafficMapWeights(ctx context.Context, isvc *v1beta1.InferenceService) map[string]int32 {
+// legacyTrafficMapHandoffPending reads the authoritative handoff state for the
+// legacy publisher. A publisher finalizer or durable publisher-owned status
+// blocks all legacy effects. TrafficMap weights belong exclusively to the
+// TrafficMap publisher path; the legacy path always uses placement weights.
+func (r *Reconciler) legacyTrafficMapHandoffPending(
+	ctx context.Context,
+	key types.NamespacedName,
+) (bool, error) {
+	if r.APIReader == nil {
+		return false, errors.New("endpoint publisher API reader is not configured")
+	}
 	tm := &v1beta1.TrafficMap{}
-	if err := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, tm); err != nil {
-		if !apierrors.IsNotFound(err) {
-			r.Log.V(1).Info("endpoint: TrafficMap read failed, using reactive weights",
-				"isvc", client.ObjectKeyFromObject(isvc).String(), "err", err.Error())
+	if err := r.APIReader.Get(ctx, key, tm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
 		}
-		return nil
+		return false, fmt.Errorf("read TrafficMap handoff state for %s: %w", key, err)
 	}
-	weights := make(map[string]int32, len(tm.Spec.Entries))
-	for _, e := range tm.Spec.Entries {
-		weights[e.Cluster] = e.Weight
-	}
-	return weights
+	return trafficMapBlocksLegacyPublisher(tm), nil
+}
+
+func trafficMapBlocksLegacyPublisher(trafficMap *v1beta1.TrafficMap) bool {
+	return trafficMap != nil &&
+		(controllerutil.ContainsFinalizer(trafficMap, TrafficMapPublisherFinalizer) ||
+			publisherStatusNeedsFinalizer(trafficMap.Status, true))
 }
 
 // applyTrafficMapWeights overlays the TrafficMap's capacity-aware, health-gated
 // weights onto the serving homes, replacing the reactive ready-replica weight
 // homesFromPlacement seeds. A home absent from the map — or a nil map, when no
 // TrafficMap exists — keeps its reactive weight, so publication degrades to the
-// live ready-replica split when routing is off or the map lags placement.
-func applyTrafficMapWeights(homes []Home, weights map[string]int32) {
+// live ready-replica split when routing is off or the map lags placement. The
+// return value is true only when every current home had an explicit map entry;
+// only that complete table may authorize an all-zero route.
+func applyTrafficMapWeights(homes []Home, weights map[string]int32) bool {
 	if weights == nil {
-		return
+		return false
 	}
+	complete := true
 	for i := range homes {
 		if w, ok := weights[homes[i].Cluster]; ok {
 			homes[i].Weight = w
+		} else {
+			complete = false
 		}
 	}
+	return complete
 }
 
 // homesFromPlacement extracts the serving homes — admitted candidates that
@@ -270,6 +251,13 @@ func (r *Reconciler) reconcileUnpublish(ctx context.Context, isvc *v1beta1.Infer
 		// Never published; nothing to clean and no finalizer to drop.
 		return ctrl.Result{}, nil
 	}
+	handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if handoffPending {
+		return ctrl.Result{}, nil
+	}
 	if err := r.Publisher.Unpublish(ctx, isvc); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -282,6 +270,13 @@ func (r *Reconciler) reconcileUnpublish(ctx context.Context, isvc *v1beta1.Infer
 
 func (r *Reconciler) reconcileDelete(ctx context.Context, isvc *v1beta1.InferenceService) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(isvc, EndpointFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if handoffPending {
 		return ctrl.Result{}, nil
 	}
 	if err := r.Publisher.Unpublish(ctx, isvc); err != nil {
@@ -318,36 +313,108 @@ func requeueOnConflict(err error) (ctrl.Result, error) {
 
 // SetupWithManager wires the controller: reconcile ISVCs, but only react to
 // events that can change a publication decision — placement-status changes,
-// deletions, and the global-host annotation — plus TrafficMap spec changes, so a
-// weight-only update (which does not touch ISVC status) still re-publishes.
-// Routine ISVC spec churn does not re-publish on every reconcile.
+// deletions, and the global-host annotation — plus TrafficMap publication-input
+// changes. Routine ISVC and TrafficMap provenance churn does not re-publish.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		return fmt.Errorf("endpoint publisher API reader is not configured")
+	}
 	// Named explicitly so it doesn't collide with the placement controller
 	// (both do For(&InferenceService{})).
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(PlacementEndpointControllerName).
 		For(&v1beta1.InferenceService{}, builder.WithPredicates(placementPublishChange)).
-		// A TrafficMap is named after and owner-ref'd to its ISVC, so map a spec
-		// change back to that ISVC. Generation-gated: a weight change bumps the
-		// spec generation, while any future status write does not, so the publisher
-		// re-runs on new weights but not on its own status echo.
+		// A TrafficMap is named after its ISVC. Map by that stable key instead
+		// of its owner reference, which orphan deletion propagation may remove.
 		Watches(&v1beta1.TrafficMap{},
-			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(),
-				&v1beta1.InferenceService{}, handler.OnlyControllerOwner()),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			handler.EnqueueRequestsFromMapFunc(enqueueTrafficMapISVC),
+			builder.WithPredicates(trafficMapPublishChange)).
 		Complete(r)
 }
 
+func enqueueTrafficMapISVC(_ context.Context, object client.Object) []ctrl.Request {
+	if _, ok := object.(*v1beta1.TrafficMap); !ok {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: client.ObjectKeyFromObject(object)}}
+}
+
+// trafficMapPublishChange admits TrafficMap events that can change the
+// publisher's desired target. Entry order and routing provenance do not affect
+// publication; service, cluster, endpoint, and weight do.
+var trafficMapPublishChange = predicate.Funcs{
+	CreateFunc: func(event.CreateEvent) bool { return true },
+	DeleteFunc: func(event.DeleteEvent) bool { return true },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldTrafficMap, ok1 := e.ObjectOld.(*v1beta1.TrafficMap)
+		newTrafficMap, ok2 := e.ObjectNew.(*v1beta1.TrafficMap)
+		if !ok1 || !ok2 || oldTrafficMap == nil || newTrafficMap == nil {
+			return true // unexpected type: fail safe
+		}
+		if trafficMapBlocksLegacyPublisher(oldTrafficMap) != trafficMapBlocksLegacyPublisher(newTrafficMap) ||
+			oldTrafficMap.DeletionTimestamp.IsZero() != newTrafficMap.DeletionTimestamp.IsZero() {
+			return true
+		}
+		return !trafficMapPublicationEqual(oldTrafficMap, newTrafficMap)
+	},
+}
+
+type trafficMapPublicationEntry struct {
+	cluster  string
+	endpoint string
+	weight   int32
+}
+
+func trafficMapPublicationEqual(a, b *v1beta1.TrafficMap) bool {
+	if a.Spec.Service != b.Spec.Service || len(a.Spec.Entries) != len(b.Spec.Entries) {
+		return false
+	}
+	return slices.Equal(trafficMapPublicationEntries(a), trafficMapPublicationEntries(b))
+}
+
+func trafficMapPublicationEntries(tm *v1beta1.TrafficMap) []trafficMapPublicationEntry {
+	entries := make([]trafficMapPublicationEntry, 0, len(tm.Spec.Entries))
+	for i := range tm.Spec.Entries {
+		entry := &tm.Spec.Entries[i]
+		endpoint := ""
+		if entry.Endpoint != nil {
+			endpoint = entry.Endpoint.String()
+		}
+		entries = append(entries, trafficMapPublicationEntry{
+			cluster:  entry.Cluster,
+			endpoint: endpoint,
+			weight:   entry.Weight,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].cluster != entries[j].cluster {
+			return entries[i].cluster < entries[j].cluster
+		}
+		if entries[i].endpoint != entries[j].endpoint {
+			return entries[i].endpoint < entries[j].endpoint
+		}
+		return entries[i].weight < entries[j].weight
+	})
+	return entries
+}
+
 // placementPublishChange admits ISVC events that can change what the publisher
-// programs: any create/delete, and updates that change status.placement (winner,
-// phase, or endpoint) or the global-host annotation. Other spec/status churn is
-// dropped so the publisher is not re-driven needlessly.
+// programs: any create/delete, and updates that change placement eligibility,
+// status.placement (winner, phase, or endpoint), or the global-host annotation.
+// Other spec/status churn is dropped so the publisher is not re-driven
+// needlessly.
 var placementPublishChange = predicate.Funcs{
 	UpdateFunc: func(e event.UpdateEvent) bool {
 		oldISVC, ok1 := e.ObjectOld.(*v1beta1.InferenceService)
 		newISVC, ok2 := e.ObjectNew.(*v1beta1.InferenceService)
 		if !ok1 || !ok2 {
 			return true // unexpected type: fail safe
+		}
+		if placementcontroller.IsPlacementEligible(oldISVC) != placementcontroller.IsPlacementEligible(newISVC) {
+			return true
+		}
+		if routingOptedOut(oldISVC) != routingOptedOut(newISVC) {
+			return true
 		}
 		if !placementEqual(oldISVC.Status.Placement, newISVC.Status.Placement) {
 			return true

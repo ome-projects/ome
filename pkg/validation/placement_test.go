@@ -23,7 +23,7 @@ func TestValidatePlacement(t *testing.T) {
 		require.NoError(t, ValidatePlacement(spec(&v1beta1.PlacementSpec{
 			Mode:            v1beta1.PlacementModeSplit,
 			Requirements:    "accelerator in (gpu-a100, gpu-h100)",
-			ClusterSelector: "provider=cloud-a",
+			ClusterSelector: "provider=cloud-a,metadata.name in (cluster-a,cluster-b)",
 			Split:           &v1beta1.SplitSpec{Replicas: ptr.To(int32(4)), MaxReplicasPerCluster: 3, MinReplicasPerCluster: 1},
 		})))
 	})

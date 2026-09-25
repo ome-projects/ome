@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -20,7 +21,7 @@ import (
 // the string degrades to "revision -> <to>" so the target is always named.
 func recreateRevisionCause(input workload.ReconcileInput, idx int32, targetRev string) string {
 	from := ""
-	if s := findInstanceStatus(input.ObservedState.InstanceStatuses, idx); s != nil {
+	if s := input.ObservedState.Instance(idx); s != nil {
 		from = s.RunningRevision
 	}
 	return fmt.Sprintf("revision %s -> %s", from, targetRev)
@@ -34,9 +35,9 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 	// "First pass of recreate" = no in-flight Update or Step != Drain;
 	// the recreate stamp sets Step=Drain.
 	wasNotRecreating := true
-	if s := findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index); s != nil &&
+	if s := input.ObservedState.Instance(inst.Index); s != nil &&
 		s.Operation != nil && s.Operation.Type == workload.InstanceOperationUpdate &&
-		s.Operation.Step == updateStepDrain {
+		s.Operation.Step == workload.UpdateStepDrain {
 		wasNotRecreating = false
 	}
 	// Cause string for the recreate: "revision <from> → <to>". Recorded on
@@ -45,14 +46,14 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 	// a revision-pair reason vs a termination reason). "from" is the
 	// recorded RunningRevision; empty on the first-ever rollout.
 	cause := recreateRevisionCause(input, inst.Index, target.Name)
-	newInc, err := patchInstanceStatusRecreatingForUpdate(ctx, input, inst.Index, target.Name, cause, plan.InstanceReadyTimeout)
+	newInc, err := status.StampRecreating(ctx, input, inst.Index, target.Name, cause, plan.UpdateStrategy.Type, plan.InstanceReadyTimeout)
 	if err != nil {
 		return false, fmt.Errorf("bump Incarnation (instance=%d): %w", inst.Index, err)
 	}
 	if wasNotRecreating {
-		recordNormal(deps.Recorder, eventTarget(input), workload.EventReasonRecreateUpdateStarted,
+		workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonRecreateUpdateStarted,
 			"OMENative %s recreate (%s, incarnation=%d)",
-			instanceKey(input.Key.Component, inst.Index), cause, newInc)
+			workload.InstanceKey(input.Key.Component, inst.Index), cause, newInc)
 	}
 
 	oldPods, newPods, unknownPods := query.PartitionPodsByIncarnation(pods, newInc)
@@ -62,9 +63,9 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 	// down by Phase A. Same rationale as Restart.
 	if len(unknownPods) > 0 {
 		for _, pod := range unknownPods {
-			recordWarning(deps.Recorder, eventTarget(input), workload.EventReasonFoundOrphan,
+			workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonFoundOrphan,
 				"OMENative %s found orphan pod %s/%s without ome.io/instance-incarnation; refusing to recreate-update",
-				instanceKey(input.Key.Component, inst.Index), pod.Namespace, pod.Name)
+				workload.InstanceKey(input.Key.Component, inst.Index), pod.Namespace, pod.Name)
 		}
 		return false, nil
 	}
@@ -133,6 +134,15 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 	newInst.Incarnation = newInc
 
 	desired := expectedPodNamesForInstance(input, plan, newInst)
+	// A rebuilt pod the kubelet refused to admit never ran and never
+	// will, yet it still holds its name. Free it now rather than polling
+	// its readiness to the operation deadline.
+	if recycling, rerr := recycleAdmissionRejectedTargets(ctx, deps, input, inst.Index, inst.Index,
+		workload.InstanceOperationUpdate, newPods, desired); rerr != nil {
+		return false, fmt.Errorf("recycle rejected replacement (instance=%d): %w", inst.Index, rerr)
+	} else if recycling {
+		return false, nil
+	}
 	existingByName := query.IndexPodsByName(newPods)
 	missing := make([]podTarget, 0, len(desired))
 	for _, t := range desired {
@@ -153,10 +163,10 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 		return false, nil
 	}
 
-	// Phase C: flip serving, then wait for kubelet to fold the readiness gate
-	// into PodReady before promoting. ContainersReady only proves the runtime
-	// probe passed; a pod is not eligible for its Service until PodReady is
-	// true, and promotion releases the slot that holds the next Instance's drain.
+	// Phase C: flip serving, then hold at the shared promote bar. ContainersReady
+	// only proves the runtime probe passed; a pod is not eligible for its Service
+	// until kubelet folds the readiness gate into PodReady, and promotion releases
+	// the slot that holds the next Instance's drain.
 	if !query.AllPodsRuntimeReady(newPods) {
 		return false, nil
 	}
@@ -170,21 +180,15 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 			return false, fmt.Errorf("mark serving (instance=%d, pod=%s): %w", inst.Index, pod.Name, err)
 		}
 	}
-	for _, pod := range newPods {
-		if !podreadiness.IsPodReady(pod) {
-			return false, nil
-		}
-	}
-	// Under a minReadySeconds window promotion additionally waits until every
-	// new pod has stayed Ready for that long.
-	if plan.MinReadySeconds > 0 && !podsAvailable(newPods, plan.MinReadySeconds, input.Now()) {
+	if promotable, wait := query.PodSetPromotable(newPods, plan.MinReadySeconds, input.Now()); !promotable {
+		input.PromoteWindow.Observe(wait)
 		return false, nil
 	}
-	if err := patchInstanceStatusReadyOnRevision(ctx, input, inst.Index, target.Name); err != nil {
+	if err := status.StampReadyOnRevision(ctx, input, inst.Index, target.Name); err != nil {
 		return false, fmt.Errorf("patch status Ready (instance=%d): %w", inst.Index, err)
 	}
-	recordNormal(deps.Recorder, eventTarget(input), workload.EventReasonRecreateUpdateCompleted,
+	workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonRecreateUpdateCompleted,
 		"OMENative %s recreate to revision %s complete",
-		instanceKey(input.Key.Component, inst.Index), target.Name)
+		workload.InstanceKey(input.Key.Component, inst.Index), target.Name)
 	return true, nil
 }

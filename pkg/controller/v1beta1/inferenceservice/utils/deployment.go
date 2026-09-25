@@ -123,8 +123,34 @@ func DetermineEntrypointComponent(isvc *v1beta1.InferenceService) v1beta1.Compon
 	return v1beta1.EngineComponent
 }
 
-// IsMultiPodComponent reports whether a Component has a positive Worker.Size.
-// Router is always single-pod.
+// InferenceServiceDeploymentMode resolves the mode of the InferenceService
+// as a whole: the top-level ome.io/deploymentMode annotation, then
+// spec.deploymentMode, then the declared shape (Engine+Decoder is
+// PDDisaggregated, an Engine Leader+Worker pair is OMENative), then the
+// operator default. It gates the InferenceService-level paths
+// (VirtualDeployment, status); per-Component dispatch uses
+// DetermineDeploymentModes.
+func InferenceServiceDeploymentMode(isvc *v1beta1.InferenceService, defaultMode constants.DeploymentModeType) constants.DeploymentModeType {
+	if isvc == nil {
+		return defaultMode
+	}
+	if mode, found := GetDeploymentModeFromAnnotations(isvc.Annotations); found {
+		return mode
+	}
+	if mode, found := deploymentModeFromSpecField(isvc.Spec.DeploymentMode); found {
+		return mode
+	}
+	if isvc.Spec.Engine != nil && isvc.Spec.Decoder != nil {
+		return constants.PDDisaggregated
+	}
+	if isvc.Spec.Engine != nil && isvc.Spec.Engine.Leader != nil && isvc.Spec.Engine.Worker != nil {
+		return constants.OMENative
+	}
+	return defaultMode
+}
+
+// IsMultiPodComponent reports whether a Component declares a Worker that
+// spawns at least one pod. Router is always single-pod.
 func IsMultiPodComponent(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) bool {
 	if isvc == nil {
 		return false
@@ -141,13 +167,15 @@ func IsMultiPodComponent(isvc *v1beta1.InferenceService, component v1beta1.Compo
 }
 
 // engineSpawnsMultiplePods is the Engine-specific tail of
-// IsMultiPodComponent. It requires a positive Worker.Size so selector
-// tightening only applies when at least two pods exist per Instance.
+// IsMultiPodComponent. An unset Worker.Size resolves to one worker at
+// reconcile time, so a declared Worker is multi-pod unless its size is
+// explicitly non-positive; selector tightening then applies only when at
+// least two pods exist per Instance.
 func engineSpawnsMultiplePods(engine *v1beta1.EngineSpec) bool {
 	if engine == nil {
 		return false
 	}
-	return engine.Worker != nil && engine.Worker.Size != nil && *engine.Worker.Size > 0
+	return workerSpawnsPods(engine.Worker)
 }
 
 // decoderSpawnsMultiplePods is the Decoder-specific tail of
@@ -156,5 +184,9 @@ func decoderSpawnsMultiplePods(decoder *v1beta1.DecoderSpec) bool {
 	if decoder == nil {
 		return false
 	}
-	return decoder.Worker != nil && decoder.Worker.Size != nil && *decoder.Worker.Size > 0
+	return workerSpawnsPods(decoder.Worker)
+}
+
+func workerSpawnsPods(worker *v1beta1.WorkerSpec) bool {
+	return worker != nil && (worker.Size == nil || *worker.Size > 0)
 }

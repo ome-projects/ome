@@ -28,6 +28,10 @@ spec:
     - jsonPath: .spec.runtime.name
       name: Runtime
       type: string
+    - jsonPath: .status.placement.phase
+      name: Placement
+      priority: 1
+      type: string
     - jsonPath: .status.rollout.activeRun.plan.groups[0].source
       name: Plan-Source
       priority: 1

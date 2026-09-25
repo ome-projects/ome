@@ -1,5 +1,7 @@
 package endpoint
 
+import placementcontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/placement"
+
 // PlacementEndpointControllerName names the endpoint publisher — explicit so it
 // doesn't collide with the placement controller (both watch InferenceService).
 const PlacementEndpointControllerName = "placement-endpoint"
@@ -26,9 +28,7 @@ const (
 	// resources from several source namespaces.
 	PlacementEndpointISVCNamespaceLabel = "ome.io/placement-endpoint-isvc-namespace"
 
-	// EndpointFinalizer keeps a placed InferenceService around long enough for the
-	// publisher to tear down its global-traffic backend before the object is
-	// removed. Distinct from the placement controller's own finalizer so the two
-	// controllers' teardown order is independent.
-	EndpointFinalizer = "ome.io/placement-endpoint"
+	// EndpointFinalizer keeps a placed InferenceService and its derived workloads
+	// around until the publisher has removed its global-traffic backend.
+	EndpointFinalizer = placementcontroller.EndpointFinalizer
 )

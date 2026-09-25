@@ -33,6 +33,10 @@ type Target struct {
 	// home. In Single there is exactly one; in All/Split there is one per cluster
 	// currently serving. Never empty when the reconciler decides to publish.
 	Homes []Home
+
+	// WeightsAuthoritative means the Home weights came from a TrafficMap and
+	// must be applied verbatim, including an intentionally all-zero set.
+	WeightsAuthoritative bool
 }
 
 // Home is one serving cluster the global host load-balances across.
@@ -50,8 +54,8 @@ type Home struct {
 	// capacity-aware, health-gated weight when the routing controller has
 	// published one, else the reactive ready-replica count (its ready replicas in
 	// Split, zero in Single/All or for a Split home with no ready replicas yet).
-	// The publisher equal-weights all homes when every weight is zero, so an
-	// unweighted placement routes evenly rather than dropping to no-traffic.
+	// Unless Target.WeightsAuthoritative is set, the publisher equal-weights all
+	// homes when every weight is zero, so an unweighted placement routes evenly.
 	Weight int32
 }
 

@@ -1,902 +1,412 @@
-package ops_test
+package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// Test file is in package ops_test so tests only see the workload.*
-// API surface — no privileged access to ops/ internals.
+// Every pod of a multi-pod Instance is stamped with its gang's
+// deterministic PodGroup name. When that name is held by another
+// controller, or by an object still being collected, a member created
+// against it would join a group this owner does not control — so the
+// create choke point withholds the members and leaves the row to the
+// escalation pass instead of failing the whole reconcile.
 
-// newFakeClient builds a controller-runtime fake client with the
-// scheme the workload reconciler needs.
-func newFakeClient(t *testing.T, initObjs ...client.Object) client.Client {
+// blockedGangFixture is the gang-surge fixture with its rejected member
+// removed, so the pass reaches the create step, and the surge index
+// classified as unusable.
+func blockedGangFixture(t *testing.T, state workload.GangState) *gangRejectionFixture {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
+	legacyResetExpectations(t)
+	f := newGangRejectionFixture(t, "OutOfmemory")
+	if err := f.client.Delete(context.Background(), f.dead); err != nil {
+		t.Fatalf("clear the pre-existing surge pod: %v", err)
 	}
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add v1beta1: %v", err)
-	}
-	if err := appsv1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add appsv1: %v", err)
-	}
-	if err := discoveryv1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add discoveryv1: %v", err)
-	}
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
-		WithObjects(initObjs...).
-		Build()
+	f.input.Gangs = workload.NewGangObservations()
+	f.input.Gangs.Record(f.surgeIndex, workload.GangObservation{
+		Name:    query.PodGroupName(f.isvcName, workload.ComponentEngine, f.surgeIndex),
+		State:   state,
+		Message: "PodGroup is not usable by this owner",
+	})
+	return f
 }
 
-// irName is the InferenceReplica name the ops_test helpers persist per-instance
-// status on (matches irprojector.InferenceReplicaName: isvcName-component).
-func irName(isvc *v1beta1.InferenceService, component workload.ComponentType) string {
-	return isvc.Name + "-" + string(component)
-}
-
-// instanceIR builds the InferenceReplica carrying the given per-instance
-// statuses for (isvc, component). The IR is the source of truth for
-// per-instance detail (the ISVC carries none), so fixtures seed it here
-// and pass the returned IR to newFakeClient alongside the ISVC.
-func instanceIR(isvc *v1beta1.InferenceService, component workload.ComponentType, insts ...v1beta1.OMENativeInstanceStatus) *v1beta1.InferenceReplica {
-	return &v1beta1.InferenceReplica{
-		ObjectMeta: metav1.ObjectMeta{Namespace: isvc.Namespace, Name: irName(isvc, component)},
-		Status:     v1beta1.InferenceReplicaStatus{InstanceStatuses: insts},
-	}
-}
-
-// instanceStatusesOnIR re-reads the InferenceReplica and returns its persisted
-// per-instance statuses, the authoritative copy assertions check. Returns nil
-// when the IR does not exist.
-func instanceStatusesOnIR(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType) []v1beta1.OMENativeInstanceStatus {
-	ir := &v1beta1.InferenceReplica{}
-	key := types.NamespacedName{Namespace: isvc.Namespace, Name: irName(isvc, component)}
-	if err := c.Get(context.Background(), key, ir); err != nil {
-		return nil
-	}
-	return ir.Status.InstanceStatuses
-}
-
-// minimalISVC builds an ISVC with the minimum metadata Create() needs.
-// The fake-client status-write path needs a concrete owner object to
-// round-trip; workload code reads the resulting ReconcileInput
-// opaquely.
-func minimalISVC(name, ns string, replicas int) *v1beta1.InferenceService {
-	mr := replicas
-	return &v1beta1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-			UID:       types.UID(name + "-uid"),
-		},
-		Spec: v1beta1.InferenceServiceSpec{
-			Engine: &v1beta1.EngineSpec{
-				ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
-					MinReplicas: &mr,
-				},
-			},
-		},
-	}
-}
-
-// testRevisionHash is the synthetic revision hash stamped on test
-// pods (matches what production Render emits via ome.io/revision-hash).
-const testRevisionHash = "testrev1"
-
-// testPodLabels reproduces the label set workload/ops.Render stamps
-// on every emitted pod. Duplicated here because Render's helper is
-// private to ops/; tests in ops_test fabricate pods directly.
-func testPodLabels(isvc string, component workload.ComponentType, instanceIdx int32, runner string, incarnation int64, ordinal int32) map[string]string {
-	return map[string]string{
-		constants.InferenceServicePodLabelKey: isvc,
-		constants.OMEComponentLabel:           string(component),
-		query.LabelInstanceIdx:                fmt.Sprintf("%d", instanceIdx),
-		query.LabelInstanceIncarnation:        fmt.Sprintf("%d", incarnation),
-		query.LabelRunner:                     runner,
-		query.LabelManagedBy:                  query.ManagedByOMENative,
-		query.LabelPodOrdinal:                 fmt.Sprintf("%d", ordinal),
-	}
-}
-
-// buildTestInput projects the ISVC under test onto a
-// workload.ReconcileInput. MutateInstance round-trips through the
-// fake client's Status().Update so tests can assert on the persisted
-// ISVC.Status.
-func buildTestInput(isvc *v1beta1.InferenceService, c client.Client, component workload.ComponentType) workload.ReconcileInput {
-	// Delegate to the production converter rather than re-listing fields:
-	// a field the reconciler reads but the helper forgets to copy is a
-	// silently-passing test.
-	instances := v1beta1convert.InstanceStatusSliceToWorkload(instanceStatusesOnIR(c, isvc, component))
-	return workload.ReconcileInput{
-		OwnerObject: isvc,
-		OwnerGVK:    v1beta1.SchemeGroupVersion.WithKind("InferenceService"),
-		EventTarget: isvc,
-		Key: workload.Key{
-			Namespace:   isvc.Namespace,
-			OwnerName:   isvc.Name,
-			Component:   workload.ComponentType(component),
-			OwnerLabels: isvc.Labels,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvc.Name,
-				constants.OMEComponentLabel:           string(component),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
-		},
-		DesiredSpec: workload.WorkloadDesiredSpec{
-			PodSpec: &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}},
-		},
-		ObservedState: workload.WorkloadObservedState{
-			InstanceStatuses: instances,
-		},
-		MutateInstance: testMutateInstance(c, isvc, component),
-	}
-}
-
-// testMutateInstance is the test-side persistence layer for
-// ReconcileInput.MutateInstance. Skips retry.RetryOnConflict (fake
-// client has no optimistic-concurrency failures to retry).
-func testMutateInstance(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType) func(ctx context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
-	return func(ctx context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
-		ir := &v1beta1.InferenceReplica{}
-		key := types.NamespacedName{Namespace: isvc.Namespace, Name: irName(isvc, component)}
-		create := false
-		if err := c.Get(ctx, key, ir); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("get IR: %w", err)
-			}
-			ir = &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
-			create = true
-		}
-		pos := -1
-		for i, s := range ir.Status.InstanceStatuses {
-			if s.Index == idx {
-				pos = i
-				break
-			}
-		}
-		var w workload.InstanceStatus
-		if pos == -1 {
-			w = workload.InstanceStatus{Index: idx}
-		} else {
-			s := ir.Status.InstanceStatuses[pos]
-			w = workload.InstanceStatus{
-				Index:           s.Index,
-				Incarnation:     s.Incarnation,
-				Phase:           workload.InstancePhase(s.Phase),
-				RunningRevision: s.RunningRevision,
-				TargetRevision:  s.TargetRevision,
-				ActiveOrdinal:   s.ActiveOrdinal,
-				Operation:       fromV1beta1Op(s.Operation),
-				LastFailure:     fromV1beta1Termination(s.LastFailure),
-			}
-		}
-		if !mutate(&w) {
-			return nil
-		}
-		updated := v1beta1.OMENativeInstanceStatus{
-			Index:           w.Index,
-			Incarnation:     w.Incarnation,
-			Phase:           v1beta1.OMENativeInstancePhase(w.Phase),
-			RunningRevision: w.RunningRevision,
-			TargetRevision:  w.TargetRevision,
-			ActiveOrdinal:   w.ActiveOrdinal,
-			Operation:       toV1beta1Op(w.Operation),
-			LastFailure:     toV1beta1Termination(w.LastFailure),
-		}
-		if pos == -1 {
-			ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, updated)
-		} else {
-			ir.Status.InstanceStatuses[pos] = updated
-		}
-		if create {
-			bare := &v1beta1.InferenceReplica{ObjectMeta: ir.ObjectMeta}
-			if err := c.Create(ctx, bare); err != nil {
-				return fmt.Errorf("create IR: %w", err)
-			}
-			bare.Status = ir.Status
-			ir = bare
-		}
-		return c.Status().Update(ctx, ir)
-	}
-}
-
-func fromV1beta1Op(op *v1beta1.InstanceOperation) *workload.InstanceOperation {
-	if op == nil {
-		return nil
-	}
-	out := &workload.InstanceOperation{
-		ID:             op.ID,
-		Type:           workload.InstanceOperationType(op.Type),
-		Step:           op.Step,
-		StartedAt:      op.StartedAt,
-		LastProgressAt: op.LastProgressAt,
-		Deadline:       op.Deadline,
-		RetryCount:     op.RetryCount,
-		TargetRevision: op.TargetRevision,
-		Reason:         op.Reason,
-		Waiting:        op.Waiting,
-		FromNode:       op.FromNode,
-		RequestUUID:    op.RequestUUID,
-	}
-	if op.SurgeIndex != nil {
-		s := *op.SurgeIndex
-		out.SurgeIndex = &s
-	}
-	if op.HintTargetNodes != nil {
-		out.HintTargetNodes = append([]string(nil), op.HintTargetNodes...)
-	}
-	return out
-}
-
-func toV1beta1Op(op *workload.InstanceOperation) *v1beta1.InstanceOperation {
-	if op == nil {
-		return nil
-	}
-	out := &v1beta1.InstanceOperation{
-		ID:             op.ID,
-		Type:           v1beta1.InstanceOperationType(op.Type),
-		Step:           op.Step,
-		StartedAt:      op.StartedAt,
-		LastProgressAt: op.LastProgressAt,
-		Deadline:       op.Deadline,
-		RetryCount:     op.RetryCount,
-		TargetRevision: op.TargetRevision,
-		Reason:         op.Reason,
-		Waiting:        op.Waiting,
-		FromNode:       op.FromNode,
-		RequestUUID:    op.RequestUUID,
-	}
-	if op.SurgeIndex != nil {
-		s := *op.SurgeIndex
-		out.SurgeIndex = &s
-	}
-	if op.HintTargetNodes != nil {
-		out.HintTargetNodes = append([]string(nil), op.HintTargetNodes...)
-	}
-	return out
-}
-
-func fromV1beta1Termination(t *v1beta1.InstanceTermination) *workload.InstanceTermination {
-	if t == nil {
-		return nil
-	}
-	out := &workload.InstanceTermination{
-		PodName:       t.PodName,
-		ContainerName: t.ContainerName,
-		Reason:        t.Reason,
-		Message:       t.Message,
-		Time:          t.Time,
-	}
-	if t.ExitCode != nil {
-		e := *t.ExitCode
-		out.ExitCode = &e
-	}
-	return out
-}
-
-func toV1beta1Termination(t *workload.InstanceTermination) *v1beta1.InstanceTermination {
-	if t == nil {
-		return nil
-	}
-	out := &v1beta1.InstanceTermination{
-		PodName:       t.PodName,
-		ContainerName: t.ContainerName,
-		Reason:        t.Reason,
-		Message:       t.Message,
-		Time:          t.Time,
-	}
-	if t.ExitCode != nil {
-		e := *t.ExitCode
-		out.ExitCode = &e
-	}
-	return out
-}
-
-// findInstanceStatusOnIR looks up the InstanceStatus by (component, idx) on the
-// authoritative InferenceReplica (the ISVC carries no per-instance detail).
-// Returns nil when the IR or the instance is absent.
-func findInstanceStatusOnIR(c client.Client, isvc *v1beta1.InferenceService, component workload.ComponentType, idx int32) *v1beta1.OMENativeInstanceStatus {
-	if isvc == nil {
-		return nil
-	}
-	ir := &v1beta1.InferenceReplica{}
-	key := types.NamespacedName{Namespace: isvc.Namespace, Name: irName(isvc, component)}
-	if err := c.Get(context.Background(), key, ir); err != nil {
-		return nil
-	}
-	for i := range ir.Status.InstanceStatuses {
-		if ir.Status.InstanceStatuses[i].Index == idx {
-			return &ir.Status.InstanceStatuses[i]
-		}
-	}
-	return nil
-}
-
-// buildPlanSinglePodEngine builds the workload.ComponentPlan a
-// single-pod engine reconcile uses. Replicas drives the count.
-func buildPlanSinglePodEngine(replicas int32) workload.ComponentPlan {
-	instances := make([]workload.InstancePlan, replicas)
-	for i := int32(0); i < replicas; i++ {
-		instances[i] = workload.InstancePlan{
-			Index:       i,
-			Incarnation: 1,
-			Runners:     []workload.RunnerPlan{{Name: "default", Size: 1}},
-		}
-	}
-	return workload.ComponentPlan{
-		Component:            workload.ComponentEngine,
-		Replicas:             replicas,
-		Instances:            instances,
-		InstanceReadyTimeout: 30 * time.Minute,
-	}
-}
-
-// resetExpectations re-seats the expectations singleton so back-to-
-// back tests don't observe prior ExpectCreates entries.
-func resetExpectations(t *testing.T) {
+func gangPodCount(t *testing.T, f *gangRejectionFixture) int {
 	t.Helper()
-	workload.DefaultExpectations = workload.NewExpectations()
-}
-
-// podForInstance fabricates a pod matching what Render() would
-// produce for the given (ISVC, instance) pair. The `ready` knob
-// synthesizes ContainersReady=True, not PodReady=True — PodReady
-// requires every readiness gate (including ome.io/serving), which is
-// exactly what the controller is about to write.
-func podForInstance(isvc *v1beta1.InferenceService, instanceIdx int32, ready, serving bool) *corev1.Pod {
-	labels := testPodLabels(isvc.Name, workload.ComponentEngine, instanceIdx, "default", 1, 0)
-	labels[query.LabelRevisionHash] = testRevisionHash
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      query.PodName(isvc.Name, workload.ComponentEngine, instanceIdx, "default", 0),
-			Namespace: isvc.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "main", Image: "test:v1"}},
-		},
-	}
-	now := metav1.NewTime(time.Now())
-	if ready {
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type:               corev1.ContainersReady,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: now,
-		})
-	}
-	if serving {
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type:               query.ServingConditionType,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: now,
-		})
-	}
-	return pod
-}
-
-func TestCreate_NilClient(t *testing.T) {
-	resetExpectations(t)
-	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
-	_, err := ops.Create(context.Background(), workload.Deps{}, workload.ReconcileInput{}, plan, nil)
-	if err == nil {
-		t.Fatal("expected error for nil client")
-	}
-}
-
-func TestCreate_EmptyClusterCreatesPodsAndRequeues(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 2)
-	c := newFakeClient(t, isvc)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(2)
-
-	result, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if result.RequeueAfter == 0 {
-		t.Errorf("expected Requeue, got %+v", result)
-	}
-
-	// Assert two pods exist with the expected stable names.
 	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(pods.Items) != 2 {
-		t.Fatalf("expected 2 pods, got %d", len(pods.Items))
-	}
-	want := map[string]bool{
-		"llama-70b-engine-0-default-0": true,
-		"llama-70b-engine-1-default-0": true,
-	}
-	for _, pod := range pods.Items {
-		if !want[pod.Name] {
-			t.Errorf("unexpected pod: %s", pod.Name)
-		}
-		delete(want, pod.Name)
-		// Initial create stamps Incarnation=1 on every pod.
-		if got := pod.Labels[query.LabelInstanceIncarnation]; got != "1" {
-			t.Errorf("pod %s %s label: got %q want 1", pod.Name, query.LabelInstanceIncarnation, got)
-		}
-	}
-	if len(want) > 0 {
-		t.Errorf("missing pods: %v", want)
-	}
-
-	// InstanceStatus for each Instance should be Creating with an Operation.
-	insts := instanceStatusesOnIR(c, isvc, workload.ComponentEngine)
-	if len(insts) != 2 {
-		t.Fatalf("InstanceStatuses: got %d want 2", len(insts))
-	}
-	for _, s := range insts {
-		if s.Phase != v1beta1.OMENativeInstanceCreating {
-			t.Errorf("instance %d Phase: got %q want Creating", s.Index, s.Phase)
-		}
-		if s.Incarnation != 1 {
-			t.Errorf("instance %d Incarnation: got %d want 1", s.Index, s.Incarnation)
-		}
-		if s.Operation == nil || s.Operation.Type != v1beta1.InstanceOperationCreate {
-			t.Errorf("instance %d Operation: %+v", s.Index, s.Operation)
-			continue
-		}
-		// Deadline must be a strictly future time — proves InstanceReadyTimeout
-		// is being threaded through to the status anchor and isn't left zero.
-		if !s.Operation.Deadline.After(s.Operation.StartedAt.Time) {
-			t.Errorf("instance %d Operation.Deadline: got %v, want > StartedAt %v",
-				s.Index, s.Operation.Deadline, s.Operation.StartedAt)
-		}
-	}
-}
-
-func TestCreate_AllPodsExistButNotReady_HoldsCreating(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	pod := podForInstance(isvc, 0, false /* ready */, false /* serving */)
-	c := newFakeClient(t, isvc, pod)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-
-	result, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if result.RequeueAfter == 0 {
-		t.Errorf("expected Requeue while waiting for Ready")
-	}
-	// Pod should not have been re-created (still 1).
-	pods := &corev1.PodList{}
-	_ = c.List(context.Background(), pods, client.InNamespace("prod"))
-	if len(pods.Items) != 1 {
-		t.Errorf("pods: got %d want 1", len(pods.Items))
-	}
-}
-
-func TestCreate_AllPodsReady_FlipsServingAndMarksReady(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	pod := podForInstance(isvc, 0, true /* ready */, false /* serving */)
-	c := newFakeClient(t, isvc, pod)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-
-	result, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if result.RequeueAfter != 0 {
-		t.Errorf("expected no Requeue when all pods Ready, got %+v", result)
-	}
-
-	// Pod should have ome.io/serving=True now.
-	got := &corev1.Pod{}
-	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), got); err != nil {
-		t.Fatalf("get pod: %v", err)
-	}
-	if !podreadiness.IsServing(got) {
-		t.Errorf("pod %s ome.io/serving not flipped: conditions=%+v", got.Name, got.Status.Conditions)
-	}
-
-	// InstanceStatus should be Ready with Operation=nil.
-	insts := instanceStatusesOnIR(c, isvc, workload.ComponentEngine)
-	if len(insts) != 1 {
-		t.Fatalf("status missing: %+v", insts)
-	}
-	is := insts[0]
-	if is.Phase != v1beta1.OMENativeInstanceReady {
-		t.Errorf("Phase: got %q want Ready", is.Phase)
-	}
-	if is.Operation != nil {
-		t.Errorf("Operation: want nil, got %+v", is.Operation)
-	}
-}
-
-func TestCreate_PartialPods_CreatesOnlyMissing(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 2)
-	// Instance 0 already exists; Instance 1 missing.
-	existing := podForInstance(isvc, 0, false, false)
-	c := newFakeClient(t, isvc, existing)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(2)
-
-	_, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	pods := &corev1.PodList{}
-	_ = c.List(context.Background(), pods, client.InNamespace("prod"))
-	if len(pods.Items) != 2 {
-		t.Fatalf("expected 2 pods, got %d", len(pods.Items))
-	}
-}
-
-// A corrective edit can advance the live target while an initial gang Create
-// is only partially materialized. The surviving pod still belongs to the
-// pinned Create attempt, so backfilling the missing member from the new target
-// would produce a mixed-revision gang that can never converge as one attempt.
-func TestCreate_CorrectiveEditDuringPartialGangDoesNotMixRevisions(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	const priorRevision = "llama-70b-engine-bad0bad0"
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-good0bad", Namespace: "prod"},
-	}
-	ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:       0,
-		Incarnation: 1,
-		Phase:       v1beta1.OMENativeInstanceCreating,
-		PodCount:    1,
-		Operation: &v1beta1.InstanceOperation{
-			ID:             "create-0-1",
-			Type:           v1beta1.InstanceOperationCreate,
-			Step:           "CreatePods",
-			TargetRevision: priorRevision,
-		},
-	})
-	leader := gangPod(isvc, 0, "leader", 0, 1, false, false)
-	leader.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(priorRevision)
-	c := newFakeClient(t, isvc, ir, leader)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyNone)
-
-	result, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if !result.Requeue {
-		t.Fatalf("superseded Create retirement must requeue immediately: %+v", result)
-	}
-
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+	if err := f.client.List(context.Background(), pods, client.InNamespace(f.namespace)); err != nil {
 		t.Fatalf("list pods: %v", err)
 	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("superseded partial Create must not mix revisions: got %d pods, want the one prior-revision survivor", len(pods.Items))
-	}
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Operation != nil {
-		t.Fatalf("superseded pinned Create must retire; got %+v", s)
-	}
+	return len(pods.Items)
 }
 
-func TestCreate_CorrectiveEditDoesNotAdoptUnpinnedPartialGang(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	const priorRevision = "llama-70b-engine-bad0bad0"
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-good0bad", Namespace: "prod"},
-	}
-	ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:       0,
-		Incarnation: 1,
-		Phase:       v1beta1.OMENativeInstanceCreating,
-		PodCount:    1,
-		Operation: &v1beta1.InstanceOperation{
-			ID:   "create-0-1",
-			Type: v1beta1.InstanceOperationCreate,
-			Step: "CreatePods",
-		},
-	})
-	leader := gangPod(isvc, 0, "leader", 0, 1, false, false)
-	leader.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(priorRevision)
-	c := newFakeClient(t, isvc, ir, leader)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyNone)
+// TestGangSurgeCreate_BlockedPodGroupNameWithholdsMembers: with no
+// PodGroup callback wired, the create choke point itself is the gate —
+// the replacement gang gets no members and the pass reports no progress
+// rather than an error.
+func TestGangSurgeCreate_BlockedPodGroupNameWithholdsMembers(t *testing.T) {
+	f := blockedGangFixture(t, workload.GangStateOwnershipConflict)
 
-	result, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target)
+	done, err := gangSurgeUpdate(context.Background(), f.deps, f.input, f.plan, f.plan.Instances[0], f.target)
 	if err != nil {
-		t.Fatalf("Create: %v", err)
+		t.Fatalf("gangSurgeUpdate: %v", err)
 	}
-	if !result.Requeue {
-		t.Fatalf("superseded Create retirement must requeue immediately: %+v", result)
+	if done {
+		t.Fatal("gangSurgeUpdate reported done while its PodGroup name was unusable")
 	}
-
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("unpinned partial Create must not mix revisions: got %d pods, want the one prior-revision survivor", len(pods.Items))
-	}
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Operation != nil {
-		t.Fatalf("superseded unpinned Create must retire; got %+v", s)
+	if got := gangPodCount(t, f); got != 0 {
+		t.Fatalf("created %d members against a PodGroup name this owner cannot write", got)
 	}
 }
 
-func TestCreate_CorrectiveEditRetiresFullyMaterializedGatedGang(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	const priorRevision = "llama-70b-engine-bad0bad0"
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-good0bad", Namespace: "prod"},
+// TestGangSurgeCreate_BlockedPodGroupEnsureDefersToEscalation: the
+// inline surge ensure reports the same collision as an error. That is
+// classified evidence about one row, so the pass defers instead of
+// taking every other Instance down with it.
+func TestGangSurgeCreate_BlockedPodGroupEnsureDefersToEscalation(t *testing.T) {
+	f := blockedGangFixture(t, workload.GangStateTerminating)
+	f.deps.EnsureGangPodGroup = func(context.Context, workload.ReconcileInput, workload.ComponentPlan, workload.InstancePlan) (string, error) {
+		return "", fmt.Errorf("%w: PodGroup is terminating", workload.ErrGangNameUnusable)
 	}
-	ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:       0,
-		Incarnation: 1,
-		Phase:       v1beta1.OMENativeInstanceCreating,
-		Operation: &v1beta1.InstanceOperation{
-			ID:             "create-0-1",
-			Type:           v1beta1.InstanceOperationCreate,
-			Step:           "CreatePods",
-			TargetRevision: priorRevision,
-		},
-	})
-	leader := gangPod(isvc, 0, "leader", 0, 1, false, false)
-	worker := gangPod(isvc, 0, "worker", 0, 1, false, false)
-	leader.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(priorRevision)
-	worker.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(priorRevision)
-	leader.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example.com/admission"}}
-	worker.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example.com/admission"}}
-	c := newFakeClient(t, isvc, ir, leader, worker)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyNone)
 
-	result, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target)
+	done, err := gangSurgeUpdate(context.Background(), f.deps, f.input, f.plan, f.plan.Instances[0], f.target)
 	if err != nil {
-		t.Fatalf("Create: %v", err)
+		t.Fatalf("gangSurgeUpdate: got %v want the blocked name deferred, not an error", err)
 	}
-	if !result.Requeue {
-		t.Fatalf("superseded gated Create must requeue immediately: %+v", result)
+	if done {
+		t.Fatal("gangSurgeUpdate reported done while its PodGroup name was still occupied")
 	}
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Operation != nil {
-		t.Fatalf("superseded gated Create must retire; got %+v", s)
-	}
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 2 {
-		t.Fatalf("retirement must not mutate the live pod set: got %d pods want 2", len(pods.Items))
+	if got := gangPodCount(t, f); got != 0 {
+		t.Fatalf("created %d members while the PodGroup name was still occupied", got)
 	}
 }
 
-func TestCreate_AdoptsUnpinnedAttemptWithoutPods(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-good0bad", Namespace: "prod"},
+// TestGangSurgeCreate_UnblockedGangStillCreates: the gate is scoped to
+// the states that make a name unusable. A group this owner controls and
+// can write gets its members, so the gate cannot quietly stall a healthy
+// surge.
+func TestGangSurgeCreate_UnblockedGangStillCreates(t *testing.T) {
+	f := blockedGangFixture(t, workload.GangStateNone)
+
+	if _, err := gangSurgeUpdate(context.Background(), f.deps, f.input, f.plan, f.plan.Instances[0], f.target); err != nil {
+		t.Fatalf("gangSurgeUpdate: %v", err)
 	}
-	ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:       0,
-		Incarnation: 1,
-		Phase:       v1beta1.OMENativeInstanceCreating,
-		Operation: &v1beta1.InstanceOperation{
-			ID:   "create-0-1",
-			Type: v1beta1.InstanceOperationCreate,
-			Step: "CreatePods",
+	if got := gangPodCount(t, f); got == 0 {
+		t.Fatal("a usable gang name must not withhold members")
+	}
+}
+
+// Create-pass RetryBlock gate tests: a deadline-disposed create leaves
+// its instance Failed-with-no-Operation — a fresh start — so without a
+// gate the Create pass re-materializes pods at the same bad revision
+// forever, bypassing the RetryBlock entirely. The gate applies ONLY to
+// disposed fresh-starts (Phase=Failed with nil Operation, or no status
+// slot at all) AND only when a block for the create's target revision
+// exists — genuinely-new scale-ups with no block are untouched.
+
+// createGateFixture builds the Create-pass analogue of retryGateFixture:
+// an ISVC whose engine IR carries the supplied instance statuses (none →
+// no IR seeded at all), the target CR matching DesiredSpec, a fake
+// clock, and the recording MutateRetryBlock closure.
+func createGateFixture(t *testing.T, t0 time.Time, insts ...v1beta1.OMENativeInstanceStatus) (*workload.ReconcileInput, workload.ComponentPlan, *appsv1.ControllerRevision, *[]retryBlockCall, client.Client, *v1beta1.InferenceService) {
+	t.Helper()
+	legacyResetExpectations(t)
+	isvc := legacyMinimalISVC("llama-70b", "prod", 1)
+	objs := []client.Object{isvc}
+	if len(insts) > 0 {
+		objs = append(objs, legacyInstanceIR(isvc, workload.ComponentEngine, insts...))
+	}
+	c := legacyNewFakeClient(t, objs...)
+	tcr := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("test:v1"))
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	input.Clock = clocktesting.NewFakeClock(t0)
+	calls := &[]retryBlockCall{}
+	input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+		var b workload.RetryBlock
+		if existing := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev); existing != nil {
+			b = *existing
+		} else {
+			b = workload.RetryBlock{TargetRevision: rev}
+		}
+		d := mutate(&b)
+		*calls = append(*calls, retryBlockCall{rev: rev, disposition: d, block: b})
+		return nil
+	}
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+	return &input, plan, tcr, calls, c, isvc
+}
+
+// disposedFreshStart is the post-disposition instance status: Failed
+// with no Operation.
+func disposedFreshStart() v1beta1.OMENativeInstanceStatus {
+	return v1beta1.OMENativeInstanceStatus{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceFailed}
+}
+
+// createGatePods lists every pod in the fixture namespace.
+func createGatePods(t *testing.T, c client.Client, ns string) []corev1.Pod {
+	t.Helper()
+	list := &corev1.PodList{}
+	if err := c.List(context.Background(), list, client.InNamespace(ns)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	return list.Items
+}
+
+// persistCalls filters the recorded MutateRetryBlock invocations down to
+// actual writes (Persist / Remove) — idempotent Unchanged probes from
+// the attempt-stamp flip don't count as block mutations.
+func persistCalls(calls []retryBlockCall) []retryBlockCall {
+	var out []retryBlockCall
+	for _, c := range calls {
+		if c.disposition != workload.RetryBlockUnchanged {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// TestCreate_RetryBlockHeld_DeniesFreshStart: (a) a Held block for the
+// target revision denies re-materialization of a disposed fresh-start —
+// no pods, no status writes, no requeue (Held has no time bound), and
+// the operator warning stays the ONE emitted at the Held transition
+// (the writer's dedup); repeated denied passes add nothing.
+func TestCreate_RetryBlockHeld_DeniesFreshStart(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0, disposedFreshStart())
+
+	// Arrive at Held the way production does: the disposition writer with
+	// a nil (unconfigured) policy Holds on the first failure and emits
+	// WarnRetryHeld exactly once.
+	warns := &[]retryHeldWarning{}
+	input.WarnRetryHeld = func(rev string, attempts int32, reason string) {
+		*warns = append(*warns, retryHeldWarning{rev: rev, attempts: attempts, reason: reason})
+	}
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, tcr.Name, "ImagePullBackOff", true); err != nil {
+		t.Fatalf("seed Held block: %v", err)
+	}
+	if len(*warns) != 1 {
+		t.Fatalf("WarnRetryHeld at Held transition: got %d want 1", len(*warns))
+	}
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{(*calls)[0].block}
+	*calls = nil
+
+	for pass := 0; pass < 2; pass++ {
+		res, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr)
+		if err != nil {
+			t.Fatalf("create pass %d: %v", pass, err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("pass %d: Held denial must not requeue: got %+v", pass, res)
+		}
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Errorf("Held block must deny materialization: got %d pod(s)", len(pods))
+	}
+	if len(*calls) != 0 {
+		t.Errorf("denied create must not touch the block: %d MutateRetryBlock calls", len(*calls))
+	}
+	if len(*warns) != 1 {
+		t.Errorf("denied passes must not re-warn: got %d want still 1", len(*warns))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceFailed || s.Operation != nil {
+		t.Errorf("denied instance mutated: phase=%q op=%v", s.Phase, s.Operation)
+	}
+}
+
+// TestCreate_NoStatusHeldBlock_Denied: a Held block also gates an
+// instance with NO status slot — scaling up onto a held revision would
+// materialize the same wedged pods.
+func TestCreate_NoStatusHeldBlock_Denied(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockHeld},
+	}
+
+	res, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("Held denial must not requeue: got %+v", res)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Errorf("Held block must deny a no-status scale-up: got %d pod(s)", len(pods))
+	}
+	if len(*calls) != 0 {
+		t.Errorf("denied create must not touch the block: %d calls", len(*calls))
+	}
+}
+
+// TestCreate_RetryBlockOtherRevision_Allows: (b) a block for a DIFFERENT
+// revision is a different RetrySubject — the create toward the current
+// target proceeds.
+func TestCreate_RetryBlockOtherRevision_Allows(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0, disposedFreshStart())
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: "some-OTHER-rev", State: workload.RetryBlockHeld},
+	}
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 1 {
+		t.Fatalf("a block for another revision must not gate: got %d pod(s) want 1", len(pods))
+	}
+	if writes := persistCalls(*calls); len(writes) != 0 {
+		t.Errorf("no block for the target — nothing to flip: %d write(s)", len(writes))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceCreating {
+		t.Errorf("allowed create must stamp Creating: got %q", s.Phase)
+	}
+}
+
+// TestCreate_RetryBlockBackoffNotDue_Requeues: (c) a not-yet-due Backoff
+// denies AND surfaces exactly the remaining interval as the pass
+// wake-up, mirroring how the update path folds retryAfter.
+func TestCreate_RetryBlockBackoffNotDue_Requeues(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0, disposedFreshStart())
+	next := metav1.NewTime(t0.Add(37 * time.Second))
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, NextRetryAt: &next},
+	}
+
+	res, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Errorf("not-yet-due Backoff must deny materialization: got %d pod(s)", len(pods))
+	}
+	if res.RequeueAfter != 37*time.Second {
+		t.Errorf("RequeueAfter: got %v want exactly 37s", res.RequeueAfter)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("denied create must not touch the block: %d calls", len(*calls))
+	}
+}
+
+// TestCreate_RetryBlockBackoffDue_AllowsAndFlips: (d) a due Backoff lets
+// the create proceed, and the Creating attempt stamp — not the gate —
+// flips the block to RetryInProgress so wave counting works for creates
+// exactly as for updates.
+func TestCreate_RetryBlockBackoffDue_AllowsAndFlips(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0, disposedFreshStart())
+	next := metav1.NewTime(t0.Add(-1 * time.Second))
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, AttemptsStarted: 1, NextRetryAt: &next},
+	}
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 1 {
+		t.Fatalf("due Backoff must allow the create: got %d pod(s) want 1", len(pods))
+	}
+	writes := persistCalls(*calls)
+	if len(writes) != 1 {
+		t.Fatalf("attempt stamp must flip exactly once: got %d write(s)", len(writes))
+	}
+	w := writes[0]
+	if w.rev != tcr.Name || w.disposition != workload.RetryBlockPersist {
+		t.Errorf("flip write: got (rev=%q, disposition=%v) want (%q, Persist)", w.rev, w.disposition, tcr.Name)
+	}
+	if w.block.State != workload.RetryBlockRetryInProgress {
+		t.Errorf("flipped state: got %q want %q", w.block.State, workload.RetryBlockRetryInProgress)
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceCreating {
+		t.Errorf("allowed create must stamp Creating: got %q", s.Phase)
+	}
+}
+
+// TestCreate_NewInstanceNoBlock_Unaffected: (e) a genuinely-new instance
+// (no status slot, no block) passes the gate and creates — and its
+// attempt stamp records nothing (a fresh start with no prior failure
+// needs no block).
+func TestCreate_NewInstanceNoBlock_Unaffected(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0)
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 1 {
+		t.Fatalf("fresh scale-up must materialize: got %d pod(s) want 1", len(pods))
+	}
+	if writes := persistCalls(*calls); len(writes) != 0 {
+		t.Errorf("no-block start must persist nothing: %d write(s)", len(writes))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceCreating {
+		t.Errorf("fresh create must stamp Creating: got %q", s.Phase)
+	}
+}
+
+// TestCreate_RetryBlockInProgressLive_Denies: while an authorized
+// attempt is in flight elsewhere (a sibling's live Create attempt), a
+// disposed fresh-start stays denied — exactly-one-attempt semantics,
+// same as the update gate.
+func TestCreate_RetryBlockInProgressLive_Denies(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0,
+		disposedFreshStart(),
+		v1beta1.OMENativeInstanceStatus{
+			Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceCreating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationCreate},
 		},
-	})
-	c := newFakeClient(t, isvc, ir)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyNone)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
-		t.Fatalf("Create: %v", err)
+	)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockRetryInProgress, AttemptsStarted: 1},
 	}
 
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Operation == nil || s.Operation.TargetRevision != target.Name {
-		t.Fatalf("safe persisted attempt must be pinned to %q; got %+v", target.Name, s)
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
 	}
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
+	for _, pod := range createGatePods(t, c, isvc.Namespace) {
+		if pod.Labels[query.LabelInstanceIdx] == "0" {
+			t.Errorf("live RetryInProgress must deny instance 0's fresh start: pod %s created", pod.Name)
+		}
 	}
-	if len(pods.Items) != 2 {
-		t.Fatalf("adopted Create must materialize the gang: got %d pods, want 2", len(pods.Items))
+	if writes := persistCalls(*calls); len(writes) != 0 {
+		t.Errorf("denied create must not touch the block: %d write(s)", len(writes))
 	}
 }
 
-func TestCreate_IdempotentOnAlreadyExists(t *testing.T) {
-	resetExpectations(t)
-	// Two reconciles back-to-back without the cache observing the first
-	// batch — the second call's client.Create returns AlreadyExists,
-	// which we treat as a no-op.
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	c := newFakeClient(t, isvc)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-
-	// First call creates the pod.
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("first Create: %v", err)
-	}
-	// Reset expectations so the second call attempts to re-create.
-	workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
-	// Second call should not error even though the pod already exists.
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("second Create: %v", err)
-	}
-}
-
-// Promote to Ready must record RunningRevision so detectUpdateTrigger's
-// fast path short-circuits on the next reconcile. Without it, every
-// fresh Instance triggers a spurious recreate on its second pass (the
-// per-pod diff false-positives against post-Render mutations).
-//
-// Guard: Create's promote only stamps RunningRevision=target.Name
-// when the existing pods actually carry target's revision hash — see
-// existingPodsMatchTargetRevision. The test pod is given a rev-hash
-// label matching the target so the normal-flow promote fires.
-func TestCreate_PromoteRecordsRunningRevision(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-deadbeef", Namespace: "prod"},
-	}
-	// Pre-seed a runtime-ready, serving pod so reconcileInstance jumps
-	// straight to the promote step. The pod's rev-hash matches target's
-	// suffix — the production-normal case (createMissingPods stamps the
-	// label from revisionHashFromTarget(target)).
-	pod := podForInstance(isvc, 0, true /* ready */, true /* serving */)
-	pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(target.Name)
-	c := newFakeClient(t, isvc, pod)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil {
-		t.Fatal("InstanceStatus[0] must exist after promote")
-	}
-	if s.Phase != v1beta1.OMENativeInstanceReady {
-		t.Errorf("Phase: got %q want Ready", s.Phase)
-	}
-	if s.RunningRevision != target.Name {
-		t.Errorf("RunningRevision: got %q want %q (Create promote must record target hash)",
-			s.RunningRevision, target.Name)
-	}
-}
-
-// TestCreate_PromoteSkipsRunningRevisionForOffTargetPods pins the
-// X-2 bump-during-bump guard in Create.reconcileInstance:
-// when existing pods are runtime-ready but carry a different revision
-// hash from target (e.g., they were created by an earlier surge cycle
-// pinned to a now-superseded target), the promote MUST NOT stamp
-// RunningRevision=target.Name — that would falsely advertise the pods
-// as on target. patchInstanceStatusReady (no RunningRevision write)
-// preserves whatever revision the prior op recorded, so the next
-// reconcile's detectUpdateTrigger fires a fresh surge cycle to roll
-// the pods to target.
-func TestCreate_PromoteSkipsRunningRevisionForOffTargetPods(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	// Seed status: Instance is in a transient Phase (e.g., Creating
-	// after an earlier surge promote) with the prior revision recorded
-	// as RunningRevision. The Create promote should NOT clobber this.
-	priorRev := "llama-70b-engine-priorrev"
-	ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:           0,
-		Incarnation:     1,
-		Phase:           v1beta1.OMENativeInstanceCreating,
-		RunningRevision: priorRev,
-	})
-	// Pre-seed a runtime-ready, serving pod labeled with the PRIOR
-	// revision's hash (not target's). reconcileInstance will find the
-	// pod, see it's runtime-ready, and reach the promote step.
-	pod := podForInstance(isvc, 0, true /* ready */, true /* serving */)
-	pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(priorRev)
-	c := newFakeClient(t, isvc, ir, pod)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newtarget", Namespace: "prod"},
-	}
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil {
-		t.Fatal("InstanceStatus[0] must exist after promote")
-	}
-	if s.Phase != v1beta1.OMENativeInstanceReady {
-		t.Errorf("Phase: got %q want Ready", s.Phase)
-	}
-	// The load-bearing assertion: RunningRevision must NOT have been
-	// updated to target.Name — the pod is genuinely on priorRev.
-	if s.RunningRevision != priorRev {
-		t.Errorf("RunningRevision: got %q want %q (X-2 guard — Create promote must NOT clobber RunningRevision when pods are off-target)",
-			s.RunningRevision, priorRev)
-	}
-}
-
-// Inverse: when target is nil (scale-down-only reconciles), Create
-// promotes without writing RunningRevision.
-func TestCreate_PromoteWithNilTargetSkipsRunningRevision(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	pod := podForInstance(isvc, 0, true, true)
-	c := newFakeClient(t, isvc, pod)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceReady {
-		t.Fatalf("expected Phase=Ready; got %+v", s)
-	}
-	if s.RunningRevision != "" {
-		t.Errorf("RunningRevision: got %q want empty (nil target)", s.RunningRevision)
-	}
-}
-
-// Gang RecreateInstance race.
-//
-// A pod loss in an already-Ready Instance can be recovered two ways: the
-// Restart pass (whole-Instance drain+recreate — the RecreateInstance
-// contract) and the Create pass (backfill the missing pod by name). These
-// race. When Create wins it stamps Phase=Creating, which latches the
-// outcome by making DetectRestartTrigger skip on every later pass — so
-// RecreateInstance silently degrades to "recreate just the dead pod" (the
-// leader and surviving workers keep their incarnation). Empirically
-// non-deterministic: the same 3-pod gang recovered the whole gang in one
-// run and only the dead pod in another.
-//
-// Fix: Create defers partial-Instance recovery to Restart under
-// RecreateInstance, so Restart deterministically owns whole-gang recreate.
-
-// gangPod fabricates a leader/worker gang pod (podForInstance only emits
-// the single-pod "default" runner).
-func gangPod(isvc *v1beta1.InferenceService, idx int32, runner string, ordinal int32, incarnation int64, ready, serving bool) *corev1.Pod {
-	labels := testPodLabels(isvc.Name, workload.ComponentEngine, idx, runner, incarnation, ordinal)
-	labels[query.LabelRevisionHash] = testRevisionHash
+// createGateGangPod fabricates one live gang member in the shape Render
+// emits, addressed by runner and ordinal so a fixture can leave a named
+// member of the set missing.
+func createGateGangPod(t *testing.T, c client.Client, isvc *v1beta1.InferenceService, idx int32, runner string, ordinal int32) {
+	t.Helper()
+	labels := legacyTestPodLabels(isvc.Name, workload.ComponentEngine, idx, runner, 1, ordinal)
+	labels[query.LabelRevisionHash] = testRevisionHashLegacy
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      query.PodName(isvc.Name, workload.ComponentEngine, idx, runner, ordinal),
@@ -905,387 +415,1087 @@ func gangPod(isvc *v1beta1.InferenceService, idx int32, runner string, ordinal i
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}},
 	}
-	now := metav1.NewTime(time.Now())
-	if ready {
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: now,
-		})
+	if err := c.Create(context.Background(), pod); err != nil {
+		t.Fatalf("seed live gang member %s: %v", pod.Name, err)
 	}
-	if serving {
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type: query.ServingConditionType, Status: corev1.ConditionTrue, LastTransitionTime: now,
-		})
-	}
-	return pod
 }
 
-// buildPlanGangEngine builds a multi-pod (leader+worker) engine plan with
-// the given restart policy. Instance 0 sits at incarnation 2 — an
-// established Instance that has already been Ready.
-func buildPlanGangEngine(restart workload.RestartPolicy) workload.ComponentPlan {
-	return workload.ComponentPlan{
-		Component:            workload.ComponentEngine,
-		Replicas:             1,
-		RestartPolicy:        restart,
-		InstanceReadyTimeout: 30 * time.Minute,
-		Instances: []workload.InstancePlan{{
-			Index:       0,
-			Incarnation: 2,
-			Runners:     []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}},
+// pendingGangMemberLost seeds the shape the missing-member rebuild starts
+// from: a row that was serving, demoted with its counters intact, whose gang
+// has lost one of its two members.
+func pendingGangMemberLost(t *testing.T, t0 time.Time) (*workload.ReconcileInput, workload.ComponentPlan, *appsv1.ControllerRevision, *[]retryBlockCall, client.Client, *v1beta1.InferenceService) {
+	t.Helper()
+	input, _, tcr, calls, c, isvc := createGateFixture(t, t0, v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending,
+	})
+	createGateGangPod(t, c, isvc, 0, "leader", 0)
+	return input, legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain), tcr, calls, c, isvc
+}
+
+// TestCreate_RetryBlockHeld_DeniesMissingMemberRebuild: a Held block denies
+// every pod at its revision, not only the first attempt at it. The rebuild of
+// a member the row lost is held on the same record — nothing is created and
+// the row is not stamped — and the pass keeps its cadence because a row short
+// of its pod set has not converged.
+func TestCreate_RetryBlockHeld_DeniesMissingMemberRebuild(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, calls, c, isvc := pendingGangMemberLost(t, t0)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockHeld, AttemptsStarted: 1, Reason: "ImagePullBackOff"},
+	}
+
+	res, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 1 {
+		t.Errorf("Held block must deny the missing member: got %d pod(s) want the 1 survivor", len(pods))
+	}
+	if res.RequeueAfter != input.Requeue.Operation {
+		t.Errorf("a row short of its pod set must keep the create cadence: got %v want %v",
+			res.RequeueAfter, input.Requeue.Operation)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("denied rebuild must not touch the block: %d MutateRetryBlock call(s)", len(*calls))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstancePending || s.Operation != nil {
+		t.Errorf("denied rebuild must not stamp an attempt: phase=%q op=%v", s.Phase, s.Operation)
+	}
+}
+
+// TestCreate_RetryBlockReleased_RebuildsMissingMember: once the record
+// releases the revision the rebuild proceeds unchanged — the missing member
+// is created under a stamped Create attempt.
+func TestCreate_RetryBlockReleased_RebuildsMissingMember(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, _, c, isvc := pendingGangMemberLost(t, t0)
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 2 {
+		t.Fatalf("released revision must rebuild the missing member: got %d pod(s) want 2", len(pods))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceCreating {
+		t.Errorf("allowed rebuild must stamp Creating: got %q", s.Phase)
+	}
+}
+
+// TestCreate_RetryBlockBackoffNotDue_AllowsMissingMemberRebuild: the milder
+// states gate the opening of an attempt, not the pods of a row already
+// holding some. A not-yet-due Backoff therefore leaves the rebuild alone.
+func TestCreate_RetryBlockBackoffNotDue_AllowsMissingMemberRebuild(t *testing.T) {
+	t0 := time.Now()
+	input, plan, tcr, _, c, isvc := pendingGangMemberLost(t, t0)
+	next := metav1.NewTime(t0.Add(time.Hour))
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockBackoff, AttemptsStarted: 1, NextRetryAt: &next},
+	}
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 2 {
+		t.Fatalf("a not-yet-due Backoff must not gate a rebuild: got %d pod(s) want 2", len(pods))
+	}
+}
+
+// TestCreate_RetryBlockHeld_DeniesRemainderOfInFlightAttempt: a block that
+// goes Held while an attempt is mid-materialization stops the rest of that
+// attempt's set — the pods it has yet to create are pods at the held revision
+// like any other. The attempt is left in place with no external wait
+// recorded, so its own deadline stays the backstop.
+func TestCreate_RetryBlockHeld_DeniesRemainderOfInFlightAttempt(t *testing.T) {
+	t0 := time.Now()
+	input, _, tcr, calls, c, isvc := createGateFixture(t, t0, v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceCreating,
+		Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationCreate},
+	})
+	// The attempt pins the revision it materializes; the fixture learns the
+	// target's name only once it is built.
+	input.ObservedState.InstanceStatuses[0].Operation.TargetRevision = tcr.Name
+	if err := input.MutateInstance(context.Background(), 0, func(s *workload.InstanceStatus) bool {
+		s.Operation.TargetRevision = tcr.Name
+		return true
+	}); err != nil {
+		t.Fatalf("pin the attempt's target revision: %v", err)
+	}
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	createGateGangPod(t, c, isvc, 0, "leader", 0)
+	pinPodRevision(t, c, isvc, query.PodName(isvc.Name, workload.ComponentEngine, 0, "leader", 0), tcr)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{
+		{TargetRevision: tcr.Name, State: workload.RetryBlockHeld, AttemptsStarted: 1, Reason: "ImagePullBackOff"},
+	}
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 1 {
+		t.Errorf("Held block must deny the rest of the set: got %d pod(s) want the 1 already created", len(pods))
+	}
+	if len(*calls) != 0 {
+		t.Errorf("denied create must not touch the block: %d MutateRetryBlock call(s)", len(*calls))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Operation == nil || s.Operation.Waiting != "" {
+		t.Errorf("a gate denial records no external wait, so the attempt deadline keeps running: op=%+v", s.Operation)
+	}
+}
+
+// pinPodRevision restamps a seeded pod with the target ControllerRevision's
+// hash, so the pass reads it as a member of the attempt pinned to that
+// revision rather than as wreckage a retired attempt left behind.
+func pinPodRevision(t *testing.T, c client.Client, isvc *v1beta1.InferenceService, name string, target *appsv1.ControllerRevision) {
+	t.Helper()
+	pod := &corev1.Pod{}
+	key := client.ObjectKey{Namespace: isvc.Namespace, Name: name}
+	if err := c.Get(context.Background(), key, pod); err != nil {
+		t.Fatalf("get seeded pod %s: %v", name, err)
+	}
+	pod.Labels[query.LabelRevisionHash] = query.RevisionOf(target).Hash()
+	if err := c.Update(context.Background(), pod); err != nil {
+		t.Fatalf("pin revision hash on %s: %v", name, err)
+	}
+}
+
+func TestCreateTransitionRollbackPreservesPublicationOnlyFields(t *testing.T) {
+	previous := workload.InstanceStatus{
+		Index: 4, Incarnation: 3, Phase: workload.InstancePhaseFailed,
+		RunningRevision: "revision-a", PodCount: 2, ServingPodCount: 1,
+		AvailablePodCount: 1, Admitted: true, ActiveOrdinal: 1,
+	}
+	committed := previous
+	committed.Phase = workload.InstancePhaseCreating
+	committed.Operation = &workload.InstanceOperation{ID: "create-4", Type: workload.InstanceOperationCreate}
+	transition := statusTransition{index: 4, previous: &previous, current: &committed}
+	mutation, ok := transition.rollbackMutation()
+	if !ok || mutation.Mutate == nil || mutation.Remove {
+		t.Fatalf("rollback mutation = %+v, want restoring mutation", mutation)
+	}
+
+	current := committed
+	current.ReadyPodCount = 2
+	current.ScheduledPodCount = 2
+	observedNodes := []string{"node-a", "node-b"}
+	current.NodesOccupied = observedNodes
+	if !mutation.Mutate(&current) {
+		t.Fatal("publication-only changes blocked lifecycle rollback")
+	}
+	want := previous
+	want.ReadyPodCount = 2
+	want.ScheduledPodCount = 2
+	want.NodesOccupied = []string{"node-a", "node-b"}
+	if !reflect.DeepEqual(current, want) {
+		t.Fatalf("restored status:\n got: %+v\nwant: %+v", current, want)
+	}
+	observedNodes[0] = "mutated"
+	if current.NodesOccupied[0] != "node-a" {
+		t.Fatal("restored node observation aliases the committed status")
+	}
+}
+
+func TestCreateTransitionRollbackIgnoresExactlyRemovableFields(t *testing.T) {
+	committed := workload.InstanceStatus{
+		Index: 2, Incarnation: 7, Phase: workload.InstancePhaseCreating,
+		RunningRevision: "revision-a", TargetRevision: "revision-b",
+		PodCount: 2, ServingPodCount: 1, AvailablePodCount: 1, Admitted: true,
+		Operation:     &workload.InstanceOperation{ID: "create-2", Type: workload.InstanceOperationCreate},
+		ActiveOrdinal: 1,
+	}
+	transition := statusTransition{index: 2, current: &committed}
+	mutation, ok := transition.rollbackMutation()
+	if !ok || !mutation.Remove || mutation.Precondition == nil {
+		t.Fatalf("rollback mutation = %+v, want conditional removal", mutation)
+	}
+
+	removable := []struct {
+		name   string
+		mutate func(*workload.InstanceStatus)
+	}{
+		{name: "ready pods", mutate: func(status *workload.InstanceStatus) { status.ReadyPodCount++ }},
+		{name: "scheduled pods", mutate: func(status *workload.InstanceStatus) { status.ScheduledPodCount++ }},
+		{name: "occupied nodes", mutate: func(status *workload.InstanceStatus) { status.NodesOccupied = []string{"node-a"} }},
+	}
+	for _, test := range removable {
+		t.Run("allows "+test.name, func(t *testing.T) {
+			current := committed
+			test.mutate(&current)
+			if !mutation.Precondition(&current) {
+				t.Fatalf("%s changed rollback ownership", test.name)
+			}
+		})
+	}
+
+	retained := []struct {
+		name   string
+		mutate func(*workload.InstanceStatus)
+	}{
+		{name: "index", mutate: func(status *workload.InstanceStatus) { status.Index++ }},
+		{name: "incarnation", mutate: func(status *workload.InstanceStatus) { status.Incarnation++ }},
+		{name: "phase", mutate: func(status *workload.InstanceStatus) { status.Phase = workload.InstancePhaseReady }},
+		{name: "running revision", mutate: func(status *workload.InstanceStatus) { status.RunningRevision = "revision-c" }},
+		{name: "target revision", mutate: func(status *workload.InstanceStatus) { status.TargetRevision = "revision-c" }},
+		{name: "pod count", mutate: func(status *workload.InstanceStatus) { status.PodCount++ }},
+		{name: "serving pods", mutate: func(status *workload.InstanceStatus) { status.ServingPodCount++ }},
+		{name: "available pods", mutate: func(status *workload.InstanceStatus) { status.AvailablePodCount++ }},
+		{name: "admission", mutate: func(status *workload.InstanceStatus) { status.Admitted = false }},
+		{name: "conditions", mutate: func(status *workload.InstanceStatus) {
+			status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}
+		}},
+		{name: "operation", mutate: func(status *workload.InstanceStatus) { status.Operation = nil }},
+		{name: "active ordinal", mutate: func(status *workload.InstanceStatus) { status.ActiveOrdinal++ }},
+		{name: "last failure", mutate: func(status *workload.InstanceStatus) {
+			status.LastFailure = &workload.InstanceTermination{Reason: "Error"}
 		}},
 	}
-}
-
-// seedReadyInstance stamps the ISVC status with one already-Ready engine
-// Instance at the given index/incarnation.
-func seedReadyInstance(isvc *v1beta1.InferenceService, idx int32, incarnation int64) *v1beta1.InferenceReplica {
-	return instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:       idx,
-		Incarnation: incarnation,
-		Phase:       v1beta1.OMENativeInstanceReady,
-	})
-}
-
-// An already-Ready gang that loses a pod must NOT be self-healed
-// pod-by-pod by Create under RecreateInstance — that races Restart's
-// whole-gang recreate and degrades the policy. Create must defer.
-func TestCreate_RecreateInstance_DefersPartialGangToRestart(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	ir := seedReadyInstance(isvc, 0, 2)
-	// Established gang lost its worker: leader present, worker gone.
-	leader := gangPod(isvc, 0, "leader", 0, 2, true /* ready */, true /* serving */)
-	c := newFakeClient(t, isvc, ir, leader)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	// The missing worker MUST NOT be backfilled — Restart owns whole-gang recreate.
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("Create must defer partial-gang recovery to Restart under RecreateInstance: got %d pod(s), want 1 (leader only)", len(pods.Items))
-	}
-	// Phase MUST stay Ready — stamping Creating here is what latches the race.
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceReady {
-		t.Fatalf("Phase must remain Ready (Create must not stamp Creating): got %+v", s)
+	for _, test := range retained {
+		t.Run("rejects "+test.name, func(t *testing.T) {
+			current := committed
+			test.mutate(&current)
+			if mutation.Precondition(&current) {
+				t.Fatalf("%s did not fence lifecycle rollback", test.name)
+			}
+		})
 	}
 }
 
-// Contrast: under a non-RecreateInstance policy, Create still self-heals a
-// missing pod — Restart isn't responsible for recovery there.
-func TestCreate_NonRecreatePolicy_SelfHealsMissingPod(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	ir := seedReadyInstance(isvc, 0, 2)
-	leader := gangPod(isvc, 0, "leader", 0, 2, true, true)
-	c := newFakeClient(t, isvc, ir, leader)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyNone)
+// Every create path in the engine funnels through createMissingPods, so a
+// classified apiserver rejection must reach the SAME outcome whichever
+// operation issued the create. These tests pin that for the sites the
+// Create pass does not cover: Restart Phase B, RecreatePod Phase B, the
+// per-pod surge, the gang surge, and the migration surge.
 
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("Create: %v", err)
+// rejectPodCreates wraps c so every Pod create is answered with err.
+func rejectPodCreates(t *testing.T, c client.Client, err error) client.Client {
+	t.Helper()
+	base, ok := c.(client.WithWatch)
+	if !ok {
+		t.Fatalf("fixture client %T does not implement client.WithWatch", c)
 	}
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 2 {
-		t.Fatalf("non-RecreateInstance policy must self-heal the missing pod: got %d pod(s), want 2", len(pods.Items))
-	}
-}
-
-// The guard must not block legitimate fresh creation: an Instance that has
-// never been Ready (no status) under RecreateInstance is still
-// materialized by Create — otherwise initial bring-up deadlocks (Create
-// defers, Restart can't fire on a never-Ready Instance).
-func TestCreate_RecreateInstance_StillMaterializesFreshInstance(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	// No instance status seeded → fresh, never Ready.
-	c := newFakeClient(t, isvc)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 2 {
-		t.Fatalf("RecreateInstance must still materialize a fresh gang Instance: got %d pod(s), want 2 (leader+worker)", len(pods.Items))
-	}
-}
-
-// seedMaterializedGang stamps a Create-owned gang Instance that was
-// already observed complete (PodCount == 2) at the given phase — the
-// production shape a drained node leaves behind.
-func seedMaterializedGang(isvc *v1beta1.InferenceService, phase v1beta1.OMENativeInstancePhase, podCount int32) *v1beta1.InferenceReplica {
-	return instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-		Index:           0,
-		Incarnation:     2,
-		Phase:           phase,
-		PodCount:        podCount,
-		RunningRevision: "llama-70b-engine-" + testRevisionHash,
-		TargetRevision:  "llama-70b-engine-" + testRevisionHash,
-		Operation: &v1beta1.InstanceOperation{
-			ID: "create-0-1", Type: v1beta1.InstanceOperationCreate, Step: "CreatePods",
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				return err
+			}
+			return cl.Create(ctx, obj, opts...)
 		},
 	})
 }
 
-// A gang that lost a member while below Ready must reach Restart, not
-// Create's per-pod backfill: backfilling leaves the survivor at the old
-// incarnation, holding the domain the replacement needs.
-func TestCreate_RecreateInstance_DefersNonReadyPartialGang(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	ir := seedMaterializedGang(isvc, v1beta1.OMENativeInstanceCreating, 2)
-	leader := gangPod(isvc, 0, "leader", 0, 2, false /* ready */, false /* serving */)
-	c := newFakeClient(t, isvc, ir, leader)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("Create must defer a non-Ready partial gang to Restart: got %d pod(s), want 1 (leader only)", len(pods.Items))
-	}
+// siteQuotaError is the ResourceQuota admission refusal the apiserver
+// returns when a namespace is out of capacity.
+func siteQuotaError() error {
+	return apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "engine-pod", errors.New(
+		"exceeded quota: team-quota, requested: requests.nvidia.com/gpu=8, used: requests.nvidia.com/gpu=56, limited: requests.nvidia.com/gpu=64"))
 }
 
-// Once CreatePods is committed, an interrupted gang is repaired by Restart
-// as one unit. Create must not backfill the missing member at the old
-// incarnation even when the latest published PodCount reflects only the
-// survivor.
-func TestCreate_RecreateInstance_DefersInterruptedGangMaterialization(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	ir := seedMaterializedGang(isvc, v1beta1.OMENativeInstanceCreating, 1)
-	leader := gangPod(isvc, 0, "leader", 0, 2, false /* ready */, false /* serving */)
-	c := newFakeClient(t, isvc, ir, leader)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
-
-	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("Create must defer an interrupted gang to Restart: got %d pod(s), want 1", len(pods.Items))
-	}
+// siteInvalidError is the apiserver refusing the pod object itself.
+func siteInvalidError() error {
+	return apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "engine-pod", nil)
 }
 
-// seedInstanceStatuses stamps the ISVC status with the given engine
-// InstanceStatuses verbatim — lets a test set per-index Phase to model
-// a mid-rollout snapshot.
-func seedInstanceStatuses(isvc *v1beta1.InferenceService, statuses ...v1beta1.OMENativeInstanceStatus) *v1beta1.InferenceReplica {
-	return instanceIR(isvc, workload.ComponentEngine, statuses...)
-}
+// TestRestartPhaseB_QuotaExceeded_WaitsWithoutFailing: Restart's recreate
+// phase hits the same quota wall as a fresh create. The pass must end
+// without an error (so the dispatcher's restart interval owns the retry,
+// not controller-runtime's escalating backoff) and record the quota as
+// the operation's waiting reason rather than failing the Instance.
+func TestRestartPhaseB_QuotaExceeded_WaitsWithoutFailing(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	// Phase A already completed: the instance is Restarting at the bumped
+	// incarnation and its old pod is gone, so Phase B does the create.
+	ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceRestarting,
+		Operation: &v1beta1.InstanceOperation{
+			Type: v1beta1.InstanceOperationRestart, Step: "Recreate", Reason: "pod lost",
+		},
+	}
+	base := legacyNewFakeClient(t, isvc, ir)
+	c := rejectPodCreates(t, base, siteQuotaError())
+	input := legacyTestInput(isvc, base, workload.ComponentEngine)
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-// CreateFreshIndices must materialize brand-new (surge-free) indices
-// while leaving an index mid-update untouched: with index 0 Updating and
-// indices 1,2 absent, it creates pods for 1 and 2 only and never
-// duplicates index 0's in-flight pod.
-func TestCreateFreshIndices_CreatesAbsentSkipsUpdating(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 3)
-	// Index 0 is mid-surge (Phase=Updating); indices 1,2 have no status.
-	ir := seedInstanceStatuses(isvc, v1beta1.OMENativeInstanceStatus{
-		Index:           0,
-		Incarnation:     1,
-		Phase:           v1beta1.OMENativeInstanceUpdating,
-		RunningRevision: "llama-70b-engine-priorrev",
-	})
-	// Index 0's existing in-flight pod — present so we can assert it is
-	// neither touched nor duplicated.
-	pod0 := podForInstance(isvc, 0, true /* ready */, true /* serving */)
-	c := newFakeClient(t, isvc, ir, pod0)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(3)
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newtarget", Namespace: "prod"},
-	}
-
-	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
-		t.Fatalf("CreateFreshIndices: %v", err)
-	}
-
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	got := map[string]bool{}
-	for _, p := range pods.Items {
-		got[p.Name] = true
-	}
-	// Index 0: exactly the original pod, no duplicate at any ordinal.
-	if !got["llama-70b-engine-0-default-0"] {
-		t.Errorf("index 0's in-flight pod must remain; got %v", got)
-	}
-	if got["llama-70b-engine-0-default-1"] {
-		t.Errorf("index 0 must NOT be duplicated at ordinal 1; got %v", got)
-	}
-	// Indices 1,2: fresh pods created.
-	if !got["llama-70b-engine-1-default-0"] {
-		t.Errorf("fresh index 1 pod must be created; got %v", got)
-	}
-	if !got["llama-70b-engine-2-default-0"] {
-		t.Errorf("fresh index 2 pod must be created; got %v", got)
-	}
-	if len(pods.Items) != 3 {
-		t.Fatalf("expected 3 pods (index 0 in-flight + fresh 1,2), got %d: %v", len(pods.Items), got)
-	}
-
-	// Index 0's status MUST be left untouched at Phase=Updating —
-	// CreateFreshIndices never reconciles it.
-	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceUpdating {
-		t.Errorf("index 0 Phase must stay Updating (not reconciled by fresh pass); got %+v", s)
-	}
-	for _, idx := range []int32{1, 2} {
-		s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, idx)
-		if s == nil || s.Operation == nil {
-			t.Errorf("fresh index %d must have a Create operation; got %+v", idx, s)
-			continue
-		}
-		if s.Operation.TargetRevision != target.Name {
-			t.Errorf("fresh index %d Create TargetRevision: got %q want %q",
-				idx, s.Operation.TargetRevision, target.Name)
-		}
-	}
-}
-
-// CreateFreshIndices must be a no-op when the only Instance is mid-update
-// — pure rollouts must not trigger any create work.
-func TestCreateFreshIndices_NoOpWhenOnlyIndexUpdating(t *testing.T) {
-	resetExpectations(t)
-	isvc := minimalISVC("llama-70b", "prod", 1)
-	ir := seedInstanceStatuses(isvc, v1beta1.OMENativeInstanceStatus{
-		Index:           0,
-		Incarnation:     1,
-		Phase:           v1beta1.OMENativeInstanceUpdating,
-		RunningRevision: "llama-70b-engine-priorrev",
-	})
-	pod0 := podForInstance(isvc, 0, true, true)
-	c := newFakeClient(t, isvc, ir, pod0)
-	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	plan := buildPlanSinglePodEngine(1)
-	target := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newtarget", Namespace: "prod"},
-	}
-
-	res, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, plan, target)
+	done, err := Restart(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], "pod lost")
 	if err != nil {
-		t.Fatalf("CreateFreshIndices: %v", err)
+		t.Fatalf("Restart: %v (a quota refusal is a wait, not an error)", err)
 	}
-	// No qualifying index → quick no-op result (no requeue scheduled).
-	if res.Requeue || res.RequeueAfter != 0 {
-		t.Errorf("expected no-op result for pure rollout, got %+v", res)
+	if done {
+		t.Fatal("Restart reported done while blocked on quota")
 	}
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-		t.Fatalf("list pods: %v", err)
+
+	s := legacyInstanceStatusesOnIR(base, isvc, workload.ComponentEngine)[0]
+	if s.Phase == v1beta1.OMENativeInstanceFailed {
+		t.Fatalf("instance 0: got Failed want the restart still in flight")
 	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("CreateFreshIndices must not create/duplicate anything for a pure rollout; got %d pods", len(pods.Items))
+	if s.Operation == nil || !workload.OperationCapacityRefused(legacyFromV1beta1Op(s.Operation)) {
+		t.Fatalf("Operation: got %+v want the quota refusal recorded", s.Operation)
+	}
+	// The restart's own cause must survive the wait: Reason says WHY the
+	// operation exists and is part of the terminal-finalize identity
+	// tuple, so a transient quota blip may not overwrite it.
+	if s.Operation.Reason != "pod lost" {
+		t.Errorf("Operation.Reason: got %q want the restart cause %q preserved", s.Operation.Reason, "pod lost")
 	}
 }
 
-// CreateFreshIndices must not treat a surge TARGET marker as a
-// surge-free index: the replacement-gang slot is Phase=Creating but
-// carries the owning op (Update for a gang surge, Migrate for a
-// migration surge). Overwriting the marker with a Create stamp unpins
-// the index from the plan and scale-down churn-deletes the in-flight
-// replacement. With index 1 absent (genuine scale-up) and index 2 a
-// marker, only index 1 may be reconciled.
-func TestCreateFreshIndices_PreservesSurgeTargetMarker(t *testing.T) {
+// TestRecreatePhaseB_Throttled_HonorsServerDelay: a 429 during the
+// recreate rollout's Phase B is the apiserver pacing us. The pass ends
+// clean and deposits the server's suggested delay on the pass pacing, so
+// the dispatcher's requeue is floored by it instead of the error path
+// escalating a backoff the server never asked for.
+func TestRecreatePhaseB_Throttled_HonorsServerDelay(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
+		UpdateStrategy: &v1beta1.UpdateStrategy{Type: v1beta1.UpdateStrategyRecreatePod},
+	}
+	targetSpec := legacyTargetSpecImage("example.com/app:v2")
+	base := legacyNewFakeClient(t, isvc, ir)
+	tcr := legacyEnsureTargetCR(t, base, isvc, targetSpec)
+	// Phase A already completed: Updating at the bumped incarnation with
+	// no pods left, so Phase B does the create.
+	ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceUpdating,
+		Operation: &v1beta1.InstanceOperation{
+			Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepDrain, TargetRevision: tcr.Name,
+		},
+	}
+	if err := base.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("seed Phase B status: %v", err)
+	}
+	c := rejectPodCreates(t, base, apierrors.NewTooManyRequests("apiserver is shedding load", 7))
+	input := legacyTestInput(isvc, base, workload.ComponentEngine)
+	input.Pacing = &workload.APIPacing{}
+	plan := legacyComponentPlan(workload.UpdateStrategyRecreatePod, nil)
+
+	done, err := Update(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, targetSpec)
+	if err != nil {
+		t.Fatalf("Update: %v (throttling is paced, not failed)", err)
+	}
+	if done {
+		t.Fatal("Update reported done while throttled")
+	}
+	if got := input.Pacing.Pending(); got != 7*time.Second {
+		t.Fatalf("pass pacing: got %v want the server's suggested 7s", got)
+	}
+	s := legacyInstanceStatusesOnIR(base, isvc, workload.ComponentEngine)[0]
+	if s.Phase == v1beta1.OMENativeInstanceFailed {
+		t.Errorf("instance 0: got Failed want the rollout still in flight")
+	}
+	if s.Operation != nil && workload.OperationCapacityRefused(legacyFromV1beta1Op(s.Operation)) {
+		t.Errorf("Operation.Waiting: got %q want unset (throttling writes no status)", s.Operation.Waiting)
+	}
+}
+
+// recreatePhaseBFixture seeds a recreate whose Phase A is done: the
+// Instance is Updating at the bumped incarnation with no pods left, so
+// the pass's only work is the Phase B rebuild create. Returns the base
+// client (unwrapped, for reading status back), the pass input and the
+// target revision.
+func recreatePhaseBFixture(t *testing.T) (client.Client, *v1beta1.InferenceService, workload.ReconcileInput, *appsv1.ControllerRevision, *corev1.PodSpec) {
+	t.Helper()
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
+		UpdateStrategy: &v1beta1.UpdateStrategy{Type: v1beta1.UpdateStrategyRecreatePod},
+	}
+	targetSpec := legacyTargetSpecImage("example.com/app:v2")
+	base := legacyNewFakeClient(t, isvc, ir)
+	tcr := legacyEnsureTargetCR(t, base, isvc, targetSpec)
+	ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceUpdating,
+		Operation: &v1beta1.InstanceOperation{
+			Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepDrain, TargetRevision: tcr.Name,
+		},
+	}
+	if err := base.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("seed Phase B status: %v", err)
+	}
+	input := legacyTestInput(isvc, base, workload.ComponentEngine)
+	input.ObservedState.UpdateRevision = tcr.Name
+	return base, isvc, input, tcr, targetSpec
+}
+
+// TestRecreatePhaseB_QuotaExceeded_WaitsWithoutFailing: the recreate has
+// already drained and deleted the old incarnation, so a quota wall in
+// front of the rebuild leaves the row serving nothing. It is still a
+// wait, not a failure: the pass ends clean and the quota lands as the
+// operation's waiting token, which is what parks the deadline clock
+// while the namespace has no room.
+func TestRecreatePhaseB_QuotaExceeded_WaitsWithoutFailing(t *testing.T) {
+	base, isvc, input, tcr, targetSpec := recreatePhaseBFixture(t)
+	c := rejectPodCreates(t, base, siteQuotaError())
+	plan := legacyComponentPlan(workload.UpdateStrategyRecreatePod, nil)
+
+	done, err := Update(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, targetSpec)
+	if err != nil {
+		t.Fatalf("Update: %v (a quota refusal is a wait, not an error)", err)
+	}
+	if done {
+		t.Fatal("Update reported done while blocked on quota")
+	}
+
+	s := legacyInstanceStatusesOnIR(base, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceUpdating {
+		t.Fatalf("Phase: got %q want Updating (the recreate is still in flight)", s.Phase)
+	}
+	if s.Operation == nil || !workload.OperationCapacityRefused(legacyFromV1beta1Op(s.Operation)) {
+		t.Fatalf("Operation: got %+v want the quota refusal recorded", s.Operation)
+	}
+}
+
+// TestRecreatePhaseB_RejectionDispositions: the rebuild create meets the
+// same classified rejections a fresh create does. A 422 is a statement
+// about the revision, so the attempt ends with the revision blamed; a
+// terminating namespace ends it with the revision blameless, since no
+// corrected pod spec would be admitted either.
+func TestRecreatePhaseB_RejectionDispositions(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		opType workload.InstanceOperationType
-		step   string
+		name       string
+		reject     error
+		wantReason string
+		wantBlocks int
 	}{
-		{name: "gang surge target", opType: workload.InstanceOperationUpdate, step: workload.UpdateStepGangSurgeTarget},
-		{name: "migration surge target", opType: workload.InstanceOperationMigrate, step: "CreateSurge"},
+		{
+			name:       "invalid pod spec",
+			reject:     siteInvalidError(),
+			wantReason: workload.RejectionReasonInvalidPodSpec,
+			wantBlocks: 1,
+		},
+		{
+			name:       "namespace terminating",
+			reject:     siteNamespaceTerminatingError("engine-pod"),
+			wantReason: workload.RejectionReasonNamespaceTerminating,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resetExpectations(t)
-			isvc := minimalISVC("llama-70b", "prod", 3)
-			markerOp := &v1beta1.InstanceOperation{
-				ID:   "op-marker",
-				Type: v1beta1.InstanceOperationType(tc.opType),
-				Step: tc.step,
-			}
-			ir := seedInstanceStatuses(isvc,
-				v1beta1.OMENativeInstanceStatus{
-					Index: 0, Incarnation: 1,
-					Phase:           v1beta1.OMENativeInstanceUpdating,
-					RunningRevision: "llama-70b-engine-priorrev",
-				},
-				v1beta1.OMENativeInstanceStatus{
-					Index: 2, Incarnation: 1,
-					Phase:     v1beta1.OMENativeInstanceCreating,
-					Operation: markerOp,
-				},
-			)
-			pod0 := podForInstance(isvc, 0, true, true)
-			c := newFakeClient(t, isvc, ir, pod0)
-			input := buildTestInput(isvc, c, workload.ComponentEngine)
-			// buildTestInput doesn't project Operation; the predicate under
-			// test reads it from ObservedState, so mirror the marker there.
-			for i := range input.ObservedState.InstanceStatuses {
-				if input.ObservedState.InstanceStatuses[i].Index == 2 {
-					input.ObservedState.InstanceStatuses[i].Operation = &workload.InstanceOperation{
-						ID: "op-marker", Type: tc.opType, Step: tc.step,
-					}
+			base, isvc, input, tcr, targetSpec := recreatePhaseBFixture(t)
+			blocks := &[]string{}
+			input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+				b := workload.RetryBlock{TargetRevision: rev}
+				if d := mutate(&b); d != workload.RetryBlockUnchanged {
+					*blocks = append(*blocks, rev)
 				}
+				return nil
 			}
-			plan := buildPlanSinglePodEngine(3)
-			target := &appsv1.ControllerRevision{
-				ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newtarget", Namespace: "prod"},
+			c := rejectPodCreates(t, base, tc.reject)
+			plan := legacyComponentPlan(workload.UpdateStrategyRecreatePod, nil)
+
+			if _, err := Update(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, targetSpec); err != nil {
+				t.Fatalf("Update: %v (a classified rejection is disposed, not returned)", err)
 			}
 
-			if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
-				t.Fatalf("CreateFreshIndices: %v", err)
+			s := legacyInstanceStatusesOnIR(base, isvc, workload.ComponentEngine)[0]
+			if s.Phase != v1beta1.OMENativeInstanceFailed {
+				t.Fatalf("Phase: got %q want Failed", s.Phase)
 			}
-
-			pods := &corev1.PodList{}
-			if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
-				t.Fatalf("list pods: %v", err)
+			if s.Operation != nil {
+				t.Errorf("Operation: got %+v want cleared", s.Operation)
 			}
-			got := map[string]bool{}
-			for _, p := range pods.Items {
-				got[p.Name] = true
+			if s.LastFailure == nil || s.LastFailure.Reason != tc.wantReason {
+				t.Errorf("LastFailure: got %+v want reason %s", s.LastFailure, tc.wantReason)
 			}
-			if !got["llama-70b-engine-1-default-0"] {
-				t.Errorf("fresh index 1 pod must be created; got %v", got)
-			}
-			if got["llama-70b-engine-2-default-0"] {
-				t.Errorf("marker index 2 must not be materialized by the fresh pass; got %v", got)
-			}
-			s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 2)
-			if s == nil || s.Operation == nil ||
-				s.Operation.Type != v1beta1.InstanceOperationType(tc.opType) ||
-				s.Operation.Step != tc.step {
-				t.Errorf("surge target marker must be preserved; got %+v", s)
+			if len(*blocks) != tc.wantBlocks {
+				t.Errorf("RetryBlock writes: got %+v want %d", *blocks, tc.wantBlocks)
 			}
 		})
+	}
+}
+
+// TestSurgeCreate_QuotaExceeded_WaitsWithoutFailing: the per-pod surge's
+// Phase 1 create is quota-blocked. The source stays serving and the
+// rollout waits with its clock parked — it must not surface an error.
+func TestSurgeCreate_QuotaExceeded_WaitsWithoutFailing(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
+	base := legacyNewFakeClient(t, isvc, ir)
+	tcr := makeCR(t, base, isvc, "llama-70b-engine-rev-abc12345")
+	sourcePod := surgePodAtOrdinal(isvc, 0, 1, 0, true, true)
+	if err := base.Create(context.Background(), sourcePod); err != nil {
+		t.Fatalf("seed source pod: %v", err)
+	}
+	c := rejectPodCreates(t, base, siteQuotaError())
+	input := legacyTestInput(isvc, base, workload.ComponentEngine)
+	plan := surgePlan()
+
+	done, err := surgeUpdate(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr,
+		[]*corev1.Pod{sourcePod})
+	if err != nil {
+		t.Fatalf("surgeUpdate: %v (a quota refusal is a wait, not an error)", err)
+	}
+	if done {
+		t.Fatal("surgeUpdate reported done while blocked on quota")
+	}
+	s := legacyInstanceStatusesOnIR(base, isvc, workload.ComponentEngine)[0]
+	if s.Phase == v1beta1.OMENativeInstanceFailed {
+		t.Fatalf("instance 0: got Failed want the surge still in flight")
+	}
+	if s.Operation == nil || !workload.OperationCapacityRefused(legacyFromV1beta1Op(s.Operation)) {
+		t.Fatalf("Operation: got %+v want the quota refusal recorded", s.Operation)
+	}
+}
+
+// gangSurgeSourceIndex is the source half of the gang surge fixture pair.
+const gangSurgeSourceIndex = int32(0)
+
+// gangSurgeRejectionFixture is a gang surge mid-flight: the source at
+// index 0 pinned to the replacement gang's marker at index 2, both on
+// the target revision, with a mutation store the pass writes through.
+func gangSurgeRejectionFixture(t *testing.T) (workload.ReconcileInput, *terminalMutationStore, int32, string) {
+	t.Helper()
+	legacyResetExpectations(t)
+	const isvcName, namespace = "gang-quota", "test-ns"
+	surgeIndex := int32(2)
+	revision := "gang-quota-engine-newrev"
+	source := workload.InstanceStatus{
+		Index:           0,
+		Incarnation:     3,
+		Phase:           workload.InstancePhaseUpdating,
+		RunningRevision: "gang-quota-engine-oldrev",
+		TargetRevision:  revision,
+		Operation: &workload.InstanceOperation{
+			ID:             "gang-update-0",
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepSurge,
+			TargetRevision: revision,
+			SurgeIndex:     &surgeIndex,
+		},
+	}
+	marker := workload.InstanceStatus{
+		Index:          surgeIndex,
+		Incarnation:    1,
+		Phase:          workload.InstancePhaseCreating,
+		TargetRevision: revision,
+		Operation: &workload.InstanceOperation{
+			ID:             "gang-update-target-2",
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepGangSurgeTarget,
+			TargetRevision: revision,
+		},
+	}
+	store := &terminalMutationStore{
+		ownerUID: "owner-a",
+		statuses: map[int32]workload.InstanceStatus{
+			source.Index: cloneTerminalStatus(source),
+			surgeIndex:   cloneTerminalStatus(marker),
+		},
+	}
+	input := workload.ReconcileInput{
+		OwnerObject: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{UID: "owner-a"}},
+		Key: workload.Key{
+			Namespace: namespace,
+			OwnerName: isvcName,
+			Component: workload.ComponentEngine,
+			SelectorLabels: map[string]string{
+				constants.InferenceServicePodLabelKey: isvcName,
+				constants.OMEComponentLabel:           string(workload.ComponentEngine),
+				query.LabelManagedBy:                  query.ManagedByOMENative,
+			},
+		},
+		ObservedState: workload.WorkloadObservedState{
+			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
+		},
+		DesiredSpec: workload.WorkloadDesiredSpec{
+			PodSpec: legacyTargetSpecImage("example.com/app:v2"),
+		},
+		MutateInstance: func(_ context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
+			return store.apply(context.Background(),
+				[]workload.InstanceMutation{{Index: idx, Mutate: mutate}}, "", nil)
+		},
+		FinalizeInstanceResources:            func(context.Context, int32) (bool, error) { return true, nil },
+		ApplyInstanceMutationsWithRetryBlock: store.apply,
+	}
+	return input, store, surgeIndex, revision
+}
+
+// TestGangSurgeCreate_QuotaExceeded_WaitsWithoutFailing: the gang surge
+// creates a whole replacement gang at once, so it is the most likely site
+// to exhaust a quota. It must wait like every other site rather than
+// erroring the pass — AND the wait must reach the SOURCE, whose operation
+// and deadline govern the rollout while the pods are created under the
+// surge index. The test drives the two readers that consume it (the
+// deadline park, the escalation skip) to prove the source is held.
+func TestGangSurgeCreate_QuotaExceeded_WaitsWithoutFailing(t *testing.T) {
+	input, store, surgeIndex, revision := gangSurgeRejectionFixture(t)
+	base := legacyNewFakeClient(t)
+	deps := legacyTestDeps(rejectPodCreates(t, base, siteQuotaError()))
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: revision}}
+
+	done, err := gangSurgeUpdate(context.Background(), deps, input, plan, plan.Instances[0], target)
+	if err != nil {
+		t.Fatalf("gangSurgeUpdate: %v (a quota refusal is a wait, not an error)", err)
+	}
+	if done {
+		t.Fatal("gangSurgeUpdate reported done while blocked on quota")
+	}
+	blocked, found := store.statuses[surgeIndex]
+	if !found {
+		t.Fatalf("surge marker missing after the blocked pass")
+	}
+	if blocked.Phase == workload.InstancePhaseFailed {
+		t.Fatalf("surge instance: got Failed want the surge still in flight")
+	}
+	if !workload.OperationCapacityRefused(blocked.Operation) {
+		t.Fatalf("surge Operation: got %+v want the quota refusal recorded", blocked.Operation)
+	}
+
+	// The SOURCE carries the deadline the rollout is judged by, and the
+	// readers that hold it (the deadline park, the escalation skip) live
+	// in the parent workload package, which cannot be imported from here.
+	// Their side of this contract is pinned by
+	// TestGangSurgeSource_HeldWhileItsSurgeWaitsOnQuota.
+	if blocked.Operation.SurgeIndex != nil {
+		t.Errorf("surge row Operation.SurgeIndex: got %v want nil (the pin lives on the source)", blocked.Operation.SurgeIndex)
+	}
+	if src := store.statuses[gangSurgeSourceIndex]; src.Operation == nil || src.Operation.SurgeIndex == nil ||
+		*src.Operation.SurgeIndex != surgeIndex {
+		t.Errorf("source Operation: got %+v want the surge pin the readers follow", src.Operation)
+	}
+}
+
+// TestMigrateSurge_InvalidPodSpec_FailsTheMigration: a surge pod the
+// apiserver will never accept cannot be waited out, so the migration
+// record is closed Failed immediately instead of idling to its deadline.
+func TestMigrateSurge_InvalidPodSpec_FailsTheMigration(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1_700_000_000, 0))
+	f := newSinglePodMigFixture(t)
+	f.clk = clk
+	const uuid = "mig-surge-invalid-spec"
+	f.records = []workload.MigrationRecord{
+		mkMigRecordWithDeadline(uuid, 0, "node-a", clk.Now().Add(time.Minute)),
+	}
+	f.c = rejectPodCreates(t, f.c, siteInvalidError())
+
+	// passResult builds its own input, so drive Migrate directly to
+	// observe the RetryBlock seam this test is about.
+	legacyResetExpectations(t)
+	record := f.record(t, uuid)
+	req := &audit.MigrationRequest{
+		SchemaVersion: audit.SchemaV1,
+		Component:     string(f.component),
+		Instance:      record.SourceInstance,
+		FromNode:      record.FromNode,
+		Reason:        record.Reason,
+	}
+	in := f.input(t)
+	blocks := &[]string{}
+	in.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+		b := workload.RetryBlock{TargetRevision: rev}
+		if d := mutate(&b); d != workload.RetryBlockUnchanged {
+			*blocks = append(*blocks, rev)
+		}
+		return nil
+	}
+
+	done, accepted, err := Migrate(context.Background(), f.deps(), in, f.plan, record.SourceInstance, uuid, req)
+	if err != nil {
+		t.Fatalf("migrate pass: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("migrate pass: accepted=false want true")
+	}
+	if !done {
+		t.Fatalf("migrate pass: done=false want true (the request is closed, not waiting)")
+	}
+	rec := f.record(t, uuid)
+	if rec.Phase != workload.MigrationPhaseFailed {
+		t.Fatalf("record phase: got %s want Failed", rec.Phase)
+	}
+	if rec.CompletedAt == nil {
+		t.Errorf("record CompletedAt: got nil want the close timestamp")
+	}
+	// The surge pod carries the request's placement overlay, so a 422 may
+	// indict the overlay rather than the revision. Closing the request is
+	// the whole remedy; holding the revision would wedge an innocent
+	// rollout on an operator's bad migration request.
+	if len(*blocks) != 0 {
+		t.Errorf("RetryBlock writes: got %+v want none for an overlay-bearing surge", *blocks)
+	}
+}
+
+// siteNamespaceTerminatingError is the apiserver refusing a create
+// because the namespace is on its way out.
+func siteNamespaceTerminatingError(name string) error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    403,
+		Reason:  metav1.StatusReasonForbidden,
+		Message: `pods "` + name + `" is forbidden: unable to create new content in namespace prod because it is being terminated`,
+		Details: &metav1.StatusDetails{
+			Kind: "pods", Name: name,
+			Causes: []metav1.StatusCause{{Type: corev1.NamespaceTerminatingCause, Message: "namespace prod is being terminated"}},
+		},
+	}}
+}
+
+// restartPhaseBRow is a repair whose Phase A is done: the old pod is
+// gone and the bumped incarnation is waiting for its rebuild create.
+func restartPhaseBRow() v1beta1.OMENativeInstanceStatus {
+	return v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceRestarting,
+		Operation: &v1beta1.InstanceOperation{
+			Type: v1beta1.InstanceOperationRestart, Step: "Recreate", Reason: "pod lost",
+		},
+	}
+}
+
+// TestRestartPhaseB_RejectionDispositions: the rebuild create meets the
+// same classified rejections a fresh create does, and the repair answers
+// them the same way — a 422 is permanent and ends the attempt with the
+// revision blamed, a terminating namespace ends it with the revision
+// blameless, and a 429 is pacing that writes nothing at all.
+func TestRestartPhaseB_RejectionDispositions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		reject     error
+		wantFailed bool
+		wantReason string
+		wantBlocks int
+	}{
+		{
+			name:       "invalid pod spec",
+			reject:     siteInvalidError(),
+			wantFailed: true,
+			wantReason: workload.RejectionReasonInvalidPodSpec,
+			wantBlocks: 1,
+		},
+		{
+			name:       "namespace terminating",
+			reject:     siteNamespaceTerminatingError("engine-pod"),
+			wantFailed: true,
+			wantReason: workload.RejectionReasonNamespaceTerminating,
+		},
+		{
+			name:   "throttled",
+			reject: apierrors.NewTooManyRequests("apiserver is shedding load", 7),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+			ir.Status.InstanceStatuses[0] = restartPhaseBRow()
+			base := legacyNewFakeClient(t, isvc, ir)
+			c := rejectPodCreates(t, base, tc.reject)
+			input := legacyTestInput(isvc, base, workload.ComponentEngine)
+			// The repair pins no revision of its own, so the revision a
+			// 422 blames is the owner's current one.
+			input.ObservedState.UpdateRevision = "llama-70b-engine-newhash"
+			blocks := &[]string{}
+			input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+				b := workload.RetryBlock{TargetRevision: rev}
+				if d := mutate(&b); d != workload.RetryBlockUnchanged {
+					*blocks = append(*blocks, rev)
+				}
+				return nil
+			}
+			plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+
+			if _, err := Restart(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], "pod lost"); err != nil {
+				t.Fatalf("Restart: %v (a classified rejection is disposed, not returned)", err)
+			}
+
+			s := legacyInstanceStatusesOnIR(base, isvc, workload.ComponentEngine)[0]
+			if tc.wantFailed {
+				if s.Phase != v1beta1.OMENativeInstanceFailed {
+					t.Fatalf("Phase: got %q want Failed", s.Phase)
+				}
+				if s.LastFailure == nil || s.LastFailure.Reason != tc.wantReason {
+					t.Errorf("LastFailure: got %+v want reason %s", s.LastFailure, tc.wantReason)
+				}
+			} else {
+				if s.Phase != v1beta1.OMENativeInstanceRestarting {
+					t.Errorf("Phase: got %q want Restarting (throttling is paced, not failed)", s.Phase)
+				}
+				if s.LastFailure != nil {
+					t.Errorf("LastFailure: got %+v want none (throttling writes no status)", s.LastFailure)
+				}
+				if s.Operation == nil || s.Operation.Reason != "pod lost" {
+					t.Errorf("Operation: got %+v want the repair intact", s.Operation)
+				}
+			}
+			if len(*blocks) != tc.wantBlocks {
+				t.Errorf("RetryBlock writes: got %+v want %d", *blocks, tc.wantBlocks)
+			}
+		})
+	}
+}
+
+// gangNamespaceTerminatingError is the apiserver refusing a gang member
+// because the namespace is on its way out.
+func gangNamespaceTerminatingError(name string) error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    403,
+		Reason:  metav1.StatusReasonForbidden,
+		Message: `pods "` + name + `" is forbidden: unable to create new content in namespace test-ns because it is being terminated`,
+		Details: &metav1.StatusDetails{
+			Kind: "pods", Name: name,
+			Causes: []metav1.StatusCause{{Type: corev1.NamespaceTerminatingCause, Message: "namespace test-ns is being terminated"}},
+		},
+	}}
+}
+
+// TestGangSurgeCreate_RejectionDispositions: a quota refusal is the one
+// gang-member rejection worth waiting out. The permanent ones are not —
+// a 422 and a terminating namespace both dispose the surge row on the
+// first rejection rather than idling it to the deadline, and they differ
+// only in whether a revision is to blame. A 429 is neither: it is pacing,
+// and it writes nothing at all.
+func TestGangSurgeCreate_RejectionDispositions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		reject     error
+		wantFailed bool
+		wantReason string
+		wantBlocks int
+	}{
+		{
+			name:       "invalid pod spec",
+			reject:     siteInvalidError(),
+			wantFailed: true,
+			wantReason: workload.RejectionReasonInvalidPodSpec,
+			wantBlocks: 1,
+		},
+		{
+			name:       "namespace terminating",
+			reject:     gangNamespaceTerminatingError("engine-pod"),
+			wantFailed: true,
+			wantReason: workload.RejectionReasonNamespaceTerminating,
+		},
+		{
+			name:   "throttled",
+			reject: apierrors.NewTooManyRequests("apiserver is shedding load", 7),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, store, surgeIndex, revision := gangSurgeRejectionFixture(t)
+			blocks := &[]string{}
+			input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+				b := workload.RetryBlock{TargetRevision: rev}
+				if d := mutate(&b); d != workload.RetryBlockUnchanged {
+					*blocks = append(*blocks, rev)
+				}
+				return nil
+			}
+			base := legacyNewFakeClient(t)
+			deps := legacyTestDeps(rejectPodCreates(t, base, tc.reject))
+			plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+			target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: revision}}
+
+			if _, err := gangSurgeUpdate(context.Background(), deps, input, plan, plan.Instances[0], target); err != nil {
+				t.Fatalf("gangSurgeUpdate: %v (a classified rejection is disposed, not returned)", err)
+			}
+
+			marker, found := store.statuses[surgeIndex]
+			if !found {
+				t.Fatalf("surge marker missing after the rejected pass")
+			}
+			if tc.wantFailed {
+				if marker.Phase != workload.InstancePhaseFailed {
+					t.Fatalf("marker Phase: got %q want Failed (the rejection is permanent)", marker.Phase)
+				}
+				if marker.LastFailure == nil || marker.LastFailure.Reason != tc.wantReason {
+					t.Errorf("marker LastFailure: got %+v want reason %s", marker.LastFailure, tc.wantReason)
+				}
+				if marker.Operation != nil {
+					t.Errorf("marker Operation: got %+v want cleared with the disposal", marker.Operation)
+				}
+			} else {
+				if marker.Phase == workload.InstancePhaseFailed {
+					t.Errorf("marker Phase: got Failed want the surge still in flight (throttling is paced)")
+				}
+				if marker.LastFailure != nil {
+					t.Errorf("marker LastFailure: got %+v want none (throttling writes no failure accounting)", marker.LastFailure)
+				}
+			}
+			if len(*blocks) != tc.wantBlocks {
+				t.Errorf("RetryBlock writes: got %v want %d (only a bad pod spec blames the revision)", *blocks, tc.wantBlocks)
+			}
+		})
+	}
+}
+
+// renderForSplitTest renders a pod through the same path the create loop
+// uses, so the split-risk check sees the injector's real output (an
+// injected topologyKey term, a preserved user term, or nothing).
+func renderForSplitTest(t *testing.T, ps *corev1.PodSpec, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan) *corev1.Pod {
+	t.Helper()
+	pod, err := testRender(basicISVC(), ps, plan, inst, runner, 0)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	return pod
+}
+
+// countGangSplitWarnings drains the recorder and returns how many
+// GangSplitRisk Warning events it buffered.
+func countGangSplitWarnings(rec *record.FakeRecorder) int {
+	n := 0
+	for drained := false; !drained; {
+		select {
+		case e := <-rec.Events:
+			if strings.Contains(e, string(workload.EventReasonGangSplitRisk)) {
+				n++
+			}
+		default:
+			drained = true
+		}
+	}
+	return n
+}
+
+// withUserPodAffinity stamps a hand-written required podAffinity term on
+// ps — the "operator already co-located the gang themselves" shape.
+func withUserPodAffinity(ps *corev1.PodSpec) *corev1.PodSpec {
+	ps.Affinity = &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey:   "kubernetes.io/hostname",
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+			}},
+		},
+	}
+	return ps
+}
+
+// splitRiskInput wires a one-row status store under the ReconcileInput so
+// the announcement has a row to record itself on, which is what decides
+// whether the warning fires.
+func splitRiskInput(owner client.Object, idx int32) workload.ReconcileInput {
+	rows := map[int32]workload.InstanceStatus{
+		idx: {Index: idx, Phase: workload.InstancePhaseCreating,
+			Operation: &workload.InstanceOperation{ID: "create-0", Type: workload.InstanceOperationCreate}},
+	}
+	return workload.ReconcileInput{
+		OwnerObject: owner,
+		MutateInstance: func(_ context.Context, index int32, mutate func(*workload.InstanceStatus) bool) error {
+			row := rows[index]
+			if mutate(&row) {
+				rows[index] = row
+			}
+			return nil
+		},
+	}
+}
+
+func warnSplitRisk(t *testing.T, rec record.EventRecorder, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, pod *corev1.Pod) {
+	t.Helper()
+	if err := maybeWarnGangSplitRisk(context.Background(), workload.Deps{Recorder: rec}, input, plan, inst, runner, pod); err != nil {
+		t.Fatalf("warn gang split risk: %v", err)
+	}
+}
+
+func TestMaybeWarnGangSplitRisk(t *testing.T) {
+	gangPlan, gangInst, gangRunners := multiPodPlan(3) // TopologyKey unset
+	keyedPlan, keyedInst, keyedRunners := multiPodPlanWithTopologyKey(3, "topology.example.com/domain")
+	singlePlan, singleInst, singleRunner := singlePodPlan()
+
+	leader := gangRunners[0]
+	worker := gangRunners[1]
+
+	cases := []struct {
+		name     string
+		ps       *corev1.PodSpec
+		plan     workload.ComponentPlan
+		inst     workload.InstancePlan
+		runner   workload.RunnerPlan
+		wantWarn bool
+	}{
+		// The only risk shape: a gang worker that, after render, carries no
+		// required podAffinity — no key resolved and no user term.
+		{"gang worker, no key, no user affinity", basicPodSpec(), gangPlan, gangInst, worker, true},
+		// A resolved topologyKey means the injector added a co-location term.
+		{"gang worker, resolved topologyKey", basicPodSpec(), keyedPlan, keyedInst, keyedRunners[1], false},
+		// A user-declared podAffinity is preserved on the pod — operator owns it.
+		{"gang worker, user podAffinity", withUserPodAffinity(basicPodSpec()), gangPlan, gangInst, worker, false},
+		// The leader is the domain anchor; it never carries the term.
+		{"gang leader (anchor)", basicPodSpec(), gangPlan, gangInst, leader, false},
+		// Single-pod Instances have nothing to co-locate.
+		{"single-pod default", basicPodSpec(), singlePlan, singleInst, singleRunner, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := record.NewFakeRecorder(8)
+			input := splitRiskInput(basicISVC(), tc.inst.Index)
+			pod := renderForSplitTest(t, tc.ps, tc.plan, tc.inst, tc.runner)
+
+			warnSplitRisk(t, rec, input, tc.plan, tc.inst, tc.runner, pod)
+
+			got := countGangSplitWarnings(rec)
+			want := 0
+			if tc.wantWarn {
+				want = 1
+			}
+			if got != want {
+				t.Errorf("GangSplitRisk warnings: got %d want %d", got, want)
+			}
+		})
+	}
+}
+
+// TestMaybeWarnGangSplitRisk_DedupPerRow pins that the warning fires
+// once per episode on the Instance's own row — a 3-worker gang rendering
+// three at-risk worker pods yields a single event, not three.
+func TestMaybeWarnGangSplitRisk_DedupPerRow(t *testing.T) {
+	rec := record.NewFakeRecorder(8)
+	plan, inst, runners := multiPodPlan(3)
+	input := splitRiskInput(basicISVC(), inst.Index)
+	worker := runners[1]
+	pod := renderForSplitTest(t, basicPodSpec(), plan, inst, worker)
+
+	warnSplitRisk(t, rec, input, plan, inst, worker, pod)
+	warnSplitRisk(t, rec, input, plan, inst, worker, pod)
+
+	if got := countGangSplitWarnings(rec); got != 1 {
+		t.Errorf("want exactly 1 warning after two calls (dedup), got %d", got)
+	}
+}
+
+// TestMaybeWarnGangSplitRisk_NilSafe pins the nil-recorder / nil-target
+// no-op contract so callers never have to branch.
+func TestMaybeWarnGangSplitRisk_NilSafe(t *testing.T) {
+	plan, inst, runners := multiPodPlan(3)
+	worker := runners[1]
+	pod := renderForSplitTest(t, basicPodSpec(), plan, inst, worker)
+
+	// nil recorder, valid target → no panic.
+	warnSplitRisk(t, nil, splitRiskInput(basicISVC(), inst.Index), plan, inst, worker, pod)
+	// valid recorder, nil target (no OwnerObject/EventTarget) → no panic, no event.
+	rec := record.NewFakeRecorder(8)
+	warnSplitRisk(t, rec, workload.ReconcileInput{}, plan, inst, worker, pod)
+	if got := countGangSplitWarnings(rec); got != 0 {
+		t.Errorf("nil-target must emit nothing, got %d", got)
+	}
+}
+
+func TestMaybeWarnGangSplitRisk_RecommendationIsProviderNeutral(t *testing.T) {
+	rec := record.NewFakeRecorder(1)
+	plan, inst, runners := multiPodPlan(2)
+	pod := renderForSplitTest(t, basicPodSpec(), plan, inst, runners[1])
+
+	warnSplitRisk(t, rec, splitRiskInput(basicISVC(), inst.Index), plan, inst, runners[1], pod)
+
+	select {
+	case event := <-rec.Events:
+		if !strings.Contains(event, ".topologyKey") {
+			t.Fatalf("recommendation does not name topologyKey: %q", event)
+		}
+		if strings.Contains(event, "cloud.google.com") {
+			t.Fatalf("recommendation must not prescribe a provider-specific label: %q", event)
+		}
+	default:
+		t.Fatal("expected GangSplitRisk event")
 	}
 }

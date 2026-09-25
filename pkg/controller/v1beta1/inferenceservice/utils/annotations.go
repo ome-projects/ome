@@ -27,18 +27,6 @@ func GetDeploymentModeFromAnnotations(annotations map[string]string) (constants.
 	return "", false
 }
 
-/*
-GetDeploymentMode returns the current deployment mode based on annotations and config.
-If a valid deployment mode is specified in annotations, it is used.
-Otherwise, returns the default deployment mode from config.
-*/
-func GetDeploymentMode(annotations map[string]string, deployConfig *controllerconfig.DeployConfig) constants.DeploymentModeType {
-	if mode, found := GetDeploymentModeFromAnnotations(annotations); found {
-		return mode
-	}
-	return constants.DeploymentModeType(deployConfig.DefaultDeploymentMode)
-}
-
 func IsOriginalModelVolumeMountNecessary(annotations map[string]string) bool {
 	return annotations[constants.FTServingWithMergedWeightsAnnotationKey] != "true"
 }

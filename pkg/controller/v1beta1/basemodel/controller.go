@@ -129,6 +129,12 @@ func reconcileModel(ctx context.Context, c client.Client, scheme *runtime.Scheme
 		log.Info("Adding finalizer to " + kind)
 		controllerutil.AddFinalizer(obj, finalizer)
 		if err := c.Update(ctx, obj); err != nil {
+			// A requeue can outrun the informer watch and read a stale
+			// resourceVersion. Let the next pass retry from fresh state instead
+			// of reporting the expected optimistic-lock rejection as a failure.
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
 			log.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}

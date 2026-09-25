@@ -21,26 +21,21 @@ type Capacity struct {
 	Cluster        string
 	ResourceName   string
 	ResourceFlavor string
-	Allocatable    resource.Quantity
 
-	// HighWaterMark is the damped reading a split divides by. Allocatable moves
-	// whenever a node is cordoned or replaced, and apportioning against it would
-	// move every tenant's share on the whole fleet whenever one node anywhere
-	// was drained. Zero means the member reports no mark, and Allocatable
-	// stands in.
+	// Allocatable is what a proportional split divides by: chips on nodes that
+	// are Ready and not cordoned. Chips on a parked node count toward the
+	// member's high-water mark but cannot run anything, so they earn no share.
+	Allocatable resource.Quantity
+
+	// HighWaterMark is the member's damped reading of installed capacity. It
+	// sizes nothing; it decides whether the member is a home for the flavor at
+	// all, so a cluster whose nodes are all parked keeps its copies at zero
+	// rather than losing them.
 	HighWaterMark resource.Quantity
 
 	// ObservedAt is when the member took the reading, carried so a caller can
 	// report how stale a share's basis is.
 	ObservedAt *metav1.Time
-}
-
-// basis is the number this reading contributes to a proportional split.
-func (c Capacity) basis() resource.Quantity {
-	if c.HighWaterMark.IsZero() {
-		return c.Allocatable
-	}
-	return c.HighWaterMark
 }
 
 // Fleet is what the hub knows about its members on one pass.
@@ -124,9 +119,16 @@ func Resolve(t *tree.Tree, fleet Fleet, opts ResolveOptions) Resolution {
 	}
 
 	byPair := map[key][]shares.Weight{}
+	homes := map[key]map[string]struct{}{}
 	for _, c := range fleet.Capacity {
 		k := key{c.ResourceName, c.ResourceFlavor}
-		byPair[k] = append(byPair[k], shares.Weight{Cluster: c.Cluster, Capacity: c.basis()})
+		byPair[k] = append(byPair[k], shares.Weight{Cluster: c.Cluster, Capacity: c.Allocatable})
+		if !c.HighWaterMark.IsZero() {
+			if homes[k] == nil {
+				homes[k] = map[string]struct{}{}
+			}
+			homes[k][c.Cluster] = struct{}{}
+		}
 	}
 	for k := range byPair {
 		// Sorted so a split's tiebreak sees the same order however the caller
@@ -138,12 +140,12 @@ func Resolve(t *tree.Tree, fleet Fleet, opts ResolveOptions) Resolution {
 
 	silent := fleet.silent()
 	for _, leaf := range t.Leaves() {
-		resolved, reason := resolveLeaf(leaf, byPair, silent, opts)
+		resolved, reason := resolveLeaf(leaf, byPair, homes, silent, opts)
 		if reason != "" {
 			out.Unresolved[leaf.Name()] = reason
 			continue
 		}
-		for _, a := range resolved {
+		for _, a := range onItsClusters(resolved) {
 			out.ByCluster[a.cluster] = append(out.ByCluster[a.cluster], a.Allowance)
 		}
 	}
@@ -167,12 +169,40 @@ func Resolve(t *tree.Tree, fleet Fleet, opts ResolveOptions) Resolution {
 // placed is an allowance together with the cluster it landed on.
 type placed struct {
 	cluster string
+	// home is set when the cluster has installed capacity of the budget's
+	// flavor, which keeps the allowance on it even when its share is zero.
+	home bool
 	Allowance
+}
+
+// onItsClusters keeps a leaf's allowances on the clusters it belongs on.
+//
+// A leaf is on a cluster when it was apportioned something there, or when a
+// Proportional budget's flavor is installed there. A zero share on a cluster
+// that never had the flavor would create a queue that can admit nothing and a
+// tenant wondering why. A zero share on a cluster whose nodes are all parked is
+// different: the queue there still holds the tenant's pending and admitted work,
+// and deleting it would strand both until capacity returns. The allowances go
+// together or not at all, so a copy carries every budget or none.
+func onItsClusters(resolved []placed) []placed {
+	keep := map[string]bool{}
+	for _, a := range resolved {
+		if a.home || !a.Nominal.IsZero() {
+			keep[a.cluster] = true
+		}
+	}
+	out := make([]placed, 0, len(resolved))
+	for _, a := range resolved {
+		if keep[a.cluster] {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // resolveLeaf splits every budget on one leaf, or explains why it could not.
 func resolveLeaf(leaf *tree.Node, byPair map[key][]shares.Weight,
-	silent []string, opts ResolveOptions,
+	homes map[key]map[string]struct{}, silent []string, opts ResolveOptions,
 ) ([]placed, string) {
 	var out []placed
 	for _, b := range leaf.Quota.Spec.Budgets {
@@ -206,7 +236,10 @@ func resolveLeaf(leaf *tree.Node, byPair map[key][]shares.Weight,
 			if err != nil {
 				return nil, fmt.Sprintf("splitting %s/%s: %v", b.ResourceName, b.ResourceFlavor, err)
 			}
-			out = append(out, attach(leaf.Name(), b, split)...)
+			for _, a := range attach(leaf.Name(), b, split) {
+				_, a.home = homes[key{b.ResourceName, b.ResourceFlavor}][a.cluster]
+				out = append(out, a)
+			}
 
 		default:
 			return nil, fmt.Sprintf(

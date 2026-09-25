@@ -224,14 +224,14 @@ func TestRoutingCapacityGatewayAndAckCompatibilityOnly(t *testing.T) {
 	factor := resource.MustParse("2")
 	s.TrafficMap.Spec.Entries[0].Capacity = &ome.TrafficMapCapacity{Allocated: 4, Ready: 2, Source: ome.CapacitySourceEndpoint, Factor: &factor, Reported: &value}
 	s.TrafficMap.Status.GatewayRef = &ome.TrafficMapGatewayRef{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute", Name: "demo-route"}
-	s.TrafficMap.Status.Programmed = true
+	s.TrafficMap.Status.Published = true
 	s.TrafficMap.Status.ObservedTrafficMapGeneration = 4
 	r, _ := ProjectEndpoint(s, fixtureClock)
 	if r.Content.Routing.Gateway == nil || r.Content.Routing.Gateway.State != "ReportedReferenceNotResolved" || r.Content.Routing.Acknowledgement != "ReportedTrue" || r.Content.Entries[0].Capacity.Source != "Endpoint" || *r.Content.Entries[0].Capacity.Reported.Value != 4 {
 		t.Fatalf("compatibility=%+v", r.Content)
 	}
 	s.TrafficMap.Status.GatewayRef.Name = "private-sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
-	s.TrafficMap.Status.Programmed = false
+	s.TrafficMap.Status.Published = false
 	s.TrafficMap.Status.ObservedTrafficMapGeneration = 4
 	r, _ = ProjectEndpoint(s, fixtureClock)
 	if r.Content.Routing.Gateway != nil || r.Content.Routing.Acknowledgement != "Unknown" {

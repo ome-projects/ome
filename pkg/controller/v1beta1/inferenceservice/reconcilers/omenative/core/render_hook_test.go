@@ -8,6 +8,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 )
 
 // coordinatedISVC builds a coordination-enabled, multi-component ISVC: a
@@ -74,38 +75,76 @@ func renderedPod(component v1beta1.ComponentType) *corev1.Pod {
 	}
 }
 
+// pairedWithDecoder is a resolver that pairs every engine revision with
+// one fixed decoder revision and records the pod hash it was asked about.
+func pairedWithDecoder(decoderHash string, asked *[]string) coordination.PeerRevisionFunc {
+	return func(peer v1beta1.ComponentType, podRevisionHash string) string {
+		*asked = append(*asked, podRevisionHash)
+		if peer == v1beta1.DecoderComponent {
+			return decoderHash
+		}
+		return ""
+	}
+}
+
 // TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent pins that the
 // hook recovers the component from constants.OMEComponentLabel
 // ("component"); reading any other key yields "", an empty peer lookup,
 // and no InjectPeerEnv call. This drives a rendered engine pod through the
-// live hook and asserts the decoder peer endpoint env actually lands on
-// every container.
+// live hook and asserts both decoder peer endpoints land on every
+// container: the generic one, and the per-revision one naming the decoder
+// revision the resolver paired this pod with — NOT the pod's own hash
+// (each Component hashes its own template, so llama-decoder-rev-<engineHash>
+// never exists).
 func TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent(t *testing.T) {
 	isvc := coordinatedISVC()
-	hook := ISVCRenderHook(isvc)
+	var asked []string
+	hook := ISVCRenderHook(isvc, pairedWithDecoder("dec456", &asked))
 	if hook == nil {
 		t.Fatal("ISVCRenderHook returned nil for a coordination-enabled ISVC")
 	}
 
 	pod := renderedPod(v1beta1.EngineComponent)
-	hook(pod, "runner-0", 0, "rev-abc123")
+	hook(pod, "runner-0", 0, "eng123")
 
 	for _, ctr := range pod.Spec.Containers {
 		if got := envValue(ctr.Env, "OME_DECODER_ENDPOINT"); got != "llama-decoder.prod.svc.cluster.local" {
 			t.Errorf("container %q: OME_DECODER_ENDPOINT = %q, want llama-decoder.prod.svc.cluster.local",
 				ctr.Name, got)
 		}
-		// The peer's revision hash is NOT the rendered pod's own hash (each
-		// Component hashes its own template), so the hook must not stamp a
-		// per-revision peer endpoint from the local hash — that DNS name
-		// (llama-decoder-rev-<engineHash>) never exists.
-		if got := envValue(ctr.Env, "OME_DECODER_REVISION_ENDPOINT"); got != "" {
-			t.Errorf("container %q: OME_DECODER_REVISION_ENDPOINT = %q, want it absent (peer hash unknown at render time)",
-				ctr.Name, got)
+		want := coordination.PerRevisionServiceName("llama", v1beta1.DecoderComponent, "dec456") + ".prod.svc.cluster.local"
+		if got := envValue(ctr.Env, "OME_DECODER_REVISION_ENDPOINT"); got != want {
+			t.Errorf("container %q: OME_DECODER_REVISION_ENDPOINT = %q, want the paired decoder revision Service %q",
+				ctr.Name, got, want)
 		}
 		// The engine never names itself as a peer.
 		if containsEnvNamed(ctr.Env, "OME_ENGINE_ENDPOINT") {
 			t.Errorf("container %q: pod should not carry its own component as a peer", ctr.Name)
+		}
+	}
+	for _, h := range asked {
+		if h != "eng123" {
+			t.Errorf("resolver must be asked about the rendered pod's own revision hash, got %q", h)
+		}
+	}
+	if len(asked) == 0 {
+		t.Error("resolver was never consulted")
+	}
+}
+
+// TestISVCRenderHook_NoResolverEmitsGenericOnly pins the degraded shape: with
+// no resolver the hook must inject only the revision-agnostic endpoint, never
+// a per-revision DNS name derived from the pod's own hash.
+func TestISVCRenderHook_NoResolverEmitsGenericOnly(t *testing.T) {
+	hook := ISVCRenderHook(coordinatedISVC(), nil)
+	pod := renderedPod(v1beta1.EngineComponent)
+	hook(pod, "runner-0", 0, "eng123")
+	for _, ctr := range pod.Spec.Containers {
+		if got := envValue(ctr.Env, "OME_DECODER_ENDPOINT"); got != "llama-decoder.prod.svc.cluster.local" {
+			t.Errorf("container %q: OME_DECODER_ENDPOINT = %q", ctr.Name, got)
+		}
+		if got := envValue(ctr.Env, "OME_DECODER_REVISION_ENDPOINT"); got != "" {
+			t.Errorf("container %q: OME_DECODER_REVISION_ENDPOINT = %q, want it absent without a resolver", ctr.Name, got)
 		}
 	}
 }
@@ -115,18 +154,19 @@ func TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent(t *testing.T) {
 // single-component / non-coordinated boxes are unaffected by the wiring.
 func TestISVCRenderHook_NilForNonCoordinatedISVC(t *testing.T) {
 	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "solo", Namespace: "prod"}}
-	if ISVCRenderHook(isvc) != nil {
+	if ISVCRenderHook(isvc, nil) != nil {
 		t.Error("ISVCRenderHook should return nil when the ISVC has no rolloutCoordination")
 	}
-	if ISVCRenderHook(nil) != nil {
+	if ISVCRenderHook(nil, nil) != nil {
 		t.Error("ISVCRenderHook(nil) should return nil")
 	}
 }
 
-// TestISVCRenderHook_RevisionAgnosticWhenNoHash confirms the empty-hash
-// render path also injects only the generic peer endpoint.
-func TestISVCRenderHook_RevisionAgnosticWhenNoHash(t *testing.T) {
-	hook := ISVCRenderHook(coordinatedISVC())
+// TestISVCRenderHook_EmptyHashStillPairs confirms the empty-hash render
+// path still asks the resolver, which pairs it as a target-revision pod.
+func TestISVCRenderHook_EmptyHashStillPairs(t *testing.T) {
+	var asked []string
+	hook := ISVCRenderHook(coordinatedISVC(), pairedWithDecoder("dec456", &asked))
 	pod := renderedPod(v1beta1.EngineComponent)
 	hook(pod, "runner-0", 0, "")
 
@@ -134,8 +174,8 @@ func TestISVCRenderHook_RevisionAgnosticWhenNoHash(t *testing.T) {
 	if got := envValue(env, "OME_DECODER_ENDPOINT"); got != "llama-decoder.prod.svc.cluster.local" {
 		t.Errorf("generic endpoint missing/wrong: %q", got)
 	}
-	if containsEnvNamed(env, "OME_DECODER_REVISION_ENDPOINT") {
-		t.Error("revision endpoint should never be injected by the hook")
+	if got := envValue(env, "OME_DECODER_REVISION_ENDPOINT"); got != "llama-decoder-rev-dec456.prod.svc.cluster.local" {
+		t.Errorf("revision endpoint = %q, want the paired decoder revision", got)
 	}
 }
 
@@ -145,15 +185,19 @@ func TestISVCRenderHook_RevisionAgnosticWhenNoHash(t *testing.T) {
 // Components — not rollout grouping, so the engine still gets the decoder's
 // endpoint regardless of how the rollout sequences them.
 func TestISVCRenderHook_SeparateGroupsStillServingPeers(t *testing.T) {
-	hook := ISVCRenderHook(decoupledISVC())
+	var asked []string
+	hook := ISVCRenderHook(decoupledISVC(), pairedWithDecoder("dec456", &asked))
 	if hook == nil {
 		t.Fatal("hook nil for an ISVC with rollout groups")
 	}
 	pod := renderedPod(v1beta1.EngineComponent)
-	hook(pod, "runner-0", 0, "rev-abc123")
+	hook(pod, "runner-0", 0, "eng123")
 	for _, ctr := range pod.Spec.Containers {
 		if got := envValue(ctr.Env, "OME_DECODER_ENDPOINT"); got != "llama-decoder.prod.svc.cluster.local" {
 			t.Errorf("container %q: OME_DECODER_ENDPOINT = %q, want the decoder serving peer (rollout grouping must not matter)", ctr.Name, got)
+		}
+		if got := envValue(ctr.Env, "OME_DECODER_REVISION_ENDPOINT"); got != "llama-decoder-rev-dec456.prod.svc.cluster.local" {
+			t.Errorf("container %q: OME_DECODER_REVISION_ENDPOINT = %q, want the paired decoder revision", ctr.Name, got)
 		}
 	}
 }

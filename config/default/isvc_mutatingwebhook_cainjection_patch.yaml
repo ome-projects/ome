@@ -5,4 +5,4 @@ metadata:
   annotations:
     cert-manager.io/inject-ca-from: $(omeNamespace)/serving-cert
 webhooks:
-  - name: inferenceservice.ome-webhook-server.defaulter
+  - name: inferenceservice.ome-webhook-server.pod-mutator

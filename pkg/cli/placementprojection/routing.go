@@ -36,7 +36,7 @@ func boundMap(parent *ome.InferenceService, tm *ome.TrafficMap) bool {
 }
 
 func projectRouting(snapshot c.Result, status v.PlacementStatusContent, clock time.Time) v.PlacementEndpointContent {
-	out := v.PlacementEndpointContent{Status: status, Entries: []v.PlacementRoute{}, Conditions: []v.PlacementCondition{}, ConditionPreview: v.PlacementPreview{State: "NotRecorded"}, Issues: []v.PlacementIssue{}, Routing: v.PlacementRouting{Acquisition: snapshot.TrafficMapAcquisition, Mode: "NotRecorded", Source: v.PlacementEvidence{Evidence: v.EvidenceUnavailable, Freshness: "Unavailable", Reason: snapshot.TrafficMapAcquisition.Reason}, Routable: conditionValue(nil, "Routable"), Programmed: conditionValue(nil, "Programmed"), Acknowledgement: "NoAcknowledgement", AcknowledgementSource: reported(), EntryPreview: v.PlacementPreview{State: "NotRecorded"}, ProbePreview: v.PlacementPreview{State: "NotRecorded"}}}
+	out := v.PlacementEndpointContent{Status: status, Entries: []v.PlacementRoute{}, Conditions: []v.PlacementCondition{}, ConditionPreview: v.PlacementPreview{State: "NotRecorded"}, Issues: []v.PlacementIssue{}, Routing: v.PlacementRouting{Acquisition: snapshot.TrafficMapAcquisition, Mode: "NotRecorded", Source: v.PlacementEvidence{Evidence: v.EvidenceUnavailable, Freshness: "Unavailable", Reason: snapshot.TrafficMapAcquisition.Reason}, Routable: conditionValue(nil, "Routable"), Published: conditionValue(nil, "Published"), Acknowledgement: "NoAcknowledgement", AcknowledgementSource: reported(), EntryPreview: v.PlacementPreview{State: "NotRecorded"}, ProbePreview: v.PlacementPreview{State: "NotRecorded"}}}
 	tm := snapshot.TrafficMap
 	if tm == nil {
 		if out.Routing.Acquisition.State == "" {
@@ -61,7 +61,7 @@ func projectRouting(snapshot c.Result, status v.PlacementStatusContent, clock ti
 		addIssue(&out.Issues, "TrafficMapConditions", out.ConditionPreview.State)
 	}
 	out.Routing.Routable = conditionValue(out.Conditions, "Routable")
-	out.Routing.Programmed = conditionValue(out.Conditions, "Programmed")
+	out.Routing.Published = conditionValue(out.Conditions, "Published")
 	projectAcknowledgement(&out.Routing, tm)
 	if ref := tm.Status.GatewayRef; ref != nil {
 		ns := ref.Namespace
@@ -176,15 +176,15 @@ func validEntry(e *ome.TrafficMapEntry) bool {
 }
 
 func projectAcknowledgement(out *v.PlacementRouting, tm *ome.TrafficMap) {
-	condition := out.Programmed
+	condition := out.Published
 	observed := tm.Status.ObservedTrafficMapGeneration
 	out.AcknowledgementSource = freshness(observed, tm.Generation)
-	if condition.Reason == "NotRecorded" && observed == 0 && !tm.Status.Programmed {
+	if condition.Reason == "NotRecorded" && observed == 0 && !tm.Status.Published {
 		out.Acknowledgement = "NoAcknowledgement"
 		out.AcknowledgementSource.Reason = "NoAcknowledgement"
 		return
 	}
-	if observed < 0 || observed > tm.Generation || condition.Source.Freshness == "Invalid" || (tm.Status.Programmed && condition.Status == "False") {
+	if observed < 0 || observed > tm.Generation || condition.Source.Freshness == "Invalid" || (tm.Status.Published && condition.Status == "False") {
 		out.Acknowledgement = "Invalid"
 		out.AcknowledgementSource.Freshness = "Invalid"
 		out.AcknowledgementSource.Reason = "ConflictingAcknowledgement"
@@ -193,7 +193,7 @@ func projectAcknowledgement(out *v.PlacementRouting, tm *ome.TrafficMap) {
 	if condition.Reason != "NotRecorded" {
 		var suppliedGeneration int64
 		for _, raw := range tm.Status.Conditions {
-			if raw.Type == "Programmed" {
+			if raw.Type == "Published" {
 				suppliedGeneration = raw.ObservedGeneration
 			}
 		}
@@ -218,7 +218,7 @@ func projectAcknowledgement(out *v.PlacementRouting, tm *ome.TrafficMap) {
 		}
 		return
 	}
-	if tm.Status.Programmed {
+	if tm.Status.Published {
 		out.Acknowledgement = "ReportedTrue"
 	} else {
 		out.Acknowledgement = "Unknown"

@@ -178,6 +178,14 @@ func Dispatch(ctx context.Context, d DispatchDeps) (time.Duration, error) {
 			}
 		}
 	}
+	// No authority names a stable revision when the plan and the new target
+	// land in one write before the IR promotes its current revision: the
+	// staged partition then blocks that promotion for as long as the canary
+	// stays unarmed. The pods still serving the non-target revision are the
+	// stable identity the step machine shifts traffic away from.
+	if stableHash == "" && revisions.fromIR {
+		stableHash = otherRevision(pods, canaryHash)
+	}
 	// Resolve the two revisions' pairing protocols through the cached client:
 	// a ControllerRevision's protocol is immutable from create, so a cache
 	// read can only lag into "" (pairs with anything) for a just-minted CR,
@@ -618,15 +626,7 @@ func observeCanaryRevisions(ctx context.Context, reads client.Reader, isvc *v1be
 // group's Components. Secondary Components (a PD pair's engine/decoder) stage
 // capacity and gate the step but don't carry the external traffic weight.
 func primaryComponentOf(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
-	if g == nil || len(g.Components) == 0 {
-		return ""
-	}
-	for _, c := range []v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent, v1beta1.DecoderComponent} {
-		if groupHasComponent(g, c) {
-			return c
-		}
-	}
-	return g.Components[0]
+	return rollout.PrimaryOf(g)
 }
 
 // componentReplicas is the steady replica count for a Component (MinReplicas,

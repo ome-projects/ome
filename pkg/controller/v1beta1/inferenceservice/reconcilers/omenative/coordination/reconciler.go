@@ -17,8 +17,8 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
@@ -241,9 +241,14 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		}
 
 		// Delete per-revision Service pairs whose revision-hash has no
-		// live pods. Safe because we Ensure only for hashes with pods —
-		// a hash with zero pods is genuinely past retention. Pods added
-		// between the list and the delete re-Ensure on the next reconcile.
+		// live pods and is not the Component's roll target. A hash with zero
+		// pods that is not the target is genuinely past retention. The
+		// target revision is protected even before its first pod exists:
+		// peer Components create its Services ahead of the pods whose
+		// OME_<PEER>_REVISION_ENDPOINT names them, and sweeping those would
+		// leave the pods with a dead peer endpoint until re-created. Pods
+		// added between the list and the delete re-Ensure on the next
+		// reconcile.
 		//
 		// The sweep runs unconditionally. It cannot be gated on the live
 		// revision-hash set matching Status.Components.<c>.Traffic: the
@@ -253,7 +258,11 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		// the pass on which the two sets agree, so a gate would skip the
 		// only sweep that could collect that revision's Services. Cost is
 		// a cached-client List, not an apiserver round trip.
-		if err := gcOrphanedPerRevisionServices(ctx, in.Client, in.ISVC, c, perRevisionPods[c]); err != nil {
+		retained, err := retainedRevisionHashes(ctx, in.Reader, in.ISVC, c, perRevisionPods[c])
+		if err != nil {
+			return nil, fmt.Errorf("resolve retained revisions for %s: %w", c, err)
+		}
+		if err := gcOrphanedPerRevisionServices(ctx, in.Client, in.ISVC, c, retained); err != nil {
 			return nil, fmt.Errorf("gc per-revision services for %s: %w", c, err)
 		}
 	}
@@ -475,7 +484,11 @@ func podReadyAndServing(pod *corev1.Pod) bool {
 func dropCanaryOwned(comps []v1beta1.ComponentType, isvc *v1beta1.InferenceService) []v1beta1.ComponentType {
 	owned := map[v1beta1.ComponentType]struct{}{}
 	for _, g := range isvc.Spec.GetRolloutGroups() {
-		if g.Canary == nil {
+		// Declared kind, not an inline body: this reads the raw spec, where a
+		// policyRef-canary group carries no inline arm. Missing it leaves the
+		// Component in coordination's pod-proportional traffic writer, which
+		// then overwrites the canary's explicit step weight every reconcile.
+		if g.DeclaredProgression() != v1beta1.RolloutProgressionCanary {
 			continue
 		}
 		for _, c := range g.Components {
@@ -606,8 +619,8 @@ func buildGroupObservation(ctx context.Context, reads client.Reader, isvc *v1bet
 		// controller stages Instances at. A runtime-inherited partition is
 		// invisible on the raw ISVC, so reading the ISVC here would treat a
 		// legitimately staged Component as an incomplete rollout forever.
-		// Canary-owned Components never reach this loop (they leave
-		// Partition 0, driven by the canary reconciler's own
+		// Canary-owned Components never reach this loop (their hold is the
+		// projected pacing partition, driven by the canary reconciler's own
 		// EffectivePartition path).
 		partition, err := irprojector.ComponentIRPartition(ctx, reads, isvc.Namespace, isvc.Name, c)
 		if err != nil {
@@ -661,7 +674,7 @@ func buildComponentObservation(summary *v1beta1.InferenceReplicaStatus, c v1beta
 	// (Replicas-Partition) instances Ready on the target revision and
 	// Partition instances Ready on the prior revision? Partition=0 means
 	// this is the RolloutComplete predicate.
-	out.AtDesiredShape = workload.ReachedDesiredShape(
+	out.AtDesiredShape = workloadstatus.ReachedDesiredShape(
 		v1beta1convert.InstanceStatusSliceToWorkload(summary.InstanceStatuses),
 		summary.UpdateRevision, partition, summary.Replicas)
 	return out
@@ -700,8 +713,33 @@ func sumPodCounts(in map[string]int32) int32 {
 	return sum
 }
 
+// retainedRevisionHashes is the revision-hash set the orphan sweep must
+// keep for one Component: every hash with a live pod plus the Component's
+// roll-target hash from its IR status. The target is retained even with
+// zero pods because peer Components create its per-revision Services
+// ahead of the pods that name them. Returns liveHashes as-is when the IR
+// reports no target yet.
+func retainedRevisionHashes(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, liveHashes map[string]int32) (map[string]int32, error) {
+	target, err := latestRevisionHashChecked(ctx, reads, isvc.Namespace, isvc.Name, component)
+	if err != nil {
+		return nil, err
+	}
+	if target == "" {
+		return liveHashes, nil
+	}
+	if _, live := liveHashes[target]; live {
+		return liveHashes, nil
+	}
+	retained := make(map[string]int32, len(liveHashes)+1)
+	for h, n := range liveHashes {
+		retained[h] = n
+	}
+	retained[target] = 0
+	return retained, nil
+}
+
 // gcOrphanedPerRevisionServices deletes per-revision Service pairs
-// whose revision-hash has no live pods for `component`.
+// whose revision-hash is not in `liveHashes` for `component`.
 //
 // The sweep lists Services in the ISVC's namespace that carry the
 // (inferenceservice + component + revision-hash) selector keys, then

@@ -258,42 +258,45 @@ type NamespaceIngressGateway struct {
 // +kubebuilder:object:generate=false
 type DeployConfig struct {
 	DefaultDeploymentMode string `json:"defaultDeploymentMode,omitempty"`
-	// Replicas carries the admission-time component replica defaults the
-	// ISVC defaulter stamps on unset minReplicas/maxReplicas fields. There
-	// are intentionally NO in-code defaults — the values are supplied via
-	// the inferenceservice-config ConfigMap (Helm chart / GitOps). Absent
-	// (nil block or nil field) means unconfigured: the defaulter leaves the
-	// corresponding field as authored, never a silent fallback to baked-in
-	// numbers. Configured values must be > 0 (rejected at config-load).
+	// Replicas carries the component replica defaults the reconciler fills
+	// on a merged component spec whose minReplicas/maxReplicas neither the
+	// InferenceService nor its ServingRuntime set; the stored object is
+	// never written. There are intentionally NO in-code defaults — the
+	// values are supplied via the inferenceservice-config ConfigMap (Helm
+	// chart / GitOps). Absent (nil block or nil field) means unconfigured:
+	// the reconciler leaves the corresponding field unset, never a silent
+	// fallback to baked-in numbers. Configured values must be > 0 (rejected
+	// at config-load).
 	Replicas *ReplicasDefaultsConfig `json:"replicas,omitempty"`
-	// TerminationGracePeriodSeconds is the admission-time pod termination
-	// grace the ISVC defaulter stamps on any component that does not author
-	// one. It bounds how long a component has to finish in-flight work after
-	// SIGTERM, so a serving component whose requests outlive the platform
-	// default loses them on every restart unless this is raised.
+	// TerminationGracePeriodSeconds is the pod termination grace the
+	// reconciler fills on any component pod spec that neither the
+	// InferenceService nor its ServingRuntime set. It bounds how long a
+	// component has to finish in-flight work after SIGTERM, so a serving
+	// component whose requests outlive the platform default loses them on
+	// every restart unless this is raised.
 	//
 	// Following Replicas above, there is no in-code default: nil means
-	// unconfigured and the component keeps whatever it authored. A configured
+	// unconfigured and the pod keeps the Kubernetes default. A configured
 	// value must be > 0 (rejected at config-load).
 	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
-	// MinReadySeconds is the admission-time lifecycle.minReadySeconds the
-	// ISVC defaulter stamps on every OMENative component that does not
-	// author one: the time a newly Ready pod must stay Ready before a
-	// rollout drains or promotes past it. No in-code default: nil means
+	// MinReadySeconds is the lifecycle.minReadySeconds the reconciler fills
+	// on every OMENative component whose InferenceService and ServingRuntime
+	// both leave it unset: the time a newly Ready pod must stay Ready before
+	// a rollout drains or promotes past it. No in-code default: nil means
 	// unconfigured and the component keeps whatever it authored (unset =
 	// Available as soon as Ready). A configured value must be >= 0.
 	MinReadySeconds *int32 `json:"minReadySeconds,omitempty"`
-	// UpdateStrategy is the admission-time lifecycle.updateStrategy the ISVC
-	// defaulter stamps on OMENative components that do not author one, keyed
-	// by component so a router and an engine can roll differently. Following
-	// the fields above there is no in-code default: an absent block, an
-	// absent component entry, or an absent field means unconfigured and the
-	// component keeps whatever it authored.
+	// UpdateStrategy is the lifecycle.updateStrategy the reconciler fills on
+	// OMENative components whose InferenceService and ServingRuntime both
+	// leave it unset, keyed by component so a router and an engine can roll
+	// differently. Following the fields above there is no in-code default:
+	// an absent block, an absent component entry, or an absent field means
+	// unconfigured and the component keeps whatever it authored.
 	UpdateStrategy *UpdateStrategyDefaultsConfig `json:"updateStrategy,omitempty"`
 }
 
-// UpdateStrategyDefaultsConfig is the admission-time per-pod-swap defaulting
-// policy loaded from the "deploy.updateStrategy" block of the
+// UpdateStrategyDefaultsConfig is the per-pod-swap defaulting policy loaded
+// from the "deploy.updateStrategy" block of the
 // inferenceservice-config ConfigMap. Each component is independent; a nil
 // entry disables defaulting for that component only.
 //
@@ -305,7 +308,7 @@ type UpdateStrategyDefaultsConfig struct {
 }
 
 // ComponentUpdateStrategyDefaults carries one component's per-pod-swap
-// defaults. Both budgets may be configured; the defaulter stamps only the one
+// defaults. Both budgets may be configured; the reconciler fills only the one
 // the resolved strategy reads, because a surge strategy never consults
 // MaxUnavailable and a non-surge strategy never consults MaxSurge, and a value
 // that is never read reads as a bound that is doing nothing.
@@ -342,7 +345,7 @@ func (c *UpdateStrategyDefaultsConfig) ForComponent(component workloadtypes.Comp
 }
 
 // validate rejects a malformed block at config-load rather than letting the
-// defaulter stamp a strategy the CRD enum refuses or a budget that deadlocks
+// reconciler run a strategy the CRD enum refuses or a budget that deadlocks
 // every rollout.
 func (c *UpdateStrategyDefaultsConfig) validate() error {
 	if c == nil {
@@ -390,8 +393,8 @@ func (e *ComponentUpdateStrategyDefaults) validate(component string) error {
 	return nil
 }
 
-// ReplicasDefaultsConfig is the admission-time replica-defaulting policy
-// loaded from the "deploy.replicas" block of the inferenceservice-config
+// ReplicasDefaultsConfig is the replica-defaulting policy loaded from the
+// "deploy.replicas" block of the inferenceservice-config
 // ConfigMap. Every field is optional; a nil field disables defaulting of
 // that value only.
 //
@@ -401,7 +404,7 @@ type ReplicasDefaultsConfig struct {
 	// components share one floor default).
 	DefaultMinReplicas *int `json:"defaultMinReplicas,omitempty"`
 	// DefaultMaxReplicas fills an unset component maxReplicas, per
-	// component. The defaulter raises the filled value to an authored
+	// component. The reconciler raises the filled value to an authored
 	// minReplicas so it never manufactures a min>max conflict.
 	DefaultMaxReplicas ComponentMaxReplicasDefaults `json:"defaultMaxReplicas,omitempty"`
 }
@@ -416,7 +419,7 @@ type ComponentMaxReplicasDefaults struct {
 }
 
 // Min returns the configured minReplicas default; nil (including a nil
-// receiver) means unconfigured — the defaulter leaves the field as authored.
+// receiver) means unconfigured — the reconciler leaves the field unset.
 func (c *ReplicasDefaultsConfig) Min() *int {
 	if c == nil {
 		return nil
@@ -544,11 +547,45 @@ type LifecycleConfig struct {
 	// means unconfigured: the workload layer fails safe (the first same-target
 	// failure Holds), never a silent fallback to baked-in numbers.
 	UpdateRetry *UpdateRetryConfig `json:"updateRetry,omitempty"`
+	// InstanceReadyTimeout is how long a newly created Instance may take to
+	// become Ready before its in-flight operation is failed. A duration
+	// string ("30m"). A per-Component
+	// spec.<component>.lifecycle.instanceReadyTimeout always wins. There is
+	// intentionally NO in-code default: absence at both levels means the
+	// backstop does not exist and operations open with no deadline, which
+	// the Component reports as a warning condition rather than being failed
+	// against a fabricated window.
+	InstanceReadyTimeout string `json:"instanceReadyTimeout,omitempty"`
 	// StuckPodGracePeriod is the wait window after pod creation before a
 	// terminal kubelet waiting state escalates to Phase=Failed. A duration
 	// string ("60s"); absence or parse failure disables fast escalation
 	// this pass (the InstanceReadyTimeout backstop remains).
 	StuckPodGracePeriod string `json:"stuckPodGracePeriod,omitempty"`
+	// UnschedulableGracePeriod is how long a pod may carry
+	// PodScheduled=False/Unschedulable before its Instance is failed as
+	// environment-caused. A duration string ("10m"), measured from the
+	// condition's last transition. There is intentionally NO in-code
+	// default: absence means the escalation does not exist and an
+	// unplaceable pod only parks the InstanceReadyTimeout clock.
+	UnschedulableGracePeriod string `json:"unschedulableGracePeriod,omitempty"`
+	// GangScheduleTimeout bounds the per-PodGroup schedule timeout a
+	// multi-pod Instance derives from its Component's
+	// InstanceReadyTimeout. Absence means the escalation does not exist —
+	// there are intentionally NO in-code bounds: the derived timeout
+	// reaches the scheduler unclamped.
+	GangScheduleTimeout *GangScheduleTimeoutConfig `json:"gangScheduleTimeout,omitempty"`
+	// Audit bounds migration admission against the owner's migration
+	// records, and how far back terminal records are kept in status.
+	// Absence means the caps do not exist, and since they are the only
+	// bound on destructive migration churn, a migration request is held
+	// (deferred, warned, and surfaced as a condition) until they are
+	// supplied — there are intentionally NO in-code caps.
+	Audit *AuditConfig `json:"audit,omitempty"`
+	// Requeue is the per-pass wake-up cadence of the OMENative
+	// dispatcher. Absence means no cadence: a pass that still has work
+	// requeues on the controller's rate-limited backoff instead of a
+	// baked-in interval.
+	Requeue *RequeueConfig `json:"requeue,omitempty"`
 	// AutoMigrate configures the deadline-disposition relocation budget.
 	// Absence disables the relocation branch.
 	AutoMigrate *AutoMigrateConfig `json:"autoMigrate,omitempty"`
@@ -589,6 +626,13 @@ type LifecycleConfig struct {
 	// means unconfigured: without a per-ISVC annotation the retention sweep
 	// prunes nothing, never a silent fallback to a baked-in number.
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty"`
+	// RetryBlockHistoryLimit caps how many RetryBlocks for SUPERSEDED
+	// target revisions an InferenceReplica keeps as historical failure
+	// evidence; the block for the current target is never pruned. There
+	// is intentionally NO in-code default — the value is supplied via the
+	// inferenceservice-config ConfigMap (Helm chart / GitOps). Absent
+	// means unconfigured: every historical block is kept.
+	RetryBlockHistoryLimit *int32 `json:"retryBlockHistoryLimit,omitempty"`
 }
 
 // PodBatchSizes contains the process-scoped OMENative scale settings loaded
@@ -640,6 +684,146 @@ type ForceDeleteConfig struct {
 	// LastTransitionTime, or the Node object gone) before the
 	// escalation may act.
 	NodeUnreachableThreshold string `json:"nodeUnreachableThreshold"`
+}
+
+// GangScheduleTimeoutConfig bounds the PodGroup ScheduleTimeoutSeconds
+// derived from a Component's InstanceReadyTimeout. Both fields are
+// duration strings ("60s", "10m") and are REQUIRED when the block is
+// present — there are no in-code bounds.
+//
+// +kubebuilder:object:generate=false
+type GangScheduleTimeoutConfig struct {
+	// Min is the floor the derived timeout is raised to. It is also what
+	// an Instance whose Component sets no usable InstanceReadyTimeout
+	// gets.
+	Min string `json:"min"`
+	// Max is the ceiling the derived timeout is lowered to, so gang
+	// admission releases an infeasible attempt on a cluster-wide
+	// schedule.
+	Max string `json:"max"`
+}
+
+// ToClamp validates the config and converts it to the workload-side
+// GangScheduleTimeoutClamp. A nil receiver (absent block) yields
+// (nil, nil) — unconfigured, the derived timeout is passed through. Any
+// violation — either field missing, unparsable, non-positive, or min
+// above max — is an error; callers treat an invalid clamp as
+// unconfigured, never patch it up with fallback bounds.
+func (c *GangScheduleTimeoutConfig) ToClamp() (*workloadtypes.GangScheduleTimeoutClamp, error) {
+	if c == nil {
+		return nil, nil
+	}
+	minTimeout, err := time.ParseDuration(c.Min)
+	if err != nil {
+		return nil, fmt.Errorf("invalid lifecycle.gangScheduleTimeout: min %q: %w", c.Min, err)
+	}
+	if minTimeout <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.gangScheduleTimeout: min must be > 0, got %s", minTimeout)
+	}
+	maxTimeout, err := time.ParseDuration(c.Max)
+	if err != nil {
+		return nil, fmt.Errorf("invalid lifecycle.gangScheduleTimeout: max %q: %w", c.Max, err)
+	}
+	if maxTimeout <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.gangScheduleTimeout: max must be > 0, got %s", maxTimeout)
+	}
+	if maxTimeout < minTimeout {
+		return nil, fmt.Errorf("invalid lifecycle.gangScheduleTimeout: max %s must be >= min %s", maxTimeout, minTimeout)
+	}
+	return &workloadtypes.GangScheduleTimeoutClamp{Min: minTimeout, Max: maxTimeout}, nil
+}
+
+// AuditConfig bounds migration EXECUTION on one owner. All three fields
+// are REQUIRED when the block is present — there are no in-code caps.
+//
+// +kubebuilder:object:generate=false
+type AuditConfig struct {
+	// MaxInFlightMigrations caps EXECUTING migration records on the owner
+	// — non-terminal with an allocated surge. Queued intent is not
+	// counted: the dispatcher executes serially and a queued record holds
+	// no resources.
+	MaxInFlightMigrations int32 `json:"maxInFlightMigrations"`
+	// MaxMigrationsPerWindow caps migration records of any phase whose
+	// surge was allocated inside the trailing Window.
+	MaxMigrationsPerWindow int32 `json:"maxMigrationsPerWindow"`
+	// Window is the trailing window MaxMigrationsPerWindow counts over,
+	// as a duration string ("1h"). Terminal migration records completed
+	// longer ago than this are pruned from the owner's status, which is
+	// what keeps that list bounded by construction.
+	Window string `json:"window"`
+}
+
+// ToPolicy validates the config and converts it to the workload-side
+// MigrationAuditPolicy. A nil receiver (absent block) yields (nil, nil)
+// — unconfigured, and the caller holds migration requests instead of
+// admitting them. Any violation —
+// a non-positive cap, or a missing, unparsable, or non-positive window
+// — is an error; callers treat an invalid policy as unconfigured, never
+// patch it up with fallback caps.
+func (c *AuditConfig) ToPolicy() (*workloadtypes.MigrationAuditPolicy, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if c.MaxInFlightMigrations <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.audit: maxInFlightMigrations must be > 0, got %d", c.MaxInFlightMigrations)
+	}
+	if c.MaxMigrationsPerWindow <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.audit: maxMigrationsPerWindow must be > 0, got %d", c.MaxMigrationsPerWindow)
+	}
+	window, err := time.ParseDuration(c.Window)
+	if err != nil {
+		return nil, fmt.Errorf("invalid lifecycle.audit: window %q: %w", c.Window, err)
+	}
+	if window <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.audit: window must be > 0, got %s", window)
+	}
+	return &workloadtypes.MigrationAuditPolicy{
+		MaxInFlight:  c.MaxInFlightMigrations,
+		MaxPerWindow: c.MaxMigrationsPerWindow,
+		Window:       window,
+	}, nil
+}
+
+// RequeueConfig is the OMENative dispatcher's wake-up cadence. Both
+// fields are duration strings ("5s", "3s") and are REQUIRED when the
+// block is present — there are no in-code intervals.
+//
+// +kubebuilder:object:generate=false
+type RequeueConfig struct {
+	// Operation is the wait between passes while a Create, Update,
+	// Restart, or Migrate operation is in flight.
+	Operation string `json:"operation"`
+	// Gate is the wait while a rollout gate denies the pass. Typically
+	// shorter than Operation: the peer Component that releases the gate
+	// may catch up on the very next reconcile.
+	Gate string `json:"gate"`
+}
+
+// ToIntervals validates the config and converts it to the workload-side
+// RequeueIntervals. A nil receiver (absent block) yields the zero value
+// — unconfigured, and every pass falls back to the controller's
+// rate-limited backoff. Any violation — either field missing,
+// unparsable, or non-positive — is an error; callers treat an invalid
+// block as unconfigured, never patch it up with fallback intervals.
+func (c *RequeueConfig) ToIntervals() (workloadtypes.RequeueIntervals, error) {
+	if c == nil {
+		return workloadtypes.RequeueIntervals{}, nil
+	}
+	operation, err := time.ParseDuration(c.Operation)
+	if err != nil {
+		return workloadtypes.RequeueIntervals{}, fmt.Errorf("invalid lifecycle.requeue: operation %q: %w", c.Operation, err)
+	}
+	if operation <= 0 {
+		return workloadtypes.RequeueIntervals{}, fmt.Errorf("invalid lifecycle.requeue: operation must be > 0, got %s", operation)
+	}
+	gate, err := time.ParseDuration(c.Gate)
+	if err != nil {
+		return workloadtypes.RequeueIntervals{}, fmt.Errorf("invalid lifecycle.requeue: gate %q: %w", c.Gate, err)
+	}
+	if gate <= 0 {
+		return workloadtypes.RequeueIntervals{}, fmt.Errorf("invalid lifecycle.requeue: gate must be > 0, got %s", gate)
+	}
+	return workloadtypes.RequeueIntervals{Operation: operation, Gate: gate}, nil
 }
 
 // TeardownConfig configures the finalizer-gated IR teardown deadline.
@@ -761,6 +945,42 @@ func (c *LifecycleConfig) ToGracePeriod() (time.Duration, error) {
 	return d, nil
 }
 
+// ToInstanceReadyTimeout validates and parses InstanceReadyTimeout. A nil
+// receiver or absent key is NOT an error — it means the operator supplied
+// no Component-wide readiness backstop, which the caller distinguishes
+// from invalid by the returned zero value.
+func (c *LifecycleConfig) ToInstanceReadyTimeout() (time.Duration, error) {
+	if c == nil || c.InstanceReadyTimeout == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.InstanceReadyTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("invalid lifecycle.instanceReadyTimeout %q: %w", c.InstanceReadyTimeout, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid lifecycle.instanceReadyTimeout: must be > 0, got %s", d)
+	}
+	return d, nil
+}
+
+// ToUnschedulableGracePeriod validates and parses
+// UnschedulableGracePeriod. A nil receiver or absent key is NOT an error
+// — it means the scheduler-hold escalation is unconfigured, which the
+// caller distinguishes from invalid by the returned zero value.
+func (c *LifecycleConfig) ToUnschedulableGracePeriod() (time.Duration, error) {
+	if c == nil || c.UnschedulableGracePeriod == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.UnschedulableGracePeriod)
+	if err != nil {
+		return 0, fmt.Errorf("invalid lifecycle.unschedulableGracePeriod %q: %w", c.UnschedulableGracePeriod, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid lifecycle.unschedulableGracePeriod: must be > 0, got %s", d)
+	}
+	return d, nil
+}
+
 // Validate checks AutoMigrateConfig constraints.
 func (c *AutoMigrateConfig) Validate() error {
 	if c.MaxAttempts <= 0 {
@@ -777,7 +997,7 @@ func (c *LifecycleConfig) ToScaleUpPodBatchSize() (*int32, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return positivePodBatchSize("scaleUpPodBatchSize", c.ScaleUpPodBatchSize)
+	return positiveInt32Field("scaleUpPodBatchSize", c.ScaleUpPodBatchSize)
 }
 
 // ToScaleDownPodBatchSize validates the configured delete Pod-equivalent batch
@@ -788,7 +1008,7 @@ func (c *LifecycleConfig) ToScaleDownPodBatchSize() (*int32, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return positivePodBatchSize("scaleDownPodBatchSize", c.ScaleDownPodBatchSize)
+	return positiveInt32Field("scaleDownPodBatchSize", c.ScaleDownPodBatchSize)
 }
 
 // ToScaleDownRequeueInterval validates the configured destructive-work polling
@@ -826,7 +1046,19 @@ func (c *LifecycleConfig) ToRevisionHistoryLimit() (*int32, error) {
 	return &limit, nil
 }
 
-func positivePodBatchSize(field string, configured *int32) (*int32, error) {
+// ToRetryBlockHistoryLimit validates the configured historical
+// RetryBlock cap. A nil LifecycleConfig or absent field means
+// unconfigured (nil, nil) — the caller keeps every historical block
+// rather than fabricating a bound. Explicit zero or negative values are
+// invalid; callers treat invalid config as unconfigured.
+func (c *LifecycleConfig) ToRetryBlockHistoryLimit() (*int32, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return positiveInt32Field("retryBlockHistoryLimit", c.RetryBlockHistoryLimit)
+}
+
+func positiveInt32Field(field string, configured *int32) (*int32, error) {
 	if configured == nil {
 		return nil, nil
 	}

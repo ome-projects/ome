@@ -1,11 +1,5 @@
 package inferencereplica
 
-// Release-mailbox coverage for the ome.io/release-held-revision
-// annotation: a Held block matched by full revision name or bare hash
-// is removed and the annotation is consumed; non-Held or unknown
-// revisions consume as an explanatory no-op; unmatched blocks are
-// never touched.
-
 import (
 	"context"
 	"testing"
@@ -20,8 +14,14 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
+
+// Release-mailbox coverage for the ome.io/release-held-revision
+// annotation: a Held block matched by full revision name or bare hash
+// is removed and the annotation is consumed; non-Held or unknown
+// revisions consume as an explanatory no-op; unmatched blocks are
+// never touched.
 
 // newReleaseFixture builds a fake-client Reconciler (with recorder)
 // around the given IR and re-reads it so the ResourceVersion is
@@ -39,7 +39,7 @@ func newReleaseFixture(t *testing.T, ir *v1beta1.InferenceReplica) (*Reconciler,
 		APIReader:            c,
 		Log:                  logf.Log.WithName("test"),
 		Recorder:             rec,
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	fresh := &v1beta1.InferenceReplica{}
@@ -82,7 +82,7 @@ func TestConsumeReleaseHeld_FullNameReleasesHeldBlock(t *testing.T) {
 	g := gomega.NewWithT(t)
 	r, c, rec, ir := newReleaseFixture(t, releaseIR("llama-engine-aaaaaaaa"))
 
-	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil)
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(requeue).To(gomega.BeFalse())
 
@@ -99,7 +99,7 @@ func TestConsumeReleaseHeld_FullNameReleasesHeldBlock(t *testing.T) {
 	assertAnnotationConsumed(t, g, c, ir)
 
 	events := drainEvents(rec)
-	g.Expect(eventsContaining(events, string(workload.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
 	g.Expect(eventsContaining(events, "llama-engine-aaaaaaaa")).NotTo(gomega.BeEmpty(),
 		"the event must name the released revision")
 	g.Expect(eventsContaining(events, "operator request")).NotTo(gomega.BeEmpty(),
@@ -113,7 +113,7 @@ func TestConsumeReleaseHeld_BareHashMatches(t *testing.T) {
 	g := gomega.NewWithT(t)
 	r, c, rec, ir := newReleaseFixture(t, releaseIR("aaaaaaaa"))
 
-	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil)
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(requeue).To(gomega.BeFalse())
 
@@ -123,7 +123,7 @@ func TestConsumeReleaseHeld_BareHashMatches(t *testing.T) {
 	g.Expect(fresh.Status.RetryBlocks[0].TargetRevision).To(gomega.Equal("llama-engine-bbbbbbbb"))
 
 	assertAnnotationConsumed(t, g, c, ir)
-	g.Expect(eventsContaining(drainEvents(rec), string(workload.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
+	g.Expect(eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
 }
 
 // TestConsumeReleaseHeld_NonHeldMatch_NoOpConsumed pins the non-Held
@@ -134,7 +134,7 @@ func TestConsumeReleaseHeld_NonHeldMatch_NoOpConsumed(t *testing.T) {
 	g := gomega.NewWithT(t)
 	r, c, rec, ir := newReleaseFixture(t, releaseIR("llama-engine-bbbbbbbb"))
 
-	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil)
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(requeue).To(gomega.BeFalse())
 
@@ -146,9 +146,9 @@ func TestConsumeReleaseHeld_NonHeldMatch_NoOpConsumed(t *testing.T) {
 	assertAnnotationConsumed(t, g, c, ir)
 
 	events := drainEvents(rec)
-	g.Expect(eventsContaining(events, string(workload.EventReasonRetryBlockReleaseSkipped))).To(gomega.HaveLen(1))
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonRetryBlockReleaseSkipped))).To(gomega.HaveLen(1))
 	g.Expect(eventsContaining(events, "not Held")).NotTo(gomega.BeEmpty())
-	g.Expect(eventsContaining(events, string(workload.EventReasonRetryBlockReleased)+" ")).To(gomega.BeEmpty(),
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonRetryBlockReleased)+" ")).To(gomega.BeEmpty(),
 		"no release event on the no-op branch")
 }
 
@@ -159,7 +159,7 @@ func TestConsumeReleaseHeld_UnknownRevision_NoOpConsumed(t *testing.T) {
 	g := gomega.NewWithT(t)
 	r, c, rec, ir := newReleaseFixture(t, releaseIR("llama-engine-cccccccc"))
 
-	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil)
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(requeue).To(gomega.BeFalse())
 
@@ -170,7 +170,7 @@ func TestConsumeReleaseHeld_UnknownRevision_NoOpConsumed(t *testing.T) {
 	assertAnnotationConsumed(t, g, c, ir)
 
 	events := drainEvents(rec)
-	g.Expect(eventsContaining(events, string(workload.EventReasonRetryBlockReleaseSkipped))).To(gomega.HaveLen(1))
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonRetryBlockReleaseSkipped))).To(gomega.HaveLen(1))
 	g.Expect(eventsContaining(events, "no retryBlock exists")).NotTo(gomega.BeEmpty())
 }
 
@@ -183,7 +183,7 @@ func TestConsumeReleaseHeld_NoAnnotation_NoOp(t *testing.T) {
 	r, c, rec, fresh0 := newReleaseFixture(t, ir)
 	rv := fresh0.ResourceVersion
 
-	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, fresh0, nil)
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, fresh0, nil, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(requeue).To(gomega.BeFalse())
 
@@ -202,10 +202,10 @@ func TestConsumeReleaseHeld_ParentIsEventTarget(t *testing.T) {
 	r, c, rec, ir := newReleaseFixture(t, releaseIR("llama-engine-aaaaaaaa"))
 	parent := migrationParent(nil, false)
 
-	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, parent)
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, parent, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(requeue).To(gomega.BeFalse())
 
 	assertAnnotationConsumed(t, g, c, ir)
-	g.Expect(eventsContaining(drainEvents(rec), string(workload.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
+	g.Expect(eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
 }

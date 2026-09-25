@@ -10,26 +10,6 @@ webhooks:
       service:
         name: $(webhookServiceName)
         namespace: $(omeNamespace)
-        path: /mutate-ome-io-v1beta1-inferenceservice
-    failurePolicy: Fail
-    name: inferenceservice.ome-webhook-server.defaulter
-    sideEffects: None
-    admissionReviewVersions: ["v1beta1"]
-    rules:
-      - apiGroups:
-          - ome.io
-        apiVersions:
-          - v1beta1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - inferenceservices
-  - clientConfig:
-      caBundle: Cg==
-      service:
-        name: $(webhookServiceName)
-        namespace: $(omeNamespace)
         path: /mutate-pods
     failurePolicy: Fail
     name: inferenceservice.ome-webhook-server.pod-mutator

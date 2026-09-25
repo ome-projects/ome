@@ -561,6 +561,103 @@ func TestDispatch_HoldsUntilIRIdentifiesCanaryTarget(t *testing.T) {
 	}
 }
 
+// A plan and a new target that land in one write before the IR promotes its
+// current revision leave every stable-revision authority empty, and the staged
+// partition then keeps the promotion from ever happening. The pods still on
+// the non-target revision must supply the stable identity so the canary arms.
+func TestDispatch_ArmsFromLivePodsWhenCurrentRevisionUnpromoted(t *testing.T) {
+	ns := "default"
+	n4 := 4
+	isvc := canaryISVC(twoStep(), nil)
+	isvc.Namespace = ns
+	isvc.Name = "unpromoted"
+	isvc.Spec.Engine = &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
+	pinActiveRun(isvc)
+
+	engineIR := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "unpromoted-engine", Generation: 2}}
+	engineIR.Spec.Runners = []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1}}
+	engineIR.Status.CurrentRevision = ""
+	engineIR.Status.UpdateRevision = "unpromoted-engine-target"
+	engineIR.Status.ObservedGeneration = engineIR.Generation
+	c := fake.NewClientBuilder().
+		WithScheme(canaryScheme(t)).
+		WithStatusSubresource(&v1beta1.InferenceReplica{}).
+		WithRuntimeObjects(
+			isvc,
+			engineIR,
+			canaryPod(ns, isvc.Name, "engine", "stable", "stable-0"),
+			canaryPod(ns, isvc.Name, "engine", "stable", "stable-1"),
+			canaryPod(ns, isvc.Name, "engine", "target", "target-2"),
+			canaryPod(ns, isvc.Name, "engine", "target", "target-3"),
+			canaryControllerRevision(ns, isvc.Name, "engine", "stable", 1),
+			canaryControllerRevision(ns, isvc.Name, "engine", "target", 2),
+		).
+		Build()
+	ctx := context.Background()
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+
+	if _, err := Dispatch(ctx, deps); err != nil {
+		t.Fatalf("Dispatch with unpromoted current revision: %v", err)
+	}
+	if isvc.Status.Canary == nil || isvc.Status.Canary.CanaryRevisionHash != "target" || isvc.Status.Canary.StableRevisionHash != "stable" {
+		t.Fatalf("live non-target pods must supply the stable identity, got %+v", isvc.Status.Canary)
+	}
+	if got := isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase; got != v1beta1.RolloutPhasePaused {
+		t.Fatalf("ready step-zero capacity should pause, got %q", got)
+	}
+
+	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
+	if _, err := Dispatch(ctx, deps); err != nil {
+		t.Fatalf("Dispatch rollback: %v", err)
+	}
+	traffic := isvc.Status.Components[v1beta1.EngineComponent].Traffic
+	wantStable := coordination.PerRevisionServiceName(isvc.Name, v1beta1.EngineComponent, "stable")
+	if len(traffic) != 1 || traffic[0].RevisionName != wantStable || traffic[0].Percent != 100 {
+		t.Fatalf("rollback traffic must target the derived stable, got %+v", traffic)
+	}
+	liveIR := &v1beta1.InferenceReplica{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: engineIR.Name}, liveIR); err != nil {
+		t.Fatal(err)
+	}
+	if liveIR.Spec.Pacing == nil || liveIR.Spec.Pacing.RollbackToRevision == nil || *liveIR.Spec.Pacing.RollbackToRevision != "unpromoted-engine-stable" {
+		t.Fatalf("rollback must select the derived stable ControllerRevision, got %+v", liveIR.Spec.Pacing)
+	}
+}
+
+// A single live revision never arms a canary: the first rollout of a service
+// has no stable identity to shift traffic away from.
+func TestDispatch_SingleRevisionDoesNotArmWithoutCurrentRevision(t *testing.T) {
+	ns := "default"
+	n2 := 2
+	isvc := canaryISVC(twoStep(), nil)
+	isvc.Namespace = ns
+	isvc.Name = "first-roll"
+	isvc.Spec.Engine = &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n2}}
+	pinActiveRun(isvc)
+
+	engineIR := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "first-roll-engine", Generation: 1}}
+	engineIR.Spec.Runners = []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1}}
+	engineIR.Status.UpdateRevision = "first-roll-engine-target"
+	engineIR.Status.ObservedGeneration = engineIR.Generation
+	c := fake.NewClientBuilder().
+		WithScheme(canaryScheme(t)).
+		WithStatusSubresource(&v1beta1.InferenceReplica{}).
+		WithRuntimeObjects(
+			isvc,
+			engineIR,
+			canaryPod(ns, isvc.Name, "engine", "target", "target-0"),
+			canaryControllerRevision(ns, isvc.Name, "engine", "target", 1),
+		).
+		Build()
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	if _, err := Dispatch(context.Background(), deps); err != nil {
+		t.Fatalf("Dispatch on a single revision: %v", err)
+	}
+	if isvc.Status.Canary != nil {
+		t.Fatalf("a single live revision must not arm a canary, got %+v", isvc.Status.Canary)
+	}
+}
+
 func TestDispatch_StalePrimaryRetargetDoesNotResetCanary(t *testing.T) {
 	ns := "default"
 	n4 := 4

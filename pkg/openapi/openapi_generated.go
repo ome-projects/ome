@@ -180,6 +180,10 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec":                      schema_pkg_apis_ome_v1beta1_RolloutSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutStatus":                    schema_pkg_apis_ome_v1beta1_RolloutStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec":                       schema_pkg_apis_ome_v1beta1_RouterSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingCapacitySpec":              schema_pkg_apis_ome_v1beta1_RoutingCapacitySpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingProbeSpec":                 schema_pkg_apis_ome_v1beta1_RoutingProbeSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingPublisherSpec":             schema_pkg_apis_ome_v1beta1_RoutingPublisherSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec":                      schema_pkg_apis_ome_v1beta1_RoutingSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.Runner":                           schema_pkg_apis_ome_v1beta1_Runner(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec":                       schema_pkg_apis_ome_v1beta1_RunnerSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScaleTargetRef":                   schema_pkg_apis_ome_v1beta1_ScaleTargetRef(ref),
@@ -205,6 +209,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapGatewayRef":             schema_pkg_apis_ome_v1beta1_TrafficMapGatewayRef(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapList":                   schema_pkg_apis_ome_v1beta1_TrafficMapList(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapProbe":                  schema_pkg_apis_ome_v1beta1_TrafficMapProbe(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherStatus":        schema_pkg_apis_ome_v1beta1_TrafficMapPublisherStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapSpec":                   schema_pkg_apis_ome_v1beta1_TrafficMapSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapStatus":                 schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec":                      schema_pkg_apis_ome_v1beta1_TrafficSpec(ref),
@@ -3209,7 +3214,7 @@ func schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref common.ReferenceCallback
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "CandidatePlacement is the per-cluster state of a fan-out candidate in the placement race.",
+				Description: "CandidatePlacement is the per-cluster state of a fan-out candidate.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"cluster": {
@@ -3235,14 +3240,14 @@ func schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref common.ReferenceCallback
 					},
 					"admittedReplicas": {
 						SchemaProps: spec.SchemaProps{
-							Description: "AdmittedReplicas is how many replicas this home's Kueue has admitted (only meaningful in Split, where a home serves a fraction of the desired count). It drives global accounting — the control plane sums it across homes to decide whether the desired count is met. Zero/unset outside Split.",
+							Description: "AdmittedReplicas is how many replicas this home's Kueue has admitted. In Split it also drives global accounting: the control plane sums it across homes to decide whether the desired count is met.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"readyReplicas": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ReadyReplicas is how many of this home's replicas are serving traffic. In Split it is the weight an external LB uses to split traffic across homes (traffic follows where the replicas actually landed). Zero/unset outside Split.",
+							Description: "ReadyReplicas is how many of this home's replicas are serving traffic. It is the live count basis and health gate for routing across homes.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
@@ -3865,7 +3870,7 @@ func schema_pkg_apis_ome_v1beta1_ComponentExtensionSpec(ref common.ReferenceCall
 					},
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.<component>.lifecycle.",
+							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.<component>.lifecycle.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
 						},
 					},
@@ -4707,7 +4712,7 @@ func schema_pkg_apis_ome_v1beta1_DecoderSpec(ref common.ReferenceCallback) commo
 					},
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.<component>.lifecycle.",
+							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.<component>.lifecycle.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
 						},
 					},
@@ -5546,7 +5551,7 @@ func schema_pkg_apis_ome_v1beta1_EngineSpec(ref common.ReferenceCallback) common
 					},
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.<component>.lifecycle.",
+							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.<component>.lifecycle.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
 						},
 					},
@@ -6091,19 +6096,19 @@ func schema_pkg_apis_ome_v1beta1_InPlaceUpdateStrategy(ref common.ReferenceCallb
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InPlaceUpdateStrategy tunes per-pod lifecycle drain timing.",
+				Description: "InPlaceUpdateStrategy tunes the per-pod in-place update sequence.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"gracePeriodSeconds": {
 						SchemaProps: spec.SchemaProps{
-							Description: "GracePeriodSeconds is the time OMENative waits between marking the pod not-ready and applying an in-place mutation. SurgeThenDrain also waits this long after EndpointSlice removal before deleting the old pod, allowing persistent load-balancer connections to drain while its workers remain available.",
+							Description: "GracePeriodSeconds is accepted so manifests that set it keep validating and has no effect on the roll: a drained pod is deleted as soon as it leaves rotation, and its own terminationGracePeriodSeconds and preStop hooks cover the in-flight work it still owes.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"markNotReadyDuringLifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MarkNotReadyDuringLifecycle, when true, flips ome.io/serving=False on the pod before the in-place mutation so EndpointSlice drains traffic first. Defaults to true.",
+							Description: "MarkNotReadyDuringLifecycle, when true, flips ome.io/serving=False on the pod before the in-place mutation so EndpointSlice drains traffic first. Unset inherits the ServingRuntime's value, then true.",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},
@@ -6809,11 +6814,17 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec"),
 						},
 					},
+					"routing": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Routing configures cross-cluster traffic distribution for this InferenceService. Unset fields inherit the operator-level routing configuration. Only consulted on the control-plane cluster; ignored in single-cluster deployments. Alpha; the API may change without notice.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec"),
+						},
+					},
 				},
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec"},
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec"},
 	}
 }
 
@@ -7086,6 +7097,19 @@ func schema_pkg_apis_ome_v1beta1_InstanceOperation(ref common.ReferenceCallback)
 					"waiting": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Waiting is a short token naming an EXTERNAL condition currently holding the operation back — e.g. \"QuotaExceeded\" when admission refuses the operation's pods for lack of quota. Distinct from Reason, which names why the operation exists: Waiting comes and goes while the operation runs, so overloading Reason would erase the operation's cause. Empty means nothing external is blocking. A token only: the blocking authority's own message is volatile (an exceeded-quota message moves as other workloads come and go) and belongs in the Event, not in status.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"capacityRefusedAt": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CapacityRefusedAt is when admission last refused one of the operation's pod creates for lack of quota. The refusal is an apiserver answer to a call the create pass made, so it cannot be read off the cluster on a later pass: it is recorded here, and the hold pass converts it into the Waiting token and the deadline park on every pass it stands. Cleared by a create that completes with no refusal. Empty means the last create was not refused for capacity.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"strategy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Strategy is the update strategy the operation runs under, pinned when the operation opens. UpdateStrategy is not part of the revision payload, so editing it retargets nothing: an attempt keeps the mechanism it started with — a patch already under way is not re-dispatched as a recreate, a surge already spent is not unwound — and the edit reaches the Instance at its next admitted attempt. Set only when Type=Update.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -7433,6 +7457,26 @@ func schema_pkg_apis_ome_v1beta1_InstanceStatusEntry(ref common.ReferenceCallbac
 						SchemaProps: spec.SchemaProps{
 							Description: "LastFailure is the Instance's preserved failure diagnostics.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceTermination"),
+						},
+					},
+					"announced": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Announced is the Instance's record of once-only messages already delivered.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
 						},
 					},
 				},
@@ -8374,7 +8418,7 @@ func schema_pkg_apis_ome_v1beta1_LifecycleSpec(ref common.ReferenceCallback) com
 				Properties: map[string]spec.Schema{
 					"restartPolicy": {
 						SchemaProps: spec.SchemaProps{
-							Description: "RestartPolicy controls what OMENative does when a managed pod fails. Distinct from the inlined corev1.PodSpec.RestartPolicy: that one tells kubelet whether to restart a container in-place; this one tells the OMENative controller whether to recreate the whole Instance.",
+							Description: "RestartPolicy controls what OMENative does when a managed pod fails. Distinct from the inlined corev1.PodSpec.RestartPolicy: that one tells kubelet whether to restart a container in-place; this one tells the OMENative controller whether to recreate the whole Instance. Unset inherits the ServingRuntime's value; when neither sets it, multi-pod Instances use RecreateInstanceOnPodRestart and single-pod Instances use None.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -8387,7 +8431,7 @@ func schema_pkg_apis_ome_v1beta1_LifecycleSpec(ref common.ReferenceCallback) com
 					},
 					"readyPolicy": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ReadyPolicy controls how Instance-level readiness is aggregated from the underlying pods. None is accepted only for single-pod Instances, where it is equivalent to AllPodReady; admission rejects None on multi-pod OMENative Components because per-pod readiness reporting is not supported.",
+							Description: "ReadyPolicy controls how Instance-level readiness is aggregated from the underlying pods. None is accepted only for single-pod Instances, where it is equivalent to AllPodReady; admission rejects None on multi-pod OMENative Components because per-pod readiness reporting is not supported. Unset inherits the ServingRuntime's value; when neither sets it, multi-pod Instances use AllPodReady and single-pod Instances use None.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -8400,7 +8444,7 @@ func schema_pkg_apis_ome_v1beta1_LifecycleSpec(ref common.ReferenceCallback) com
 					},
 					"minReadySeconds": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MinReadySeconds is the minimum time a newly Ready pod must stay Ready before OMENative treats it as Available. A pod is Available when its PodReady condition is True and that condition's lastTransitionTime plus MinReadySeconds is not after the current time, evaluated per pod (the Deployment.spec.minReadySeconds rule). Ready remains the health signal; Available is the pacing signal: a rollout drains or promotes an Instance only once its new pods are Available, so the maxSurge / maxUnavailable budgets stay held for the whole window, and availableReplicas / availablePodCount count only Available pods. Unset or 0 means Available as soon as Ready. A value authored on the InferenceService always wins. Clusters may supply an admission-time default through the inferenceservice-config ConfigMap; it is stamped onto the InferenceService, so it also takes precedence over a value authored in the ServingRuntime's engineConfig / decoderConfig / routerConfig lifecycle (the InferenceService overrides the runtime when the two merge), as terminationGracePeriodSeconds does.",
+							Description: "MinReadySeconds is the minimum time a newly Ready pod must stay Ready before OMENative treats it as Available. A pod is Available when its PodReady condition is True and that condition's lastTransitionTime plus MinReadySeconds is not after the current time, evaluated per pod (the Deployment.spec.minReadySeconds rule). Ready remains the health signal; Available is the pacing signal: a rollout drains or promotes an Instance only once its new pods are Available, so the maxSurge / maxUnavailable budgets stay held for the whole window, and availableReplicas / availablePodCount count only Available pods. Unset or 0 means Available as soon as Ready. A value authored on the InferenceService wins; an unset value inherits the ServingRuntime's; when neither sets it, the cluster default from the inferenceservice-config ConfigMap applies.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
@@ -8739,7 +8783,7 @@ func schema_pkg_apis_ome_v1beta1_MigrationPolicy(ref common.ReferenceCallback) c
 				Properties: map[string]spec.Schema{
 					"mode": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Mode gates migration: Auto enables both deadline-disposition relocation and explicit migration requests; Never disables both. Defaults to Auto.",
+							Description: "Mode gates migration: Auto enables both deadline-disposition relocation and explicit migration requests; Never disables both. Unset inherits the ServingRuntime's value, then Auto.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9575,6 +9619,26 @@ func schema_pkg_apis_ome_v1beta1_OMENativeInstanceStatus(ref common.ReferenceCal
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceTermination"),
 						},
 					},
+					"announced": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Announced records the once-only messages this Instance has already emitted, one entry per message: the event reason it was emitted under and the episode it was emitted in, joined by \"@\". A warning an operator needs to see once — the gang has no co-location term, the PodGroup was rebuilt, a repair is held, a drain is past its deadline — is emitted only when its entry is absent, and is stamped in the same write that emits it. Recording it on the Instance rather than in controller memory is what makes the once-only property hold per workload rather than per process, and survive a controller restart.\n\nThe episode is the in-flight operation, or the incarnation when there is none: a new attempt or a rebuilt Instance has its own messages to deliver, and the entries of the episode it replaced no longer match.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
 				},
 				Required: []string{"index", "phase"},
 			},
@@ -9648,14 +9712,14 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 					},
 					"requirements": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Requirements is the intrinsic capability selector a candidate workload cluster MUST satisfy, expressed as a Kubernetes label-selector string matched against WorkloadCluster labels (e.g. \"accelerator in (gb300, tpu7x)\"). It is the structured equivalent of the ome.io/accelerator-requirements annotation. Empty means no intrinsic requirement.",
+							Description: "Requirements is the intrinsic capability selector a candidate workload cluster MUST satisfy, expressed as a Kubernetes label-selector string matched against WorkloadCluster labels plus the virtual, immutable metadata.name key (e.g. \"accelerator in (gb300, tpu7x)\"). It is the structured equivalent of the ome.io/accelerator-requirements annotation. Empty means no intrinsic requirement.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"clusterSelector": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ClusterSelector is an optional operator-imposed routing overlay (label-selector string) AND-ed onto Requirements to further narrow candidates (e.g. \"provider=cloud-a\"). Structured equivalent of the ome.io/cluster-selector annotation.",
+							Description: "ClusterSelector is an optional operator-imposed routing overlay (label-selector string) AND-ed onto Requirements to further narrow candidates. It can select WorkloadCluster labels (e.g. \"provider=cloud-a\") or immutable object names (e.g. \"metadata.name in (cluster-a,cluster-c)\"). Structured equivalent of the ome.io/cluster-selector annotation.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9668,7 +9732,7 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 					},
 					"capacityFactors": {
 						SchemaProps: spec.SchemaProps{
-							Description: "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters, keyed by WorkloadCluster name. It weights traffic for heterogeneous hardware where one cluster's replica serves more (or less) than another's: a home's routed share scales with its admitted replicas times this factor. A quantity of \"2\" means each replica on that cluster carries twice the share of a factor-1 replica; \"500m\" means half. A cluster absent from the map (or the whole field unset) uses the identity factor 1. This is a routing weight only — it does not influence placement or how many replicas a cluster admits.",
+							Description: "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters, keyed by WorkloadCluster name. It weights traffic for heterogeneous hardware where one cluster's replica serves more (or less) than another's: a home's routed share scales with its admitted replicas times this factor. A quantity of \"2\" means each replica on that cluster carries twice the share of a factor-1 replica; \"500m\" means half. A cluster absent from the map (or the whole field unset) uses the identity factor 1. This is a routing weight only — it does not influence placement or how many replicas a cluster admits.\n\nDeprecated: use spec.routing.capacityFactors.",
 							Type:        []string{"object"},
 							AdditionalProperties: &spec.SchemaOrBool{
 								Allows: true,
@@ -9692,12 +9756,12 @@ func schema_pkg_apis_ome_v1beta1_PlacementStatus(ref common.ReferenceCallback) c
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "PlacementStatus is the multi-cluster placement status: which workload cluster an InferenceService is placed on and a coarse phase.",
+				Description: "PlacementStatus is the multi-cluster placement status: its coarse phase and the candidate clusters participating in placement.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"cluster": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Cluster is the WorkloadCluster the ISVC is currently placed on. Empty while pending (no candidate yet, or transport not connected).",
+							Description: "Cluster is the winning WorkloadCluster in Single mode. It is empty before admission and in All/Split modes, where Candidates is authoritative.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9711,7 +9775,7 @@ func schema_pkg_apis_ome_v1beta1_PlacementStatus(ref common.ReferenceCallback) c
 					},
 					"endpoint": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Endpoint is the externally-addressable URL of the winning cluster's placement, mirrored from the derived InferenceService's status.url once it is admitted AND addressable. Empty while pending/racing/failed or before the winner reports a URL. An external global LB/DNS consumes this to route traffic to the winning cluster.",
+							Description: "Endpoint is the externally-addressable URL of the winning cluster in Single mode, mirrored from the derived InferenceService's status.url once it is admitted AND addressable. It is empty before the winner reports a URL and in All/Split modes, where per-candidate endpoints are authoritative.",
 							Ref:         ref("knative.dev/pkg/apis.URL"),
 						},
 					},
@@ -9725,7 +9789,7 @@ func schema_pkg_apis_ome_v1beta1_PlacementStatus(ref common.ReferenceCallback) c
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Candidates are the clusters this ISVC has been fanned out to during the placement race. Populated by the control plane.",
+							Description: "Candidates are the clusters this ISVC has been fanned out to during placement. Populated by the control plane.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -10528,13 +10592,13 @@ func schema_pkg_apis_ome_v1beta1_RollingUpdate(ref common.ReferenceCallback) com
 					},
 					"maxUnavailable": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxUnavailable is the maximum number of Instances (or fraction) allowed to be in a non-Ready state during the rollout. Accepts either an absolute integer count (e.g. 2) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time so the budget scales with the Component's replica count.",
+							Description: "MaxUnavailable is the maximum number of Instances (or fraction) allowed to be in a non-Ready state during the rollout. Accepts either an absolute integer count (e.g. 2) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time so the budget scales with the Component's replica count. Unset inherits the ServingRuntime's value; when neither sets it and the strategy is not SurgeThenDrain, the cluster default applies, and without one this layer sets no cap.",
 							Ref:         ref("k8s.io/apimachinery/pkg/util/intstr.IntOrString"),
 						},
 					},
 					"maxSurge": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxSurge is the maximum number of extra Instances (or fraction) the rollout may create above the Component's desired replica count during a rolling update. Accepts either an absolute integer count (e.g. 1) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time. Mirrors the semantics of upstream appsv1.Deployment.Strategy.RollingUpdate.MaxSurge — extra capacity is created and brought to Ready before old Instances are drained, enabling zero-capacity-dip rollouts.\n\nWhen the Component participates in a RolloutCoordinationGroup with a non-zero CoordinationPacing.MaxSurge, the group-wide ceiling caps the per-Component MaxSurge.",
+							Description: "MaxSurge is the maximum number of extra Instances (or fraction) the rollout may create above the Component's desired replica count during a rolling update. Accepts either an absolute integer count (e.g. 1) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time. Mirrors the semantics of upstream appsv1.Deployment.Strategy.RollingUpdate.MaxSurge — extra capacity is created and brought to Ready before old Instances are drained, enabling zero-capacity-dip rollouts.\n\nWhen the Component participates in a RolloutCoordinationGroup with a non-zero CoordinationPacing.MaxSurge, the group-wide ceiling caps the per-Component MaxSurge. Unset inherits the ServingRuntime's value; when neither sets it and the strategy is SurgeThenDrain, the cluster default applies, and without one this layer sets no cap.",
 							Ref:         ref("k8s.io/apimachinery/pkg/util/intstr.IntOrString"),
 						},
 					},
@@ -12365,7 +12429,7 @@ func schema_pkg_apis_ome_v1beta1_RouterSpec(ref common.ReferenceCallback) common
 					},
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.<component>.lifecycle.",
+							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.<component>.lifecycle.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
 						},
 					},
@@ -12408,6 +12472,289 @@ func schema_pkg_apis_ome_v1beta1_RouterSpec(ref common.ReferenceCallback) common
 		},
 		Dependencies: []string{
 			"k8s.io/api/apps/v1.DeploymentStrategy", "k8s.io/api/core/v1.Affinity", "k8s.io/api/core/v1.Container", "k8s.io/api/core/v1.EphemeralContainer", "k8s.io/api/core/v1.HostAlias", "k8s.io/api/core/v1.LocalObjectReference", "k8s.io/api/core/v1.PodDNSConfig", "k8s.io/api/core/v1.PodOS", "k8s.io/api/core/v1.PodReadinessGate", "k8s.io/api/core/v1.PodResourceClaim", "k8s.io/api/core/v1.PodSchedulingGate", "k8s.io/api/core/v1.PodSecurityContext", "k8s.io/api/core/v1.Toleration", "k8s.io/api/core/v1.TopologySpreadConstraint", "k8s.io/api/core/v1.Volume", "k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/util/intstr.IntOrString", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AutoscalerPolicyRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_RoutingCapacitySpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RoutingCapacitySpec configures polling each serving home for its current servable capacity.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"disabled": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Disabled explicitly disables capacity polling. No other field may be set when true.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"path": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Path is appended to each serving home's endpoint and must start with \"/\".",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"method": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Method is the HTTP method used by the capacity request.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"format": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Format names the response shape returned by the capacity endpoint.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"options": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Options contains format-specific settings interpreted by the configured capacity format.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"period": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Period is how often each serving home is polled.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
+					"timeout": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Timeout bounds one capacity request and must be shorter than Period.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
+					"samples": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Samples is the number of recent readings in the capacity window.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"quorum": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Quorum is the number of readings required to corroborate a lower capacity.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"maxAge": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MaxAge is the maximum accepted age of a capacity report.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Duration"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_RoutingProbeSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RoutingProbeSpec configures an active end-to-end health probe for each serving home's externally addressable endpoint.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"disabled": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Disabled explicitly disables probing. No other field may be set when true.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"path": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Path is appended to each serving home's endpoint and must start with \"/\".",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"method": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Method is the HTTP method used by the probe.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"acceptStatuses": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "AcceptStatuses are response codes counted as a successful probe.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: 0,
+										Type:    []string{"integer"},
+										Format:  "int32",
+									},
+								},
+							},
+						},
+					},
+					"gateStatuses": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "GateStatuses are response codes counted as a failed probe. A code in neither status list is inconclusive.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: 0,
+										Type:    []string{"integer"},
+										Format:  "int32",
+									},
+								},
+							},
+						},
+					},
+					"period": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Period is how often each serving home is probed.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
+					"timeout": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Timeout bounds one probe request and must be shorter than Period.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
+					"failureThreshold": {
+						SchemaProps: spec.SchemaProps{
+							Description: "FailureThreshold is the number of consecutive failures required to gate a serving home.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"successThreshold": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SuccessThreshold is the number of consecutive successes required to restore a gated serving home.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"allFailedPolicy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AllFailedPolicy controls the result when every serving home has crossed the failure threshold.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Duration"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_RoutingPublisherSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RoutingPublisherSpec provides per-InferenceService behavior options to the single publisher selected by the operator.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"options": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Options are interpreted and validated by the operator-selected publisher.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_RoutingSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RoutingSpec configures cross-cluster traffic distribution for an InferenceService. Fields that are unset inherit the operator-level routing configuration.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"enabled": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Enabled overrides routing for this InferenceService. Nil inherits the operator-level setting; false opts this InferenceService out. True opts in only when routing is enabled for the installation and cannot bypass a disabled installation gate.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"capacityFactors": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters. Every quantity must be greater than zero. A cluster absent from the map uses the identity factor 1.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Ref: ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
+									},
+								},
+							},
+						},
+					},
+					"probe": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Probe overrides the operator-level endpoint health probe. The block is a complete replacement; set disabled to explicitly turn probing off.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingProbeSpec"),
+						},
+					},
+					"capacity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Capacity overrides the operator-level endpoint capacity poll. The block is a complete replacement; set disabled to explicitly turn polling off.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingCapacitySpec"),
+						},
+					},
+					"publisher": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Publisher supplies behavior options to the operator-selected publisher. Publisher identity, transport, and credentials remain operator-level configuration.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingPublisherSpec"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/api/resource.Quantity", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingCapacitySpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingProbeSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingPublisherSpec"},
 	}
 }
 
@@ -13946,7 +14293,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMap(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty and the Routable condition says why. The routing controller owns spec and the Routable condition; the publisher owns the rest of status.",
+				Description: "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -13998,27 +14345,27 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapCapacity(ref common.ReferenceCallback
 				Properties: map[string]spec.Schema{
 					"allocated": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Allocated is the number of replicas this home is intended to run for the ISVC — the Split apportionment intersected with what the home's AcceleratorQuota admitted. It is the count basis of the weight.",
+							Description: "Allocated is the effective allocation ceiling for this home: the control-plane-admitted count, optionally lowered by a capacity report. Ready independently caps it when computing Weight.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"ready": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Ready is the home's live ready-replica count — the health signal. Zero means the entry is health-gated to weight 0.",
+							Description: "Ready is the home's live ready-replica count. It caps Allocated when computing Weight; zero health-gates the entry to weight 0.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"factor": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Factor is the per-replica relative serving capacity of this home's accelerator (baseline \"1\", higher = faster), so heterogeneous hardware is weighted by capacity rather than raw replica count: weight is proportional to allocated * factor. Defaults to \"1\" (homogeneous) when unset — the multiplicative identity, i.e. no scaling. It is operator-supplied config, never derived from raw hardware FLOPS.",
+							Description: "Factor is the per-replica relative serving capacity of this home's accelerator (baseline \"1\", higher = faster), so heterogeneous hardware is weighted by capacity rather than raw replica count: weight is proportional to min(allocated, ready) * factor. Defaults to \"1\" (homogeneous) when unset — the multiplicative identity, i.e. no scaling. It is operator-supplied config, never derived from raw hardware FLOPS.",
 							Ref:         ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
 						},
 					},
 					"source": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Source names which input produced Allocated. Without it an operator reading an unexpected weight cannot tell \"the home reported less capacity\" from \"the endpoint source was configured but failed open and the plan was used\" — the same number with opposite remediations.",
+							Description: "Source names which input produced Allocated. FallbackReason separately distinguishes an intentionally control-plane-only allocation from a configured endpoint source that could not supply a usable ceiling.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -14028,6 +14375,13 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapCapacity(ref common.ReferenceCallback
 							Description: "Reported is the home's own servable-capacity figure, recorded whenever the endpoint source answered — including when it was at or above the plan and therefore did not lower Allocated. Keeping it visible in that case is what makes the ceiling auditable: Allocated alone cannot show that a report was received and found non-binding.",
 							Type:        []string{"integer"},
 							Format:      "int32",
+						},
+					},
+					"fallbackReason": {
+						SchemaProps: spec.SchemaProps{
+							Description: "FallbackReason explains why a configured endpoint capacity source did not produce an applied ceiling and the control-plane allocation was retained. Empty means capacity polling is disabled or its latest result was usable.",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 				},
@@ -14061,7 +14415,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapEntry(ref common.ReferenceCallback) c
 					},
 					"weight": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Weight is the home's final, normalized, capacity-planned, health-gated traffic share as a relative non-negative integer (matching Gateway API and Envoy weighted-cluster semantics). A consumer either applies it verbatim or divides by the sum of weights for a percentage. When every home is unhealthy the controller writes equal weights rather than all-zero, so traffic is never black-holed.",
+							Description: "Weight is the home's final, normalized, capacity-planned, health-gated traffic share as a relative integer from 0 through 1,000,000. The upper bound matches the Gateway API backendRef weight limit, so a publisher can apply it verbatim; another consumer may divide by the sum of weights for a percentage. Unready and zero-capacity homes always have weight 0. When every probe conclusively fails, PreserveTraffic may retain capacity-derived weights for ready homes; Drain writes an authoritative all-zero table. Manual DrainRefs can force any arm to zero after these automatic inputs.",
 							Default:     0,
 							Type:        []string{"integer"},
 							Format:      "int32",
@@ -14069,7 +14423,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapEntry(ref common.ReferenceCallback) c
 					},
 					"healthy": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Healthy is the health-gate result for this home (readyReplicas > 0). An unhealthy home is weighted 0 (unless every home is unhealthy).",
+							Description: "Healthy is the readiness-plus-probe result for this home. An unready home is always weighted 0; a probe-unhealthy home may retain a positive weight only under a fleet-wide PreserveTraffic fallback. A manual DrainRefs override can set a healthy home to zero without changing its health evidence.",
 							Default:     false,
 							Type:        []string{"boolean"},
 							Format:      "",
@@ -14077,7 +14431,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapEntry(ref common.ReferenceCallback) c
 					},
 					"capacity": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Capacity is the provenance of Weight: weight is proportional to allocated * factor, gated to 0 when the home has no ready replicas.",
+							Description: "Capacity is the provenance of Weight: weight is proportional to min(allocated, ready) * factor, then gated by the active probe.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapCapacity"),
 						},
 					},
@@ -14085,6 +14439,26 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapEntry(ref common.ReferenceCallback) c
 						SchemaProps: spec.SchemaProps{
 							Description: "Probe is the active end-to-end health probe's contribution to Healthy, present only when probing is configured. Healthy alone does not say whether readiness or reachability failed, and those are different faults with different owners: readiness is the workload's, reachability is the path's (ingress, DNS, certificate, route).",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapProbe"),
+						},
+					},
+					"drainRefs": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "DrainRefs names the independent override IDs in the source InferenceService's ome.io/traffic-drain annotation that force this entry's weight to zero. Empty means no manual override contributed.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
 						},
 					},
 				},
@@ -14195,16 +14569,30 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapProbe(ref common.ReferenceCallback) c
 				Description: "TrafficMapProbe records what the active end-to-end probe observed for one home. The probe targets the entry's Endpoint — the URL a client uses — so it covers the whole serving path rather than pod readiness inside the home.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"policyDigest": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PolicyDigest identifies the effective probe policy that produced this observation. A controller may restore hysteresis state after a restart only when this digest and the entry identity still match.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"result": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Result is the most recent probe verdict. Only a sustained Failing gates the weight; Unknown never does.",
+							Description: "Result is the most recent probe attempt's verdict. Failing gates only after the configured threshold. Unknown does not change the previous gate.",
 							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"gated": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Gated is the current hysteresis gate. It remains true through an Unknown attempt until enough consecutive passing attempts reopen the home.",
+							Type:        []string{"boolean"},
 							Format:      "",
 						},
 					},
 					"lastProbeTime": {
 						SchemaProps: spec.SchemaProps{
-							Description: "LastProbeTime is when the probe last reached a verdict, so a stalled prober is visible rather than being read as a steady pass.",
+							Description: "LastProbeTime is when the latest probe attempt completed, so a stalled prober is visible rather than being read as a steady pass.",
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
 						},
 					},
@@ -14227,6 +14615,55 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapProbe(ref common.ReferenceCallback) c
 		},
 		Dependencies: []string{
 			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_TrafficMapPublisherStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "TrafficMapPublisherStatus is the durable cleanup journal for one publisher. Claims are persisted before external mutation and retained until their targets have been cleaned up.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"publisherName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PublisherName identifies the publisher implementation whose cleanup semantics apply. An implementation upgraded under the same name must remain able to clean target identifiers written by its prior versions.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"claimedTargets": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "ClaimedTargets are publisher-defined canonical identifiers owned by this map. The publisher records the complete claim set before mutating any target. Identifiers are status-visible and must not contain credentials or secrets.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"observedOptionsDigest": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservedOptionsDigest is the SHA-256 digest of the effective safe publisher options used by the most recent successful reconciliation. It is absent before the first successful reconciliation and does not determine target ownership.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"publisherName"},
+			},
+		},
 	}
 }
 
@@ -14294,19 +14731,26 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Programmed, GatewayRef and ObservedTrafficMapGeneration, and the routing controller owns the Routable condition. Conditions is keyed on type, so each writer must patch only its own and never rewrite the list.",
+				Description: "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Published, GatewayRef, ObservedTrafficMapGeneration, Publisher, and the Published condition; the routing controller owns SourceUID plus the Routable and CapacityFallback conditions. Conditions is keyed on type, so each writer must patch only its own fields and conditions.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
-					"programmed": {
+					"sourceUID": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Programmed reports whether the active publisher has realized this map onto its data plane.",
+							Description: "SourceUID is the UID of the InferenceService that generated this map. The routing controller writes it through its own status field manager before a publisher may create external effects. It remains available if orphan deletion propagation removes the owner reference.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"published": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Published reports whether the active publisher has realized this map onto its data plane.",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},
 					},
 					"gatewayRef": {
 						SchemaProps: spec.SchemaProps{
-							Description: "GatewayRef identifies the data plane object realizing this map (e.g. the HTTPRoute the Gateway API publisher created). Empty until programmed.",
+							Description: "GatewayRef identifies the data plane object realizing this map (e.g. the HTTPRoute the Gateway API publisher created). Empty until published.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapGatewayRef"),
 						},
 					},
@@ -14315,6 +14759,12 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 							Description: "ObservedTrafficMapGeneration is the spec generation the publisher last realized, so lag between generation and realization is observable.",
 							Type:        []string{"integer"},
 							Format:      "int64",
+						},
+					},
+					"publisher": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Publisher records the durable target claims needed to recover or reverse data-plane mutations made while realizing this map.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherStatus"),
 						},
 					},
 					"conditions": {
@@ -14329,7 +14779,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Conditions carry the Programmed condition.",
+							Description: "Conditions carry the routing controller's Routable and CapacityFallback conditions and the publisher's Published condition.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -14345,7 +14795,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapGatewayRef"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapGatewayRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherStatus"},
 	}
 }
 
@@ -14462,7 +14912,7 @@ func schema_pkg_apis_ome_v1beta1_UpdateStrategy(ref common.ReferenceCallback) co
 				Properties: map[string]spec.Schema{
 					"type": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Type selects the rollout mechanism. Defaults to SurgeThenDrain for safety — preserves serving capacity throughout the rollout.",
+							Description: "Type selects the rollout mechanism. Unset inherits the ServingRuntime's value, then the cluster default from the inferenceservice-config ConfigMap, then SurgeThenDrain, which preserves serving capacity throughout the rollout.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -14964,7 +15414,7 @@ func schema_pkg_apis_ome_v1beta1_WorkerSpec(ref common.ReferenceCallback) common
 					},
 					"size": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Size of the worker, this is the number of pods in the worker. Controls how many worker pod instances will be deployed for horizontal scaling.",
+							Description: "Size of the worker, this is the number of pods in the worker. Controls how many worker pod instances will be deployed for horizontal scaling. Unset inherits the ServingRuntime's value; when neither sets it, a declared leader gets one worker.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},

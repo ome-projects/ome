@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"math"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -45,12 +46,12 @@ func TestWeights(t *testing.T) {
 			want: []int32{5, 2},
 		},
 		{
-			name: "allocation reduced to smallest whole ratio",
+			name: "partial readiness lowers each home's share",
 			homes: []Home{
-				{Cluster: "a", Allocated: 50, Ready: 10},
-				{Cluster: "b", Allocated: 30, Ready: 10},
+				{Cluster: "a", Allocated: 7, Ready: 4},
+				{Cluster: "b", Allocated: 3, Ready: 3},
 			},
-			want: []int32{5, 3},
+			want: []int32{4, 3},
 		},
 		{
 			name: "heterogeneous hardware weighted by capacity factor",
@@ -78,20 +79,20 @@ func TestWeights(t *testing.T) {
 			want: []int32{3, 0, 1},
 		},
 		{
-			name: "all homes unhealthy falls back to equal weight",
+			name: "all homes unready stay at zero",
 			homes: []Home{
 				{Cluster: "a", Allocated: 5, Ready: 0},
 				{Cluster: "b", Allocated: 3, Ready: 0},
 			},
-			want: []int32{1, 1},
+			want: []int32{0, 0},
 		},
 		{
-			name: "nothing allocated falls back to equal weight",
+			name: "nothing allocated stays at zero",
 			homes: []Home{
 				{Cluster: "a", Allocated: 0, Ready: 4},
 				{Cluster: "b", Allocated: 0, Ready: 4},
 			},
-			want: []int32{1, 1},
+			want: []int32{0, 0},
 		},
 		{
 			name: "nil factor treated as identity",
@@ -118,6 +119,39 @@ func TestWeights(t *testing.T) {
 			},
 			want: []int32{2, 1},
 		},
+		{
+			name: "ratio at the publisher limit remains exact",
+			homes: []Home{
+				{Cluster: "large", Allocated: 1, Ready: 1, Factor: factor("1000000")},
+				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+			},
+			want: []int32{maxTrafficMapWeight, 1},
+		},
+		{
+			name: "ratio one above the publisher limit is proportionally bounded",
+			homes: []Home{
+				{Cluster: "large", Allocated: 1, Ready: 1, Factor: factor("1000001")},
+				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+			},
+			want: []int32{maxTrafficMapWeight, 1},
+		},
+		{
+			name: "ratio beyond the publisher limit is safely compressed",
+			homes: []Home{
+				{Cluster: "large", Allocated: 1, Ready: 1, Factor: factor("3000000000")},
+				{Cluster: "gated", Allocated: 1, Ready: 0, Factor: factor("9000000000")},
+				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+			},
+			want: []int32{maxTrafficMapWeight, 0, 1},
+		},
+		{
+			name: "factor and allocation multiplication cannot overflow",
+			homes: []Home{
+				{Cluster: "large", Allocated: math.MaxInt32, Ready: math.MaxInt32, Factor: factor("9223372036854775807")},
+				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+			},
+			want: []int32{maxTrafficMapWeight, 1},
+		},
 	}
 
 	for _, tt := range tests {
@@ -132,24 +166,6 @@ func TestWeights(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestGCD(t *testing.T) {
-	tests := []struct {
-		a, b, want int64
-	}{
-		{0, 0, 0},
-		{0, 5, 5},
-		{5, 0, 5},
-		{12, 8, 4},
-		{100000, 50000, 50000},
-		{7, 3, 1},
-	}
-	for _, tt := range tests {
-		if got := gcd(tt.a, tt.b); got != tt.want {
-			t.Errorf("gcd(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
-		}
 	}
 }
 
@@ -210,13 +226,12 @@ func TestWeights_ReportedCapacityIsACeiling(t *testing.T) {
 			want: []int32{7, 3},
 		},
 		{
-			// Even total capacity collapse spreads rather than drops.
-			name: "every home reporting zero falls back to equal weight",
+			name: "every home reporting zero stays at zero",
 			homes: []Home{
 				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0))},
 				{Cluster: "b", Allocated: 3, Ready: 3, Reported: ptr(int32(0))},
 			},
-			want: []int32{1, 1},
+			want: []int32{0, 0},
 		},
 		{
 			// The ceiling applies to the count, so the factor still scales it.
@@ -268,15 +283,14 @@ func TestWeights_ProbeGatesOnlyWhenItReachedAVerdict(t *testing.T) {
 			want: []int32{0, 1},
 		},
 		{
-			// The correlated-prober case. A prober bug or a control-plane
-			// partition marks every home down at once; spreading traffic beats
-			// dropping all of it.
-			name: "every home unreachable falls back to equal weight",
+			// PreserveTraffic ignores a fleet-wide probe failure but retains the
+			// capacity-derived ratio.
+			name: "every home unreachable preserves capacity weights",
 			homes: []Home{
 				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
 				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
 			},
-			want: []int32{1, 1},
+			want: []int32{7, 3},
 		},
 		{
 			// Two independent gates: passing the probe does not excuse having no
@@ -301,6 +315,158 @@ func TestWeights_ProbeGatesOnlyWhenItReachedAVerdict(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assertWeights(t, tt.homes, tt.want)
+		})
+	}
+}
+
+func TestWeights_DrainOnAllProbeFailures(t *testing.T) {
+	homes := []Home{
+		{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
+		{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+	}
+
+	assertWeightsWithPolicy(t, homes, AllFailedPolicyDrain, []int32{0, 0})
+	assertWeightsWithPolicy(t, homes, AllFailedPolicy(""), []int32{0, 0})
+	assertWeightsWithPolicy(t, homes, AllFailedPolicyPreserveTraffic, []int32{7, 3})
+}
+
+func TestWeights_PreserveTrafficOnlyIgnoresFleetWideProbeFailure(t *testing.T) {
+	tests := []struct {
+		name  string
+		homes []Home
+		want  []int32
+	}{
+		{
+			name: "capacity minima and factors still apply",
+			homes: []Home{
+				{Cluster: "a", Allocated: 8, Ready: 6, Reported: ptr(int32(4)), Factor: factor("2"), Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 6, Ready: 3, Reachable: ptr(false)},
+			},
+			want: []int32{8, 3},
+		},
+		{
+			name: "unready home stays at zero",
+			homes: []Home{
+				{Cluster: "a", Allocated: 7, Ready: 0, Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+			},
+			want: []int32{0, 1},
+		},
+		{
+			name: "unadmitted home stays at zero",
+			homes: []Home{
+				{Cluster: "a", Allocated: 0, Ready: 7, Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+			},
+			want: []int32{0, 1},
+		},
+		{
+			name: "zero reported capacity stays at zero",
+			homes: []Home{
+				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0)), Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+			},
+			want: []int32{0, 1},
+		},
+		{
+			name: "all unready stays all zero",
+			homes: []Home{
+				{Cluster: "a", Allocated: 7, Ready: 0, Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 3, Ready: 0, Reachable: ptr(false)},
+			},
+			want: []int32{0, 0},
+		},
+		{
+			name: "all reported capacity zero stays all zero",
+			homes: []Home{
+				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0)), Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 3, Ready: 3, Reported: ptr(int32(0)), Reachable: ptr(false)},
+			},
+			want: []int32{0, 0},
+		},
+		{
+			name: "unknown verdict prevents fallback",
+			homes: []Home{
+				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 3, Ready: 0},
+			},
+			want: []int32{0, 0},
+		},
+		{
+			name: "passing verdict prevents fallback",
+			homes: []Home{
+				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
+				{Cluster: "b", Allocated: 0, Ready: 3, Reachable: ptr(true)},
+			},
+			want: []int32{0, 0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertWeightsWithPolicy(t, tt.homes, AllFailedPolicyPreserveTraffic, tt.want)
+		})
+	}
+}
+
+func TestRoutableReplicas(t *testing.T) {
+	tests := []struct {
+		name string
+		home Home
+		want int32
+	}{
+		{
+			name: "admitted capacity is the minimum",
+			home: Home{Allocated: 3, Ready: 7, Reported: ptr(int32(5))},
+			want: 3,
+		},
+		{
+			name: "ready capacity is the minimum",
+			home: Home{Allocated: 7, Ready: 3, Reported: ptr(int32(5))},
+			want: 3,
+		},
+		{
+			name: "reported capacity is the minimum",
+			home: Home{Allocated: 7, Ready: 5, Reported: ptr(int32(2))},
+			want: 2,
+		},
+		{
+			name: "absent report leaves admitted and ready minimum",
+			home: Home{Allocated: 7, Ready: 3},
+			want: 3,
+		},
+		{
+			name: "zero admitted capacity stays zero",
+			home: Home{Allocated: 0, Ready: 3},
+			want: 0,
+		},
+		{
+			name: "zero ready capacity stays zero",
+			home: Home{Allocated: 7, Ready: 0},
+			want: 0,
+		},
+		{
+			name: "zero reported capacity stays zero",
+			home: Home{Allocated: 7, Ready: 5, Reported: ptr(int32(0))},
+			want: 0,
+		},
+		{
+			name: "negative ready capacity stays zero",
+			home: Home{Allocated: 7, Ready: -1},
+			want: 0,
+		},
+		{
+			name: "negative report is ignored",
+			home: Home{Allocated: 7, Ready: 5, Reported: ptr(int32(-1))},
+			want: 5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.home.RoutableReplicas(); got != tt.want {
+				t.Fatalf("RoutableReplicas() = %d, want %d", got, tt.want)
+			}
 		})
 	}
 }
@@ -337,6 +503,19 @@ func assertWeights(t *testing.T, homes []Home, want []int32) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("Weights() = %v, want %v", got, want)
+		}
+	}
+}
+
+func assertWeightsWithPolicy(t *testing.T, homes []Home, policy AllFailedPolicy, want []int32) {
+	t.Helper()
+	got := weights(homes, policy)
+	if len(got) != len(want) {
+		t.Fatalf("weights() length = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("weights() = %v, want %v", got, want)
 		}
 	}
 }

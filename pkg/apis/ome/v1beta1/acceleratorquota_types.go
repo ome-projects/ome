@@ -218,10 +218,12 @@ const (
 	// entries MUST sum to nominal.
 	AcceleratorQuotaDistributionExplicit AcceleratorQuotaDistributionPolicy = "Explicit"
 
-	// AcceleratorQuotaDistributionProportional splits nominal in proportion to a
-	// snapshot of each cluster's allocatable capacity of the flavor, taken at
-	// reconcile. The snapshot is held between reconciles, so shares do not drift
-	// as capacity moves.
+	// AcceleratorQuotaDistributionProportional splits nominal in proportion to
+	// each cluster's schedulable capacity of the flavor: chips on nodes that are
+	// Ready and not cordoned, as the cluster last reported them. A cluster with
+	// the flavor installed but none schedulable keeps its share at zero; one
+	// without the flavor gets none. While a cluster cannot be read, every
+	// proportional split is held at its last value.
 	AcceleratorQuotaDistributionProportional AcceleratorQuotaDistributionPolicy = "Proportional"
 )
 

@@ -270,6 +270,7 @@ rules:
   - acceleratorclasses/finalizers
   - clusterbasemodels/finalizers
   - inferencereplicas/finalizers
+  - trafficmaps/finalizers
   verbs:
   - update
 - apiGroups:

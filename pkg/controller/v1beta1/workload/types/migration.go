@@ -122,6 +122,13 @@ type MigrationRecord struct {
 	Succeeded *bool
 }
 
+// SurgeAllocated reports whether the record has taken its surge index.
+// An allocated migration resumes from its durable record; only an
+// unallocated one waits for the Component's other surges to finish.
+func (r MigrationRecord) SurgeAllocated() bool {
+	return r.SurgeInstance != nil && *r.SurgeInstance >= 0
+}
+
 // FindMigrationRecord returns a pointer to the record for requestUUID
 // (aliasing the slice element), or nil.
 func FindMigrationRecord(records []MigrationRecord, requestUUID string) *MigrationRecord {

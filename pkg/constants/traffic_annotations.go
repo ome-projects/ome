@@ -35,6 +35,14 @@ var (
 
 // Operational annotation keys.
 var (
+	// TrafficDrainAnnotation carries durable manual route-arm overrides on a
+	// control-plane InferenceService. Its value is a strict JSON object keyed by
+	// independent override IDs; each entry names one workload cluster and an
+	// operator reason. The placement routing controller holds every matching arm
+	// at weight zero until the corresponding entry is removed. The annotation is
+	// control-plane-only and is stripped from derived workload ISVCs.
+	TrafficDrainAnnotation = OMEAPIGroupName + "/traffic-drain"
+
 	// ManagedByConflictAckedAnnotation, when set to "true" on the
 	// InferenceService, acknowledges a hand-authored backend policy
 	// with the conflicting name OME would use. Suppresses the GA

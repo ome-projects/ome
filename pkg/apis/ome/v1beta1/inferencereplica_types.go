@@ -618,7 +618,7 @@ type InstanceStatusCountGroup struct {
 
 // InstanceStatusEntry carries the records of one Instance that are not
 // grouped into columns. Each record is the dense row's value, unchanged.
-// +kubebuilder:validation:XValidation:rule="has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure)",message="an entry must carry at least one of conditions, readySince, operation, or lastFailure"
+// +kubebuilder:validation:XValidation:rule="has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure) || has(self.announced)",message="an entry must carry at least one of conditions, readySince, operation, lastFailure, or announced"
 type InstanceStatusEntry struct {
 	// Index is the Instance this entry belongs to; it is a member.
 	// +kubebuilder:validation:Minimum=0
@@ -642,6 +642,13 @@ type InstanceStatusEntry struct {
 	// LastFailure is the Instance's preserved failure diagnostics.
 	// +optional
 	LastFailure *InstanceTermination `json:"lastFailure,omitempty"`
+
+	// Announced is the Instance's record of once-only messages already
+	// delivered.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +listType=set
+	Announced []string `json:"announced,omitempty"`
 }
 
 // RetryBlockState is the retry authority state for one target revision.

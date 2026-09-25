@@ -47,7 +47,7 @@ func projectConditions(raw []metav1.Condition, generation int64, clock time.Time
 	preview := v.PlacementPreview{State: "Validated", Total: len(raw)}
 	out := []v.PlacementCondition{}
 	if len(raw) > 64 {
-		return []v.PlacementCondition{invalidCondition("Ready", "BudgetExceeded"), invalidCondition("Routable", "BudgetExceeded"), invalidCondition("Programmed", "BudgetExceeded")}, v.PlacementPreview{State: "BudgetExceeded", Total: len(raw)}
+		return []v.PlacementCondition{invalidCondition("Ready", "BudgetExceeded"), invalidCondition("Routable", "BudgetExceeded"), invalidCondition("Published", "BudgetExceeded")}, v.PlacementPreview{State: "BudgetExceeded", Total: len(raw)}
 	}
 	seen := map[string]*metav1.Condition{}
 	invalid := map[string]v.PlacementValue{}
@@ -68,7 +68,7 @@ func projectConditions(raw []metav1.Condition, generation int64, clock time.Time
 		}
 		seen[x.Type] = x
 	}
-	for _, kind := range []string{"Ready", "Routable", "Programmed"} {
+	for _, kind := range []string{"Ready", "Routable", "Published"} {
 		if issue, ok := invalid[kind]; ok {
 			out = append(out, invalidCondition(v.PlacementValue(kind), issue))
 			continue
@@ -90,7 +90,7 @@ func invalidCondition(kind, reason v.PlacementValue) v.PlacementCondition {
 }
 func conditionReason(reason string) v.PlacementValue {
 	switch reason {
-	case "Routable", "NotPlaced", "NoAddressableHome", "AllHomesUnready", "ProbeFailedRetrying", "ProbeSucceeded", "Connected", "ConnectionFailed", "ProbeFailed", "Programmed", "NotProgrammed", "Ready", "NotReady", "UnsupportedClusterSource", "UnsupportedProfileSource", "ClusterProfileUnsupported":
+	case "Routable", "NotPlaced", "NoAddressableHome", "AllHomesUnready", "ProbeFailedRetrying", "ProbeSucceeded", "Connected", "ConnectionFailed", "ProbeFailed", "Published", "Withdrawn", "Unpublished", "Ready", "NotReady", "UnsupportedClusterSource", "UnsupportedProfileSource", "ClusterProfileUnsupported":
 		return v.PlacementValue(reason)
 	default:
 		return "OtherReportedReason"

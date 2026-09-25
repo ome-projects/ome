@@ -180,6 +180,11 @@ func (r *Reconciler) project(ctx context.Context, built *tree.Tree,
 		}
 		return view, nil
 	}
+	// Members own their roots, so no projected root is read back to replace a
+	// fleet-wide hold. Record the healthy membership explicitly on each pass.
+	if built.Root != nil {
+		view.say(built.Root.Name(), registered, "")
+	}
 
 	capacity, reported, unreadable := r.fleetCapacity(ctx, connected)
 	for cluster, err := range unreadable {
@@ -219,9 +224,10 @@ func (r *Reconciler) project(ctx context.Context, built *tree.Tree,
 		resolution.ByCluster[cluster] = kept
 	}
 
+	held := heldNodes(built, frozen, resolution.Unresolved)
 	var errs []error
 	for _, cluster := range connected {
-		if err := r.projectOnto(ctx, built, cluster, resolution.ByCluster[cluster], frozen, view); err != nil {
+		if err := r.projectOnto(ctx, built, cluster, resolution.ByCluster[cluster], held, view); err != nil {
 			// Recorded per cluster and carried on. The next member's quota does
 			// not depend on this one's write having landed.
 			errs = append(errs, fmt.Errorf("cluster %s: %w", cluster, err))
@@ -273,7 +279,7 @@ func missing(registered, connected []string) []string {
 // projectOnto applies one member's copy of the tree, then removes the copies
 // that no longer belong there.
 func (r *Reconciler) projectOnto(ctx context.Context, built *tree.Tree,
-	cluster string, allowances []projection.Allowance, frozen map[string]tree.Violation,
+	cluster string, allowances []projection.Allowance, held sets.Set[string],
 	view fleetView,
 ) error {
 	remote, ok := r.Project.Clusters.ClientFor(cluster)
@@ -341,7 +347,7 @@ func (r *Reconciler) projectOnto(ctx context.Context, built *tree.Tree,
 	// Applied first, swept second. A node that moved between clusters exists
 	// briefly on both, and sweeping first would delete the copy this pass is
 	// about to write.
-	if err := r.sweepMember(ctx, remote, cluster, live, keepOn(objects, frozen)); err != nil {
+	if err := r.sweepMember(ctx, remote, cluster, live, keepOn(objects, held)); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -385,21 +391,46 @@ func (r *Reconciler) readBack(cluster string, live []v1beta1.AcceleratorQuota, v
 }
 
 // keepOn is what may remain on a member: what this pass wrote, plus the copies
-// belonging to frozen nodes.
+// belonging to held nodes.
 //
-// Frozen nodes are the subtle half. Their allowances are withheld, so they are
+// Held nodes are the subtle half. Their allowances are withheld, so they are
 // absent from what was written — and a sweep that read absence as "no longer
-// belongs" would delete exactly the projections the freeze exists to preserve,
+// belongs" would delete exactly the projections the hold exists to preserve,
 // turning a held tenant into a deleted one.
-func keepOn(written []*v1beta1.AcceleratorQuota, frozen map[string]tree.Violation) sets.Set[string] {
+func keepOn(written []*v1beta1.AcceleratorQuota, held sets.Set[string]) sets.Set[string] {
 	keep := sets.New[string]()
 	for _, obj := range written {
 		keep.Insert(obj.Name)
 	}
-	for name := range frozen {
-		keep.Insert(name)
+	return keep.Union(held)
+}
+
+// heldNodes is every node whose member copies must outlive this pass: the
+// frozen ones and the leaves whose split could not be computed, each with the
+// ancestors its copies hang from.
+//
+// An unresolved leaf is held for the same reason a frozen one is. Its split is
+// missing an input — a member that did not report, shares that do not add up —
+// so the last split the members received is the best figure there is, and
+// deleting it would take a tenant's quota away over a fault that is not the
+// tenant's.
+func heldNodes(built *tree.Tree, frozen map[string]tree.Violation, unresolved map[string]string) sets.Set[string] {
+	held := sets.New[string]()
+	hold := func(name string) {
+		held.Insert(name)
+		if node, ok := built.Node(name); ok {
+			for _, ancestor := range node.Ancestors() {
+				held.Insert(ancestor.Name())
+			}
+		}
 	}
-	return keep
+	for name := range frozen {
+		hold(name)
+	}
+	for name := range unresolved {
+		hold(name)
+	}
+	return held
 }
 
 // sourceGenerationOf reads the generation the renderer stamped on a copy. It is

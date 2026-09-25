@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -67,13 +68,25 @@ func placementInputs(isvc *v1beta1.InferenceService) (requirements, clusterSelec
 	return isvc.Annotations[AcceleratorRequirementsAnnotation], isvc.Annotations[ClusterSelectorAnnotation]
 }
 
+// workloadClusterSelectorSet exposes immutable object identity alongside the
+// cluster's labels. The real object name is authoritative when a label uses the
+// same key, and the copy keeps selector evaluation from mutating informer data.
+func workloadClusterSelectorSet(cluster *v1beta1.WorkloadCluster) labels.Set {
+	set := make(labels.Set, len(cluster.Labels)+1)
+	for key, value := range cluster.Labels {
+		set[key] = value
+	}
+	set[metav1.ObjectNameField] = cluster.Name
+	return set
+}
+
 // MatchCandidates returns the names (sorted) of Ready WorkloadClusters whose
-// capability labels satisfy the ISVC's accelerator/capability requirements
-// (candidate selection). The requirements are the AND of the ISVC's
-// accelerator-requirements annotation and the optional cluster-selector
-// annotation. An ISVC that declares NO requirement matches NO cluster (it is not
-// fanned out fleet-wide). When the result is empty, the returned MatchReason
-// explains why; err is non-nil only for a malformed selector.
+// capability labels and metadata.name satisfy the ISVC's selectors. The
+// requirements are the AND of the ISVC's accelerator-requirements annotation
+// and the optional cluster-selector annotation. An ISVC that declares NO
+// requirement matches NO cluster (it is not fanned out fleet-wide). When the
+// result is empty, the returned MatchReason explains why; err is non-nil only
+// for a malformed selector.
 func MatchCandidates(isvc *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster) ([]string, MatchReason, error) {
 	sel, hasReq, err := requirementSelector(isvc)
 	if err != nil {
@@ -91,7 +104,7 @@ func MatchCandidates(isvc *v1beta1.InferenceService, clusters []v1beta1.Workload
 			continue
 		}
 		ready++
-		if sel.Matches(labels.Set(c.Labels)) {
+		if sel.Matches(workloadClusterSelectorSet(c)) {
 			out = append(out, c.Name)
 		}
 	}

@@ -89,6 +89,11 @@ type BaseComponentFields struct {
 	// under the quota backend, threaded from the InferenceServiceReconciler to
 	// the InferenceReplica projector. Empty governs everything.
 	QuotaAcceleratorResources []string
+
+	// PacingPartition is the canary machine's rollout-control partition for
+	// this Component, threaded from ComponentInputs to the InferenceReplica
+	// projector. nil when no canary governs the Component.
+	PacingPartition *int32
 }
 
 // newBaseComponentFields is the ONE place BaseComponentFields is
@@ -120,6 +125,7 @@ func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName 
 		AcceleratorClassName:      in.AcceleratorClassName,
 		Overlays:                  in.Overlays,
 		PolicyResolver:            in.PolicyResolver,
+		PacingPartition:           in.PacingPartition,
 	}
 }
 

@@ -2097,3 +2097,50 @@ func TestReconcile_SteadyStateEmitsNoGroupEvents(t *testing.T) {
 		}
 	}
 }
+
+// TestReconcile_GCRetainsTargetRevisionServicesWithoutPods pins that the
+// orphan sweep keeps a Component's roll-target revision Services alive
+// before that revision has any pod: a peer Component creates them ahead of
+// the pods whose per-revision peer endpoint names them. A genuinely stale
+// revision (no pods, not the target) is still swept in the same pass.
+func TestReconcile_GCRetainsTargetRevisionServicesWithoutPods(t *testing.T) {
+	isvc := testOMENativeISVC()
+	steadyEngineStatus(isvc, "hash1")
+	engineIR := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: isvc.Name + "-engine", Namespace: isvc.Namespace},
+		Status: v1beta1.InferenceReplicaStatus{
+			CurrentRevision: isvc.Name + "-engine-hash1",
+			UpdateRevision:  isvc.Name + "-engine-hash2",
+		},
+	}
+	targetRouting := PerRevisionServiceName(isvc.Name, v1beta1.EngineComponent, "hash2")
+	targetHeadless := PerRevisionHeadlessServiceName(isvc.Name, v1beta1.EngineComponent, "hash2")
+	staleRouting := PerRevisionServiceName(isvc.Name, v1beta1.EngineComponent, "hash0")
+	staleHeadless := PerRevisionHeadlessServiceName(isvc.Name, v1beta1.EngineComponent, "hash0")
+	objs := []runtime.Object{
+		engineIR,
+		buildPod(isvc, v1beta1.EngineComponent, "hash1", 0),
+		perRevisionServiceFixture(isvc, v1beta1.EngineComponent, "hash2", targetRouting),
+		perRevisionServiceFixture(isvc, v1beta1.EngineComponent, "hash2", targetHeadless),
+		perRevisionServiceFixture(isvc, v1beta1.EngineComponent, "hash0", staleRouting),
+		perRevisionServiceFixture(isvc, v1beta1.EngineComponent, "hash0", staleHeadless),
+	}
+	c := testClient(objs...)
+	if _, err := Reconcile(context.Background(), ReconcileInputs{
+		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
+		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, name := range []string{targetRouting, targetHeadless} {
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: name}, &corev1.Service{}); err != nil {
+			t.Errorf("target-revision Service %s must survive the sweep before its pods exist: %v", name, err)
+		}
+	}
+	for _, name := range []string{staleRouting, staleHeadless} {
+		err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: name}, &corev1.Service{})
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("stale Service %s must still be swept, Get returned %v", name, err)
+		}
+	}
+}

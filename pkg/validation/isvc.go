@@ -60,9 +60,9 @@ const (
 	// budgets at literal zero there is no surge headroom (no pod can be
 	// added) AND no drain headroom (no pod can be taken offline), so
 	// the rollout has no way to make progress and the Component will
-	// never finish reconciling. Defaulted nil values are not zero —
-	// the defaulter fills 25% for both — so this reason only fires when
-	// the operator has explicitly set both to 0. Mirrored as a runtime
+	// never finish reconciling. Unset values are not zero — the
+	// coordination resolver fills 25% for both — so this reason only
+	// fires when the operator has explicitly set both to 0. Mirrored as a runtime
 	// safety net in the coordination groups resolver.
 	ReasonZeroBudgetPacingUnstartable = "ZeroBudgetPacingUnstartable"
 )
@@ -83,9 +83,10 @@ func ValidateEngineDecoderConfig(spec *v1beta1.InferenceServiceSpec) error {
 
 // ValidateLeaderWorkerPairing enforces that the Leader / Worker spec
 // pair on each Component (Engine, Decoder) is internally consistent:
-// either both are absent (single-pod) or both are present with
-// Worker.Size > 0 (multi-pod). Rejects orphan-leader, orphan-worker, and
-// declared-worker-with-no-positive-size configurations.
+// either both are absent (single-pod) or both are present (multi-pod)
+// with Worker.Size positive when set. An unset size is legal: it resolves
+// at reconcile time to the runtime's value, or to one worker. Rejects
+// orphan-leader, orphan-worker, and explicit non-positive sizes.
 //
 // Error strings embed both the legacy "InvalidLeaderWorkerPairing"
 // reason (for back-compat with operators / tests grepping for it) and
@@ -120,9 +121,9 @@ func validateLeaderWorkerPairing(component string, leader *v1beta1.LeaderSpec, w
 			ReasonInvalidLeaderWorkerPairing, component, component, ReasonWorkerRequiresLeader,
 		)
 	}
-	if worker.Size == nil || *worker.Size <= 0 {
+	if worker.Size != nil && *worker.Size <= 0 {
 		return fmt.Errorf(
-			"%s: %s.worker is set but worker.size is not a positive integer; multi-pod configurations require worker.size > 0 (%s)",
+			"%s: %s.worker.size must be a positive integer when set; leave it unset to use the runtime's size or one worker (%s)",
 			ReasonInvalidLeaderWorkerPairing, component, ReasonWorkerSizeMustBePositive,
 		)
 	}

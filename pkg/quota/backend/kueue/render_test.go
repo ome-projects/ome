@@ -763,3 +763,20 @@ func TestRenderBorrowingIsOffUnlessAuthored(t *testing.T) {
 		})
 	}
 }
+
+// A leaf apportioned zero on a cluster still gets a queue there, and it must
+// admit nothing of its own: nominal zero, and no borrowing to stand in for it.
+func TestRenderZeroShare(t *testing.T) {
+	funded := map[string]v1beta1.AcceleratorBudget{"nvidia.com/gpu": {
+		ResourceName:   "nvidia.com/gpu",
+		ResourceFlavor: "a100",
+		Nominal:        resource.MustParse("0"),
+	}}
+	got := resourceQuota("nvidia.com/gpu", funded, Options{})
+	if got.NominalQuota == nil || !got.NominalQuota.IsZero() {
+		t.Errorf("nominalQuota = %v, want 0", got.NominalQuota)
+	}
+	if got.BorrowingLimit == nil || !got.BorrowingLimit.IsZero() {
+		t.Errorf("borrowingLimit = %v, want 0", got.BorrowingLimit)
+	}
+}

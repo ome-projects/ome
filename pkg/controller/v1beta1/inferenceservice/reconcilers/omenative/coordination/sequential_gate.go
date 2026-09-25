@@ -13,8 +13,8 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 )
 
 // conditionReady is the IR-level condition type stamped by the
@@ -197,9 +197,10 @@ func observeSequentialComponentsForGate(ctx context.Context, reads client.Reader
 	out := make(map[v1beta1.ComponentType]ComponentObservation, len(components))
 	for _, c := range components {
 		// One consistent IR snapshot per Component: metadata (generation,
-		// parent-generation annotation), spec (effective partition from the
-		// merged ISVC↔runtime lifecycle — including a runtime-inherited
-		// partition the raw ISVC never shows), and status. A read error
+		// parent-generation annotation), spec (effective partition: the
+		// projected pacing partition, else the merged ISVC↔runtime lifecycle
+		// partition — including a runtime-inherited one the raw ISVC never
+		// shows), and status. A read error
 		// fails closed: fabricating a zero-valued observation for the
 		// rolling peer would admit a second Component and break
 		// at-most-one-rolling.
@@ -236,7 +237,7 @@ func observeSequentialComponentsForGate(ctx context.Context, reads client.Reader
 			// started rolling at t=0 (overlap). Only trust AtDesiredShape
 			// once the target is genuinely known to differ.
 			if revisionSkew {
-				obs.AtDesiredShape = workload.ReachedDesiredShape(
+				obs.AtDesiredShape = workloadstatus.ReachedDesiredShape(
 					v1beta1convert.InstanceStatusSliceToWorkload(summary.InstanceStatuses),
 					summary.UpdateRevision, partition, summary.Replicas)
 			}
