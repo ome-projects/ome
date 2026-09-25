@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -75,6 +76,133 @@ func TestListAllPagedPropagatesErrorMidStreamAndStopsPaging(t *testing.T) {
 	require.ErrorIs(t, err, boom)
 	assert.Nil(t, got, "a mid-stream error should not return a partial page")
 	assert.Equal(t, 2, call, "paging must stop at the failing page, not retry or continue")
+}
+
+func TestListAllPagedRestartsOnceAfterExpiredContinuation(t *testing.T) {
+	expired := apierrors.NewResourceExpired("private continuation detail")
+	var gotOpts []metav1.ListOptions
+	call := 0
+	page := func(opts metav1.ListOptions) ([]runtime.Object, string, error) {
+		gotOpts = append(gotOpts, opts)
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("stale-prefix")}, "old-token", nil
+		case 2:
+			return nil, "", expired
+		case 3:
+			return []runtime.Object{obj("fresh-a")}, "new-token", nil
+		case 4:
+			return []runtime.Object{obj("fresh-b")}, "", nil
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "fresh-a", got[0].(*fakeObj).N)
+	assert.Equal(t, "fresh-b", got[1].(*fakeObj).N)
+	assert.Equal(t, []string{"", "old-token", "", "new-token"}, []string{
+		gotOpts[0].Continue,
+		gotOpts[1].Continue,
+		gotOpts[2].Continue,
+		gotOpts[3].Continue,
+	})
+	for _, opts := range gotOpts {
+		assert.Equal(t, int64(ChunkSize), opts.Limit)
+	}
+}
+
+func TestListAllPagedExpiredRestartResetsTokenCycleState(t *testing.T) {
+	expired := apierrors.NewResourceExpired("expired")
+	call := 0
+	page := func(opts metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("discarded")}, "same-token", nil
+		case 2:
+			return nil, "", expired
+		case 3:
+			return []runtime.Object{obj("kept-a")}, "same-token", nil
+		case 4:
+			return []runtime.Object{obj("kept-b")}, "", nil
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, 4, call)
+}
+
+func TestListAllPagedReturnsSecondExpiredContinuationWithoutPartialData(t *testing.T) {
+	firstExpired := apierrors.NewResourceExpired("first private detail")
+	secondExpired := apierrors.NewResourceExpired("second private detail")
+	call := 0
+	page := func(opts metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("discarded")}, "old-token", nil
+		case 2:
+			return nil, "", firstExpired
+		case 3:
+			return []runtime.Object{obj("also-discarded")}, "new-token", nil
+		case 4:
+			return nil, "", secondExpired
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.ErrorIs(t, err, secondExpired)
+	assert.Nil(t, got)
+	assert.Equal(t, 4, call, "an expired continuation must restart at most once")
+}
+
+func TestListAllPagedDoesNotRestartExpiredFirstPage(t *testing.T) {
+	expired := apierrors.NewResourceExpired("private detail")
+	call := 0
+	page := func(opts metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		assert.Empty(t, opts.Continue)
+		return nil, "", expired
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.ErrorIs(t, err, expired)
+	assert.Nil(t, got)
+	assert.Equal(t, 1, call)
+}
+
+func TestListAllPagedCancellationStopsExpiredRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	expired := apierrors.NewResourceExpired("private detail")
+	call := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		if call == 1 {
+			return []runtime.Object{obj("discarded")}, "old-token", nil
+		}
+		cancel()
+		return nil, "", expired
+	}
+
+	got, err := ListAllPaged(ctx, page)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, got)
+	assert.Equal(t, 2, call, "cancellation must prevent the restart request")
 }
 
 func TestListAllPagedEmptyResultStopsAfterOneCall(t *testing.T) {

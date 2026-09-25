@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -26,6 +27,10 @@ type PageFunc func(opts metav1.ListOptions) (items []runtime.Object, continueTok
 // ListAllPaged drains a paginated list API, kubectl-style: it fetches
 // ChunkSize items per request, feeding each response's continue token into
 // the next request, until the server returns no more continue tokens.
+// If a continuation expires after page one, the incomplete snapshot is
+// discarded and the same chunked read restarts once. A repeated expiration
+// is returned to the caller, so retries stay finite and no partial or mixed
+// snapshot can escape.
 //
 // Callers close over their own context and base ListOptions (e.g.
 // LabelSelector) inside page; ListAllPaged itself only ever sets Limit and
@@ -36,12 +41,27 @@ func ListAllPaged(ctx context.Context, page PageFunc) ([]runtime.Object, error) 
 	opts := metav1.ListOptions{Limit: ChunkSize}
 	seenContinueTokens := make(map[string]struct{})
 	completedPages := 0
+	restartedAfterExpiration := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		items, cont, err := page(opts)
 		if err != nil {
+			// A Kubernetes continuation token can expire while a client is
+			// draining a large list. Discard the old snapshot and restart the
+			// same chunked read once from page one. Unlike client-go's full-list
+			// fallback, every request remains capped at ChunkSize. A second
+			// expiration is returned so a busy API server cannot make this loop
+			// forever.
+			if apierrors.IsResourceExpired(err) && opts.Continue != "" && !restartedAfterExpiration {
+				out = nil
+				opts = metav1.ListOptions{Limit: ChunkSize}
+				seenContinueTokens = make(map[string]struct{})
+				completedPages = 0
+				restartedAfterExpiration = true
+				continue
+			}
 			return nil, err
 		}
 		completedPages++
