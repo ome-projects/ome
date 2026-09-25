@@ -579,6 +579,18 @@ func TestInstanceCommandRegistersRetryBlocks(t *testing.T) {
 	assert.Equal(t, "retry-blocks", command.Name())
 }
 
+func TestRetryBlocksRejectsInvalidRecoveryOverrideBeforeFactoryAccess(t *testing.T) {
+	t.Parallel()
+
+	deps := retryCommandDependencies()
+	deps.limits.MaxConsumedItems = deps.limits.MaxItems*2 + 1
+	o := &retryBlocksOptions{output: "table", component: "engine", deps: deps}
+
+	err := o.run(context.Background(), panicFactory{}, "chat")
+
+	require.ErrorIs(t, err, ErrInvalidInstancePagingLimits)
+}
+
 func executeRetryBlocks(
 	t *testing.T,
 	f factory.Factory,

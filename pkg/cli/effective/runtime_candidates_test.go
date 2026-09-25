@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -55,6 +56,7 @@ type runtimeCandidateRequest struct {
 	labelSelector   string
 	fieldSelector   string
 	resourceVersion string
+	resourceMatch   metav1.ResourceVersionMatch
 	limit           int64
 	continueToken   string
 	deadline        time.Time
@@ -81,6 +83,7 @@ func recordRuntimeCandidateRequest(
 		labelSelector:   raw.LabelSelector,
 		fieldSelector:   raw.FieldSelector,
 		resourceVersion: raw.ResourceVersion,
+		resourceMatch:   raw.ResourceVersionMatch,
 		limit:           raw.Limit,
 		continueToken:   raw.Continue,
 		deadline:        deadline,
@@ -143,7 +146,9 @@ func TestBoundedRuntimeResolverPagesCandidateListsUnderOneBudget(t *testing.T) {
 	resolver, err := NewBoundedRuntimeResolver(client, candidateLimits())
 	require.NoError(t, err)
 
-	raw := &metav1.ListOptions{ResourceVersion: "resource-version-7"}
+	raw := &metav1.ListOptions{
+		ResourceVersion: "resource-version-7", ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+	}
 	callerOptions := &ctrlclient.ListOptions{
 		Namespace:     "workloads",
 		LabelSelector: labels.SelectorFromSet(labels.Set{"ome.io/pool": "online"}),
@@ -169,13 +174,13 @@ func TestBoundedRuntimeResolverPagesCandidateListsUnderOneBudget(t *testing.T) {
 		{
 			kind: "ServingRuntime", namespace: "workloads",
 			labelSelector: "ome.io/pool=online", fieldSelector: "metadata.name=runtime-a",
-			resourceVersion: "resource-version-7", limit: 2,
+			resourceVersion: "resource-version-7", resourceMatch: metav1.ResourceVersionMatchExact, limit: 2,
 			deadline: requests[0].deadline,
 		},
 		{
 			kind: "ServingRuntime", namespace: "workloads",
 			labelSelector: "ome.io/pool=online", fieldSelector: "metadata.name=runtime-a",
-			resourceVersion: "resource-version-7", limit: 2, continueToken: "next-runtime-page",
+			limit: 2, continueToken: "next-runtime-page",
 			deadline: requests[1].deadline,
 		},
 		{
@@ -192,6 +197,8 @@ func TestBoundedRuntimeResolverPagesCandidateListsUnderOneBudget(t *testing.T) {
 	assert.Equal(t, int64(99), callerOptions.Limit)
 	assert.Zero(t, raw.Limit)
 	assert.Empty(t, raw.Continue)
+	assert.Equal(t, "resource-version-7", raw.ResourceVersion)
+	assert.Equal(t, metav1.ResourceVersionMatchExact, raw.ResourceVersionMatch)
 }
 
 func TestBoundedRuntimeResolverCachesSelectorRetry(t *testing.T) {
@@ -523,6 +530,106 @@ func TestBoundedRuntimeResolverSharesLimitsAcrossCandidateKinds(t *testing.T) {
 	}
 }
 
+func TestBoundedRuntimeResolverRestartsExpiredListTransactionally(t *testing.T) {
+	t.Parallel()
+
+	var requests []runtimeCandidateRequest
+	base := newRuntimeCandidateBaseClient(t)
+	client := &runtimeCandidateListClient{Client: base}
+	client.list = func(ctx context.Context, list ctrlclient.ObjectList, opts ...ctrlclient.ListOption) error {
+		request := recordRuntimeCandidateRequest(ctx, list, opts...)
+		requests = append(requests, request)
+		switch len(requests) {
+		case 1:
+			serving, ok := list.(*v1beta1.ServingRuntimeList)
+			require.True(t, ok)
+			serving.ListMeta = metav1.ListMeta{
+				ResourceVersion: "stale-rv", Continue: "expired-token",
+			}
+			serving.Items = []v1beta1.ServingRuntime{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "runtime-a", Namespace: "workloads",
+					UID: "runtime-a", ResourceVersion: "stale-rv",
+				},
+			}}
+			return nil
+		case 2:
+			return apierrors.NewResourceExpired("private token detail")
+		case 3:
+			serving, ok := list.(*v1beta1.ServingRuntimeList)
+			require.True(t, ok)
+			serving.ListMeta = metav1.ListMeta{
+				ResourceVersion: "fresh-rv", Continue: "fresh-token",
+			}
+			serving.Items = []v1beta1.ServingRuntime{{ObjectMeta: metav1.ObjectMeta{
+				Name: "runtime-a", Namespace: "workloads",
+				UID: "runtime-a", ResourceVersion: "fresh-a-rv",
+			}}}
+			return nil
+		case 4:
+			serving, ok := list.(*v1beta1.ServingRuntimeList)
+			require.True(t, ok)
+			serving.ListMeta = metav1.ListMeta{ResourceVersion: "fresh-rv"}
+			serving.Items = []v1beta1.ServingRuntime{{ObjectMeta: metav1.ObjectMeta{
+				Name: "runtime-b", Namespace: "workloads",
+				UID: "runtime-b", ResourceVersion: "fresh-b-rv",
+			}}}
+			return nil
+		case 5:
+			cluster, ok := list.(*v1beta1.ClusterServingRuntimeList)
+			require.True(t, ok, "discarded work must not consume snapshot evidence budget")
+			cluster.ListMeta = metav1.ListMeta{ResourceVersion: "fresh-rv"}
+			return nil
+		default:
+			t.Fatalf("unexpected request %d", len(requests))
+			return nil
+		}
+	}
+	resolver, err := NewBoundedRuntimeResolver(client, paging.Limits{
+		PageSize: 1, MaxItems: 3, MaxPages: 4, RequestTimeout: time.Second,
+	})
+	require.NoError(t, err)
+
+	got := &v1beta1.ServingRuntimeList{}
+	err = resolver.client.List(context.Background(), got, &ctrlclient.ListOptions{
+		Namespace: "workloads",
+		Raw: &metav1.ListOptions{
+			ResourceVersion: "requested-rv", ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "fresh-rv", got.ResourceVersion)
+	assert.Equal(t, []string{"runtime-a", "runtime-b"}, servingRuntimeNames(got.Items))
+	assert.Equal(t, []string{"", "expired-token", "", "fresh-token"}, []string{
+		requests[0].continueToken, requests[1].continueToken,
+		requests[2].continueToken, requests[3].continueToken,
+	})
+	assert.Equal(t, []int64{1, 1, 1, 1}, []int64{
+		requests[0].limit, requests[1].limit, requests[2].limit, requests[3].limit,
+	})
+	assert.Equal(t, []string{"requested-rv", "", "requested-rv", ""}, []string{
+		requests[0].resourceVersion, requests[1].resourceVersion,
+		requests[2].resourceVersion, requests[3].resourceVersion,
+	})
+	assert.Equal(t, []metav1.ResourceVersionMatch{
+		metav1.ResourceVersionMatchExact, "", metav1.ResourceVersionMatchExact, "",
+	}, []metav1.ResourceVersionMatch{
+		requests[0].resourceMatch, requests[1].resourceMatch,
+		requests[2].resourceMatch, requests[3].resourceMatch,
+	})
+	bounded := resolver.client.(*boundedRuntimeCandidateClient)
+	snapshot, found := bounded.runtimeSnapshot(
+		runtimeselector.KindServingRuntime, "workloads", "runtime-a",
+	)
+	require.True(t, found)
+	assert.Equal(t, "fresh-a-rv", snapshot.resourceVersion)
+
+	err = resolver.client.List(context.Background(), &v1beta1.ClusterServingRuntimeList{})
+	require.NoError(t, err)
+	assert.Len(t, requests, 5)
+}
+
 func TestBoundedRuntimeResolverRejectsServerItemOverrun(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -759,6 +866,59 @@ func TestNewBoundedRuntimeResolverRejectsInvalidConfiguration(t *testing.T) {
 
 			require.Error(t, err)
 			assert.Nil(t, resolver)
+		})
+	}
+}
+
+func TestNewBoundedRuntimeResolverRejectsInvalidRecoveryOverridesBeforeClientUse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			invalid := candidateLimits()
+			test.mutate(&invalid)
+			clientCalls := 0
+			client := &runtimeCandidateListClient{
+				Client: newRuntimeCandidateBaseClient(t),
+				get: func(
+					context.Context, ctrlclient.ObjectKey, ctrlclient.Object,
+					...ctrlclient.GetOption,
+				) error {
+					clientCalls++
+					return fmt.Errorf("unexpected runtime GET")
+				},
+				list: func(
+					context.Context, ctrlclient.ObjectList, ...ctrlclient.ListOption,
+				) error {
+					clientCalls++
+					return fmt.Errorf("unexpected runtime LIST")
+				},
+			}
+
+			resolver, err := NewBoundedRuntimeResolver(client, invalid)
+
+			require.Error(t, err)
+			assert.Nil(t, resolver)
+			assert.Zero(t, clientCalls)
 		})
 	}
 }

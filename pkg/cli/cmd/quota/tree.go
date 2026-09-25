@@ -66,6 +66,9 @@ It never prints labels, annotations, status messages, UIDs, or resource versions
 					return errors.New("unsupported output format (supported: table, wide, json, yaml)")
 				}
 			}
+			if err := limits.Validate(); err != nil {
+				return errors.New("quota tree paging limits are invalid")
+			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), limits.RequestTimeout)
 			defer cancel()
 			if err := ctx.Err(); err != nil {

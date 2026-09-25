@@ -80,7 +80,7 @@ func Collect(
 	return Result{
 		Quotas: copyQuotas(listed.Items),
 		Completeness: Completeness{
-			ObservedPages: listed.Pages,
+			ObservedPages: listed.ObservedPages,
 			ObservedItems: len(listed.Items),
 			Truncated:     listed.Truncated,
 		},
@@ -88,7 +88,7 @@ func Collect(
 }
 
 func validateLimits(limits paging.Limits) error {
-	if limits.PageSize <= 0 || limits.MaxItems <= 0 || limits.MaxPages <= 0 || limits.RequestTimeout <= 0 {
+	if err := limits.Validate(); err != nil {
 		return ErrInvalidLimits
 	}
 	return nil

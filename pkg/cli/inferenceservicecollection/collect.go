@@ -56,7 +56,6 @@ func collect(
 	limits paging.Limits,
 ) (Result, error) {
 	result := Result{InferenceServices: []omev1beta1.InferenceService{}}
-	observedPages := 0
 	services, err := paging.ListBounded(
 		ctx,
 		metav1.ListOptions{},
@@ -75,7 +74,6 @@ func collect(
 			if list == nil {
 				return paging.Page[omev1beta1.InferenceService]{}, errors.New("empty response")
 			}
-			observedPages++
 			return paging.Page[omev1beta1.InferenceService]{
 				Items: list.Items, Continue: list.Continue,
 			}, nil
@@ -83,7 +81,7 @@ func collect(
 	)
 	result.InferenceServices = copyInferenceServices(services.Items)
 	result.Completeness = Completeness{
-		ObservedPages: observedPages,
+		ObservedPages: services.ObservedPages,
 		ObservedItems: len(services.Items),
 		Truncated:     services.Truncated,
 	}

@@ -2,6 +2,7 @@ package logs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -28,6 +29,7 @@ const (
 var (
 	revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
 	fullRevisionPattern = regexp.MustCompile(`^(.+)-(engine|decoder|router)-([0-9a-f]{8})$`)
+	errInvalidPodPaging = errors.New("pod discovery paging limits are invalid")
 )
 
 type dependencies struct {
@@ -151,6 +153,9 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 }
 
 func (o *Options) run(ctx context.Context, f factory.Factory, deps dependencies) error {
+	if err := deps.podLimits.Validate(); err != nil {
+		return errInvalidPodPaging
+	}
 	if deps.openLogStream == nil {
 		deps.openLogStream = defaultOpenLogStream
 	}

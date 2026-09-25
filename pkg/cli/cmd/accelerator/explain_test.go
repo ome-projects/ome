@@ -889,6 +889,37 @@ func TestExplainRunRejectsInvalidEvidenceAndProjectionFailures(t *testing.T) {
 }
 
 func TestCollectAcceleratorEvidenceRejectsInvalidLimitsAndFactoryFailures(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			limits := commandLimits()
+			test.mutate(&limits)
+			tracking := &acceleratorTrackingFactory{namespace: "prod"}
+
+			_, err := collectAcceleratorEvidence(
+				context.Background(), tracking, namespace.NewOptions(), "chat", limits,
+			)
+
+			require.ErrorContains(t, err, "limits are invalid")
+			assert.Empty(t, tracking.calls, "invalid limits must prevent factory and client calls")
+		})
+	}
+
 	_, err := collectAcceleratorEvidence(
 		context.Background(), &acceleratorTrackingFactory{namespace: "prod"},
 		namespace.NewOptions(), "chat", paging.Limits{},
@@ -1071,6 +1102,7 @@ type acceleratorTrackingFactory struct {
 	ome          versioned.Interface
 	kube         kubernetes.Interface
 	runtime      ctrlclient.Client
+	calls        []string
 	namespace    string
 	namespaceErr error
 	omeErr       error
@@ -1083,17 +1115,21 @@ func (*acceleratorTrackingFactory) RESTConfig() (*rest.Config, error) {
 }
 
 func (f *acceleratorTrackingFactory) Namespace() (string, bool, error) {
+	f.calls = append(f.calls, "namespace")
 	return f.namespace, false, f.namespaceErr
 }
 
 func (f *acceleratorTrackingFactory) OMEClient() (versioned.Interface, error) {
+	f.calls = append(f.calls, "ome")
 	return f.ome, f.omeErr
 }
 
 func (f *acceleratorTrackingFactory) KubeClient() (kubernetes.Interface, error) {
+	f.calls = append(f.calls, "kube")
 	return f.kube, f.kubeErr
 }
 
 func (f *acceleratorTrackingFactory) RuntimeClient() (ctrlclient.Client, error) {
+	f.calls = append(f.calls, "runtime")
 	return f.runtime, f.runtimeErr
 }

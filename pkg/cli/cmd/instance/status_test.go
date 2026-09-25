@@ -818,6 +818,57 @@ func firstCoreAction(t *testing.T, actions []ktesting.Action, resource string) k
 	return nil
 }
 
+func TestStatusRejectsInvalidPagingOverridesBeforeFactoryAccess(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*statusDependencies)
+		want   error
+	}{
+		{
+			name: "inference replicas",
+			mutate: func(deps *statusDependencies) {
+				deps.irLimits.Paging.MaxRequests = deps.irLimits.Paging.MaxPages*2 + 1
+			},
+			want: ErrStatusIRPagingInvalid,
+		},
+		{
+			name: "pods",
+			mutate: func(deps *statusDependencies) {
+				deps.podLimits.MaxConsumedItems = deps.podLimits.MaxItems*2 + 1
+			},
+			want: ErrStatusPodPagingInvalid,
+		},
+		{
+			name: "events",
+			mutate: func(deps *statusDependencies) {
+				deps.eventLimits.Paging.MaxRequests = deps.eventLimits.Paging.MaxPages*2 + 1
+			},
+			want: ErrStatusEventPagingInvalid,
+		},
+		{
+			name: "runtime",
+			mutate: func(deps *statusDependencies) {
+				deps.runtimeLimits.MaxConsumedItems = deps.runtimeLimits.MaxItems*2 + 1
+			},
+			want: ErrStatusRuntimePagingInvalid,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			deps := defaultInstanceStatusDependencies()
+			test.mutate(&deps)
+			o := &statusOptions{deps: deps}
+
+			err := o.run(context.Background(), panicFactory{}, "chat")
+
+			require.ErrorIs(t, err, test.want)
+		})
+	}
+}
+
 type statusFactory struct {
 	factory.Factory
 	ns         string

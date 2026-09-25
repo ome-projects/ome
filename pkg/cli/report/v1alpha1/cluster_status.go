@@ -113,11 +113,13 @@ type ClusterStatusReport struct {
 	CollectedAt          time.Time               `json:"collectedAt"`
 	Observation          ClusterObservationState `json:"observation"`
 	UnavailableReason    UnavailableReason       `json:"unavailableReason,omitempty"`
+	RequestedPages       int                     `json:"requestedPages"`
 	ObservedPages        int                     `json:"observedPages"`
 	ReturnedSources      int                     `json:"returnedSources"`
 	AdmittedSources      int                     `json:"admittedSources"`
 	SourceLimit          int                     `json:"sourceLimit"`
 	PageLimit            int                     `json:"pageLimit"`
+	RequestLimit         int                     `json:"requestLimit"`
 	PageSize             int64                   `json:"pageSize"`
 	ConditionScanLimit   int                     `json:"conditionScanLimit"`
 	ConditionOutputLimit int                     `json:"conditionOutputLimit"`
@@ -273,7 +275,7 @@ func (r ClusterStatusReport) Table() report.Table {
 	add("@ observation", string(r.Observation), "", "", "")
 	add("@ availability", string(r.UnavailableReason), "", "", "")
 	add("@ sources", "returned="+strconv.Itoa(r.ReturnedSources), "kept="+strconv.Itoa(r.AdmittedSources), "max="+strconv.Itoa(r.SourceLimit), "cut="+strconv.FormatBool(r.SourcesTruncated))
-	add("@ pages", "read="+strconv.Itoa(r.ObservedPages), "max="+strconv.Itoa(r.PageLimit), "size="+strconv.FormatInt(r.PageSize, 10), "")
+	add("@ pages", "seen="+strconv.Itoa(r.ObservedPages)+"/"+strconv.Itoa(r.PageLimit), "calls="+strconv.Itoa(r.RequestedPages), "cap="+strconv.Itoa(r.RequestLimit), "size="+strconv.FormatInt(r.PageSize, 10))
 	detailTruncated := false
 	for _, row := range r.Clusters {
 		source, conditions := string(row.SourceKind), string(row.ConditionState)
@@ -315,7 +317,9 @@ func (r ClusterStatusReport) WideTable() report.Table {
 	add("Observation", string(r.Observation))
 	add("Unavailable reason", string(r.UnavailableReason))
 	add("Source counts returned/admitted", strconv.Itoa(r.ReturnedSources)+"/"+strconv.Itoa(r.AdmittedSources))
-	add("Pages/limit/size", strconv.Itoa(r.ObservedPages)+"/"+strconv.Itoa(r.PageLimit)+"/"+strconv.FormatInt(r.PageSize, 10))
+	add("Pages seen/limit", strconv.Itoa(r.ObservedPages)+"/"+strconv.Itoa(r.PageLimit))
+	add("Requests used/limit", strconv.Itoa(r.RequestedPages)+"/"+strconv.Itoa(r.RequestLimit))
+	add("Page size", strconv.FormatInt(r.PageSize, 10))
 	add("Source limit/truncated", strconv.Itoa(r.SourceLimit)+"/"+strconv.FormatBool(r.SourcesTruncated))
 	add("Condition scan/output limits", strconv.Itoa(r.ConditionScanLimit)+"/"+strconv.Itoa(r.ConditionOutputLimit))
 	add("Collected at", r.CollectedAt.Format(time.RFC3339Nano))

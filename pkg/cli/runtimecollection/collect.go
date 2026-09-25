@@ -96,7 +96,6 @@ func collect(
 		ClusterServingRuntimes: []omev1beta1.ClusterServingRuntime{},
 		ServingRuntimes:        []omev1beta1.ServingRuntime{},
 	}}
-	clusterPages := 0
 	clusters, err := paging.ListBounded(ctx, metav1.ListOptions{}, limits,
 		func(requestCtx context.Context, options metav1.ListOptions) (paging.Page[omev1beta1.ClusterServingRuntime], error) {
 			list, listErr := client.ClusterServingRuntimes().List(requestCtx, options)
@@ -109,12 +108,11 @@ func collect(
 			if list == nil {
 				return paging.Page[omev1beta1.ClusterServingRuntime]{}, errors.New("empty response")
 			}
-			clusterPages++
 			return paging.Page[omev1beta1.ClusterServingRuntime]{Items: list.Items, Continue: list.Continue}, nil
 		})
 	result.Snapshot.ClusterServingRuntimes = copyClusterServingRuntimes(clusters.Items)
 	result.Completeness.ClusterServingRuntimes = KindCompleteness{
-		ObservedPages: clusterPages,
+		ObservedPages: clusters.ObservedPages,
 		ObservedItems: len(clusters.Items),
 		Truncated:     clusters.Truncated,
 	}
@@ -145,7 +143,6 @@ func CollectServingRuntimes(
 	limits paging.Limits,
 ) (ServingRuntimeResult, error) {
 	result := ServingRuntimeResult{ServingRuntimes: []omev1beta1.ServingRuntime{}}
-	runtimePages := 0
 	runtimes, err := paging.ListBounded(ctx, metav1.ListOptions{}, limits,
 		func(requestCtx context.Context, options metav1.ListOptions) (paging.Page[omev1beta1.ServingRuntime], error) {
 			list, listErr := client.ServingRuntimes(namespace).List(requestCtx, options)
@@ -158,12 +155,11 @@ func CollectServingRuntimes(
 			if list == nil {
 				return paging.Page[omev1beta1.ServingRuntime]{}, errors.New("empty response")
 			}
-			runtimePages++
 			return paging.Page[omev1beta1.ServingRuntime]{Items: list.Items, Continue: list.Continue}, nil
 		})
 	result.ServingRuntimes = copyServingRuntimes(runtimes.Items)
 	result.Completeness = KindCompleteness{
-		ObservedPages: runtimePages,
+		ObservedPages: runtimes.ObservedPages,
 		ObservedItems: len(runtimes.Items),
 		Truncated:     runtimes.Truncated,
 	}

@@ -274,6 +274,7 @@ type projectionStateSnapshot struct {
 	HistoryRequested        bool
 	HistoryPages            int
 	HistoryPageLimit        int
+	HistoryRequestLimit     int
 	HistoryRequestedPages   int
 	HistoryObservedPages    int
 	HistoryComplete         bool
@@ -299,8 +300,9 @@ func snapshotProjectionState(state *effective.RuntimeState) projectionStateSnaps
 		SyncTokenState: state.SyncTokenState, DriftState: state.DriftState, DriftReason: state.DriftReason,
 		LiveToActive: state.LiveToActive, LiveShortHash: state.LiveShortHash,
 		HistoryRequested: state.HistoryRequested, HistoryPages: state.HistoryPages,
-		HistoryPageLimit: state.HistoryPageLimit, HistoryRequestedPages: state.HistoryRequestedPages,
-		HistoryObservedPages: state.HistoryObservedPages, HistoryComplete: state.HistoryComplete,
+		HistoryPageLimit: state.HistoryPageLimit, HistoryRequestLimit: state.HistoryRequestLimit,
+		HistoryRequestedPages: state.HistoryRequestedPages,
+		HistoryObservedPages:  state.HistoryObservedPages, HistoryComplete: state.HistoryComplete,
 		HistoryTruncated: state.HistoryTruncated, HistoryNamespace: state.HistoryNamespace(),
 		LiveAvailability: state.LiveAvailability(), Identity: state.InferenceServiceIdentity(),
 		Live: state.LiveConfiguration(), Active: active, Revisions: state.RevisionObservations(), Issues: state.SourceIssues(),

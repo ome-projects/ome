@@ -145,8 +145,10 @@ type Result struct {
 	RetryBlocksTruncated []RetryBlocksTruncation
 	DetailsTruncated     []DetailTruncation
 	DetailsMalformed     []DetailMalformed
-	Pages                int
-	Truncated            bool
+	// Pages counts every Kubernetes API request attempt, including a failed
+	// expired continuation and any discarded pre-restart responses.
+	Pages     int
+	Truncated bool
 }
 
 type Lister interface {

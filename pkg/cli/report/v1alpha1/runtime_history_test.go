@@ -549,6 +549,37 @@ func TestRuntimeHistoryEmptyFormsHaveDiagnosticSummaryRow(t *testing.T) {
 	}}, tests[2].content.WideTable().Rows)
 }
 
+func TestRuntimeHistoryRecoveredRestartCountersRemainVisible(t *testing.T) {
+	t.Parallel()
+
+	content := v1alpha1.RuntimeHistoryContent{
+		Observation:    v1alpha1.HistoryObservationStateComplete,
+		Completeness:   v1alpha1.HistoryCompletenessRetentionBounded,
+		RequestedPages: 4,
+		ObservedPages:  2,
+	}
+	assert.Equal(t, "C/B/2/4", content.Table().Rows[0][0])
+	assert.Equal(t, "2/4", content.WideTable().Rows[0][2])
+
+	reportValue := v1alpha1.NewRuntimeHistoryReport(
+		v1alpha1.Metadata{Namespace: "prod", Name: "chat"}, content,
+		fixedClock{now: time.Date(2026, time.September, 25, 7, 0, 0, 0, time.UTC)},
+	)
+	for _, test := range []struct {
+		format report.Format
+		want   []string
+	}{
+		{format: report.FormatJSON, want: []string{`"requestedPages": 4`, `"observedPages": 2`}},
+		{format: report.FormatYAML, want: []string{"requestedPages: 4", "observedPages: 2"}},
+	} {
+		var output bytes.Buffer
+		require.NoError(t, report.Write(&output, test.format, reportValue))
+		for _, want := range test.want {
+			assert.Contains(t, output.String(), want)
+		}
+	}
+}
+
 func TestRuntimeHistoryMachineOutputContract(t *testing.T) {
 	reportValue := v1alpha1.NewRuntimeHistoryReport(
 		v1alpha1.Metadata{Namespace: "prod", Name: "chat"},

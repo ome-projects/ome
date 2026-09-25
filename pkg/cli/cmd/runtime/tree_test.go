@@ -1199,6 +1199,28 @@ func TestTreeValidationPrecedesClientAcquisition(t *testing.T) {
 	}
 }
 
+func TestTreeRejectsInvalidRecoveryOverrideBeforeAcquisition(t *testing.T) {
+	client := omefake.NewSimpleClientset()
+	f := &acquisitionFactory{ome: client, namespace: treeFixtureNamespace}
+	dependencies := fixedTreeDependencies()
+	dependencies.limits.MaxRequests = dependencies.limits.MaxPages*2 + 1
+	var out bytes.Buffer
+
+	errOut, err := executeTreeWithDependencies(
+		t, f, dependencies, &out,
+		treeFixturePrefix+"private", "--kind", "ServingRuntime",
+	)
+
+	require.EqualError(t, err, "runtime tree paging limits are invalid")
+	assert.Zero(t, f.namespaceGet)
+	assert.Zero(t, f.omeGet)
+	assert.Zero(t, f.kubeGet)
+	assert.Zero(t, f.runtimeGet)
+	assert.Empty(t, client.Actions())
+	assert.Empty(t, out.String())
+	assert.Empty(t, errOut)
+}
+
 // TestTreeHelpShowsCollisionSafeInvocations catches the discoverability path
 // for operators who encounter same-name ServingRuntime/ClusterServingRuntime
 // targets.

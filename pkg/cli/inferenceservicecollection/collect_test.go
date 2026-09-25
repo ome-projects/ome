@@ -61,6 +61,54 @@ func TestCollectDrainsInferenceServicesAcrossAllNamespaces(t *testing.T) {
 	assert.Equal(t, []string{metav1.NamespaceAll, metav1.NamespaceAll}, namespaces)
 }
 
+func TestCollectRestartsExpiredContinuationWithoutStaleCompleteness(t *testing.T) {
+	t.Parallel()
+
+	client := omefake.NewSimpleClientset()
+	requests := []metav1.ListOptions{}
+	client.PrependReactor("list", "inferenceservices", func(action ktesting.Action) (bool, runtime.Object, error) {
+		options := action.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
+		requests = append(requests, options)
+		switch len(requests) {
+		case 1:
+			return true, &omev1beta1.InferenceServiceList{
+				Items:    []omev1beta1.InferenceService{inferenceService("old", "stale")},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private detail")
+		case 3:
+			return true, &omev1beta1.InferenceServiceList{
+				Items:    []omev1beta1.InferenceService{inferenceService("team-a", "fresh-a")},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &omev1beta1.InferenceServiceList{
+				Items: []omev1beta1.InferenceService{inferenceService("team-a", "fresh-b")},
+			}, nil
+		default:
+			t.Fatalf("unexpected request %d", len(requests))
+			return true, nil, nil
+		}
+	})
+	limits := paging.Limits{
+		PageSize: 1, MaxItems: 4, MaxPages: 5, RequestTimeout: time.Second,
+	}
+
+	got, err := Collect(context.Background(), client.OmeV1beta1(), limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, Completeness{ObservedPages: 2, ObservedItems: 2}, got.Completeness)
+	require.Len(t, got.InferenceServices, 2)
+	assert.Equal(t, []string{"fresh-a", "fresh-b"}, []string{
+		got.InferenceServices[0].Name, got.InferenceServices[1].Name,
+	})
+	assert.Equal(t, []string{"", "expired-token", "", "fresh-token"}, []string{
+		requests[0].Continue, requests[1].Continue,
+		requests[2].Continue, requests[3].Continue,
+	})
+}
+
 func TestCollectInNamespaceNeverUsesAClusterWideList(t *testing.T) {
 	t.Parallel()
 

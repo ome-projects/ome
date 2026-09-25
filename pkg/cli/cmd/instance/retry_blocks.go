@@ -103,6 +103,9 @@ func (o *retryBlocksOptions) run(ctx context.Context, f factory.Factory, name st
 	if err != nil {
 		return err
 	}
+	if err := o.deps.limits.Validate(); err != nil {
+		return ErrInvalidInstancePagingLimits
+	}
 	namespace, _, err := f.Namespace()
 	if err != nil {
 		return fmt.Errorf("resolve namespace: %w", err)

@@ -30,13 +30,17 @@ type RuntimeRevisionEntry struct {
 
 // RuntimeHistoryContent reports a bounded runtime revision history window.
 type RuntimeHistoryContent struct {
-	Runtime        *RuntimeObjectReference `json:"runtime,omitempty"`
-	Observation    HistoryObservationState `json:"observation"`
-	Completeness   HistoryCompleteness     `json:"completeness"`
-	RequestedPages int                     `json:"requestedPages"`
-	ObservedPages  int                     `json:"observedPages"`
-	Revisions      []RuntimeRevisionEntry  `json:"revisions"`
-	Issues         []RuntimeIssue          `json:"issues"`
+	Runtime      *RuntimeObjectReference `json:"runtime,omitempty"`
+	Observation  HistoryObservationState `json:"observation"`
+	Completeness HistoryCompleteness     `json:"completeness"`
+	// RequestedPages counts every bounded API attempt, including a handled 410
+	// and pages discarded before the single consistent-snapshot restart.
+	RequestedPages int `json:"requestedPages"`
+	// ObservedPages counts successful API responses in the current consistent
+	// attempt, including a response later rejected by pagination validation.
+	ObservedPages int                    `json:"observedPages"`
+	Revisions     []RuntimeRevisionEntry `json:"revisions"`
+	Issues        []RuntimeIssue         `json:"issues"`
 }
 
 // NewRuntimeHistoryReport creates a canonical runtime history report.

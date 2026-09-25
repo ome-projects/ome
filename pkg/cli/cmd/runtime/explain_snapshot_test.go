@@ -56,10 +56,11 @@ type runtimeListPage struct {
 type scriptedRuntimeClient struct {
 	ctrlclient.Client
 
-	mu    sync.Mutex
-	pages map[string]map[string]runtimeListPage
-	calls []runtimeListCall
-	gets  int
+	mu            sync.Mutex
+	pages         map[string]map[string]runtimeListPage
+	pageSequences map[string]map[string][]runtimeListPage
+	calls         []runtimeListCall
+	gets          int
 }
 
 func newScriptedRuntimeClient(t *testing.T, objects ...ctrlclient.Object) *scriptedRuntimeClient {
@@ -68,6 +69,10 @@ func newScriptedRuntimeClient(t *testing.T, objects ...ctrlclient.Object) *scrip
 	return &scriptedRuntimeClient{
 		Client: base,
 		pages: map[string]map[string]runtimeListPage{
+			"ServingRuntime":        {},
+			"ClusterServingRuntime": {},
+		},
+		pageSequences: map[string]map[string][]runtimeListPage{
 			"ServingRuntime":        {},
 			"ClusterServingRuntime": {},
 		},
@@ -93,6 +98,10 @@ func (c *scriptedRuntimeClient) List(
 
 	c.mu.Lock()
 	page, found := c.pages[kind][options.Continue]
+	if sequence := c.pageSequences[kind][options.Continue]; len(sequence) > 0 {
+		page, found = sequence[0], true
+		c.pageSequences[kind][options.Continue] = sequence[1:]
+	}
 	c.calls = append(c.calls, runtimeListCall{
 		kind: kind, namespace: options.Namespace, limit: options.Limit,
 		continueToken: options.Continue, hasDeadline: hasDeadline,
@@ -161,6 +170,15 @@ func (c *scriptedRuntimeClient) setPage(kind, token string, page runtimeListPage
 	c.pages[kind][token] = page
 }
 
+func (c *scriptedRuntimeClient) setPages(
+	kind, token string,
+	pages ...runtimeListPage,
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pageSequences[kind][token] = append([]runtimeListPage(nil), pages...)
+}
+
 func (c *scriptedRuntimeClient) observations() ([]runtimeListCall, int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -170,6 +188,52 @@ func (c *scriptedRuntimeClient) observations() ([]runtimeListCall, int) {
 func testRuntimeLimits() paging.Limits {
 	return paging.Limits{
 		PageSize: 2, MaxItems: 8, MaxPages: 4, RequestTimeout: time.Second,
+	}
+}
+
+func TestRuntimeSnapshotConstructorsRejectInvalidRecoveryOverridesBeforeClientUse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			invalid := testRuntimeLimits()
+			test.mutate(&invalid)
+
+			budget, err := newRuntimeSnapshotBudget(invalid)
+
+			require.Error(t, err)
+			assert.Nil(t, budget)
+
+			client := newScriptedRuntimeClient(t)
+			snapshot, err := collectRuntimeCandidateSnapshot(
+				context.Background(), client, "team-a", invalid,
+			)
+
+			require.Error(t, err)
+			assert.Nil(t, snapshot)
+			calls, gets := client.observations()
+			assert.Empty(t, calls)
+			assert.Zero(t, gets)
+		})
 	}
 }
 
@@ -271,6 +335,150 @@ func TestCollectRuntimeCandidateSnapshotUsesOneSharedBudget(t *testing.T) {
 	after, afterGets := client.observations()
 	assert.Equal(t, calls, after)
 	assert.Equal(t, gets, afterGets)
+}
+
+func TestCollectRuntimeCandidateSnapshotRestartsExpiredNamespacedList(t *testing.T) {
+	t.Parallel()
+
+	client := newScriptedRuntimeClient(t)
+	client.setPages("ServingRuntime", "",
+		runtimeListPage{
+			serving: []v1beta1.ServingRuntime{
+				namespacedRuntime("team-a", "stale", "safetensors"),
+			},
+			continueToken: "expired-token", resourceVersion: "101",
+		},
+		runtimeListPage{
+			serving: []v1beta1.ServingRuntime{
+				namespacedRuntime("team-a", "fresh-a", "safetensors"),
+			},
+			continueToken: "fresh-token", resourceVersion: "202",
+		},
+	)
+	client.setPage("ServingRuntime", "expired-token", runtimeListPage{
+		err: apierrors.NewResourceExpired("private expired continuation"),
+	})
+	client.setPage("ServingRuntime", "fresh-token", runtimeListPage{
+		serving: []v1beta1.ServingRuntime{
+			namespacedRuntime("team-a", "fresh-b", "safetensors"),
+		},
+		resourceVersion: "202",
+	})
+	client.setPage("ClusterServingRuntime", "", runtimeListPage{resourceVersion: "202"})
+	limits := testRuntimeLimits()
+	limits.MaxPages = 6
+
+	snapshot, err := collectRuntimeCandidateSnapshot(
+		context.Background(), client, "team-a", limits,
+	)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []runtimeCandidate{
+		{name: "fresh-a"}, {name: "fresh-b"},
+	}, snapshot.candidates)
+
+	calls, _ := client.observations()
+	require.Len(t, calls, 5)
+	assert.Equal(t, []string{"", "expired-token", "", "fresh-token", ""}, []string{
+		calls[0].continueToken, calls[1].continueToken, calls[2].continueToken,
+		calls[3].continueToken, calls[4].continueToken,
+	})
+	assert.Equal(t, "202", calls[4].resourceVersion)
+	assert.Equal(t, metav1.ResourceVersionMatchExact, calls[4].resourceVersionMatch)
+}
+
+func TestCollectRuntimeCandidateSnapshotCountsDiscardedNamespacedItems(t *testing.T) {
+	t.Parallel()
+
+	client := newScriptedRuntimeClient(t)
+	client.setPages("ServingRuntime", "",
+		runtimeListPage{
+			serving: []v1beta1.ServingRuntime{
+				namespacedRuntime("team-a", "stale", "safetensors"),
+			},
+			continueToken: "expired-token", resourceVersion: "101",
+		},
+		runtimeListPage{
+			serving: []v1beta1.ServingRuntime{
+				namespacedRuntime("team-a", "fresh-a", "safetensors"),
+				namespacedRuntime("team-a", "fresh-b", "safetensors"),
+			},
+			resourceVersion: "202",
+		},
+	)
+	client.setPage("ServingRuntime", "expired-token", runtimeListPage{
+		err: apierrors.NewResourceExpired("private expired continuation"),
+	})
+	client.setPage("ClusterServingRuntime", "", runtimeListPage{
+		clusterServing: []v1beta1.ClusterServingRuntime{
+			clusterRuntime("would-exceed-total-budget", "safetensors"),
+		},
+		resourceVersion: "202",
+	})
+	limits := testRuntimeLimits()
+	limits.MaxItems = 3
+	limits.MaxPages = 5
+	limits.MaxConsumedItems = 3
+
+	_, err := collectRuntimeCandidateSnapshot(
+		context.Background(), client, "team-a", limits,
+	)
+	require.ErrorIs(t, err, errRuntimeSnapshotTruncated)
+}
+
+func TestCollectRuntimeCandidateSnapshotRestartsExpiredClusterList(t *testing.T) {
+	t.Parallel()
+
+	client := newScriptedRuntimeClient(t)
+	client.setPage("ServingRuntime", "", runtimeListPage{resourceVersion: "101"})
+	client.setPages("ClusterServingRuntime", "",
+		runtimeListPage{
+			clusterServing: []v1beta1.ClusterServingRuntime{
+				clusterRuntime("stale", "safetensors"),
+			},
+			continueToken: "expired-token", resourceVersion: "101",
+		},
+		runtimeListPage{
+			clusterServing: []v1beta1.ClusterServingRuntime{
+				clusterRuntime("fresh-a", "safetensors"),
+			},
+			continueToken: "fresh-token", resourceVersion: "101",
+		},
+	)
+	client.setPage("ClusterServingRuntime", "expired-token", runtimeListPage{
+		err: apierrors.NewResourceExpired("private expired continuation"),
+	})
+	client.setPage("ClusterServingRuntime", "fresh-token", runtimeListPage{
+		clusterServing: []v1beta1.ClusterServingRuntime{
+			clusterRuntime("fresh-b", "safetensors"),
+		},
+		resourceVersion: "101",
+	})
+	limits := testRuntimeLimits()
+	limits.MaxPages = 6
+
+	snapshot, err := collectRuntimeCandidateSnapshot(
+		context.Background(), client, "team-a", limits,
+	)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []runtimeCandidate{
+		{name: "fresh-a", isCluster: true},
+		{name: "fresh-b", isCluster: true},
+	}, snapshot.candidates)
+
+	calls, _ := client.observations()
+	require.Len(t, calls, 5)
+	assert.Equal(t, []string{"", "", "expired-token", "", "fresh-token"}, []string{
+		calls[0].continueToken, calls[1].continueToken, calls[2].continueToken,
+		calls[3].continueToken, calls[4].continueToken,
+	})
+	for _, index := range []int{1, 3} {
+		assert.Equal(t, "101", calls[index].resourceVersion)
+		assert.Equal(t, metav1.ResourceVersionMatchExact, calls[index].resourceVersionMatch)
+	}
+	for _, index := range []int{2, 4} {
+		assert.Empty(t, calls[index].resourceVersion)
+		assert.Empty(t, calls[index].resourceVersionMatch)
+	}
 }
 
 func TestCollectRuntimeCandidateSnapshotAllowsExactItemBudget(t *testing.T) {

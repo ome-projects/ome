@@ -26,6 +26,8 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/cli/namespace"
+	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	ometypedv1beta1 "sigs.k8s.io/ome/pkg/client/clientset/versioned/typed/ome/v1beta1"
@@ -527,6 +529,40 @@ func (f *acquisitionFactory) RuntimeClient() (ctrlclient.Client, error) {
 func (f *acquisitionFactory) Namespace() (string, bool, error) {
 	f.namespaceGet++
 	return f.namespace, false, nil
+}
+
+func TestCollectRuntimeEvidenceRejectsInvalidRecoveryOverrideBeforeAcquisition(t *testing.T) {
+	t.Parallel()
+
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+		Name: "service", Namespace: "team-a", UID: types.UID("isvc-uid"),
+		ResourceVersion: "17",
+	}}
+	ome := omefake.NewSimpleClientset(isvc)
+	kube := k8sfake.NewSimpleClientset()
+	f := &acquisitionFactory{
+		ome: ome, kube: kube,
+		runtime:   ctrlfake.NewClientBuilder().WithScheme(scheme(t)).Build(),
+		namespace: "team-a",
+	}
+	invalid := paging.Limits{
+		PageSize: 16, MaxItems: 32, MaxPages: 2, MaxRequests: 5,
+		RequestTimeout: time.Second,
+	}
+
+	evidence, err := collectRuntimeEvidence(
+		context.Background(), f, namespace.NewOptions(), "service", invalid,
+		runtimeEvidenceOptions{},
+	)
+
+	require.Error(t, err)
+	assert.Nil(t, evidence)
+	assert.Zero(t, f.namespaceGet)
+	assert.Zero(t, f.omeGet)
+	assert.Zero(t, f.kubeGet)
+	assert.Zero(t, f.runtimeGet)
+	assert.Empty(t, ome.Actions())
+	assert.Empty(t, kube.Actions())
 }
 
 // TestEffectiveAcquiresBoundSnapshotBeforeOptionalEvidence catches namespace

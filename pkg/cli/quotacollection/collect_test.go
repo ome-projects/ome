@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ktesting "k8s.io/client-go/testing"
@@ -61,6 +62,49 @@ func TestCollectDrainsBoundedPagesAndReturnsDefensiveCopies(t *testing.T) {
 	first.Annotations["canary"] = "source-mutated"
 	assert.Equal(t, "output-mutated", got.Quotas[0].Annotations["canary"])
 	assert.Equal(t, "original", second.Annotations["canary"])
+}
+
+func TestCollectRestartsExpiredQuotaContinuationWithoutStaleCompleteness(t *testing.T) {
+	t.Parallel()
+
+	client := omefake.NewSimpleClientset()
+	calls := 0
+	client.PrependReactor("list", "acceleratorquotas", func(ktesting.Action) (bool, runtime.Object, error) {
+		calls++
+		switch calls {
+		case 1:
+			return true, &omev1beta1.AcceleratorQuotaList{
+				Items:    []omev1beta1.AcceleratorQuota{collectionQuota("stale")},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private detail")
+		case 3:
+			return true, &omev1beta1.AcceleratorQuotaList{
+				Items:    []omev1beta1.AcceleratorQuota{collectionQuota("fresh-a")},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &omev1beta1.AcceleratorQuotaList{
+				Items: []omev1beta1.AcceleratorQuota{collectionQuota("fresh-b")},
+			}, nil
+		default:
+			t.Fatalf("unexpected list request %d", calls)
+			return true, nil, nil
+		}
+	})
+	limits := paging.Limits{
+		PageSize: 1, MaxItems: 4, MaxPages: 5, RequestTimeout: time.Second,
+	}
+
+	got, err := Collect(context.Background(), client.OmeV1beta1().AcceleratorQuotas(), limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, Completeness{ObservedPages: 2, ObservedItems: 2}, got.Completeness)
+	require.Len(t, got.Quotas, 2)
+	assert.Equal(t, []string{"fresh-a", "fresh-b"}, []string{
+		got.Quotas[0].Name, got.Quotas[1].Name,
+	})
 }
 
 // Removing the total-page guard makes this fail because an incomplete tree
@@ -164,6 +208,46 @@ func TestCollectRejectsInvalidDependenciesAndResponses(t *testing.T) {
 
 			assert.ErrorIs(t, err, test.want)
 			assert.Empty(t, got.Quotas)
+		})
+	}
+}
+
+func TestCollectRejectsInvalidRecoveryOverridesBeforeList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			invalid := collectionTestLimits
+			test.mutate(&invalid)
+			quota := collectionQuota("root")
+			client := omefake.NewSimpleClientset(&quota)
+
+			got, err := Collect(
+				context.Background(), client.OmeV1beta1().AcceleratorQuotas(), invalid,
+			)
+
+			require.ErrorIs(t, err, ErrInvalidLimits)
+			assert.Empty(t, got.Quotas)
+			assert.Empty(t, client.Actions(), "invalid limits must prevent LIST")
 		})
 	}
 }

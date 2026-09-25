@@ -101,10 +101,14 @@ func projectHistoryCollectionState(
 }
 
 func validHistoryCollectionEvidence(state *effective.RuntimeState) bool {
-	if state == nil || state.HistoryPageLimit <= 0 || state.HistoryPages < 0 ||
+	maxInt := int(^uint(0) >> 1)
+	if state == nil || state.HistoryPageLimit <= 0 || state.HistoryPageLimit > maxInt/2 ||
+		state.HistoryRequestLimit < state.HistoryPageLimit || state.HistoryPages < 0 ||
+		state.HistoryRequestLimit > 2*state.HistoryPageLimit ||
 		state.HistoryRequestedPages < 0 || state.HistoryObservedPages < 0 ||
 		state.HistoryPages != state.HistoryRequestedPages ||
-		state.HistoryRequestedPages > state.HistoryPageLimit ||
+		state.HistoryRequestedPages > state.HistoryRequestLimit ||
+		state.HistoryObservedPages > state.HistoryPageLimit ||
 		state.HistoryObservedPages > state.HistoryRequestedPages {
 		return false
 	}
@@ -136,17 +140,33 @@ func validHistoryCollectionEvidence(state *effective.RuntimeState) bool {
 	}
 	if state.HistoryComplete {
 		return !state.HistoryTruncated &&
-			state.HistoryObservedPages == state.HistoryRequestedPages && listFailures == 0
+			validSuccessfulHistoryPageCounts(state) && listFailures == 0
 	}
 	if state.HistoryTruncated {
-		return state.HistoryObservedPages == state.HistoryRequestedPages && listFailures == 0
+		return validSuccessfulHistoryPageCounts(state) && listFailures == 0
 	}
 	if listFailures != 1 {
 		return false
 	}
-	failedBeforeObservation := state.HistoryRequestedPages-state.HistoryObservedPages == 1
-	failedAfterObservation := state.HistoryRequestedPages == state.HistoryObservedPages
-	return failedBeforeObservation || failedAfterObservation
+	gap := state.HistoryRequestedPages - state.HistoryObservedPages
+	// A validation failure can follow a successful response (gap 0), and an
+	// ordinary request failure contributes one unobserved request (gap 1).
+	// After one recovered expiration, the discarded successful prefix plus the
+	// expired continuation account for at least two additional requests.
+	return (gap == 0 && state.HistoryObservedPages > 0) ||
+		(gap == 1 && state.HistoryObservedPages < state.HistoryPageLimit) ||
+		(gap >= 2 && gap <= state.HistoryPageLimit+1)
+}
+
+func validSuccessfulHistoryPageCounts(state *effective.RuntimeState) bool {
+	if state.HistoryObservedPages == 0 {
+		return false
+	}
+	gap := state.HistoryRequestedPages - state.HistoryObservedPages
+	// A successful non-restarted collection has no gap. A recovered expired
+	// continuation has at least one discarded observed page plus the failed 410
+	// request, so the only other valid gap is two or greater.
+	return gap == 0 || gap >= 2 && gap <= state.HistoryPageLimit
 }
 
 func projectRevisionEntry(

@@ -27,7 +27,7 @@ type RuntimeSyncResolver struct {
 }
 
 func NewRuntimeSyncResolver(revisions appstyped.ControllerRevisionsGetter, client ctrlclient.Client, namespace string, limits paging.Limits) (*RuntimeSyncResolver, error) {
-	if revisions == nil || client == nil || namespace == "" || limits.PageSize <= 0 || limits.PageSize > 16 || limits.MaxItems <= 0 || limits.MaxItems > 32 || limits.MaxPages <= 0 || limits.MaxPages > 2 || limits.RequestTimeout <= 0 || limits.RequestTimeout > 10*time.Second {
+	if revisions == nil || client == nil || namespace == "" || limits.PageSize <= 0 || limits.PageSize > 16 || limits.MaxItems <= 0 || limits.MaxItems > 32 || limits.MaxPages <= 0 || limits.MaxPages > 2 || limits.RequestTimeout <= 0 || limits.RequestTimeout > 10*time.Second || limits.Validate() != nil {
 		return nil, ErrRuntimeSyncEvidence
 	}
 	return &RuntimeSyncResolver{revisions, client, namespace, limits}, nil

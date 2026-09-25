@@ -179,7 +179,7 @@ func collectReplicas(
 			return paging.Page[omev1beta1.InferenceReplica]{Items: list.Items, Continue: list.Continue}, nil
 		},
 	)
-	observation := ReplicaObservation{ObservedPages: listed.Pages, ObservedItems: len(listed.Items), Truncated: listed.Truncated}
+	observation := ReplicaObservation{ObservedPages: listed.ObservedPages, ObservedItems: len(listed.Items), Truncated: listed.Truncated}
 	if err != nil {
 		switch {
 		case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
@@ -240,7 +240,7 @@ func collectAudit(
 }
 
 func validLimits(limits paging.Limits) bool {
-	return limits.PageSize > 0 && limits.MaxItems > 0 && limits.MaxPages > 0 && limits.RequestTimeout > 0
+	return limits.Validate() == nil
 }
 
 func validParent(parent *omev1beta1.InferenceService, namespace, name string) bool {

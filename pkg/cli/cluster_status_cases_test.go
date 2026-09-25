@@ -65,7 +65,7 @@ func TestClusterStatusPartialFailureVisibleAllFormats(t *testing.T) {
 				t.Fatalf("private evidence leaked: %s", &out)
 			}
 			if format == "table" {
-				for _, want := range []string{"returned=1", "kept=1", "max=64", "read=2", "cut=true"} {
+				for _, want := range []string{"returned=1", "kept=1", "max=64", "seen=1/2", "calls=2", "cap=4", "cut=true"} {
 					if !strings.Contains(out.String(), want) {
 						t.Fatalf("compact window missing %q: %s", want, &out)
 					}
@@ -81,15 +81,17 @@ func TestClusterStatusPartialFailureVisibleAllFormats(t *testing.T) {
 					}
 				}
 				var got struct {
-					Observation, UnavailableReason                  string
-					ObservedPages, ReturnedSources, AdmittedSources int
-					SourcesTruncated                                bool
-					Clusters                                        []struct{ ConnectionState string }
+					Observation, UnavailableReason   string
+					RequestedPages, ObservedPages    int
+					ReturnedSources, AdmittedSources int
+					PageLimit, RequestLimit          int
+					SourcesTruncated                 bool
+					Clusters                         []struct{ ConnectionState string }
 				}
 				if err := json.Unmarshal(data, &got); err != nil {
 					t.Fatal(err)
 				}
-				if got.Observation != "Partial" || got.UnavailableReason != "Forbidden" || got.ObservedPages != 2 || got.ReturnedSources != 1 || got.AdmittedSources != 1 || !got.SourcesTruncated || len(got.Clusters) != 1 || got.Clusters[0].ConnectionState != "ReportedReady" {
+				if got.Observation != "Partial" || got.UnavailableReason != "Forbidden" || got.RequestedPages != 2 || got.ObservedPages != 1 || got.PageLimit != 2 || got.RequestLimit != 4 || got.ReturnedSources != 1 || got.AdmittedSources != 1 || !got.SourcesTruncated || len(got.Clusters) != 1 || got.Clusters[0].ConnectionState != "ReportedReady" {
 					t.Fatalf("partial machine semantics: %+v", got)
 				}
 			}

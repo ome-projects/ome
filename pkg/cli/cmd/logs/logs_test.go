@@ -361,6 +361,17 @@ func TestLogsRejectsInvalidMaxLogRequestsBeforeFactoryAccess(t *testing.T) {
 	}
 }
 
+func TestLogsRejectsInvalidPagingOverrideBeforeFactoryAccess(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDependencies
+	deps.podLimits.MaxRequests = deps.podLimits.MaxPages*2 + 1
+
+	_, err := executeWithDependencies(t, struct{ factory.Factory }{}, deps, "chat")
+
+	require.ErrorIs(t, err, errInvalidPodPaging)
+}
+
 func TestLogsHelpDocumentsFollowRequestLimit(t *testing.T) {
 	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{})
 	flag := cmd.Flags().Lookup("max-log-requests")

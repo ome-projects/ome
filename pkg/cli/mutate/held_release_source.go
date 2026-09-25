@@ -78,7 +78,7 @@ func CollectHeldReleaseEvidence(ctx context.Context, client omeclient.OmeV1beta1
 	}{parent, list.Items}) {
 		return HeldReleaseEvidence{}, ErrBounds
 	}
-	result := HeldReleaseEvidence{selected: -1, pages: list.Pages}
+	result := HeldReleaseEvidence{selected: -1, pages: list.ObservedPages}
 	seenComponents, seenUIDs, seenNames := map[v1beta1.ComponentType]bool{}, map[string]bool{}, map[string]bool{}
 	for i := range list.Items {
 		ir := &list.Items[i]

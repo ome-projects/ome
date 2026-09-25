@@ -94,6 +94,55 @@ func TestCollectReadsBoundedAuthoritativeAndAuditEvidence(t *testing.T) {
 	assert.Equal(t, `{"entries":[{"requestUUID":"req-a"}]}`, audit.Data[AuditHistoryKey])
 }
 
+func TestCollectRestartsExpiredReplicaHistoryWithoutStaleCompleteness(t *testing.T) {
+	t.Parallel()
+
+	parent := testISVC("chat", "prod")
+	omeClient := omefake.NewSimpleClientset(parent)
+	calls := 0
+	omeClient.PrependReactor("list", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
+		calls++
+		switch calls {
+		case 1:
+			return true, &omev1beta1.InferenceReplicaList{
+				Items:    []omev1beta1.InferenceReplica{testIR(parent, "stale", omev1beta1.EngineComponent)},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private detail")
+		case 3:
+			return true, &omev1beta1.InferenceReplicaList{
+				Items:    []omev1beta1.InferenceReplica{testIR(parent, "fresh-a", omev1beta1.EngineComponent)},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &omev1beta1.InferenceReplicaList{
+				Items: []omev1beta1.InferenceReplica{testIR(parent, "fresh-b", omev1beta1.RouterComponent)},
+			}, nil
+		default:
+			t.Fatalf("unexpected list request %d", calls)
+			return true, nil, nil
+		}
+	})
+	limits := paging.Limits{
+		PageSize: 1, MaxItems: 4, MaxPages: 5, RequestTimeout: time.Second,
+	}
+
+	got, err := Collect(
+		context.Background(), omeClient.OmeV1beta1(), k8sfake.NewSimpleClientset(),
+		"prod", "chat", limits,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, ReplicaObservation{
+		Availability: AvailabilityAvailable, ObservedPages: 2, ObservedItems: 2,
+	}, got.Replicas)
+	require.Len(t, got.InferenceReplicas, 2)
+	assert.Equal(t, []string{"fresh-a", "fresh-b"}, []string{
+		got.InferenceReplicas[0].Name, got.InferenceReplicas[1].Name,
+	})
+}
+
 func TestCollectClassifiesOptionalAuditFailuresWithoutLosingRequiredEvidence(t *testing.T) {
 	t.Parallel()
 
@@ -261,6 +310,47 @@ func TestCollectValidatesInputsAndRequiredParentBeforeSecondaryReads(t *testing.
 	_, err := Collect(context.Background(), omeClient.OmeV1beta1(), kubeClient, "prod", "chat", testLimits)
 	require.ErrorIs(t, err, ErrInferenceServiceIdentityInvalid)
 	assert.Empty(t, kubeClient.Actions())
+}
+
+func TestCollectRejectsInvalidRecoveryOverridesBeforeAnyRead(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			invalid := testLimits
+			test.mutate(&invalid)
+			omeClient := omefake.NewSimpleClientset(testISVC("chat", "prod"))
+			kubeClient := k8sfake.NewSimpleClientset()
+
+			_, err := Collect(
+				context.Background(), omeClient.OmeV1beta1(), kubeClient,
+				"prod", "chat", invalid,
+			)
+
+			require.ErrorIs(t, err, ErrLimitsInvalid)
+			assert.Empty(t, omeClient.Actions())
+			assert.Empty(t, kubeClient.Actions())
+		})
+	}
 }
 
 func TestCollectPropagatesCancellationAndRequiredParentErrors(t *testing.T) {

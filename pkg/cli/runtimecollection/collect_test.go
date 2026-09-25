@@ -96,6 +96,61 @@ func TestCollectDrainsBothRuntimeKindsAcrossAllNamespaces(t *testing.T) {
 	}
 }
 
+func TestCollectRestartsExpiredRuntimeContinuationWithoutStaleCompleteness(t *testing.T) {
+	t.Parallel()
+
+	client := omefake.NewSimpleClientset()
+	clusterRequests := []metav1.ListOptions{}
+	client.PrependReactor("list", "*", func(action ktesting.Action) (bool, runtime.Object, error) {
+		resource := action.GetResource().Resource
+		if resource == "servingruntimes" {
+			return true, &omev1beta1.ServingRuntimeList{}, nil
+		}
+		require.Equal(t, "clusterservingruntimes", resource)
+		options := action.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
+		clusterRequests = append(clusterRequests, options)
+		switch len(clusterRequests) {
+		case 1:
+			return true, &omev1beta1.ClusterServingRuntimeList{
+				Items:    []omev1beta1.ClusterServingRuntime{clusterRuntime("stale")},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private detail")
+		case 3:
+			return true, &omev1beta1.ClusterServingRuntimeList{
+				Items:    []omev1beta1.ClusterServingRuntime{clusterRuntime("fresh-a")},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &omev1beta1.ClusterServingRuntimeList{
+				Items: []omev1beta1.ClusterServingRuntime{clusterRuntime("fresh-b")},
+			}, nil
+		default:
+			t.Fatalf("unexpected cluster request %d", len(clusterRequests))
+			return true, nil, nil
+		}
+	})
+	limits := paging.Limits{
+		PageSize: 1, MaxItems: 4, MaxPages: 5, RequestTimeout: time.Second,
+	}
+
+	got, err := Collect(context.Background(), client.OmeV1beta1(), limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, KindCompleteness{ObservedPages: 2, ObservedItems: 2},
+		got.Completeness.ClusterServingRuntimes)
+	require.Len(t, got.Snapshot.ClusterServingRuntimes, 2)
+	assert.Equal(t, []string{"fresh-a", "fresh-b"}, []string{
+		got.Snapshot.ClusterServingRuntimes[0].Name,
+		got.Snapshot.ClusterServingRuntimes[1].Name,
+	})
+	assert.Equal(t, []string{"", "expired-token", "", "fresh-token"}, []string{
+		clusterRequests[0].Continue, clusterRequests[1].Continue,
+		clusterRequests[2].Continue, clusterRequests[3].Continue,
+	})
+}
+
 func TestCollectInNamespaceScopesOnlyServingRuntimes(t *testing.T) {
 	t.Parallel()
 

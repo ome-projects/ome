@@ -109,6 +109,40 @@ func TestExplainRequiresExactlyOneTarget(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestExplainRejectsInvalidRecoveryOverrideBeforeAcquisition(t *testing.T) {
+	model := &v1beta1.ClusterBaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "private-model"},
+		Spec: v1beta1.BaseModelSpec{
+			ModelFormat: v1beta1.ModelFormat{Name: "safetensors"},
+		},
+	}
+	ome := omefake.NewSimpleClientset(model)
+	runtimeClient := withRuntimeListMetadata(
+		ctrlfake.NewClientBuilder().WithScheme(scheme(t)).Build(),
+	)
+	f := &acquisitionFactory{
+		ome: ome, runtime: runtimeClient, namespace: "team-a",
+	}
+	invalid := defaultRuntimeExplainLimits()
+	invalid.MaxRequests = invalid.MaxPages*2 + 1
+	var out, errOut bytes.Buffer
+	o := &explainOptions{
+		IOStreams: genericiooptions.IOStreams{Out: &out, ErrOut: &errOut},
+		Model:     "private-model", candidateLimits: invalid,
+	}
+
+	err := o.Run(context.Background(), f)
+
+	require.EqualError(t, err, "runtime explain paging limits are invalid")
+	assert.Zero(t, f.namespaceGet)
+	assert.Zero(t, f.omeGet)
+	assert.Zero(t, f.kubeGet)
+	assert.Zero(t, f.runtimeGet)
+	assert.Empty(t, ome.Actions())
+	assert.Empty(t, out.String())
+	assert.Empty(t, errOut.String())
+}
+
 func TestExplainRanksRuntimes(t *testing.T) {
 	format := "safetensors"
 	size := "70B"

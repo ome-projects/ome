@@ -175,6 +175,9 @@ func collectAutoscaleExplainEvidence(
 	name string,
 	limits paging.Limits,
 ) (*explainEvidence, error) {
+	if err := limits.Validate(); err != nil {
+		return nil, errors.New("autoscale explain paging limits are invalid")
+	}
 	workloadNamespace, _, err := f.Namespace()
 	if err != nil {
 		return nil, fmt.Errorf("resolve workload namespace: %w", err)

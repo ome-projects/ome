@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -76,6 +77,50 @@ func TestCollectGetsExactParentAndPagesExactLabeledReplicas(t *testing.T) {
 	got.InferenceService.Name = "changed"
 	got.InferenceReplicas[0].Name = "changed"
 	assert.Equal(t, "chat", parent.Name)
+}
+
+func TestCollectRestartsExpiredReplicaContinuationWithoutStaleCompleteness(t *testing.T) {
+	t.Parallel()
+
+	parent := collectionISVC("chat", "prod", "uid-chat")
+	client := omefake.NewSimpleClientset(parent)
+	calls := 0
+	client.PrependReactor("list", "inferencereplicas", func(ktesting.Action) (bool, runtime.Object, error) {
+		calls++
+		switch calls {
+		case 1:
+			return true, &omev1beta1.InferenceReplicaList{
+				Items:    []omev1beta1.InferenceReplica{collectionIR("stale", "prod", "stale")},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private detail")
+		case 3:
+			return true, &omev1beta1.InferenceReplicaList{
+				Items:    []omev1beta1.InferenceReplica{collectionIR("fresh-a", "prod", "fresh-a")},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &omev1beta1.InferenceReplicaList{
+				Items: []omev1beta1.InferenceReplica{collectionIR("fresh-b", "prod", "fresh-b")},
+			}, nil
+		default:
+			t.Fatalf("unexpected list request %d", calls)
+			return true, nil, nil
+		}
+	})
+	limits := paging.Limits{
+		PageSize: 1, MaxItems: 4, MaxPages: 5, RequestTimeout: time.Second,
+	}
+
+	got, err := Collect(context.Background(), client.OmeV1beta1(), "prod", "chat", limits)
+
+	require.NoError(t, err)
+	assert.Equal(t, Completeness{ObservedPages: 2, ObservedItems: 2}, got.Completeness)
+	require.Len(t, got.InferenceReplicas, 2)
+	assert.Equal(t, []string{"fresh-a", "fresh-b"}, []string{
+		got.InferenceReplicas[0].Name, got.InferenceReplicas[1].Name,
+	})
 }
 
 func TestCollectNeverBuildsAnInvalidRelationshipLabelSelector(t *testing.T) {
@@ -378,6 +423,12 @@ func TestCollectRejectsInvalidLimitsBeforeAnyRead(t *testing.T) {
 		{name: "page size", mutate: func(limits *paging.Limits) { limits.PageSize = 0 }, want: "page size must be positive"},
 		{name: "item limit", mutate: func(limits *paging.Limits) { limits.MaxItems = 0 }, want: "item limit must be positive"},
 		{name: "page limit", mutate: func(limits *paging.Limits) { limits.MaxPages = 0 }, want: "page limit must be positive"},
+		{name: "request recovery limit", mutate: func(limits *paging.Limits) {
+			limits.MaxRequests = limits.MaxPages*2 + 1
+		}, want: "request limit must be between page limit and twice page limit"},
+		{name: "item recovery limit", mutate: func(limits *paging.Limits) {
+			limits.MaxConsumedItems = limits.MaxItems*2 + 1
+		}, want: "consumed item limit must be between item limit and twice item limit"},
 		{name: "request timeout", mutate: func(limits *paging.Limits) { limits.RequestTimeout = 0 }, want: "request timeout must be positive"},
 	}
 	for _, test := range tests {

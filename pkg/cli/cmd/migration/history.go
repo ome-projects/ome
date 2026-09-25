@@ -156,6 +156,9 @@ func parseMigrationHistoryOutput(value string) (report.Format, bool, error) {
 }
 
 func (o *historyOptions) run(ctx context.Context, f factory.Factory, name string) error {
+	if err := o.deps.collectionLimits.Validate(); err != nil {
+		return ErrInvalidCollectionLimits
+	}
 	namespace, _, err := f.Namespace()
 	if err != nil {
 		return fmt.Errorf("resolve namespace: %w", err)

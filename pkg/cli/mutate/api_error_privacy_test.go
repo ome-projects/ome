@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 func TestSafeAPIErrorNormalizesWrappedCancellationWithoutPrivateProse(t *testing.T) {
@@ -17,5 +18,39 @@ func TestSafeAPIErrorNormalizesWrappedCancellationWithoutPrivateProse(t *testing
 			require.ErrorIs(t, got, sentinel)
 			require.NotContains(t, got.Error(), "PRIVATE_")
 		}
+	}
+}
+
+func TestSafeAPIErrorPreservesResourceExpiredWithoutPrivateProse(t *testing.T) {
+	expired := apierrors.NewResourceExpired("PRIVATE_CONTINUE_TOKEN")
+
+	got := SafeAPIError(expired)
+
+	require.True(t, apierrors.IsResourceExpired(got))
+	require.ErrorIs(t, got, expired)
+	require.Equal(t,
+		"required Kubernetes API request failed; check access and connectivity",
+		got.Error(),
+	)
+	require.NotContains(t, got.Error(), "PRIVATE_")
+	require.Same(t, got, SafeAPIError(got), "safe wrappers must not nest")
+	require.Same(t, got, SafeAPIError(fmt.Errorf("PRIVATE_OUTER: %w", got)))
+	for _, rendered := range []string{
+		fmt.Sprintf("%v", got),
+		fmt.Sprintf("%+v", got),
+		fmt.Sprintf("%#v", got),
+		fmt.Sprintf("%q", got),
+		fmt.Sprintf("%d", got),
+		fmt.Sprintf("%c", got),
+		fmt.Sprintf("%U", got),
+		fmt.Sprintf("%#x", got),
+		fmt.Sprintf("%20.5v", got),
+	} {
+		require.Equal(t,
+			"required Kubernetes API request failed; check access and connectivity",
+			rendered,
+		)
+		require.NotContains(t, rendered, "PRIVATE_CONTINUE_TOKEN")
+		require.NotContains(t, rendered, "PRIVATE_OUTER")
 	}
 }

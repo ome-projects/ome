@@ -175,6 +175,36 @@ func TestDiagnosticArgumentsFactoryAndNamedIdentityFailClosed(t *testing.T) {
 	assert.Empty(t, out)
 }
 
+func TestNamedDiagnosticRejectsInvalidRecoveryOverrideBeforeGet(t *testing.T) {
+	t.Parallel()
+
+	quota := &api.AcceleratorQuota{ObjectMeta: metav1.ObjectMeta{Name: "team"}}
+	client := fake.NewSimpleClientset(quota)
+	invalid := paging.Limits{
+		PageSize: 2, MaxItems: 4, MaxPages: 2, MaxRequests: 5,
+		RequestTimeout: time.Second,
+	}
+	var out, stderr bytes.Buffer
+	cmd := newDiagnosticCmd(
+		factory.Static{OME: client},
+		genericiooptions.IOStreams{Out: &out, ErrOut: &stderr},
+		v.ClockFunc(func() time.Time {
+			return time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+		}),
+		invalid,
+		false,
+	)
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	cmd.SetArgs([]string{"team"})
+
+	err := cmd.Execute()
+
+	require.Error(t, err)
+	assert.Empty(t, client.Actions(), "invalid limits must prevent the named GET")
+	assert.Empty(t, out.String())
+	assert.Empty(t, stderr.String())
+}
+
 func TestDiagnosticCanceledIncompleteAndWriterFailureNeverClaimSuccess(t *testing.T) {
 	for _, validate := range []bool{true, false} {
 		client := fake.NewSimpleClientset()

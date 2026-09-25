@@ -29,6 +29,7 @@ var (
 	ErrReturnedInferenceServiceNamespaceMismatch = errors.New("returned inference service namespace does not match request")
 	ErrReturnedInferenceServiceUIDMissing        = errors.New("returned inference service has no UID")
 	ErrReturnedInferenceServiceUIDInvalid        = errors.New("returned inference service has an unsafe UID")
+	ErrInvalidInstancePagingLimits               = errors.New("instance paging limits are invalid")
 )
 
 type instanceProjector func(
@@ -80,6 +81,9 @@ func (o *listOptions) run(ctx context.Context, f factory.Factory, name string) e
 	}
 	if problems := utilvalidation.IsDNS1123Subdomain(name); len(problems) > 0 {
 		return ErrInvalidInferenceServiceName
+	}
+	if err := o.deps.limits.Validate(); err != nil {
+		return ErrInvalidInstancePagingLimits
 	}
 	namespace, _, err := f.Namespace()
 	if err != nil {

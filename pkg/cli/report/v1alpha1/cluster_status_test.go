@@ -126,13 +126,13 @@ func TestClusterWritersAndSerializationErrors(t *testing.T) {
 // Context rows use a non-DNS prefix, so they cannot impersonate a cluster.
 func TestClusterCompactObservationAndTruncationEvidence(t *testing.T) {
 	for _, reason := range []UnavailableReason{"", UnavailableForbidden} {
-		value := ClusterStatusReport{Observation: ClusterPartial, UnavailableReason: reason, ObservedPages: 2, ReturnedSources: 1, AdmittedSources: 1, SourceLimit: 64, PageLimit: 2, PageSize: 32, SourcesTruncated: true, Clusters: []ClusterStatusRow{{Name: "healthy-prefix", SourceKind: ClusterKubeConfigSecret, SourceState: ClusterConditionReported, ReportedReady: ClusterReadyTrue, Freshness: StatusFreshnessCurrent, ConditionState: ClusterConditionReported}}}
+		value := ClusterStatusReport{Observation: ClusterPartial, UnavailableReason: reason, RequestedPages: 2, ObservedPages: 2, ReturnedSources: 1, AdmittedSources: 1, SourceLimit: 64, PageLimit: 2, RequestLimit: 4, PageSize: 32, SourcesTruncated: true, Clusters: []ClusterStatusRow{{Name: "healthy-prefix", SourceKind: ClusterKubeConfigSecret, SourceState: ClusterConditionReported, ReportedReady: ClusterReadyTrue, Freshness: StatusFreshnessCurrent, ConditionState: ClusterConditionReported}}}
 		before, _ := json.Marshal(value)
 		var out bytes.Buffer
 		if err := value.Table().Write(&out); err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"@ observation", "Partial", "@ sources", "returned=1", "kept=1", "max=64", "cut=true", "@ pages", "read=2", "max=2", "size=32", "healthy-prefix", "True", "Current", "Reported"} {
+		for _, want := range []string{"@ observation", "Partial", "@ sources", "returned=1", "kept=1", "max=64", "cut=true", "@ pages", "seen=2/2", "calls=2", "cap=4", "size=32", "healthy-prefix", "True", "Current", "Reported"} {
 			if !strings.Contains(out.String(), want) {
 				t.Fatalf("missing literal %q from bounded compact report:\n%s", want, &out)
 			}

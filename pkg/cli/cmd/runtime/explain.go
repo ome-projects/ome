@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -77,6 +78,9 @@ func (o *explainOptions) Validate() error {
 }
 
 func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
+	if err := o.candidateLimits.Validate(); err != nil {
+		return errors.New("runtime explain paging limits are invalid")
+	}
 	ns, _, err := f.Namespace()
 	if err != nil {
 		return err

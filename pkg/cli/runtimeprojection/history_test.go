@@ -385,6 +385,190 @@ func TestProjectionRejectsImpossibleCollectionCounters(t *testing.T) {
 	}
 }
 
+func TestProjectionAcceptsRecoveredExpiredHistorySnapshot(t *testing.T) {
+	t.Parallel()
+
+	liveSpec := projectionRuntimeSpec("private.registry/live:secret")
+	stale := projectionRevision(
+		t, "stale-uid", "gpu-runtime", projectionRuntimeSpec("private.registry/stale:secret"),
+	)
+	freshA := projectionRevision(
+		t, "fresh-a-uid", "gpu-runtime", projectionRuntimeSpec("private.registry/fresh-a:secret"),
+	)
+	freshB := projectionRevision(
+		t, "fresh-b-uid", "gpu-runtime", projectionRuntimeSpec("private.registry/fresh-b:secret"),
+	)
+	clientset := k8sfake.NewSimpleClientset()
+	calls := 0
+	clientset.PrependReactor("list", "controllerrevisions", func(k8stesting.Action) (bool, runtime.Object, error) {
+		calls++
+		switch calls {
+		case 1:
+			return true, &appsv1.ControllerRevisionList{
+				Items:    []appsv1.ControllerRevision{*stale.DeepCopy()},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private expiration detail")
+		case 3:
+			return true, &appsv1.ControllerRevisionList{
+				Items:    []appsv1.ControllerRevision{*freshA.DeepCopy()},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &appsv1.ControllerRevisionList{
+				Items: []appsv1.ControllerRevision{*freshB.DeepCopy()},
+			}, nil
+		default:
+			t.Fatalf("unexpected history list call %d", calls)
+			return true, nil, nil
+		}
+	})
+	isvc, state := resolveProjectionWithRevisionClientAndLimits(
+		t, clientset, liveSpec, "", nil,
+		paging.Limits{PageSize: 1, MaxItems: 8, MaxPages: 5, RequestTimeout: time.Second},
+	)
+
+	_, err := ProjectEffective(isvc, state, projectionTestClock)
+	require.NoError(t, err)
+	history, err := ProjectHistory(isvc, state, projectionTestClock)
+	require.NoError(t, err)
+
+	assert.Equal(t, reportv1alpha1.HistoryObservationStateComplete, history.Content.Observation)
+	assert.Equal(t, reportv1alpha1.HistoryCompletenessRetentionBounded, history.Content.Completeness)
+	assert.Equal(t, 4, history.Content.RequestedPages)
+	assert.Equal(t, 2, history.Content.ObservedPages)
+	assert.Empty(t, history.Content.Issues)
+	assert.Empty(t, history.Warnings)
+	require.Len(t, history.Content.Revisions, 2)
+	for _, revision := range history.Content.Revisions {
+		assert.NotEqual(t, stale.Name, revision.Revision.Name)
+	}
+}
+
+func TestProjectionMapsSecondExpirationAfterRecoveredRestart(t *testing.T) {
+	t.Parallel()
+
+	liveSpec := projectionRuntimeSpec("private.registry/live:secret")
+	stale := projectionRevision(
+		t, "stale-uid", "gpu-runtime", projectionRuntimeSpec("private.registry/stale:secret"),
+	)
+	fresh := projectionRevision(
+		t, "fresh-uid", "gpu-runtime", projectionRuntimeSpec("private.registry/fresh:secret"),
+	)
+	clientset := k8sfake.NewSimpleClientset()
+	calls := 0
+	clientset.PrependReactor("list", "controllerrevisions", func(k8stesting.Action) (bool, runtime.Object, error) {
+		calls++
+		switch calls {
+		case 1:
+			return true, &appsv1.ControllerRevisionList{
+				Items:    []appsv1.ControllerRevision{*stale.DeepCopy()},
+				ListMeta: metav1.ListMeta{Continue: "first-private-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("first private expiration detail")
+		case 3:
+			return true, &appsv1.ControllerRevisionList{
+				Items:    []appsv1.ControllerRevision{*fresh.DeepCopy()},
+				ListMeta: metav1.ListMeta{Continue: "second-private-token"},
+			}, nil
+		case 4:
+			return true, nil, apierrors.NewResourceExpired("second private expiration detail")
+		default:
+			t.Fatalf("unexpected history list call %d", calls)
+			return true, nil, nil
+		}
+	})
+	isvc, state := resolveProjectionWithRevisionClientAndLimits(
+		t, clientset, liveSpec, "", nil,
+		paging.Limits{PageSize: 1, MaxItems: 8, MaxPages: 5, RequestTimeout: time.Second},
+	)
+
+	_, err := ProjectEffective(isvc, state, projectionTestClock)
+	require.NoError(t, err)
+	history, err := ProjectHistory(isvc, state, projectionTestClock)
+	require.NoError(t, err)
+
+	assert.Equal(t, reportv1alpha1.HistoryObservationStatePartial, history.Content.Observation)
+	assert.Equal(t, reportv1alpha1.HistoryCompletenessIncomplete, history.Content.Completeness)
+	assert.Equal(t, 4, history.Content.RequestedPages)
+	assert.Equal(t, 1, history.Content.ObservedPages)
+	assert.Equal(t, []reportv1alpha1.RuntimeIssue{
+		{Code: reportv1alpha1.RuntimeIssueHistoryUnavailable},
+	}, history.Content.Issues)
+	assert.Equal(t, []reportv1alpha1.RuntimeWarning{
+		{Code: reportv1alpha1.WarningPartialData},
+		{Code: reportv1alpha1.WarningSourceUnavailable},
+	}, history.Warnings)
+	require.Len(t, history.Content.Revisions, 1)
+	assert.Equal(t, fresh.Name, history.Content.Revisions[0].Revision.Name)
+	assert.NotEqual(t, stale.Name, history.Content.Revisions[0].Revision.Name)
+
+	machine, err := json.Marshal(history)
+	require.NoError(t, err)
+	rendered := string(machine) + fmt.Sprint(history.Content.Table().Rows) +
+		fmt.Sprint(history.Content.WideTable().Rows)
+	for _, private := range []string{
+		"first-private-token", "second-private-token",
+		"first private expiration detail", "second private expiration detail",
+	} {
+		assert.NotContains(t, rendered, private)
+	}
+}
+
+func TestProjectionMapsClearedExpirationWhenRecoveryBudgetIsTightened(t *testing.T) {
+	t.Parallel()
+
+	liveSpec := projectionRuntimeSpec("private.registry/live:secret")
+	stale := projectionRevision(
+		t, "stale-uid", "gpu-runtime", projectionRuntimeSpec("private.registry/stale:secret"),
+	)
+	clientset := k8sfake.NewSimpleClientset()
+	calls := 0
+	clientset.PrependReactor("list", "controllerrevisions", func(k8stesting.Action) (bool, runtime.Object, error) {
+		calls++
+		if calls == 1 {
+			return true, &appsv1.ControllerRevisionList{
+				Items:    []appsv1.ControllerRevision{*stale.DeepCopy()},
+				ListMeta: metav1.ListMeta{Continue: "private-expired-token"},
+			}, nil
+		}
+		return true, nil, apierrors.NewResourceExpired("private expiration detail")
+	})
+	isvc, state := resolveProjectionWithRevisionClientAndLimits(
+		t, clientset, liveSpec, "", nil,
+		paging.Limits{
+			PageSize: 1, MaxItems: 2, MaxPages: 2, MaxRequests: 2,
+			RequestTimeout: time.Second,
+		},
+	)
+
+	_, err := ProjectEffective(isvc, state, projectionTestClock)
+	require.NoError(t, err)
+	history, err := ProjectHistory(isvc, state, projectionTestClock)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, reportv1alpha1.HistoryObservationStateUnavailable, history.Content.Observation)
+	assert.Equal(t, reportv1alpha1.HistoryCompletenessIncomplete, history.Content.Completeness)
+	assert.Equal(t, 2, history.Content.RequestedPages)
+	assert.Zero(t, history.Content.ObservedPages)
+	assert.Empty(t, history.Content.Revisions, "the expired prefix must not reach projection")
+	assert.Equal(t, []reportv1alpha1.RuntimeIssue{{Code: reportv1alpha1.RuntimeIssueHistoryUnavailable}}, history.Content.Issues)
+	assert.Equal(t, []reportv1alpha1.RuntimeWarning{
+		{Code: reportv1alpha1.WarningPartialData},
+		{Code: reportv1alpha1.WarningSourceUnavailable},
+	}, history.Warnings)
+	machine, marshalErr := json.Marshal(history)
+	require.NoError(t, marshalErr)
+	rendered := string(machine) + fmt.Sprint(history.Content.Table().Rows) +
+		fmt.Sprint(history.Content.WideTable().Rows)
+	assert.NotContains(t, rendered, stale.Name)
+	assert.NotContains(t, rendered, "private-expired-token")
+	assert.NotContains(t, rendered, "private expiration detail")
+}
+
 func TestProjectionRejectsCollectorCollectionContradictions(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -396,11 +580,20 @@ func TestProjectionRejectsCollectorCollectionContradictions(t *testing.T) {
 			mutate: func(state *effective.RuntimeState) { state.HistoryPages++ },
 		},
 		{
+			name: "successful recovered counters have no retained page", resolve: resolveCompleteHistoryCollectionFixture,
+			mutate: func(state *effective.RuntimeState) {
+				state.HistoryPageLimit = 3
+				state.HistoryPages = 3
+				state.HistoryRequestedPages = 3
+				state.HistoryObservedPages = 0
+			},
+		},
+		{
 			name: "history pages are negative", resolve: resolveCompleteHistoryCollectionFixture,
 			mutate: func(state *effective.RuntimeState) { state.HistoryPages = -1 },
 		},
 		{
-			name: "requests exceed collector page limit", resolve: resolveCompleteHistoryCollectionFixture,
+			name: "observed pages exceed consistent snapshot limit", resolve: resolveCompleteHistoryCollectionFixture,
 			mutate: func(state *effective.RuntimeState) {
 				state.HistoryPages = state.HistoryPageLimit + 1
 				state.HistoryRequestedPages = state.HistoryPages
@@ -408,8 +601,25 @@ func TestProjectionRejectsCollectorCollectionContradictions(t *testing.T) {
 			},
 		},
 		{
+			name: "requests exceed total request limit", resolve: resolveCompleteHistoryCollectionFixture,
+			mutate: func(state *effective.RuntimeState) {
+				state.HistoryPages = state.HistoryRequestLimit + 1
+				state.HistoryRequestedPages = state.HistoryPages
+			},
+		},
+		{
+			name: "request limit exceeds single restart bound", resolve: resolveCompleteHistoryCollectionFixture,
+			mutate: func(state *effective.RuntimeState) {
+				state.HistoryRequestLimit = 2*state.HistoryPageLimit + 1
+			},
+		},
+		{
 			name: "collector page limit is absent", resolve: resolveCompleteHistoryCollectionFixture,
 			mutate: func(state *effective.RuntimeState) { state.HistoryPageLimit = 0 },
+		},
+		{
+			name: "collector request limit is absent", resolve: resolveCompleteHistoryCollectionFixture,
+			mutate: func(state *effective.RuntimeState) { state.HistoryRequestLimit = 0 },
 		},
 		{
 			name: "not requested carries a collector page", resolve: resolveLiveProjectionFixture,
@@ -743,7 +953,23 @@ func resolveProjectionWithRevisionClient(
 	reportedRevision string,
 	requestedRevision *string,
 ) (*v1beta1.InferenceService, *effective.RuntimeState) {
-	return resolveProjectionWithRevisionGetter(t, clientset.AppsV1(), liveSpec, reportedRevision, requestedRevision)
+	return resolveProjectionWithRevisionClientAndLimits(
+		t, clientset, liveSpec, reportedRevision, requestedRevision,
+		paging.Limits{PageSize: 10, MaxItems: 20, MaxPages: 2, RequestTimeout: time.Second},
+	)
+}
+
+func resolveProjectionWithRevisionClientAndLimits(
+	t *testing.T,
+	clientset *k8sfake.Clientset,
+	liveSpec *v1beta1.ServingRuntimeSpec,
+	reportedRevision string,
+	requestedRevision *string,
+	limits paging.Limits,
+) (*v1beta1.InferenceService, *effective.RuntimeState) {
+	return resolveProjectionWithRevisionGetterAndLimits(
+		t, clientset.AppsV1(), liveSpec, reportedRevision, requestedRevision, limits,
+	)
 }
 
 func resolveProjectionWithRevisionGetter(
@@ -752,6 +978,20 @@ func resolveProjectionWithRevisionGetter(
 	liveSpec *v1beta1.ServingRuntimeSpec,
 	reportedRevision string,
 	requestedRevision *string,
+) (*v1beta1.InferenceService, *effective.RuntimeState) {
+	return resolveProjectionWithRevisionGetterAndLimits(
+		t, revisions, liveSpec, reportedRevision, requestedRevision,
+		paging.Limits{PageSize: 10, MaxItems: 20, MaxPages: 2, RequestTimeout: time.Second},
+	)
+}
+
+func resolveProjectionWithRevisionGetterAndLimits(
+	t *testing.T,
+	revisions appstyped.ControllerRevisionsGetter,
+	liveSpec *v1beta1.ServingRuntimeSpec,
+	reportedRevision string,
+	requestedRevision *string,
+	limits paging.Limits,
 ) (*v1beta1.InferenceService, *effective.RuntimeState) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -778,7 +1018,7 @@ func resolveProjectionWithRevisionGetter(
 	isvc.Status.PinnedRevisionName = reportedRevision
 	resolver, err := effective.NewRuntimePinResolver(
 		revisions, effective.NewRuntimeResolver(liveClient), "ome-system",
-		paging.Limits{PageSize: 10, MaxItems: 20, MaxPages: 2, RequestTimeout: time.Second},
+		limits,
 	)
 	require.NoError(t, err)
 	state, err := resolver.Resolve(t.Context(), isvc, effective.RuntimeResolveOptions{IncludeHistory: true})

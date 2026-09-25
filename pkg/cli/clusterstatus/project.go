@@ -23,7 +23,12 @@ func Project(s Snapshot, clock r.Clock) r.ClusterStatusReport {
 		clock = r.SystemClock{}
 	}
 	now := clock.Now().UTC()
-	report := r.ClusterStatusReport{CollectedAt: now, Observation: r.ClusterComplete, UnavailableReason: s.Unavailable, ObservedPages: s.Pages, ReturnedSources: s.Returned, AdmittedSources: len(s.Items), SourceLimit: s.Limits.MaxItems, PageLimit: s.Limits.MaxPages, PageSize: s.Limits.PageSize, ConditionScanLimit: ConditionScanLimit, ConditionOutputLimit: ConditionOutputLimit, SourcesTruncated: s.Truncated, Clusters: []r.ClusterStatusRow{}}
+	sourceLimit, pageLimit := s.Limits.MaxItems, s.Limits.MaxPages
+	requestLimit, pageSize := s.Limits.MaxRequestAttempts(), s.Limits.PageSize
+	if s.Named {
+		sourceLimit, pageLimit, requestLimit, pageSize = 1, 1, 1, 1
+	}
+	report := r.ClusterStatusReport{CollectedAt: now, Observation: r.ClusterComplete, UnavailableReason: s.Unavailable, RequestedPages: s.RequestedPages, ObservedPages: s.ObservedPages, ReturnedSources: s.Returned, AdmittedSources: len(s.Items), SourceLimit: sourceLimit, PageLimit: pageLimit, RequestLimit: requestLimit, PageSize: pageSize, ConditionScanLimit: ConditionScanLimit, ConditionOutputLimit: ConditionOutputLimit, SourcesTruncated: s.Truncated, Clusters: []r.ClusterStatusRow{}}
 	switch {
 	case s.Truncated || s.Unavailable != "" && len(s.Items) > 0:
 		report.Observation = r.ClusterPartial

@@ -356,6 +356,64 @@ func TestNewRuntimePinResolverRejectsInvalidDependencies(t *testing.T) {
 	assert.EqualError(t, err, "revision paging limits are invalid")
 }
 
+func TestRuntimePinConstructorsRejectInvalidRecoveryOverridesBeforeClientUse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			invalid := testPinLimits
+			test.mutate(&invalid)
+			kube := k8sfake.NewSimpleClientset()
+
+			resolver, err := NewRuntimePinResolver(
+				kube.AppsV1(), &RuntimeResolver{}, "ome", invalid,
+			)
+
+			require.EqualError(t, err, "revision paging limits are invalid")
+			assert.Nil(t, resolver)
+			assert.Empty(t, kube.Actions())
+
+			dependencyCalls := 0
+			resolver, err = newRuntimePinResolver(
+				func(string) revisionNamespace {
+					dependencyCalls++
+					return revisionNamespaceStub{}
+				},
+				liveRuntimeResolverFunc(func(
+					context.Context, *v1beta1.InferenceService,
+				) (*LiveConfiguration, error) {
+					dependencyCalls++
+					return nil, errors.New("unexpected live resolution")
+				}),
+				"ome", invalid,
+			)
+
+			require.EqualError(t, err, "revision paging limits are invalid")
+			assert.Nil(t, resolver)
+			assert.Zero(t, dependencyCalls)
+		})
+	}
+}
+
 func TestResolveAutoSyncUsesLiveAndRetainsStatusPinAsInactiveEvidence(t *testing.T) {
 	var revisionCalls int
 	live := livePinFixture("team-runtime", runtimeselector.KindClusterServingRuntime, "", false)

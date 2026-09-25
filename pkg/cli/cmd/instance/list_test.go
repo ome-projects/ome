@@ -471,6 +471,24 @@ func (panicFactory) OMEClient() (versioned.Interface, error)   { panic("factory 
 func (panicFactory) RuntimeClient() (ctrlclient.Client, error) { panic("factory access") }
 func (panicFactory) Namespace() (string, bool, error)          { panic("factory access") }
 
+func TestListRejectsInvalidRecoveryOverrideBeforeFactoryAccess(t *testing.T) {
+	t.Parallel()
+
+	deps := listDependencies{
+		clock: commandClock,
+		limits: paging.Limits{
+			PageSize: 2, MaxItems: 4, MaxPages: 2, MaxRequests: 5,
+			RequestTimeout: time.Second,
+		},
+		maxInstances: 16,
+	}
+	o := &listOptions{output: "table", deps: deps}
+
+	err := o.run(context.Background(), panicFactory{}, "chat")
+
+	require.ErrorIs(t, err, ErrInvalidInstancePagingLimits)
+}
+
 type namespaceFactory struct {
 	factory.Factory
 	namespace string

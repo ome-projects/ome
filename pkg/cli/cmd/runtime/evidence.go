@@ -40,6 +40,12 @@ func collectRuntimeEvidence(
 	limits paging.Limits,
 	options runtimeEvidenceOptions,
 ) (*runtimeEvidence, error) {
+	if err := limits.Validate(); err != nil {
+		return nil, fmt.Errorf(
+			"construct runtime evidence resolver: %w",
+			errors.New("revision paging limits are invalid"),
+		)
+	}
 	workloadNamespace, _, err := f.Namespace()
 	if err != nil {
 		return nil, fmt.Errorf("resolve workload namespace: %w", err)

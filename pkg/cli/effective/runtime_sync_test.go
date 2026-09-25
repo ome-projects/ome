@@ -48,6 +48,66 @@ func runtimeSyncSourceResolver(t *testing.T, kube *kfake.Clientset, objects ...c
 	return resolver
 }
 
+func TestNewRuntimeSyncResolverRejectsInvalidRecoveryOverridesBeforeClientUse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			invalid := paging.Limits{
+				PageSize: 16, MaxItems: 32, MaxPages: 2,
+				RequestTimeout: time.Second,
+			}
+			test.mutate(&invalid)
+			kube := kfake.NewSimpleClientset()
+			clientCalls := 0
+			client := &runtimeCandidateListClient{
+				Client: newRuntimeCandidateBaseClient(t),
+				get: func(
+					context.Context, ctrlclient.ObjectKey, ctrlclient.Object,
+					...ctrlclient.GetOption,
+				) error {
+					clientCalls++
+					return errors.New("unexpected runtime GET")
+				},
+				list: func(
+					context.Context, ctrlclient.ObjectList, ...ctrlclient.ListOption,
+				) error {
+					clientCalls++
+					return errors.New("unexpected runtime LIST")
+				},
+			}
+
+			resolver, err := NewRuntimeSyncResolver(
+				kube.AppsV1(), client, "ome", invalid,
+			)
+
+			require.ErrorIs(t, err, ErrRuntimeSyncEvidence)
+			require.Nil(t, resolver)
+			require.Empty(t, kube.Actions())
+			require.Zero(t, clientCalls)
+		})
+	}
+}
+
 func TestRuntimeSyncEvidenceKeepsGlobalGenerationAdvisoryAndPrivate(t *testing.T) {
 	for _, observed := range []int64{0, 2, 3, 4} {
 		t.Run(fmt.Sprint(observed), func(t *testing.T) {

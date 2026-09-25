@@ -18,19 +18,21 @@ import (
 
 // Snapshot owns its objects and retains the bounded read's source windows.
 type Snapshot struct {
-	Items       []ome.WorkloadCluster
-	Pages       int
-	Returned    int
-	Truncated   bool
-	Unavailable r.UnavailableReason
-	Limits      paging.Limits
+	Items          []ome.WorkloadCluster
+	Named          bool
+	RequestedPages int
+	ObservedPages  int
+	Returned       int
+	Truncated      bool
+	Unavailable    r.UnavailableReason
+	Limits         paging.Limits
 }
 
 // Collect issues only a named cluster-scoped GET or bounded LIST. Optional
 // source errors are classified without retaining arbitrary server error text.
 // Cancellation aborts rather than masquerading as an ordinary empty report.
 func Collect(ctx context.Context, client omeclient.OmeV1beta1Interface, name string, limits paging.Limits) (Snapshot, error) {
-	s := Snapshot{Items: []ome.WorkloadCluster{}, Limits: limits}
+	s := Snapshot{Items: []ome.WorkloadCluster{}, Named: name != "", Limits: limits}
 	if err := ctx.Err(); err != nil {
 		return s, err
 	}
@@ -40,15 +42,15 @@ func Collect(ctx context.Context, client omeclient.OmeV1beta1Interface, name str
 	if name != "" && len(validation.IsDNS1123Subdomain(name)) != 0 {
 		return s, errors.New("invalid WorkloadCluster name")
 	}
-	if limits.PageSize <= 0 || limits.MaxItems <= 0 || limits.MaxPages <= 0 || limits.RequestTimeout <= 0 {
+	if err := limits.Validate(); err != nil {
 		return s, errors.New("invalid collection limits")
 	}
 	if name != "" {
 		requestCtx, cancel := context.WithTimeout(ctx, limits.RequestTimeout)
+		s.RequestedPages = 1
 		w, err := client.WorkloadClusters().Get(requestCtx, name, metav1.GetOptions{})
 		requestErr := requestCtx.Err()
 		cancel()
-		s.Pages = 1
 		if ctx.Err() != nil {
 			return s, ctx.Err()
 		}
@@ -64,6 +66,7 @@ func Collect(ctx context.Context, client omeclient.OmeV1beta1Interface, name str
 			s.Unavailable = r.UnavailableMalformedPayload
 			return s, nil
 		}
+		s.ObservedPages = 1
 		s.Returned = 1
 		if w.Name != name || w.Namespace != "" {
 			s.Unavailable = r.UnavailableMalformedPayload
@@ -83,13 +86,13 @@ func Collect(ctx context.Context, client omeclient.OmeV1beta1Interface, name str
 		if list == nil {
 			return paging.Page[ome.WorkloadCluster]{}, errMalformedResponse
 		}
-		s.Returned += len(list.Items)
 		return paging.Page[ome.WorkloadCluster]{Items: list.Items, Continue: list.Continue}, nil
 	})
 	if ctx.Err() != nil {
 		return s, ctx.Err()
 	}
-	s.Pages, s.Truncated = listed.Pages, listed.Truncated
+	s.RequestedPages, s.ObservedPages, s.Returned, s.Truncated =
+		listed.Pages, listed.ObservedPages, listed.ReturnedItems, listed.Truncated
 	if err != nil {
 		s.Unavailable = classify(err)
 		s.Truncated = len(listed.Items) > 0

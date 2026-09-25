@@ -3,6 +3,7 @@ package mutate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
@@ -428,7 +429,22 @@ func replicaPayloadBounded(ir *v1beta1.InferenceReplica) bool {
 	return true
 }
 
-// SafeAPIError never copies arbitrary API/status payloads into action output.
+type safeAPIError struct{ cause error }
+
+func (*safeAPIError) Error() string {
+	return "required Kubernetes API request failed; check access and connectivity"
+}
+
+func (e *safeAPIError) GoString() string { return e.Error() }
+
+func (e *safeAPIError) Format(state fmt.State, _ rune) {
+	_, _ = state.Write([]byte(e.Error()))
+}
+
+func (e *safeAPIError) Unwrap() error { return e.cause }
+
+// SafeAPIError never copies arbitrary API/status payloads into action output,
+// but preserves the typed cause for Kubernetes error predicates.
 func SafeAPIError(err error) error {
 	if err == nil {
 		return nil
@@ -439,5 +455,9 @@ func SafeAPIError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return context.DeadlineExceeded
 	}
-	return errors.New("required Kubernetes API request failed; check access and connectivity")
+	var safe *safeAPIError
+	if errors.As(err, &safe) {
+		return safe
+	}
+	return &safeAPIError{cause: err}
 }

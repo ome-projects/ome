@@ -131,7 +131,7 @@ func Collect(
 		InferenceService:  isvc.DeepCopy(),
 		InferenceReplicas: copyInferenceReplicas(replicas),
 		Completeness: Completeness{
-			ObservedPages: listed.Pages,
+			ObservedPages: listed.ObservedPages,
 			ObservedItems: len(listed.Items),
 			Truncated:     listed.Truncated,
 		},
@@ -180,7 +180,7 @@ func validateLimits(limits paging.Limits) error {
 	case limits.RequestTimeout <= 0:
 		return errors.New("request timeout must be positive")
 	default:
-		return nil
+		return limits.Validate()
 	}
 }
 

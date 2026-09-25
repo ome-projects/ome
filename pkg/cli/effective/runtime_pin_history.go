@@ -21,6 +21,7 @@ func (r *RuntimePinResolver) collectHistory(
 ) error {
 	state.HistoryRequested = options.IncludeHistory
 	state.HistoryPageLimit = r.limits.MaxPages
+	state.HistoryRequestLimit = r.limits.MaxRequestAttempts()
 	if !options.IncludeHistory {
 		state.HistoryComplete = false
 		finalizeRevisionEvidence(state)
@@ -36,13 +37,10 @@ func (r *RuntimePinResolver) collectHistory(
 	base := metav1.ListOptions{LabelSelector: labels.Set{
 		constants.RuntimeRevisionOfLabelKey: state.RuntimeName,
 	}.AsSelector().String()}
-	requestedPages := 0
-	observedPages := 0
 	result, err := paging.ListBounded(ctx, base, r.limits, func(
 		requestCtx context.Context,
 		listOptions metav1.ListOptions,
 	) (paging.Page[appsv1.ControllerRevision], error) {
-		requestedPages++
 		list, err := r.revisions(r.omeNamespace).List(requestCtx, listOptions)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -53,7 +51,6 @@ func (r *RuntimePinResolver) collectHistory(
 		if list == nil {
 			return paging.Page[appsv1.ControllerRevision]{}, errors.New("runtime revision history returned an empty response")
 		}
-		observedPages++
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return paging.Page[appsv1.ControllerRevision]{}, ctxErr
 		}
@@ -63,8 +60,8 @@ func (r *RuntimePinResolver) collectHistory(
 		return ctxErr
 	}
 	state.HistoryPages = result.Pages
-	state.HistoryRequestedPages = requestedPages
-	state.HistoryObservedPages = observedPages
+	state.HistoryRequestedPages = result.Pages
+	state.HistoryObservedPages = result.ObservedPages
 	state.HistoryTruncated = result.Truncated
 	state.HistoryComplete = err == nil && !result.Truncated
 	historyObservations := make([]RuntimeRevisionObservation, 0, len(result.Items))

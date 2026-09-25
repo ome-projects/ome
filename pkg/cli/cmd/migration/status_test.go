@@ -135,6 +135,17 @@ func TestStatusValidatesArgumentsBeforeFactoryAccess(t *testing.T) {
 	}
 }
 
+func TestStatusRejectsInvalidPagingOverrideBeforeFactoryAccess(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultStatusDependencies()
+	deps.collectionLimits.MaxConsumedItems = deps.collectionLimits.MaxItems*2 + 1
+
+	_, err := executeStatus(t, panicFactory{}, deps, "chat")
+
+	require.ErrorIs(t, err, ErrInvalidCollectionLimits)
+}
+
 func TestStatusValidatesResolvedNamespaceBeforeClientAccess(t *testing.T) {
 	t.Parallel()
 

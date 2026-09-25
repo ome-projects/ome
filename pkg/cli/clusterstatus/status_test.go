@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -80,7 +82,7 @@ func TestCollectWirePaginationAndImmutableCopies(t *testing.T) {
 	if len(queries) != 2 || queries[0].Limit != 2 || queries[0].Continue != "" || queries[1].Limit != 1 || queries[1].Continue != "private-token" || queries[0].LabelSelector != "" || queries[1].FieldSelector != "" {
 		t.Fatalf("bounded request wire: %+v", queries)
 	}
-	if s.Pages != 2 || s.Returned != 4 || len(s.Items) != 3 || !s.Truncated {
+	if s.RequestedPages != 2 || s.ObservedPages != 2 || s.Returned != 4 || len(s.Items) != 3 || !s.Truncated {
 		t.Fatalf("bounded source counts: %+v", s)
 	}
 	first.Items[0].Spec.ClusterSource.ClusterProfileRef.Name = "changed"
@@ -95,6 +97,56 @@ func TestCollectWirePaginationAndImmutableCopies(t *testing.T) {
 	if bytes.Contains(data, []byte("token")) {
 		t.Fatal("continue token leaked")
 	}
+}
+
+func TestCollectRestartsExpiredContinuationWithoutMixingSnapshots(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	requests := []metav1.ListOptions{}
+	client.PrependReactor("list", "workloadclusters", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		options := action.(clienttesting.ListActionImpl).ListOptions
+		requests = append(requests, options)
+		switch len(requests) {
+		case 1:
+			return true, &ome.WorkloadClusterList{
+				Items:    []ome.WorkloadCluster{fixture("stale")},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			return true, nil, apierrors.NewResourceExpired("private detail")
+		case 3:
+			return true, &ome.WorkloadClusterList{
+				Items:    []ome.WorkloadCluster{fixture("fresh-a")},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			return true, &ome.WorkloadClusterList{
+				Items: []ome.WorkloadCluster{fixture("fresh-b")},
+			}, nil
+		default:
+			t.Fatalf("unexpected request %d", len(requests))
+			return true, nil, nil
+		}
+	})
+	bounded := paging.Limits{
+		PageSize: 1, MaxItems: 4, MaxPages: 5, RequestTimeout: time.Second,
+	}
+
+	snapshot, err := Collect(context.Background(), client.OmeV1beta1(), "", bounded)
+
+	require.NoError(t, err)
+	assert.Equal(t, 4, snapshot.RequestedPages)
+	assert.Equal(t, 2, snapshot.ObservedPages)
+	assert.Equal(t, 2, snapshot.Returned)
+	assert.False(t, snapshot.Truncated)
+	assert.Empty(t, snapshot.Unavailable)
+	require.Len(t, snapshot.Items, 2)
+	assert.Equal(t, []string{"fresh-a", "fresh-b"}, []string{
+		snapshot.Items[0].Name, snapshot.Items[1].Name,
+	})
+	assert.Equal(t, []string{"", "expired-token", "", "fresh-token"}, []string{
+		requests[0].Continue, requests[1].Continue,
+		requests[2].Continue, requests[3].Continue,
+	})
 }
 
 func TestCollectClassifiedUnavailableAndPartial(t *testing.T) {
@@ -128,6 +180,18 @@ func TestCollectClassifiedUnavailableAndPartial(t *testing.T) {
 				if string(value.UnavailableReason) != tc.want || value.Observation != "Unavailable" {
 					t.Fatalf("wrong availability: %+v", value)
 				}
+				if named {
+					assert.Equal(t, 1, value.RequestedPages)
+					assert.Equal(t, 1, value.SourceLimit)
+					assert.Equal(t, 1, value.PageLimit)
+					assert.Equal(t, 1, value.RequestLimit)
+					assert.Equal(t, int64(1), value.PageSize)
+				} else {
+					assert.Equal(t, 1, value.RequestedPages)
+					assert.Equal(t, limits().MaxItems, value.SourceLimit)
+					assert.Equal(t, limits().MaxPages, value.PageLimit)
+					assert.Equal(t, limits().MaxRequestAttempts(), value.RequestLimit)
+				}
 				data, _ := json.Marshal(value)
 				if bytes.Contains(data, []byte("PRIVATE-")) {
 					t.Fatalf("API error privacy: %s", data)
@@ -149,7 +213,7 @@ func TestCollectClassifiedUnavailableAndPartial(t *testing.T) {
 		t.Fatal(err)
 	}
 	value := Project(s, clock())
-	if value.Observation != "Partial" || value.UnavailableReason != "Forbidden" || value.ObservedPages != 2 || value.ReturnedSources != 1 || len(value.Clusters) != 1 || value.Clusters[0].ConnectionState != "ReportedReady" {
+	if value.Observation != "Partial" || value.UnavailableReason != "Forbidden" || value.ObservedPages != 1 || value.ReturnedSources != 1 || len(value.Clusters) != 1 || value.Clusters[0].ConnectionState != "ReportedReady" {
 		t.Fatalf("partial discarded independent evidence: %+v", value)
 	}
 }
@@ -197,12 +261,51 @@ func TestCollectMalformedAndValidationNoCalls(t *testing.T) {
 	}
 }
 
+func TestCollectNamedRejectsInvalidRecoveryOverridesBeforeGet(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*paging.Limits)
+	}{
+		{
+			name: "request recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxRequests = limits.MaxPages*2 + 1
+			},
+		},
+		{
+			name: "item recovery limit",
+			mutate: func(limits *paging.Limits) {
+				limits.MaxConsumedItems = limits.MaxItems*2 + 1
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			workload := fixture("gpu")
+			client := fake.NewSimpleClientset(&workload)
+			invalid := limits()
+			test.mutate(&invalid)
+
+			_, err := Collect(
+				context.Background(), client.OmeV1beta1(), "gpu", invalid,
+			)
+
+			require.Error(t, err)
+			assert.Empty(t, client.Actions(), "invalid limits must prevent the named GET")
+		})
+	}
+}
+
 func TestCollectRequestTimeoutIsBoundedUnavailable(t *testing.T) {
 	for _, name := range []string{"", "gpu"} {
 		l := limits()
 		l.RequestTimeout = time.Millisecond
 		s, err := Collect(context.Background(), boundaryClient{workload: boundaryWorkload{wait: true}}, name, l)
-		if err != nil || s.Unavailable != "Unreadable" || s.Pages != 1 {
+		if err != nil || s.Unavailable != "Unreadable" || s.RequestedPages != 1 || s.ObservedPages != 0 {
 			t.Fatalf("bounded request timeout: %+v %v", s, err)
 		}
 	}
@@ -216,7 +319,7 @@ func TestCollectRepeatedTokenEmptyAndCancellation(t *testing.T) {
 		return true, &ome.WorkloadClusterList{ListMeta: metav1.ListMeta{Continue: "same"}, Items: []ome.WorkloadCluster{fixture(fmt.Sprintf("gpu%d", calls))}}, nil
 	})
 	s, err := Collect(context.Background(), client.OmeV1beta1(), "", limits())
-	if err != nil || s.Unavailable != "Unreadable" || len(s.Items) != 1 || s.Pages != 2 {
+	if err != nil || s.Unavailable != "Unreadable" || len(s.Items) != 1 || s.RequestedPages != 2 || s.ObservedPages != 2 {
 		t.Fatalf("repeated token bound: %+v, %v", s, err)
 	}
 	value := Project(Snapshot{Limits: limits()}, clock())

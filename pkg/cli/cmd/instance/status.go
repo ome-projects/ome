@@ -33,9 +33,13 @@ import (
 )
 
 var (
-	ErrStatusComponentRequired = errors.New("--component is required")
-	ErrStatusComponentInvalid  = errors.New("component must be engine, decoder, or router")
-	ErrStatusIndexInvalid      = errors.New("instance index must be an integer from 0 through 2147483647")
+	ErrStatusComponentRequired    = errors.New("--component is required")
+	ErrStatusComponentInvalid     = errors.New("component must be engine, decoder, or router")
+	ErrStatusIndexInvalid         = errors.New("instance index must be an integer from 0 through 2147483647")
+	ErrStatusIRPagingInvalid      = errors.New("instance replica paging limits are invalid")
+	ErrStatusPodPagingInvalid     = errors.New("pod paging limits are invalid")
+	ErrStatusEventPagingInvalid   = errors.New("event paging limits are invalid")
+	ErrStatusRuntimePagingInvalid = errors.New("runtime paging limits are invalid")
 )
 
 type statusDependencies struct {
@@ -164,6 +168,18 @@ func (o *statusOptions) validate(name, rawIndex string) error {
 }
 
 func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string) error {
+	if err := o.deps.irLimits.Paging.Validate(); err != nil {
+		return ErrStatusIRPagingInvalid
+	}
+	if err := o.deps.podLimits.Validate(); err != nil {
+		return ErrStatusPodPagingInvalid
+	}
+	if err := o.deps.eventLimits.Paging.Validate(); err != nil {
+		return ErrStatusEventPagingInvalid
+	}
+	if err := o.deps.runtimeLimits.Validate(); err != nil {
+		return ErrStatusRuntimePagingInvalid
+	}
 	namespace, _, err := f.Namespace()
 	if err != nil {
 		return fmt.Errorf("resolve namespace: %w", err)

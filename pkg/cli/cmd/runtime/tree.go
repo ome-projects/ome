@@ -130,6 +130,9 @@ func parseRuntimeTreeOutput(value string) (report.Format, bool, error) {
 }
 
 func (o *treeOptions) run(ctx context.Context, f factory.Factory) error {
+	if err := o.dependencies.limits.Validate(); err != nil {
+		return errors.New("runtime tree paging limits are invalid")
+	}
 	target := runtimegraph.Target{Kind: runtimegraph.Kind(o.kind), Name: o.name}
 	if target.Kind != runtimegraph.KindClusterServingRuntime {
 		namespace, _, err := f.Namespace()

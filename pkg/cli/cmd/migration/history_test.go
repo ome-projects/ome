@@ -123,6 +123,17 @@ func TestHistoryHelpExplainsAuthorityBoundsRedactionAndNamespace(t *testing.T) {
 	assert.Nil(t, cmd.Flags().Lookup("ome-namespace"))
 }
 
+func TestHistoryRejectsInvalidPagingOverrideBeforeFactoryAccess(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultHistoryDependencies()
+	deps.collectionLimits.MaxRequests = deps.collectionLimits.MaxPages*2 + 1
+
+	_, err := executeHistory(t, panicFactory{}, deps, "chat")
+
+	require.ErrorIs(t, err, ErrInvalidCollectionLimits)
+}
+
 func TestHistoryValidatesArgumentsBeforeFactoryAccess(t *testing.T) {
 	t.Parallel()
 

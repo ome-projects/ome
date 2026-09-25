@@ -72,6 +72,7 @@ func TestResolveHistoryUsesRuntimeNameOnlySelectorUnionsExactReadsAndSorts(t *te
 	assert.True(t, state.HistoryRequested)
 	assert.True(t, state.HistoryComplete)
 	assert.Equal(t, testPinLimits.MaxPages, state.HistoryPageLimit)
+	assert.Equal(t, testPinLimits.MaxRequestAttempts(), state.HistoryRequestLimit)
 	assert.Equal(t, 2, state.HistoryRequestedPages)
 	assert.Equal(t, 2, state.HistoryObservedPages)
 	observations := state.RevisionObservations()
@@ -118,6 +119,64 @@ func TestResolveHistoryRetainsSuccessfulPrefixAfterLaterFailure(t *testing.T) {
 	require.Len(t, issues, 1)
 	assert.Equal(t, "runtime revision history read failed", issues[0].Error())
 	assert.ErrorIs(t, issues[0], forbidden)
+}
+
+func TestResolveHistoryRestartsExpiredContinuationWithoutStaleEvidence(t *testing.T) {
+	stale := revisionFixture(t, runtimeselector.KindClusterServingRuntime, "", "runtime", runtimeSpecFixture("stale"))
+	freshA := revisionFixture(t, runtimeselector.KindClusterServingRuntime, "", "runtime", runtimeSpecFixture("fresh-a"))
+	freshB := revisionFixture(t, runtimeselector.KindClusterServingRuntime, "", "runtime", runtimeSpecFixture("fresh-b"))
+	calls := 0
+	resolver, err := newRuntimePinResolver(
+		func(string) revisionNamespace {
+			return revisionNamespaceStub{list: func(_ context.Context, options metav1.ListOptions) (*appsv1.ControllerRevisionList, error) {
+				calls++
+				switch calls {
+				case 1:
+					return &appsv1.ControllerRevisionList{
+						Items:    []appsv1.ControllerRevision{*stale.DeepCopy()},
+						ListMeta: metav1.ListMeta{Continue: "expired-token"},
+					}, nil
+				case 2:
+					return nil, apierrors.NewResourceExpired("private detail")
+				case 3:
+					return &appsv1.ControllerRevisionList{
+						Items:    []appsv1.ControllerRevision{*freshA.DeepCopy()},
+						ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+					}, nil
+				case 4:
+					return &appsv1.ControllerRevisionList{
+						Items: []appsv1.ControllerRevision{*freshB.DeepCopy()},
+					}, nil
+				default:
+					t.Fatalf("unexpected request %d with token %q", calls, options.Continue)
+					return nil, nil
+				}
+			}}
+		},
+		liveRuntimeResolverFunc(func(context.Context, *v1beta1.InferenceService) (*LiveConfiguration, error) {
+			return livePinFixture("runtime", runtimeselector.KindClusterServingRuntime, "", false), nil
+		}),
+		"ome", testPinLimits,
+	)
+	require.NoError(t, err)
+
+	state, err := resolver.Resolve(
+		context.Background(), pinISVC("runtime", nil, ""),
+		RuntimeResolveOptions{IncludeHistory: true},
+	)
+
+	require.NoError(t, err)
+	assert.True(t, state.HistoryComplete)
+	assert.False(t, state.HistoryTruncated)
+	assert.Equal(t, 4, state.HistoryPages)
+	assert.Equal(t, 4, state.HistoryRequestedPages)
+	assert.Equal(t, 2, state.HistoryObservedPages)
+	assert.Empty(t, state.SourceIssues())
+	observations := state.RevisionObservations()
+	require.Len(t, observations, 2)
+	for _, observation := range observations {
+		assert.NotEqual(t, stale.Name, observation.Name)
+	}
 }
 
 func TestResolveHistoryNilSuccessfulListResponseIsBounded(t *testing.T) {
@@ -390,6 +449,7 @@ func TestResolveHistoryDuplicateAbsorptionIsPermutationInvariant(t *testing.T) {
 		HistoryRequested                            bool
 		HistoryPages                                int
 		HistoryPageLimit                            int
+		HistoryRequestLimit                         int
 		HistoryRequestedPages                       int
 		HistoryObservedPages                        int
 		HistoryComplete                             bool
@@ -422,6 +482,7 @@ func TestResolveHistoryDuplicateAbsorptionIsPermutationInvariant(t *testing.T) {
 			LiveToActive: state.LiveToActive, LiveShortHash: state.LiveShortHash,
 			HistoryRequested: state.HistoryRequested, HistoryPages: state.HistoryPages,
 			HistoryPageLimit:      state.HistoryPageLimit,
+			HistoryRequestLimit:   state.HistoryRequestLimit,
 			HistoryRequestedPages: state.HistoryRequestedPages, HistoryObservedPages: state.HistoryObservedPages,
 			HistoryComplete: state.HistoryComplete, HistoryTruncated: state.HistoryTruncated,
 			LiveAvailability: state.LiveAvailability(), Live: state.LiveConfiguration(), Active: active,

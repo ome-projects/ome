@@ -61,9 +61,11 @@ type runtimeCandidateSnapshot struct {
 }
 
 type runtimeSnapshotBudget struct {
-	items int
-	pages int
-	base  paging.Limits
+	items     int
+	pages     int
+	workItems int
+	requests  int
+	base      paging.Limits
 }
 
 func newRuntimeSnapshotBudget(limits paging.Limits) (*runtimeSnapshotBudget, error) {
@@ -77,14 +79,19 @@ func newRuntimeSnapshotBudget(limits paging.Limits) (*runtimeSnapshotBudget, err
 	case limits.RequestTimeout <= 0:
 		return nil, errors.New("runtime candidate request timeout must be positive")
 	default:
+		if err := limits.Validate(); err != nil {
+			return nil, fmt.Errorf("runtime candidate paging limits are invalid: %w", err)
+		}
 		return &runtimeSnapshotBudget{
-			items: limits.MaxItems, pages: limits.MaxPages, base: limits,
+			items: limits.MaxItems, pages: limits.MaxPages,
+			workItems: limits.MaxItemWork(), requests: limits.MaxRequestAttempts(),
+			base: limits,
 		}, nil
 	}
 }
 
 func (b *runtimeSnapshotBudget) limits() (paging.Limits, error) {
-	if b.pages <= 0 {
+	if b.pages <= 0 || b.requests <= 0 || b.workItems <= 0 {
 		return paging.Limits{}, errRuntimeSnapshotTruncated
 	}
 	limits := b.base
@@ -94,13 +101,25 @@ func (b *runtimeSnapshotBudget) limits() (paging.Limits, error) {
 		// is empty when the first kind consumed the exact shared item budget.
 		limits.MaxItems = 1
 	}
+	if limits.MaxItems > b.workItems {
+		limits.MaxItems = b.workItems
+	}
 	limits.MaxPages = b.pages
+	if limits.MaxPages > b.requests {
+		limits.MaxPages = b.requests
+	}
+	limits.MaxRequests = 0
+	limits.MaxConsumedItems = 0
+	limits.MaxRequests = min(b.requests, limits.MaxRequestAttempts())
+	limits.MaxConsumedItems = min(b.workItems, limits.MaxItemWork())
 	return limits, nil
 }
 
-func (b *runtimeSnapshotBudget) consume(pages, items int) {
-	b.pages -= pages
-	b.items -= items
+func (b *runtimeSnapshotBudget) consume(observedPages, returnedItems, requests, workItems int) {
+	b.pages -= observedPages
+	b.items -= returnedItems
+	b.requests -= requests
+	b.workItems -= workItems
 }
 
 // collectRuntimeCandidateSnapshot captures the complete namespace-scoped and
@@ -190,18 +209,23 @@ func collectNamespacedRuntimeCandidates(
 			if int64(len(response.Items)) > options.Limit {
 				return paging.Page[v1beta1.ServingRuntime]{}, errRuntimeSnapshotInconsistent
 			}
-			if metadataObserved && response.ResourceVersion != resourceVersion {
+			if options.Continue != "" &&
+				(!metadataObserved || response.ResourceVersion != resourceVersion) {
 				return paging.Page[v1beta1.ServingRuntime]{}, errRuntimeSnapshotInconsistent
 			}
-			resourceVersion = response.ResourceVersion
-			metadataObserved = true
+			if options.Continue == "" {
+				// A recovered 410 restart begins a new consistent snapshot. Its
+				// first-page RV replaces metadata from the discarded attempt.
+				resourceVersion = response.ResourceVersion
+				metadataObserved = true
+			}
 			return paging.Page[v1beta1.ServingRuntime]{
 				Items: response.Items, Continue: response.Continue,
 			}, nil
 		},
 	)
 	remainingItems := budget.items
-	budget.consume(result.Pages, len(result.Items))
+	budget.consume(result.ObservedPages, result.ReturnedItems, result.Pages, result.ConsumedItems)
 	if err != nil {
 		return nil, "", preserveRuntimeSnapshotContext(ctx, err)
 	}
@@ -270,7 +294,7 @@ func collectClusterRuntimeCandidates(
 		},
 	)
 	remainingItems := budget.items
-	budget.consume(result.Pages, len(result.Items))
+	budget.consume(result.ObservedPages, result.ReturnedItems, result.Pages, result.ConsumedItems)
 	if err != nil {
 		return nil, preserveRuntimeSnapshotContext(ctx, err)
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -71,6 +72,63 @@ func TestCollectRelatedPagesWithExactSelectorAndRejectsUnboundObjects(t *testing
 	}, got.Rejected)
 	assert.Equal(t, 2, got.Pages)
 	assert.False(t, got.Truncated)
+}
+
+func TestCollectRelatedRestartsExpiredContinuationWithoutStaleReplicas(t *testing.T) {
+	t.Parallel()
+
+	isvc := collectionISVC()
+	stale := relatedReplica(isvc, "stale-engine", omev1beta1.EngineComponent)
+	freshEngine := relatedReplica(isvc, "fresh-engine", omev1beta1.EngineComponent)
+	freshDecoder := relatedReplica(isvc, "fresh-decoder", omev1beta1.DecoderComponent)
+	calls := 0
+	lister := listerFunc(func(_ context.Context, options metav1.ListOptions) (*omev1beta1.InferenceReplicaList, error) {
+		calls++
+		switch calls {
+		case 1:
+			assert.Empty(t, options.Continue)
+			return &omev1beta1.InferenceReplicaList{
+				Items:    []omev1beta1.InferenceReplica{stale},
+				ListMeta: metav1.ListMeta{Continue: "expired-token"},
+			}, nil
+		case 2:
+			assert.Equal(t, "expired-token", options.Continue)
+			return nil, apierrors.NewResourceExpired("private expiration detail")
+		case 3:
+			assert.Empty(t, options.Continue)
+			return &omev1beta1.InferenceReplicaList{
+				Items:    []omev1beta1.InferenceReplica{freshEngine},
+				ListMeta: metav1.ListMeta{Continue: "fresh-token"},
+			}, nil
+		case 4:
+			assert.Equal(t, "fresh-token", options.Continue)
+			return &omev1beta1.InferenceReplicaList{
+				Items: []omev1beta1.InferenceReplica{freshDecoder},
+			}, nil
+		default:
+			t.Fatalf("unexpected list call %d", calls)
+			return nil, nil
+		}
+	})
+
+	got, err := instancecollection.CollectRelated(
+		context.Background(), lister, isvc,
+		instancecollection.Limits{
+			Paging: paging.Limits{
+				PageSize: 1, MaxItems: 2, MaxPages: 2, RequestTimeout: time.Second,
+			},
+			MaxStatusRows: 100,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 4, got.Pages)
+	assert.Equal(t, 4, calls)
+	require.Len(t, got.Items, 2)
+	assert.Equal(t, []string{"fresh-engine", "fresh-decoder"}, []string{
+		got.Items[0].Name, got.Items[1].Name,
+	})
+	assert.NotContains(t, []string{got.Items[0].Name, got.Items[1].Name}, stale.Name)
 }
 
 func TestCollectRelatedLongParentNameUsesBoundedExactRelationshipScan(t *testing.T) {

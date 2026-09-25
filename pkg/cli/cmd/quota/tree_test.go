@@ -23,9 +23,20 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	v "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
+	clientset "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	fake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	"sigs.k8s.io/yaml"
 )
+
+type treeFactory struct {
+	factory.Static
+	omeCalls int
+}
+
+func (f *treeFactory) OMEClient() (clientset.Interface, error) {
+	f.omeCalls++
+	return f.Static.OMEClient()
+}
 
 func execute(t *testing.T, client *fake.Clientset, args ...string) (string, string, error) {
 	t.Helper()
@@ -122,6 +133,34 @@ func TestTreeInputValidationAndLimits(t *testing.T) {
 	assert.Equal(t, 2, calls)
 }
 
+func TestTreeRejectsInvalidRecoveryOverrideBeforeAcquisition(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	f := &treeFactory{Static: factory.Static{OME: client}}
+	invalid := paging.Limits{
+		PageSize: 2, MaxItems: 4, MaxPages: 2, MaxRequests: 5,
+		RequestTimeout: time.Second,
+	}
+	var out, stderr bytes.Buffer
+	cmd := newTreeCmd(
+		f,
+		genericiooptions.IOStreams{Out: &out, ErrOut: &stderr},
+		v.ClockFunc(func() time.Time {
+			return time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+		}),
+		invalid,
+	)
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	cmd.SetArgs([]string{})
+
+	err := cmd.Execute()
+
+	require.EqualError(t, err, "quota tree paging limits are invalid")
+	assert.Zero(t, f.omeCalls)
+	assert.Empty(t, client.Actions())
+	assert.Empty(t, out.String())
+	assert.Empty(t, stderr.String())
+}
+
 func TestTreeHelpAndFactoryFailure(t *testing.T) {
 	var out bytes.Buffer
 	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{Out: &out, ErrOut: &out})
@@ -177,7 +216,9 @@ func TestCanceledCommandInvalidSnapshotAndWriter(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	cmd := newTreeCmd(factory.Static{OME: client}, genericiooptions.IOStreams{Out: io.Discard, ErrOut: io.Discard}, nil, paging.Limits{RequestTimeout: time.Second})
+	cmd := newTreeCmd(factory.Static{OME: client}, genericiooptions.IOStreams{Out: io.Discard, ErrOut: io.Discard}, nil, paging.Limits{
+		PageSize: 1, MaxItems: 1, MaxPages: 1, RequestTimeout: time.Second,
+	})
 	cmd.SetContext(ctx)
 	cmd.SilenceErrors = true
 	cmd.SilenceUsage = true

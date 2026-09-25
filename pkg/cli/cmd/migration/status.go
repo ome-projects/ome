@@ -31,6 +31,7 @@ var (
 	ErrInvalidInferenceServiceName = errors.New("inference service name is invalid")
 	ErrInvalidNamespace            = errors.New("namespace is invalid")
 	ErrInvalidComponent            = errors.New("component must be engine, decoder, or router")
+	ErrInvalidCollectionLimits     = errors.New("migration collection paging limits are invalid")
 )
 
 type collectionClient = omeclient.OmeV1beta1Interface
@@ -144,6 +145,9 @@ func (o *statusOptions) validate(name string) error {
 }
 
 func (o *statusOptions) run(ctx context.Context, f factory.Factory, name string) error {
+	if err := o.deps.collectionLimits.Validate(); err != nil {
+		return ErrInvalidCollectionLimits
+	}
 	namespace, _, err := f.Namespace()
 	if err != nil {
 		return fmt.Errorf("resolve namespace: %w", err)

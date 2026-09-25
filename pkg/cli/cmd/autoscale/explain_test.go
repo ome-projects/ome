@@ -814,6 +814,32 @@ func TestExplainPreservesClientConstructionErrorsAtTheirAcquisitionBoundary(t *t
 	}
 }
 
+func TestCollectAutoscaleExplainEvidenceRejectsInvalidRecoveryOverrideBeforeAcquisition(t *testing.T) {
+	t.Parallel()
+
+	ome := omefake.NewSimpleClientset(explainISVCFixture())
+	kube := k8sfake.NewSimpleClientset()
+	f := &explainTrackingFactory{
+		ome: ome, kube: kube,
+		runtime:   ctrlfake.NewClientBuilder().WithScheme(explainScheme(t)).Build(),
+		namespace: "prod",
+	}
+	invalid := paging.Limits{
+		PageSize: 16, MaxItems: 32, MaxPages: 2, MaxRequests: 5,
+		RequestTimeout: time.Second,
+	}
+
+	evidence, err := collectAutoscaleExplainEvidence(
+		context.Background(), f, namespace.NewOptions(), "chat", invalid,
+	)
+
+	require.Error(t, err)
+	assert.Nil(t, evidence)
+	assert.Empty(t, f.calls)
+	assert.Empty(t, ome.Actions())
+	assert.Empty(t, kube.Actions())
+}
+
 func TestExplainValidatesArgumentsBeforeFactoryOrCollectorAccess(t *testing.T) {
 	deps := explainDependencies{collect: func(
 		context.Context, factory.Factory, *namespace.Options, string, paging.Limits,

@@ -356,6 +356,7 @@ type RuntimeState struct {
 	HistoryRequested        bool
 	HistoryPages            int
 	HistoryPageLimit        int
+	HistoryRequestLimit     int
 	HistoryRequestedPages   int
 	HistoryObservedPages    int
 	HistoryComplete         bool
@@ -417,6 +418,9 @@ func newRuntimePinResolver(revisions revisionNamespaceGetter, live liveRuntimeRe
 		return nil, errors.New("OME namespace must not be empty")
 	}
 	if limits.PageSize <= 0 || limits.MaxItems <= 0 || limits.MaxPages <= 0 || limits.RequestTimeout <= 0 {
+		return nil, errors.New("revision paging limits are invalid")
+	}
+	if err := limits.Validate(); err != nil {
 		return nil, errors.New("revision paging limits are invalid")
 	}
 	return &RuntimePinResolver{revisions: revisions, live: live, omeNamespace: omeNamespace, limits: limits}, nil

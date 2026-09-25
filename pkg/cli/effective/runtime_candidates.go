@@ -124,14 +124,14 @@ func (c *runtimeSnapshotClient) List(
 		if options.Limit > 0 && int64(len(typed.Items)) > options.Limit {
 			return &RuntimeSelectionTruncated{}
 		}
+		objects := make([]ctrlclient.Object, 0, len(typed.Items))
 		for i := range typed.Items {
 			if typed.Items[i].Namespace != namespace {
 				return ErrRuntimeObjectIdentityMismatch
 			}
-			if err := c.recordObject(&typed.Items[i]); err != nil {
-				return err
-			}
+			objects = append(objects, &typed.Items[i])
 		}
+		return c.recordObjects(objects)
 	case *v1beta1.ClusterServingRuntimeList:
 		if typed == nil {
 			return errors.New("ClusterServingRuntime list must not be nil")
@@ -139,31 +139,48 @@ func (c *runtimeSnapshotClient) List(
 		if options.Limit > 0 && int64(len(typed.Items)) > options.Limit {
 			return &RuntimeSelectionTruncated{}
 		}
+		objects := make([]ctrlclient.Object, 0, len(typed.Items))
 		for i := range typed.Items {
 			if typed.Items[i].Namespace != "" {
 				return ErrRuntimeObjectIdentityMismatch
 			}
-			if err := c.recordObject(&typed.Items[i]); err != nil {
-				return err
-			}
+			objects = append(objects, &typed.Items[i])
 		}
+		return c.recordObjects(objects)
 	}
 	return nil
 }
 
 func (c *runtimeSnapshotClient) recordObject(object ctrlclient.Object) error {
-	snapshot, tracked, err := makeRuntimeObjectSnapshot(object)
-	if err != nil || !tracked {
-		return err
+	return c.recordObjects([]ctrlclient.Object{object})
+}
+
+func (c *runtimeSnapshotClient) recordObjects(objects []ctrlclient.Object) error {
+	pending := make(map[runtimeSnapshotKey]runtimeObjectSnapshot, len(objects))
+	for _, object := range objects {
+		snapshot, tracked, err := makeRuntimeObjectSnapshot(object)
+		if err != nil {
+			return err
+		}
+		if !tracked {
+			continue
+		}
+		if previous, found := pending[snapshot.key]; found && previous != snapshot {
+			return ErrRuntimeSnapshotChanged
+		}
+		pending[snapshot.key] = snapshot
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	previous, found := c.snapshots[snapshot.key]
-	if found && previous != snapshot {
-		return ErrRuntimeSnapshotChanged
+	for key, snapshot := range pending {
+		if previous, found := c.snapshots[key]; found && previous != snapshot {
+			return ErrRuntimeSnapshotChanged
+		}
 	}
-	if !found {
-		c.snapshots[snapshot.key] = snapshot
+	for key, snapshot := range pending {
+		if _, found := c.snapshots[key]; !found {
+			c.snapshots[key] = snapshot
+		}
 	}
 	return nil
 }
@@ -235,6 +252,8 @@ func NewBoundedRuntimeResolver(client ctrlclient.Client, limits paging.Limits) (
 		limits:                     limits,
 		remainingItems:             limits.MaxItems,
 		remainingPages:             limits.MaxPages,
+		remainingConsumedItems:     limits.MaxItemWork(),
+		remainingRequests:          limits.MaxRequestAttempts(),
 		servingRuntimeCache:        map[string]*v1beta1.ServingRuntimeList{},
 		clusterServingRuntimeCache: map[string]*v1beta1.ClusterServingRuntimeList{},
 	}
@@ -254,6 +273,9 @@ func validateRuntimeCandidateLimits(limits paging.Limits) error {
 	if limits.RequestTimeout <= 0 {
 		return errors.New("runtime selection request timeout must be positive")
 	}
+	if err := limits.Validate(); err != nil {
+		return fmt.Errorf("runtime selection paging limits are invalid: %w", err)
+	}
 	return nil
 }
 
@@ -261,10 +283,12 @@ type boundedRuntimeCandidateClient struct {
 	ctrlclient.Client
 	snapshots *runtimeSnapshotClient
 
-	mu             sync.Mutex
-	limits         paging.Limits
-	remainingItems int
-	remainingPages int
+	mu                     sync.Mutex
+	limits                 paging.Limits
+	remainingItems         int
+	remainingPages         int
+	remainingConsumedItems int
+	remainingRequests      int
 
 	servingRuntimeCache        map[string]*v1beta1.ServingRuntimeList
 	clusterServingRuntimeCache map[string]*v1beta1.ClusterServingRuntimeList
@@ -284,6 +308,8 @@ func (c *boundedRuntimeCandidateClient) resetRuntimeSnapshots() {
 	c.mu.Lock()
 	c.remainingItems = c.limits.MaxItems
 	c.remainingPages = c.limits.MaxPages
+	c.remainingConsumedItems = c.limits.MaxItemWork()
+	c.remainingRequests = c.limits.MaxRequestAttempts()
 	c.servingRuntimeCache = map[string]*v1beta1.ServingRuntimeList{}
 	c.clusterServingRuntimeCache = map[string]*v1beta1.ClusterServingRuntimeList{}
 	if c.snapshots != nil {
@@ -360,7 +386,6 @@ func (c *boundedRuntimeCandidateClient) listServingRuntimes(
 	}
 	var typeMeta metav1.TypeMeta
 	var listMeta metav1.ListMeta
-	metadataObserved := false
 	result, err := paging.ListBounded(
 		ctx,
 		metav1.ListOptions{},
@@ -368,22 +393,24 @@ func (c *boundedRuntimeCandidateClient) listServingRuntimes(
 		func(requestCtx context.Context, page metav1.ListOptions) (paging.Page[v1beta1.ServingRuntime], error) {
 			response := &v1beta1.ServingRuntimeList{}
 			request := runtimeCandidatePageOptions(base, page)
-			listErr := c.Client.List(requestCtx, response, &request)
+			listErr := c.snapshots.Client.List(requestCtx, response, &request)
 			if requestErr := requestCtx.Err(); requestErr != nil {
 				return paging.Page[v1beta1.ServingRuntime]{}, requestErr
 			}
 			if listErr != nil {
 				return paging.Page[v1beta1.ServingRuntime]{}, listErr
 			}
+			if page.Limit > 0 && int64(len(response.Items)) > page.Limit {
+				return paging.Page[v1beta1.ServingRuntime]{}, &RuntimeSelectionTruncated{}
+			}
 			for i := range response.Items {
 				if response.Items[i].Namespace != base.Namespace {
 					return paging.Page[v1beta1.ServingRuntime]{}, ErrRuntimeObjectIdentityMismatch
 				}
 			}
-			if !metadataObserved {
+			if page.Continue == "" {
 				typeMeta = response.TypeMeta
 				listMeta = response.ListMeta
-				metadataObserved = true
 			}
 			return paging.Page[v1beta1.ServingRuntime]{
 				Items:    response.Items,
@@ -391,12 +418,19 @@ func (c *boundedRuntimeCandidateClient) listServingRuntimes(
 			}, nil
 		},
 	)
-	c.consume(result.Pages, len(result.Items))
+	c.consume(result.ObservedPages, result.ReturnedItems, result.Pages, result.ConsumedItems)
 	if err != nil {
 		return err
 	}
 	if result.Truncated {
 		return &RuntimeSelectionTruncated{}
+	}
+	objects := make([]ctrlclient.Object, 0, len(result.Items))
+	for i := range result.Items {
+		objects = append(objects, &result.Items[i])
+	}
+	if err := c.snapshots.recordObjects(objects); err != nil {
+		return err
 	}
 
 	listMeta.Continue = ""
@@ -437,7 +471,6 @@ func (c *boundedRuntimeCandidateClient) listClusterServingRuntimes(
 	}
 	var typeMeta metav1.TypeMeta
 	var listMeta metav1.ListMeta
-	metadataObserved := false
 	result, err := paging.ListBounded(
 		ctx,
 		metav1.ListOptions{},
@@ -445,22 +478,24 @@ func (c *boundedRuntimeCandidateClient) listClusterServingRuntimes(
 		func(requestCtx context.Context, page metav1.ListOptions) (paging.Page[v1beta1.ClusterServingRuntime], error) {
 			response := &v1beta1.ClusterServingRuntimeList{}
 			request := runtimeCandidatePageOptions(base, page)
-			listErr := c.Client.List(requestCtx, response, &request)
+			listErr := c.snapshots.Client.List(requestCtx, response, &request)
 			if requestErr := requestCtx.Err(); requestErr != nil {
 				return paging.Page[v1beta1.ClusterServingRuntime]{}, requestErr
 			}
 			if listErr != nil {
 				return paging.Page[v1beta1.ClusterServingRuntime]{}, listErr
 			}
+			if page.Limit > 0 && int64(len(response.Items)) > page.Limit {
+				return paging.Page[v1beta1.ClusterServingRuntime]{}, &RuntimeSelectionTruncated{}
+			}
 			for i := range response.Items {
 				if response.Items[i].Namespace != "" {
 					return paging.Page[v1beta1.ClusterServingRuntime]{}, ErrRuntimeObjectIdentityMismatch
 				}
 			}
-			if !metadataObserved {
+			if page.Continue == "" {
 				typeMeta = response.TypeMeta
 				listMeta = response.ListMeta
-				metadataObserved = true
 			}
 			return paging.Page[v1beta1.ClusterServingRuntime]{
 				Items:    response.Items,
@@ -468,12 +503,19 @@ func (c *boundedRuntimeCandidateClient) listClusterServingRuntimes(
 			}, nil
 		},
 	)
-	c.consume(result.Pages, len(result.Items))
+	c.consume(result.ObservedPages, result.ReturnedItems, result.Pages, result.ConsumedItems)
 	if err != nil {
 		return err
 	}
 	if result.Truncated {
 		return &RuntimeSelectionTruncated{}
+	}
+	objects := make([]ctrlclient.Object, 0, len(result.Items))
+	for i := range result.Items {
+		objects = append(objects, &result.Items[i])
+	}
+	if err := c.snapshots.recordObjects(objects); err != nil {
+		return err
 	}
 
 	listMeta.Continue = ""
@@ -489,23 +531,36 @@ func (c *boundedRuntimeCandidateClient) listClusterServingRuntimes(
 }
 
 func (c *boundedRuntimeCandidateClient) remainingLimits() (paging.Limits, error) {
-	if c.remainingItems <= 0 || c.remainingPages <= 0 {
+	if c.remainingItems <= 0 || c.remainingPages <= 0 ||
+		c.remainingConsumedItems <= 0 || c.remainingRequests <= 0 {
 		return paging.Limits{}, &RuntimeSelectionTruncated{}
 	}
 	limits := c.limits
-	limits.MaxItems = c.remainingItems
-	limits.MaxPages = c.remainingPages
+	limits.MaxItems = min(c.remainingItems, c.remainingConsumedItems)
+	limits.MaxPages = min(c.remainingPages, c.remainingRequests)
+	limits.MaxRequests = 0
+	limits.MaxConsumedItems = 0
+	limits.MaxRequests = min(c.remainingRequests, limits.MaxRequestAttempts())
+	limits.MaxConsumedItems = min(c.remainingConsumedItems, limits.MaxItemWork())
 	return limits, nil
 }
 
-func (c *boundedRuntimeCandidateClient) consume(pages, items int) {
-	c.remainingPages -= pages
-	c.remainingItems -= items
+func (c *boundedRuntimeCandidateClient) consume(observedPages, returnedItems, requests, consumedItems int) {
+	c.remainingPages -= observedPages
+	c.remainingItems -= returnedItems
+	c.remainingRequests -= requests
+	c.remainingConsumedItems -= consumedItems
 	if c.remainingPages < 0 {
 		c.remainingPages = 0
 	}
 	if c.remainingItems < 0 {
 		c.remainingItems = 0
+	}
+	if c.remainingRequests < 0 {
+		c.remainingRequests = 0
+	}
+	if c.remainingConsumedItems < 0 {
+		c.remainingConsumedItems = 0
 	}
 }
 
@@ -546,6 +601,10 @@ func runtimeCandidatePageOptions(base ctrlclient.ListOptions, page metav1.ListOp
 	if request.Raw != nil {
 		request.Raw.Limit = page.Limit
 		request.Raw.Continue = page.Continue
+		if page.Continue != "" {
+			request.Raw.ResourceVersion = ""
+			request.Raw.ResourceVersionMatch = ""
+		}
 	}
 	return request
 }
