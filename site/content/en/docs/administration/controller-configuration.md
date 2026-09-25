@@ -41,10 +41,15 @@ kubectl -n ome logs deploy/<ome-controller-manager> | grep -iE 'retention|graceP
 
 ### Leader election
 
-| Flag                          | Type   | Default       | Description                                             |
-|-------------------------------|--------|---------------|--------------------------------------------------------|
-| `--leader-elect`              | bool   | `false`       | Enable leader election so only one manager is active.  |
-| `--leader-election-namespace` | string | OME namespace | Namespace for the leader-election lease.               |
+| Flag                            | Type     | Default       | Description                                                                                            |
+|---------------------------------|----------|---------------|--------------------------------------------------------------------------------------------------------|
+| `--leader-elect`                | bool     | `false`       | Enable leader election so only one manager is active.                                                  |
+| `--leader-election-namespace`   | string   | OME namespace | Namespace for the leader-election lease.                                                               |
+| `--leader-elect-lease-duration` | duration | unset         | How long the lease stays valid after its last renewal, and so the longest a standby waits before taking over from a leader that stopped renewing. |
+| `--leader-elect-renew-deadline` | duration | unset         | How long the leader keeps retrying a failed renewal before giving up leadership and exiting.           |
+| `--leader-elect-retry-period`   | duration | unset         | Gap between renewal attempts inside a renew window, and the interval at which a standby polls for an expired lease. |
+
+The three timing flags have no in-binary default and must be supplied together or not at all; see [Tuning leader election timing](#tuning-leader-election-timing).
 
 ### Metrics
 
@@ -63,6 +68,28 @@ These control cleanup of the OME-managed `ControllerRevision` snapshots created 
 | `--runtime-revision-grace-period`| duration | `24h`   | How long a snapshot must stay unreferenced and over-retention before the GC deletes it.        |
 
 Logging is configured with the standard controller-runtime zap flags (for example `--zap-log-level`, `--zap-encoder`).
+
+## Tuning leader election timing
+
+The binary carries no leader election timings of its own. When the three timing flags are unset, controller-runtime's built-in defaults apply: `15s` lease duration, `10s` renew deadline, `2s` retry period. The `ome-resources` chart supplies `60s`/`40s`/`8s` by default through `ome.controller.leaderElection`, and renders the flags only when all three values are present:
+
+```yaml
+ome:
+  controller:
+    leaderElection:
+      leaseDuration: "60s"
+      renewDeadline: "40s"
+      retryPeriod: "8s"
+```
+
+The three durations constrain each other, and the manager validates them at startup — a bad value is an immediate, named failure at boot rather than a late error partway through manager start:
+
+- **All or none.** Setting only one or two of the flags is rejected; supply the complete set or leave all three unset.
+- **All positive.** A zero or negative duration is rejected.
+- **`--leader-elect-lease-duration` must exceed `--leader-elect-renew-deadline`.** Otherwise the lease can expire while its holder is still renewing, handing the lock to a standby while the old leader still believes it is active.
+- **`--leader-elect-renew-deadline` must exceed 1.2× `--leader-elect-retry-period`** (the retry period jittered by client-go's jitter factor). Otherwise a renew window cannot hold one complete renewal attempt.
+
+When sizing the values: controller-runtime caps each renewal request at half the renew deadline, so a renew window holds two attempts and the leader survives exactly one hung apiserver request. At controller-runtime's defaults that is a ~10s budget, which a routine etcd stall can exhaust — costing the leader its lease and restarting the pod. The chart's `40s` renew deadline buys two 20s attempts instead. The cost is failover latency: a standby waits up to the lease duration (`60s` at the chart default) before taking over, so raise these values only as far as your cluster's apiserver latency actually needs.
 
 ## Tuning runtime-revision garbage collection
 
