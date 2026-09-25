@@ -225,3 +225,53 @@ func TestStoreLastKnownGood(t *testing.T) {
 		t.Fatal("failed update must keep last-known-good")
 	}
 }
+
+func TestStoreChangedSignalsSuccessfulUpdates(t *testing.T) {
+	store := NewStore()
+	changed := store.Changed()
+	select {
+	case <-changed:
+		t.Fatal("Changed must stay open until an update lands")
+	default:
+	}
+
+	if _, err := store.Update([]byte("schemaVersion: 99")); err == nil {
+		t.Fatal("invalid update should fail")
+	}
+	select {
+	case <-changed:
+		t.Fatal("a rejected update must not signal a change")
+	default:
+	}
+
+	if _, err := store.Update([]byte("schemaVersion: 1\nmode: execute")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-changed:
+	default:
+		t.Fatal("a successful update must close the channel handed out before it")
+	}
+	if store.Get().Mode != ModeExecute {
+		t.Fatal("the announced change must already be visible through Get")
+	}
+
+	// Each wake hands out a fresh channel for the following change.
+	next := store.Changed()
+	select {
+	case <-next:
+		t.Fatal("re-subscribing after a change must return an open channel")
+	default:
+	}
+	if _, err := store.Update([]byte("schemaVersion: 1\ndecisionLoopInterval: 1m")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-next:
+	default:
+		t.Fatal("the following update must close the re-subscribed channel")
+	}
+	if store.Get().DecisionLoopInterval.Duration != time.Minute {
+		t.Fatal("the following change must be visible through Get")
+	}
+}
