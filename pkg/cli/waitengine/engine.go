@@ -405,7 +405,9 @@ func (s *runState[T]) consume(w watch.Interface) (watchAction, time.Duration, er
 }
 
 func (s *runState[T]) poll() error {
-	s.result.Fallback = !s.options.PollOnly
+	if stop, err := s.canceled(); stop {
+		return err
+	}
 	for {
 		timer := s.options.Clock.NewTimer(s.options.PollInterval)
 		select {
@@ -416,6 +418,10 @@ func (s *runState[T]) poll() error {
 		case <-timer.C():
 		}
 		timer.Stop()
+		if stop, err := s.canceled(); stop {
+			return err
+		}
+		s.result.Fallback = !s.options.PollOnly
 		s.result.Method = MethodPoll
 		s.result.Counts.Polls++
 		if stop, err := s.get(); stop {

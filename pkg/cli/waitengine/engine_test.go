@@ -400,6 +400,29 @@ func TestForbiddenWatchFallsBackToBoundedPolling(t *testing.T) {
 	require.Equal(t, MethodPoll, c.result.Method)
 	require.Equal(t, 1, c.result.Counts.Polls)
 }
+
+func TestPollTimerAtOverallDeadlineDoesNotRecordPoll(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	s := sourceFor(response{snapshot: falseSnapshot()})
+	s.watchResponses[0].err = apierrors.NewForbidden(
+		schema.GroupResource{Resource: "inferenceservices"},
+		"service",
+		errors.New("secret"),
+	)
+	done := startEngine(t, s, context.Background(), Options{Timeout: 5 * time.Second, Clock: clk})
+	request(t, s, "get")
+	request(t, s, "watch:opaque:rv")
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	clk.Step(5 * time.Second)
+	c := finish(t, done)
+	require.NoError(t, c.err)
+	require.Equal(t, OutcomeTimedOut, c.result.Outcome)
+	require.False(t, c.result.Fallback)
+	require.Equal(t, MethodInitialGET, c.result.Method)
+	require.Equal(t, Counts{Gets: 1, Watches: 1, Observations: 1}, c.result.Counts)
+	require.Empty(t, s.requests)
+}
+
 func TestPollOnlySkipsWatchAndKeepsFallbackFalse(t *testing.T) {
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	snap := falseSnapshot()
