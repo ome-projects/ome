@@ -22,9 +22,9 @@ func ExecuteCommand(cmd *cobra.Command, stderr io.Writer) int {
 // and returns the stable process exit code without terminating the process.
 func ExecuteCommandContext(ctx context.Context, cmd *cobra.Command, stderr io.Writer) int {
 	// Cobra retains inherited contexts on children between executions.
-	clearCommandContexts(cmd.Root())
-	// Execute also delegates to the root when cmd is a descendant.
-	cmd.Root().SetContext(ctx)
+	// Set the new execution context on the full tree so no child can retain a
+	// canceled context from an earlier execution.
+	setCommandContexts(cmd.Root(), ctx)
 	return executeCommand(cmd, stderr, func() error { return cmd.ExecuteContext(ctx) })
 }
 
@@ -43,10 +43,10 @@ func executeCommand(cmd *cobra.Command, stderr io.Writer, execute func() error) 
 	return exitcode.FromError(err)
 }
 
-func clearCommandContexts(cmd *cobra.Command) {
-	cmd.SetContext(nil)
+func setCommandContexts(cmd *cobra.Command, ctx context.Context) {
+	cmd.SetContext(ctx)
 	for _, child := range cmd.Commands() {
-		clearCommandContexts(child)
+		setCommandContexts(child, ctx)
 	}
 }
 
