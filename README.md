@@ -31,6 +31,10 @@ Read the [documentation](https://ome-projects.github.io/ome/docs/) to learn more
 
 - **Accelerator Management:** Hardware-aware scheduling through AcceleratorClass resources that define GPU capabilities, discovery patterns, and cost information. Enables intelligent accelerator selection with policies like BestFit, Cheapest, or MostCapable.
 
+- **Fleet Capacity and GPU Operations (alpha):** Optional add-on control planes for large GPU fleets. The quota manager assembles the AcceleratorQuota tree and renders it into Kueue, or projects per-cluster shares onto members from a management cluster. Alfred, the GPU cluster caretaker, observes the physical GPU layer and recommends corrective migrations — recommend-only by default.
+
+- **Command-Line Interface:** `kubectl ome` is the official OME CLI, distributed as a kubectl plugin. It inspects models, runtimes, inference services, and logical instances; explains runtime and accelerator selection; reports rollout, autoscaling, placement, quota, and traffic evidence; streams component logs; and submits guarded actions such as rollout pause/resume/promote/rollback, traffic drain, and migration requests. See the [CLI reference](cmd/kubectl-ome/README.md).
+
 - **Web Console:** Modern web interface for managing models, serving runtimes, and inference services with real-time updates and HuggingFace model search integration. Developed separately in [ome-projects/ome-console](https://github.com/ome-projects/ome-console).
 
 - **Kubernetes Ecosystem Integration:** Deep integration with modern Kubernetes components including [Kueue](https://kueue.sigs.k8s.io/) for gang scheduling of multi-pod workloads, [LeaderWorkerSet](https://github.com/kubernetes-sigs/lws) for resilient multi-node deployments, [KEDA](https://keda.sh/) for advanced custom metrics-based autoscaling, [K8s Gateway API](https://gateway-api.sigs.k8s.io/) for sophisticated traffic routing, and [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/) for standardized inference endpoints.
@@ -87,6 +91,41 @@ The `ome-serving` chart deploys a set of pre-configured ClusterBaseModels, Clust
 helm upgrade --install ome-serving oci://ghcr.io/moirai-internal/charts/ome-serving --namespace ome
 ```
 
+### Optional: Operational Add-ons
+
+Each of these is published alongside the core charts and is independently optional (alpha):
+
+```bash
+# GPU bin-packing scheduler, installed as a SECOND scheduler; workloads opt in
+# via spec.schedulerName. Requires the scheduler-plugins PodGroup CRD.
+helm upgrade --install ome-scheduler oci://ghcr.io/moirai-internal/charts/ome-scheduler --namespace ome
+
+# Fleet quota control plane: assembles the AcceleratorQuota tree and renders it into Kueue
+helm upgrade --install ome-quota-manager oci://ghcr.io/moirai-internal/charts/ome-quota-manager --namespace ome
+
+# Alfred, the GPU cluster caretaker (recommend-only by default)
+helm upgrade --install ome-alfred oci://ghcr.io/moirai-internal/charts/ome-alfred --namespace ome
+```
+
+### Command-Line Interface
+
+Install the `kubectl ome` plugin from the latest release:
+
+```bash
+kubectl krew install --manifest-url \
+  https://github.com/ome-projects/ome/releases/latest/download/ome.yaml
+```
+
+Or build it from a checkout:
+
+```bash
+make kubectl-ome
+export PATH="$PWD/bin:$PATH"
+kubectl ome --help
+```
+
+Installing the CLI does not install or upgrade the controller or CRDs. See the [CLI reference](cmd/kubectl-ome/README.md) for the full command tree, guarded-action safeguards, and required permissions.
+
 Read the [installation guide](https://ome-projects.github.io/ome/docs/installation/) for more options and advanced configurations.
 
 Learn more about:
@@ -103,6 +142,11 @@ OME uses a component-based architecture built on Kubernetes custom resources:
 - **InferenceService:** Connects models to runtimes for deployment with support for prefill-decode disaggregation and multi-node inference
 - **AcceleratorClass:** Define GPU hardware classes with capabilities, discovery patterns, and cost information for intelligent scheduling
 - **BenchmarkJob:** Measures model performance under different workloads with configurable traffic patterns
+- **AutoscalerPolicy / RolloutPolicy:** Reusable, parameterized autoscaling and rollout templates that components and rollout groups attach by reference
+- **InferenceReplica:** Per-component workload abstraction for OME-native deployments, exposing a scale subresource that HPA and KEDA target directly
+- **TrafficMap:** Control-plane-generated routing projection — the per-home traffic weights a gateway consumes, derived from placement and quota allocation
+- **AcceleratorQuota:** Fleet-level capacity policy; one node of the cluster-scoped accelerator quota tree
+- **WorkloadCluster:** Registry of the workload clusters OME can place onto (multi-cluster reconciliation is still in development)
 
 OME's controller automatically:
 1. Downloads and parses models to understand their characteristics
@@ -121,7 +165,6 @@ High-level overview of the main priorities:
 - KV cache pooling
 - Model Context Protocol (MCP) gateway support
 - Accelerator-aware runtime selection for heterogeneous GPU clusters
-- A kubectl plugin for managing OME resources from the command line
 
 ## Community and Support
 
