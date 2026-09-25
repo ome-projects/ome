@@ -126,6 +126,11 @@ func TestHelpReadOnlyContract(t *testing.T) {
 		if !strings.HasSuffix(sub.Use, " INFERENCESERVICE") || !strings.Contains(sub.Long, "origins only") {
 			t.Fatalf("help=%+v", sub)
 		}
+		if sub.Name() == string(c.Explain) &&
+			(!strings.Contains(sub.Long, "summarizes declared") ||
+				!strings.Contains(sub.Long, "installation routing gate and operator defaults are not read")) {
+			t.Fatalf("explain routing contract missing from help: %s", sub.Long)
+		}
 		for _, name := range []string{"watch", "confirm", "dry-run", "force", "apply", "delete"} {
 			if sub.Flags().Lookup(name) != nil {
 				t.Fatalf("mutation flag=%s", name)

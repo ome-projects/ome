@@ -27,7 +27,7 @@ func ProjectExplain(snapshot c.Result, clock v.Clock) (v.PlacementExplainReport,
 	if err != nil {
 		return v.PlacementExplainReport{}, err
 	}
-	content := v.PlacementExplainContent{Status: status, Fleet: snapshot.Fleet, Clusters: []v.PlacementCluster{}, UnobservedInputs: []v.PlacementValue{"RemoteConnection", "Admission", "Quota", "Capacity", "PolicyDistribution", "RolloutPreflight", "StickyPlacement"}}
+	content := v.PlacementExplainContent{Status: status, Routing: projectRoutingIntent(snapshot.InferenceService), Fleet: snapshot.Fleet, Clusters: []v.PlacementCluster{}, UnobservedInputs: []v.PlacementValue{"RemoteConnection", "Admission", "Quota", "Capacity", "PolicyDistribution", "RolloutPreflight", "StickyPlacement", "OperatorRoutingDefaults"}}
 	if len(snapshot.WorkloadClusters) > 64 {
 		content.Fleet.State = "Unavailable"
 		content.Fleet.Reason = "BudgetExceeded"

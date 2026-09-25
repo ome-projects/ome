@@ -385,6 +385,111 @@ func TestPlacementFourViewsBoundedAndTypedEmptyArrays(t *testing.T) {
 	}
 }
 
+func TestPlacementRoutingIntentCanonicalRejectsRawText(t *testing.T) {
+	content := PlacementExplainContent{Routing: PlacementRoutingIntent{
+		State: "SECRET_STATE\n\x1b[31m", Enablement: "SECRET_ENABLED",
+		CapacityFactors: PlacementRoutingCapacityFactors{Source: "SECRET_SOURCE", Count: -1},
+		Probe: PlacementRoutingProbeIntent{
+			State: "SECRET_PROBE", Method: "SECRET_METHOD",
+			AllFailedPolicy: "SECRET_POLICY", AcceptStatusCount: -1,
+			GateStatusCount: -2, Period: "SECRET_PERIOD", Timeout: "30s",
+		},
+		Capacity: PlacementRoutingCapacityIntent{
+			State: "SECRET_CAPACITY", Method: "SECRET_CAPACITY_METHOD",
+			OptionCount: -1, Period: "1m", Timeout: "SECRET_TIMEOUT", MaxAge: "3m",
+		},
+		Publisher: PlacementRoutingPublisherIntent{State: "SECRET_PUBLISHER", OptionCount: -1},
+	}}
+	canonical := content.Canonical()
+	table := placementRenderTable(t, content.Table())
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"SECRET_STATE", "SECRET_ENABLED", "SECRET_SOURCE", "SECRET_PROBE",
+		"SECRET_METHOD", "SECRET_POLICY", "SECRET_PERIOD", "SECRET_CAPACITY",
+		"SECRET_CAPACITY_METHOD", "SECRET_TIMEOUT", "SECRET_PUBLISHER", "\x1b",
+	} {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("canonical routing intent leaked %q: %s", secret, data)
+		}
+		if strings.Contains(table, secret) {
+			t.Fatalf("routing intent table leaked %q: %s", secret, table)
+		}
+	}
+	if canonical.Routing.State != "Unknown" || canonical.Routing.Enablement != "Unknown" ||
+		canonical.Routing.CapacityFactors.Count != 0 || canonical.Routing.Probe.Period != "" ||
+		canonical.Routing.Probe.Timeout != "30s" || canonical.Routing.Capacity.Period != "1m0s" ||
+		canonical.Routing.Capacity.MaxAge != "3m0s" || canonical.Routing.Publisher.OptionCount != 0 {
+		t.Fatalf("canonical routing intent=%+v", canonical.Routing)
+	}
+}
+
+func TestPlacementRoutingIntentCanonicalOmitsZeroDurations(t *testing.T) {
+	t.Parallel()
+
+	content := PlacementExplainContent{Routing: PlacementRoutingIntent{
+		Probe: PlacementRoutingProbeIntent{
+			Period: "0s", Timeout: "-5s",
+			FailureThreshold: -3, SuccessThreshold: -2,
+		},
+		Capacity: PlacementRoutingCapacityIntent{
+			Period: "0s", Timeout: "-10s", MaxAge: "-3m",
+			Samples: -5, Quorum: -3,
+		},
+	}}
+
+	canonical := content.Canonical()
+	require.Empty(t, canonical.Routing.Probe.Period)
+	require.Equal(t, "-5s", canonical.Routing.Probe.Timeout)
+	require.Equal(t, int32(-3), canonical.Routing.Probe.FailureThreshold)
+	require.Equal(t, int32(-2), canonical.Routing.Probe.SuccessThreshold)
+	require.Empty(t, canonical.Routing.Capacity.Period)
+	require.Equal(t, "-10s", canonical.Routing.Capacity.Timeout)
+	require.Equal(t, "-3m0s", canonical.Routing.Capacity.MaxAge)
+	require.Equal(t, int32(-5), canonical.Routing.Capacity.Samples)
+	require.Equal(t, int32(-3), canonical.Routing.Capacity.Quorum)
+}
+
+func TestPlacementRoutingIntentTablesExposeUnobservedInstallConfig(t *testing.T) {
+	t.Parallel()
+
+	content := PlacementExplainContent{Routing: PlacementRoutingIntent{
+		State:      "Declared",
+		Enablement: "OptIn", // codespell:ignore optin
+		CapacityFactors: PlacementRoutingCapacityFactors{
+			Source: "Routing",
+			Count:  2,
+		},
+		Probe: PlacementRoutingProbeIntent{
+			State:           "Configured",
+			Method:          "HEAD",
+			AllFailedPolicy: "PreserveTraffic",
+		},
+		Capacity: PlacementRoutingCapacityIntent{
+			State:  "Configured",
+			Method: "GET",
+		},
+		Publisher: PlacementRoutingPublisherIntent{
+			State:       "Configured",
+			OptionCount: 1,
+		},
+	}}
+
+	for name, table := range map[string]report.Table{
+		"compact": content.Table(),
+		"wide":    content.WideTable(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			output := placementRenderTable(t, table)
+			require.Contains(t, output, "Install routing")
+			require.Contains(t, output, "Gate/defaults unobserved")
+		})
+	}
+}
+
 func TestPlacementCanonicalEqualIdentityFullFieldTies(t *testing.T) {
 	a := PlacementStatusContent{Placement: PlacementReported{Homes: []PlacementHome{{Cluster: "same", Phase: "Admitted"}, {Cluster: "same", Phase: "Placed"}}}}
 	b := a

@@ -170,8 +170,65 @@ type PlacementCluster struct {
 	ConditionPreview           PlacementPreview   `json:"conditionPreview"`
 }
 
+// PlacementRoutingCapacityFactors describes where the declared per-home
+// capacity overrides came from without copying cluster names or quantities.
+type PlacementRoutingCapacityFactors struct {
+	Source PlacementValue `json:"source"`
+	Count  int            `json:"count"`
+}
+
+// PlacementRoutingProbeIntent is a closed, non-sensitive summary of the
+// declared endpoint-probe contract. Path contents are deliberately omitted.
+type PlacementRoutingProbeIntent struct {
+	State             PlacementValue `json:"state"`
+	PathPresent       bool           `json:"pathPresent"`
+	Method            PlacementValue `json:"method"`
+	AcceptStatusCount int            `json:"acceptStatusCount"`
+	GateStatusCount   int            `json:"gateStatusCount"`
+	Period            string         `json:"period,omitempty"`
+	Timeout           string         `json:"timeout,omitempty"`
+	FailureThreshold  int32          `json:"failureThreshold,omitempty"`
+	SuccessThreshold  int32          `json:"successThreshold,omitempty"`
+	AllFailedPolicy   PlacementValue `json:"allFailedPolicy"`
+}
+
+// PlacementRoutingCapacityIntent is a closed, non-sensitive summary of the
+// declared capacity-poll contract. Paths, format names, keys, and values are
+// never copied into a report.
+type PlacementRoutingCapacityIntent struct {
+	State         PlacementValue `json:"state"`
+	PathPresent   bool           `json:"pathPresent"`
+	Method        PlacementValue `json:"method"`
+	FormatPresent bool           `json:"formatPresent"`
+	OptionCount   int            `json:"optionCount"`
+	Period        string         `json:"period,omitempty"`
+	Timeout       string         `json:"timeout,omitempty"`
+	Samples       int32          `json:"samples,omitempty"`
+	Quorum        int32          `json:"quorum,omitempty"`
+	MaxAge        string         `json:"maxAge,omitempty"`
+}
+
+// PlacementRoutingPublisherIntent reports only whether per-service publisher
+// options were declared and how many; option keys and values remain private.
+type PlacementRoutingPublisherIntent struct {
+	State       PlacementValue `json:"state"`
+	OptionCount int            `json:"optionCount"`
+}
+
+// PlacementRoutingIntent reports only declaration evidence. Operator-level
+// defaults and data-plane realization require separate observations.
+type PlacementRoutingIntent struct {
+	State           PlacementValue                  `json:"state"`
+	Enablement      PlacementValue                  `json:"enablement"`
+	CapacityFactors PlacementRoutingCapacityFactors `json:"capacityFactors"`
+	Probe           PlacementRoutingProbeIntent     `json:"probe"`
+	Capacity        PlacementRoutingCapacityIntent  `json:"capacity"`
+	Publisher       PlacementRoutingPublisherIntent `json:"publisher"`
+}
+
 type PlacementExplainContent struct {
 	Status           PlacementStatusContent `json:"status"`
+	Routing          PlacementRoutingIntent `json:"routing"`
 	Fleet            PlacementAcquisition   `json:"fleet"`
 	Clusters         []PlacementCluster     `json:"clusters"`
 	UnobservedInputs []PlacementValue       `json:"unobservedInputs"`
@@ -275,11 +332,69 @@ func (c PlacementStatusContent) Canonical() PlacementStatusContent {
 
 func (c PlacementExplainContent) Canonical() PlacementExplainContent {
 	c.Status = c.Status.Canonical()
+	c.Routing = placementCanonicalRoutingIntent(c.Routing)
 	c.Clusters = append([]PlacementCluster{}, c.Clusters...)
 	sort.Slice(c.Clusters, func(i, j int) bool { return placementTypedKey(c.Clusters[i]) < placementTypedKey(c.Clusters[j]) })
 	c.UnobservedInputs = append([]PlacementValue{}, c.UnobservedInputs...)
 	c.Issues = placementCanonicalIssues(c.Issues)
 	return c
+}
+
+func placementCanonicalRoutingIntent(in PlacementRoutingIntent) PlacementRoutingIntent {
+	in.State = placementClosedValue(in.State, "Absent", "Declared", "Invalid", "BudgetExceeded")
+	in.Enablement = placementClosedValue(in.Enablement, "Inherited", "OptIn", "OptOut") // codespell:ignore optin
+	in.CapacityFactors.Source = placementClosedValue(
+		in.CapacityFactors.Source, "Inherited", "Routing", "LegacyPlacement", "Conflict",
+	)
+	if in.CapacityFactors.Count < 0 {
+		in.CapacityFactors.Count = 0
+	}
+	in.Probe.State = placementClosedValue(in.Probe.State, "Inherited", "Disabled", "Configured")
+	in.Probe.Method = placementClosedValue(in.Probe.Method, "NotApplicable", "GET", "HEAD", "POST", "Unknown")
+	in.Probe.AllFailedPolicy = placementClosedValue(
+		in.Probe.AllFailedPolicy, "NotApplicable", "PreserveTraffic", "Drain", "Unknown",
+	)
+	if in.Probe.AcceptStatusCount < 0 {
+		in.Probe.AcceptStatusCount = 0
+	}
+	if in.Probe.GateStatusCount < 0 {
+		in.Probe.GateStatusCount = 0
+	}
+	in.Probe.Period = placementDuration(in.Probe.Period)
+	in.Probe.Timeout = placementDuration(in.Probe.Timeout)
+	in.Capacity.State = placementClosedValue(in.Capacity.State, "Inherited", "Disabled", "Configured")
+	in.Capacity.Method = placementClosedValue(in.Capacity.Method, "NotApplicable", "GET", "HEAD", "POST", "Unknown")
+	if in.Capacity.OptionCount < 0 {
+		in.Capacity.OptionCount = 0
+	}
+	in.Capacity.Period = placementDuration(in.Capacity.Period)
+	in.Capacity.Timeout = placementDuration(in.Capacity.Timeout)
+	in.Capacity.MaxAge = placementDuration(in.Capacity.MaxAge)
+	in.Publisher.State = placementClosedValue(in.Publisher.State, "Inherited", "Configured")
+	if in.Publisher.OptionCount < 0 {
+		in.Publisher.OptionCount = 0
+	}
+	return in
+}
+
+func placementClosedValue(value PlacementValue, allowed ...PlacementValue) PlacementValue {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return value
+		}
+	}
+	return "Unknown"
+}
+
+func placementDuration(value string) string {
+	if value == "" {
+		return ""
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration == 0 {
+		return ""
+	}
+	return duration.String()
 }
 
 func (c PlacementEndpointContent) Canonical() PlacementEndpointContent {
@@ -411,9 +526,42 @@ func (c PlacementExplainContent) Table() report.Table {
 }
 
 func (c PlacementExplainContent) placementExplainTable(wide bool) report.Table {
-	rows := placementSummary(c.Status)
+	canonical := c.Canonical()
+	routing := canonical.Routing
+	rows := placementSummary(canonical.Status)
+	rows = append(rows,
+		[]string{"Routing intent", string(routing.State)},
+		[]string{"Routing enablement", string(routing.Enablement)},
+		[]string{"Install routing", "Gate/defaults unobserved"},
+	)
+	if routing.State != "Absent" {
+		rows = append(rows,
+			[]string{"Capacity factors", string(routing.CapacityFactors.Source) + " (" + strconv.Itoa(routing.CapacityFactors.Count) + ")"},
+			[]string{"Routing probe", string(routing.Probe.State)},
+			[]string{"Capacity poll", string(routing.Capacity.State)},
+			[]string{"Publisher options", string(routing.Publisher.State) + " (" + strconv.Itoa(routing.Publisher.OptionCount) + ")"},
+		)
+	}
+	if wide {
+		if routing.Probe.State == "Configured" {
+			rows = append(rows,
+				[]string{"Probe method", string(routing.Probe.Method) + "; path=" + strconv.FormatBool(routing.Probe.PathPresent)},
+				[]string{"Probe statuses", "accept=" + strconv.Itoa(routing.Probe.AcceptStatusCount) + "; gate=" + strconv.Itoa(routing.Probe.GateStatusCount)},
+				[]string{"Probe thresholds", "failure=" + placementOptionalInt32Cell(routing.Probe.FailureThreshold) + "; success=" + placementOptionalInt32Cell(routing.Probe.SuccessThreshold)},
+				[]string{"Probe timing", "period=" + placementOptionalStringCell(routing.Probe.Period) + "; timeout=" + placementOptionalStringCell(routing.Probe.Timeout)},
+				[]string{"All-failed policy", string(routing.Probe.AllFailedPolicy)},
+			)
+		}
+		if routing.Capacity.State == "Configured" {
+			rows = append(rows,
+				[]string{"Capacity method", string(routing.Capacity.Method) + "; path=" + strconv.FormatBool(routing.Capacity.PathPresent) + "; format=" + strconv.FormatBool(routing.Capacity.FormatPresent)},
+				[]string{"Capacity window", "samples=" + placementOptionalInt32Cell(routing.Capacity.Samples) + "; quorum=" + placementOptionalInt32Cell(routing.Capacity.Quorum) + "; options=" + strconv.Itoa(routing.Capacity.OptionCount)},
+				[]string{"Capacity timing", "period=" + placementOptionalStringCell(routing.Capacity.Period) + "; timeout=" + placementOptionalStringCell(routing.Capacity.Timeout) + "; maxAge=" + placementOptionalStringCell(routing.Capacity.MaxAge)},
+			)
+		}
+	}
 	rows = append(rows, placementAcquisitionRows("Fleet", c.Fleet)...)
-	clusters := c.Canonical().Clusters
+	clusters := canonical.Clusters
 	if !wide && len(clusters) > 4 {
 		rows = append(rows, []string{"Cluster preview", "4/" + strconv.Itoa(len(clusters)) + "; use -o wide or json"})
 		clusters = clusters[:4]
@@ -428,6 +576,20 @@ func (c PlacementExplainContent) placementExplainTable(wide bool) report.Table {
 	rows = append(rows, placementIssueRows(c.Issues)...)
 	rows = append(rows, []string{"Hint", "WLC Ready is reachability, not capacity"}, []string{"Hint", "Partial fleet: no global eligibility verdict"}, []string{"View", "Bounded cells; use -o json for complete identities"})
 	return placementTable(rows)
+}
+
+func placementOptionalInt32Cell(value int32) string {
+	if value == 0 {
+		return "-"
+	}
+	return strconv.Itoa(int(value))
+}
+
+func placementOptionalStringCell(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func (c PlacementExplainContent) WideTable() report.Table { return c.placementExplainTable(true) }

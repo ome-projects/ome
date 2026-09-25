@@ -32,12 +32,15 @@ func newReadCmd(f factory.Factory, streams genericiooptions.IOStreams, view c.Vi
 		Use: string(view) + " INFERENCESERVICE", Short: short,
 		Long: `Inspect bounded current-context observations for one InferenceService.
 Placement freshness is unverifiable; reported addresses do not prove success.
-Explain computes only standard label-selector compatibility. WLC Ready is
+Explain computes standard label-selector compatibility and summarizes declared
+routing overrides.
+The installation routing gate and operator defaults are not read. WLC Ready is
 reported control-plane reachability, not capacity, quota, or eligibility.
 Endpoint shows origins only, not full URLs. Routing weights are reported
 verbatim; publisher acknowledgement and recorded probes are separate facts.
 Optional missing or unreadable sources remain diagnostics. No remote clients,
-credential/profile resolution, endpoint probes, mutations, or watches are used.`,
+credential/profile resolution, endpoint probes, mutations, or watches are
+used.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cmd.Context(), f, streams, view, args[0], output, clock)
