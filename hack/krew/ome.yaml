@@ -13,8 +13,12 @@ spec:
     explanations powered by the operator's own scoring engine, and
     component-aware log streaming.
   caveats: |
-    This plugin is read-only and needs get/list on ome.io resources plus
-    pods, pods/log and events. See the docs for an example ClusterRole:
+    Inspection commands are read-only, and read pods, pods/log, events,
+    configmaps, apps/deployments and apps/controllerrevisions alongside
+    ome.io resources. Action commands (rollout, traffic, migration start,
+    scale, runtime sync, instance release-held) patch inferenceservices,
+    inferencereplicas and inferencereplicas/scale. The docs carry
+    ClusterRoles with the exact verbs:
     https://ome-projects.github.io/ome/docs/tasks/kubectl-ome/
   platforms:
     - selector: {matchLabels: {os: linux, arch: amd64}}
