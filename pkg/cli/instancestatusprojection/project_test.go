@@ -296,6 +296,119 @@ func TestProjectReportsCollectedStatusEncoding(t *testing.T) {
 	}
 }
 
+func TestProjectOperationBlockerIsEquivalentAcrossStatusEncodings(t *testing.T) {
+	t.Parallel()
+
+	started := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	refused := metav1.NewTime(started.Add(5 * time.Minute))
+	operation := &omev1beta1.InstanceOperation{
+		ID: "op-1", Type: omev1beta1.InstanceOperationUpdate, Step: "WaitReady",
+		StartedAt: started, LastProgressAt: started, Waiting: "QuotaExceeded",
+		CapacityRefusedAt: &refused, Strategy: "SurgeThenDrain",
+	}
+
+	dense := projectEncodedOperation(t, false, operation)
+	columnar := projectEncodedOperation(t, true, operation)
+	require.NotNil(t, dense.Content.Instance)
+	require.NotNil(t, dense.Content.Instance.Operation)
+	require.NotNil(t, columnar.Content.Instance)
+	require.NotNil(t, columnar.Content.Instance.Operation)
+	assert.Equal(t, mustJSON(t, dense.Content.Instance.Operation), mustJSON(t, columnar.Content.Instance.Operation))
+	assert.Equal(t, "QuotaExceeded", dense.Content.Instance.Operation.Waiting)
+	require.NotNil(t, dense.Content.Instance.Operation.CapacityRefusedAt)
+	assert.Equal(t, refused.Time.UTC(), *dense.Content.Instance.Operation.CapacityRefusedAt)
+	assert.Equal(t, "SurgeThenDrain", dense.Content.Instance.Operation.Strategy)
+}
+
+func TestProjectOperationWaitingKnownValues(t *testing.T) {
+	t.Parallel()
+
+	for _, waiting := range []string{
+		"QuotaExceeded", "NodeUnknown", "SourceUnrouted", "Unschedulable", "PodGroupTerminating", "Paused",
+	} {
+		waiting := waiting
+		t.Run(waiting, func(t *testing.T) {
+			t.Parallel()
+			got := projectOperation(t, &omev1beta1.InstanceOperation{Waiting: waiting})
+			require.NotNil(t, got.Content.Instance.Operation)
+			assert.Equal(t, waiting, got.Content.Instance.Operation.Waiting)
+			assert.NotContains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationWaitingUnknown)
+		})
+	}
+}
+
+func TestProjectOperationStrategyKnownValues(t *testing.T) {
+	t.Parallel()
+
+	for _, strategy := range []string{
+		"SurgeThenDrain", "RecreatePod", "InPlaceIfPossible", "InPlaceOnly",
+	} {
+		strategy := strategy
+		t.Run(strategy, func(t *testing.T) {
+			t.Parallel()
+			got := projectOperation(t, &omev1beta1.InstanceOperation{Strategy: strategy})
+			require.NotNil(t, got.Content.Instance.Operation)
+			assert.Equal(t, strategy, got.Content.Instance.Operation.Strategy)
+			assert.NotContains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationStrategyUnknown)
+		})
+	}
+}
+
+func TestProjectCapacityRefusedWithoutWaitingRemainsVisible(t *testing.T) {
+	t.Parallel()
+
+	refused := metav1.NewTime(time.Date(2026, 9, 14, 20, 5, 0, 0, time.UTC))
+	got := projectOperation(t, &omev1beta1.InstanceOperation{CapacityRefusedAt: &refused})
+	require.NotNil(t, got.Content.Instance.Operation)
+	assert.Empty(t, got.Content.Instance.Operation.Waiting)
+	require.NotNil(t, got.Content.Instance.Operation.CapacityRefusedAt)
+	assert.Equal(t, refused.Time.UTC(), *got.Content.Instance.Operation.CapacityRefusedAt)
+	assert.Contains(t, mustJSON(t, got), `"capacityRefusedAt":"2026-09-14T20:05:00Z"`)
+}
+
+func TestProjectOperationBlockerUnknownTokensAreBoundedAndPrivate(t *testing.T) {
+	t.Parallel()
+
+	rawWaiting := "Future\nSECRET_WAITING\x1b[31m"
+	rawStrategy := "Future\nSECRET_STRATEGY\x1b[31m"
+	got := projectOperation(t, &omev1beta1.InstanceOperation{Waiting: rawWaiting, Strategy: rawStrategy})
+	require.NotNil(t, got.Content.Instance.Operation)
+	assert.Equal(t, "Unknown", got.Content.Instance.Operation.Waiting)
+	assert.Equal(t, "Unknown", got.Content.Instance.Operation.Strategy)
+	assert.Equal(t, 1, countIssueCode(got, reportv1alpha1.InstanceStatusIssueOperationWaitingUnknown))
+	assert.Equal(t, 1, countIssueCode(got, reportv1alpha1.InstanceStatusIssueOperationStrategyUnknown))
+
+	for _, format := range []report.Format{report.FormatTable, report.FormatJSON, report.FormatYAML} {
+		var output bytes.Buffer
+		require.NoError(t, report.Write(&output, format, got))
+		assert.NotContains(t, output.String(), "SECRET_WAITING")
+		assert.NotContains(t, output.String(), "SECRET_STRATEGY")
+		assert.NotContains(t, output.String(), rawWaiting)
+		assert.NotContains(t, output.String(), rawStrategy)
+		assert.Contains(t, output.String(), "OperationWaitingUnknown")
+		assert.Contains(t, output.String(), "OperationStrategyUnknown")
+	}
+}
+
+func TestProjectRejectsMalformedCapacityRefusedTimes(t *testing.T) {
+	t.Parallel()
+
+	started := time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC)
+	for name, refused := range map[string]metav1.Time{
+		"zero":         {},
+		"before start": metav1.NewTime(started.Add(-time.Second)),
+	} {
+		name, refused := name, refused
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := projectOperation(t, &omev1beta1.InstanceOperation{CapacityRefusedAt: &refused})
+			require.NotNil(t, got.Content.Instance)
+			assert.Nil(t, got.Content.Instance.Operation)
+			assert.Contains(t, issueCodes(got), reportv1alpha1.InstanceStatusIssueOperationInvalid)
+		})
+	}
+}
+
 func TestProjectRejectsSelectorBlindWrongNamespaceLabelsIndexAndOwner(t *testing.T) {
 	t.Parallel()
 
@@ -1358,6 +1471,47 @@ func statusInput() instancestatusprojection.Input {
 	}
 }
 
+func projectOperation(t *testing.T, fields *omev1beta1.InstanceOperation) reportv1alpha1.InstanceStatusReport {
+	t.Helper()
+	started := metav1.NewTime(time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC))
+	operation := fields.DeepCopy()
+	operation.ID = "op-1"
+	operation.Type = omev1beta1.InstanceOperationUpdate
+	operation.Step = "WaitReady"
+	operation.StartedAt = started
+	operation.LastProgressAt = started
+	return projectEncodedOperation(t, false, operation)
+}
+
+func projectEncodedOperation(t *testing.T, columnar bool, operation *omev1beta1.InstanceOperation) reportv1alpha1.InstanceStatusReport {
+	t.Helper()
+	input := statusInput()
+	replica := input.Collection.Items[0]
+	replica.Status.InstanceStatuses[0].Operation = operation.DeepCopy()
+	if columnar {
+		columns, err := irstatus.EncodeColumns(replica.Status.InstanceStatuses, 100)
+		require.NoError(t, err)
+		encoding := omev1beta1.InstanceStatusEncodingColumnarV2
+		replica.Status.InstanceStatusEncoding = &encoding
+		replica.Status.InstanceStatusColumns = columns
+		replica.Status.InstanceStatuses = nil
+	}
+	collection, err := instancecollection.CollectRelated(context.Background(), conditionLister{replica}, input.InferenceService, instancecollection.Limits{
+		Paging:        paging.Limits{PageSize: 20, MaxItems: 60, MaxPages: 3, RequestTimeout: time.Second},
+		MaxStatusRows: 100,
+		Details: instancecollection.DetailLimits{
+			MaxConditions: 16, MaxScannedConditions: 64, MaxNodeHints: 16, MaxScannedNodeHints: 64,
+			MaxMigrations: 16, MaxScannedMigrations: 64,
+			SelectedComponent: omev1beta1.EngineComponent, SelectedIndex: 2,
+		},
+	})
+	require.NoError(t, err)
+	input.Collection = collection
+	got, err := instancestatusprojection.Project(input, statusLimits(), fixedClock())
+	require.NoError(t, err)
+	return got
+}
+
 func statusLimits() instancestatusprojection.Limits {
 	return instancestatusprojection.Limits{MaxInstances: 100, MaxPods: 8, MaxContainerStatuses: 16, MaxPodConditions: 16, MaxEvents: 32}
 }
@@ -1416,6 +1570,16 @@ func issueCodes(report reportv1alpha1.InstanceStatusReport) []reportv1alpha1.Ins
 		codes[i] = report.Content.Issues[i].Code
 	}
 	return codes
+}
+
+func countIssueCode(report reportv1alpha1.InstanceStatusReport, want reportv1alpha1.InstanceStatusIssueCode) int {
+	count := 0
+	for _, code := range issueCodes(report) {
+		if code == want {
+			count++
+		}
+	}
+	return count
 }
 
 func warningCodes(report reportv1alpha1.InstanceStatusReport) []reportv1alpha1.WarningCode {

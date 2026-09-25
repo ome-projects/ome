@@ -63,6 +63,8 @@ const (
 	InstanceStatusIssueConditionGenerationStale  InstanceStatusIssueCode = "ConditionGenerationStale"
 	InstanceStatusIssueOperationDetailsTruncated InstanceStatusIssueCode = "OperationDetailsTruncated"
 	InstanceStatusIssueOperationInvalid          InstanceStatusIssueCode = "OperationInvalid"
+	InstanceStatusIssueOperationWaitingUnknown   InstanceStatusIssueCode = "OperationWaitingUnknown"
+	InstanceStatusIssueOperationStrategyUnknown  InstanceStatusIssueCode = "OperationStrategyUnknown"
 	InstanceStatusIssueLastFailureInvalid        InstanceStatusIssueCode = "LastFailureInvalid"
 	InstanceStatusIssuePodsUnavailable           InstanceStatusIssueCode = "PodsUnavailable"
 	InstanceStatusIssuePodsTruncated             InstanceStatusIssueCode = "PodsTruncated"
@@ -108,19 +110,22 @@ type InstanceStatusCondition struct {
 }
 
 type InstanceStatusOperation struct {
-	ID              string     `json:"id"`
-	Type            string     `json:"type"`
-	Step            string     `json:"step"`
-	StartedAt       *time.Time `json:"startedAt,omitempty"`
-	LastProgressAt  *time.Time `json:"lastProgressAt,omitempty"`
-	Deadline        *time.Time `json:"deadline,omitempty"`
-	RetryCount      int32      `json:"retryCount"`
-	TargetRevision  string     `json:"targetRevision,omitempty"`
-	Reason          string     `json:"reason,omitempty"`
-	SurgeIndex      *int32     `json:"surgeIndex,omitempty"`
-	FromNode        string     `json:"fromNode,omitempty"`
-	TargetNodeHints []string   `json:"targetNodeHints"`
-	RequestUUID     string     `json:"requestUUID,omitempty"`
+	ID                string     `json:"id"`
+	Type              string     `json:"type"`
+	Step              string     `json:"step"`
+	StartedAt         *time.Time `json:"startedAt,omitempty"`
+	LastProgressAt    *time.Time `json:"lastProgressAt,omitempty"`
+	Deadline          *time.Time `json:"deadline,omitempty"`
+	RetryCount        int32      `json:"retryCount"`
+	TargetRevision    string     `json:"targetRevision,omitempty"`
+	Reason            string     `json:"reason,omitempty"`
+	Waiting           string     `json:"waiting,omitempty"`
+	CapacityRefusedAt *time.Time `json:"capacityRefusedAt,omitempty"`
+	Strategy          string     `json:"strategy,omitempty"`
+	SurgeIndex        *int32     `json:"surgeIndex,omitempty"`
+	FromNode          string     `json:"fromNode,omitempty"`
+	TargetNodeHints   []string   `json:"targetNodeHints"`
+	RequestUUID       string     `json:"requestUUID,omitempty"`
 }
 
 type InstanceStatusFailure struct {
@@ -377,6 +382,9 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 		operation.Step = safeInstanceStatusText(operation.Step, 128)
 		operation.TargetRevision = safeInstanceStatusText(operation.TargetRevision, 253)
 		operation.Reason = safeInstanceStatusText(operation.Reason, instanceStatusTextWidth)
+		operation.Waiting = safeInstanceStatusText(operation.Waiting, 32)
+		operation.CapacityRefusedAt = copyInstanceStatusTime(operation.CapacityRefusedAt)
+		operation.Strategy = safeInstanceStatusText(operation.Strategy, 32)
 		operation.FromNode = safeInstanceStatusText(operation.FromNode, 253)
 		operation.RequestUUID = safeInstanceStatusText(operation.RequestUUID, 128)
 		operation.StartedAt = copyInstanceStatusTime(operation.StartedAt)
@@ -425,6 +433,12 @@ func (r InstanceStatusReport) Table() report.Table {
 			add("operation", fmt.Sprintf("%s id=%s step=%s retry=%d", operation.Type, operation.ID, operation.Step, operation.RetryCount))
 			add("op target", fmt.Sprintf("revision=%s reason=%s", instanceStatusDash(operation.TargetRevision), instanceStatusDash(operation.Reason)))
 			add("op timing", fmt.Sprintf("start=%s progress=%s deadline=%s", statusTime(operation.StartedAt), statusTime(operation.LastProgressAt), statusTime(operation.Deadline)))
+			if operation.Waiting != "" || operation.CapacityRefusedAt != nil {
+				add("op hold", fmt.Sprintf("waiting=%s refused=%s", instanceStatusDash(operation.Waiting), statusTime(operation.CapacityRefusedAt)))
+			}
+			if operation.Strategy != "" {
+				add("op strategy", operation.Strategy)
+			}
 			add("op nodes", fmt.Sprintf("from=%s surge=%s hints=%s", instanceStatusDash(operation.FromNode), statusInt32(operation.SurgeIndex), instanceStatusDash(strings.Join(operation.TargetNodeHints, ","))))
 		}
 		if failure := instance.LastFailure; failure != nil {
@@ -529,6 +543,12 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add("operation started", statusTime(operation.StartedAt))
 			add("operation progress", statusTime(operation.LastProgressAt))
 			add("operation deadline", statusTime(operation.Deadline))
+			if operation.Waiting != "" || operation.CapacityRefusedAt != nil {
+				add("op hold", fmt.Sprintf("waiting=%s refused=%s", instanceStatusDash(operation.Waiting), statusTime(operation.CapacityRefusedAt)))
+			}
+			if operation.Strategy != "" {
+				add("op strategy", operation.Strategy)
+			}
 		}
 		if failure := instance.LastFailure; failure != nil {
 			add("failure pod", failure.PodName)

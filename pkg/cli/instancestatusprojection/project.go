@@ -327,11 +327,20 @@ func projectAuthoritative(
 	}
 	if raw.Operation != nil {
 		if validOperation(raw.Operation) {
+			waiting, waitingUnknown := normalizeOperationWaiting(raw.Operation.Waiting)
+			if waitingUnknown {
+				addIssue(report, reportv1alpha1.InstanceStatusIssueOperationWaitingUnknown, "")
+			}
+			strategy, strategyUnknown := normalizeOperationStrategy(raw.Operation.Strategy)
+			if strategyUnknown {
+				addIssue(report, reportv1alpha1.InstanceStatusIssueOperationStrategyUnknown, "")
+			}
 			result.Operation = &reportv1alpha1.InstanceStatusOperation{
 				ID: raw.Operation.ID, Type: string(raw.Operation.Type), Step: raw.Operation.Step,
 				StartedAt: metaTimePointer(raw.Operation.StartedAt), LastProgressAt: metaTimePointer(raw.Operation.LastProgressAt),
 				Deadline: metaTimePointer(raw.Operation.Deadline), RetryCount: raw.Operation.RetryCount,
 				TargetRevision: raw.Operation.TargetRevision, Reason: raw.Operation.Reason,
+				Waiting: waiting, CapacityRefusedAt: metaTimePointerValue(raw.Operation.CapacityRefusedAt), Strategy: strategy,
 				SurgeIndex: copyInt32(raw.Operation.SurgeIndex), FromNode: raw.Operation.FromNode,
 				TargetNodeHints: append([]string{}, raw.Operation.HintTargetNodes...), RequestUUID: raw.Operation.RequestUUID,
 			}
@@ -769,7 +778,8 @@ func validOperation(operation *omev1beta1.InstanceOperation) bool {
 		(operation.SurgeIndex != nil && *operation.SurgeIndex < 0) ||
 		operation.StartedAt.IsZero() || operation.LastProgressAt.IsZero() ||
 		operation.LastProgressAt.Before(&operation.StartedAt) ||
-		(!operation.Deadline.IsZero() && operation.Deadline.Before(&operation.StartedAt)) {
+		(!operation.Deadline.IsZero() && operation.Deadline.Before(&operation.StartedAt)) ||
+		(operation.CapacityRefusedAt != nil && (operation.CapacityRefusedAt.IsZero() || operation.CapacityRefusedAt.Before(&operation.StartedAt))) {
 		return false
 	}
 	switch operation.Type {
@@ -779,6 +789,28 @@ func validOperation(operation *omev1beta1.InstanceOperation) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func normalizeOperationWaiting(value string) (string, bool) {
+	switch value {
+	case "":
+		return "", false
+	case "QuotaExceeded", "NodeUnknown", "SourceUnrouted", "Unschedulable", "PodGroupTerminating", "Paused":
+		return value, false
+	default:
+		return "Unknown", true
+	}
+}
+
+func normalizeOperationStrategy(value string) (string, bool) {
+	switch value {
+	case "":
+		return "", false
+	case "SurgeThenDrain", "RecreatePod", "InPlaceIfPossible", "InPlaceOnly":
+		return value, false
+	default:
+		return "Unknown", true
 	}
 }
 
