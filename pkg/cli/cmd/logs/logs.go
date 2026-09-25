@@ -64,9 +64,6 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 }
 
 func newCmdWithDependencies(f factory.Factory, streams genericiooptions.IOStreams, deps dependencies) *cobra.Command {
-	if deps.openLogStream == nil {
-		deps.openLogStream = defaultOpenLogStream
-	}
 	o := &Options{
 		IOStreams:      streams,
 		Instance:       -1,
@@ -154,6 +151,9 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 }
 
 func (o *Options) run(ctx context.Context, f factory.Factory, deps dependencies) error {
+	if deps.openLogStream == nil {
+		deps.openLogStream = defaultOpenLogStream
+	}
 	ns, _, err := f.Namespace()
 	if err != nil {
 		return err

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,8 +17,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/cli/factory"
@@ -76,6 +79,55 @@ func TestLogsPrefixesMultiplePods(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "[engine/llama-engine-1] fake logs")
 	assert.Contains(t, out, "[decoder/llama-decoder-1] fake logs")
+}
+
+func TestOptionsRunUsesDefaultLogStreamAndClosesResponse(t *testing.T) {
+	logBody := newCountingReadCloser(strings.NewReader("direct run logs\n"))
+	kube, err := kubernetes.NewForConfig(&rest.Config{
+		Host: "https://fixture.invalid",
+		Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Request:    request,
+			}
+			switch request.URL.Path {
+			case "/api/v1/namespaces/team-a/pods":
+				response.Header.Set("Content-Type", "application/json")
+				response.Body = io.NopCloser(strings.NewReader(`{
+					"apiVersion":"v1",
+					"kind":"PodList",
+					"metadata":{"resourceVersion":"1"},
+					"items":[{
+						"apiVersion":"v1",
+						"kind":"Pod",
+						"metadata":{"name":"chat-engine-0","namespace":"team-a","labels":{"ome.io/inferenceservice":"chat","component":"engine"}},
+						"spec":{"containers":[{"name":"main"}]}
+					}]
+				}`))
+			case "/api/v1/namespaces/team-a/pods/chat-engine-0/log":
+				response.Header.Set("Content-Type", "text/plain")
+				response.Body = logBody
+			default:
+				response.StatusCode = http.StatusNotFound
+				response.Body = io.NopCloser(strings.NewReader("not found"))
+			}
+			return response, nil
+		}),
+	})
+	require.NoError(t, err)
+	var out bytes.Buffer
+	options := &Options{
+		IOStreams:      genericiooptions.IOStreams{Out: &out},
+		Name:           "chat",
+		Instance:       -1,
+		Tail:           -1,
+		MaxLogRequests: defaultMaxLogRequests,
+	}
+
+	require.NoError(t, options.Run(context.Background(), factory.Static{Kube: kube, NS: "team-a"}))
+	assert.Equal(t, "direct run logs\n", out.String())
+	assert.Equal(t, int32(1), logBody.closes.Load())
 }
 
 func TestLogsComponentFilterSinglePodNoPrefix(t *testing.T) {
