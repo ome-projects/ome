@@ -213,7 +213,7 @@ func (b *projector) projectGroups() {
 		for index := range groups {
 			if index == collapsed[0] {
 				b.projectSequential(groups, collapsed)
-			} else if groups[index].Canary != nil {
+			} else if declaredStrategy(&groups[index]) == reportv1alpha1.RolloutStrategyCanary {
 				b.projectGroup(index, &groups[index])
 			}
 		}
@@ -228,7 +228,7 @@ func (b *projector) projectGroups() {
 func (b *projector) rejectUnexpectedCanaryStatuses(groups []omev1beta1.RolloutGroup) {
 	primaries := make(map[omev1beta1.ComponentType]struct{})
 	for _, group := range groups {
-		if group.Canary != nil {
+		if declaredStrategy(&group) == reportv1alpha1.RolloutStrategyCanary {
 			primaries[canaryPrimary(group.Components)] = struct{}{}
 		}
 	}
@@ -281,13 +281,14 @@ func (b *projector) collapsedSequentialIndices(groups []omev1beta1.RolloutGroup)
 	indices := make([]int, 0, len(groups))
 	for i := range groups {
 		group := &groups[i]
-		if group.Canary != nil {
+		strategy := declaredStrategy(group)
+		if strategy == reportv1alpha1.RolloutStrategyCanary {
 			if group.BlueGreen != nil || group.RollingUpdate != nil {
 				return nil
 			}
 			continue
 		}
-		if len(group.Components) != 1 || group.RollingUpdate != nil {
+		if strategy != reportv1alpha1.RolloutStrategyBlueGreen || len(group.Components) != 1 || group.RollingUpdate != nil {
 			return nil
 		}
 		indices = append(indices, i)
@@ -327,25 +328,24 @@ func (b *projector) projectSequential(groups []omev1beta1.RolloutGroup, indices 
 	b.content.Groups = append(b.content.Groups, projected)
 }
 
+func declaredStrategy(group *omev1beta1.RolloutGroup) reportv1alpha1.RolloutStrategy {
+	return projectProgression(group.DeclaredProgression())
+}
+
 func (b *projector) projectGroup(index int, group *omev1beta1.RolloutGroup) {
 	projected := reportv1alpha1.RolloutGroupStatus{
 		Index: index, Phase: reportv1alpha1.RolloutPhaseUnknown,
+		Strategy: declaredStrategy(group),
 	}
 	progressions := 0
 	if group.Canary != nil {
 		progressions++
-		projected.Strategy = reportv1alpha1.RolloutStrategyCanary
 	}
 	if group.BlueGreen != nil {
 		progressions++
-		projected.Strategy = reportv1alpha1.RolloutStrategyBlueGreen
 	}
 	if group.RollingUpdate != nil {
 		progressions++
-		projected.Strategy = reportv1alpha1.RolloutStrategyRollingUpdate
-	}
-	if progressions == 0 {
-		projected.Strategy = reportv1alpha1.RolloutStrategyBlueGreen
 	}
 	if progressions > 1 {
 		projected.Strategy = reportv1alpha1.RolloutStrategyUnknown
@@ -375,11 +375,12 @@ func (b *projector) projectGroup(index int, group *omev1beta1.RolloutGroup) {
 		b.markMalformed(reportv1alpha1.RolloutIssueSpecMalformed, ptrInt(index), "")
 	}
 
-	if group.Canary != nil && progressions == 1 {
+	if projected.Strategy == reportv1alpha1.RolloutStrategyCanary {
 		b.applyCanaryStatus(&projected, group)
-	} else if progressions <= 1 {
+	} else if projected.Strategy == reportv1alpha1.RolloutStrategyBlueGreen ||
+		projected.Strategy == reportv1alpha1.RolloutStrategyRollingUpdate {
 		expectedPolicy := omev1beta1.CoordinationPolicyBlueGreen
-		if group.RollingUpdate != nil {
+		if projected.Strategy == reportv1alpha1.RolloutStrategyRollingUpdate {
 			expectedPolicy = omev1beta1.CoordinationPolicyRollingUpdate
 		}
 		if observed := b.coordinationGroup(strconv.Itoa(index)); observed != nil {
@@ -418,11 +419,18 @@ func (b *projector) applyCanaryStatus(
 		b.markMalformed(reportv1alpha1.RolloutIssueRevisionNameInvalid, ptrInt(projected.Index), "")
 	}
 	if projected.Phase == reportv1alpha1.RolloutPhaseStable {
-		b.applyCompletedCanaryStatus(projected, group, primary, status)
+		if group.Canary != nil {
+			b.applyCompletedCanaryStatus(projected, group, primary, status)
+		}
 		return
 	}
 	if !canaryPhaseNeedsStatus(projected.Phase) {
 		b.markMalformed(reportv1alpha1.RolloutIssueCanaryStatusUnexpected, ptrInt(projected.Index), "")
+		return
+	}
+	// A policy reference declares Canary without supplying its steps. Preserve
+	// observed phase and revisions, but do not invent or validate a step body.
+	if group.Canary == nil {
 		return
 	}
 	if status.CurrentStep < 0 || int(status.CurrentStep) >= len(group.Canary.Steps) {
@@ -500,7 +508,7 @@ func canaryStatusForGroup(
 	// multiple groups exist, that alias does not identify which run it belongs to.
 	canaryGroups := 0
 	for _, group := range groups {
-		if group.Canary != nil {
+		if declaredStrategy(&group) == reportv1alpha1.RolloutStrategyCanary {
 			canaryGroups++
 		}
 	}

@@ -111,6 +111,106 @@ func TestProjectCanaryProducesSafeFaithfulReport(t *testing.T) {
 	}
 }
 
+func TestProjectDeclaredProgressionMatchesExplain(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		progression omev1beta1.RolloutProgressionKind
+		blueGreen   *omev1beta1.GroupBlueGreen
+		want        reportv1alpha1.RolloutStrategy
+	}{
+		{name: "policy Canary", progression: omev1beta1.RolloutProgressionCanary, want: reportv1alpha1.RolloutStrategyCanary},
+		{name: "policy RollingUpdate", progression: omev1beta1.RolloutProgressionRollingUpdate, want: reportv1alpha1.RolloutStrategyRollingUpdate},
+		{name: "policy BlueGreen", progression: omev1beta1.RolloutProgressionBlueGreen, want: reportv1alpha1.RolloutStrategyBlueGreen},
+		{name: "inline BlueGreen shadows policy Canary", progression: omev1beta1.RolloutProgressionCanary, blueGreen: &omev1beta1.GroupBlueGreen{}, want: reportv1alpha1.RolloutStrategyBlueGreen},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := baseInferenceService()
+			isvc.Spec.Rollout = &omev1beta1.RolloutSpec{Groups: []omev1beta1.RolloutGroup{{
+				Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+				PolicyRef:  &omev1beta1.RolloutPolicyRef{Name: "guarded", Progression: tc.progression},
+				BlueGreen:  tc.blueGreen,
+			}}}
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+			require.NoError(t, err)
+			require.Len(t, got.Content.Groups, 1)
+			assert.Equal(t, tc.want, got.Content.Groups[0].Strategy)
+			explained, err := rolloutprojection.ProjectExplain(isvc, fixedClock())
+			require.NoError(t, err)
+			require.Len(t, explained.Content.DeclaredGroups, 1)
+			assert.Equal(t, explained.Content.DeclaredGroups[0].Strategy, got.Content.Groups[0].Strategy)
+		})
+	}
+}
+
+func TestProjectPolicyRefCanaryAcceptsPrimaryStatus(t *testing.T) {
+	for _, perComponent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("per component=%t", perComponent), func(t *testing.T) {
+			isvc := activeCanaryInferenceService()
+			group := &isvc.Spec.Rollout.Groups[0]
+			group.Canary = nil
+			group.PolicyRef = &omev1beta1.RolloutPolicyRef{Name: "guarded", Progression: omev1beta1.RolloutProgressionCanary}
+			if perComponent {
+				component := isvc.Status.Components[omev1beta1.EngineComponent]
+				component.Canary = isvc.Status.Canary
+				isvc.Status.Components[omev1beta1.EngineComponent] = component
+				isvc.Status.Canary = nil
+			}
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+			require.NoError(t, err)
+			require.Len(t, got.Content.Groups, 1)
+			assert.Equal(t, reportv1alpha1.RolloutStrategyCanary, got.Content.Groups[0].Strategy)
+			assert.Equal(t, reportv1alpha1.RolloutPhaseCanarying, got.Content.Groups[0].Phase)
+			assert.Equal(t, "bbbbbbbb", got.Content.Groups[0].TargetRevisionHash)
+			assert.Nil(t, got.Content.Groups[0].Step, "the referenced policy's steps are not known")
+			for _, issue := range got.Content.Issues {
+				assert.NotEqual(t, reportv1alpha1.RolloutIssueCanaryStatusUnexpected, issue.Code)
+			}
+		})
+	}
+}
+
+func TestProjectPolicyRefCanaryRemainsOutsideSequentialGroup(t *testing.T) {
+	for _, index := range []int{0, 1, 2} {
+		t.Run(fmt.Sprint(index), func(t *testing.T) {
+			isvc := mixedConcurrentInferenceService(index)
+			group := &isvc.Spec.Rollout.Groups[index]
+			group.Canary = nil
+			group.PolicyRef = &omev1beta1.RolloutPolicyRef{Name: "guarded", Progression: omev1beta1.RolloutProgressionCanary}
+
+			got, err := rolloutprojection.Project(isvc, fixedClock())
+			require.NoError(t, err)
+			require.Len(t, got.Content.Groups, 2)
+			for _, projected := range got.Content.Groups {
+				if projected.Index == index {
+					assert.Equal(t, reportv1alpha1.RolloutStrategyCanary, projected.Strategy)
+					assert.Equal(t, []reportv1alpha1.RuntimeComponentType{reportv1alpha1.RuntimeComponentRouter}, projected.Components)
+				} else {
+					assert.Equal(t, reportv1alpha1.RolloutStrategySequential, projected.Strategy)
+					assert.Equal(t, []reportv1alpha1.RuntimeComponentType{reportv1alpha1.RuntimeComponentDecoder, reportv1alpha1.RuntimeComponentEngine}, projected.Components)
+				}
+			}
+		})
+	}
+}
+
+func TestProjectPolicyRefRollingUpdateDoesNotCollapse(t *testing.T) {
+	isvc := sequentialInferenceService()
+	ordering := omev1beta1.RolloutGroupOrderingConcurrent
+	isvc.Spec.Rollout.GroupOrdering = &ordering
+	isvc.Spec.Rollout.Groups[0].PolicyRef = &omev1beta1.RolloutPolicyRef{
+		Name: "rolling", Progression: omev1beta1.RolloutProgressionRollingUpdate,
+	}
+	isvc.Status.RolloutCoordination = nil
+
+	got, err := rolloutprojection.Project(isvc, fixedClock())
+	require.NoError(t, err)
+	require.Len(t, got.Content.Groups, 2)
+	assert.Equal(t, reportv1alpha1.RolloutStrategyRollingUpdate, got.Content.Groups[0].Strategy)
+	assert.Equal(t, reportv1alpha1.RolloutStrategyBlueGreen, got.Content.Groups[1].Strategy)
+}
+
 func TestProjectUsesPinnedCanaryPlanForPolicyOnlyLiveGroup(t *testing.T) {
 	isvc := activeCanaryInferenceService()
 	pinnedGroup := isvc.Spec.Rollout.Groups[0]
