@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/cli/instanceannouncement"
 	"sigs.k8s.io/ome/pkg/cli/instancecollection"
 	"sigs.k8s.io/ome/pkg/cli/instanceprojection"
 	"sigs.k8s.io/ome/pkg/cli/observation"
@@ -37,6 +38,7 @@ type Limits struct {
 	MaxContainerStatuses int
 	MaxPodConditions     int
 	MaxEvents            int
+	MaxAnnouncements     int
 }
 
 type Input struct {
@@ -126,7 +128,7 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		return reportv1alpha1.InstanceStatusReport{}, ErrInvalidIndex
 	}
 	if limits.MaxInstances <= 0 || limits.MaxPods <= 0 || limits.MaxContainerStatuses <= 0 ||
-		limits.MaxPodConditions <= 0 || limits.MaxEvents <= 0 {
+		limits.MaxPodConditions <= 0 || limits.MaxEvents <= 0 || limits.MaxAnnouncements <= 0 {
 		return reportv1alpha1.InstanceStatusReport{}, ErrInvalidLimits
 	}
 	list, err := instanceprojection.Project(instanceprojection.Input{
@@ -233,7 +235,7 @@ func Project(input Input, limits Limits, clock reportv1alpha1.Clock) (reportv1al
 		addIssue(&report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
 		return finish(report), nil
 	}
-	report.Content.Instance = projectAuthoritative(row, rawRow, ir, input.Index, &report)
+	report.Content.Instance = projectAuthoritative(row, rawRow, ir, input.Index, limits.MaxAnnouncements, &report)
 	if component.State == reportv1alpha1.InstanceEvidenceStale {
 		report.Content.Summary.State = reportv1alpha1.InstanceStatusStatePartial
 	}
@@ -251,6 +253,7 @@ func projectAuthoritative(
 	raw *omev1beta1.OMENativeInstanceStatus,
 	ir *omev1beta1.InferenceReplica,
 	selectedIndex int32,
+	maxAnnouncements int,
 	report *reportv1alpha1.InstanceStatusReport,
 ) *reportv1alpha1.InstanceStatusInstance {
 	result := &reportv1alpha1.InstanceStatusInstance{
@@ -258,7 +261,7 @@ func projectAuthoritative(
 		Phase: row.Phase, RunningRevision: row.RunningRevision, TargetRevision: row.TargetRevision,
 		Pods: row.Pods, Admitted: row.Admitted, Conditions: []reportv1alpha1.InstanceStatusCondition{},
 		ReadySince: metaTimePointerValue(raw.ReadySince),
-		Migrations: []reportv1alpha1.InstanceStatusMigration{},
+		Migrations: []reportv1alpha1.InstanceStatusMigration{}, Announcements: []reportv1alpha1.InstanceStatusAnnouncement{},
 	}
 	if raw.ActiveOrdinal == 0 || raw.ActiveOrdinal == 1 {
 		result.ActiveOrdinal = copyInt32(&raw.ActiveOrdinal)
@@ -346,6 +349,27 @@ func projectAuthoritative(
 			}
 		} else {
 			addIssue(report, reportv1alpha1.InstanceStatusIssueOperationInvalid, reportv1alpha1.UnavailableMalformedPayload)
+		}
+	}
+	if len(raw.Announced) > maxAnnouncements {
+		addIssue(report, reportv1alpha1.InstanceStatusIssueAnnouncementsTruncated, "")
+		report.Content.Summary.Truncated = true
+	} else {
+		seen := make(map[instanceannouncement.Value]struct{}, len(raw.Announced))
+		for _, marker := range raw.Announced {
+			value, ok := instanceannouncement.Parse(marker)
+			if !ok {
+				addIssue(report, reportv1alpha1.InstanceStatusIssueAnnouncementInvalid, reportv1alpha1.UnavailableMalformedPayload)
+				continue
+			}
+			if _, duplicate := seen[value]; duplicate {
+				addIssue(report, reportv1alpha1.InstanceStatusIssueAnnouncementInvalid, reportv1alpha1.UnavailableMalformedPayload)
+				continue
+			}
+			seen[value] = struct{}{}
+			result.Announcements = append(result.Announcements, reportv1alpha1.InstanceStatusAnnouncement{
+				Reason: value.Reason, Episode: value.Episode,
+			})
 		}
 	}
 	if raw.LastFailure != nil {
@@ -617,8 +641,14 @@ func copyListIssues(report *reportv1alpha1.InstanceStatusReport, list reportv1al
 
 func copyDetailCompleteness(report *reportv1alpha1.InstanceStatusReport, collection instancecollection.Result, name string, component omev1beta1.ComponentType, index int32) {
 	for _, malformed := range collection.DetailsMalformed {
-		if malformed.Name == name && malformed.Component == component && malformed.Index == index && malformed.Kind == instancecollection.DetailConditions {
+		if malformed.Name != name || malformed.Component != component || malformed.Index != index {
+			continue
+		}
+		switch malformed.Kind {
+		case instancecollection.DetailConditions:
 			addIssue(report, reportv1alpha1.InstanceStatusIssueAuthoritativeInvalid, reportv1alpha1.UnavailableMalformedPayload)
+		case instancecollection.DetailAnnouncements:
+			addIssue(report, reportv1alpha1.InstanceStatusIssueAnnouncementInvalid, reportv1alpha1.UnavailableMalformedPayload)
 		}
 	}
 	for _, truncation := range collection.DetailsTruncated {
@@ -632,6 +662,8 @@ func copyDetailCompleteness(report *reportv1alpha1.InstanceStatusReport, collect
 			addIssue(report, reportv1alpha1.InstanceStatusIssueOperationDetailsTruncated, "")
 		case instancecollection.DetailMigrations:
 			addIssue(report, reportv1alpha1.InstanceStatusIssueMigrationsTruncated, "")
+		case instancecollection.DetailAnnouncements:
+			addIssue(report, reportv1alpha1.InstanceStatusIssueAnnouncementsTruncated, "")
 		}
 		report.Content.Summary.Truncated = true
 	}

@@ -55,7 +55,7 @@ func defaultInstanceStatusDependencies() statusDependencies {
 			MaxStatusRows: 4096,
 			Details: instancecollection.DetailLimits{
 				MaxConditions: 16, MaxScannedConditions: 64, MaxNodeHints: 16, MaxScannedNodeHints: 64,
-				MaxMigrations: 16, MaxScannedMigrations: 64,
+				MaxMigrations: 16, MaxScannedMigrations: 64, MaxAnnouncements: 16, MaxScannedAnnouncements: 64,
 			},
 		},
 		podLimits:     paging.Limits{PageSize: 32, MaxItems: 64, MaxPages: 2, RequestTimeout: 10 * time.Second},
@@ -65,7 +65,7 @@ func defaultInstanceStatusDependencies() statusDependencies {
 			MaxTargets: 17, MaxConcurrent: 4,
 		},
 		projectionLimits: instancestatusprojection.Limits{
-			MaxInstances: 4096, MaxPods: 16, MaxContainerStatuses: 64, MaxPodConditions: 64, MaxEvents: 100,
+			MaxInstances: 4096, MaxPods: 16, MaxContainerStatuses: 64, MaxPodConditions: 64, MaxEvents: 100, MaxAnnouncements: 16,
 		},
 	}
 }
@@ -100,9 +100,13 @@ evidence. A RawDeployment component is reported as NotOMENative.
 Effective deployment mode follows the controller's live-runtime or pinned
 ControllerRevision snapshot; --ome-namespace selects the revision namespace.
 The report includes ReadySince, active ordinal, and migrations involving the
-selected source or surge instance. Status encoding provenance is reported as
-DenseV1 or ColumnarV2 when a complete related InferenceReplica was collected.
-It is unavailable when that evidence cannot be established.
+selected source or surge instance. It also includes bounded durable
+announcement markers, identifying which once-only controller messages were
+emitted for operation or incarnation episodes; prior operation episodes may
+remain until a later announcement prunes them. Status encoding
+provenance is reported as DenseV1 or ColumnarV2 when a complete related
+InferenceReplica was collected. It is unavailable when that evidence cannot
+be established.
 
 POD Ready is the Kubernetes Ready condition. Serving is the controller-owned
 ome.io/serving readiness gate. POD restarts total bounded init and regular

@@ -75,6 +75,8 @@ const (
 	InstanceStatusIssueEventIdentityRejected     InstanceStatusIssueCode = "EventIdentityRejected"
 	InstanceStatusIssueMigrationsTruncated       InstanceStatusIssueCode = "MigrationsTruncated"
 	InstanceStatusIssueMigrationInvalid          InstanceStatusIssueCode = "MigrationInvalid"
+	InstanceStatusIssueAnnouncementsTruncated    InstanceStatusIssueCode = "AnnouncementsTruncated"
+	InstanceStatusIssueAnnouncementInvalid       InstanceStatusIssueCode = "AnnouncementInvalid"
 	InstanceStatusIssueEncodingUnsupported       InstanceStatusIssueCode = "EncodingUnsupported"
 )
 
@@ -155,21 +157,30 @@ type InstanceStatusMigration struct {
 	Succeeded       *bool      `json:"succeeded,omitempty"`
 }
 
+// InstanceStatusAnnouncement identifies one once-only controller message and
+// the operation or incarnation episode in which it was emitted. The volatile
+// Kubernetes Event message is intentionally excluded.
+type InstanceStatusAnnouncement struct {
+	Reason  string `json:"reason"`
+	Episode string `json:"episode"`
+}
+
 type InstanceStatusInstance struct {
-	InferenceReplica string                    `json:"inferenceReplica"`
-	Index            int32                     `json:"index"`
-	Incarnation      int64                     `json:"incarnation"`
-	Phase            InstancePhase             `json:"phase"`
-	RunningRevision  string                    `json:"runningRevision,omitempty"`
-	TargetRevision   string                    `json:"targetRevision,omitempty"`
-	Pods             InstancePodCounts         `json:"pods"`
-	Admitted         bool                      `json:"admitted"`
-	ReadySince       *time.Time                `json:"readySince,omitempty"`
-	ActiveOrdinal    *int32                    `json:"activeOrdinal,omitempty"`
-	Conditions       []InstanceStatusCondition `json:"conditions"`
-	Migrations       []InstanceStatusMigration `json:"migrations"`
-	Operation        *InstanceStatusOperation  `json:"operation,omitempty"`
-	LastFailure      *InstanceStatusFailure    `json:"lastFailure,omitempty"`
+	InferenceReplica string                       `json:"inferenceReplica"`
+	Index            int32                        `json:"index"`
+	Incarnation      int64                        `json:"incarnation"`
+	Phase            InstancePhase                `json:"phase"`
+	RunningRevision  string                       `json:"runningRevision,omitempty"`
+	TargetRevision   string                       `json:"targetRevision,omitempty"`
+	Pods             InstancePodCounts            `json:"pods"`
+	Admitted         bool                         `json:"admitted"`
+	ReadySince       *time.Time                   `json:"readySince,omitempty"`
+	ActiveOrdinal    *int32                       `json:"activeOrdinal,omitempty"`
+	Conditions       []InstanceStatusCondition    `json:"conditions"`
+	Migrations       []InstanceStatusMigration    `json:"migrations"`
+	Announcements    []InstanceStatusAnnouncement `json:"announcements"`
+	Operation        *InstanceStatusOperation     `json:"operation,omitempty"`
+	LastFailure      *InstanceStatusFailure       `json:"lastFailure,omitempty"`
 }
 
 type InstanceStatusPod struct {
@@ -375,6 +386,19 @@ func canonicalInstanceStatusContent(in InstanceStatusContent) InstanceStatusCont
 			compareInstanceStatusTime(a.CompletedAt, b.CompletedAt), compareInstanceStatusBoolPointer(a.Succeeded, b.Succeeded),
 		) < 0
 	})
+	instance.Announcements = append([]InstanceStatusAnnouncement{}, in.Instance.Announcements...)
+	for i := range instance.Announcements {
+		announcement := &instance.Announcements[i]
+		announcement.Reason = safeInstanceStatusText(announcement.Reason, 128)
+		announcement.Episode = safeInstanceStatusText(announcement.Episode, 128)
+	}
+	sort.Slice(instance.Announcements, func(i, j int) bool {
+		return cmp.Or(
+			cmp.Compare(instance.Announcements[i].Reason, instance.Announcements[j].Reason),
+			cmp.Compare(instance.Announcements[i].Episode, instance.Announcements[j].Episode),
+		) < 0
+	})
+	instance.Announcements = slices.Compact(instance.Announcements)
 	if in.Instance.Operation != nil {
 		operation := *in.Instance.Operation
 		operation.ID = safeInstanceStatusText(operation.ID, 128)
@@ -428,6 +452,9 @@ func (r InstanceStatusReport) Table() report.Table {
 		add("lifecycle", fmt.Sprintf("activeOrdinal=%s readySince=%s", statusInt32(instance.ActiveOrdinal), statusTime(instance.ReadySince)))
 		for _, condition := range instance.Conditions {
 			add("condition", fmt.Sprintf("%s=%s gen=%d evidence=%s reason=%s", condition.Type, condition.Status, condition.ObservedGeneration, condition.Evidence, instanceStatusDash(condition.Reason)))
+		}
+		for _, announcement := range instance.Announcements {
+			add("announced", announcement.Reason+"@"+announcement.Episode)
 		}
 		if operation := instance.Operation; operation != nil {
 			add("operation", fmt.Sprintf("%s id=%s step=%s retry=%d", operation.Type, operation.ID, operation.Step, operation.RetryCount))
@@ -523,6 +550,11 @@ func (r InstanceStatusReport) WideTable() report.Table {
 			add(prefix+"evidence", string(condition.Evidence))
 			add(prefix+"reason", instanceStatusDash(condition.Reason))
 			add(prefix+"transition", statusTime(condition.LastTransitionTime))
+		}
+		for index, announcement := range instance.Announcements {
+			prefix := fmt.Sprintf("announcement[%d] ", index)
+			add(prefix+"reason", announcement.Reason)
+			add(prefix+"episode", announcement.Episode)
 		}
 		if operation := instance.Operation; operation != nil {
 			add("operation id", operation.ID)
