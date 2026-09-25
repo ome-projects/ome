@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
@@ -149,6 +150,176 @@ func TestExecuteCommandMapsErrorsAndPrintsOnce(t *testing.T) {
 				t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 			}
 		})
+	}
+}
+
+func TestExecuteCommandPreservesConfiguredContext(t *testing.T) {
+	t.Parallel()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer cancelExpired()
+	active, cancelActive := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
+	defer cancelActive()
+	cases := []struct {
+		name         string
+		rootContext  context.Context
+		childContext context.Context
+		wantContext  context.Context
+		wantCode     int
+		wantStderr   string
+	}{
+		{name: "unset", wantContext: context.Background(), wantCode: exitcode.Success},
+		{name: "canceled root", rootContext: canceled, wantContext: canceled, wantCode: exitcode.GeneralError, wantStderr: "error: context canceled\n"},
+		{name: "expired root deadline", rootContext: expired, wantContext: expired, wantCode: exitcode.GeneralError, wantStderr: "error: context deadline exceeded\n"},
+		{name: "active root deadline", rootContext: active, wantContext: active, wantCode: exitcode.Success},
+		{name: "explicit child context", rootContext: canceled, childContext: active, wantContext: active, wantCode: exitcode.Success},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			var observed context.Context
+			root := &cobra.Command{Use: "test"}
+			child := &cobra.Command{
+				Use: "child",
+				RunE: func(cmd *cobra.Command, _ []string) error {
+					observed = cmd.Context()
+					return observed.Err()
+				},
+			}
+			root.AddCommand(child)
+			root.SetContext(tc.rootContext)
+			child.SetContext(tc.childContext)
+			root.SetArgs([]string{"child"})
+			if code := ExecuteCommand(root, &stderr); code != tc.wantCode {
+				t.Errorf("ExecuteCommand() = %d, want %d", code, tc.wantCode)
+			}
+			if observed != tc.wantContext {
+				t.Errorf("handler context = %v, want configured context %v", observed, tc.wantContext)
+			}
+			if stderr.String() != tc.wantStderr {
+				t.Errorf("stderr = %q, want %q", stderr.String(), tc.wantStderr)
+			}
+		})
+	}
+}
+
+func TestExecuteCommandContextPropagatesCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stderr bytes.Buffer
+	observed := make(chan context.Context, 1)
+	done := make(chan int, 1)
+	cmd := &cobra.Command{
+		Use: "test",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			observed <- ctx
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	cmd.SetArgs([]string{})
+	go func() { done <- ExecuteCommandContext(ctx, cmd, &stderr) }()
+
+	select {
+	case got := <-observed:
+		if got != ctx {
+			t.Fatal("handler did not receive the caller's context")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	select {
+	case code := <-done:
+		if code != exitcode.GeneralError {
+			t.Fatalf("ExecuteCommandContext() = %d, want %d", code, exitcode.GeneralError)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not exit after cancellation")
+	}
+	if got := stderr.String(); got != "error: context canceled\n" {
+		t.Fatalf("stderr = %q, want one cancellation diagnostic", got)
+	}
+}
+
+func TestExecuteCommandContextCancellationBeforeFactoryAcquisition(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	streams := genericiooptions.IOStreams{Out: &stdout, ErrOut: &stderr}
+	f := &guardedActionParserFactory{}
+	cmd := NewRootCmdWithFactory(f, streams)
+	cmd.SetArgs([]string{"cluster", "status"})
+	if code := ExecuteCommandContext(ctx, cmd, &stderr); code != exitcode.GeneralError {
+		t.Fatalf("ExecuteCommandContext() = %d, want %d", code, exitcode.GeneralError)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("canceled command acquired factory methods: %v", f.calls)
+	}
+	if stdout.Len() != 0 || stderr.String() != "error: context canceled\n" {
+		t.Fatalf("canceled command stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestExecuteCommandContextRefreshesReusedCommandTree(t *testing.T) {
+	t.Parallel()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	fresh, cancelFresh := context.WithCancel(context.Background())
+	defer cancelFresh()
+	var observed []context.Context
+	root := &cobra.Command{Use: "test"}
+	group := &cobra.Command{Use: "group"}
+	child := &cobra.Command{
+		Use: "child",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			observed = append(observed, cmd.Context())
+			return cmd.Context().Err()
+		},
+	}
+	group.AddCommand(child)
+	root.AddCommand(group)
+	root.SetArgs([]string{"group", "child"})
+	var stderr bytes.Buffer
+	if code := ExecuteCommandContext(canceled, root, &stderr); code != exitcode.GeneralError {
+		t.Fatalf("first execution code=%d, want %d", code, exitcode.GeneralError)
+	}
+	if stderr.String() != "error: context canceled\n" {
+		t.Fatalf("first execution stderr=%q, want one cancellation diagnostic", stderr.String())
+	}
+	stderr.Reset()
+	if code := ExecuteCommandContext(fresh, root, &stderr); code != exitcode.Success {
+		t.Errorf("second execution code=%d stderr=%q, want success", code, stderr.String())
+	}
+	if len(observed) != 2 || observed[0] != canceled || observed[1] != fresh {
+		t.Fatalf("reused child did not receive each execution's context: %v", observed)
+	}
+	if observed[1].Err() != nil || stderr.Len() != 0 {
+		t.Fatalf("fresh execution err=%v stderr=%q, want no error", observed[1].Err(), stderr.String())
+	}
+}
+
+func TestRunContextPropagatesCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	streams := genericiooptions.IOStreams{Out: &stdout, ErrOut: &stderr}
+	args := []string{"--kubeconfig=" + t.TempDir() + "/missing", "cluster", "status"}
+	if code := RunContext(ctx, args, streams); code != exitcode.GeneralError {
+		t.Fatalf("RunContext() = %d, want %d", code, exitcode.GeneralError)
+	}
+	if stdout.Len() != 0 || stderr.String() != "error: context canceled\n" {
+		t.Fatalf("canceled command stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 
