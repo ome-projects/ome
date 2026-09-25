@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/cli/effective"
@@ -20,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/report"
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/transport"
+	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 )
 
 type actionOptions struct {
@@ -125,7 +127,16 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	if err != nil || !mutate.SafeScalar(contextName) {
 		return errors.New("selected kubeconfig context is unavailable or unsafe")
 	}
-	client, err := f.OMEClient()
+	getOME, getKube := f.OMEClient, f.KubeClient
+	if owned, ok := f.(factory.ActionReadClientsResolver); ok {
+		getOME = func() (versioned.Interface, error) { return owned.OMEClientForAction(ctx) }
+		getKube = func() (kubernetes.Interface, error) { return owned.KubeClientForAction(ctx) }
+	}
+	client, err := getOME()
+	if err != nil {
+		return mutate.SafeAPIError(err)
+	}
+	kube, err := getKube()
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
@@ -145,10 +156,6 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	if v.Name != name || v.Namespace != resolved.WorkloadNamespace {
 		return errors.New("action target response does not match exact request")
 	}
-	kube, err := f.KubeClient()
-	if err != nil {
-		return mutate.SafeAPIError(err)
-	}
 	var runtimeClient ctrlclient.Client
 	if bounded, ok := f.(factory.ActionRuntimeResolver); ok {
 		runtimeClient, err = bounded.RuntimeClientForAction(ctx)
@@ -165,6 +172,14 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	state, err := resolver.Resolve(ctx, v, effective.RuntimeResolveOptions{})
 	if err != nil {
 		return mutate.SafeAPIError(err)
+	}
+	// Autosync may retain a usable live runtime after a revision read fails.
+	// Guarded actions require every collected revision read to succeed.
+	for _, issue := range state.SourceIssues() {
+		switch issue.Code {
+		case effective.RuntimeSourceIssueRevisionNotFound, effective.RuntimeSourceIssueRevisionGetFailed, effective.RuntimeSourceIssueRevisionListFailed:
+			return mutate.SafeAPIError(issue)
+		}
 	}
 	components, err := mutate.RequireNativeRuntime(v, state)
 	if err != nil {

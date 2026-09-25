@@ -71,5 +71,9 @@ func (f *defaultFactory) KubeClientForAction(ctx context.Context) (kubernetes.In
 	if err != nil {
 		return nil, err
 	}
+	// actionConfigAndClient already owns this copy. Match KubeClient's
+	// built-in API negotiation without changing the shared OME JSON config.
+	config.ContentType = "application/vnd.kubernetes.protobuf"
+	config.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
 	return kubernetes.NewForConfigAndClient(config, client)
 }

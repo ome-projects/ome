@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,10 +23,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
@@ -41,6 +46,241 @@ import (
 type actionFactory struct {
 	factory.Static
 	config *rest.Config
+}
+
+type actionReadFactory struct {
+	actionFactory
+	resolver       factory.ActionReadClientsResolver
+	calls          []string
+	ordinaryFails  bool
+	resolutionFail string
+	contexts       []context.Context
+}
+
+func (f *actionReadFactory) OMEClient() (versioned.Interface, error) {
+	f.calls = append(f.calls, "OMEClient")
+	if f.ordinaryFails {
+		return nil, errors.New("ordinary OME client must not be used")
+	}
+	return f.actionFactory.OMEClient()
+}
+
+func (f *actionReadFactory) KubeClient() (kubernetes.Interface, error) {
+	f.calls = append(f.calls, "KubeClient")
+	if f.ordinaryFails {
+		return nil, errors.New("ordinary Kubernetes client must not be used")
+	}
+	return f.actionFactory.KubeClient()
+}
+
+func (f *actionReadFactory) OMEClientForAction(ctx context.Context) (versioned.Interface, error) {
+	f.calls = append(f.calls, "OMEClientForAction")
+	f.contexts = append(f.contexts, ctx)
+	if f.resolutionFail == "ome" {
+		return nil, errors.New("PRIVATE_ACTION_CLIENT_CONFIG")
+	}
+	return f.resolver.OMEClientForAction(ctx)
+}
+
+func (f *actionReadFactory) KubeClientForAction(ctx context.Context) (kubernetes.Interface, error) {
+	f.calls = append(f.calls, "KubeClientForAction")
+	f.contexts = append(f.contexts, ctx)
+	if f.resolutionFail == "kube" {
+		return nil, errors.New("PRIVATE_ACTION_CLIENT_CONFIG")
+	}
+	return f.resolver.KubeClientForAction(ctx)
+}
+
+func newActionReadFactory(t *testing.T, server *httptest.Server, rt *v1beta1.ServingRuntime) *actionReadFactory {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config")
+	config := clientcmdapi.NewConfig()
+	config.CurrentContext = "moirai"
+	config.Contexts["moirai"] = &clientcmdapi.Context{Cluster: "local", Namespace: "prod"}
+	config.Clusters["local"] = &clientcmdapi.Cluster{Server: server.URL}
+	require.NoError(t, clientcmd.WriteToFile(*config, path))
+	flags := genericclioptions.NewConfigFlags(true)
+	flags.KubeConfig = &path
+	f := newWireFactory(t, server, rt)
+	var err error
+	f.Kube, err = kubernetes.NewForConfig(f.config)
+	require.NoError(t, err)
+	return &actionReadFactory{actionFactory: f, resolver: factory.New(flags).(factory.ActionReadClientsResolver)}
+}
+
+func TestRolloutActionReadsUseOwnedClients(t *testing.T) {
+	for _, action := range []string{"pause", "resume", "promote", "rollback"} {
+		t.Run(action, func(t *testing.T) {
+			v, rt, ir := actionFixture()
+			if action == "resume" {
+				v.Annotations[constants.PausedRolloutAnnotation] = "true"
+			}
+			if action == "promote" || action == "rollback" {
+				v, rt, ir = canaryActionFixture(t, false)
+			}
+			var reads atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reads.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				serveCanaryRead(t, w, r, v, ir)
+			}))
+			defer server.Close()
+			f := newActionReadFactory(t, server, rt)
+			f.ordinaryFails = true
+			var out, stderr bytes.Buffer
+			cmd := newCmdWithClock(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr}, reportv1alpha1.ClockFunc(func() time.Time { return canaryNow }))
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetArgs([]string{action, "chat", "--yes", "--dry-run=client", "-o=json"})
+			err := cmd.Execute()
+			require.Equal(t, []string{"OMEClientForAction", "KubeClientForAction"}, f.calls)
+			require.NoError(t, err)
+			require.Same(t, f.contexts[0], f.contexts[1], "both clients must bind the action context")
+			require.ErrorIs(t, f.contexts[0].Err(), context.Canceled, "action scope must end with the command")
+			wantReads := int32(2)
+			if action == "resume" {
+				wantReads = 1
+			}
+			require.Equal(t, wantReads, reads.Load())
+			var result reportv1alpha1.ActionResult
+			require.NoError(t, json.Unmarshal(out.Bytes(), &result))
+			require.Equal(t, "rollout "+action, result.Action)
+			require.False(t, result.Applied)
+			require.NotEmpty(t, stderr.String())
+		})
+	}
+}
+
+func TestRolloutActionReadClientErrorsPrecedeTargetRead(t *testing.T) {
+	for _, lane := range []string{"ome", "kube"} {
+		t.Run(lane, func(t *testing.T) {
+			_, rt, _ := actionFixture()
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusForbidden)
+			}))
+			defer server.Close()
+			f := newActionReadFactory(t, server, rt)
+			f.resolutionFail = lane
+			var out, stderr bytes.Buffer
+			cmd := NewCmd(f, genericiooptions.IOStreams{In: bytes.NewBufferString("yes\n"), Out: &out, ErrOut: &stderr})
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetArgs([]string{"pause", "chat"})
+			err := cmd.Execute()
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), "PRIVATE_ACTION_CLIENT_CONFIG")
+			require.Zero(t, requests.Load(), "resolve both clients before any GET or PATCH")
+			require.Empty(t, out.String())
+			require.Empty(t, stderr.String(), "failure must precede preview and confirmation")
+			wantCalls := []string{"OMEClientForAction"}
+			if lane == "kube" {
+				wantCalls = append(wantCalls, "KubeClientForAction")
+			}
+			require.Equal(t, wantCalls, f.calls, "never fall back after an action client error")
+		})
+	}
+}
+
+func TestRolloutActionReadsRefuseRedirectsBeforePreviewOrPatch(t *testing.T) {
+	for _, code := range []int{301, 302, 303, 307, 308} {
+		for _, lane := range []string{"inferenceservice-get", "revision-get", "autosync-revision-get"} {
+			t.Run(fmt.Sprintf("%d/%s", code, lane), func(t *testing.T) {
+				v, rt, _ := actionFixture()
+				if lane != "inferenceservice-get" {
+					*v.Spec.Runtime.AutoSync = lane == "autosync-revision-get"
+					v.Status.PinnedRevisionName = "simple-aaaaaaaa"
+				}
+				if lane == "autosync-revision-get" {
+					v.Annotations[constants.PausedRolloutAnnotation] = "true"
+				}
+				var destination, redirects, patches atomic.Int32
+				destinationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					destination.Add(1)
+					w.WriteHeader(http.StatusForbidden)
+				}))
+				defer destinationServer.Close()
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPatch {
+						patches.Add(1)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					if r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat" && lane != "inferenceservice-get" {
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(v)
+						return
+					}
+					wantPath := "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat"
+					if lane != "inferenceservice-get" {
+						wantPath = "/apis/apps/v1/namespaces/ome/controllerrevisions/simple-aaaaaaaa"
+					}
+					if r.Method != http.MethodGet || r.URL.Path != wantPath {
+						t.Errorf("unexpected preflight request %s %s", r.Method, r.URL.Path)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					redirects.Add(1)
+					w.Header().Set("Location", destinationServer.URL+"/unselected")
+					w.WriteHeader(code)
+				}))
+				defer server.Close()
+				f := newActionReadFactory(t, server, rt)
+				var out, stderr bytes.Buffer
+				cmd := NewCmd(f, genericiooptions.IOStreams{In: bytes.NewBufferString("yes\n"), Out: &out, ErrOut: &stderr})
+				cmd.SilenceErrors, cmd.SilenceUsage = true, true
+				cmd.SetArgs([]string{"pause", "chat"})
+				if lane == "autosync-revision-get" {
+					cmd.SetArgs([]string{"resume", "chat", "--yes"})
+				}
+				require.Error(t, cmd.Execute())
+				require.Equal(t, int32(1), redirects.Load(), "exercise the selected read without replay")
+				require.Zero(t, destination.Load(), "redirect destination must receive no request")
+				require.Zero(t, patches.Load(), "failed revision reads must refuse even with --yes")
+				require.Empty(t, out.String())
+				require.Empty(t, stderr.String(), "failure must precede preview and confirmation")
+			})
+		}
+	}
+}
+
+func TestRolloutActionReadFailureWithAutosyncPrecedesConfirmation(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusNotFound} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			v, rt, _ := actionFixture()
+			v.Status.PinnedRevisionName = "simple-aaaaaaaa"
+			v.Annotations[constants.PausedRolloutAnnotation] = "true"
+			var revisions, patches atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPatch:
+					patches.Add(1)
+					_ = json.NewEncoder(w).Encode(v)
+				case r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat":
+					_ = json.NewEncoder(w).Encode(v)
+				case r.URL.Path == "/apis/apps/v1/namespaces/ome/controllerrevisions/simple-aaaaaaaa":
+					revisions.Add(1)
+					w.WriteHeader(code)
+					_ = json.NewEncoder(w).Encode(metav1.Status{Status: "Failure", Code: int32(code), Message: "PRIVATE_REVISION_FAILURE"})
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+			var out, stderr bytes.Buffer
+			cmd := NewCmd(newActionReadFactory(t, server, rt), genericiooptions.IOStreams{In: bytes.NewBufferString("yes\n"), Out: &out, ErrOut: &stderr})
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetArgs([]string{"resume", "chat"})
+			err := cmd.Execute()
+			require.Error(t, err)
+			require.Equal(t, int32(1), revisions.Load())
+			require.NotContains(t, err.Error()+out.String()+stderr.String(), "PRIVATE_REVISION_FAILURE")
+			require.Empty(t, out.String())
+			require.Empty(t, stderr.String(), "revision failure must precede preview and confirmation")
+			require.Zero(t, patches.Load())
+		})
+	}
 }
 
 type actionParserFactory struct{ calls []string }

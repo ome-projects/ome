@@ -28,6 +28,39 @@ type actionReadsCapability interface {
 
 type privateWarningSentinel struct{ calls atomic.Int32 }
 
+func TestActionReadKubeClientNegotiatesProtobufWithoutChangingOMEConfig(t *testing.T) {
+	var kubeAccept, omeAccept string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/apis/apps/v1/namespaces/team-a/controllerrevisions" {
+			kubeAccept = r.Header.Get("Accept")
+			_, _ = w.Write([]byte(`{"apiVersion":"apps/v1","kind":"ControllerRevisionList","items":[]}`))
+			return
+		}
+		omeAccept = r.Header.Get("Accept")
+		_, _ = w.Write([]byte(`{"apiVersion":"ome.io/v1beta1","kind":"InferenceService","metadata":{"name":"service","namespace":"team-a"}}`))
+	}))
+	defer server.Close()
+	config := &rest.Config{Host: server.URL, ContentConfig: rest.ContentConfig{
+		ContentType: "application/json", AcceptContentTypes: "application/json",
+	}}
+	f := &defaultFactory{rest: config}
+	kube, err := f.KubeClientForAction(context.Background())
+	require.NoError(t, err)
+	_, err = kube.AppsV1().ControllerRevisions("team-a").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "application/vnd.kubernetes.protobuf,application/json", kubeAccept)
+	ome, err := f.OMEClientForAction(context.Background())
+	require.NoError(t, err)
+	_, err = ome.OmeV1beta1().InferenceServices("team-a").Get(context.Background(), "service", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "application/json", omeAccept)
+	require.Equal(t, "application/json", config.ContentType)
+	require.Equal(t, "application/json", config.AcceptContentTypes)
+	require.Nil(t, f.kube)
+	require.Nil(t, f.ome)
+}
+
 func (s *privateWarningSentinel) HandleWarningHeader(int, string, string) { s.calls.Add(1) }
 func (s *privateWarningSentinel) HandleWarningHeaderWithContext(context.Context, int, string, string) {
 	s.calls.Add(1)
