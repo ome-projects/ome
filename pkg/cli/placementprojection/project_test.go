@@ -157,6 +157,54 @@ func TestProjectStatusFlagsUnknownPhasesWithoutEchoingThem(t *testing.T) {
 	}
 }
 
+func TestProjectStatusDiscardsCandidatePhaseIssuesOnInvalidHomes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		other     ome.CandidatePlacement
+		wantState v.PlacementValue
+	}{
+		{"malformed", ome.CandidatePlacement{Cluster: "east", Phase: "FutureCandidate\ncontrol-text\x1b[2J"}, "MalformedPayload"},
+		{"conflicting-duplicate", ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced}, "ConflictingDuplicates"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			s.InferenceService.Status.Placement.Phase = "FuturePlacement"
+			unknown := ome.CandidatePlacement{Cluster: "west", Phase: "FutureCandidate"}
+			outputs := map[report.Format]string{}
+			for i, candidates := range [][]ome.CandidatePlacement{{unknown, tc.other}, {tc.other, unknown}} {
+				s.InferenceService.Status.Placement.Candidates = candidates
+				got, err := ProjectStatus(s, fixtureClock)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Content.Placement.HomePreview.State != tc.wantState || len(got.Content.Placement.Homes) != 0 {
+					t.Errorf("order %d: placement=%+v", i, got.Content.Placement)
+				}
+				wantIssues := []v.PlacementIssue{{Group: "PlacementPhase", Code: "UnknownValue", Count: 1}}
+				if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+					t.Errorf("order %d: issues=%+v want %+v", i, got.Content.Issues, wantIssues)
+				}
+				for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+					var out bytes.Buffer
+					if err := report.Write(&out, format, got); err != nil {
+						t.Fatal(err)
+					}
+					if i == 0 {
+						outputs[format] = out.String()
+					} else if out.String() != outputs[format] {
+						t.Errorf("%s output changed after reordering invalid candidates", format)
+					}
+					for _, raw := range []string{"FuturePlacement", "FutureCandidate", "control-text", "\x1b"} {
+						if strings.Contains(out.String(), raw) {
+							t.Errorf("%s output leaked %q: %s", format, raw, out.String())
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestSplitReportedNotFloorFulfillmentAndOriginPrivacy(t *testing.T) {
 	snapshot := fixture(t)
 	before := snapshot.InferenceService.DeepCopy()
