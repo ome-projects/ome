@@ -13,6 +13,9 @@ Do not describe planned or partially implemented features as working features.
 
 Return JSON matching the supplied schema, with at most max_prs concerns.
 Return an empty concerns list when no well-supported gaps remain.
+Finish evidence gathering within 80 turns and reserve the remaining budget for
+the structured plan. Return the well-supported concerns found so far; discovery
+can continue on later nights and need not exhaust the history in this run.
 
 ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
 - Each item must answer ONE concrete user question or correct ONE stale claim
