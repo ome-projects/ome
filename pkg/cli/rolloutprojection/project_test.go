@@ -171,6 +171,36 @@ func TestProjectPolicyRefCanaryAcceptsPrimaryStatus(t *testing.T) {
 	}
 }
 
+func TestProjectPolicyRefCanaryAcceptsEmptySecondaries(t *testing.T) {
+	isvc := multiComponentCanaryInferenceService()
+	group := &isvc.Spec.Rollout.Groups[0]
+	group.Canary = nil
+	group.PolicyRef = &omev1beta1.RolloutPolicyRef{Name: "guarded", Progression: omev1beta1.RolloutProgressionCanary}
+
+	got, err := rolloutprojection.Project(isvc, fixedClock())
+	require.NoError(t, err)
+	require.Len(t, got.Content.Groups, 1)
+	assert.Equal(t, reportv1alpha1.RolloutPhaseCanarying, got.Content.Groups[0].Phase)
+	assertOnlyEpochBoundary(t, got, reportv1alpha1.RolloutStateInProgress)
+}
+
+func TestProjectPolicyRefCanaryRejectsCoordinationResidue(t *testing.T) {
+	isvc := activeCanaryInferenceService()
+	group := &isvc.Spec.Rollout.Groups[0]
+	group.Canary = nil
+	group.PolicyRef = &omev1beta1.RolloutPolicyRef{Name: "guarded", Progression: omev1beta1.RolloutProgressionCanary}
+	isvc.Status.RolloutCoordination = &omev1beta1.RolloutCoordinationStatus{Groups: []omev1beta1.RolloutCoordinationGroupStatus{{
+		Name: "0", Components: []omev1beta1.ComponentType{omev1beta1.EngineComponent},
+		Policy: omev1beta1.CoordinationPolicyBlueGreen, Phase: omev1beta1.CoordinationPhaseIdle,
+	}}}
+
+	got, err := rolloutprojection.Project(isvc, fixedClock())
+	require.NoError(t, err)
+	assert.Contains(t, got.Content.Issues, reportv1alpha1.RolloutIssue{
+		Code: reportv1alpha1.RolloutIssueGroupStatusUnexpected,
+	})
+}
+
 func TestProjectPolicyRefCanaryRemainsOutsideSequentialGroup(t *testing.T) {
 	for _, index := range []int{0, 1, 2} {
 		t.Run(fmt.Sprint(index), func(t *testing.T) {

@@ -1081,7 +1081,8 @@ func (b *projector) normalEmptyCanarySecondary(component omev1beta1.ComponentTyp
 		return false
 	}
 	groups := b.effectiveSpec.GetRolloutGroups()
-	if *groupIndex < 0 || *groupIndex >= len(groups) || groups[*groupIndex].Canary == nil {
+	if *groupIndex < 0 || *groupIndex >= len(groups) ||
+		declaredStrategy(&groups[*groupIndex]) != reportv1alpha1.RolloutStrategyCanary {
 		return false
 	}
 	if component == canaryPrimary(groups[*groupIndex].Components) {
@@ -1131,7 +1132,7 @@ func (b *projector) flagUnexpectedCoordination(groups []omev1beta1.RolloutGroup)
 		expected["0"] = struct{}{}
 	} else {
 		for i := range groups {
-			if groups[i].Canary == nil {
+			if declaredStrategy(&groups[i]) != reportv1alpha1.RolloutStrategyCanary {
 				expected[strconv.Itoa(i)] = struct{}{}
 			}
 		}
