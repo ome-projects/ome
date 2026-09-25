@@ -153,6 +153,58 @@ func TestExecuteCommandMapsErrorsAndPrintsOnce(t *testing.T) {
 	}
 }
 
+func TestExecuteCommandPreservesConfiguredContext(t *testing.T) {
+	t.Parallel()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer cancelExpired()
+	active, cancelActive := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
+	defer cancelActive()
+	cases := []struct {
+		name         string
+		rootContext  context.Context
+		childContext context.Context
+		wantContext  context.Context
+		wantCode     int
+		wantStderr   string
+	}{
+		{name: "unset", wantContext: context.Background(), wantCode: exitcode.Success},
+		{name: "canceled root", rootContext: canceled, wantContext: canceled, wantCode: exitcode.GeneralError, wantStderr: "error: context canceled\n"},
+		{name: "expired root deadline", rootContext: expired, wantContext: expired, wantCode: exitcode.GeneralError, wantStderr: "error: context deadline exceeded\n"},
+		{name: "active root deadline", rootContext: active, wantContext: active, wantCode: exitcode.Success},
+		{name: "explicit child context", rootContext: canceled, childContext: active, wantContext: active, wantCode: exitcode.Success},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			var observed context.Context
+			root := &cobra.Command{Use: "test"}
+			child := &cobra.Command{
+				Use: "child",
+				RunE: func(cmd *cobra.Command, _ []string) error {
+					observed = cmd.Context()
+					return observed.Err()
+				},
+			}
+			root.AddCommand(child)
+			root.SetContext(tc.rootContext)
+			child.SetContext(tc.childContext)
+			root.SetArgs([]string{"child"})
+			if code := ExecuteCommand(root, &stderr); code != tc.wantCode {
+				t.Errorf("ExecuteCommand() = %d, want %d", code, tc.wantCode)
+			}
+			if observed != tc.wantContext {
+				t.Errorf("handler context = %v, want configured context %v", observed, tc.wantContext)
+			}
+			if stderr.String() != tc.wantStderr {
+				t.Errorf("stderr = %q, want %q", stderr.String(), tc.wantStderr)
+			}
+		})
+	}
+}
+
 func TestExecuteCommandContextPropagatesCancellation(t *testing.T) {
 	t.Parallel()
 

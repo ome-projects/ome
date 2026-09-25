@@ -12,23 +12,28 @@ import (
 )
 
 // ExecuteCommand executes cmd, writes one user-facing error, and returns the
-// stable process exit code without terminating the process.
+// stable process exit code without terminating the process. Contexts configured
+// on cmd or its descendants are preserved using Cobra's normal inheritance.
 func ExecuteCommand(cmd *cobra.Command, stderr io.Writer) int {
-	return ExecuteCommandContext(context.Background(), cmd, stderr)
+	return executeCommand(cmd, stderr, cmd.Execute)
 }
 
 // ExecuteCommandContext executes cmd with ctx, writes one user-facing error,
 // and returns the stable process exit code without terminating the process.
 func ExecuteCommandContext(ctx context.Context, cmd *cobra.Command, stderr io.Writer) int {
-	cmd.SilenceErrors = true
-	cmd.SilenceUsage = true
-	cmd.SetErr(stderr)
-
 	// Cobra retains inherited contexts on children between executions.
 	clearCommandContexts(cmd.Root())
 	// Execute also delegates to the root when cmd is a descendant.
 	cmd.Root().SetContext(ctx)
-	err := cmd.ExecuteContext(ctx)
+	return executeCommand(cmd, stderr, func() error { return cmd.ExecuteContext(ctx) })
+}
+
+func executeCommand(cmd *cobra.Command, stderr io.Writer, execute func() error) int {
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetErr(stderr)
+
+	err := execute()
 	if err == nil {
 		return exitcode.Success
 	}
