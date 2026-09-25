@@ -2,7 +2,11 @@ package logs
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/cli/factory"
@@ -260,4 +265,62 @@ func TestLogsFailsClosedWhenPodDiscoveryIsTruncated(t *testing.T) {
 		"llama", "--component", "engine", "--instance", "0")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pod discovery was truncated")
+}
+
+func TestLogsFollowRejectsSixTargetsBeforeOpeningAStream(t *testing.T) {
+	kube := kubefake.NewSimpleClientset(sixPods("chat")...)
+	var opened atomic.Int32
+	deps := defaultDependencies
+	deps.openLogStream = func(context.Context, coreclient.PodInterface, logTarget) (io.ReadCloser, error) {
+		opened.Add(1)
+		return io.NopCloser(strings.NewReader("unexpected\n")), nil
+	}
+
+	out, err := executeWithDependencies(t, factory.Static{Kube: kube, NS: "team-a"}, deps, "chat", "--follow")
+	require.EqualError(t, err, "you are attempting to follow 6 log streams, but maximum allowed concurrency is 5, use --max-log-requests to increase the limit")
+	assert.Empty(t, out)
+	assert.Zero(t, opened.Load())
+}
+
+func TestLogsFollowHonorsRaisedRequestCap(t *testing.T) {
+	kube := kubefake.NewSimpleClientset(sixPods("chat")...)
+	var opened atomic.Int32
+	deps := defaultDependencies
+	deps.openLogStream = func(_ context.Context, _ coreclient.PodInterface, target logTarget) (io.ReadCloser, error) {
+		opened.Add(1)
+		return io.NopCloser(strings.NewReader(target.podName + "\n")), nil
+	}
+
+	out, err := executeWithDependencies(t, factory.Static{Kube: kube, NS: "team-a"}, deps,
+		"chat", "--follow", "--max-log-requests=6")
+	require.NoError(t, err)
+	assert.Equal(t, int32(6), opened.Load())
+	for i := range 6 {
+		assert.Contains(t, out, fmt.Sprintf("[engine/chat-engine-%d] chat-engine-%d\n", i, i))
+	}
+}
+
+func TestLogsRejectsInvalidMaxLogRequestsBeforeFactoryAccess(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := execute(t, factory.Static{}, "chat", "--max-log-requests="+value)
+			require.EqualError(t, err, "--max-log-requests must be greater than 0")
+		})
+	}
+}
+
+func TestLogsHelpDocumentsFollowRequestLimit(t *testing.T) {
+	cmd := NewCmd(factory.Static{}, genericiooptions.IOStreams{})
+	flag := cmd.Flags().Lookup("max-log-requests")
+	require.NotNil(t, flag)
+	assert.Equal(t, "5", flag.DefValue)
+	assert.Contains(t, flag.Usage, "concurrent log streams")
+}
+
+func sixPods(isvc string) []runtime.Object {
+	objects := make([]runtime.Object, 0, 6)
+	for i := range 6 {
+		objects = append(objects, pod(fmt.Sprintf("%s-engine-%d", isvc, i), isvc, "engine"))
+	}
+	return objects
 }
