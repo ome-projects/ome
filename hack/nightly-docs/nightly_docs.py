@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import html
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -119,6 +120,10 @@ def plan(raw, context):
     candidates = {line.split()[0] for line in context["code_history"]}
     selected, occupied, keys = [], set(), set()
     for proposal in proposed:
+        # The workflow owns the repository's presentation prefix. Keep all
+        # content, length, and printable-character validation below unchanged.
+        if not proposal["title"].startswith("[Docs] "):
+            proposal = {**proposal, "title": "[Docs] " + proposal["title"]}
         item = validate_item(proposal)
         if item["source_sha"] not in candidates:
             raise ValueError("Source commit is not in the supplied default-branch history")
@@ -193,8 +198,30 @@ def import_bundle(item, base, raw):
     return validate_diff(item, base)
 
 
-def review_passes(raw):
+def review_verdict(raw):
     verdict = json.loads(raw)
+    if (not isinstance(verdict, dict)
+            or type(verdict.get("single_concern")) is not bool
+            or type(verdict.get("accurate")) is not bool
+            or not isinstance(verdict.get("reason"), str)
+            or not verdict["reason"].strip() or len(verdict["reason"]) > 10000):
+        raise ValueError("Malformed documentation review")
+    return verdict
+
+
+def record_review(raw):
+    verdict = review_verdict(raw)
+    accepted = verdict["single_concern"] and verdict["accurate"]
+    with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+        output.write(f"accepted={str(accepted).lower()}\n")
+    if not accepted:
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+            summary.write("Documentation proposal rejected; no PR created.\n\n<pre>"
+                          + html.escape(verdict["reason"]) + "</pre>\n")
+
+
+def review_passes(raw):
+    verdict = review_verdict(raw)
     if verdict.get("single_concern") is not True or verdict.get("accurate") is not True:
         raise ValueError("Documentation review rejected the change: " + str(verdict.get("reason")))
 
@@ -263,7 +290,7 @@ Scope: **{item["area"]} / {item["concern"]}**. Other concerns are deferred.
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["context", "plan", "evidence", "check", "export", "import", "publish"])
+    parser.add_argument("command", choices=["context", "plan", "evidence", "check", "export", "import", "review", "publish"])
     args = parser.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
     if args.command == "context":
@@ -274,6 +301,8 @@ def main():
         with open(os.environ["GITHUB_OUTPUT"], "a") as out:
             out.write("matrix=" + json.dumps({"include": items}) + "\n")
             out.write(f"count={len(items)}\n")
+    elif args.command == "review":
+        record_review(os.environ["REVIEW_JSON"])
     else:
         item = validate_item(json.loads(os.environ["ITEM_JSON"]))
         base = os.environ["BASE_SHA"]

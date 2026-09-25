@@ -13,6 +13,9 @@ Do not describe planned or partially implemented features as working features.
 
 Return JSON matching the supplied schema, with at most max_prs concerns.
 Return an empty concerns list when no well-supported gaps remain.
+Finish evidence gathering within 80 turns and reserve the remaining budget for
+the structured plan. Return the well-supported concerns found so far; discovery
+can continue on later nights and need not exhaust the history in this run.
 
 ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
 - Each item must answer ONE concrete user question or correct ONE stale claim
@@ -24,6 +27,8 @@ ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
   slug for the behavior, without a date. Preserve existing slugs for the same gap.
 - source_sha must be a full SHA from the supplied code-change history. Confirm
   that the behavior still exists on the current default branch.
+- title must be a nonempty printable single line, at most 120 characters
+  including the `[Docs] ` prefix. Include that prefix in every title.
 - evidence must cite exact current source paths/symbols and explain the missing
   or wrong documentation, including why this is one independent concern.
 - doc_paths is an explicit allowlist of the Markdown files needed in

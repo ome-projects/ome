@@ -40,6 +40,35 @@ class PlanningTests(unittest.TestCase):
     def test_empty_plan_is_valid(self):
         self.assertEqual(self.plan([]), [])
 
+    def test_plan_supplies_title_prefix_without_relaxing_title_validation(self):
+        self.assertEqual(self.plan([proposal(title="Explain rollout timeout")])[0]["title"],
+                         "[Docs] Explain rollout timeout")
+        for title in ["", " ", "bad\ntitle", "bad\x00title", "x" * 114]:
+            with self.subTest(title=title), self.assertRaises(ValueError):
+                self.plan([proposal(title=title)])
+
+    def test_explicit_review_rejection_is_recorded_but_cannot_pass_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, summary = Path(directory) / "output", Path(directory) / "summary"
+            raw = json.dumps({"single_concern": True, "accurate": False,
+                              "reason": "Incorrect <verb> claim"})
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output),
+                                         "GITHUB_STEP_SUMMARY": str(summary)}):
+                docs.record_review(raw)
+            self.assertEqual(output.read_text(), "accepted=false\n")
+            self.assertIn("Incorrect &lt;verb&gt; claim", summary.read_text())
+            with self.assertRaisesRegex(ValueError, "rejected"):
+                docs.review_passes(raw)
+
+    def test_malformed_review_never_produces_a_gate_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for raw in ['null', '[]', '{}', '{"single_concern":true,"accurate":"false","reason":"x"}']:
+                with self.subTest(raw=raw), patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                    with self.assertRaises(ValueError):
+                        docs.record_review(raw)
+            self.assertFalse(output.exists())
+
     def test_accepts_one_hundred_independent_concerns(self):
         items = [proposal(concern=f"concern-{i}",
                           doc_paths=[docs.DOC_ROOT + f"tasks/concern-{i}.md"])

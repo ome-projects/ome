@@ -1,6 +1,8 @@
 Independently review the supplied documentation patch and the concern JSON
 in NIGHTLY_ITEM. Read AGENTS.md, the supplied source-commit patch, current code,
 relevant tests/OEPs, and the surrounding documentation.
+Finish evidence gathering within 40 turns, reserving headroom for the structured
+verdict. If accuracy remains uncertain, reject and explain the uncertainty.
 
 Return JSON with single_concern (boolean), accurate (boolean), and reason (text).
 Set single_concern=true ONLY when EVERY substantive edit serves the single

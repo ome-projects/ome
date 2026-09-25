@@ -1,6 +1,7 @@
 Read AGENTS.md and the single concern JSON in NIGHTLY_ITEM.
 Read the supplied source-commit patch, current implementation, tests, and docs.
 Update ONLY the listed doc_paths to address exactly this one concern.
+Finish investigation and editing within 40 turns, leaving headroom to conclude.
 
 Do not fix adjacent gaps, sweep wording/formatting, or add other features to this
 PR. The diff must stay under 1,000 total added plus deleted lines (999 maximum).
@@ -12,6 +13,9 @@ unsupported by current code, or depends on an unfinished OEP, make no changes.
 Follow existing Hugo front matter, links, shortcodes, and writing conventions.
 Use concrete source-backed defaults and examples. Distinguish released behavior
 from unreleased behavior on main when relevant. Never invent test results.
+Verify API verbs, RBAC requirements, and success guarantees by following the
+implementation into its helpers; help text and comments alone are not proof.
+Do not describe reported status as convergence or attribution unless verified.
 Do not edit generated API reference docs, code, workflows, site configuration,
 lockfiles, or the automation's own instructions. Do not delete existing files.
 Do not commit, push, create PRs, comment, or invoke other agents; the workflow
