@@ -3,6 +3,7 @@ package placementprojection
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -200,6 +201,70 @@ func TestProjectStatusDiscardsCandidatePhaseIssuesOnInvalidHomes(t *testing.T) {
 						}
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestProjectStatusAggregatesUnknownCandidatePhasesAcrossBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		unique         int
+		unknownFrom    int
+		duplicate      bool
+		wantIssueCount int
+		wantKept       int
+		wantState      v.PlacementValue
+		wantPhase      v.PlacementValue
+	}{
+		{"identical-duplicate", 1, 0, true, 1, 1, "Validated", "Unknown"},
+		{"unknown-beyond-preview", 65, 64, false, 1, 64, "Validated", "Placed"},
+		{"at-scan-budget", 256, 0, false, 256, 64, "Validated", "Unknown"},
+		{"over-scan-budget", 257, 0, false, 0, 0, "BudgetExceeded", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			candidates := make([]ome.CandidatePlacement, tc.unique)
+			for i := range candidates {
+				phase := ome.CandidatePhasePlaced
+				if i >= tc.unknownFrom {
+					phase = "FutureCandidate"
+				}
+				candidates[i] = ome.CandidatePlacement{Cluster: fmt.Sprintf("home-%03d", i), Phase: phase}
+			}
+			if tc.duplicate {
+				candidates = append(candidates, candidates[0])
+			}
+			s.InferenceService.Status.Placement.Candidates = candidates
+			got, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantIssues := []v.PlacementIssue{}
+			if tc.wantIssueCount > 0 {
+				wantIssues = append(wantIssues, v.PlacementIssue{Group: "CandidatePhase", Code: "UnknownValue", Count: tc.wantIssueCount})
+			}
+			if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+				t.Errorf("issues=%+v want %+v", got.Content.Issues, wantIssues)
+			}
+			preview := got.Content.Placement.HomePreview
+			if preview.State != tc.wantState || preview.Total != tc.unique || preview.Kept != tc.wantKept || len(got.Content.Placement.Homes) != tc.wantKept {
+				t.Errorf("preview=%+v homes=%d", preview, len(got.Content.Placement.Homes))
+			}
+			for _, home := range got.Content.Placement.Homes {
+				if home.Phase != tc.wantPhase {
+					t.Errorf("home %s phase=%q want %q", home.Cluster, home.Phase, tc.wantPhase)
+				}
+			}
+			for i, j := 0, len(candidates)-1; i < j; i, j = i+1, j-1 {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+			reordered, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, reordered) {
+				t.Error("report changed after reversing candidate order")
 			}
 		})
 	}
