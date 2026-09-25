@@ -28,7 +28,7 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 				{Type: "Zeta", Status: "True", Reason: unsafe},
 				{Type: "AllPodsReady", Status: "True", Reason: "Ready"},
 			},
-			Operation:   &InstanceStatusOperation{ID: unsafe, Type: "Update", Step: unsafe, Reason: unsafe, TargetNodeHints: []string{"node-b", "node-a"}},
+			Operation:   &InstanceStatusOperation{ID: unsafe, Type: "Update", Step: unsafe, Reason: unsafe, Waiting: unsafe, Strategy: unsafe, TargetNodeHints: []string{"node-b", "node-a"}},
 			LastFailure: &InstanceStatusFailure{PodName: "chat-engine-2-0", ContainerName: "runner", Reason: unsafe},
 		},
 		Pods: []InstanceStatusPod{
@@ -57,6 +57,8 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 	assert.Equal(t, []string{"node-a", "node-b"}, canonical.Content.Instance.Operation.TargetNodeHints)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.ID)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.Step)
+	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.Waiting)
+	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Operation.Strategy)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.Conditions[1].Reason)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Events[1].Reason)
 	assert.Equal(t, "[REDACTED]", canonical.Content.Instance.LastFailure.Reason)
@@ -64,6 +66,49 @@ func TestInstanceStatusCanonicalIsDeterministicSanitizedAndImmutable(t *testing.
 	assert.Equal(t, unsafe, input.Instance.Operation.ID)
 	report.Content.Instance.Operation.TargetNodeHints[0] = "mutated"
 	assert.Equal(t, "node-a", canonical.Content.Instance.Operation.TargetNodeHints[0])
+}
+
+func TestInstanceStatusOperationBlockerCanonicalAndRendering(t *testing.T) {
+	t.Parallel()
+
+	refused := time.Date(2026, 9, 14, 23, 1, 2, 0, time.FixedZone("source", -7*60*60))
+	input := InstanceStatusContent{
+		Summary: InstanceStatusSummary{State: InstanceStatusStateReported, Component: RuntimeComponentEngine},
+		Instance: &InstanceStatusInstance{Operation: &InstanceStatusOperation{
+			ID: "op-1", Type: "Update", Step: "WaitReady",
+			Waiting: "QuotaExceeded", CapacityRefusedAt: &refused, Strategy: "SurgeThenDrain",
+		}},
+	}
+	got := NewInstanceStatusReport(Metadata{Name: "chat"}, input, ClockFunc(func() time.Time { return time.Unix(0, 0) }))
+
+	require.NotNil(t, got.Content.Instance)
+	require.NotNil(t, got.Content.Instance.Operation)
+	require.NotNil(t, got.Content.Instance.Operation.CapacityRefusedAt)
+	assert.Equal(t, "QuotaExceeded", got.Content.Instance.Operation.Waiting)
+	assert.Equal(t, "SurgeThenDrain", got.Content.Instance.Operation.Strategy)
+	assert.Equal(t, time.Date(2026, 9, 15, 6, 1, 2, 0, time.UTC), *got.Content.Instance.Operation.CapacityRefusedAt)
+	assert.NotSame(t, input.Instance.Operation.CapacityRefusedAt, got.Content.Instance.Operation.CapacityRefusedAt)
+	*input.Instance.Operation.CapacityRefusedAt = time.Time{}
+	assert.False(t, got.Content.Instance.Operation.CapacityRefusedAt.IsZero(), "canonical report must not alias the caller timestamp")
+
+	jsonData, err := json.Marshal(got)
+	require.NoError(t, err)
+	yamlData, err := yaml.Marshal(got)
+	require.NoError(t, err)
+	for _, output := range []string{string(jsonData), string(yamlData)} {
+		assert.Contains(t, output, "waiting")
+		assert.Contains(t, output, "capacityRefusedAt")
+		assert.Contains(t, output, "strategy")
+		assert.Contains(t, output, "QuotaExceeded")
+		assert.Contains(t, output, "SurgeThenDrain")
+	}
+
+	wantHold := []string{"op hold", "waiting=QuotaExceeded refused=2026-09-15T06:01:02Z"}
+	wantStrategy := []string{"op strategy", "SurgeThenDrain"}
+	assert.Contains(t, got.Table().Rows, wantHold)
+	assert.Contains(t, got.Table().Rows, wantStrategy)
+	assert.Contains(t, got.WideTable().Rows, wantHold)
+	assert.Contains(t, got.WideTable().Rows, wantStrategy)
 }
 
 func TestInstanceStatusJSONKeepsEmptyCollectionsAsArrays(t *testing.T) {
