@@ -4,6 +4,7 @@
 package factory
 
 import (
+	"strings"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,6 +17,13 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
+	omeversion "sigs.k8s.io/ome/pkg/version"
+)
+
+const (
+	userAgentProduct          = "kubectl-ome"
+	unknownUserAgentVersion   = "unknown"
+	maxUserAgentVersionLength = 64
 )
 
 type Factory interface {
@@ -41,17 +49,22 @@ func New(flags *genericclioptions.ConfigFlags) Factory {
 type defaultFactory struct {
 	flags *genericclioptions.ConfigFlags
 
-	mu      sync.Mutex
-	rest    *rest.Config
-	kube    kubernetes.Interface
-	ome     versioned.Interface
-	runtime ctrlclient.Client
+	mu                 sync.Mutex
+	rest               *rest.Config
+	restUserAgentReady bool
+	kube               kubernetes.Interface
+	ome                versioned.Interface
+	runtime            ctrlclient.Client
 }
 
 func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.rest != nil {
+		if !f.restUserAgentReady {
+			addProductUserAgent(f.rest, omeversion.GitVersion)
+			f.restUserAgentReady = true
+		}
 		return f.rest, nil
 	}
 	cfg, err := f.flags.ToRESTConfig()
@@ -65,8 +78,147 @@ func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	// the API server.
 	cfg.QPS = 50
 	cfg.Burst = 300
+	addProductUserAgent(cfg, omeversion.GitVersion)
 	f.rest = cfg
+	f.restUserAgentReady = true
 	return cfg, nil
+}
+
+// addProductUserAgent installs exactly one kubectl-ome/<version> HTTP product
+// token. The first existing top-level kubectl-ome product is replaced in
+// place, later duplicates are removed, and every unrelated product or comment
+// retains its order. Product-shaped text inside a User-Agent comment remains
+// caller-owned and byte-exact.
+// rest.AddUserAgent is not used because it replaces a caller-supplied value
+// instead of extending it.
+func addProductUserAgent(config *rest.Config, gitVersion string) {
+	product := userAgentProduct + "/" + canonicalUserAgentVersion(gitVersion)
+	if config.UserAgent == "" {
+		config.UserAgent = rest.DefaultKubernetesUserAgent()
+	}
+	elements, unclosedComment := splitUserAgentElements(config.UserAgent)
+	result := make([]string, 0, len(elements)+1)
+	installed := false
+	for i, element := range elements {
+		// Anything appended after an unclosed comment would become comment
+		// prose rather than a top-level product. Install immediately before
+		// the opaque malformed suffix so the operation remains idempotent.
+		if i == unclosedComment && !installed {
+			result = append(result, product)
+			installed = true
+		}
+		if isUserAgentProductElement(element) {
+			if !installed {
+				result = append(result, product)
+				installed = true
+			}
+			continue
+		}
+		result = append(result, element)
+	}
+	if !installed {
+		result = append(result, product)
+	}
+	config.UserAgent = strings.Join(result, " ")
+}
+
+// splitUserAgentElements separates top-level products and comments while
+// keeping comment contents opaque. HTTP comments may nest and use backslash
+// escapes; malformed unclosed comments conservatively consume the remainder
+// so product-shaped text in caller-owned prose is never rewritten.
+func splitUserAgentElements(value string) ([]string, int) {
+	elements := make([]string, 0, 4)
+	start := -1
+	depth := 0
+	escaped := false
+	for i := range len(value) {
+		current := value[i]
+		if depth > 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch current {
+			case '\\':
+				escaped = true
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+			continue
+		}
+		if current == ' ' || current == '\t' {
+			if start >= 0 {
+				elements = append(elements, value[start:i])
+				start = -1
+			}
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+		if current == '(' {
+			depth = 1
+		}
+	}
+	if start >= 0 {
+		elements = append(elements, value[start:])
+	}
+	unclosedComment := -1
+	if depth > 0 {
+		unclosedComment = len(elements) - 1
+	}
+	return elements, unclosedComment
+}
+
+func isUserAgentProductElement(element string) bool {
+	if element == userAgentProduct {
+		return true
+	}
+	prefix := userAgentProduct + "/"
+	if !strings.HasPrefix(element, prefix) {
+		return false
+	}
+	version := element[len(prefix):]
+	// Remove a legacy malformed empty-version occurrence rather than leave a
+	// second kubectl-ome product-shaped field in the outgoing header.
+	if version == "" {
+		return true
+	}
+	for i := range len(version) {
+		if !isHTTPTokenByte(version[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// canonicalUserAgentVersion accepts only a bounded HTTP token. Unsafe linker
+// input is never reflected into request headers; it collapses to a stable,
+// non-sensitive fallback instead.
+func canonicalUserAgentVersion(gitVersion string) string {
+	if len(gitVersion) == 0 || len(gitVersion) > maxUserAgentVersionLength {
+		return unknownUserAgentVersion
+	}
+	for i := range len(gitVersion) {
+		if !isHTTPTokenByte(gitVersion[i]) {
+			return unknownUserAgentVersion
+		}
+	}
+	return gitVersion
+}
+
+func isHTTPTokenByte(value byte) bool {
+	if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' {
+		return true
+	}
+	switch value {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
 }
 
 // protobufConfig returns a COPY of cfg negotiating protobuf the way kubectl
