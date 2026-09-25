@@ -21,7 +21,8 @@ type ReloadObserver interface {
 // Watcher hot-reloads the Store from the alfred-config ConfigMap through the
 // manager's informer cache. It runs on every replica (config is needed
 // before and regardless of leadership) and never restarts Alfred: a change
-// takes effect on the next loop pass that calls Store.Get.
+// takes effect on the next loop pass that calls Store.Get, and a loop that
+// arms timers from the config is woken through Store.Changed.
 type Watcher struct {
 	Cache     ctrlcache.Cache
 	Namespace string

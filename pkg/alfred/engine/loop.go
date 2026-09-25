@@ -71,27 +71,37 @@ func (l *DecisionLoop) NeedLeaderElection() bool { return true }
 
 // Start runs an immediate first pass, then regular passes at
 // decisionLoopInterval. Early signals add fresh, serialized passes without
-// moving the current regular deadline. The interval is reloaded only when a
+// moving the current regular deadline. The interval is reloaded when a
 // regular deadline is consumed, including a deadline coincident with an early
-// signal.
+// signal, and when the active configuration changes: the pending deadline is
+// then recomputed under the new interval from the point the current one was
+// armed, running at once if that instant has already passed. A leader elected
+// before the ConfigMap is applied thus follows the configured cadence as soon
+// as it lands instead of waiting out the built-in default.
 func (l *DecisionLoop) Start(ctx context.Context) error {
 	l.RunOnce(ctx)
-	timer := l.decisionClock().NewTimer(l.Store.Get().DecisionLoopInterval.Duration)
+	// Subscribe before reading the interval so an update landing between the
+	// two still wakes the loop.
+	changed := l.Store.Changed()
+	clk := l.decisionClock()
+	interval := l.Store.Get().DecisionLoopInterval.Duration
+	armedAt := clk.Now()
+	timer := clk.NewTimer(interval)
 	defer timer.Stop()
+	// resetCadence arms the next regular deadline one freshly loaded interval
+	// after the consumed one.
+	resetCadence := func() {
+		interval = l.Store.Get().DecisionLoopInterval.Duration
+		armedAt = clk.Now()
+		timer.Reset(interval)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-timer.C():
-			// If an early signal is already pending at the regular deadline,
-			// fold both into one fresh pass. A failed refresh skips that pass,
-			// but the consumed regular deadline still resets normal cadence.
-			if l.takeEarlyTick() {
-				l.runFreshDecisionLogged(ctx)
-			} else {
-				l.RunOnce(ctx)
-			}
-			timer.Reset(l.Store.Get().DecisionLoopInterval.Duration)
+			l.runRegularPass(ctx)
+			resetCadence()
 		case <-l.EarlyTick:
 			// The timer may become ready either just before the early signal or
 			// while its refresh is in flight. Drain it in either case and count the
@@ -112,9 +122,41 @@ func (l *DecisionLoop) Start(ctx context.Context) error {
 				}
 			}
 			if regularDue {
-				timer.Reset(l.Store.Get().DecisionLoopInterval.Duration)
+				resetCadence()
+			}
+		case <-changed:
+			changed = l.Store.Changed()
+			next := l.Store.Get().DecisionLoopInterval.Duration
+			if next == interval {
+				continue
+			}
+			// Move the pending deadline to where the new interval places it
+			// from the point the current one was armed. A deadline that has
+			// already expired under the old interval is superseded by the
+			// recomputed one.
+			interval = next
+			select {
+			case <-timer.C():
+			default:
+			}
+			if wait := armedAt.Add(interval).Sub(clk.Now()); wait > 0 {
+				timer.Reset(wait)
+			} else {
+				l.runRegularPass(ctx)
+				resetCadence()
 			}
 		}
+	}
+}
+
+// runRegularPass runs the pass owed at a regular deadline. An early signal
+// already pending is folded into one fresh pass; a failed refresh skips that
+// pass, but the consumed deadline still resets normal cadence.
+func (l *DecisionLoop) runRegularPass(ctx context.Context) {
+	if l.takeEarlyTick() {
+		l.runFreshDecisionLogged(ctx)
+	} else {
+		l.RunOnce(ctx)
 	}
 }
 

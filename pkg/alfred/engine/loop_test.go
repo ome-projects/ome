@@ -402,6 +402,132 @@ func TestStartRegularTickReloadsInterval(t *testing.T) {
 	}
 }
 
+// startWithNotifyingClock runs Start under a fake clock whose timer creations
+// and resets are reported, and stops the loop at cleanup.
+func startWithNotifyingClock(t *testing.T, loop *DecisionLoop) (*clocktesting.FakeClock, <-chan time.Duration, <-chan time.Duration) {
+	t.Helper()
+	fakeClock := clocktesting.NewFakeClock(testNow)
+	created := make(chan time.Duration, 1)
+	resets := make(chan time.Duration, 4)
+	loop.timerClock = &notifyingClock{Clock: fakeClock, created: created, resets: resets}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- loop.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Start returned error on shutdown: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("Start did not stop after cancellation")
+		}
+	})
+	return fakeClock, created, resets
+}
+
+// TestStartFollowsIntervalAppliedAfterStart covers a leader elected before the
+// config watcher applies the ConfigMap: the regular timer is armed from the
+// built-in default, and the configured interval must take over as soon as it
+// lands rather than after that default deadline.
+func TestStartFollowsIntervalAppliedAfterStart(t *testing.T) {
+	p := &stubPolicy{}
+	loop, _, _ := newTestLoop(t, scenario().Build(), p)
+	fakeClock, created, resets := startWithNotifyingClock(t, loop)
+
+	waitForPolicyCalls(t, p, 1)
+	if got := receiveDuration(t, created, "regular timer creation"); got != 5*time.Minute {
+		t.Fatalf("initial decision interval = %v, want the 5m default", got)
+	}
+
+	// The ConfigMap lands two seconds after the first pass with a 5s interval:
+	// the next regular pass is due 5s after the first one, so 3s from now.
+	fakeClock.Step(2 * time.Second)
+	if _, err := loop.Store.Update([]byte("schemaVersion: 1\ndecisionLoopInterval: 5s")); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveDuration(t, resets, "re-arm after config apply"); got != 3*time.Second {
+		t.Fatalf("re-armed deadline = %v, want 3s (5s after the first pass)", got)
+	}
+	fakeClock.Step(3 * time.Second)
+	waitForPolicyCalls(t, p, 2)
+
+	// From there the regular cadence is the configured 5s.
+	if got := receiveDuration(t, resets, "cadence reset after second pass"); got != 5*time.Second {
+		t.Fatalf("regular interval after second pass = %v, want 5s", got)
+	}
+	fakeClock.Step(5 * time.Second)
+	waitForPolicyCalls(t, p, 3)
+	if got := receiveDuration(t, resets, "cadence reset after third pass"); got != 5*time.Second {
+		t.Fatalf("regular interval after third pass = %v, want 5s", got)
+	}
+}
+
+// TestStartShortenedIntervalAlreadyDueRunsRegularPassAtOnce: when the interval
+// applied after start places the next regular deadline in the past, the
+// regular pass runs immediately and the new cadence starts from it.
+func TestStartShortenedIntervalAlreadyDueRunsRegularPassAtOnce(t *testing.T) {
+	p := &stubPolicy{}
+	loop, _, _ := newTestLoop(t, scenario().Build(), p)
+	fakeClock, created, resets := startWithNotifyingClock(t, loop)
+
+	waitForPolicyCalls(t, p, 1)
+	receiveDuration(t, created, "regular timer creation")
+
+	// Ten seconds have passed on the default interval when a 5s interval
+	// lands: the deadline it implies is already behind, so the regular pass
+	// runs now rather than at the default deadline or another 5s later.
+	fakeClock.Step(10 * time.Second)
+	if _, err := loop.Store.Update([]byte("schemaVersion: 1\ndecisionLoopInterval: 5s")); err != nil {
+		t.Fatal(err)
+	}
+	waitForPolicyCalls(t, p, 2)
+	if got := receiveDuration(t, resets, "cadence reset after the overdue pass"); got != 5*time.Second {
+		t.Fatalf("regular interval after overdue pass = %v, want 5s", got)
+	}
+	fakeClock.Step(5 * time.Second)
+	waitForPolicyCalls(t, p, 3)
+}
+
+// TestStartLengthenedIntervalDelaysNextRegularPass: a longer interval applied
+// mid-cycle moves the pending deadline out to where the new interval places
+// it, measured from the previous regular pass; the old deadline passes without
+// a pass.
+func TestStartLengthenedIntervalDelaysNextRegularPass(t *testing.T) {
+	p := &stubPolicy{}
+	loop, _, _ := newTestLoop(t, scenario().Build(), p)
+	if _, err := loop.Store.Update([]byte("schemaVersion: 1\ndecisionLoopInterval: 1m")); err != nil {
+		t.Fatal(err)
+	}
+	fakeClock, created, resets := startWithNotifyingClock(t, loop)
+
+	waitForPolicyCalls(t, p, 1)
+	if got := receiveDuration(t, created, "regular timer creation"); got != time.Minute {
+		t.Fatalf("initial decision interval = %v, want 1m", got)
+	}
+
+	// Thirty seconds into a 1m cycle the interval becomes 3m: the deadline
+	// moves from t=1m to t=3m, so 2m30s from now.
+	fakeClock.Step(30 * time.Second)
+	if _, err := loop.Store.Update([]byte("schemaVersion: 1\ndecisionLoopInterval: 3m")); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveDuration(t, resets, "re-arm after lengthening"); got != 150*time.Second {
+		t.Fatalf("re-armed deadline = %v, want 2m30s (3m after the first pass)", got)
+	}
+	// The superseded 1m deadline passes without a regular pass.
+	fakeClock.Step(30 * time.Second)
+	if got := atomic.LoadInt64(&p.calls); got != 1 {
+		t.Fatalf("policy calls at the superseded deadline = %d, want 1", got)
+	}
+	fakeClock.Step(2 * time.Minute)
+	waitForPolicyCalls(t, p, 2)
+	if got := receiveDuration(t, resets, "cadence reset after second pass"); got != 3*time.Minute {
+		t.Fatalf("regular interval after second pass = %v, want 3m", got)
+	}
+}
+
 func TestStartElapsedDeadlineDuringFailedEarlyRefreshSkipsStaleDecision(t *testing.T) {
 	advisory := cand("prod/b", "node3")
 	advisory.Executable = false
