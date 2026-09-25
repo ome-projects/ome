@@ -7,7 +7,8 @@ the existing release-driven Pages workflow publishes the website separately.
 
 ## Scope and lifecycle
 
-1. Inspect the full first-parent history of code/configuration changes on the
+1. Build the unchanged base site first to catch runner/dependency failures before
+   calling a model. Inspect the full first-parent history of code/configuration changes on the
    default branch and compare candidate changes with current code and docs.
    There is no date cutoff or persisted success cursor: older gaps and failed or
    deferred work remain eligible. Discovery is model-guided, not an exhaustive
@@ -59,7 +60,10 @@ reopen/rework it; the nightly does not silently recreate it.
 - Runner pods must expose `ANTHROPIC_API_KEY` with access to `claude-fable-5`,
   and support the Linux/Go/Node build used by the Pages workflow. The nightly
   downloads Hugo Extended 0.157.0 for Linux amd64/arm64 and verifies its pinned
-  SHA-256 digest; a C compiler is not required on the runner.
+  SHA-256 digest; a C compiler is not required on the runner. Builds use Node 22
+  (required by postcss-cli 12) and pin Docsy 0.14.3, compatible with this Hugo,
+  only in the isolated build copy. Dependency resolution and generated files
+  never enter the documentation PR. The Pages deployment workflow is separate.
   Use ephemeral, single-job runner pods so jobs do not share mutable host state.
 - Enable **Allow GitHub Actions to create and approve pull requests** in the
   repository's Actions settings (organization policy must allow it).
