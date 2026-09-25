@@ -12,7 +12,7 @@ the existing release-driven Pages workflow publishes the website separately.
    There is no date cutoff or persisted success cursor: older gaps and failed or
    deferred work remain eligible. Discovery is model-guided, not an exhaustive
    guarantee that every gap will be found in a single run.
-2. Select **at most four independent concerns per run**. Each concern answers
+2. Select **at most 100 independent concerns per run**. Each concern answers
    one concrete user question or corrects one stale claim and cites a source
    commit. Sharing a subsystem or source commit never justifies bundling fixes.
 3. Give each concern its own fresh checkout and allowlist of **at most three

@@ -15,7 +15,7 @@ DOC_ROOT = "site/content/en/docs/"
 GENERATED = DOC_ROOT + "reference/ome.v1beta1.md"
 MAX_FILES = 3
 MAX_LINES = 300
-MAX_PRS = 4
+MAX_PRS = 100
 CODE_PATHS = ["cmd", "pkg", "internal", "charts", "config", "scheduler", "hack",
               "dockerfiles", "Makefile", "Makefile-deps.mk", "go.mod"]
 SLUG = r"[a-z0-9]+(?:-[a-z0-9]+)*"

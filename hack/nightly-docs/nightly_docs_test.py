@@ -40,9 +40,15 @@ class PlanningTests(unittest.TestCase):
     def test_empty_plan_is_valid(self):
         self.assertEqual(self.plan([]), [])
 
-    def test_rejects_more_than_four_concerns(self):
+    def test_accepts_one_hundred_independent_concerns(self):
+        items = [proposal(concern=f"concern-{i}",
+                          doc_paths=[docs.DOC_ROOT + f"tasks/concern-{i}.md"])
+                 for i in range(100)]
+        self.assertEqual(len(self.plan(items)), 100)
+
+    def test_rejects_more_than_one_hundred_concerns(self):
         with self.assertRaisesRegex(ValueError, "nightly PR limit"):
-            self.plan([proposal()] * 5)
+            self.plan([proposal()] * 101)
 
     def test_rejects_unknown_source(self):
         with self.assertRaisesRegex(ValueError, "history"):
