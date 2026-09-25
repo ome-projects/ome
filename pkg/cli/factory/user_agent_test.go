@@ -71,6 +71,30 @@ func TestRESTConfigAddsBoundedProductUserAgent(t *testing.T) {
 			existing: "operations-console/2 kubectl-ome/v1.2.3",
 			want:     "operations-console/2 kubectl-ome/v1.2.3",
 		},
+		{
+			name:     "real executable default version",
+			version:  "v1.2.3",
+			existing: "kubectl-ome/v0.0.0 (linux/amd64) kubernetes/abcdef0",
+			want:     "kubectl-ome/v1.2.3 (linux/amd64) kubernetes/abcdef0",
+		},
+		{
+			name:     "caller supplied prior version",
+			version:  "v1.2.3",
+			existing: "operations-console/2 kubectl-ome/v0.9.0 audit-client/4",
+			want:     "operations-console/2 kubectl-ome/v1.2.3 audit-client/4",
+		},
+		{
+			name:     "duplicate and malformed product occurrences",
+			version:  "v1.2.3",
+			existing: "operations-console/2 kubectl-ome/v0.9.0 kubectl-ome/ kubectl-ome audit-client/4",
+			want:     "operations-console/2 kubectl-ome/v1.2.3 audit-client/4",
+		},
+		{
+			name:     "near match remains caller owned",
+			version:  "v1.2.3",
+			existing: "operations-console/2 kubectl-ome-helper/v4",
+			want:     "operations-console/2 kubectl-ome-helper/v4 kubectl-ome/v1.2.3",
+		},
 	}
 
 	for _, tt := range tests {

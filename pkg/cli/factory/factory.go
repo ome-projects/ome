@@ -79,21 +79,33 @@ func (f *defaultFactory) RESTConfig() (*rest.Config, error) {
 	return cfg, nil
 }
 
-// addProductUserAgent appends kubectl-ome/<version> as a distinct HTTP
-// product token. It preserves a caller-supplied User-Agent byte-for-byte and
-// is idempotent for an already appended token. rest.AddUserAgent is not used
-// because it replaces a caller-supplied value instead of extending it.
+// addProductUserAgent installs exactly one kubectl-ome/<version> HTTP product
+// token. The first existing kubectl-ome product is replaced in place, later
+// duplicates are removed, and every unrelated token retains its order.
+// rest.AddUserAgent is not used because it replaces a caller-supplied value
+// instead of extending it.
 func addProductUserAgent(config *rest.Config, gitVersion string) {
 	product := userAgentProduct + "/" + canonicalUserAgentVersion(gitVersion)
-	for _, token := range strings.Fields(config.UserAgent) {
-		if token == product {
-			return
-		}
-	}
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-	config.UserAgent += " " + product
+	tokens := strings.Fields(config.UserAgent)
+	result := make([]string, 0, len(tokens)+1)
+	installed := false
+	for _, token := range tokens {
+		if token == userAgentProduct || strings.HasPrefix(token, userAgentProduct+"/") {
+			if !installed {
+				result = append(result, product)
+				installed = true
+			}
+			continue
+		}
+		result = append(result, token)
+	}
+	if !installed {
+		result = append(result, product)
+	}
+	config.UserAgent = strings.Join(result, " ")
 }
 
 // canonicalUserAgentVersion accepts only a bounded HTTP token. Unsafe linker
