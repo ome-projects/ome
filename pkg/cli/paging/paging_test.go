@@ -91,6 +91,52 @@ func TestListAllPagedEmptyResultStopsAfterOneCall(t *testing.T) {
 	assert.Equal(t, 1, call, "an empty first page with no continue token must not be re-fetched")
 }
 
+func TestListAllPagedRejectsContinueTokenCycle(t *testing.T) {
+	responses := []struct {
+		items         []runtime.Object
+		continueToken string
+	}{
+		{items: []runtime.Object{obj("first")}, continueToken: "secret-token-a"},
+		{items: []runtime.Object{obj("second")}, continueToken: "secret-token-b"},
+		{items: []runtime.Object{obj("cycle-closing")}, continueToken: "secret-token-a"},
+	}
+	calls := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		if calls >= len(responses) {
+			return nil, "", errors.New("fixture exhausted without detecting token cycle")
+		}
+		response := responses[calls]
+		calls++
+		return response.items, response.continueToken, nil
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.EqualError(t, err, "continue token cycle detected after page 3")
+	assert.Nil(t, got, "a cycle must preserve ListAllPaged's all-or-nothing contract")
+	assert.Equal(t, 3, calls)
+	assert.NotContains(t, err.Error(), "secret-token-a")
+	assert.NotContains(t, err.Error(), "secret-token-b")
+}
+
+func TestListAllPagedRejectsImmediateContinueTokenCycle(t *testing.T) {
+	calls := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		calls++
+		if calls > 2 {
+			return nil, "", errors.New("fixture exhausted without detecting token cycle")
+		}
+		return []runtime.Object{obj("item")}, "secret-token-a", nil
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.EqualError(t, err, "continue token cycle detected after page 2")
+	assert.Nil(t, got, "a cycle must preserve ListAllPaged's all-or-nothing contract")
+	assert.Equal(t, 2, calls)
+	assert.NotContains(t, err.Error(), "secret-token-a")
+}
+
 func TestChunkSizeMatchesKubectlDefault(t *testing.T) {
 	// Pin the documented contract (500-item chunks, kubectl parity) so a
 	// change here is a deliberate, reviewed decision rather than an

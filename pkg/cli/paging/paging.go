@@ -5,6 +5,7 @@ package paging
 
 import (
 	"context"
+	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +34,8 @@ type PageFunc func(opts metav1.ListOptions) (items []runtime.Object, continueTok
 func ListAllPaged(ctx context.Context, page PageFunc) ([]runtime.Object, error) {
 	var out []runtime.Object
 	opts := metav1.ListOptions{Limit: ChunkSize}
+	seenContinueTokens := make(map[string]struct{})
+	completedPages := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -40,6 +43,13 @@ func ListAllPaged(ctx context.Context, page PageFunc) ([]runtime.Object, error) 
 		items, cont, err := page(opts)
 		if err != nil {
 			return nil, err
+		}
+		completedPages++
+		if cont != "" {
+			if _, seen := seenContinueTokens[cont]; seen {
+				return nil, fmt.Errorf("continue token cycle detected after page %d", completedPages)
+			}
+			seenContinueTokens[cont] = struct{}{}
 		}
 		out = append(out, items...)
 		if cont == "" {
