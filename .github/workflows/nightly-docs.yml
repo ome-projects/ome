@@ -139,7 +139,7 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 40
+            --max-turns 60
             --tools "Read,Glob,Grep,Edit,Write"
             --allowedTools "Read,Glob,Grep,Edit,Write"
       - name: Export untrusted documentation data
@@ -224,29 +224,30 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 30
+            --max-turns 60
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
             --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"}},"required":["single_concern","accurate","reason"]}'
-      - name: Require a passing review
+      - name: Record the review decision
         if: steps.scope.outputs.changed == 'true'
+        id: verdict
         env:
           REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
         run: |
-          python3 -c 'import os, sys; sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "nightly-docs-tools")); from nightly_docs import review_passes; review_passes(os.environ["REVIEW_JSON"])'
+          python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" review
       - uses: actions/setup-go@v6
-        if: steps.scope.outputs.changed == 'true'
+        if: steps.verdict.outputs.accepted == 'true'
         with:
           go-version: '1.26'
           cache-dependency-path: hack/internal/tools/go.sum
       - uses: actions/setup-node@v6
-        if: steps.scope.outputs.changed == 'true'
+        if: steps.verdict.outputs.accepted == 'true'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: site/package-lock.json
       - name: Build the documentation site
-        if: steps.scope.outputs.changed == 'true'
+        if: steps.verdict.outputs.accepted == 'true'
         env:
           HUGO_ENVIRONMENT: production
           HUGO_BASEURL: https://ome-projects.github.io/ome/
@@ -254,7 +255,7 @@ jobs:
           python3 "$RUNNER_TEMP/nightly-docs-tools/install_hugo.py" "$RUNNER_TEMP/nightly-docs-bin"
           python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" site "$RUNNER_TEMP/nightly-docs-site" "$RUNNER_TEMP/nightly-docs-bin/hugo"
       - name: Publish one documentation PR
-        if: steps.scope.outputs.changed == 'true'
+        if: steps.verdict.outputs.accepted == 'true'
         env:
           REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
         run: |

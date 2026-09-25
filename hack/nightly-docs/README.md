@@ -33,6 +33,9 @@ the existing release-driven Pages workflow publishes the website separately.
    single concern, build the production Hugo site, recheck live PRs, sign off
    one commit, and open one PR. Git commands disable hooks, including pre-push.
    Nothing is merged automatically. Empty or failed edits publish no PR.
+   An explicit accuracy/scope rejection is recorded in the job summary and skips
+   publication; it is an expected filter outcome. Malformed review output, model
+   failures, scope violations, and build/publication errors still fail the run.
    `fail-fast: false` lets other concerns finish when one fails. The publisher
    skips concerns whose writer failed to produce an artifact.
 

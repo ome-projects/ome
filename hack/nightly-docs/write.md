@@ -1,6 +1,7 @@
 Read AGENTS.md and the single concern JSON in NIGHTLY_ITEM.
 Read the supplied source-commit patch, current implementation, tests, and docs.
 Update ONLY the listed doc_paths to address exactly this one concern.
+Finish investigation and editing within 40 turns, leaving headroom to conclude.
 
 Do not fix adjacent gaps, sweep wording/formatting, or add other features to this
 PR. The diff must stay under 1,000 total added plus deleted lines (999 maximum).
