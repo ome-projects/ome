@@ -43,11 +43,15 @@ type boundedBody struct {
 	once      sync.Once
 	closeErr  error
 	failed    bool
+	eof       bool
 }
 
 func (b *boundedBody) Read(p []byte) (int, error) {
 	if b.failed {
 		return 0, errBodyLimit
+	}
+	if b.eof {
+		return 0, io.EOF
 	}
 	if int64(len(p)) > b.remaining {
 		p = p[:b.remaining]
@@ -64,6 +68,7 @@ func (b *boundedBody) Read(p []byte) (int, error) {
 		if err != io.EOF {
 			return 0, errBodyRead
 		}
+		b.eof = true
 	}
 	return n, err
 }

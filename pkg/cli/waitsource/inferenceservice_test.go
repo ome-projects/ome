@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
 	clocktesting "k8s.io/utils/clock/testing"
+	knapis "knative.dev/pkg/apis"
 
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/waitengine"
@@ -74,6 +76,85 @@ func TestRealWireNamedGetAndExactWatch(t *testing.T) {
 	}
 	require.Equal(t, int32(2), requests.Load())
 }
+
+func TestRealWireBookmarkResumeUsesLatestOpaqueResourceVersion(t *testing.T) {
+	service := func(resourceVersion string, ready corev1.ConditionStatus) *ome.InferenceService {
+		value := &ome.InferenceService{
+			TypeMeta: metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceService"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "service",
+				Namespace:       "work",
+				UID:             types.UID("uid"),
+				ResourceVersion: resourceVersion,
+			},
+		}
+		value.Status.Conditions = []knapis.Condition{{Type: knapis.ConditionReady, Status: ready}}
+		return value
+	}
+	var gets atomic.Int32
+	var watches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("watch") != "true" {
+			if gets.Add(1) != 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				require.NoError(t, json.NewEncoder(w).Encode(&metav1.Status{
+					TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+					Status:   metav1.StatusFailure,
+					Reason:   metav1.StatusReasonInternalError,
+					Code:     http.StatusInternalServerError,
+				}))
+				return
+			}
+			require.Equal(t, "/apis/ome.io/v1beta1/namespaces/work/inferenceservices/service", r.URL.Path)
+			require.NoError(t, json.NewEncoder(w).Encode(service("rv-initial", corev1.ConditionFalse)))
+			return
+		}
+		require.Equal(t, "/apis/ome.io/v1beta1/namespaces/work/inferenceservices", r.URL.Path)
+		require.Equal(t, "metadata.name=service", r.URL.Query().Get("fieldSelector"))
+		switch watches.Add(1) {
+		case 1:
+			require.Equal(t, "rv-initial", r.URL.Query().Get("resourceVersion"))
+			bookmark := &ome.InferenceService{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceService"},
+				ObjectMeta: metav1.ObjectMeta{ResourceVersion: "rv-bookmark"},
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(struct {
+				Type   string                `json:"type"`
+				Object *ome.InferenceService `json:"object"`
+			}{Type: "BOOKMARK", Object: bookmark}))
+			w.(http.Flusher).Flush()
+		case 2:
+			require.Equal(t, "rv-bookmark", r.URL.Query().Get("resourceVersion"))
+			require.NoError(t, json.NewEncoder(w).Encode(struct {
+				Type   string                `json:"type"`
+				Object *ome.InferenceService `json:"object"`
+			}{Type: "MODIFIED", Object: service("rv-ready", corev1.ConditionTrue)}))
+		default:
+			t.Errorf("unexpected watch opening")
+		}
+	}))
+	defer server.Close()
+	source, err := NewInferenceService(&rest.Config{Host: server.URL}, "work", "service")
+	require.NoError(t, err)
+	result, err := waitengine.Run(context.Background(), source, func(value *ome.InferenceService) (waitengine.Decision, error) {
+		condition := value.Status.GetCondition(knapis.ConditionReady)
+		matched := condition != nil && condition.IsTrue()
+		reason := waitengine.ReasonNotMatched
+		if matched {
+			reason = waitengine.ReasonMatched
+		}
+		return waitengine.Decision{Matched: matched, Reason: reason}, nil
+	}, waitengine.Options{Timeout: time.Minute})
+	require.NoError(t, err)
+	require.Equal(t, waitengine.OutcomeMatched, result.Outcome)
+	require.Equal(t, waitengine.MethodWatch, result.Method)
+	require.False(t, result.Fallback)
+	require.Equal(t, waitengine.Counts{Gets: 1, Watches: 2, Events: 2, Observations: 2}, result.Counts)
+	require.Equal(t, int32(1), gets.Load())
+	require.Equal(t, int32(2), watches.Load())
+}
+
 func TestNamedGet429IsNotRetried(t *testing.T) {
 	var n atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

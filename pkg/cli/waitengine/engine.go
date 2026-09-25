@@ -7,6 +7,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -142,6 +143,20 @@ func Run[T any](ctx context.Context, source Source[T], predicate Predicate[T], o
 
 var errTimeout = errors.New("wait command timeout")
 
+const (
+	maxWatchOpenings   = 2
+	maxWatchRetryDelay = 30 * time.Second
+)
+
+type watchAction uint8
+
+const (
+	watchFail watchAction = iota
+	watchResume
+	watchRefresh
+	watchPoll
+)
+
 type runState[T any] struct {
 	ctx, parent context.Context
 	source      Source[T]
@@ -241,7 +256,7 @@ func (s *runState[T]) run() error {
 	if s.options.PollOnly {
 		return s.poll()
 	}
-	for endings := 0; endings < 2; endings++ {
+	for opening := 0; opening < maxWatchOpenings; opening++ {
 		if stop, err := s.canceled(); stop {
 			return err
 		}
@@ -253,84 +268,131 @@ func (s *runState[T]) run() error {
 			}
 			return cancelErr
 		}
+		action := watchFail
+		var delay time.Duration
+		var actionErr error
 		if err != nil {
 			if w != nil {
 				w.Stop()
 			}
-			if watchPollable(err) {
-				return s.poll()
-			}
-			if !apierrors.IsResourceExpired(err) && !apierrors.IsGone(err) {
-				return &Error{Reason: ReasonAcquisitionFailed}
-			}
+			action, delay = classifyWatchFailure(err)
 		} else {
 			if w == nil {
 				return &Error{Reason: ReasonAcquisitionFailed}
 			}
-			stop, poll, watchErr := s.consume(w)
-			if stop {
-				return watchErr
-			}
-			if poll {
-				return s.poll()
-			}
+			action, delay, actionErr = s.consume(w)
 		}
-		if endings == 0 {
+		switch action {
+		case watchFail:
+			if actionErr != nil {
+				return actionErr
+			}
+			if s.result.Outcome != "" {
+				return nil
+			}
+			return &Error{Reason: ReasonAcquisitionFailed}
+		case watchPoll:
+			return s.poll()
+		case watchRefresh:
 			s.result.Method = MethodRefreshGET
 			if stop, getErr := s.get(); stop {
 				return getErr
+			}
+			if opening+1 >= maxWatchOpenings {
+				return s.poll()
+			}
+		case watchResume:
+			if opening+1 >= maxWatchOpenings {
+				return s.poll()
+			}
+			if stop, retryErr := s.waitWatchRetry(delay); stop {
+				return retryErr
 			}
 		}
 	}
 	return s.poll()
 }
 
-func watchPollable(err error) bool {
-	return apierrors.IsForbidden(err) || apierrors.IsMethodNotSupported(err) || apierrors.IsNotFound(err) || apierrors.IsInternalError(err) || apierrors.IsServiceUnavailable(err)
+func classifyWatchFailure(err error) (watchAction, time.Duration) {
+	if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+		return watchRefresh, 0
+	}
+	transient := apierrors.IsTooManyRequests(err) || apierrors.IsServerTimeout(err) ||
+		apierrors.IsTimeout(err) || apierrors.IsInternalError(err) || apierrors.IsServiceUnavailable(err)
+	if transient {
+		if seconds, suggested := apierrors.SuggestsClientDelay(err); suggested && seconds > 0 {
+			maxSeconds := int(maxWatchRetryDelay / time.Second)
+			if seconds > maxSeconds {
+				seconds = maxSeconds
+			}
+			return watchResume, time.Duration(seconds) * time.Second
+		}
+		return watchPoll, 0
+	}
+	if apierrors.IsForbidden(err) || apierrors.IsMethodNotSupported(err) || apierrors.IsNotFound(err) {
+		return watchPoll, 0
+	}
+	return watchFail, 0
 }
 
-func (s *runState[T]) consume(w watch.Interface) (stop, poll bool, err error) {
+func (s *runState[T]) waitWatchRetry(delay time.Duration) (bool, error) {
+	if delay <= 0 {
+		return s.canceled()
+	}
+	timer := s.options.Clock.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-s.ctx.Done():
+	case <-timer.C():
+	}
+	return s.canceled()
+}
+
+func (s *runState[T]) consume(w watch.Interface) (watchAction, time.Duration, error) {
 	defer w.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
-			stop, err = s.canceled()
-			return stop, false, err
+			_, err := s.canceled()
+			return watchFail, 0, err
 		case event, ok := <-w.ResultChan():
 			if !ok {
-				return false, false, nil
+				return watchResume, 0, nil
 			}
 			if done, cancelErr := s.canceled(); done {
-				return true, false, cancelErr
+				return watchFail, 0, cancelErr
 			}
 			if s.result.Counts.Events >= s.options.EventBudget {
-				return true, false, &Error{Reason: ReasonEventLimit}
+				return watchFail, 0, &Error{Reason: ReasonEventLimit}
 			}
 			s.result.Counts.Events++
 			switch event.Type {
 			case watch.Bookmark:
+				accessor, accessorErr := meta.Accessor(event.Object)
+				if accessorErr != nil || accessor.GetResourceVersion() == "" {
+					return watchFail, 0, &Error{Reason: ReasonInvalidIdentity}
+				}
+				s.rv = accessor.GetResourceVersion()
 				continue
 			case watch.Error:
 				eventErr := apierrors.FromObject(event.Object)
-				if watchPollable(eventErr) {
-					return false, true, nil
+				action, delay := classifyWatchFailure(eventErr)
+				if action == watchFail {
+					return watchFail, 0, &Error{Reason: ReasonAcquisitionFailed}
 				}
-				if apierrors.IsResourceExpired(eventErr) || apierrors.IsGone(eventErr) {
-					return false, false, nil
-				}
-				return true, false, &Error{Reason: ReasonAcquisitionFailed}
+				return action, delay, nil
 			case watch.Added, watch.Modified, watch.Deleted:
 				snapshot, decodeErr := s.source.Decode(event.Object)
 				if decodeErr != nil {
-					return true, false, &Error{Reason: ReasonInvalidIdentity}
+					return watchFail, 0, &Error{Reason: ReasonInvalidIdentity}
 				}
 				s.result.Method = MethodWatch
 				done, observeErr := s.observe(snapshot, event.Type == watch.Deleted)
 				if done {
-					return true, false, observeErr
+					return watchFail, 0, observeErr
 				}
 			default:
-				return true, false, &Error{Reason: ReasonAcquisitionFailed}
+				return watchFail, 0, &Error{Reason: ReasonAcquisitionFailed}
 			}
 		}
 	}
