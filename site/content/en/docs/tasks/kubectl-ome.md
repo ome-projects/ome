@@ -22,11 +22,11 @@ kubectl krew install --manifest-url \
 ```
 
 To pin a release instead of tracking the newest one, replace `latest/download`
-with `download/<tag>`:
+with `download/` and the release tag:
 
 ```bash
 kubectl krew install --manifest-url \
-  https://github.com/ome-projects/ome/releases/download/<tag>/ome.yaml
+  https://github.com/ome-projects/ome/releases/download/vX.Y.Z/ome.yaml
 ```
 
 ## Commands
@@ -63,7 +63,7 @@ rules:
     resources: ["pods", "events"]
     verbs: ["get", "list"]
   - apiGroups: [""]
-    resources: ["pods/log", "configmaps"]
+    resources: ["pods/log"]
     verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -73,13 +73,45 @@ rules:
     verbs: ["get", "list"]
 ```
 
-The action commands — `rollout pause/resume/promote/rollback`,
-`migration start`, `scale`, `runtime sync` and `instance release-held` —
-patch their target, so they need one more rule. Grant it only to users who
-should be able to change rollout, migration and scale state:
+`admin recommendations`, `migration history` and `migration start` each read
+one derived ConfigMap in the namespace they are pointed at. Bound
+cluster-wide, a ConfigMap rule grants `get` on every ConfigMap in the
+cluster, so keep it out of the baseline role and add it only where those
+commands are used — as an extra rule, or through a namespace-scoped `Role`
+and `RoleBinding` for users confined to one namespace:
+
+```yaml
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+```
+
+Full `autoscale status` output also reads `horizontalpodautoscalers`
+(`autoscaling/v2`) and KEDA `scaledobjects` (`keda.sh/v1alpha1`). Without
+them the command still succeeds but reports scaler evidence as unavailable,
+which is easy to mistake for a broken autoscaler:
+
+```yaml
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get"]
+```
+
+The action commands — `rollout pause/resume/promote/rollback/repin`,
+`traffic drain/undrain`, `migration start`, `scale`, `runtime sync` and
+`instance release-held` — patch their target, so they need one more rule.
+`scale` patches the `scale` subresource, which RBAC matches only when it is
+named explicitly. Grant this rule only to users who should be able to change
+rollout, traffic, migration and scale state:
 
 ```yaml
   - apiGroups: ["ome.io"]
-    resources: ["inferenceservices", "inferencereplicas"]
+    resources:
+      - inferenceservices
+      - inferencereplicas
+      - inferencereplicas/scale
     verbs: ["patch"]
 ```

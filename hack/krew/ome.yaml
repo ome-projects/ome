@@ -13,12 +13,12 @@ spec:
     explanations powered by the operator's own scoring engine, and
     component-aware log streaming.
   caveats: |
-    Inspection commands need get/list on ome.io resources plus pods,
-    pods/log, events, configmaps, apps/deployments and
-    apps/controllerrevisions. Action commands (rollout, migration start,
-    scale, runtime sync, instance release-held) also patch
-    inferenceservices and inferencereplicas. See the docs for example
-    ClusterRoles:
+    Inspection commands are read-only, and read pods, pods/log, events,
+    configmaps, apps/deployments and apps/controllerrevisions alongside
+    ome.io resources. Action commands (rollout, traffic, migration start,
+    scale, runtime sync, instance release-held) patch inferenceservices,
+    inferencereplicas and inferencereplicas/scale. The docs carry
+    ClusterRoles with the exact verbs:
     https://ome-projects.github.io/ome/docs/tasks/kubectl-ome/
   platforms:
     - selector: {matchLabels: {os: linux, arch: amd64}}
