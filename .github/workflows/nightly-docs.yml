@@ -20,19 +20,18 @@ concurrency:
 
 jobs:
   plan:
-    if: github.repository == 'ome-projects/ome'
+    if: github.repository == 'ome-projects/ome' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ome-runner-cpu
     timeout-minutes: 45
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
-      base_sha: ${{ steps.plan.outputs.base_sha }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/nightly-docs-setup
@@ -83,7 +82,7 @@ jobs:
     name: 'Document: ${{ matrix.concern }}'
     env:
       GH_TOKEN: ${{ github.token }}
-      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      BASE_SHA: ${{ github.sha }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
       ITEM_JSON: ${{ toJSON(matrix) }}
     steps:
@@ -91,7 +90,7 @@ jobs:
       # from another documentation PR's branch.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.plan.outputs.base_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/nightly-docs-setup
@@ -141,7 +140,7 @@ jobs:
     name: 'Validate and publish: ${{ matrix.concern }}'
     env:
       GH_TOKEN: ${{ github.token }}
-      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      BASE_SHA: ${{ github.sha }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
       ITEM_JSON: ${{ toJSON(matrix) }}
     steps:
@@ -149,7 +148,7 @@ jobs:
       # hooks, config, or review verdicts are reused in this privileged job.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.plan.outputs.base_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/nightly-docs-setup

@@ -273,7 +273,7 @@ def main():
         items = plan(os.environ["PLAN_JSON"], context)
         with open(os.environ["GITHUB_OUTPUT"], "a") as out:
             out.write("matrix=" + json.dumps({"include": items}) + "\n")
-            out.write(f"count={len(items)}\nbase_sha={context['base_sha']}\n")
+            out.write(f"count={len(items)}\n")
     else:
         item = validate_item(json.loads(os.environ["ITEM_JSON"]))
         base = os.environ["BASE_SHA"]
