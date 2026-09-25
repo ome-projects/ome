@@ -62,17 +62,23 @@ func (o *Options) Complete(f factory.Factory, args []string) error {
 		return err
 	}
 	o.entry = e
+	if !e.Namespaced {
+		o.namespace = ""
+		if o.AllNamespaces {
+			fmt.Fprintf(o.ErrOut, "warning: --all-namespaces is ignored for the cluster-scoped resource %q\n", e.Canonical)
+		}
+		return nil
+	}
 	ns, _, err := f.Namespace()
 	if err != nil {
-		return err
+		return apierror.SafeRead(err, apierror.ReadTarget{
+			Operation: apierror.ReadOperationResolve,
+			Resource:  "namespace",
+		})
 	}
 	o.namespace = ns
 	if o.AllNamespaces {
-		if e.Namespaced {
-			o.namespace = metav1.NamespaceAll
-		} else {
-			fmt.Fprintf(o.ErrOut, "warning: --all-namespaces is ignored for the cluster-scoped resource %q\n", e.Canonical)
-		}
+		o.namespace = metav1.NamespaceAll
 	}
 	return nil
 }
@@ -97,14 +103,23 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 	if o.Name != "" {
 		obj, err := o.entry.GetOne(ctx, f, o.namespace, o.Name)
 		if err != nil {
-			return apierror.Friendly(err)
+			return apierror.SafeRead(err, apierror.ReadTarget{
+				Operation: apierror.ReadOperationGet,
+				Resource:  o.entry.Canonical,
+				Namespace: o.namespace,
+				Name:      o.Name,
+			})
 		}
 		objs = []runtime.Object{obj}
 	} else {
 		var err error
 		objs, err = o.entry.List(ctx, f, o.namespace, metav1.ListOptions{LabelSelector: o.Selector})
 		if err != nil {
-			return apierror.Friendly(err)
+			return apierror.SafeRead(err, apierror.ReadTarget{
+				Operation: apierror.ReadOperationList,
+				Resource:  o.entry.Canonical,
+				Namespace: o.namespace,
+			})
 		}
 	}
 	if o.Output == "json" || o.Output == "yaml" {

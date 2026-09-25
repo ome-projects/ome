@@ -11,9 +11,15 @@ import (
 
 const maxInspectionBytes = 8192
 
+var slackWebhookPrefixes = [...]string{
+	"https://hooks.slack.com/services/",
+	"https://hooks.slack-gov.com/services/",
+}
+
 var credentialShapes = []*regexp.Regexp{
 	regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`),
 	regexp.MustCompile(`(?:^|[^A-Za-z0-9])sk-(?:[A-Za-z0-9_-]{20,})`),
+	regexp.MustCompile(`(?:xox[baprs]|xapp|xwfp|xoxe)-[A-Za-z0-9-]{10,}`),
 	regexp.MustCompile(`(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[^A-Z0-9])`),
 	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}`),
 	regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])bearer[[:space:]]+[A-Za-z0-9._~+/-]{4,}`),
@@ -27,6 +33,14 @@ func Sanitize(value string, width int) string {
 	inspected := value
 	if len(inspected) > maxInspectionBytes {
 		inspected = inspected[:maxInspectionBytes]
+	}
+	// A Slack webhook is sensitive as soon as its stable prefix appears. Keep
+	// this case-insensitive scan bounded to the same window as every regex.
+	lowerInspected := strings.ToLower(inspected)
+	for _, prefix := range slackWebhookPrefixes {
+		if strings.Contains(lowerInspected, prefix) {
+			return "[REDACTED]"
+		}
 	}
 	for _, shape := range credentialShapes {
 		if shape.FindStringIndex(inspected) != nil {

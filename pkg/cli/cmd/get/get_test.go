@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,11 +15,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	k8stesting "k8s.io/client-go/testing"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
@@ -24,6 +30,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/paging"
+	"sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 )
 
@@ -48,6 +55,48 @@ func execute(t *testing.T, f factory.Factory, args ...string) (string, error) {
 	cmd.SetArgs(args)
 	err := cmd.Execute()
 	return out.String(), err
+}
+
+func executeSeparate(t *testing.T, f factory.Factory, args ...string) (string, string, error) {
+	t.Helper()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	streams := genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: &stdout, ErrOut: &stderr}
+	cmd := NewCmd(f, streams)
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetErr(&stderr)
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return stdout.String(), stderr.String(), err
+}
+
+type readErrorFactory struct {
+	factory.Factory
+	namespaceErr   error
+	omeErr         error
+	namespaceCalls int
+	omeCalls       int
+}
+
+func (f *readErrorFactory) Namespace() (string, bool, error) {
+	f.namespaceCalls++
+	if f.namespaceErr != nil {
+		return "", false, f.namespaceErr
+	}
+	return f.Factory.Namespace()
+}
+
+func (f *readErrorFactory) OMEClient() (versioned.Interface, error) {
+	f.omeCalls++
+	if f.omeErr != nil {
+		return nil, f.omeErr
+	}
+	return f.Factory.OMEClient()
+}
+
+func getTestSecret() string {
+	return strings.Join([]string{"xoxb", "123456789012", "123456789012", "abcdefghijklmnopqrstuvwxyz"}, "-")
 }
 
 func fixtureISVC(name, ns string) *v1beta1.InferenceService {
@@ -219,7 +268,8 @@ func TestGetNotFoundFriendly(t *testing.T) {
 	f := factory.Static{OME: omefake.NewSimpleClientset(), NS: "team-a"}
 	_, err := execute(t, f, "isvc", "missing")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `"missing" not found`)
+	assert.Equal(t, "get inferenceservices team-a/missing: NotFound", err.Error())
+	assert.True(t, kerrors.IsNotFound(err))
 }
 
 // TestGetISVCListJSONEnvelope pins Finding 1: a multi-object -o json listing
@@ -446,4 +496,220 @@ func TestGetAcceleratorQuotaPreservesStaleAndCurrentBudgets(t *testing.T) {
 	assert.Equal(t, 3, strings.Count(out, "Stale"), out)
 	assert.Contains(t, out, "h200", "a current declaration absent from stale status must remain visible")
 	assert.Less(t, strings.Index(out, "Declared"), strings.Index(out, "Reported"), "current declaration must precede stale reported data for the same budget")
+}
+
+func TestGetNamespaceResolutionErrorIsSafeAndStopsBeforeClientCreation(t *testing.T) {
+	hostile := errors.New("exec plugin stderr: Bearer " + getTestSecret())
+	f := &readErrorFactory{
+		Factory:      factory.Static{OME: omefake.NewSimpleClientset(), NS: "team-a"},
+		namespaceErr: hostile,
+	}
+
+	stdout, stderr, err := executeSeparate(t, f, "isvc")
+	require.Error(t, err)
+	assert.Equal(t, "resolve namespace: Unavailable", err.Error())
+	assert.Empty(t, stdout)
+	assert.Empty(t, stderr)
+	assert.Equal(t, 1, f.namespaceCalls)
+	assert.Zero(t, f.omeCalls, "namespace failure must stop before any API client is acquired")
+	assert.True(t, errors.Is(err, hostile))
+	assert.NotContains(t, err.Error(), getTestSecret())
+}
+
+func TestGetClientCreationErrorIsSafe(t *testing.T) {
+	hostile := errors.New("load config https://user:" + getTestSecret() + "@api.invalid")
+	f := &readErrorFactory{
+		Factory: factory.Static{NS: "team-a"},
+		omeErr:  hostile,
+	}
+
+	stdout, stderr, err := executeSeparate(t, f, "isvc", "chat", "-o", "json")
+	require.Error(t, err)
+	assert.Equal(t, "get inferenceservices team-a/chat: Unavailable", err.Error())
+	assert.Empty(t, stdout)
+	assert.Empty(t, stderr)
+	assert.Equal(t, 1, f.omeCalls)
+	assert.True(t, errors.Is(err, hostile))
+	assert.NotContains(t, err.Error(), getTestSecret())
+}
+
+func TestGetNamedAPIErrorIsSafeInEveryOutputFormat(t *testing.T) {
+	groupResource := schema.GroupResource{Group: "ome.io", Resource: "inferenceservices"}
+	raw := kerrors.NewForbidden(groupResource, "chat", errors.New("policy webhook: "+getTestSecret()))
+
+	for _, format := range []string{"", "wide", "json", "yaml"} {
+		format := format
+		t.Run(fmt.Sprintf("format_%s", format), func(t *testing.T) {
+			client := omefake.NewSimpleClientset()
+			client.PrependReactor("get", "inferenceservices", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				return true, nil, raw
+			})
+			args := []string{"isvc", "chat"}
+			if format != "" {
+				args = append(args, "-o", format)
+			}
+
+			stdout, stderr, err := executeSeparate(t, factory.Static{OME: client, NS: "team-a"}, args...)
+			require.Error(t, err)
+			assert.Equal(t, "get inferenceservices team-a/chat: Forbidden", err.Error())
+			assert.Empty(t, stdout, "failed structured reads must not emit partial objects")
+			assert.Empty(t, stderr)
+			assert.True(t, kerrors.IsForbidden(err))
+			assert.NotContains(t, err.Error(), getTestSecret())
+		})
+	}
+}
+
+func TestGetListAPIErrorIsSafeInEveryOutputFormat(t *testing.T) {
+	raw := kerrors.NewTooManyRequests("scheduler said "+getTestSecret(), 4)
+
+	for _, format := range []string{"", "wide", "json", "yaml"} {
+		format := format
+		t.Run(fmt.Sprintf("format_%s", format), func(t *testing.T) {
+			client := omefake.NewSimpleClientset()
+			client.PrependReactor("list", "inferenceservices", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				return true, nil, raw
+			})
+			args := []string{"isvc"}
+			if format != "" {
+				args = append(args, "-o", format)
+			}
+
+			stdout, stderr, err := executeSeparate(t, factory.Static{OME: client, NS: "team-a"}, args...)
+			require.Error(t, err)
+			assert.Equal(t, "list inferenceservices team-a: TooManyRequests", err.Error())
+			assert.Empty(t, stdout, "failed structured reads must not emit partial lists")
+			assert.Empty(t, stderr)
+			assert.True(t, kerrors.IsTooManyRequests(err))
+			assert.NotContains(t, err.Error(), getTestSecret())
+		})
+	}
+}
+
+func TestGetPreservesCancellationAndDeadlineIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  error
+		want string
+	}{
+		{name: "canceled", raw: fmt.Errorf("transport %s: %w", getTestSecret(), context.Canceled), want: "Canceled"},
+		{name: "deadline", raw: fmt.Errorf("transport %s: %w", getTestSecret(), context.DeadlineExceeded), want: "TimedOut"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := omefake.NewSimpleClientset()
+			client.PrependReactor("list", "inferenceservices", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				return true, nil, tt.raw
+			})
+
+			stdout, stderr, err := executeSeparate(t, factory.Static{OME: client, NS: "team-a"}, "isvc")
+			require.Error(t, err)
+			assert.Equal(t, "list inferenceservices team-a: "+tt.want, err.Error())
+			assert.Empty(t, stdout)
+			assert.Empty(t, stderr)
+			if tt.name == "canceled" {
+				assert.True(t, errors.Is(err, context.Canceled))
+			} else {
+				assert.True(t, errors.Is(err, context.DeadlineExceeded))
+			}
+		})
+	}
+}
+
+func TestGetDistinguishesMissingObjectFromMissingOMEAPI(t *testing.T) {
+	groupResource := schema.GroupResource{Group: "ome.io", Resource: "inferenceservices"}
+	tests := []struct {
+		name string
+		raw  error
+		want string
+	}{
+		{
+			name: "object",
+			raw:  kerrors.NewNotFound(groupResource, "missing"),
+			want: "get inferenceservices team-a/missing: NotFound",
+		},
+		{
+			name: "api with named generic response",
+			raw:  kerrors.NewGenericServerResponse(http.StatusNotFound, http.MethodGet, groupResource, "missing", "proxy "+getTestSecret(), 0, true),
+			want: "get inferenceservices team-a/missing: OMEAPIMissing (install OME first)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := omefake.NewSimpleClientset()
+			client.PrependReactor("get", "inferenceservices", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				return true, nil, tt.raw
+			})
+
+			stdout, stderr, err := executeSeparate(t, factory.Static{OME: client, NS: "team-a"}, "isvc", "missing")
+			require.Error(t, err)
+			assert.Equal(t, tt.want, err.Error())
+			assert.Empty(t, stdout)
+			assert.Empty(t, stderr)
+			assert.True(t, kerrors.IsNotFound(err))
+			assert.NotContains(t, err.Error(), getTestSecret())
+		})
+	}
+}
+
+func TestGetClusterScopedErrorsSkipNamespaceResolutionAndOmitNamespace(t *testing.T) {
+	groupResource := schema.GroupResource{Group: "ome.io", Resource: "clusterbasemodels"}
+	tests := []struct {
+		name string
+		verb string
+		args []string
+		want string
+	}{
+		{
+			name: "named",
+			verb: "get",
+			args: []string{"clusterbasemodels", "llama"},
+			want: "get clusterbasemodels llama: Forbidden",
+		},
+		{
+			name: "list",
+			verb: "list",
+			args: []string{"clusterbasemodels"},
+			want: "list clusterbasemodels: Forbidden",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := omefake.NewSimpleClientset()
+			client.PrependReactor(tt.verb, "clusterbasemodels", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				return true, nil, kerrors.NewForbidden(groupResource, "llama", errors.New("private policy"))
+			})
+			f := &readErrorFactory{
+				Factory:      factory.Static{OME: client, NS: "team-a"},
+				namespaceErr: errors.New("namespace resolution must not run"),
+			}
+
+			stdout, stderr, err := executeSeparate(t, f, tt.args...)
+			require.Error(t, err)
+			assert.Equal(t, tt.want, err.Error())
+			assert.Empty(t, stdout)
+			assert.Empty(t, stderr)
+			assert.Zero(t, f.namespaceCalls)
+			assert.Equal(t, 1, f.omeCalls)
+			assert.True(t, kerrors.IsForbidden(err))
+		})
+	}
+}
+
+func TestGetClusterScopedAllNamespacesWarnsWithoutResolvingNamespace(t *testing.T) {
+	f := &readErrorFactory{
+		Factory:      factory.Static{OME: omefake.NewSimpleClientset(), NS: "team-a"},
+		namespaceErr: errors.New("namespace resolution must not run"),
+	}
+
+	stdout, stderr, err := executeSeparate(t, f, "clusterbasemodels", "--all-namespaces")
+	require.NoError(t, err)
+	assert.Empty(t, stdout)
+	assert.Contains(t, stderr, `warning: --all-namespaces is ignored for the cluster-scoped resource "clusterbasemodels"`)
+	assert.Contains(t, stderr, "No clusterbasemodels found.")
+	assert.Zero(t, f.namespaceCalls)
+	assert.Equal(t, 1, f.omeCalls)
 }
