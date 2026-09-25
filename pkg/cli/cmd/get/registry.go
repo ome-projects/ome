@@ -1165,6 +1165,139 @@ func rolloutPolicyConditionStatus(policy *v1beta1.RolloutPolicy, conditionType s
 	return conditionStatus(policy.Status.Conditions, conditionType)
 }
 
+var trafficMapsEntry = &entry{
+	Canonical:  "trafficmaps",
+	Aliases:    []string{"trafficmap", "tm", "tmap"},
+	Namespaced: true,
+	Columns: []column{
+		{Name: "NAME", Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return trafficMap.Name
+		})},
+		{Name: "MODE", Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return printers.OrDash(string(trafficMap.Spec.Mode))
+		})},
+		{Name: "TARGETS", Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return fmt.Sprintf("%d", len(trafficMap.Spec.Entries))
+		})},
+		{Name: "ROUTABLE", Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return trafficMapConditionStatus(trafficMap, v1beta1.TrafficMapRoutable)
+		})},
+		{Name: "PUBLISHED", Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return trafficMapConditionStatus(trafficMap, v1beta1.TrafficMapPublished)
+		})},
+		{Name: "AGE", Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return printers.Age(trafficMap.CreationTimestamp)
+		})},
+		{Name: "SERVICE", Wide: true, Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return printers.OrDash(trafficMap.Spec.Service)
+		})},
+		{Name: "ACTIVE", Wide: true, Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return fmt.Sprintf("%d", trafficMapEntryCount(trafficMap, func(entry v1beta1.TrafficMapEntry) bool {
+				return entry.Weight > 0
+			}))
+		})},
+		{Name: "HEALTHY", Wide: true, Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return fmt.Sprintf("%d", trafficMapEntryCount(trafficMap, func(entry v1beta1.TrafficMapEntry) bool {
+				return entry.Healthy
+			}))
+		})},
+		{Name: "OVERRIDE", Wide: true, Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			return trafficMapConditionStatus(trafficMap, v1beta1.TrafficMapOverrideActive)
+		})},
+		{Name: "OVERRIDE-REASON", Wide: true, Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			condition := trafficMapCurrentCondition(trafficMap, v1beta1.TrafficMapOverrideActive)
+			if condition == nil {
+				return "-"
+			}
+			return printers.OrDash(condition.Reason)
+		})},
+		{Name: "REASON", Wide: true, Extract: safeCol(func(trafficMap *v1beta1.TrafficMap) string {
+			condition := trafficMapCurrentCondition(trafficMap, v1beta1.TrafficMapRoutable)
+			if condition == nil {
+				return "-"
+			}
+			return printers.OrDash(condition.Reason)
+		})},
+		{Name: "GATEWAY", Wide: true, Extract: safeCol(trafficMapGateway)},
+		{Name: "PUBLISHER-FRESHNESS", Wide: true, Extract: safeCol(trafficMapPublisherFreshness)},
+	},
+	List: func(ctx context.Context, f factory.Factory, namespace string, options metav1.ListOptions) ([]runtime.Object, error) {
+		client, err := f.OMEClient()
+		if err != nil {
+			return nil, err
+		}
+		trafficMaps := client.OmeV1beta1().TrafficMaps(namespace)
+		return paging.ListAllPaged(ctx, func(pageOptions metav1.ListOptions) ([]runtime.Object, string, error) {
+			pageOptions.LabelSelector = options.LabelSelector
+			list, err := trafficMaps.List(ctx, pageOptions)
+			if err != nil {
+				return nil, "", err
+			}
+			items := make([]runtime.Object, 0, len(list.Items))
+			for index := range list.Items {
+				items = append(items, &list.Items[index])
+			}
+			return items, list.Continue, nil
+		})
+	},
+	GetOne: func(ctx context.Context, f factory.Factory, namespace, name string) (runtime.Object, error) {
+		client, err := f.OMEClient()
+		if err != nil {
+			return nil, err
+		}
+		return client.OmeV1beta1().TrafficMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	},
+}
+
+func trafficMapCurrentCondition(trafficMap *v1beta1.TrafficMap, conditionType string) *metav1.Condition {
+	condition := meta.FindStatusCondition(trafficMap.Status.Conditions, conditionType)
+	if condition == nil || condition.ObservedGeneration != trafficMap.Generation {
+		return nil
+	}
+	return condition
+}
+
+func trafficMapConditionStatus(trafficMap *v1beta1.TrafficMap, conditionType string) string {
+	condition := trafficMapCurrentCondition(trafficMap, conditionType)
+	if condition == nil {
+		return "Unknown"
+	}
+	return string(condition.Status)
+}
+
+func trafficMapEntryCount(trafficMap *v1beta1.TrafficMap, include func(v1beta1.TrafficMapEntry) bool) int {
+	count := 0
+	for _, entry := range trafficMap.Spec.Entries {
+		if include(entry) {
+			count++
+		}
+	}
+	return count
+}
+
+func trafficMapGateway(trafficMap *v1beta1.TrafficMap) string {
+	reference := trafficMap.Status.GatewayRef
+	if reference == nil {
+		return "-"
+	}
+	group := reference.Group
+	if group == "" {
+		group = "core"
+	}
+	namespace := reference.Namespace
+	if namespace == "" {
+		namespace = trafficMap.Namespace
+	}
+	return fmt.Sprintf("%s/%s:%s/%s", group, printers.OrDash(reference.Kind), printers.OrDash(namespace), printers.OrDash(reference.Name))
+}
+
+func trafficMapPublisherFreshness(trafficMap *v1beta1.TrafficMap) string {
+	if trafficMap.Status.ObservedTrafficMapGeneration == 0 {
+		return "Unobserved"
+	}
+	return generationFreshness(trafficMap.Generation, trafficMap.Status.ObservedTrafficMapGeneration)
+}
+
 const (
 	acceleratorQuotaColumns     = 12
 	acceleratorQuotaWideColumns = 14
@@ -1216,5 +1349,5 @@ var registry = []*entry{
 	runtimesEntry, servingRuntimesEntry, clusterServingRuntimesEntry,
 	acceleratorClassesEntry, acceleratorQuotasEntry, benchmarkJobsEntry,
 	fineTunedWeightsEntry, inferenceReplicasEntry, workloadClustersEntry, rolloutPoliciesEntry,
-	autoscalerPoliciesEntry,
+	autoscalerPoliciesEntry, trafficMapsEntry,
 }

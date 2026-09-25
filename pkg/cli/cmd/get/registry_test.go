@@ -57,7 +57,7 @@ func TestRegistryHasAllResources(t *testing.T) {
 		"inferenceservices", "basemodels", "clusterbasemodels",
 		"servingruntimes", "clusterservingruntimes", "acceleratorclasses",
 		"acceleratorquotas", "benchmarkjobs", "finetunedweights", "inferencereplicas",
-		"workloadclusters", "rolloutpolicies", "autoscalerpolicies", "models", "runtimes",
+		"workloadclusters", "rolloutpolicies", "autoscalerpolicies", "trafficmaps", "models", "runtimes",
 	}
 	var got []string
 	for _, e := range registry {
