@@ -17,9 +17,16 @@ kubectl krew install ome
 Until then, install straight from a GitHub release:
 
 ```bash
-VERSION=v0.10.0  # pick the release you want
 kubectl krew install --manifest-url \
-  https://github.com/ome-projects/ome/releases/download/${VERSION}/ome.yaml
+  https://github.com/ome-projects/ome/releases/latest/download/ome.yaml
+```
+
+To pin a release instead of tracking the newest one, replace `latest/download`
+with `download/<tag>`:
+
+```bash
+kubectl krew install --manifest-url \
+  https://github.com/ome-projects/ome/releases/download/<tag>/ome.yaml
 ```
 
 ## Commands
@@ -41,7 +48,7 @@ before GA — script against `-o json`.
 
 ## Required RBAC
 
-The plugin is read-only. A minimal ClusterRole:
+The inspection commands are read-only. A minimal ClusterRole:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -56,9 +63,23 @@ rules:
     resources: ["pods", "events"]
     verbs: ["get", "list"]
   - apiGroups: [""]
-    resources: ["pods/log"]
+    resources: ["pods/log", "configmaps"]
     verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["controllerrevisions"]
+    verbs: ["get", "list"]
+```
+
+The action commands — `rollout pause/resume/promote/rollback`,
+`migration start`, `scale`, `runtime sync` and `instance release-held` —
+patch their target, so they need one more rule. Grant it only to users who
+should be able to change rollout, migration and scale state:
+
+```yaml
+  - apiGroups: ["ome.io"]
+    resources: ["inferenceservices", "inferencereplicas"]
+    verbs: ["patch"]
 ```
