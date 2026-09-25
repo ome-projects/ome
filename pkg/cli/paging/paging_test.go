@@ -3,6 +3,7 @@ package paging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,6 +26,15 @@ func (f *fakeObj) DeepCopyObject() runtime.Object {
 }
 
 func obj(n string) runtime.Object { return &fakeObj{N: n} }
+
+func legacyGone(message string) *apierrors.StatusError {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    410,
+		Reason:  metav1.StatusReasonGone,
+		Message: message,
+	}}
+}
 
 func TestListAllPagedDrainsThreePagesFollowingContinueTokens(t *testing.T) {
 	pages := [][]runtime.Object{
@@ -203,6 +213,210 @@ func TestListAllPagedCancellationStopsExpiredRestart(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, got)
 	assert.Equal(t, 2, call, "cancellation must prevent the restart request")
+}
+
+func TestListAllPagedRestartsOnceAfterLegacyGoneContinuation(t *testing.T) {
+	gone := legacyGone("private server detail")
+	var gotOpts []metav1.ListOptions
+	call := 0
+	page := func(opts metav1.ListOptions) ([]runtime.Object, string, error) {
+		gotOpts = append(gotOpts, opts)
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("stale-prefix")}, "old-token", nil
+		case 2:
+			return nil, "", gone
+		case 3:
+			return []runtime.Object{obj("fresh-a")}, "new-token", nil
+		case 4:
+			return []runtime.Object{obj("fresh-b")}, "", nil
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "fresh-a", got[0].(*fakeObj).N)
+	assert.Equal(t, "fresh-b", got[1].(*fakeObj).N)
+	assert.Equal(t, []string{"", "old-token", "", "new-token"}, []string{
+		gotOpts[0].Continue,
+		gotOpts[1].Continue,
+		gotOpts[2].Continue,
+		gotOpts[3].Continue,
+	})
+	for _, opts := range gotOpts {
+		assert.Equal(t, int64(ChunkSize), opts.Limit)
+	}
+}
+
+func TestListAllPagedRestartsOnceAfterWrappedLegacyGoneContinuation(t *testing.T) {
+	gone := legacyGone("private server detail")
+	call := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("discarded")}, "old-token", nil
+		case 2:
+			return nil, "", fmt.Errorf("safe list failure: %w", gone)
+		case 3:
+			return []runtime.Object{obj("kept")}, "", nil
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "kept", got[0].(*fakeObj).N)
+	assert.Equal(t, 3, call)
+}
+
+func TestListAllPagedLegacyGoneRestartResetsTokenCycleState(t *testing.T) {
+	gone := legacyGone("private server detail")
+	call := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("discarded")}, "same-token", nil
+		case 2:
+			return nil, "", gone
+		case 3:
+			return []runtime.Object{obj("kept-a")}, "same-token", nil
+		case 4:
+			return []runtime.Object{obj("kept-b")}, "", nil
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, 4, call)
+}
+
+func TestListAllPagedReturnsSecondMixedContinuationExpirationWithoutPartialData(t *testing.T) {
+	tests := []struct {
+		name  string
+		first error
+		last  error
+	}{
+		{
+			name:  "expired then gone",
+			first: apierrors.NewResourceExpired("first private detail"),
+			last:  legacyGone("second private detail"),
+		},
+		{
+			name:  "gone then expired",
+			first: legacyGone("first private detail"),
+			last:  apierrors.NewResourceExpired("second private detail"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := 0
+			page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+				call++
+				switch call {
+				case 1:
+					return []runtime.Object{obj("discarded")}, "old-token", nil
+				case 2:
+					return nil, "", tt.first
+				case 3:
+					return []runtime.Object{obj("also-discarded")}, "new-token", nil
+				case 4:
+					return nil, "", tt.last
+				default:
+					return nil, "", errors.New("unexpected extra request")
+				}
+			}
+
+			got, err := ListAllPaged(context.Background(), page)
+
+			require.ErrorIs(t, err, tt.last)
+			assert.Nil(t, got)
+			assert.Equal(t, 4, call, "a continuation expiration must restart at most once")
+		})
+	}
+}
+
+func TestListAllPagedDoesNotRestartLegacyGoneFirstPage(t *testing.T) {
+	gone := legacyGone("private server detail")
+	call := 0
+	page := func(opts metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		assert.Empty(t, opts.Continue)
+		return nil, "", gone
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.ErrorIs(t, err, gone)
+	assert.Nil(t, got)
+	assert.Equal(t, 1, call)
+}
+
+func TestListAllPagedCancellationStopsLegacyGoneRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	gone := legacyGone("private server detail")
+	call := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		if call == 1 {
+			return []runtime.Object{obj("discarded")}, "old-token", nil
+		}
+		cancel()
+		return nil, "", gone
+	}
+
+	got, err := ListAllPaged(ctx, page)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, got)
+	assert.Equal(t, 2, call, "cancellation must prevent the restart request")
+}
+
+func TestListAllPagedLegacyGoneRecoveryDoesNotLeakPrivateDetails(t *testing.T) {
+	const (
+		oldToken       = "private-old-token"
+		freshToken     = "private-fresh-token"
+		serverMessage  = "private apiserver message"
+		wrapperMessage = "safe list failure"
+	)
+	call := 0
+	page := func(metav1.ListOptions) ([]runtime.Object, string, error) {
+		call++
+		switch call {
+		case 1:
+			return []runtime.Object{obj("discarded")}, oldToken, nil
+		case 2:
+			return nil, "", fmt.Errorf("%s: %w", wrapperMessage, legacyGone(serverMessage))
+		case 3:
+			return []runtime.Object{obj("kept-a")}, freshToken, nil
+		case 4:
+			return []runtime.Object{obj("kept-b")}, freshToken, nil
+		default:
+			return nil, "", errors.New("unexpected extra request")
+		}
+	}
+
+	got, err := ListAllPaged(context.Background(), page)
+
+	require.EqualError(t, err, "continue token cycle detected after page 2")
+	assert.Nil(t, got)
+	assert.NotContains(t, err.Error(), oldToken)
+	assert.NotContains(t, err.Error(), freshToken)
+	assert.NotContains(t, err.Error(), serverMessage)
+	assert.NotContains(t, err.Error(), wrapperMessage)
 }
 
 func TestListAllPagedEmptyResultStopsAfterOneCall(t *testing.T) {
