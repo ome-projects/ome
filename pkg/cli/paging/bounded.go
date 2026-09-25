@@ -38,6 +38,10 @@ func ListBounded[T any](ctx context.Context, base metav1.ListOptions, limits Lim
 	}
 	result := Result[T]{Items: make([]T, 0, limits.MaxItems)}
 	continueToken := base.Continue
+	seenContinueTokens := make(map[string]struct{})
+	if continueToken != "" {
+		seenContinueTokens[continueToken] = struct{}{}
+	}
 
 	for result.Pages < limits.MaxPages && len(result.Items) < limits.MaxItems {
 		if err := ctx.Err(); err != nil {
@@ -61,6 +65,12 @@ func ListBounded[T any](ctx context.Context, base metav1.ListOptions, limits Lim
 		}
 		if page.Continue != "" && page.Continue == request.Continue {
 			return result, fmt.Errorf("continue token did not advance after page %d", result.Pages)
+		}
+		if page.Continue != "" {
+			if _, seen := seenContinueTokens[page.Continue]; seen {
+				return result, fmt.Errorf("continue token cycle detected after page %d", result.Pages)
+			}
+			seenContinueTokens[page.Continue] = struct{}{}
 		}
 		if len(page.Items) > remaining {
 			result.Items = append(result.Items, page.Items[:remaining]...)
