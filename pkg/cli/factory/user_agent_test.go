@@ -253,6 +253,7 @@ func TestFactoryClientsSendSameProductUserAgent(t *testing.T) {
 }
 
 func TestRESTConfigCachedAccessDoesNotRaceConfigCopies(t *testing.T) {
+	setGitVersion(t, "unknown")
 	config := &rest.Config{UserAgent: "operations-console/2"}
 	f := &defaultFactory{rest: config}
 	got, err := f.RESTConfig()
