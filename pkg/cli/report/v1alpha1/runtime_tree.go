@@ -107,6 +107,44 @@ type RuntimeTreeDependent struct {
 	UID       string                   `json:"uid,omitempty"`
 }
 
+// RuntimeTreeUnattributedState is a closed classification for an
+// InferenceService that cannot safely be attached to one runtime head.
+type RuntimeTreeUnattributedState string
+
+const (
+	RuntimeTreeUnattributedUnresolved RuntimeTreeUnattributedState = "Unresolved"
+	RuntimeTreeUnattributedInvalid    RuntimeTreeUnattributedState = "Invalid"
+	RuntimeTreeUnattributedAmbiguous  RuntimeTreeUnattributedState = "Ambiguous"
+)
+
+// RuntimeTreeUnattributedReason is a bounded explanation that never carries
+// an API error or controller message.
+type RuntimeTreeUnattributedReason string
+
+const (
+	RuntimeTreeUnattributedAutomaticSelection        RuntimeTreeUnattributedReason = "AutomaticSelection"
+	RuntimeTreeUnattributedRuntimeNotFound           RuntimeTreeUnattributedReason = "RuntimeNotFound"
+	RuntimeTreeUnattributedInvalidRuntimeName        RuntimeTreeUnattributedReason = "InvalidRuntimeName"
+	RuntimeTreeUnattributedDuplicateInferenceService RuntimeTreeUnattributedReason = "DuplicateInferenceService"
+)
+
+// RuntimeTreeUnattributedUser is safe identity-only evidence. It is never a
+// child of Target or of any runtime path.
+type RuntimeTreeUnattributedUser struct {
+	Kind        RuntimeTreeDependentKind      `json:"kind"`
+	Namespace   string                        `json:"namespace"`
+	Name        string                        `json:"name"`
+	State       RuntimeTreeUnattributedState  `json:"state"`
+	ReasonCode  RuntimeTreeUnattributedReason `json:"reasonCode"`
+	RuntimeName string                        `json:"runtimeName,omitempty"`
+}
+
+// RuntimeTreeUnattributedUsers is present only when the caller explicitly
+// requests unresolved-reference evidence.
+type RuntimeTreeUnattributedUsers struct {
+	Items []RuntimeTreeUnattributedUser `json:"items"`
+}
+
 // RuntimeTreeIssueCode classifies an inheritance topology problem.
 type RuntimeTreeIssueCode string
 
@@ -161,9 +199,10 @@ type RuntimeTreeContext struct {
 
 // RuntimeTreeContent is the typed body shared by terminal and machine output.
 type RuntimeTreeContent struct {
-	Target   RuntimeTreeIdentity  `json:"target"`
-	Snapshot RuntimeTreeSnapshot  `json:"snapshot"`
-	Contexts []RuntimeTreeContext `json:"contexts"`
+	Target            RuntimeTreeIdentity           `json:"target"`
+	Snapshot          RuntimeTreeSnapshot           `json:"snapshot"`
+	Contexts          []RuntimeTreeContext          `json:"contexts"`
+	UnattributedUsers *RuntimeTreeUnattributedUsers `json:"unattributedUsers,omitempty"`
 }
 
 // NewRuntimeTreeReport creates a canonical runtime inheritance tree report.
@@ -194,6 +233,16 @@ func (c RuntimeTreeContent) Canonical() RuntimeTreeContent {
 	sort.Slice(result.Contexts, func(i, j int) bool {
 		return compareRuntimeTreeContexts(result.Contexts[i], result.Contexts[j]) < 0
 	})
+	if c.UnattributedUsers != nil {
+		result.UnattributedUsers = &RuntimeTreeUnattributedUsers{
+			Items: append([]RuntimeTreeUnattributedUser{}, c.UnattributedUsers.Items...),
+		}
+		sort.Slice(result.UnattributedUsers.Items, func(i, j int) bool {
+			return compareRuntimeTreeUnattributedUsers(
+				result.UnattributedUsers.Items[i], result.UnattributedUsers.Items[j],
+			) < 0
+		})
+	}
 	return result
 }
 
@@ -248,9 +297,11 @@ func (c RuntimeTreeContent) Table() report.Table {
 	return c.tableWithWarnings(nil)
 }
 
-// RuntimeTreeWideTable returns the complete legacy human view of value. The
-// envelope is canonicalized so warnings retain the same deterministic order as
-// compact and machine output.
+// RuntimeTreeWideTable returns the complete legacy human view of value. Only
+// the opt-in unattributed-user rows remain bounded to 80 columns because their
+// explicit non-attribution labels are safety-critical. The envelope is
+// canonicalized so warnings retain the same deterministic order as compact and
+// machine output.
 func RuntimeTreeWideTable(value RuntimeEnvelope[RuntimeTreeContent]) report.Table {
 	canonical := value.Canonical()
 	return canonical.Content.wideTableWithWarnings(canonical.Warnings)
@@ -298,6 +349,7 @@ func (c RuntimeTreeContent) tableWithWarnings(warnings []RuntimeWarning) report.
 			}
 		}
 	}
+	rows = append(rows, formatRuntimeTreeUnattributedRows(canonical.UnattributedUsers)...)
 	rows = append(rows, []string{formatRuntimeTreeComponentRow(
 		"Snapshot: ", string(canonical.Snapshot.Completeness), "",
 	)})
@@ -357,6 +409,7 @@ func (c RuntimeTreeContent) wideTableWithWarnings(warnings []RuntimeWarning) rep
 			}
 		}
 	}
+	rows = append(rows, formatRuntimeTreeUnattributedRows(canonical.UnattributedUsers)...)
 	rows = append(rows, []string{"Snapshot: " + string(canonical.Snapshot.Completeness)})
 	for _, collection := range canonical.Snapshot.Collections {
 		rows = append(rows, []string{formatRuntimeTreeCollection(collection)})
@@ -365,6 +418,35 @@ func (c RuntimeTreeContent) wideTableWithWarnings(warnings []RuntimeWarning) rep
 		rows = append(rows, []string{"Warning: " + string(warning.Code)})
 	}
 	return report.Table{Headers: []string{"RUNTIME TREE"}, Rows: rows}
+}
+
+func formatRuntimeTreeUnattributedRows(block *RuntimeTreeUnattributedUsers) [][]string {
+	if block == nil {
+		return nil
+	}
+	rows := [][]string{{"Unattributed users (not attributed to runtime tree):"}}
+	for _, user := range block.Items {
+		rows = append(rows, []string{formatRuntimeTreeUnattributedIdentityRow(user)})
+		detail := "  state=" + string(user.State) + " reason=" + string(user.ReasonCode)
+		rows = append(rows, []string{formatRuntimeTreeComponentRow("", detail, "")})
+		if user.RuntimeName != "" {
+			rows = append(rows, []string{formatRuntimeTreeComponentRow(
+				"  declared runtime=", user.RuntimeName, "",
+			)})
+		}
+	}
+	if len(block.Items) == 0 {
+		rows = append(rows, []string{"  none observed"})
+	}
+	return rows
+}
+
+func formatRuntimeTreeUnattributedIdentityRow(user RuntimeTreeUnattributedUser) string {
+	const prefix = "  [not attributed] "
+	return prefix + formatBoundedRuntimeTreeIdentityParts(
+		string(user.Kind), user.Namespace, user.Name,
+		runtimeTreeTableWidth-printers.CellDisplayWidth(prefix),
+	)
 }
 
 func selectedSuffix(selected bool) string {
@@ -728,6 +810,22 @@ func compareRuntimeTreeDependents(a, b RuntimeTreeDependent) int {
 		cmp.Compare(a.Namespace, b.Namespace),
 		cmp.Compare(a.Name, b.Name),
 		cmp.Compare(a.UID, b.UID),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareRuntimeTreeUnattributedUsers(a, b RuntimeTreeUnattributedUser) int {
+	for _, result := range []int{
+		cmp.Compare(a.Kind, b.Kind),
+		cmp.Compare(a.Namespace, b.Namespace),
+		cmp.Compare(a.Name, b.Name),
+		cmp.Compare(a.State, b.State),
+		cmp.Compare(a.ReasonCode, b.ReasonCode),
+		cmp.Compare(a.RuntimeName, b.RuntimeName),
 	} {
 		if result != 0 {
 			return result

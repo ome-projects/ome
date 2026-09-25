@@ -194,6 +194,94 @@ Collection: InferenceService scope=AllNamespaces status=Complete pages=1 items=1
 	assert.Greater(t, printers.CellDisplayWidth(strings.Split(out.String(), "\n")[5]), 80)
 }
 
+func TestTreeShowsUnattributedUsersOnlyWhenRequested(t *testing.T) {
+	clusterKind := "ClusterServingRuntime"
+	localKind := "ServingRuntime"
+	// Repeated keys cannot come from a conforming Kubernetes LIST. Inject one
+	// defensively to prove corrupt/nonconforming snapshot evidence stays separate.
+	services := []omev1beta1.InferenceService{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-z", Name: "automatic"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "missing-cluster"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: "gone-cluster", Kind: &clusterKind}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "missing-local"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: "gone-local", Kind: &localKind}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "malformed"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: ""}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "unsafe"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: "TOKEN=private-value"}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "duplicate"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: "gone-local", Kind: &localKind}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "duplicate"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: "root", Kind: &clusterKind}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "resolved"}, Spec: omev1beta1.InferenceServiceSpec{Runtime: &omev1beta1.ServingRuntimeRef{Name: "root", Kind: &clusterKind}}},
+	}
+	newClient := func() *omefake.Clientset {
+		client := omefake.NewSimpleClientset(clusterRuntimeWithExactName("root", ""))
+		client.PrependReactor("list", "inferenceservices", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+			return true, &omev1beta1.InferenceServiceList{Items: services}, nil
+		})
+		return client
+	}
+
+	defaultClient := newClient()
+	var defaultOut bytes.Buffer
+	_, err := executeTree(t, factory.Static{OME: defaultClient, NS: "team-a"}, &defaultOut,
+		"root", "--kind", "ClusterServingRuntime")
+	require.NoError(t, err)
+	assert.Contains(t, defaultOut.String(), "InferenceService/team-a/resolved")
+	assert.NotContains(t, defaultOut.String(), "Unattributed users")
+	assert.NotContains(t, defaultOut.String(), "missing-cluster")
+	assert.Len(t, defaultClient.Actions(), 3)
+
+	flaggedClient := newClient()
+	var flaggedOut bytes.Buffer
+	_, err = executeTree(t, factory.Static{OME: flaggedClient, NS: "team-a"}, &flaggedOut,
+		"root", "--kind", "ClusterServingRuntime", "--show-unattributed-users")
+	require.NoError(t, err)
+	assert.Contains(t, flaggedOut.String(), "Unattributed users (not attributed to runtime tree):")
+	for _, name := range []string{"automatic", "missing-cluster", "missing-local", "malformed", "unsafe", "duplicate"} {
+		assert.Contains(t, flaggedOut.String(), name)
+	}
+	assert.Contains(t, flaggedOut.String(), "state=Unresolved reason=AutomaticSelection")
+	assert.Contains(t, flaggedOut.String(), "state=Unresolved reason=RuntimeNotFound")
+	assert.Contains(t, flaggedOut.String(), "state=Invalid reason=InvalidRuntimeName")
+	assert.Contains(t, flaggedOut.String(), "state=Ambiguous reason=DuplicateInferenceService")
+	assert.NotContains(t, flaggedOut.String(), "TOKEN=private-value")
+	assert.Len(t, flaggedClient.Actions(), 3, "opt-in projection must not add API reads")
+
+	jsonClient := newClient()
+	var jsonOut bytes.Buffer
+	_, err = executeTree(t, factory.Static{OME: jsonClient, NS: "team-a"}, &jsonOut,
+		"root", "--kind", "ClusterServingRuntime", "--show-unattributed-users", "-o", "json")
+	require.NoError(t, err)
+	var decoded reportv1alpha1.RuntimeEnvelope[reportv1alpha1.RuntimeTreeContent]
+	require.NoError(t, json.Unmarshal(jsonOut.Bytes(), &decoded))
+	require.NotNil(t, decoded.Content.UnattributedUsers)
+	assert.Len(t, decoded.Content.UnattributedUsers.Items, 6)
+	for _, context := range decoded.Content.Contexts {
+		for _, path := range context.Paths {
+			for _, dependent := range path.Dependents {
+				assert.Equal(t, "resolved", dependent.Name)
+			}
+		}
+	}
+}
+
+func TestTreeUnattributedUsersPreserveUnavailableSnapshotEvidence(t *testing.T) {
+	client := omefake.NewSimpleClientset(clusterRuntimeWithExactName("root", ""))
+	client.PrependReactor("list", "inferenceservices", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Group: "ome.io", Resource: "inferenceservices"}, "",
+			errors.New("private source detail"),
+		)
+	})
+	var out bytes.Buffer
+
+	_, err := executeTree(t, factory.Static{OME: client, NS: "team-a"}, &out,
+		"root", "--kind", "ClusterServingRuntime", "--show-unattributed-users")
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "Unattributed users (not attributed to runtime tree):\n  none observed\n")
+	assert.Contains(t, out.String(), "Snapshot: Partial")
+	assert.Contains(t, out.String(), "status=Unavailable pages=0 items=0")
+	assert.NotContains(t, out.String(), "private source detail")
+	assert.Len(t, client.Actions(), 3)
+}
+
 // TestTreeExplainsHowToResolveKindCollisions catches an implicit target
 // silently choosing either the namespaced or cluster-scoped object.
 func TestTreeExplainsHowToResolveKindCollisions(t *testing.T) {
@@ -361,7 +449,7 @@ func TestTreeReportsTruncatedInferenceServiceCollection(t *testing.T) {
 		factory.Static{OME: client, NS: "team-a"},
 		dependencies,
 		&out,
-		"root", "--kind", "ClusterServingRuntime",
+		"root", "--kind", "ClusterServingRuntime", "--show-unattributed-users",
 	)
 
 	require.NoError(t, err)
@@ -375,6 +463,8 @@ func TestTreeReportsTruncatedInferenceServiceCollection(t *testing.T) {
 	assert.Contains(t, out.String(), "Warning: PartialData\n")
 	assert.Contains(t, out.String(), "Warning: Truncated\n")
 	assert.NotContains(t, out.String(), "Warning: SourceUnavailable\n")
+	assert.Contains(t, out.String(),
+		"Unattributed users (not attributed to runtime tree):\n  none observed\n")
 }
 
 // TestTreeDrainsFinitePagesForEveryCollection catches command composition
@@ -1182,6 +1272,7 @@ func TestTreeValidationPrecedesClientAcquisition(t *testing.T) {
 		{name: "invalid output", args: []string{"runtime", "--output", "xml"}, wantError: `unsupported output format "xml" (supported: table, wide, json, yaml)`},
 		{name: "invalid output first", args: []string{"Bad_Name", "--output", "xml"}, wantError: `unsupported output format "xml" (supported: table, wide, json, yaml)`},
 		{name: "invalid kind", args: []string{"runtime", "--kind", "Pod"}, wantError: "unsupported runtime kind"},
+		{name: "invalid unattributed flag value", args: []string{"runtime", "--show-unattributed-users=maybe"}, wantError: "invalid argument"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1238,11 +1329,13 @@ func TestTreeHelpShowsCollisionSafeInvocations(t *testing.T) {
 		"kubectl ome runtime tree vllm-runtime",
 		"--kind ClusterServingRuntime",
 		"--kind ServingRuntime -n team-a -o json",
-		"Use -o wide for the complete unabridged tree",
+		"complete unabridged runtime tree;",
+		"unattributed-user rows remain bounded to 80",
 		"Output format: table, wide, json or yaml",
 		"explicitly reference each visible runtime head",
 		"inheritance is rendered only from complete runtime collections",
 		"InferenceService collection remains visible as partial dependency evidence",
+		"keys are defensive Ambiguous evidence of a corrupt or nonconforming snapshot",
 	} {
 		assert.Contains(t, out.String(), want)
 	}
@@ -1517,7 +1610,9 @@ func TestTreeHonorsCancellationBeforeListing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cmd.SetContext(ctx)
-	cmd.SetArgs([]string{treeFixturePrefix + "root", "--kind", "ClusterServingRuntime"})
+	cmd.SetArgs([]string{
+		treeFixturePrefix + "root", "--kind", "ClusterServingRuntime", "--show-unattributed-users",
+	})
 
 	err := cmd.Execute()
 

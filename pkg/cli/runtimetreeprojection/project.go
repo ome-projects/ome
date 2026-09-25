@@ -27,6 +27,9 @@ var (
 	// ErrDependentRuntimeNotVisible indicates a leaf whose runtime is absent as
 	// an exact direct head. An ancestor occurrence is intentionally insufficient.
 	ErrDependentRuntimeNotVisible = errors.New("runtime tree dependent runtime is not a visible head")
+	// ErrInvalidUnattributedUser indicates evidence that is unsafe or outside
+	// the report's closed state/reason vocabulary.
+	ErrInvalidUnattributedUser = errors.New("runtime tree unattributed user is invalid")
 )
 
 // CollectionObservation is bounded pagination evidence for one collected
@@ -58,12 +61,24 @@ type DependentLeaf struct {
 	UID       string
 }
 
+// UnattributedUserObservation is one identity-only service reference that
+// cannot be assigned to exactly one runtime.
+type UnattributedUserObservation struct {
+	Namespace   string
+	Name        string
+	State       reportv1alpha1.RuntimeTreeUnattributedState
+	Reason      reportv1alpha1.RuntimeTreeUnattributedReason
+	RuntimeName string
+}
+
 // Input contains already-collected evidence. Project never performs I/O or
 // mutates these values.
 type Input struct {
-	Projection runtimegraph.Projection
-	Snapshot   SnapshotObservation
-	Dependents []DependentLeaf
+	Projection               runtimegraph.Projection
+	Snapshot                 SnapshotObservation
+	Dependents               []DependentLeaf
+	IncludeUnattributedUsers bool
+	UnattributedUsers        []UnattributedUserObservation
 }
 
 // Project builds a canonical runtime-tree report from already-resolved graph
@@ -87,7 +102,14 @@ func Project(
 	if err := attachDependents(contexts, heads, input.Dependents); err != nil {
 		return reportv1alpha1.RuntimeEnvelope[reportv1alpha1.RuntimeTreeContent]{}, err
 	}
-	if err := validateVisibleCounts(snapshot, contexts); err != nil {
+	var unattributedUsers *reportv1alpha1.RuntimeTreeUnattributedUsers
+	if input.IncludeUnattributedUsers {
+		unattributedUsers, err = projectUnattributedUsers(input.UnattributedUsers)
+		if err != nil {
+			return reportv1alpha1.RuntimeEnvelope[reportv1alpha1.RuntimeTreeContent]{}, err
+		}
+	}
+	if err := validateVisibleCounts(snapshot, contexts, unattributedUsers); err != nil {
 		return reportv1alpha1.RuntimeEnvelope[reportv1alpha1.RuntimeTreeContent]{}, err
 	}
 	reportValue := reportv1alpha1.NewRuntimeTreeReport(
@@ -95,11 +117,77 @@ func Project(
 			Namespace: input.Projection.Target.Namespace,
 			Name:      input.Projection.Target.Name,
 		},
-		reportv1alpha1.RuntimeTreeContent{Target: target, Snapshot: snapshot, Contexts: contexts},
+		reportv1alpha1.RuntimeTreeContent{
+			Target: target, Snapshot: snapshot, Contexts: contexts,
+			UnattributedUsers: unattributedUsers,
+		},
 		clock,
 	)
 	reportValue.Warnings = warnings
 	return reportValue.Canonical(), nil
+}
+
+func projectUnattributedUsers(
+	values []UnattributedUserObservation,
+) (*reportv1alpha1.RuntimeTreeUnattributedUsers, error) {
+	result := &reportv1alpha1.RuntimeTreeUnattributedUsers{
+		Items: make([]reportv1alpha1.RuntimeTreeUnattributedUser, 0, len(values)),
+	}
+	seen := make(map[dependentIdentity]struct{}, len(values))
+	for _, value := range values {
+		if err := validateUnattributedUser(value); err != nil {
+			return nil, err
+		}
+		identity := dependentIdentity{
+			kind:      reportv1alpha1.RuntimeTreeDependentInferenceService,
+			namespace: value.Namespace,
+			name:      value.Name,
+		}
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, fmt.Errorf(
+				"%w: duplicate InferenceService identity", ErrInvalidUnattributedUser,
+			)
+		}
+		seen[identity] = struct{}{}
+		result.Items = append(result.Items, reportv1alpha1.RuntimeTreeUnattributedUser{
+			Kind:      reportv1alpha1.RuntimeTreeDependentInferenceService,
+			Namespace: value.Namespace, Name: value.Name,
+			State: value.State, ReasonCode: value.Reason, RuntimeName: value.RuntimeName,
+		})
+	}
+	return result, nil
+}
+
+func validateUnattributedUser(value UnattributedUserObservation) error {
+	if len(validation.IsDNS1123Label(value.Namespace)) != 0 ||
+		len(validation.IsDNS1123Subdomain(value.Name)) != 0 {
+		return fmt.Errorf("%w: unsafe InferenceService identity", ErrInvalidUnattributedUser)
+	}
+	switch {
+	case value.State == reportv1alpha1.RuntimeTreeUnattributedUnresolved &&
+		value.Reason == reportv1alpha1.RuntimeTreeUnattributedAutomaticSelection:
+		if value.RuntimeName != "" {
+			return fmt.Errorf("%w: automatic selection has a declared runtime", ErrInvalidUnattributedUser)
+		}
+	case value.State == reportv1alpha1.RuntimeTreeUnattributedUnresolved &&
+		value.Reason == reportv1alpha1.RuntimeTreeUnattributedRuntimeNotFound:
+		if len(validation.IsDNS1123Subdomain(value.RuntimeName)) != 0 {
+			return fmt.Errorf("%w: unsafe declared runtime name", ErrInvalidUnattributedUser)
+		}
+	case value.State == reportv1alpha1.RuntimeTreeUnattributedInvalid &&
+		value.Reason == reportv1alpha1.RuntimeTreeUnattributedInvalidRuntimeName:
+		if value.RuntimeName != "" {
+			return fmt.Errorf("%w: invalid runtime name was retained", ErrInvalidUnattributedUser)
+		}
+	case value.State == reportv1alpha1.RuntimeTreeUnattributedAmbiguous &&
+		value.Reason == reportv1alpha1.RuntimeTreeUnattributedDuplicateInferenceService:
+		if value.RuntimeName != "" {
+			return fmt.Errorf("%w: ambiguous reference has a runtime name", ErrInvalidUnattributedUser)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported state/reason", ErrInvalidUnattributedUser)
+	}
+	return nil
 }
 
 func projectSnapshot(
@@ -737,6 +825,7 @@ func validateDependent(value DependentLeaf) error {
 func validateVisibleCounts(
 	snapshot reportv1alpha1.RuntimeTreeSnapshot,
 	contexts []reportv1alpha1.RuntimeTreeContext,
+	unattributedUsers *reportv1alpha1.RuntimeTreeUnattributedUsers,
 ) error {
 	visibleRuntimes := map[reportv1alpha1.RuntimeTreeIdentity]struct{}{}
 	visibleDependents := map[dependentIdentity]struct{}{}
@@ -750,6 +839,20 @@ func validateVisibleCounts(
 					kind: dependent.Kind, namespace: dependent.Namespace, name: dependent.Name,
 				}] = struct{}{}
 			}
+		}
+	}
+	if unattributedUsers != nil {
+		for _, user := range unattributedUsers.Items {
+			identity := dependentIdentity{
+				kind: user.Kind, namespace: user.Namespace, name: user.Name,
+			}
+			if _, attributed := visibleDependents[identity]; attributed {
+				return fmt.Errorf(
+					"%w: InferenceService identity is also attributed to a runtime",
+					ErrInvalidUnattributedUser,
+				)
+			}
+			visibleDependents[identity] = struct{}{}
 		}
 	}
 

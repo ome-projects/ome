@@ -31,12 +31,13 @@ type treeCommandDependencies struct {
 
 type treeOptions struct {
 	genericiooptions.IOStreams
-	dependencies treeCommandDependencies
-	name         string
-	kind         string
-	output       string
-	format       report.Format
-	wide         bool
+	dependencies          treeCommandDependencies
+	name                  string
+	kind                  string
+	output                string
+	format                report.Format
+	wide                  bool
+	showUnattributedUsers bool
 }
 
 func newTreeCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -65,14 +66,19 @@ explicitly reference each visible runtime head.
 Namespaced and cluster resolution contexts remain separate. Runtime
 inheritance is rendered only from complete runtime collections. An incomplete
 InferenceService collection remains visible as partial dependency evidence.
+With --show-unattributed-users, unresolved and invalid service references are
+shown in a separate block and are never attached to the tree. Duplicate object
+keys are defensive Ambiguous evidence of a corrupt or nonconforming snapshot;
+ordinary controller resolution is deterministic.
 Runtime specs, InferenceService specs and status, labels, annotations, and
 resource versions are never printed. Namespaced targets list ServingRuntimes
 and InferenceServices only in the selected namespace; cluster targets expand
 those reads across namespaces.
 
 The default table bounds every line to 80 display columns and marks each
-clipped identity component with a stable fingerprint.
-Use -o wide for the complete unabridged tree.`,
+clipped identity component with a stable fingerprint. Use -o wide for the
+complete unabridged runtime tree; unattributed-user rows remain bounded to 80
+display columns.`,
 		Example: `  # Auto-detect when the name resolves to exactly one runtime
   kubectl ome runtime tree vllm-runtime
 
@@ -92,6 +98,12 @@ Use -o wide for the complete unabridged tree.`,
 	}
 	cmd.Flags().StringVar(&o.kind, "kind", "", "Runtime kind: ServingRuntime or ClusterServingRuntime (auto-detected when omitted)")
 	cmd.Flags().StringVarP(&o.output, "output", "o", "table", "Output format: table, wide, json or yaml")
+	cmd.Flags().BoolVar(
+		&o.showUnattributedUsers,
+		"show-unattributed-users",
+		false,
+		"Show unattributed and defensive duplicate-key evidence separately from runtime users",
+	)
 	return cmd
 }
 
@@ -251,6 +263,10 @@ func (o *treeOptions) run(ctx context.Context, f factory.Factory) error {
 	if err != nil {
 		return fmt.Errorf("project runtime users: %w", err)
 	}
+	var unattributedUsers []runtimetreeprojection.UnattributedUserObservation
+	if o.showUnattributedUsers {
+		unattributedUsers = projectTreeUnattributedUsers(usage)
+	}
 	namespacedCollectionScope := reportv1alpha1.RuntimeTreeCollectionScopeAllNamespaces
 	collectionNamespace := ""
 	if projection.Target.Kind == runtimegraph.KindServingRuntime {
@@ -286,7 +302,9 @@ func (o *treeOptions) run(ctx context.Context, f factory.Factory) error {
 				ObservedItems: services.Completeness.ObservedItems,
 			},
 		}},
-		Dependents: dependents,
+		Dependents:               dependents,
+		IncludeUnattributedUsers: o.showUnattributedUsers,
+		UnattributedUsers:        unattributedUsers,
 	}, o.dependencies.clock)
 	if err != nil {
 		return fmt.Errorf("build runtime tree report: %w", err)
@@ -301,6 +319,43 @@ func (o *treeOptions) run(ctx context.Context, f factory.Factory) error {
 		return fmt.Errorf("write runtime tree report: %w", err)
 	}
 	return nil
+}
+
+func projectTreeUnattributedUsers(
+	usage *runtimeusage.Index,
+) []runtimetreeprojection.UnattributedUserObservation {
+	result := []runtimetreeprojection.UnattributedUserObservation{}
+	for _, reference := range usage.References() {
+		value := runtimetreeprojection.UnattributedUserObservation{
+			Namespace: reference.InferenceService.Namespace,
+			Name:      reference.InferenceService.Name,
+		}
+		switch {
+		case reference.State == runtimeusage.ReferenceUnresolved &&
+			reference.Reason == runtimeusage.ReasonAutomaticSelection:
+			value.State = reportv1alpha1.RuntimeTreeUnattributedUnresolved
+			value.Reason = reportv1alpha1.RuntimeTreeUnattributedAutomaticSelection
+		case reference.State == runtimeusage.ReferenceUnresolved &&
+			reference.Reason == runtimeusage.ReasonRuntimeNotFound:
+			value.State = reportv1alpha1.RuntimeTreeUnattributedUnresolved
+			value.Reason = reportv1alpha1.RuntimeTreeUnattributedRuntimeNotFound
+			value.RuntimeName = reference.RuntimeName
+		case reference.State == runtimeusage.ReferenceInvalid &&
+			reference.Reason == runtimeusage.ReasonInvalidRuntimeName:
+			value.State = reportv1alpha1.RuntimeTreeUnattributedInvalid
+			value.Reason = reportv1alpha1.RuntimeTreeUnattributedInvalidRuntimeName
+		case reference.State == runtimeusage.ReferenceAmbiguous &&
+			reference.Reason == runtimeusage.ReasonDuplicateInferenceService:
+			value.State = reportv1alpha1.RuntimeTreeUnattributedAmbiguous
+			value.Reason = reportv1alpha1.RuntimeTreeUnattributedDuplicateInferenceService
+		default:
+			// Resolved users belong on exact heads. Invalid object identities have
+			// no safe identity to expose and are intentionally omitted.
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
 }
 
 func requireCompleteRuntimeEvidence(

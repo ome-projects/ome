@@ -283,6 +283,23 @@ func TestBuildDistinguishesAutomaticSelectionFromEmptyRuntimeName(t *testing.T) 
 	}, index.References())
 }
 
+func TestBuildClassifiesUnsafeNamesWithoutRetainingTheirValues(t *testing.T) {
+	index := Build([]omev1beta1.InferenceService{
+		inferenceService("team-a", "safe-service", runtimeReference("TOKEN=private-value", nil, nil)),
+		inferenceService("team-a", "SECRET=private-service", runtimeReference("runtime-a", nil, nil)),
+	}, runtimegraph.Snapshot{})
+
+	assert.Equal(t, []ReferenceEvidence{
+		{
+			State: ReferenceInvalid, Reason: ReasonInvalidInferenceService, Occurrences: 1,
+		},
+		{
+			InferenceService: InferenceServiceIdentity{Namespace: "team-a", Name: "safe-service"},
+			State:            ReferenceInvalid, Reason: ReasonInvalidRuntimeName, Occurrences: 1,
+		},
+	}, index.References())
+}
+
 func TestBuildIgnoresAPIGroupAndDefaultsOtherKindsForMissingRuntime(t *testing.T) {
 	empty := ""
 	unsupportedKind := "OtherRuntime"
@@ -327,7 +344,7 @@ func TestBuildIgnoresAPIGroupAndDefaultsOtherKindsForMissingRuntime(t *testing.T
 	}, index.References())
 }
 
-func TestBuildPreservesDuplicateObjectsAsAmbiguousEvidence(t *testing.T) {
+func TestBuildTreatsDuplicateKeysAsDefensiveSnapshotCorruptionEvidence(t *testing.T) {
 	clusterKind := string(runtimegraph.KindClusterServingRuntime)
 	namespacedKind := string(runtimegraph.KindServingRuntime)
 	index := Build([]omev1beta1.InferenceService{
@@ -373,7 +390,7 @@ func TestBuildPreservesDuplicateObjectsAsAmbiguousEvidence(t *testing.T) {
 	}, index.References())
 }
 
-func TestBuildPreservesInvalidObjectIdentityEvidence(t *testing.T) {
+func TestBuildDiscardsInvalidObjectIdentityValues(t *testing.T) {
 	index := Build([]omev1beta1.InferenceService{
 		inferenceService("", "missing-namespace", runtimeReference("runtime", nil, nil)),
 		inferenceService("team-a", "", runtimeReference("runtime", nil, nil)),
@@ -381,16 +398,10 @@ func TestBuildPreservesInvalidObjectIdentityEvidence(t *testing.T) {
 
 	assert.Equal(t, []ReferenceEvidence{
 		{
-			InferenceService: InferenceServiceIdentity{Name: "missing-namespace"},
-			State:            ReferenceInvalid,
-			Reason:           ReasonInvalidInferenceService,
-			Occurrences:      1,
+			State: ReferenceInvalid, Reason: ReasonInvalidInferenceService, Occurrences: 1,
 		},
 		{
-			InferenceService: InferenceServiceIdentity{Namespace: "team-a"},
-			State:            ReferenceInvalid,
-			Reason:           ReasonInvalidInferenceService,
-			Occurrences:      1,
+			State: ReferenceInvalid, Reason: ReasonInvalidInferenceService, Occurrences: 1,
 		},
 	}, index.References())
 }

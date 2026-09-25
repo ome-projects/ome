@@ -77,6 +77,118 @@ func TestProjectPreservesThreeContextsAndAttachesOnlyToExactHeads(t *testing.T) 
 		output.String())
 }
 
+func TestProjectKeepsUnattributedUsersOutsideRuntimePaths(t *testing.T) {
+	projection := graphProjection(t, threeContextSnapshot(), runtimegraph.Target{
+		Kind: runtimegraph.KindClusterServingRuntime, Name: "root",
+	})
+	input := runtimetreeprojection.Input{
+		Projection:               projection,
+		Snapshot:                 completeSnapshotObservation(2, 2, 4),
+		IncludeUnattributedUsers: true,
+		UnattributedUsers: []runtimetreeprojection.UnattributedUserObservation{
+			{Namespace: "team-b", Name: "missing", State: reportv1alpha1.RuntimeTreeUnattributedUnresolved, Reason: reportv1alpha1.RuntimeTreeUnattributedRuntimeNotFound, RuntimeName: "gone"},
+			{Namespace: "team-a", Name: "automatic", State: reportv1alpha1.RuntimeTreeUnattributedUnresolved, Reason: reportv1alpha1.RuntimeTreeUnattributedAutomaticSelection},
+			{Namespace: "team-a", Name: "invalid", State: reportv1alpha1.RuntimeTreeUnattributedInvalid, Reason: reportv1alpha1.RuntimeTreeUnattributedInvalidRuntimeName},
+			{Namespace: "team-a", Name: "duplicate", State: reportv1alpha1.RuntimeTreeUnattributedAmbiguous, Reason: reportv1alpha1.RuntimeTreeUnattributedDuplicateInferenceService},
+		},
+	}
+
+	reportValue, err := runtimetreeprojection.Project(input, fixedProjectionClock())
+
+	require.NoError(t, err)
+	require.NotNil(t, reportValue.Content.UnattributedUsers)
+	assert.Len(t, reportValue.Content.UnattributedUsers.Items, 4)
+	for _, context := range reportValue.Content.Contexts {
+		for _, path := range context.Paths {
+			assert.Empty(t, path.Dependents, "unattributed users must never become runtime dependents")
+		}
+	}
+}
+
+func TestProjectRejectsIdentityAttributedAndUnattributedAtOnce(t *testing.T) {
+	projection := graphProjection(t, threeContextSnapshot(), runtimegraph.Target{
+		Kind: runtimegraph.KindClusterServingRuntime, Name: "root",
+	})
+	_, err := runtimetreeprojection.Project(runtimetreeprojection.Input{
+		Projection: projection,
+		Snapshot:   completeSnapshotObservation(2, 2, 1),
+		Dependents: []runtimetreeprojection.DependentLeaf{{
+			Runtime: clusterIdentity("root"), Kind: reportv1alpha1.RuntimeTreeDependentInferenceService,
+			Namespace: "team-a", Name: "service",
+		}},
+		IncludeUnattributedUsers: true,
+		UnattributedUsers: []runtimetreeprojection.UnattributedUserObservation{{
+			Namespace: "team-a", Name: "service",
+			State:  reportv1alpha1.RuntimeTreeUnattributedUnresolved,
+			Reason: reportv1alpha1.RuntimeTreeUnattributedAutomaticSelection,
+		}},
+	}, fixedProjectionClock())
+
+	assert.ErrorIs(t, err, runtimetreeprojection.ErrInvalidUnattributedUser)
+}
+
+func TestProjectCountsUnattributedUsersAgainstObservedServices(t *testing.T) {
+	projection := graphProjection(t, threeContextSnapshot(), runtimegraph.Target{
+		Kind: runtimegraph.KindClusterServingRuntime, Name: "root",
+	})
+	_, err := runtimetreeprojection.Project(runtimetreeprojection.Input{
+		Projection:               projection,
+		Snapshot:                 completeSnapshotObservation(2, 2, 0),
+		IncludeUnattributedUsers: true,
+		UnattributedUsers: []runtimetreeprojection.UnattributedUserObservation{{
+			Namespace: "team-a", Name: "automatic",
+			State:  reportv1alpha1.RuntimeTreeUnattributedUnresolved,
+			Reason: reportv1alpha1.RuntimeTreeUnattributedAutomaticSelection,
+		}},
+	}, fixedProjectionClock())
+
+	assert.ErrorIs(t, err, runtimetreeprojection.ErrInvalidSnapshot)
+}
+
+func TestProjectRejectsUnsafeOrOpenEndedUnattributedEvidence(t *testing.T) {
+	projection := graphProjection(t, threeContextSnapshot(), runtimegraph.Target{
+		Kind: runtimegraph.KindClusterServingRuntime, Name: "root",
+	})
+	tests := []struct {
+		name string
+		user runtimetreeprojection.UnattributedUserObservation
+	}{
+		{name: "arbitrary state", user: runtimetreeprojection.UnattributedUserObservation{Namespace: "team-a", Name: "svc", State: "Leaked", Reason: reportv1alpha1.RuntimeTreeUnattributedRuntimeNotFound, RuntimeName: "gone"}},
+		{name: "arbitrary reason", user: runtimetreeprojection.UnattributedUserObservation{Namespace: "team-a", Name: "svc", State: reportv1alpha1.RuntimeTreeUnattributedUnresolved, Reason: "database password is hunter2", RuntimeName: "gone"}},
+		{name: "unsafe service identity", user: runtimetreeprojection.UnattributedUserObservation{Namespace: "team-a", Name: "SECRET=value", State: reportv1alpha1.RuntimeTreeUnattributedUnresolved, Reason: reportv1alpha1.RuntimeTreeUnattributedAutomaticSelection}},
+		{name: "unsafe declared runtime", user: runtimetreeprojection.UnattributedUserObservation{Namespace: "team-a", Name: "svc", State: reportv1alpha1.RuntimeTreeUnattributedUnresolved, Reason: reportv1alpha1.RuntimeTreeUnattributedRuntimeNotFound, RuntimeName: "TOKEN=value"}},
+		{name: "contradictory reason", user: runtimetreeprojection.UnattributedUserObservation{Namespace: "team-a", Name: "svc", State: reportv1alpha1.RuntimeTreeUnattributedInvalid, Reason: reportv1alpha1.RuntimeTreeUnattributedRuntimeNotFound, RuntimeName: "gone"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := runtimetreeprojection.Project(runtimetreeprojection.Input{
+				Projection: projection, Snapshot: completeSnapshotObservation(2, 2, 4),
+				IncludeUnattributedUsers: true,
+				UnattributedUsers:        []runtimetreeprojection.UnattributedUserObservation{test.user},
+			}, fixedProjectionClock())
+			assert.ErrorIs(t, err, runtimetreeprojection.ErrInvalidUnattributedUser)
+		})
+	}
+}
+
+func TestProjectIncludesEmptyUnattributedBlockOnlyWhenRequested(t *testing.T) {
+	projection := graphProjection(t, threeContextSnapshot(), runtimegraph.Target{
+		Kind: runtimegraph.KindClusterServingRuntime, Name: "root",
+	})
+	base := runtimetreeprojection.Input{
+		Projection: projection, Snapshot: completeSnapshotObservation(2, 2, 4),
+	}
+	without, err := runtimetreeprojection.Project(base, fixedProjectionClock())
+	require.NoError(t, err)
+	assert.Nil(t, without.Content.UnattributedUsers)
+
+	base.IncludeUnattributedUsers = true
+	with, err := runtimetreeprojection.Project(base, fixedProjectionClock())
+	require.NoError(t, err)
+	require.NotNil(t, with.Content.UnattributedUsers)
+	assert.Empty(t, with.Content.UnattributedUsers.Items)
+}
+
 func TestProjectKeepsSameContextMaxDepthPathsSeparate(t *testing.T) {
 	projection := graphProjection(t, runtimegraph.Snapshot{ClusterServingRuntimes: []omev1beta1.ClusterServingRuntime{
 		clusterRuntime("level-1", ""),

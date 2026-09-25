@@ -262,6 +262,13 @@ func TestRuntimeTreeWideTablePreservesCompleteLegacyRows(t *testing.T) {
 					}},
 				}},
 			}},
+			UnattributedUsers: &v1alpha1.RuntimeTreeUnattributedUsers{
+				Items: []v1alpha1.RuntimeTreeUnattributedUser{{
+					Kind: v1alpha1.RuntimeTreeDependentInferenceService, Namespace: "team-a", Name: "automatic",
+					State:      v1alpha1.RuntimeTreeUnattributedUnresolved,
+					ReasonCode: v1alpha1.RuntimeTreeUnattributedAutomaticSelection,
+				}},
+			},
 		},
 		treeClock(),
 	)
@@ -279,6 +286,9 @@ Context: Namespaced/team-a (resolution: Complete)
 Head: ServingRuntime/runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail
 ServingRuntime/runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tail [selected]
 `+"`"+`-- InferenceService/service-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-tail
+Unattributed users (not attributed to runtime tree):
+  [not attributed] InferenceService/team-a/automatic
+  state=Unresolved reason=AutomaticSelection
 Snapshot: Complete
 Warning: PartialData
 Warning: SourceUnavailable
@@ -832,6 +842,105 @@ func renderWideTreeReport(
 	var output bytes.Buffer
 	require.NoError(t, v1alpha1.RuntimeTreeWideTable(reportValue).Write(&output))
 	return output.String()
+}
+
+func TestRuntimeTreeUnattributedUsersAreSeparateCanonicalAndBounded(t *testing.T) {
+	target := treeIdentity(v1alpha1.RuntimeKindClusterServingRuntime, "", "root")
+	users := &v1alpha1.RuntimeTreeUnattributedUsers{Items: []v1alpha1.RuntimeTreeUnattributedUser{
+		{
+			Kind: v1alpha1.RuntimeTreeDependentInferenceService, Namespace: "team-z",
+			Name: "duplicate", State: v1alpha1.RuntimeTreeUnattributedAmbiguous,
+			ReasonCode: v1alpha1.RuntimeTreeUnattributedDuplicateInferenceService,
+		},
+		{
+			Kind: v1alpha1.RuntimeTreeDependentInferenceService, Namespace: "team-a",
+			Name:        "missing-with-a-very-long-but-valid-identity-that-needs-collision-safe-clipping",
+			State:       v1alpha1.RuntimeTreeUnattributedUnresolved,
+			ReasonCode:  v1alpha1.RuntimeTreeUnattributedRuntimeNotFound,
+			RuntimeName: "declared-runtime-with-a-very-long-but-valid-name-that-must-also-be-clipped",
+		},
+	}}
+	reportValue := v1alpha1.NewRuntimeTreeReport(
+		v1alpha1.Metadata{Name: target.Name},
+		v1alpha1.RuntimeTreeContent{Target: target, UnattributedUsers: users},
+		treeClock(),
+	)
+
+	canonical := reportValue.Canonical()
+	require.NotNil(t, canonical.Content.UnattributedUsers)
+	assert.Equal(t, "team-a", canonical.Content.UnattributedUsers.Items[0].Namespace)
+	canonical.Content.UnattributedUsers.Items[0].Name = "mutated"
+	assert.Equal(t, "missing-with-a-very-long-but-valid-identity-that-needs-collision-safe-clipping",
+		reportValue.Content.UnattributedUsers.Items[0].Name)
+
+	for _, output := range []string{
+		renderTreeReport(t, reportValue, report.FormatTable),
+		renderWideTreeReport(t, reportValue),
+	} {
+		assert.Contains(t, output, "Unattributed users (not attributed to runtime tree):")
+		assert.Contains(t, output, "state=Unresolved reason=RuntimeNotFound")
+		for number, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+			assert.Equalf(t, line, printers.BoundedCell(line, 80),
+				"line %d exceeds 80 terminal columns: %q", number+1, line)
+		}
+	}
+
+	for _, format := range []report.Format{report.FormatJSON, report.FormatYAML} {
+		output := renderTreeReport(t, reportValue, format)
+		var got v1alpha1.RuntimeEnvelope[v1alpha1.RuntimeTreeContent]
+		if format == report.FormatJSON {
+			require.NoError(t, json.Unmarshal([]byte(output), &got))
+		} else {
+			require.NoError(t, yaml.Unmarshal([]byte(output), &got))
+		}
+		assert.Equal(t, reportValue.Canonical(), got)
+	}
+}
+
+func TestRuntimeTreeWidePreservesUnabridgedTreeAndBoundsUnattributedRows(t *testing.T) {
+	reportValue := hostileLongRuntimeTreeReport()
+	reportValue.Content.UnattributedUsers = &v1alpha1.RuntimeTreeUnattributedUsers{
+		Items: []v1alpha1.RuntimeTreeUnattributedUser{{
+			Kind: v1alpha1.RuntimeTreeDependentInferenceService, Namespace: "team-a", Name: "automatic",
+			State:      v1alpha1.RuntimeTreeUnattributedUnresolved,
+			ReasonCode: v1alpha1.RuntimeTreeUnattributedAutomaticSelection,
+		}},
+	}
+
+	output := renderWideTreeReport(t, reportValue)
+
+	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+	unabridged := false
+	inUnattributedBlock := false
+	for number, line := range lines {
+		if strings.HasPrefix(line, "Target: ") && printers.CellDisplayWidth(line) > 80 {
+			unabridged = true
+		}
+		if line == "Unattributed users (not attributed to runtime tree):" {
+			inUnattributedBlock = true
+		}
+		if inUnattributedBlock && line == "Snapshot: Complete" {
+			inUnattributedBlock = false
+		}
+		if inUnattributedBlock {
+			assert.Equalf(t, line, printers.BoundedCell(line, 80),
+				"unattributed line %d exceeds 80 terminal columns: %q", number+1, line)
+		}
+	}
+	assert.True(t, unabridged, "wide output must retain the complete tree identity")
+}
+
+func TestRuntimeTreeOmitsUnattributedBlockByDefault(t *testing.T) {
+	reportValue := v1alpha1.NewRuntimeTreeReport(
+		v1alpha1.Metadata{Name: "root"},
+		v1alpha1.RuntimeTreeContent{Target: treeIdentity(v1alpha1.RuntimeKindClusterServingRuntime, "", "root")},
+		treeClock(),
+	)
+	for _, format := range []report.Format{report.FormatTable, report.FormatJSON, report.FormatYAML} {
+		output := renderTreeReport(t, reportValue, format)
+		assert.NotContains(t, output, "Unattributed")
+		assert.NotContains(t, output, "unattributedUsers")
+	}
 }
 
 type treeShortWriter struct{}

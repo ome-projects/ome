@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"sort"
 
+	"k8s.io/apimachinery/pkg/util/validation"
+
 	omev1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/runtimegraph"
 )
@@ -33,8 +35,9 @@ const (
 	ReferenceUnresolved ReferenceState = "Unresolved"
 	// ReferenceInvalid means the object or declared reference is malformed.
 	ReferenceInvalid ReferenceState = "Invalid"
-	// ReferenceAmbiguous means a snapshot repeats an InferenceService identity,
-	// so none of the competing observations can be treated as current.
+	// ReferenceAmbiguous is defensive evidence that a corrupt or nonconforming
+	// snapshot repeated an InferenceService key. A normal Kubernetes LIST cannot
+	// contain two current objects with the same namespace/name identity.
 	ReferenceAmbiguous ReferenceState = "Ambiguous"
 )
 
@@ -55,9 +58,10 @@ const (
 	ReasonRuntimeNotFound           ReferenceReason = "RuntimeNotFound"
 )
 
-// ReferenceEvidence is a safe, immutable-by-value observation of one service
-// reference. Runtime is present only when State is Resolved. Occurrences is
-// greater than one only for an ambiguous duplicate identity.
+// ReferenceEvidence is a privacy-safe, immutable-by-value observation of one
+// service reference. Unsafe malformed identities and runtime names are never
+// retained. Runtime is present only when State is Resolved. Occurrences is
+// greater than one only for defensive duplicate-key evidence.
 type ReferenceEvidence struct {
 	InferenceService InferenceServiceIdentity `json:"inferenceService"`
 	State            ReferenceState           `json:"state"`
@@ -84,9 +88,10 @@ type Index struct {
 }
 
 // Build indexes explicit references against an already-collected complete
-// runtime snapshot without mutating or retaining either input. Duplicate and
-// malformed services remain visible through References but are never silently
-// attributed to a runtime. ServingRuntime kinds resolve namespaced-only;
+// runtime snapshot without mutating or retaining either input. Defensive
+// duplicate-key and malformed-service classifications remain visible through
+// References, but unsafe identity values are discarded and neither case is
+// silently attributed to a runtime. ServingRuntime kinds resolve namespaced-only;
 // ClusterServingRuntime kinds resolve cluster-first; and empty or unrecognized
 // kinds resolve namespaced-first. APIGroup is ignored, matching the controller
 // lookup.
@@ -110,10 +115,9 @@ func Build(services []omev1beta1.InferenceService, snapshot runtimegraph.Snapsho
 		identity := serviceIdentity(service)
 		if !validServiceIdentity(identity) {
 			index.references = append(index.references, ReferenceEvidence{
-				InferenceService: identity,
-				State:            ReferenceInvalid,
-				Reason:           ReasonInvalidInferenceService,
-				Occurrences:      1,
+				State:       ReferenceInvalid,
+				Reason:      ReasonInvalidInferenceService,
+				Occurrences: 1,
 			})
 			continue
 		}
@@ -188,7 +192,7 @@ func classifyReference(
 		evidence.Reason = ReasonAutomaticSelection
 		return evidence
 	}
-	if reference.Name == "" {
+	if len(validation.IsDNS1123Subdomain(reference.Name)) != 0 {
 		evidence.State = ReferenceInvalid
 		evidence.Reason = ReasonInvalidRuntimeName
 		return evidence
@@ -244,7 +248,8 @@ func serviceIdentity(service *omev1beta1.InferenceService) InferenceServiceIdent
 }
 
 func validServiceIdentity(identity InferenceServiceIdentity) bool {
-	return identity.Namespace != "" && identity.Name != ""
+	return len(validation.IsDNS1123Label(identity.Namespace)) == 0 &&
+		len(validation.IsDNS1123Subdomain(identity.Name)) == 0
 }
 
 func validateRuntimeIdentity(identity runtimegraph.Identity) error {
