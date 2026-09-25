@@ -20,7 +20,10 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
-const maxInstanceIndex int64 = 1<<31 - 1
+const (
+	maxInstanceIndex      int64 = 1<<31 - 1
+	defaultMaxLogRequests       = 5
+)
 
 var (
 	revisionHashPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
@@ -28,7 +31,8 @@ var (
 )
 
 type dependencies struct {
-	podLimits paging.Limits
+	podLimits     paging.Limits
+	openLogStream openLogStreamFunc
 }
 
 var defaultDependencies = dependencies{podLimits: paging.Limits{
@@ -40,14 +44,16 @@ var defaultDependencies = dependencies{podLimits: paging.Limits{
 
 type Options struct {
 	genericiooptions.IOStreams
-	Name      string
-	Component string
-	Instance  int64
-	Revision  string
-	Container string
-	Follow    bool
-	Tail      int64
-	Since     time.Duration
+	Name           string
+	Component      string
+	Instance       int64
+	Revision       string
+	Container      string
+	Follow         bool
+	Tail           int64
+	Since          time.Duration
+	MaxLogRequests int
+	LimitBytes     int64
 
 	instanceSet  bool
 	revisionHash string
@@ -58,7 +64,12 @@ func NewCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Comman
 }
 
 func newCmdWithDependencies(f factory.Factory, streams genericiooptions.IOStreams, deps dependencies) *cobra.Command {
-	o := &Options{IOStreams: streams, Instance: -1, Tail: -1}
+	o := &Options{
+		IOStreams:      streams,
+		Instance:       -1,
+		Tail:           -1,
+		MaxLogRequests: defaultMaxLogRequests,
+	}
 	cmd := &cobra.Command{
 		Use:   "logs INFERENCESERVICE",
 		Short: "Stream logs from the pods behind an InferenceService",
@@ -79,6 +90,8 @@ func newCmdWithDependencies(f factory.Factory, streams genericiooptions.IOStream
 	cmd.Flags().BoolVarP(&o.Follow, "follow", "f", false, "Stream new log lines as they arrive")
 	cmd.Flags().Int64Var(&o.Tail, "tail", o.Tail, "Lines of recent log to show per pod (-1 for all)")
 	cmd.Flags().DurationVar(&o.Since, "since", 0, "Only logs newer than this duration (e.g. 10m)")
+	cmd.Flags().IntVar(&o.MaxLogRequests, "max-log-requests", o.MaxLogRequests, "Maximum number of concurrent log streams to follow")
+	cmd.Flags().Int64Var(&o.LimitBytes, "limit-bytes", 0, "Maximum bytes of logs to request per pod for one-shot reads (0 for no limit)")
 	return cmd
 }
 
@@ -95,6 +108,15 @@ func (o *Options) Validate() error {
 		if o.Instance < 0 || o.Instance > maxInstanceIndex {
 			return fmt.Errorf("--instance must be between 0 and %d", maxInstanceIndex)
 		}
+	}
+	if o.MaxLogRequests <= 0 {
+		return fmt.Errorf("--max-log-requests must be greater than 0")
+	}
+	if o.LimitBytes < 0 {
+		return fmt.Errorf("--limit-bytes must be greater than or equal to 0")
+	}
+	if o.Follow && o.LimitBytes > 0 {
+		return fmt.Errorf("--limit-bytes cannot be used with --follow")
 	}
 	if o.Revision == "" {
 		if o.instanceSet && o.Component == "" {
@@ -129,6 +151,9 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 }
 
 func (o *Options) run(ctx context.Context, f factory.Factory, deps dependencies) error {
+	if deps.openLogStream == nil {
+		deps.openLogStream = defaultOpenLogStream
+	}
 	ns, _, err := f.Namespace()
 	if err != nil {
 		return err
@@ -167,36 +192,37 @@ func (o *Options) run(ctx context.Context, f factory.Factory, deps dependencies)
 	if len(pods) == 0 {
 		return fmt.Errorf("no pods found for InferenceService %q in namespace %q (selector %s)", o.Name, ns, selector)
 	}
-	opts := &corev1.PodLogOptions{Follow: o.Follow}
-	if o.Tail >= 0 {
-		opts.TailLines = &o.Tail
-	}
-	if o.Since > 0 {
-		secs := int64(o.Since.Seconds())
-		opts.SinceSeconds = &secs
-	}
-	var streams []namedStream
-	for _, p := range pods {
-		po := *opts
-		po.Container = o.containerFor(&p)
-		req := kube.CoreV1().Pods(ns).GetLogs(p.Name, &po)
-		reader, err := req.Stream(ctx)
-		if err != nil {
-			// Don't leak the API-server log connections already opened for
-			// earlier pods in this loop: multiplex() never gets to run its
-			// deferred Close on them since we're bailing out before the call.
-			for _, s := range streams {
-				_ = s.Reader.Close()
-			}
-			return fmt.Errorf("streaming logs for pod %s: %w", p.Name, err)
+	targets := make([]logTarget, 0, len(pods))
+	for i := range pods {
+		p := &pods[i]
+		options := corev1.PodLogOptions{Follow: o.Follow, Container: o.containerFor(p)}
+		if o.Tail >= 0 {
+			tail := o.Tail
+			options.TailLines = &tail
+		}
+		if o.Since > 0 {
+			seconds := int64(o.Since.Seconds())
+			options.SinceSeconds = &seconds
+		}
+		if o.LimitBytes > 0 {
+			limitBytes := o.LimitBytes
+			options.LimitBytes = &limitBytes
 		}
 		prefix := ""
 		if len(pods) > 1 {
 			prefix = fmt.Sprintf("[%s/%s] ", p.Labels[constants.OMEComponentLabel], p.Name)
 		}
-		streams = append(streams, namedStream{Prefix: prefix, Reader: reader})
+		targets = append(targets, logTarget{podName: p.Name, prefix: prefix, options: options})
 	}
-	return multiplex(streams, o.Out)
+	return consumeLogs(
+		ctx,
+		kube.CoreV1().Pods(ns),
+		targets,
+		o.Follow,
+		o.MaxLogRequests,
+		deps.openLogStream,
+		o.Out,
+	)
 }
 
 // containerFor picks --container if set, else the OME main container when the

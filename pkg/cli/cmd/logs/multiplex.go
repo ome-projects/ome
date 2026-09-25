@@ -4,6 +4,7 @@ package logs
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"sync"
 )
@@ -17,7 +18,12 @@ type namedStream struct {
 // serialized by a mutex so lines never interleave mid-line. Blocks until all
 // workers exit; the first failure closes every reader. Reader close is also
 // guaranteed on successful EOF.
-func multiplex(streams []namedStream, out io.Writer) error {
+func multiplex(
+	ctx context.Context,
+	cancel context.CancelCauseFunc,
+	streams []namedStream,
+	out io.Writer,
+) error {
 	var (
 		mu       sync.Mutex
 		wg       sync.WaitGroup
@@ -36,11 +42,22 @@ func multiplex(streams []namedStream, out io.Writer) error {
 			// Preserve the triggering error before closing siblings unblocks
 			// their scanners, which may report errors caused by the close.
 			firstErr = err
+			cancel(err)
 			for i := range streams {
 				closeStream(i)
 			}
 		})
 	}
+	stopWatcher := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			closeAll(context.Cause(ctx))
+		case <-stopWatcher:
+		}
+	}()
 	for i, s := range streams {
 		wg.Add(1)
 		go func(i int, s namedStream) {
@@ -61,5 +78,7 @@ func multiplex(streams []namedStream, out io.Writer) error {
 		}(i, s)
 	}
 	wg.Wait()
+	close(stopWatcher)
+	<-watcherDone
 	return firstErr
 }
