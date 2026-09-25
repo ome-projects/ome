@@ -53,7 +53,9 @@ reopen/rework it; the nightly does not silently recreate it.
 ## Setup
 
 - Runner pods must expose `ANTHROPIC_API_KEY` with access to `claude-fable-5`,
-  and support the same Linux/Go/Node/Hugo build used by the Pages workflow.
+  and support the Linux/Go/Node build used by the Pages workflow. The nightly
+  downloads Hugo Extended 0.157.0 for Linux amd64/arm64 and verifies its pinned
+  SHA-256 digest; a C compiler is not required on the runner.
   Use ephemeral, single-job runner pods so jobs do not share mutable host state.
 - Enable **Allow GitHub Actions to create and approve pull requests** in the
   repository's Actions settings (organization policy must allow it).
