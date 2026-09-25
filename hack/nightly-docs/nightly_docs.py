@@ -13,8 +13,7 @@ import tempfile
 
 DOC_ROOT = "site/content/en/docs/"
 GENERATED = DOC_ROOT + "reference/ome.v1beta1.md"
-MAX_FILES = 3
-MAX_LINES = 300
+MAX_LINES = 1000
 MAX_PRS = 100
 CODE_PATHS = ["cmd", "pkg", "internal", "charts", "config", "scheduler", "hack",
               "dockerfiles", "Makefile", "Makefile-deps.mk", "go.mod"]
@@ -53,8 +52,8 @@ def validate_item(item):
         if not isinstance(item[key], str) or not item[key].strip():
             raise ValueError(f"Missing {key}")
     paths = item["doc_paths"]
-    if not 1 <= len(paths) <= MAX_FILES or len(set(paths)) != len(paths):
-        raise ValueError("Expected one to three distinct documentation files")
+    if not paths or len(set(paths)) != len(paths):
+        raise ValueError("Expected one or more distinct documentation files")
     if not all(doc_path(path) for path in paths):
         raise ValueError("Only handwritten documentation Markdown is allowed")
     key = f'{item["source_sha"]}:{item["area"]}:{item["concern"]}'
@@ -126,7 +125,7 @@ def validate_diff(item, base):
     changed.update(filter(None, git("ls-files", "--others", "--exclude-standard").splitlines()))
     if not changed:
         return False
-    if not changed <= set(item["doc_paths"]) or len(changed) > MAX_FILES:
+    if not changed <= set(item["doc_paths"]):
         raise ValueError("Changes exceed the planned documentation file allowlist")
     for path in changed:
         p = Path(path)
@@ -141,8 +140,8 @@ def validate_diff(item, base):
         if not added.isdigit() or not removed.isdigit():
             raise ValueError("Binary changes are not allowed")
         total += int(added) + int(removed)
-    if total > MAX_LINES:
-        raise ValueError(f"Documentation diff exceeds {MAX_LINES} changed lines")
+    if total >= MAX_LINES:
+        raise ValueError(f"Documentation diff must be under {MAX_LINES} changed lines")
     subprocess.run(["git", "diff", "--cached", "--check", base], check=True)
     return total > 0
 
@@ -194,7 +193,7 @@ Scope: **{item["area"]} / {item["concern"]}**. Other concerns are deferred.
 
 ## How to test
 
-- Passed the documentation path and size guard (at most {MAX_FILES} files, {MAX_LINES} changed lines).
+- Passed the documentation path and size guard (under {MAX_LINES} added plus deleted lines; no file-count limit).
 - Passed an independent accuracy and single-concern review.
 - Passed `git diff --check` and the production Hugo build.
 

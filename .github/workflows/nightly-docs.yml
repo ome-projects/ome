@@ -55,7 +55,7 @@ jobs:
             --effort xhigh
             --max-turns 60
             --allowedTools "Read,Glob,Grep,Bash(git show:*),Bash(git log:*),Bash(git diff:*)"
-            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_sha":{"type":"string"},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string"}}},"required":["area","concern","source_sha","title","question","evidence","doc_paths"]}}},"required":["concerns"]}'
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_sha":{"type":"string"},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["area","concern","source_sha","title","question","evidence","doc_paths"]}}},"required":["concerns"]}'
       - name: Validate plan and remove duplicate concerns
         id: plan
         env:

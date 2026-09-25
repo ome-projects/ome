@@ -24,9 +24,10 @@ ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
   that the behavior still exists on the current default branch.
 - evidence must cite exact current source paths/symbols and explain the missing
   or wrong documentation, including why this is one independent concern.
-- doc_paths is an explicit allowlist of at most THREE Markdown files in
+- doc_paths is an explicit allowlist of the Markdown files needed in
   site/content/en/docs/. Choose only files necessary to explain this concern.
-  Keep the proposed edit within 300 added plus deleted lines. Do not edit the
+  There is no file-count limit. Keep the proposed edit under 1,000 total added
+  plus deleted lines (999 maximum). Do not edit the
   generated reference/ome.v1beta1.md. Avoid broad rewrites, formatting sweeps,
   unrelated examples, or navigation/configuration changes.
 

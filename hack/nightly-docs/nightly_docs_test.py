@@ -131,6 +131,16 @@ class GitGuardTests(unittest.TestCase):
         self.assertEqual(set(self.git("diff", "--cached", "--name-only").splitlines()),
                          {str(self.path), str(new)})
 
+    def test_many_documentation_files_for_one_concern_are_allowed(self):
+        paths = []
+        for i in range(20):
+            path = self.path.parent / f"related-{i}.md"
+            path.write_text("Related documentation.\n")
+            paths.append(str(path))
+        item = docs.validate_item(proposal(source_sha=self.base, doc_paths=paths))
+        self.assertTrue(docs.validate_diff(item, self.base))
+        self.assertEqual(len(self.git("diff", "--cached", "--name-only").splitlines()), 20)
+
     def test_catches_code_changes_even_if_staged(self):
         self.path.write_text("Updated documentation.\n")
         Path("source.go").write_text("package changed\n")
@@ -156,11 +166,11 @@ class GitGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "executable"):
             docs.validate_diff(self.item, self.base)
 
-    def test_three_hundred_changed_lines_boundary(self):
-        self.path.write_text("\n".join(str(i) for i in range(299)) + "\n")
-        self.assertTrue(docs.validate_diff(self.item, self.base)) # 299 additions + 1 deletion
-        self.path.write_text("\n".join(str(i) for i in range(300)) + "\n")
-        with self.assertRaisesRegex(ValueError, "300 changed lines"):
+    def test_strictly_under_one_thousand_changed_lines_boundary(self):
+        self.path.write_text("\n".join(str(i) for i in range(998)) + "\n")
+        self.assertTrue(docs.validate_diff(self.item, self.base)) # 998 additions + 1 deletion
+        self.path.write_text("\n".join(str(i) for i in range(999)) + "\n")
+        with self.assertRaisesRegex(ValueError, "under 1000 changed lines"):
             docs.validate_diff(self.item, self.base)
 
     def test_writer_cannot_hide_edits_in_commit(self):

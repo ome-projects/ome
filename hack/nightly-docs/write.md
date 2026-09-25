@@ -3,9 +3,10 @@ Read the source commit, current implementation, tests, and relevant docs.
 Update ONLY the listed doc_paths to address exactly this one concern.
 
 Do not fix adjacent gaps, sweep wording/formatting, or add other features to this
-PR. At most three Markdown files and 300 total added plus deleted lines are
-allowed. If a complete, accurate fix cannot fit, leave the tree unchanged; do
-not truncate a larger change or broaden the plan. If the gap is already fixed,
+PR. The diff must stay under 1,000 total added plus deleted lines (999 maximum).
+There is no file-count limit; every file must serve the planned concern. If a
+complete, accurate fix cannot fit, leave the tree unchanged; do not truncate a
+larger change or broaden the plan. If the gap is already fixed,
 unsupported by current code, or depends on an unfinished OEP, make no changes.
 
 Follow existing Hugo front matter, links, shortcodes, and writing conventions.

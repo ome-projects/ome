@@ -15,8 +15,9 @@ the existing release-driven Pages workflow publishes the website separately.
 2. Select **at most 100 independent concerns per run**. Each concern answers
    one concrete user question or corrects one stale claim and cites a source
    commit. Sharing a subsystem or source commit never justifies bundling fixes.
-3. Give each concern its own fresh checkout and allowlist of **at most three
-   handwritten Markdown files and 300 added plus deleted lines**. Generated API
+3. Give each concern its own fresh checkout and allowlist of handwritten
+   Markdown files. Each PR must have **fewer than 1,000 added plus deleted lines
+   (999 maximum)**, with **no file-count limit**. Generated API
    reference files, code, configuration, file deletion, and symlinks are blocked.
 4. Reject overlapping files within a plan; defer files touched by any open PR.
    Examine human PRs too. Stable source/area/concern markers and branch names
