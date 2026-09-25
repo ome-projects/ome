@@ -183,12 +183,15 @@ func TestRolloutActionReadClientErrorsPrecedeTargetRead(t *testing.T) {
 
 func TestRolloutActionReadsRefuseRedirectsBeforePreviewOrPatch(t *testing.T) {
 	for _, code := range []int{301, 302, 303, 307, 308} {
-		for _, lane := range []string{"inferenceservice-get", "revision-get"} {
+		for _, lane := range []string{"inferenceservice-get", "revision-get", "autosync-revision-get"} {
 			t.Run(fmt.Sprintf("%d/%s", code, lane), func(t *testing.T) {
 				v, rt, _ := actionFixture()
-				if lane == "revision-get" {
-					*v.Spec.Runtime.AutoSync = false
+				if lane != "inferenceservice-get" {
+					*v.Spec.Runtime.AutoSync = lane == "autosync-revision-get"
 					v.Status.PinnedRevisionName = "simple-aaaaaaaa"
+				}
+				if lane == "autosync-revision-get" {
+					v.Annotations[constants.PausedRolloutAnnotation] = "true"
 				}
 				var destination, redirects, patches atomic.Int32
 				destinationServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -202,13 +205,13 @@ func TestRolloutActionReadsRefuseRedirectsBeforePreviewOrPatch(t *testing.T) {
 						w.WriteHeader(http.StatusInternalServerError)
 						return
 					}
-					if r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat" && lane == "revision-get" {
+					if r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat" && lane != "inferenceservice-get" {
 						w.Header().Set("Content-Type", "application/json")
 						_ = json.NewEncoder(w).Encode(v)
 						return
 					}
 					wantPath := "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat"
-					if lane == "revision-get" {
+					if lane != "inferenceservice-get" {
 						wantPath = "/apis/apps/v1/namespaces/ome/controllerrevisions/simple-aaaaaaaa"
 					}
 					if r.Method != http.MethodGet || r.URL.Path != wantPath {
@@ -226,14 +229,57 @@ func TestRolloutActionReadsRefuseRedirectsBeforePreviewOrPatch(t *testing.T) {
 				cmd := NewCmd(f, genericiooptions.IOStreams{In: bytes.NewBufferString("yes\n"), Out: &out, ErrOut: &stderr})
 				cmd.SilenceErrors, cmd.SilenceUsage = true, true
 				cmd.SetArgs([]string{"pause", "chat"})
+				if lane == "autosync-revision-get" {
+					cmd.SetArgs([]string{"resume", "chat", "--yes"})
+				}
 				require.Error(t, cmd.Execute())
 				require.Equal(t, int32(1), redirects.Load(), "exercise the selected read without replay")
 				require.Zero(t, destination.Load(), "redirect destination must receive no request")
+				require.Zero(t, patches.Load(), "failed revision reads must refuse even with --yes")
 				require.Empty(t, out.String())
 				require.Empty(t, stderr.String(), "failure must precede preview and confirmation")
-				require.Zero(t, patches.Load())
 			})
 		}
+	}
+}
+
+func TestRolloutActionReadFailureWithAutosyncPrecedesConfirmation(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusNotFound} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			v, rt, _ := actionFixture()
+			v.Status.PinnedRevisionName = "simple-aaaaaaaa"
+			v.Annotations[constants.PausedRolloutAnnotation] = "true"
+			var revisions, patches atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPatch:
+					patches.Add(1)
+					_ = json.NewEncoder(w).Encode(v)
+				case r.URL.Path == "/apis/ome.io/v1beta1/namespaces/prod/inferenceservices/chat":
+					_ = json.NewEncoder(w).Encode(v)
+				case r.URL.Path == "/apis/apps/v1/namespaces/ome/controllerrevisions/simple-aaaaaaaa":
+					revisions.Add(1)
+					w.WriteHeader(code)
+					_ = json.NewEncoder(w).Encode(metav1.Status{Status: "Failure", Code: int32(code), Message: "PRIVATE_REVISION_FAILURE"})
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+			var out, stderr bytes.Buffer
+			cmd := NewCmd(newActionReadFactory(t, server, rt), genericiooptions.IOStreams{In: bytes.NewBufferString("yes\n"), Out: &out, ErrOut: &stderr})
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			cmd.SetArgs([]string{"resume", "chat"})
+			err := cmd.Execute()
+			require.Error(t, err)
+			require.Equal(t, int32(1), revisions.Load())
+			require.NotContains(t, err.Error()+out.String()+stderr.String(), "PRIVATE_REVISION_FAILURE")
+			require.Empty(t, out.String())
+			require.Empty(t, stderr.String(), "revision failure must precede preview and confirmation")
+			require.Zero(t, patches.Load())
+		})
 	}
 }
 

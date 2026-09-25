@@ -173,6 +173,14 @@ func (o *actionOptions) run(parent context.Context, f factory.Factory, name stri
 	if err != nil {
 		return mutate.SafeAPIError(err)
 	}
+	// Autosync may retain a usable live runtime after a revision read fails.
+	// Guarded actions require every collected revision read to succeed.
+	for _, issue := range state.SourceIssues() {
+		switch issue.Code {
+		case effective.RuntimeSourceIssueRevisionNotFound, effective.RuntimeSourceIssueRevisionGetFailed, effective.RuntimeSourceIssueRevisionListFailed:
+			return mutate.SafeAPIError(issue)
+		}
+	}
 	components, err := mutate.RequireNativeRuntime(v, state)
 	if err != nil {
 		return err
