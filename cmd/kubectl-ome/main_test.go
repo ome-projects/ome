@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"k8s.io/cli-runtime/pkg/genericiooptions"
@@ -56,5 +58,56 @@ func TestRunContextPropagatesCancellation(t *testing.T) {
 	}
 	if stdout.Len() != 0 || stderr.String() != "error: context canceled\n" {
 		t.Fatalf("canceled command stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestRunWithSignalContextStopsBeforeReturning(t *testing.T) {
+	t.Parallel()
+
+	for _, canceled := range []bool{false, true} {
+		name := "success"
+		if canceled {
+			name = "cancellation"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var stdout, stderr bytes.Buffer
+			streams := genericiooptions.IOStreams{Out: &stdout, ErrOut: &stderr}
+			args := []string{"--help"}
+			wantCode, wantStderr := 0, ""
+			if canceled {
+				args = []string{"--kubeconfig=" + t.TempDir() + "/missing", "cluster", "status"}
+				wantCode, wantStderr = 1, "error: context canceled\n"
+			}
+			notifyCalls, stopCalls := 0, 0
+			notify := func(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc) {
+				notifyCalls++
+				if parent != context.Background() || len(signals) != 2 || signals[0] != os.Interrupt || signals[1] != syscall.SIGTERM {
+					t.Fatalf("unexpected signal registration: parent=%v signals=%v", parent, signals)
+				}
+				ctx, cancel := context.WithCancel(parent)
+				t.Cleanup(cancel)
+				if canceled {
+					cancel()
+				}
+				return ctx, func() {
+					stopCalls++
+					if stderr.String() != wantStderr || !canceled && stdout.Len() == 0 {
+						t.Error("signal cleanup ran before command output completed")
+					}
+					cancel()
+				}
+			}
+			if code := runWithSignalContext(args, streams, notify); code != wantCode {
+				t.Fatalf("runWithSignalContext() = %d, want %d", code, wantCode)
+			}
+			if notifyCalls != 1 || stopCalls != 1 {
+				t.Fatalf("notify calls = %d, stop calls = %d; want one each before return", notifyCalls, stopCalls)
+			}
+			if stderr.String() != wantStderr {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), wantStderr)
+			}
+		})
 	}
 }

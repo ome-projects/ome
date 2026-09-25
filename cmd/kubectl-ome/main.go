@@ -12,10 +12,14 @@ import (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	streams := genericiooptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr}
-	os.Exit(runContext(ctx, os.Args[1:], streams))
+	os.Exit(runWithSignalContext(os.Args[1:], streams, signal.NotifyContext))
+}
+
+func runWithSignalContext(args []string, streams genericiooptions.IOStreams, notify func(context.Context, ...os.Signal) (context.Context, context.CancelFunc)) int {
+	ctx, stop := notify(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runContext(ctx, args, streams)
 }
 
 func run(args []string, streams genericiooptions.IOStreams) int {
