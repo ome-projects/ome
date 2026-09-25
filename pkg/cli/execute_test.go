@@ -216,6 +216,45 @@ func TestExecuteCommandContextCancellationBeforeFactoryAcquisition(t *testing.T)
 	}
 }
 
+func TestExecuteCommandContextRefreshesReusedCommandTree(t *testing.T) {
+	t.Parallel()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	fresh, cancelFresh := context.WithCancel(context.Background())
+	defer cancelFresh()
+	var observed []context.Context
+	root := &cobra.Command{Use: "test"}
+	group := &cobra.Command{Use: "group"}
+	child := &cobra.Command{
+		Use: "child",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			observed = append(observed, cmd.Context())
+			return cmd.Context().Err()
+		},
+	}
+	group.AddCommand(child)
+	root.AddCommand(group)
+	root.SetArgs([]string{"group", "child"})
+	var stderr bytes.Buffer
+	if code := ExecuteCommandContext(canceled, root, &stderr); code != exitcode.GeneralError {
+		t.Fatalf("first execution code=%d, want %d", code, exitcode.GeneralError)
+	}
+	if stderr.String() != "error: context canceled\n" {
+		t.Fatalf("first execution stderr=%q, want one cancellation diagnostic", stderr.String())
+	}
+	stderr.Reset()
+	if code := ExecuteCommandContext(fresh, root, &stderr); code != exitcode.Success {
+		t.Errorf("second execution code=%d stderr=%q, want success", code, stderr.String())
+	}
+	if len(observed) != 2 || observed[0] != canceled || observed[1] != fresh {
+		t.Fatalf("reused child did not receive each execution's context: %v", observed)
+	}
+	if observed[1].Err() != nil || stderr.Len() != 0 {
+		t.Fatalf("fresh execution err=%v stderr=%q, want no error", observed[1].Err(), stderr.String())
+	}
+}
+
 func TestRunContextPropagatesCancellation(t *testing.T) {
 	t.Parallel()
 

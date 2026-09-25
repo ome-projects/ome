@@ -5,8 +5,10 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 )
@@ -93,13 +95,10 @@ func TestRunWithSignalContextStopsBeforeReturning(t *testing.T) {
 				}
 				return ctx, func() {
 					stopCalls++
-					if stderr.String() != wantStderr || !canceled && stdout.Len() == 0 {
-						t.Error("signal cleanup ran before command output completed")
-					}
 					cancel()
 				}
 			}
-			if code := runWithSignalContext(args, streams, notify); code != wantCode {
+			if code := runWithSignalContext(args, streams, notify, runContext); code != wantCode {
 				t.Fatalf("runWithSignalContext() = %d, want %d", code, wantCode)
 			}
 			if notifyCalls != 1 || stopCalls != 1 {
@@ -109,5 +108,68 @@ func TestRunWithSignalContextStopsBeforeReturning(t *testing.T) {
 				t.Fatalf("stderr = %q, want %q", stderr.String(), wantStderr)
 			}
 		})
+	}
+}
+
+func TestRunWithSignalContextStopsBeforeCanceledRunnerReturns(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started, stopped := make(chan struct{}), make(chan struct{})
+	release, exited := make(chan struct{}), make(chan struct{})
+	var stopCalls atomic.Int32
+	notify := func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {
+			if stopCalls.Add(1) == 1 {
+				close(stopped)
+			}
+			cancel()
+		}
+	}
+	runner := func(got context.Context, _ []string, _ genericiooptions.IOStreams) int {
+		if got != ctx {
+			t.Error("runner did not receive signal context")
+		}
+		close(started)
+		<-release
+		return 17
+	}
+	var code int
+	go func() {
+		code = runWithSignalContext(nil, genericiooptions.IOStreams{}, notify, runner)
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		close(release)
+		select {
+		case <-exited:
+			if code != 17 || stopCalls.Load() != 1 {
+				t.Errorf("code=%d stop calls=%d, want 17 and 1", code, stopCalls.Load())
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("signal helper did not finish after runner was released")
+		}
+	})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not start")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("signal notification stopped before cancellation or runner completion")
+	default:
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal notification was not stopped while canceled runner remained blocked")
+	}
+	select {
+	case <-exited:
+		t.Fatal("signal helper returned before runner was released")
+	default:
 	}
 }

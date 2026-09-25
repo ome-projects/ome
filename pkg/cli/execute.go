@@ -24,6 +24,10 @@ func ExecuteCommandContext(ctx context.Context, cmd *cobra.Command, stderr io.Wr
 	cmd.SilenceUsage = true
 	cmd.SetErr(stderr)
 
+	// Cobra retains inherited contexts on children between executions.
+	clearCommandContexts(cmd.Root())
+	// Execute also delegates to the root when cmd is a descendant.
+	cmd.Root().SetContext(ctx)
 	err := cmd.ExecuteContext(ctx)
 	if err == nil {
 		return exitcode.Success
@@ -32,6 +36,13 @@ func ExecuteCommandContext(ctx context.Context, cmd *cobra.Command, stderr io.Wr
 		fmt.Fprintf(stderr, "error: %v\n", err)
 	}
 	return exitcode.FromError(err)
+}
+
+func clearCommandContexts(cmd *cobra.Command) {
+	cmd.SetContext(nil)
+	for _, child := range cmd.Commands() {
+		clearCommandContexts(child)
+	}
 }
 
 // Run constructs and executes the production command tree for args.
