@@ -41,9 +41,13 @@ agent tools); source diffs are prepared by the workflow. The publisher does not
 trust any checks run inside the writer's checkout. PR titles must be a nonempty,
 single printable line, validated before any branch is pushed.
 
-Every job checks out the immutable workflow `github.sha` directly; the planner
-cannot select the publisher's source revision. Every PR starts from that same
-default-branch snapshot, not from another documentation branch. Run-level concurrency prevents overlapping nightlies.
+Every job first checks out the immutable workflow `github.sha` and preserves its
+automation tools outside the source checkout. The planner job pins the default
+branch's source SHA once, before calling the model; every job then checks out
+that same source SHA. A manual run from a fix branch therefore tests that
+branch's tooling while all generated PRs contain only documentation changes
+against the pinned default branch. The model cannot choose either revision.
+Run-level concurrency prevents overlapping nightlies.
 Existing PR branches are never force-pushed or overwritten. If a previous run
 pushed a branch but failed to open its PR, an exact retry can reuse that tree;
 otherwise the job fails for maintainer inspection instead of overwriting it.
@@ -65,8 +69,11 @@ reopen/rework it; the nightly does not silently recreate it.
   so the nightly performs its own scope, review, and Hugo checks before opening
   the PR. Maintainers can trigger any further desired CI manually.
 - Schedules become active only after the workflow is on the default branch.
-  Manual dispatch is allowed only on the default branch; other branches are
-  skipped. The workflow does not change runner or repository settings.
+  Maintainers can manually dispatch from a trusted workflow branch to validate
+  fixes before opening a PR. These runs perform the full review/build/publication
+  pipeline and open documentation PRs targeting the default branch. Use
+  `gh workflow run nightly-docs.yml --repo ome-projects/ome --ref BRANCH`.
+  The workflow does not change runner or repository settings.
 
 ## Local validation
 

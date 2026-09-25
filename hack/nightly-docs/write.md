@@ -12,6 +12,9 @@ unsupported by current code, or depends on an unfinished OEP, make no changes.
 Follow existing Hugo front matter, links, shortcodes, and writing conventions.
 Use concrete source-backed defaults and examples. Distinguish released behavior
 from unreleased behavior on main when relevant. Never invent test results.
+Verify API verbs, RBAC requirements, and success guarantees by following the
+implementation into its helpers; help text and comments alone are not proof.
+Do not describe reported status as convergence or attribution unless verified.
 Do not edit generated API reference docs, code, workflows, site configuration,
 lockfiles, or the automation's own instructions. Do not delete existing files.
 Do not commit, push, create PRs, comment, or invoke other agents; the workflow

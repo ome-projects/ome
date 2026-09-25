@@ -1,5 +1,9 @@
 name: Set up nightly documentation tools
 description: Prepare Python, gh, and the runner-provided Anthropic key
+inputs:
+  source-sha:
+    description: Immutable default-branch commit to document
+    required: true
 runs:
   using: composite
   steps:
@@ -27,3 +31,8 @@ runs:
             | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${version}_linux_${arch}/bin/gh"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
         fi
+    - name: Preserve workflow tools and check out documentation source
+      shell: bash
+      env:
+        SOURCE_SHA: ${{ inputs.source-sha }}
+      run: python3 hack/nightly-docs/prepare_source.py "$SOURCE_SHA" "$RUNNER_TEMP/nightly-docs-tools"

@@ -20,12 +20,13 @@ concurrency:
 
 jobs:
   plan:
-    if: github.repository == 'ome-projects/ome' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.repository == 'ome-projects/ome' && (github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ome-runner-cpu
     timeout-minutes: 45
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
+      base_sha: ${{ steps.baseline.outputs.sha }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -34,12 +35,24 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Pin the default-branch documentation baseline
+        id: baseline
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$(git rev-parse "refs/remotes/origin/$DEFAULT_BRANCH")" >> "$GITHUB_OUTPUT"
+          fi
       - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ steps.baseline.outputs.sha }}
       - name: Gather code history and existing documentation PRs
         env:
           NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
         run: |
-          python3 hack/nightly-docs/nightly_docs.py context
+          python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" context
       - name: Identify separate documentation concerns
         id: discover
         uses: anthropics/claude-code-action@v1
@@ -48,7 +61,7 @@ jobs:
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          prompt: Read and follow hack/nightly-docs/plan.md. The context file is ${{ runner.temp }}/nightly-docs-context.json.
+          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/plan.md. The context file is ${{ runner.temp }}/nightly-docs-context.json.
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
@@ -61,7 +74,7 @@ jobs:
         env:
           NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
           PLAN_JSON: ${{ steps.discover.outputs.structured_output }}
-        run: python3 hack/nightly-docs/nightly_docs.py plan
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" plan
       - name: Planning summary
         env:
           COUNT: ${{ steps.plan.outputs.count }}
@@ -82,29 +95,31 @@ jobs:
     name: 'Document: ${{ matrix.concern }}'
     env:
       GH_TOKEN: ${{ github.token }}
-      BASE_SHA: ${{ github.sha }}
+      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
       ITEM_JSON: ${{ toJSON(matrix) }}
     steps:
-      # Every concern starts from the same clean default-branch snapshot, never
-      # from another documentation PR's branch.
+      # Load automation from the immutable workflow revision, then the setup
+      # action switches to the same clean default-branch snapshot for all jobs.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ needs.plan.outputs.base_sha }}
       - name: Save the single concern
         env:
           NIGHTLY_ITEM: ${{ runner.temp }}/nightly-docs-item.json
         run: |
-          python3 hack/nightly-docs/nightly_docs.py evidence
+          python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" evidence
       - name: Update documentation for this concern only
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          prompt: Read and follow hack/nightly-docs/write.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json; the source commit diff is ${{ runner.temp }}/nightly-docs-source.patch.
+          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/write.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json; the source commit diff is ${{ runner.temp }}/nightly-docs-source.patch.
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
@@ -114,7 +129,7 @@ jobs:
       - name: Export untrusted documentation data
         env:
           BUNDLE_PATH: ${{ runner.temp }}/nightly-docs-bundle.json
-        run: python3 hack/nightly-docs/nightly_docs.py export
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" export
       - uses: actions/upload-artifact@v4
         with:
           name: nightly-docs-${{ strategy.job-index }}
@@ -140,7 +155,7 @@ jobs:
     name: 'Validate and publish: ${{ matrix.concern }}'
     env:
       GH_TOKEN: ${{ github.token }}
-      BASE_SHA: ${{ github.sha }}
+      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
       ITEM_JSON: ${{ toJSON(matrix) }}
     steps:
@@ -152,6 +167,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ needs.plan.outputs.base_sha }}
       - name: Find this concern's artifact
         id: artifact
         env:
@@ -177,8 +194,8 @@ jobs:
           BUNDLE_PATH: ${{ runner.temp }}/nightly-docs-incoming/nightly-docs-bundle.json
           NIGHTLY_ITEM: ${{ runner.temp }}/nightly-docs-item.json
         run: |
-          python3 hack/nightly-docs/nightly_docs.py evidence
-          python3 hack/nightly-docs/nightly_docs.py import
+          python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" evidence
+          python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" import
           git -c core.hooksPath=/dev/null diff --cached --no-ext-diff --no-textconv > "$RUNNER_TEMP/nightly-docs-review.patch"
       - name: Independently review accuracy and scope
         if: steps.scope.outputs.changed == 'true'
@@ -187,7 +204,7 @@ jobs:
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          prompt: Read and follow hack/nightly-docs/review.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json. Read ${{ runner.temp }}/nightly-docs-review.patch and ${{ runner.temp }}/nightly-docs-source.patch.
+          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/review.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json. Read ${{ runner.temp }}/nightly-docs-review.patch and ${{ runner.temp }}/nightly-docs-source.patch.
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
@@ -200,7 +217,7 @@ jobs:
         env:
           REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
         run: |
-          python3 -c 'import os, sys; sys.path.insert(0, "hack/nightly-docs"); from nightly_docs import review_passes; review_passes(os.environ["REVIEW_JSON"])'
+          python3 -c 'import os, sys; sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "nightly-docs-tools")); from nightly_docs import review_passes; review_passes(os.environ["REVIEW_JSON"])'
       - uses: actions/setup-go@v6
         if: steps.scope.outputs.changed == 'true'
         with:
@@ -218,7 +235,7 @@ jobs:
           HUGO_ENVIRONMENT: production
           HUGO_BASEURL: https://ome-projects.github.io/ome/
         run: |
-          python3 hack/nightly-docs/install_hugo.py "$RUNNER_TEMP/nightly-docs-bin"
+          python3 "$RUNNER_TEMP/nightly-docs-tools/install_hugo.py" "$RUNNER_TEMP/nightly-docs-bin"
           # Hugo resolves Docsy modules into go.mod/go.sum. Build a copy so those
           # generated files cannot contaminate the strictly docs-only PR.
           cp -a site "$RUNNER_TEMP/nightly-docs-site"
@@ -229,7 +246,7 @@ jobs:
           REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
         run: |
           gh auth setup-git
-          python3 hack/nightly-docs/nightly_docs.py publish
+          python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" publish
       - name: No-op summary
         if: steps.scope.outputs.changed == 'false'
         run: echo "No supported documentation change remained for this concern; no PR created." >> "$GITHUB_STEP_SUMMARY"
