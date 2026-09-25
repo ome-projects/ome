@@ -274,7 +274,7 @@ func (s *runState[T]) run() error {
 			}
 			return cancelErr
 		}
-		action := watchFail
+		var action watchAction
 		var delay time.Duration
 		var actionErr error
 		if err != nil {
