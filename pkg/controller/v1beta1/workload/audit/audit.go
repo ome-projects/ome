@@ -446,29 +446,6 @@ func NewTerminalEntry(prev Entry, phase, outcome string) Entry {
 	return out
 }
 
-// Migration capacity defaults. Cluster-wide caps that gate any
-// automated migration caller from flooding the controller's
-// destructive-action pipeline with too much concurrent or hourly
-// EXECUTION churn — queued intent is never counted (the dispatcher
-// executes serially; a queued record holds no resources).
-const (
-	// DefaultInFlightCap is the maximum number of EXECUTING migration
-	// records on the owner — non-terminal with an allocated surge —
-	// before new requests are RateLimited. Default of 3.
-	DefaultInFlightCap = 3
-
-	// DefaultPerHourCap is the maximum number of migration records (any
-	// phase) whose AllocatedAt falls in the trailing CapacityRateWindow.
-	// Default of 10.
-	DefaultPerHourCap = 10
-
-	// CapacityRateWindow is the trailing window the per-hour cap counts
-	// over. The status-entry trim rule shares it: terminal records older
-	// than the window are pruned, so the record list stays bounded by
-	// construction (in-flight cap x window).
-	CapacityRateWindow = time.Hour
-)
-
 // ValidateCapacity reports whether the migration request identified by
 // requestUUID is admissible against the owner's status.migrations
 // records — the single source of truth for migration work. Returns
@@ -487,24 +464,32 @@ const (
 //     (SurgeInstance set). Terminal records (Completed / Failed /
 //     Relocated) free their slot structurally — the wedged-Started-row
 //     capacity leak cannot exist.
-//   - per-hour = records of ANY phase with AllocatedAt inside the
-//     trailing CapacityRateWindow. A nil AllocatedAt (queued, or an
-//     Auto record that never allocates a surge) never counts.
+//   - per-window = records of ANY phase with AllocatedAt inside the
+//     policy's trailing window. A nil AllocatedAt (queued, or an Auto
+//     record that never allocates a surge) never counts.
 //
 // The two caps are independent — either tripping rejects the request.
 // `now` is injected so tests can pin a deterministic time and walk the
 // trailing window past the relevant records.
-func ValidateCapacity(records []types.MigrationRecord, requestUUID string, now time.Time) (ok bool, reason string) {
-	inFlight := 0
-	allocatedInWindow := 0
-	windowStart := now.Add(-CapacityRateWindow)
+//
+// A nil policy (no lifecycle.audit) is not admissible: the caps are the
+// only bound on how much destructive migration work one requester can
+// start. The caller holds the request on that answer rather than
+// failing it, so the reason names the missing configuration.
+func ValidateCapacity(policy *types.MigrationAuditPolicy, records []types.MigrationRecord, requestUUID string, now time.Time) (ok bool, reason string) {
+	if policy == nil {
+		return false, "migration capacity policy unconfigured (no lifecycle.audit)"
+	}
+	inFlight := int32(0)
+	allocatedInWindow := int32(0)
+	windowStart := now.Add(-policy.Window)
 
 	for i := range records {
 		r := &records[i]
 		if r.RequestUUID == requestUUID {
 			continue
 		}
-		if !r.Phase.Terminal() && r.SurgeInstance != nil && *r.SurgeInstance >= 0 {
+		if !r.Phase.Terminal() && r.SurgeAllocated() {
 			inFlight++
 		}
 		if r.AllocatedAt != nil && r.AllocatedAt.Time.After(windowStart) {
@@ -512,11 +497,11 @@ func ValidateCapacity(records []types.MigrationRecord, requestUUID string, now t
 		}
 	}
 
-	if inFlight >= DefaultInFlightCap {
-		return false, fmt.Sprintf("in-flight migration cap reached (%d/%d)", inFlight, DefaultInFlightCap)
+	if inFlight >= policy.MaxInFlight {
+		return false, fmt.Sprintf("in-flight migration cap reached (%d/%d)", inFlight, policy.MaxInFlight)
 	}
-	if allocatedInWindow >= DefaultPerHourCap {
-		return false, fmt.Sprintf("per-hour migration cap reached (%d/%d in last hour)", allocatedInWindow, DefaultPerHourCap)
+	if allocatedInWindow >= policy.MaxPerWindow {
+		return false, fmt.Sprintf("migration rate cap reached (%d/%d in the last %s)", allocatedInWindow, policy.MaxPerWindow, policy.Window)
 	}
 	return true, ""
 }

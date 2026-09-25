@@ -5,16 +5,15 @@
 // validateBudgetIntOrString helper in budget.go; this file composes
 // the per-Component field paths and adds the zero-budget pair rule.
 //
-// As of the per-Component MaxSurge/MaxUnavailable wire-up, the rollout
-// budget now reads the per-Component RollingUpdate fields directly
-// (see pkg/controller/v1beta1/workload/budget.go) and composes them
-// with the coordination-group budgets as independent layers — the
-// effective cap is the min of both. Because the per-Component layer
-// now actively gates rollouts, we MUST also reject the unstartable
-// configuration (MaxSurge=0 AND MaxUnavailable=0), mirroring upstream
-// appsv1.Deployment's same rule. Either knob nil (operator unset) is
-// fine — nil means "this layer does not cap" so the rollout falls
-// through to the group layer.
+// The rollout budget reads the per-Component RollingUpdate fields
+// directly (see pkg/controller/v1beta1/workload/escalation/budget.go)
+// and composes them with the coordination-group budgets as independent
+// layers — the effective cap is the min of both. Because the
+// per-Component layer gates rollouts, the unstartable configuration
+// (MaxSurge=0 AND MaxUnavailable=0) is rejected, mirroring
+// appsv1.Deployment's rule. Either knob nil (operator unset) is fine —
+// nil means "this layer does not cap" so the rollout falls through to
+// the group layer.
 //
 // The webhook ALSO rejects the equivalent deadlock at the
 // coordination-pacing layer (see validatePacingNotZeroBudget in

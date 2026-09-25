@@ -177,6 +177,7 @@ func (r *Router) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 			ObjectMeta:                objectMeta,
 			PodSpec:                   podSpec,
 			MultiPod:                  false,
+			PacingPartition:           r.PacingPartition,
 			ResolvedAutoscaler:        res.Resolved,
 			PreserveAutoscaler:        res.Hold,
 			QuotaAcceleratorResources: r.QuotaAcceleratorResources,

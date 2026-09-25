@@ -283,24 +283,7 @@ func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1bet
 	if perr != nil {
 		return out, perr
 	}
-	routingBuild := func(i *v1beta1.InferenceService, comp v1beta1.ComponentType, hash string) (*corev1.Service, error) {
-		svc, err := BuildPerRevisionRoutingService(i, comp, hash, routing, runnerPorts)
-		if err != nil || svc == nil {
-			return svc, err
-		}
-		if protocol != "" {
-			// Replace the label map rather than mutate it: the builder may
-			// alias Labels and Spec.Selector, and the protocol must never
-			// enter the selector (pod selection stays revision-hash based).
-			lbls := make(map[string]string, len(svc.Labels)+1)
-			for k, v := range svc.Labels {
-				lbls[k] = v
-			}
-			lbls[query.LabelPairingProtocol] = protocol
-			svc.Labels = lbls
-		}
-		return svc, nil
-	}
+	routingBuild := perRevisionRoutingBuilder(protocol, routing, runnerPorts)
 	switch err := ensureService(ctx, c, isvc, routingBuild, component, revisionHash, out.RoutingName, false); {
 	case errors.Is(err, ErrNoServingPort):
 		out.RoutingName = ""
@@ -313,6 +296,129 @@ func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1bet
 		return out, err
 	}
 	return out, nil
+}
+
+// CreatePerRevisionServicesIfAbsent creates the routing + headless pair for
+// one (component, revisionHash) when they do not exist yet and leaves
+// existing Services untouched. It is the create-before-pods path for a peer
+// Component's target revision: a pod whose per-revision peer endpoint names
+// this Service must find it resolvable when it starts. Drift correction
+// stays with EnsurePerRevisionServices, which derives the selector from the
+// revision's observed pods; this path derives it from the peer's declared
+// Runners (RoutingSelectorForRunners) and never overwrites, so the two
+// writers cannot fight. A missing serving port skips the routing Service
+// the same way the ensure path does.
+func CreatePerRevisionServicesIfAbsent(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) error {
+	if c == nil {
+		return fmt.Errorf("CreatePerRevisionServicesIfAbsent: nil client")
+	}
+	if isvc == nil || revisionHash == "" {
+		return nil
+	}
+	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, isvc.Name, component, revisionHash)
+	if perr != nil {
+		return perr
+	}
+	names := PerRevisionServiceNames(isvc.Name, component, revisionHash)
+	routingBuild := perRevisionRoutingBuilder(protocol, routing, runnerPorts)
+	if err := createServiceIfAbsent(ctx, c, isvc, routingBuild, component, revisionHash, names.RoutingName); err != nil && !errors.Is(err, ErrNoServingPort) {
+		return err
+	}
+	return createServiceIfAbsent(ctx, c, isvc, BuildPerRevisionHeadlessService, component, revisionHash, names.HeadlessName)
+}
+
+// perRevisionRoutingBuilder returns the routing-Service builder for one
+// revision with the revision's pairing protocol stamped as a metadata label.
+// The label never enters the selector: the builder may alias Labels and
+// Spec.Selector, so the label map is replaced rather than mutated.
+func perRevisionRoutingBuilder(protocol string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) func(*v1beta1.InferenceService, v1beta1.ComponentType, string) (*corev1.Service, error) {
+	return func(i *v1beta1.InferenceService, comp v1beta1.ComponentType, hash string) (*corev1.Service, error) {
+		svc, err := BuildPerRevisionRoutingService(i, comp, hash, routing, runnerPorts)
+		if err != nil || svc == nil {
+			return svc, err
+		}
+		if protocol != "" {
+			lbls := make(map[string]string, len(svc.Labels)+1)
+			for k, v := range svc.Labels {
+				lbls[k] = v
+			}
+			lbls[query.LabelPairingProtocol] = protocol
+			svc.Labels = lbls
+		}
+		return svc, nil
+	}
+}
+
+// RoutingSelectorForRunners derives the routing selector for a revision
+// that has no observed pods yet from the Component's declared Runners. It
+// matches what observing the revision's pods yields once they exist: a
+// leader/worker shape narrows the routing Service to the leader pod at
+// ordinal 0 (every rendered pod carries the ordinal label); a single
+// default Runner keeps the broad selector.
+func RoutingSelectorForRunners(runners []v1beta1.Runner) RevisionRoutingSelector {
+	for i := range runners {
+		if runners[i].Name == v1beta1.RunnerNameLeader {
+			return RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}
+		}
+	}
+	return RevisionRoutingSelector{}
+}
+
+// ServingPortsFromRunners returns the container ports of the Runner
+// template that serves a Component's traffic — the leader template for a
+// multi-pod shape, else the default one — in container order. The routing
+// Service publishes the port named `http` from this set, else the first.
+func ServingPortsFromRunners(runners []v1beta1.Runner) []corev1.ContainerPort {
+	var serving *v1beta1.Runner
+	for i := range runners {
+		switch runners[i].Name {
+		case v1beta1.RunnerNameLeader:
+			serving = &runners[i]
+		case v1beta1.RunnerNameDefault:
+			if serving == nil {
+				serving = &runners[i]
+			}
+		}
+	}
+	if serving == nil {
+		return nil
+	}
+	var ports []corev1.ContainerPort
+	for _, ctr := range serving.Template.Spec.Containers {
+		ports = append(ports, ctr.Ports...)
+	}
+	return ports
+}
+
+// createServiceIfAbsent creates the built Service only when no Service of
+// that name exists; an existing one is left exactly as found.
+func createServiceIfAbsent(
+	ctx context.Context,
+	c client.Client,
+	isvc *v1beta1.InferenceService,
+	build func(*v1beta1.InferenceService, v1beta1.ComponentType, string) (*corev1.Service, error),
+	component v1beta1.ComponentType,
+	revisionHash, name string,
+) error {
+	existing := &corev1.Service{}
+	err := c.Get(ctx, client.ObjectKey{Namespace: isvc.Namespace, Name: name}, existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get per-revision service %s/%s: %w", isvc.Namespace, name, err)
+	}
+	desired, err := build(isvc, component, revisionHash)
+	if err != nil {
+		if errors.Is(err, ErrNoServingPort) {
+			return err
+		}
+		return fmt.Errorf("build per-revision service %s: %w", name, err)
+	}
+	if err := c.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create per-revision service %s/%s: %w", isvc.Namespace, name, err)
+	}
+	return nil
 }
 
 // ensureService is the shared CreateOrUpdate helper for the routing /

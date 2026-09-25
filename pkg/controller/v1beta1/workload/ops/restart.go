@@ -12,15 +12,21 @@ import (
 
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// RestartRequeueInterval is the wait between passes while a Restart
-// is in flight. Exported so the dispatcher's pacing stays in
-// lockstep.
-const RestartRequeueInterval = 5 * time.Second
+// RestartRequeueInterval is the wait between passes while a Restart is
+// in flight, from the operator's lifecycle.requeue.operation. Exported
+// so the dispatcher's pacing stays in lockstep. Zero means
+// unconfigured: the caller requeues on the controller's rate-limited
+// backoff instead.
+func RestartRequeueInterval(input workload.ReconcileInput) time.Duration {
+	return input.Requeue.Operation
+}
 
 // DetectRestartTrigger fires when the Instance is mid-restart, when
 // Phase=Ready and a pod is Failed / the live pod count is below
@@ -28,6 +34,11 @@ const RestartRequeueInterval = 5 * time.Second
 // any phase (see instanceLostGangMember). A Migrate-owned Instance is
 // suppressed because Migrate's source-pod deletion would otherwise trip
 // the "pod count below desired" trigger on the source.
+//
+// The restart policy is read here rather than by the caller: all of the
+// above is RestartPolicyRecreateInstance's, while driving an
+// open repair and the operation-free crash-loop repair
+// (crashLoopRepairReason) belong to every policy.
 //
 // Ownership: Create materializes an Instance, Restart repairs one that
 // was already materialized. Gating repair on Phase=Ready is right for a
@@ -46,7 +57,7 @@ const RestartRequeueInterval = 5 * time.Second
 // live List + bucket, so a Component with N gangs costs one live List per
 // reconcile instead of N — see that variant.
 func DetectRestartTrigger(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan) (bool, string, error) {
-	s := findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index)
+	s := input.ObservedState.Instance(inst.Index)
 	// Restarting and the absent/Migrate-owned cases decide without reading
 	// pods at all, so the live List is wasted there. Every other phase can
 	// reach a pod-set comparison.
@@ -70,17 +81,29 @@ func DetectRestartTrigger(ctx context.Context, deps workload.Deps, input workloa
 // instancePods must already be filtered to inst.Index. Semantics are
 // identical to DetectRestartTrigger; only the read source differs.
 func DetectRestartTriggerWithPods(input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, instancePods []*corev1.Pod) (bool, string) {
-	s := findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index)
+	s := input.ObservedState.Instance(inst.Index)
 	if s == nil {
 		return false, ""
 	}
 	if isMigrateOwnedStatus(s) {
 		return false, ""
 	}
+	// An open Restart is driven to completion whatever the policy says:
+	// the policy governs whether a repair STARTS, and a half-drained
+	// Instance abandoned mid-repair is worse than one never repaired.
 	if s.Phase == workload.InstancePhaseRestarting {
 		return true, ""
 	}
 	expected := inst.TotalPods()
+	// A pod wedged in a terminal kubelet waiting reason cannot recover on
+	// its own and no other pass owns an operation-free Ready row, so the
+	// repair starts regardless of the restart policy.
+	if reason, wedged := crashLoopRepairReason(input, s, expected, instancePods); wedged {
+		return true, reason
+	}
+	if plan.RestartPolicy != workload.RestartPolicyRecreateInstance {
+		return false, ""
+	}
 	if s.Phase != workload.InstancePhaseReady {
 		// Below Ready only gang-member loss triggers. Pod-level failure
 		// evidence stays Ready-gated: a container that dies while the
@@ -162,8 +185,9 @@ func instanceLostGangMember(input workload.ReconcileInput, plan workload.Compone
 		!(s.Operation.Type == workload.InstanceOperationRestart && s.Phase == workload.InstancePhaseFailed) {
 		return "", false
 	}
-	createCommitted := s.Operation != nil && s.Operation.Step == createStepCreatePods
-	if !createCommitted && s.Phase != workload.InstancePhaseFailed && s.PodCount < expected {
+	createCommitted := s.Operation != nil && s.Operation.Step == status.CreateStepCreatePods
+	publishedPods, _ := workload.AdapterPublished(s)
+	if !createCommitted && s.Phase != workload.InstancePhaseFailed && publishedPods < expected {
 		return "", false
 	}
 	// A terminal pod is not a survivor: it holds no capacity and pins no
@@ -198,7 +222,7 @@ func rebuildRetryBlockDenies(input workload.ReconcileInput, s *workload.Instance
 	if b == nil {
 		return false
 	}
-	denied, _ := evaluateRetryBlockGate(b, input.Now(), anyInFlightCreateAttempt(input.ObservedState.InstanceStatuses))
+	denied, _ := evaluateRetryBlockGate(b, input.Now(), anyInFlightCreateAttempt(input, allInstances))
 	return denied
 }
 
@@ -234,17 +258,17 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 	// Use the post-patch Incarnation, not inst.Incarnation — BuildPlan
 	// ran against an earlier read.
 	wasNotRestarting := true
-	if s := findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index); s != nil && s.Phase == workload.InstancePhaseRestarting {
+	if s := input.ObservedState.Instance(inst.Index); s != nil && s.Phase == workload.InstancePhaseRestarting {
 		wasNotRestarting = false
 	}
-	newInc, err := patchInstanceStatusRestarting(ctx, input, inst.Index, reason, plan.InstanceReadyTimeout)
+	newInc, err := status.StampRestarting(ctx, input, inst.Index, reason, plan.InstanceReadyTimeout)
 	if err != nil {
 		return false, fmt.Errorf("patch status Restarting (instance=%d): %w", inst.Index, err)
 	}
 	if wasNotRestarting {
-		recordWarning(deps.Recorder, eventTarget(input), workload.EventReasonRestartTriggered,
+		workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonRestartTriggered,
 			"OMENative %s restart triggered: %s (incarnation=%d)",
-			instanceKey(input.Key.Component, inst.Index), reason, newInc)
+			workload.InstanceKey(input.Key.Component, inst.Index), reason, newInc)
 	}
 
 	pods, err := query.LiveListPodsForInstance(ctx, deps.Client, input.Key.Namespace, input.Key.OwnerName, plan.Component, inst.Index)
@@ -261,7 +285,7 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 	// capture and leaves any prior LastFailure intact.
 	if wasNotRestarting {
 		if t := firstFailedPodTermination(pods); t != nil {
-			if err := patchInstanceLastFailure(ctx, input, inst.Index, t); err != nil {
+			if err := status.RecordLastFailure(ctx, input, inst.Index, t); err != nil {
 				return false, fmt.Errorf("record LastFailure (instance=%d): %w", inst.Index, err)
 			}
 		}
@@ -275,9 +299,9 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 	// must re-classify or delete the pod for Restart to proceed.
 	if len(unknownPods) > 0 {
 		for _, pod := range unknownPods {
-			recordWarning(deps.Recorder, eventTarget(input), workload.EventReasonFoundOrphan,
+			workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonFoundOrphan,
 				"OMENative %s found orphan pod %s/%s without ome.io/instance-incarnation; refusing to delete",
-				instanceKey(input.Key.Component, inst.Index), pod.Namespace, pod.Name)
+				workload.InstanceKey(input.Key.Component, inst.Index), pod.Namespace, pod.Name)
 		}
 		return false, nil
 	}
@@ -359,11 +383,24 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 	// A new-incarnation pod that died (rejected at admission, evicted) is
 	// absent: it holds the stable name but will never run. Recycle it so
 	// the name frees up; its target is created on a later pass.
-	recycling, err := recycleTerminalPods(ctx, deps, input, inst.Index, workload.InstanceOperationRestart, terminalTargetPods(newPods, desired))
+	recycling, err := recycleTerminalPods(ctx, deps, input, inst.Index, inst.Index, workload.InstanceOperationRestart, terminalTargetPods(newPods, desired))
 	if err != nil {
 		return false, fmt.Errorf("Restart: recycle terminal pods (instance=%d): %w", inst.Index, err)
 	}
 	if recycling {
+		return false, nil
+	}
+	// A pod whose node stopped reporting it is not dead evidence: the
+	// name stays occupied until the force-delete sweep proves the node
+	// gone, and the repair reports that wait instead of polling a name no
+	// kubelet is answering for. The policy boundary that wait ends on
+	// needs no plumbing here: an unfinished Restart requeues at
+	// RestartRequeueInterval, well inside any node-death threshold.
+	holding, _, err := recoverUnknownPhaseTargets(ctx, deps, input, inst.Index, newPods, desired)
+	if err != nil {
+		return false, fmt.Errorf("Restart: recover unknown-phase pods (instance=%d): %w", inst.Index, err)
+	}
+	if holding {
 		return false, nil
 	}
 	existingByName := query.IndexPodsByName(query.ExcludeTerminalPods(newPods))
@@ -386,7 +423,9 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 		return false, nil
 	}
 
-	// Phase C: flip serving, promote Ready.
+	// Phase C: flip serving, then hold at the shared promote bar. The gate
+	// write comes first because the rebuilt pods carry the lifecycle hold, so
+	// PodReady cannot become true until it is released.
 	if !query.AllPodsRuntimeReady(newPods) {
 		return false, nil
 	}
@@ -400,56 +439,18 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 			return false, fmt.Errorf("mark serving (instance=%d, pod=%s): %w", inst.Index, pod.Name, err)
 		}
 	}
+	if promotable, wait := query.PodSetPromotable(newPods, plan.MinReadySeconds, input.Now()); !promotable {
+		input.PromoteWindow.Observe(wait)
+		return false, nil
+	}
 
-	if err := patchInstanceStatusReady(ctx, input, inst.Index); err != nil {
+	if err := status.StampReady(ctx, input, inst.Index); err != nil {
 		return false, fmt.Errorf("patch status Ready (instance=%d): %w", inst.Index, err)
 	}
-	recordNormal(deps.Recorder, eventTarget(input), workload.EventReasonRestartCompleted,
+	workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonRestartCompleted,
 		"OMENative %s restart complete (incarnation=%d)",
-		instanceKey(input.Key.Component, inst.Index), newInc)
+		workload.InstanceKey(input.Key.Component, inst.Index), newInc)
 	return true, nil
-}
-
-// patchInstanceStatusRestarting idempotently stamps Phase=Restarting +
-// Restart/Drain with the given reason and increments Incarnation by one.
-// Returns the post-write Incarnation; if a previous pass already moved
-// into Restart, the existing Incarnation is preserved.
-func patchInstanceStatusRestarting(ctx context.Context, input workload.ReconcileInput, idx int32, reason string, timeout time.Duration) (int64, error) {
-	var observedIncarnation int64
-	err := input.MutateInstance(ctx, idx, func(s *workload.InstanceStatus) bool {
-		if s.Phase == workload.InstancePhaseRestarting &&
-			s.Operation != nil && s.Operation.Type == workload.InstanceOperationRestart {
-			observedIncarnation = s.Incarnation
-			return false
-		}
-		// An Instance that never ran a revision has only the revision its
-		// interrupted attempt pinned; the rebuilt pods must carry it so the
-		// per-revision Service selects them.
-		pinned := ""
-		if s.RunningRevision == "" && s.TargetRevision == "" && s.Operation != nil {
-			pinned = s.Operation.TargetRevision
-		}
-		// Bump first so old pods can be distinguished from the new set.
-		if s.Incarnation == 0 {
-			s.Incarnation = 1
-		}
-		s.Incarnation++
-		observedIncarnation = s.Incarnation
-		s.Phase = workload.InstancePhaseRestarting
-		now := metav1.NewTime(input.Now())
-		s.Operation = &workload.InstanceOperation{
-			ID:             fmt.Sprintf("restart-%d-%d", idx, now.Unix()),
-			Type:           workload.InstanceOperationRestart,
-			Step:           "Drain",
-			Reason:         reason,
-			StartedAt:      now,
-			LastProgressAt: now,
-			Deadline:       metav1.NewTime(now.Add(timeout)),
-			TargetRevision: pinned,
-		}
-		return true
-	})
-	return observedIncarnation, err
 }
 
 // firstFailedPodTermination returns the InstanceTermination of the first
@@ -481,45 +482,6 @@ func firstFailedPodTermination(pods []*corev1.Pod) *workload.InstanceTermination
 	return nil
 }
 
-// patchInstanceLastFailure stamps InstanceStatus.LastFailure with the
-// captured termination. Idempotent: a no-op when an identical record is
-// already stored (same pod + reason + exit code), so a repeated first-pass
-// (status conflict retry) doesn't churn the field.
-func patchInstanceLastFailure(ctx context.Context, input workload.ReconcileInput, idx int32, t *workload.InstanceTermination) error {
-	if t == nil {
-		return nil
-	}
-	return input.MutateInstance(ctx, idx, func(s *workload.InstanceStatus) bool {
-		if sameTermination(s.LastFailure, t) {
-			return false
-		}
-		captured := *t
-		s.LastFailure = &captured
-		return true
-	})
-}
-
-// sameTermination reports whether two termination records carry the same
-// operator-relevant identity (pod, container, reason, exit code). Time and
-// Message are excluded so a re-capture that differs only in the recorded
-// timestamp doesn't trigger a redundant status write.
-func sameTermination(a, b *workload.InstanceTermination) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.PodName != b.PodName || a.ContainerName != b.ContainerName || a.Reason != b.Reason {
-		return false
-	}
-	switch {
-	case a.ExitCode == nil && b.ExitCode == nil:
-		return true
-	case a.ExitCode == nil || b.ExitCode == nil:
-		return false
-	default:
-		return *a.ExitCode == *b.ExitCode
-	}
-}
-
 // revisionForInstance returns the revision to stamp on pods
 // being recreated for one Instance. Restart keeps the Instance on its
 // existing revision, so we read RunningRevision from the observed
@@ -528,7 +490,7 @@ func sameTermination(a, b *workload.InstanceTermination) bool {
 // pinned on the Operation. Returns the zero RevisionID when nothing
 // records a revision.
 func revisionForInstance(input workload.ReconcileInput, idx int32) query.RevisionID {
-	s := findInstanceStatus(input.ObservedState.InstanceStatuses, idx)
+	s := input.ObservedState.Instance(idx)
 	if s == nil {
 		return query.RevisionID{}
 	}
@@ -575,4 +537,54 @@ func runnerRestartedSinceReady(pod *corev1.Pod, readySince *metav1.Time) (string
 		}
 	}
 	return "", false
+}
+
+// Crash-loop repair: a wedge no other pass owns.
+//
+// No pass owns an operation-free Ready row, so this trigger does: the
+// stuck-pod fast escalator qualifies such a row only through the
+// wedged-pod shape, which is a revision-hash disagreement, so a pod
+// crash-looping on the revision the Instance is supposed to be running
+// reaches no escalation path. The trigger belongs to every restart
+// policy; RestartPolicy=None keeps its meaning for mere container
+// restarts, because a container that died and came back is not a wedge.
+//
+// The repair is a Restart, not a Failed stamp: the pod set can be
+// rebuilt. Routing it through the restart pass means the rebuild is
+// admitted the way any attempt that takes capacity offline is — the
+// per-Component unavailability budget and the cross-Component
+// coordination gate must both admit it before it opens, and the
+// RetryBlock recorded against the revision denies it once the attempts
+// are spent. A Component wedged on a bad revision therefore repairs at
+// the operator's configured pace instead of recycling every Instance in
+// one pass, and a revision that keeps crash-looping is held rather than
+// recycled forever.
+
+// crashLoopRepairReason reports whether this row holds a crash-loop
+// wedge the restart pass may repair: the wedge itself is
+// evidence.CrashLoopWedge, and the RetryBlock held against the revision
+// is what denies the rebuild — the same authority a repair of a
+// never-Ready Instance answers to.
+func crashLoopRepairReason(input workload.ReconcileInput, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) (string, bool) {
+	reason, wedged := evidence.CrashLoopWedge(input, s, expected, pods)
+	if !wedged {
+		return "", false
+	}
+	if rebuildRetryBlockDenies(input, s) {
+		return "", false
+	}
+	return reason, true
+}
+
+// RestartOpensUnavailability reports whether a restart selection for
+// inst would OPEN a fresh crash-loop repair this pass, as opposed to
+// driving one already in flight or recovering capacity that is already
+// gone. Only a fresh open takes serving capacity offline, so only a
+// fresh open is put to the unavailability budget and the coordination
+// gate; a Restart already in flight must be driven to completion, and
+// the pod-loss triggers repair an outage rather than causing one.
+func RestartOpensUnavailability(input workload.ReconcileInput, inst workload.InstancePlan, instancePods []*corev1.Pod) bool {
+	s := input.ObservedState.Instance(inst.Index)
+	_, wedged := crashLoopRepairReason(input, s, inst.TotalPods(), instancePods)
+	return wedged
 }

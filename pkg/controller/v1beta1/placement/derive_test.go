@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -21,6 +22,7 @@ func TestDeriveISVC(t *testing.T) {
 				LocalQueueAnnotation:                "serving-lq",
 				AcceleratorRequirementsAnnotation:   "gpu=gb300",
 				ClusterSelectorAnnotation:           "provider=cloud-a",
+				constants.TrafficDrainAnnotation:    `{"drain":{"cluster":"cluster-a","reason":"mitigation"}}`,
 				constants.RolloutPromoteAnnotation:  "abc123def",
 				constants.RolloutRollbackAnnotation: "true",
 				constants.NetworkVisibility:         "cluster-local", // an ingress override that SHOULD ride along
@@ -61,6 +63,7 @@ func TestDeriveISVC(t *testing.T) {
 	// placement selectors and the rollout operator verbs.
 	for _, k := range []string{
 		AcceleratorRequirementsAnnotation, ClusterSelectorAnnotation,
+		constants.TrafficDrainAnnotation,
 		constants.RolloutPromoteAnnotation, constants.RolloutRollbackAnnotation,
 	} {
 		_, has := d.Annotations[k]
@@ -127,6 +130,38 @@ func TestDeriveISVC_StripsGitOpsAnnotations(t *testing.T) {
 	// The source is untouched: DeriveISVC works on a deep copy.
 	assert.Equal(t, "source-app:ome.io/InferenceService:prod/svc",
 		src.Annotations["argocd.argoproj.io/tracking-id"])
+}
+
+func TestDeriveISVC_StripsRoutingDirectives(t *testing.T) {
+	enabled := true
+	src := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "uid-123"},
+		Spec: v1beta1.InferenceServiceSpec{
+			Engine: &v1beta1.EngineSpec{},
+			Placement: &v1beta1.PlacementSpec{
+				Mode: v1beta1.PlacementModeAll,
+				CapacityFactors: map[string]resource.Quantity{ //nolint:staticcheck // Exercise the supported legacy alias.
+					"cluster-a": resource.MustParse("2"),
+				},
+			},
+			Routing: &v1beta1.RoutingSpec{
+				Enabled: &enabled,
+				Publisher: &v1beta1.RoutingPublisherSpec{
+					Options: map[string]string{"routingClass": "premium"},
+				},
+			},
+		},
+	}
+	wantSource := src.DeepCopy()
+
+	d := DeriveISVC(src, "cp-east", "")
+
+	assert.Nil(t, d.Spec.Routing, "routing is reconciled only by the control plane")
+	require.NotNil(t, d.Spec.Placement)
+	assert.Equal(t, v1beta1.PlacementModeAll, d.Spec.Placement.Mode)
+	assert.Nil(t, d.Spec.Placement.CapacityFactors, //nolint:staticcheck // Verify the supported legacy alias is removed.
+		"the legacy routing capacity alias is reconciled only by the control plane")
+	assert.Equal(t, wantSource, src, "derivation must not mutate the source ISVC")
 }
 
 func TestSetDerivedReplicas(t *testing.T) {

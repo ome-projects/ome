@@ -20,11 +20,14 @@ spec:
     - jsonPath: .spec.mode
       name: Mode
       type: string
-    - jsonPath: .status.conditions[?(@.type=="Programmed")].status
-      name: Programmed
+    - jsonPath: .status.conditions[?(@.type=="Published")].status
+      name: Published
       type: string
     - jsonPath: .status.conditions[?(@.type=="Routable")].status
       name: Routable
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="OverrideActive")].status
+      name: Override
       type: string
     - jsonPath: .status.conditions[?(@.type=="Routable")].reason
       name: Reason

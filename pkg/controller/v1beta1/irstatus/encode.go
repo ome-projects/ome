@@ -190,7 +190,8 @@ func encodeOptionalIndexSet(indices []int32, n uint64) (*string, error) {
 // entryOf copies the exceptional records of row into an entry, reporting
 // false when the row has none. An empty conditions list counts as absent.
 func entryOf(row *v1beta1.OMENativeInstanceStatus) (v1beta1.InstanceStatusEntry, bool) {
-	if len(row.Conditions) == 0 && row.ReadySince == nil && row.Operation == nil && row.LastFailure == nil {
+	if len(row.Conditions) == 0 && row.ReadySince == nil && row.Operation == nil && row.LastFailure == nil &&
+		len(row.Announced) == 0 {
 		return v1beta1.InstanceStatusEntry{}, false
 	}
 	entry := v1beta1.InstanceStatusEntry{
@@ -198,6 +199,9 @@ func entryOf(row *v1beta1.OMENativeInstanceStatus) (v1beta1.InstanceStatusEntry,
 		ReadySince:  row.ReadySince.DeepCopy(),
 		Operation:   row.Operation.DeepCopy(),
 		LastFailure: row.LastFailure.DeepCopy(),
+	}
+	if len(row.Announced) > 0 {
+		entry.Announced = append([]string(nil), row.Announced...)
 	}
 	if len(row.Conditions) > 0 {
 		entry.Conditions = cloneConditions(row.Conditions)

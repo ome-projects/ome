@@ -8,6 +8,7 @@ import (
 )
 
 // InferenceServiceSpec is the top level type for this resource
+// +kubebuilder:validation:XValidation:rule="!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement) && has(self.placement.capacityFactors))",message="spec.routing.capacityFactors and deprecated spec.placement.capacityFactors must not both be set"
 type InferenceServiceSpec struct {
 	// DeploymentMode selects the dispatch backend that drives every
 	// Component on this InferenceService. When set, it propagates to
@@ -97,6 +98,13 @@ type InferenceServiceSpec struct {
 	// deployments. Alpha; the API may change without notice.
 	// +optional
 	Placement *PlacementSpec `json:"placement,omitempty"`
+
+	// Routing configures cross-cluster traffic distribution for this
+	// InferenceService. Unset fields inherit the operator-level routing
+	// configuration. Only consulted on the control-plane cluster; ignored in
+	// single-cluster deployments. Alpha; the API may change without notice.
+	// +optional
+	Routing *RoutingSpec `json:"routing,omitempty"`
 }
 
 // GetRolloutGroups returns the ordered rollout groups (spec.rollout.groups), or
@@ -423,6 +431,8 @@ type WorkerSpec struct {
 
 	// Size of the worker, this is the number of pods in the worker.
 	// Controls how many worker pod instances will be deployed for horizontal scaling.
+	// Unset inherits the ServingRuntime's value; when neither sets it, a
+	// declared leader gets one worker.
 	// +optional
 	Size *int `json:"size,omitempty"`
 
@@ -548,6 +558,7 @@ type ServingRuntimeRef struct {
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="BaseModel",type="string",JSONPath=".spec.model.name"
 // +kubebuilder:printcolumn:name="Runtime",type="string",JSONPath=".spec.runtime.name"
+// +kubebuilder:printcolumn:name="Placement",type="string",JSONPath=".status.placement.phase",priority=1
 // +kubebuilder:printcolumn:name="Plan-Source",type="string",JSONPath=".status.rollout.activeRun.plan.groups[0].source",priority=1
 // +kubebuilder:printcolumn:name="Plan-Drift",type="string",JSONPath=".status.conditions[?(@.type=='RolloutPlanDrift')].status",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"

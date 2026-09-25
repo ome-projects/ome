@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // --- enum round-trips (v1beta1 → workload → v1beta1) ---------------------
@@ -90,10 +90,10 @@ func TestUpdateStrategyTypeRoundtrip(t *testing.T) {
 // --- enum reverse round-trips (workload → v1beta1 → workload) ------------
 
 func TestComponentTypeRoundtripReverse(t *testing.T) {
-	cases := []workload.ComponentType{
-		workload.ComponentRouter,
-		workload.ComponentEngine,
-		workload.ComponentDecoder,
+	cases := []workloadtypes.ComponentType{
+		workloadtypes.ComponentRouter,
+		workloadtypes.ComponentEngine,
+		workloadtypes.ComponentDecoder,
 	}
 	for _, in := range cases {
 		t.Run(string(in), func(t *testing.T) {
@@ -106,16 +106,16 @@ func TestComponentTypeRoundtripReverse(t *testing.T) {
 }
 
 func TestInstancePhaseRoundtripReverse(t *testing.T) {
-	cases := []workload.InstancePhase{
-		workload.InstancePhaseEmpty,
-		workload.InstancePhasePending,
-		workload.InstancePhaseCreating,
-		workload.InstancePhaseReady,
-		workload.InstancePhaseUpdating,
-		workload.InstancePhaseRestarting,
-		workload.InstancePhaseMigrating,
-		workload.InstancePhaseFailed,
-		workload.InstancePhaseDeleting,
+	cases := []workloadtypes.InstancePhase{
+		workloadtypes.InstancePhaseEmpty,
+		workloadtypes.InstancePhasePending,
+		workloadtypes.InstancePhaseCreating,
+		workloadtypes.InstancePhaseReady,
+		workloadtypes.InstancePhaseUpdating,
+		workloadtypes.InstancePhaseRestarting,
+		workloadtypes.InstancePhaseMigrating,
+		workloadtypes.InstancePhaseFailed,
+		workloadtypes.InstancePhaseDeleting,
 	}
 	for _, in := range cases {
 		t.Run(string(in), func(t *testing.T) {
@@ -128,12 +128,12 @@ func TestInstancePhaseRoundtripReverse(t *testing.T) {
 }
 
 func TestInstanceOperationTypeRoundtripReverse(t *testing.T) {
-	cases := []workload.InstanceOperationType{
-		workload.InstanceOperationCreate,
-		workload.InstanceOperationUpdate,
-		workload.InstanceOperationRestart,
-		workload.InstanceOperationMigrate,
-		workload.InstanceOperationDelete,
+	cases := []workloadtypes.InstanceOperationType{
+		workloadtypes.InstanceOperationCreate,
+		workloadtypes.InstanceOperationUpdate,
+		workloadtypes.InstanceOperationRestart,
+		workloadtypes.InstanceOperationMigrate,
+		workloadtypes.InstanceOperationDelete,
 	}
 	for _, in := range cases {
 		t.Run(string(in), func(t *testing.T) {
@@ -146,11 +146,11 @@ func TestInstanceOperationTypeRoundtripReverse(t *testing.T) {
 }
 
 func TestUpdateStrategyTypeRoundtripReverse(t *testing.T) {
-	cases := []workload.UpdateStrategyType{
-		workload.UpdateStrategySurgeThenDrain,
-		workload.UpdateStrategyRecreatePod,
-		workload.UpdateStrategyInPlaceIfPossible,
-		workload.UpdateStrategyInPlaceOnly,
+	cases := []workloadtypes.UpdateStrategyType{
+		workloadtypes.UpdateStrategySurgeThenDrain,
+		workloadtypes.UpdateStrategyRecreatePod,
+		workloadtypes.UpdateStrategyInPlaceIfPossible,
+		workloadtypes.UpdateStrategyInPlaceOnly,
 	}
 	for _, in := range cases {
 		t.Run(string(in), func(t *testing.T) {
@@ -168,16 +168,16 @@ func TestComponentType_UnknownValueReturnsEmpty(t *testing.T) {
 	if got := ComponentTypeToWorkload(v1beta1.ComponentType("future-component")); got != "" {
 		t.Fatalf("unknown v1beta1.ComponentType should map to empty; got=%q", got)
 	}
-	if got := ComponentTypeFromWorkload(workload.ComponentType("future-component")); got != "" {
+	if got := ComponentTypeFromWorkload(workloadtypes.ComponentType("future-component")); got != "" {
 		t.Fatalf("unknown workload.ComponentType should map to empty; got=%q", got)
 	}
 }
 
 func TestInstancePhase_UnknownValueReturnsEmpty(t *testing.T) {
-	if got := InstancePhaseToWorkload(v1beta1.OMENativeInstancePhase("Suspended")); got != workload.InstancePhaseEmpty {
+	if got := InstancePhaseToWorkload(v1beta1.OMENativeInstancePhase("Suspended")); got != workloadtypes.InstancePhaseEmpty {
 		t.Fatalf("unknown v1beta1 phase should map to empty; got=%q", got)
 	}
-	if got := InstancePhaseFromWorkload(workload.InstancePhase("Suspended")); got != "" {
+	if got := InstancePhaseFromWorkload(workloadtypes.InstancePhase("Suspended")); got != "" {
 		t.Fatalf("unknown workload phase should map to empty; got=%q", got)
 	}
 }
@@ -186,7 +186,7 @@ func TestInstanceOperationType_UnknownValueReturnsEmpty(t *testing.T) {
 	if got := InstanceOperationTypeToWorkload(v1beta1.InstanceOperationType("Rotate")); got != "" {
 		t.Fatalf("unknown v1beta1 op type should map to empty; got=%q", got)
 	}
-	if got := InstanceOperationTypeFromWorkload(workload.InstanceOperationType("Rotate")); got != "" {
+	if got := InstanceOperationTypeFromWorkload(workloadtypes.InstanceOperationType("Rotate")); got != "" {
 		t.Fatalf("unknown workload op type should map to empty; got=%q", got)
 	}
 }
@@ -195,7 +195,7 @@ func TestUpdateStrategyType_UnknownValueReturnsEmpty(t *testing.T) {
 	if got := UpdateStrategyTypeToWorkload(v1beta1.UpdateStrategyType("BlueGreen")); got != "" {
 		t.Fatalf("unknown v1beta1 strategy should map to empty; got=%q", got)
 	}
-	if got := UpdateStrategyTypeFromWorkload(workload.UpdateStrategyType("BlueGreen")); got != "" {
+	if got := UpdateStrategyTypeFromWorkload(workloadtypes.UpdateStrategyType("BlueGreen")); got != "" {
 		t.Fatalf("unknown workload strategy should map to empty; got=%q", got)
 	}
 }
@@ -512,5 +512,27 @@ func TestInstanceStatusSliceRoundtrip_EmptyPreserved(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected len 0; got=%d", len(got))
+	}
+}
+
+// The pinned strategy has to survive both directions: the update pass reads
+// it back from status to decide the mode of an attempt already under way, so
+// a field that drops in conversion silently un-pins every operation.
+func TestInstanceOperationStrategyRoundtrip(t *testing.T) {
+	cases := []v1beta1.UpdateStrategyType{
+		v1beta1.UpdateStrategySurgeThenDrain,
+		v1beta1.UpdateStrategyRecreatePod,
+		v1beta1.UpdateStrategyInPlaceIfPossible,
+		v1beta1.UpdateStrategyInPlaceOnly,
+		"",
+	}
+	for _, in := range cases {
+		t.Run(string(in), func(t *testing.T) {
+			op := &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate, Strategy: string(in)}
+			got := InstanceOperationFromWorkload(InstanceOperationToWorkload(op))
+			if got.Strategy != op.Strategy {
+				t.Fatalf("round-trip mismatch: in=%q got=%q", op.Strategy, got.Strategy)
+			}
+		})
 	}
 }

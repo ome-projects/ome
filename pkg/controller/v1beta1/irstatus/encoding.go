@@ -97,5 +97,6 @@ func supportedPhase(phase v1beta1.OMENativeInstancePhase) bool {
 // record. Reused nested records keep their DenseV1 normalization, so an
 // explicitly empty conditions list counts as absent.
 func entryHasContent(entry *v1beta1.InstanceStatusEntry) bool {
-	return len(entry.Conditions) > 0 || entry.ReadySince != nil || entry.Operation != nil || entry.LastFailure != nil
+	return len(entry.Conditions) > 0 || entry.ReadySince != nil || entry.Operation != nil || entry.LastFailure != nil ||
+		len(entry.Announced) > 0
 }

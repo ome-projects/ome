@@ -3856,6 +3856,12 @@ spec:
                     entries:
                       items:
                         properties:
+                          announced:
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: set
                           conditions:
                             items:
                               properties:
@@ -3921,6 +3927,9 @@ spec:
                             type: object
                           operation:
                             properties:
+                              capacityRefusedAt:
+                                format: date-time
+                                type: string
                               deadline:
                                 format: date-time
                                 nullable: true
@@ -3948,6 +3957,8 @@ spec:
                                 format: date-time
                                 type: string
                               step:
+                                type: string
+                              strategy:
                                 type: string
                               surgeIndex:
                                 format: int32
@@ -3978,8 +3989,8 @@ spec:
                           - index
                         type: object
                         x-kubernetes-validations:
-                          - message: an entry must carry at least one of conditions, readySince, operation, or lastFailure
-                            rule: has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure)
+                          - message: an entry must carry at least one of conditions, readySince, operation, lastFailure, or announced
+                            rule: has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure) || has(self.announced)
                       minItems: 1
                       type: array
                       x-kubernetes-list-type: atomic
@@ -4128,6 +4139,11 @@ spec:
                         type: integer
                       admitted:
                         type: boolean
+                      announced:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
                       availablePodCount:
                         format: int32
                         type: integer
@@ -4202,6 +4218,9 @@ spec:
                         x-kubernetes-list-type: set
                       operation:
                         properties:
+                          capacityRefusedAt:
+                            format: date-time
+                            type: string
                           deadline:
                             format: date-time
                             nullable: true
@@ -4229,6 +4248,8 @@ spec:
                             format: date-time
                             type: string
                           step:
+                            type: string
+                          strategy:
                             type: string
                           surgeIndex:
                             format: int32

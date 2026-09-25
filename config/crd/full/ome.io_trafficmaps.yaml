@@ -21,11 +21,14 @@ spec:
     - jsonPath: .spec.mode
       name: Mode
       type: string
-    - jsonPath: .status.conditions[?(@.type=="Programmed")].status
-      name: Programmed
+    - jsonPath: .status.conditions[?(@.type=="Published")].status
+      name: Published
       type: string
     - jsonPath: .status.conditions[?(@.type=="Routable")].status
       name: Routable
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="OverrideActive")].status
+      name: Override
       type: string
     - jsonPath: .status.conditions[?(@.type=="Routable")].reason
       name: Reason
@@ -57,9 +60,10 @@ spec:
                           anyOf:
                           - type: integer
                           - type: string
-                          default: "1"
                           pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                           x-kubernetes-int-or-string: true
+                        fallbackReason:
+                          type: string
                         ready:
                           format: int32
                           type: integer
@@ -76,6 +80,11 @@ spec:
                       type: object
                     cluster:
                       type: string
+                    drainRefs:
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
                     endpoint:
                       type: string
                     healthy:
@@ -86,10 +95,15 @@ spec:
                           format: int32
                           minimum: 0
                           type: integer
+                        gated:
+                          type: boolean
                         lastProbeTime:
                           format: date-time
                           type: string
                         message:
+                          type: string
+                        policyDigest:
+                          pattern: ^sha256:[0-9a-f]{64}$
                           type: string
                         result:
                           enum:
@@ -100,6 +114,7 @@ spec:
                       type: object
                     weight:
                       format: int32
+                      maximum: 1000000
                       minimum: 0
                       type: integer
                   required:
@@ -181,8 +196,31 @@ spec:
               observedTrafficMapGeneration:
                 format: int64
                 type: integer
-              programmed:
+              published:
                 type: boolean
+              publisher:
+                properties:
+                  claimedTargets:
+                    items:
+                      maxLength: 512
+                      minLength: 1
+                      type: string
+                    maxItems: 128
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: set
+                  observedOptionsDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  publisherName:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - publisherName
+                type: object
+              sourceUID:
+                type: string
             type: object
         type: object
     served: true

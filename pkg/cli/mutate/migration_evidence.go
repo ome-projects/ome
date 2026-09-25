@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // MigrationEvidence grants no caller-supplied completeness shortcut. Its
@@ -173,7 +174,7 @@ func CollectMigrationEvidence(ctx context.Context, ome omeclient.OmeV1beta1Inter
 			e.warnings = append(e.warnings, "Other migration work is queued or executing; dispatch is serial and capacity is not guaranteed.")
 		}
 	}
-	desired := workload.WorkloadDesiredSpec{Replicas: 1}
+	desired := workloadtypes.WorkloadDesiredSpec{Replicas: 1}
 	if e.ir.Spec.Replicas != nil {
 		if *e.ir.Spec.Replicas < 0 {
 			return MigrationEvidence{}, migrationConflict()
@@ -194,7 +195,7 @@ func CollectMigrationEvidence(ctx context.Context, ome omeclient.OmeV1beta1Inter
 		desired.Lifecycle = v1beta1convert.LifecycleSpecToWorkload(*e.ir.Spec.Lifecycle)
 	}
 	mode := workload.MigrationModeOrDefault(desired.Lifecycle.MigrationPolicy)
-	if mode != workload.MigrationModeAuto && mode != workload.MigrationModeSurge {
+	if mode != workloadtypes.MigrationModeAuto && mode != workloadtypes.MigrationModeSurge {
 		return MigrationEvidence{}, migrationConflict()
 	}
 	e.mode = string(mode)
@@ -202,10 +203,10 @@ func CollectMigrationEvidence(ctx context.Context, ome omeclient.OmeV1beta1Inter
 		return MigrationEvidence{}, migrationConflict()
 	}
 	for _, runner := range e.ir.Spec.Runners {
-		desired.Runners = append(desired.Runners, workload.Runner{Name: string(runner.Name), Size: runner.Size})
+		desired.Runners = append(desired.Runners, workloadtypes.Runner{Name: string(runner.Name), Size: runner.Size})
 		desired.MultiPod = desired.MultiPod || runner.Name != v1beta1.RunnerNameDefault
 	}
-	plan, err := workload.BuildPlan(workload.ComponentType(o.Component), desired, workload.WorkloadObservedState{InstanceStatuses: v1beta1convert.InstanceStatusSliceToWorkload(e.ir.Status.InstanceStatuses)})
+	plan, err := workload.BuildPlan(workloadtypes.ComponentType(o.Component), desired, workloadtypes.WorkloadObservedState{InstanceStatuses: v1beta1convert.InstanceStatusSliceToWorkload(e.ir.Status.InstanceStatuses)})
 	if err != nil {
 		return MigrationEvidence{}, migrationConflict()
 	}
@@ -251,7 +252,7 @@ func CollectMigrationEvidence(ctx context.Context, ome omeclient.OmeV1beta1Inter
 	if desired.MultiPod != (payload.WorkerPodSpec != nil) {
 		return MigrationEvidence{}, migrationConflict()
 	}
-	overlay := &workload.MigrationOverlay{FromNode: e.fromNode}
+	overlay := &workloadtypes.MigrationOverlay{FromNode: e.fromNode}
 	if ops.WouldOverlayConflictWithNodeAffinity(payload.PodSpec, overlay) || ops.WouldOverlayConflictWithNodeAffinity(payload.WorkerPodSpec, overlay) {
 		return MigrationEvidence{}, migrationConflict()
 	}
@@ -416,7 +417,7 @@ func inspectMigrationPods(parent *v1beta1.InferenceService, ir *v1beta1.Inferenc
 		p := &pods[i]
 		inc, incOK := query.InstanceIncarnationFromLabels(p)
 		ordinal, ordOK := query.PodOrdinalFromLabels(p)
-		if !SafeScalar(p.Name) || !SafeScalar(string(p.UID)) || !SafeScalar(p.ResourceVersion) || p.Namespace != parent.Namespace || len(p.OwnerReferences) > 16 || !exactMigrationOwner(p.OwnerReferences, "InferenceReplica", ir.Name, ir.UID) || p.Labels[constants.InferenceServicePodLabelKey] != parent.Name || p.Labels[constants.OMEComponentLabel] != string(ir.Spec.Component) || p.Labels[query.LabelManagedBy] != query.ManagedByOMENative || p.Labels[query.LabelInstanceIdx] != strconv.FormatInt(int64(source.Index), 10) || !incOK || !ordOK || p.Labels[query.LabelPodOrdinal] != strconv.FormatInt(int64(ordinal), 10) || p.Labels[query.LabelInstanceIncarnation] != strconv.FormatInt(inc, 10) || p.Name != query.PodName(parent.Name, workload.ComponentType(ir.Spec.Component), source.Index, p.Labels[query.LabelRunner], ordinal) {
+		if !SafeScalar(p.Name) || !SafeScalar(string(p.UID)) || !SafeScalar(p.ResourceVersion) || p.Namespace != parent.Namespace || len(p.OwnerReferences) > 16 || !exactMigrationOwner(p.OwnerReferences, "InferenceReplica", ir.Name, ir.UID) || p.Labels[constants.InferenceServicePodLabelKey] != parent.Name || p.Labels[constants.OMEComponentLabel] != string(ir.Spec.Component) || p.Labels[query.LabelManagedBy] != query.ManagedByOMENative || p.Labels[query.LabelInstanceIdx] != strconv.FormatInt(int64(source.Index), 10) || !incOK || !ordOK || p.Labels[query.LabelPodOrdinal] != strconv.FormatInt(int64(ordinal), 10) || p.Labels[query.LabelInstanceIncarnation] != strconv.FormatInt(inc, 10) || p.Name != query.PodName(parent.Name, workloadtypes.ComponentType(ir.Spec.Component), source.Index, p.Labels[query.LabelRunner], ordinal) {
 			return nil, migrationConflict()
 		}
 		if p.DeletionTimestamp != nil {

@@ -11,24 +11,27 @@ const PlacementControllerName = "placement"
 
 const (
 	// AcceleratorRequirementsAnnotation holds a label-selector string of the
-	// accelerator/capability labels a candidate WorkloadCluster MUST satisfy
-	// for this ISVC (e.g. "gpu=gb300"). Candidate clusters are
-	// those whose labels satisfy the ISVC's accelerator requirements; an ISVC
-	// that declares no requirement (neither this nor ClusterSelectorAnnotation)
-	// is NOT fanned out fleet-wide. The value is user/GitOps-supplied — there is
-	// no in-code default (eventually the control plane resolves it from
-	// spec.model + selected runtime; until then it is expressed here).
+	// accelerator/capability attributes a candidate WorkloadCluster MUST satisfy
+	// for this ISVC (e.g. "gpu=gb300"). Selector attributes include cluster labels
+	// and the virtual, immutable metadata.name key. An ISVC that declares neither
+	// this nor ClusterSelectorAnnotation is NOT fanned out fleet-wide. The value
+	// is user/GitOps-supplied — there is no in-code default.
 	AcceleratorRequirementsAnnotation = "ome.io/accelerator-requirements"
 
-	// ClusterSelectorAnnotation holds an optional extra label-selector string
-	// (e.g. "provider=cloud-a") AND-ed onto the accelerator requirements to further
-	// narrow candidate clusters (operator-imposed routing). It does NOT, on its
-	// own, make an ISVC eligible for fleet-wide fan-out.
+	// ClusterSelectorAnnotation holds an optional extra selector string (e.g.
+	// "provider=cloud-a" or "metadata.name=cluster-a") AND-ed onto the accelerator
+	// requirements to further narrow candidate clusters. It is sufficient on its
+	// own to make an ISVC eligible for fleet-wide fan-out.
 	ClusterSelectorAnnotation = "ome.io/cluster-selector"
 
 	// PlacementFinalizer lets the controller delete the derived ISVC before the
 	// source ISVC is removed.
 	PlacementFinalizer = "ome.io/placement"
+
+	// EndpointFinalizer coordinates endpoint and placement teardown. The endpoint
+	// publisher removes it only after publication is gone; placement retains
+	// derived workloads while it remains so routing never outlives its backends.
+	EndpointFinalizer = "ome.io/placement-endpoint"
 )
 
 // LocalQueueAnnotation names the Kueue LocalQueue the derived workload's
@@ -60,6 +63,7 @@ var (
 // plane's placement decision and must NOT ride along onto the derived ISVC,
 // where the worker cluster's reconciler would (re)interpret them: the
 // placement selectors (candidate selection is the control plane's job), the
+// traffic-drain override (one shared cross-cluster routing decision), the
 // rollout operator-verbs (promote/rollback/repin advance one shared rollout,
 // owned by the control plane — a copy on every candidate would each consume
 // the verb), and the rollout plan-source provenance (system-authored during
@@ -69,6 +73,7 @@ var (
 var controlPlaneOnlyAnnotations = []string{
 	AcceleratorRequirementsAnnotation,
 	ClusterSelectorAnnotation,
+	constants.TrafficDrainAnnotation,
 	constants.RolloutPromoteAnnotation,
 	constants.RolloutRollbackAnnotation,
 	constants.RolloutRepinAnnotation,

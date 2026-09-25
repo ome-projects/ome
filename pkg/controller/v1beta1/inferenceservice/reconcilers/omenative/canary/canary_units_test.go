@@ -172,7 +172,10 @@ func TestEffectivePartition(t *testing.T) {
 	}
 }
 
-func TestStampStepPartition(t *testing.T) {
+// TestStepPartition pins the invariant that the canary step's partition is a
+// returned rollout-control value: the merged Component's lifecycle — the
+// user's update strategy — is never created or rewritten to carry it.
+func TestStepPartition(t *testing.T) {
 	n := 4
 	isvc := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
 		Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
@@ -183,27 +186,65 @@ func TestStampStepPartition(t *testing.T) {
 			}},
 		}}}}}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4}
-	StampStepPartition(isvc, v1beta1.EngineComponent, ext)
-	ru := ext.Lifecycle.UpdateStrategy.RollingUpdate
-	if ru == nil || ru.Partition == nil || *ru.Partition != 2 {
-		t.Fatalf("step0 50%% of 4 → partition 2, got %+v", ru)
+	p := StepPartition(isvc, v1beta1.EngineComponent, ext)
+	if p == nil || *p != 2 {
+		t.Fatalf("step0 50%% of 4 → partition 2, got %v", p)
+	}
+	if ext.Lifecycle != nil {
+		t.Fatal("the step partition must not create the user's lifecycle chain")
 	}
 
-	// No canary → no-op (lifecycle chain not created).
+	// A user-set rollingUpdate.partition survives the canary untouched: the
+	// step value travels on spec.pacing.partition, not in the user's strategy.
+	user := int32(1)
+	extUser := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4,
+		Lifecycle: &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
+			RollingUpdate: &v1beta1.RollingUpdate{Partition: &user}}}}
+	if p := StepPartition(isvc, v1beta1.EngineComponent, extUser); p == nil || *p != 2 {
+		t.Fatalf("step partition must be computed regardless of the user partition, got %v", p)
+	}
+	if got := extUser.Lifecycle.UpdateStrategy.RollingUpdate.Partition; got == nil || *got != 1 {
+		t.Fatalf("user rollingUpdate.partition must be preserved, got %v", got)
+	}
+
+	// No canary → nil (and the lifecycle chain is not created).
 	ext2 := &v1beta1.ComponentExtensionSpec{MinReplicas: &n}
-	StampStepPartition(&v1beta1.InferenceService{}, v1beta1.EngineComponent, ext2)
+	if p := StepPartition(&v1beta1.InferenceService{}, v1beta1.EngineComponent, ext2); p != nil {
+		t.Fatalf("no canary must yield no partition, got %d", *p)
+	}
 	if ext2.Lifecycle != nil {
-		t.Fatal("no canary must not stamp lifecycle")
+		t.Fatal("no canary must not touch lifecycle")
 	}
 
 	// Negative CurrentStep (status is an unvalidated subresource, an external
 	// write can go below 0) must clamp to step 0, not panic indexing plan.Steps.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: -1}
 	ext3 := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4}
-	StampStepPartition(isvc, v1beta1.EngineComponent, ext3)
-	ru3 := ext3.Lifecycle.UpdateStrategy.RollingUpdate
-	if ru3 == nil || ru3.Partition == nil || *ru3.Partition != 2 {
-		t.Fatalf("negative step must clamp to step-0 partition 2, got %+v", ru3)
+	if p := StepPartition(isvc, v1beta1.EngineComponent, ext3); p == nil || *p != 2 {
+		t.Fatalf("negative step must clamp to step-0 partition 2, got %v", p)
+	}
+}
+
+// TestPlanGateHoldPartition pins the pre-open hold: a Component in a
+// canary-kind group with no effective plan gets a full hold (every
+// Instance), returned as a value and never written into the user's
+// lifecycle; Components outside such a group get none.
+func TestPlanGateHoldPartition(t *testing.T) {
+	n := 4
+	isvc := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+		Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+			PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "unresolved", Progression: v1beta1.RolloutProgressionCanary},
+		}}}}}
+	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4}
+	if p := PlanGateHoldPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 4 {
+		t.Fatalf("canary-kind group without a plan must hold every Instance (4), got %v", p)
+	}
+	if ext.Lifecycle != nil {
+		t.Fatal("the plan-gate hold must not create the user's lifecycle chain")
+	}
+	if p := PlanGateHoldPartition(isvc, v1beta1.RouterComponent, ext); p != nil {
+		t.Fatalf("a Component outside the canary-kind group must get no hold, got %d", *p)
 	}
 }
 

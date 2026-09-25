@@ -32,19 +32,38 @@ func ComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName s
 	return ir, nil
 }
 
-// IRPartition returns the effective rollingUpdate partition carried on a
-// projected InferenceReplica spec, or 0 (the API-defined "update every
-// Instance" value) when the IR is nil or no partition is set. Shared by
-// ComponentIRPartition and callers that already hold the IR object.
+// EffectivePartition returns the partition an InferenceReplica spec holds
+// Instances at — the same source order the workload engine uses, so every
+// reader agrees with the plan. spec.pacing.partition wins when set: it is
+// the rollout-control value the ISVC controller projects for a canary step
+// or plan-gate hold, and an explicit 0 there releases every Instance even
+// over a user partition. Otherwise the user's
+// spec.lifecycle.updateStrategy.rollingUpdate.partition applies. nil when
+// neither is set.
+func EffectivePartition(lifecycle *v1beta1.LifecycleSpec, pacing *v1beta1.InferenceReplicaPacing) *int32 {
+	if pacing != nil && pacing.Partition != nil {
+		return pacing.Partition
+	}
+	if lifecycle == nil || lifecycle.UpdateStrategy == nil || lifecycle.UpdateStrategy.RollingUpdate == nil {
+		return nil
+	}
+	return lifecycle.UpdateStrategy.RollingUpdate.Partition
+}
+
+// IRPartition returns the effective partition carried on a projected
+// InferenceReplica spec (see EffectivePartition), or 0 (the API-defined
+// "update every Instance" value) when the IR is nil or no partition is
+// set. Shared by ComponentIRPartition and callers that already hold the
+// IR object.
 func IRPartition(ir *v1beta1.InferenceReplica) int32 {
 	if ir == nil {
 		return 0
 	}
-	lc := ir.Spec.Lifecycle
-	if lc == nil || lc.UpdateStrategy == nil || lc.UpdateStrategy.RollingUpdate == nil || lc.UpdateStrategy.RollingUpdate.Partition == nil {
+	p := EffectivePartition(ir.Spec.Lifecycle, ir.Spec.Pacing)
+	if p == nil {
 		return 0
 	}
-	return *lc.UpdateStrategy.RollingUpdate.Partition
+	return *p
 }
 
 // ComponentIRStatus returns the authoritative InferenceReplica status for one
@@ -91,15 +110,16 @@ func DecodedComponentIRStatus(ctx context.Context, reads client.Reader, namespac
 	return &ir.Status, nil
 }
 
-// ComponentIRPartition returns the effective rollingUpdate partition for one
-// Component of an ISVC, read from the projected InferenceReplica spec
-// (spec.lifecycle.updateStrategy.rollingUpdate.partition). The IR spec carries
-// the merged ISVC↔runtime lifecycle, so this is the partition the workload
-// controller actually stages Instances at — including a partition inherited
-// from the ServingRuntime, which the raw ISVC spec never shows. Coordination
-// MUST read this value rather than re-deriving it from the unmerged ISVC:
-// a raw-spec read reports partition 0 for a runtime-staged Component and
-// treats its held Instances as an incomplete rollout forever.
+// ComponentIRPartition returns the effective partition for one Component
+// of an ISVC, read from the projected InferenceReplica spec (the projected
+// spec.pacing.partition, else the user's
+// spec.lifecycle.updateStrategy.rollingUpdate.partition). The IR spec
+// carries the merged ISVC↔runtime lifecycle, so this is the partition the
+// workload controller actually stages Instances at — including a partition
+// inherited from the ServingRuntime, which the raw ISVC spec never shows.
+// Coordination MUST read this value rather than re-deriving it from the
+// unmerged ISVC: a raw-spec read reports partition 0 for a runtime-staged
+// Component and treats its held Instances as an incomplete rollout forever.
 //
 // Returns 0 when the IR does not exist yet or no partition is set (the
 // API-defined "update every Instance" value). Any other read failure is

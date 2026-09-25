@@ -250,15 +250,13 @@ func TestValidateLeaderWorkerPairing(t *testing.T) {
 			errSub:  "engine.worker is set but engine.leader is not",
 		},
 		{
-			name: "engine: worker with nil size — rejected",
+			name: "engine: leader + worker with unset size — valid, size resolves at reconcile",
 			spec: &v1beta1.InferenceServiceSpec{
 				Engine: &v1beta1.EngineSpec{
 					Leader: &v1beta1.LeaderSpec{},
 					Worker: withWorker(nil),
 				},
 			},
-			wantErr: true,
-			errSub:  "worker.size is not a positive integer",
 		},
 		{
 			name: "engine: worker with size=0 — rejected",
@@ -269,7 +267,7 @@ func TestValidateLeaderWorkerPairing(t *testing.T) {
 				},
 			},
 			wantErr: true,
-			errSub:  "worker.size is not a positive integer",
+			errSub:  "worker.size must be a positive integer when set",
 		},
 		{
 			name: "decoder: leader without worker — rejected",
@@ -449,16 +447,6 @@ func TestValidateLeaderWorkerPairing_ReasonConstants(t *testing.T) {
 				Engine: &v1beta1.EngineSpec{
 					Leader: &v1beta1.LeaderSpec{},
 					Worker: &v1beta1.WorkerSpec{Size: sizePtr(0)},
-				},
-			},
-			wantReasons: []string{ReasonInvalidLeaderWorkerPairing, ReasonWorkerSizeMustBePositive},
-		},
-		{
-			name: "leader + worker(nil size) — WorkerSizeMustBePositive",
-			spec: &v1beta1.InferenceServiceSpec{
-				Engine: &v1beta1.EngineSpec{
-					Leader: &v1beta1.LeaderSpec{},
-					Worker: &v1beta1.WorkerSpec{},
 				},
 			},
 			wantReasons: []string{ReasonInvalidLeaderWorkerPairing, ReasonWorkerSizeMustBePositive},

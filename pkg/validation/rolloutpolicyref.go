@@ -35,23 +35,10 @@ const (
 // value); "ClusterRolloutPolicy" is a reserved shape.
 const RolloutPolicyKind = "RolloutPolicy"
 
-// rolloutGroupKind resolves the progression kind a rollout group validates
-// as. Inline arms win over a policyRef (the ref is preview-only then); a
-// ref-only group validates as its declared kind, so every shape rule holds
-// without dereferencing the policy; a group with neither carries the
-// no-progression default, blueGreen.
+// rolloutGroupKind is the progression kind a rollout group validates as, so
+// every shape rule holds without dereferencing the policy.
 func rolloutGroupKind(g *v1beta1.RolloutGroup) v1beta1.RolloutProgressionKind {
-	switch {
-	case g.Canary != nil:
-		return v1beta1.RolloutProgressionCanary
-	case g.BlueGreen != nil:
-		return v1beta1.RolloutProgressionBlueGreen
-	case g.RollingUpdate != nil:
-		return v1beta1.RolloutProgressionRollingUpdate
-	case g.PolicyRef != nil:
-		return g.PolicyRef.Progression
-	}
-	return v1beta1.RolloutProgressionBlueGreen
+	return g.DeclaredProgression()
 }
 
 // ValidateRolloutPolicyRefs checks the shape of every

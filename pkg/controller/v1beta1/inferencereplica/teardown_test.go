@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	kubefake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -22,18 +21,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // terminatingIR returns baselineIR stamped Terminating with the
@@ -44,119 +41,6 @@ func terminatingIR(name, namespace string, replicas int32, dt time.Time) *v1beta
 	ir.DeletionTimestamp = &ts
 	ir.Finalizers = []string{TeardownFinalizer}
 	return ir
-}
-
-// withLifecycleConfig wires a fake clientset + zero-TTL config cache
-// serving the given lifecycle JSON so the teardown/force-delete config
-// resolvers see it.
-func withLifecycleConfig(r *Reconciler, lifecycleJSON string) {
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "inferenceservice-config", Namespace: "ome"},
-		Data:       map[string]string{"lifecycle": lifecycleJSON},
-	}
-	r.Clientset = kubefake.NewSimpleClientset(cm)
-	r.ConfigCache = controllerconfig.NewConfigCache(0)
-}
-
-// drainEvents empties a FakeRecorder's channel.
-func drainEvents(rec *record.FakeRecorder) []string {
-	var out []string
-	for {
-		select {
-		case e := <-rec.Events:
-			out = append(out, e)
-		default:
-			return out
-		}
-	}
-}
-
-func eventsContaining(events []string, substr string) []string {
-	var out []string
-	for _, e := range events {
-		if strings.Contains(e, substr) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-type teardownListReader struct {
-	client.Reader
-	podLists      int
-	podGroupLists int
-	podError      error
-	podGroupError error
-}
-
-func (r *teardownListReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	switch list.(type) {
-	case *corev1.PodList:
-		r.podLists++
-		if r.podError != nil {
-			return r.podError
-		}
-	case *schedulingv1alpha1.PodGroupList:
-		r.podGroupLists++
-		if r.podGroupError != nil {
-			return r.podGroupError
-		}
-	}
-	return r.Reader.List(ctx, list, opts...)
-}
-
-func ownedPodGroupForIR(ir *v1beta1.InferenceReplica, name string, index int32) *schedulingv1alpha1.PodGroup {
-	return &schedulingv1alpha1.PodGroup{ObjectMeta: metav1.ObjectMeta{
-		Name:      name,
-		Namespace: ir.Namespace,
-		Labels: map[string]string{
-			query.LabelInstanceIdx: intToLabel(int64(index)),
-		},
-		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
-			ir, v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"))},
-	}}
-}
-
-func scaleDownGaugeSeriesExists(t *testing.T, metricName, namespace, isvc, component string) bool {
-	t.Helper()
-	families, err := controllermetrics.Registry.Gather()
-	if err != nil {
-		t.Fatalf("gather controller metrics: %v", err)
-	}
-	want := map[string]string{"namespace": namespace, "isvc": isvc, "component": component}
-	for _, family := range families {
-		if family.GetName() != metricName {
-			continue
-		}
-		for _, metric := range family.Metric {
-			if len(metric.Label) != len(want) {
-				continue
-			}
-			matches := true
-			for _, label := range metric.Label {
-				if want[label.GetName()] != label.GetValue() {
-					matches = false
-					break
-				}
-			}
-			if matches {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func assertScaleDownGaugeSeries(t *testing.T, want bool, namespace, isvc, component string) {
-	t.Helper()
-	for _, name := range []string{
-		"ome_omenative_scale_down_active_pods",
-		"ome_omenative_scale_down_deferred_instances",
-	} {
-		if got := scaleDownGaugeSeriesExists(t, name, namespace, isvc, component); got != want {
-			t.Errorf("metric %s series existence: got %t want %t", name, got, want)
-		}
-	}
 }
 
 // TestReconcile_AddsTeardownFinalizer pins the arm step: the first
@@ -378,20 +262,6 @@ func TestTeardown_InvalidDeadlineConfig_WarnsInvalid(t *testing.T) {
 	}
 }
 
-// ledgerCMForOwner materializes a migration audit ConfigMap for the
-// named ledger owner, the shape audit.PersistLedgerForOwner writes.
-func ledgerCMForOwner(t *testing.T, ownerName, namespace string, ledger *audit.Ledger) *corev1.ConfigMap {
-	t.Helper()
-	raw, err := json.Marshal(ledger)
-	if err != nil {
-		t.Fatalf("marshal ledger: %v", err)
-	}
-	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: ownerName + audit.ConfigMapNameSuffix, Namespace: namespace},
-		Data:       map[string]string{audit.LedgerKey: string(raw)},
-	}
-}
-
 // startedMigrationEntry is the ledger row an accepted-but-unfinished
 // migration leaves behind: Phase=Started, source 0 → surge 7.
 func startedMigrationEntry() audit.Entry {
@@ -532,7 +402,7 @@ func TestTeardown_LedgerClose_RetriesOnConflict(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
+	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workloadtypes.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
@@ -617,7 +487,7 @@ func TestTeardown_LedgerClose_RebasesOverPeerComponentWrite(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
+	r := &Reconciler{Client: c, APIReader: c, Log: ctrl.Log.WithName("test"), Expectations: workloadtypes.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
@@ -680,7 +550,7 @@ func TestTeardown_StaleParentNotFound_ClosesParentLedger(t *testing.T) {
 		WithScheme(testScheme(t)).
 		WithObjects(parent, liveLedgerCM, ir).
 		Build()
-	r := &Reconciler{Client: c, APIReader: reader, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
+	r := &Reconciler{Client: c, APIReader: reader, Log: ctrl.Log.WithName("test"), Expectations: workloadtypes.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
@@ -741,7 +611,7 @@ func TestReconcile_FinalizerAddDeletionRace_NoError(t *testing.T) {
 		Client:               newStaleClient(t),
 		APIReader:            fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(live).Build(),
 		Log:                  ctrl.Log.WithName("test"),
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	result, err := r.Reconcile(context.Background(), req)
@@ -757,7 +627,7 @@ func TestReconcile_FinalizerAddDeletionRace_NoError(t *testing.T) {
 		Client:               newStaleClient(t),
 		APIReader:            fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(baselineIR("llama-engine", "prod", 1)).Build(),
 		Log:                  ctrl.Log.WithName("test"),
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
 	if _, err := r.Reconcile(context.Background(), req); err == nil {
@@ -875,7 +745,7 @@ func TestTeardown_StatuslessPodGroupsDeleteInBoundedWaves(t *testing.T) {
 		APIReader:                reader,
 		Log:                      ctrl.Log.WithName("test"),
 		Recorder:                 recorder,
-		Expectations:             workload.NewExpectations(),
+		Expectations:             workloadtypes.NewExpectations(),
 		InstanceStatusTarget:     irstatus.EncodingDenseV1,
 		GangSchedulingAvailable:  true,
 		ScaleDownPodBatchSize:    &budget,
@@ -1103,7 +973,7 @@ func TestTeardown_CleansMetricSeriesBeforeFinalizerRelease(t *testing.T) {
 			},
 		}).
 		Build()
-	r := &Reconciler{Client: base, APIReader: base, Log: ctrl.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
+	r := &Reconciler{Client: base, APIReader: base, Log: ctrl.Log.WithName("test"), Expectations: workloadtypes.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)})
 	if err == nil || !strings.Contains(err.Error(), "injected finalizer update failure") {
@@ -1200,6 +1070,67 @@ func TestTeardown_DeadlineExceeded_WarnsAndReleases(t *testing.T) {
 	}
 	if strings.Contains(exceeded[0], orphan.Name) {
 		t.Errorf("TeardownDeadlineExceeded must omit Pod names: %q", exceeded[0])
+	}
+}
+
+// TestTeardown_DeadlineExceeded_ReleasesFromEveryInstanceState walks the
+// deadline release from every persisted (Phase, Operation) an Instance row
+// can carry. The release is decided before the row is read at all — it is
+// the owner's own deadline, not an Instance's — so each state must end the
+// same way: the Warning, the finalizer released, and the row purged with
+// the owner in one delete.
+func TestTeardown_DeadlineExceeded_ReleasesFromEveryInstanceState(t *testing.T) {
+	op := func(opType v1beta1.InstanceOperationType, step string) *v1beta1.InstanceOperation {
+		return &v1beta1.InstanceOperation{ID: "op-" + step, Type: opType, Step: step}
+	}
+	for _, tc := range []struct {
+		state string
+		phase v1beta1.OMENativeInstancePhase
+		op    *v1beta1.InstanceOperation
+	}{
+		{state: "Pending", phase: v1beta1.OMENativeInstancePending},
+		{state: "Ready", phase: v1beta1.OMENativeInstanceReady},
+		{state: "Failed", phase: v1beta1.OMENativeInstanceFailed},
+		{state: "Create/CreatePods", phase: v1beta1.OMENativeInstanceCreating, op: op(v1beta1.InstanceOperationCreate, "CreatePods")},
+		{state: "Update/Surge", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, workloadtypes.UpdateStepSurge)},
+		{state: "Update/SurgeDrain", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, workloadtypes.UpdateStepSurgeDrain)},
+		{state: "Update/GangSurgeTarget", phase: v1beta1.OMENativeInstanceCreating, op: op(v1beta1.InstanceOperationUpdate, workloadtypes.UpdateStepGangSurgeTarget)},
+		{state: "Update/GangSurgeTargetCleanup", phase: v1beta1.OMENativeInstanceCreating, op: op(v1beta1.InstanceOperationUpdate, workloadtypes.UpdateStepGangSurgeTargetCleanup)},
+		{state: "Update/InPlace", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, "InPlace")},
+		{state: "Update/Drain", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, "Drain")},
+		{state: "Restart/Drain", phase: v1beta1.OMENativeInstanceRestarting, op: op(v1beta1.InstanceOperationRestart, "Drain")},
+		{state: "Migrate/CreateSurge", phase: v1beta1.OMENativeInstanceMigrating, op: op(v1beta1.InstanceOperationMigrate, "CreateSurge")},
+		{state: "Migrate/SurgeTarget", phase: v1beta1.OMENativeInstanceCreating, op: op(v1beta1.InstanceOperationMigrate, "CreateSurge")},
+		{state: "Delete/Drain", phase: v1beta1.OMENativeInstanceDeleting, op: op(v1beta1.InstanceOperationDelete, "Drain")},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			base := time.Now()
+			ir := terminatingIR("llama-engine", "prod", 1, base.Add(-time.Hour))
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: tc.phase, Operation: tc.op},
+			}
+			survivor := podForIR(ir, 0, "default", 0, false, false)
+			r, c := newReconciler(t, ir, survivor)
+			r.Clock = clocktesting.NewFakeClock(base)
+			withLifecycleConfig(r, `{"teardown":{"deadline":"30m"}}`)
+			rec := record.NewFakeRecorder(32)
+			r.Recorder = rec
+
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
+			}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), &v1beta1.InferenceReplica{}); !apierrors.IsNotFound(err) {
+				t.Errorf("owner and its %s row must be purged past the deadline; get returned %v", tc.state, err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(survivor), &corev1.Pod{}); err != nil {
+				t.Errorf("survivor pod is background GC's problem after release, must not be touched: %v", err)
+			}
+			if got := eventsContaining(drainEvents(rec), ReasonTeardownDeadlineExceeded); len(got) != 1 {
+				t.Errorf("expected one TeardownDeadlineExceeded warning, got %v", got)
+			}
+		})
 	}
 }
 
@@ -1312,7 +1243,7 @@ func TestTeardown_ForceDeleteEscalation_UnwedgesDeadNodePod(t *testing.T) {
 		Client:               c,
 		APIReader:            c,
 		Log:                  ctrl.Log.WithName("test"),
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 		Clock:                clocktesting.NewFakeClock(base),
 	}
@@ -1341,7 +1272,7 @@ func TestTeardown_ForceDeleteEscalation_UnwedgesDeadNodePod(t *testing.T) {
 	if forced == nil {
 		t.Fatalf("expected a grace-0 force-delete of %s during teardown; recorded deletes=%+v", wedged.Name, deletes)
 	}
-	if got := eventsContaining(drainEvents(rec), string(workload.EventReasonPodForceDeleted)); len(got) != 1 {
+	if got := eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonPodForceDeleted)); len(got) != 1 {
 		t.Errorf("expected one PodForceDeleted warning, got %v", got)
 	}
 

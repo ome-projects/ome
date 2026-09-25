@@ -22,6 +22,8 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -333,8 +335,8 @@ func TestForceDelete_NilPolicy_NoNodeReadsNoAction(t *testing.T) {
 		t.Fatalf("escalate: %v", err)
 	}
 	// evidence helper with nil policy: NotConfigured before any read.
-	if res := stuckTerminatingEvidence(context.Background(), c, pod, nil, fdNow); res.kind != evidenceNotConfigured {
-		t.Errorf("evidence kind: got %s want not-configured", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), c, pod, nil, fdNow); res.Kind != evidence.NotConfigured {
+		t.Errorf("evidence kind: got %s want not-configured", res.Kind)
 	}
 	if nodeGets != 0 {
 		t.Errorf("node reads with nil policy: got %d want 0", nodeGets)
@@ -356,9 +358,9 @@ func TestForceDelete_WithinOwnGrace_NodeGone_Untouched(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod)) // node NOT seeded → NotFound if read
 	isvc := fdISVC("llama")
 
-	res := stuckTerminatingEvidence(context.Background(), c, pod, fdPolicy(), fdNow)
-	if res.kind != evidenceWithinGrace {
-		t.Errorf("evidence kind: got %s want within-grace", res.kind)
+	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	if res.Kind != evidence.WithinGrace {
+		t.Errorf("evidence kind: got %s want within-grace", res.Kind)
 	}
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdPolicy()), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
@@ -370,8 +372,8 @@ func TestForceDelete_WithinOwnGrace_NodeGone_Untouched(t *testing.T) {
 	// Boundary: exactly at DeletionTimestamp+OverdueSlack is still
 	// within grace (predicate requires now strictly after).
 	boundary := fdTerminatingPod("wedge-1", "gone-node", fdNow.Add(-fdPolicy().OverdueSlack))
-	if res := stuckTerminatingEvidence(context.Background(), c, boundary, fdPolicy(), fdNow); res.kind != evidenceWithinGrace {
-		t.Errorf("boundary evidence kind: got %s want within-grace", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), c, boundary, fdPolicy(), fdNow); res.Kind != evidence.WithinGrace {
+		t.Errorf("boundary evidence kind: got %s want within-grace", res.Kind)
 	}
 }
 
@@ -384,12 +386,12 @@ func TestForceDelete_Overdue_NodeReady_Untouched(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeReady("healthy-node"))
 	isvc := fdISVC("llama")
 
-	res := stuckTerminatingEvidence(context.Background(), c, pod, fdPolicy(), fdNow)
-	if res.kind != evidenceNodeHealthy {
-		t.Errorf("evidence kind: got %s want node-healthy", res.kind)
+	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	if res.Kind != evidence.NodeHealthy {
+		t.Errorf("evidence kind: got %s want node-healthy", res.Kind)
 	}
-	if want := fdNow.Add(fdPolicy().NodeUnreachableThreshold); !res.requeueAt.Equal(want) {
-		t.Errorf("requeueAt: got %s want %s", res.requeueAt, want)
+	if want := fdNow.Add(fdPolicy().NodeUnreachableThreshold); !res.RequeueAt.Equal(want) {
+		t.Errorf("requeueAt: got %s want %s", res.RequeueAt, want)
 	}
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdPolicy()), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
@@ -409,9 +411,9 @@ func TestForceDelete_Overdue_EvidenceYoungerThanThreshold_Untouched(t *testing.T
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeNotReady("dying-node", 2*time.Minute))
 	isvc := fdISVC("llama")
 
-	res := stuckTerminatingEvidence(context.Background(), c, pod, fdPolicy(), fdNow)
-	if res.kind != evidenceNodeNotDeadLongEnough {
-		t.Errorf("evidence kind: got %s want node-not-dead-long-enough", res.kind)
+	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	if res.Kind != evidence.NodeNotDeadLongEnough {
+		t.Errorf("evidence kind: got %s want node-not-dead-long-enough", res.Kind)
 	}
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdPolicy()), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
@@ -422,16 +424,16 @@ func TestForceDelete_Overdue_EvidenceYoungerThanThreshold_Untouched(t *testing.T
 
 	// Young taint (2m < 5m threshold) on a separate client.
 	cTaint := fdFakeClient(t, nil, fdNodeUnreachable("dying-node", 2*time.Minute))
-	if res := stuckTerminatingEvidence(context.Background(), cTaint, pod, fdPolicy(), fdNow); res.kind != evidenceNodeNotDeadLongEnough {
-		t.Errorf("young-taint evidence kind: got %s want node-not-dead-long-enough", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), cTaint, pod, fdPolicy(), fdNow); res.Kind != evidence.NodeNotDeadLongEnough {
+		t.Errorf("young-taint evidence kind: got %s want node-not-dead-long-enough", res.Kind)
 	}
 	// Taint with nil TimeAdded can't prove the threshold elapsed.
 	nilAdded := fdNodeUnreachable("dying-node", 10*time.Minute)
 	nilAdded.Spec.Taints[0].TimeAdded = nil
 	nilAdded.Status.Conditions[0].LastTransitionTime = metav1.NewTime(fdNow.Add(-time.Minute))
 	cNil := fdFakeClient(t, nil, nilAdded)
-	if res := stuckTerminatingEvidence(context.Background(), cNil, pod, fdPolicy(), fdNow); res.kind != evidenceNodeNotDeadLongEnough {
-		t.Errorf("nil-TimeAdded evidence kind: got %s want node-not-dead-long-enough", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), cNil, pod, fdPolicy(), fdNow); res.Kind != evidence.NodeNotDeadLongEnough {
+		t.Errorf("nil-TimeAdded evidence kind: got %s want node-not-dead-long-enough", res.Kind)
 	}
 }
 
@@ -445,9 +447,9 @@ func TestForceDelete_Overdue_OldUnreachableTaint_DeletedWithOptions(t *testing.T
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeUnreachable("dead-node", 10*time.Minute))
 	isvc := fdISVC("llama")
 
-	res := stuckTerminatingEvidence(context.Background(), c, pod, fdPolicy(), fdNow)
-	if res.kind != evidenceNodeUnreachableTaint {
-		t.Fatalf("evidence kind: got %s want node-unreachable-taint", res.kind)
+	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	if res.Kind != evidence.NodeUnreachableTaint {
+		t.Fatalf("evidence kind: got %s want node-unreachable-taint", res.Kind)
 	}
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdPolicy()), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
@@ -496,12 +498,12 @@ func TestForceDelete_StaleTaintOnRecoveredNode_ReadyTrueVetoes(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), node)
 	isvc := fdISVC("llama")
 
-	res := stuckTerminatingEvidence(context.Background(), c, pod, fdPolicy(), fdNow)
-	if res.kind != evidenceNodeHealthy {
-		t.Errorf("evidence kind: got %s want node-healthy (Ready=True must veto the stale taint)", res.kind)
+	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	if res.Kind != evidence.NodeHealthy {
+		t.Errorf("evidence kind: got %s want node-healthy (Ready=True must veto the stale taint)", res.Kind)
 	}
-	if want := fdNow.Add(fdPolicy().NodeUnreachableThreshold); !res.requeueAt.Equal(want) {
-		t.Errorf("requeueAt: got %s want %s", res.requeueAt, want)
+	if want := fdNow.Add(fdPolicy().NodeUnreachableThreshold); !res.RequeueAt.Equal(want) {
+		t.Errorf("requeueAt: got %s want %s", res.RequeueAt, want)
 	}
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdPolicy()), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
@@ -513,8 +515,8 @@ func TestForceDelete_StaleTaintOnRecoveredNode_ReadyTrueVetoes(t *testing.T) {
 	// Companion: same-age taint, Ready=Unknown just as old — the genuine
 	// dead node. Still actionable.
 	cDead := fdFakeClient(t, nil, fdNodeUnreachable("recovered-node", 10*time.Minute))
-	if res := stuckTerminatingEvidence(context.Background(), cDead, pod, fdPolicy(), fdNow); res.kind != evidenceNodeUnreachableTaint {
-		t.Errorf("dead-node evidence kind: got %s want node-unreachable-taint", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), cDead, pod, fdPolicy(), fdNow); res.Kind != evidence.NodeUnreachableTaint {
+		t.Errorf("dead-node evidence kind: got %s want node-unreachable-taint", res.Kind)
 	}
 }
 
@@ -526,9 +528,9 @@ func TestForceDelete_Overdue_NodeGone_Deleted(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod)) // no node object
 	isvc := fdISVC("llama")
 
-	res := stuckTerminatingEvidence(context.Background(), c, pod, fdPolicy(), fdNow)
-	if res.kind != evidenceNodeGone {
-		t.Fatalf("evidence kind: got %s want node-gone", res.kind)
+	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	if res.Kind != evidence.NodeGone {
+		t.Fatalf("evidence kind: got %s want node-gone", res.Kind)
 	}
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdPolicy()), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
@@ -540,14 +542,14 @@ func TestForceDelete_Overdue_NodeGone_Deleted(t *testing.T) {
 	// Overdue + NotReady long enough is the third actionable branch.
 	pod2 := fdTerminatingPod("wedge-1", "notready-node", overdueTS)
 	c2 := fdFakeClient(t, nil, fdNodeNotReady("notready-node", 10*time.Minute))
-	if res := stuckTerminatingEvidence(context.Background(), c2, pod2, fdPolicy(), fdNow); res.kind != evidenceNodeNotReady {
-		t.Errorf("evidence kind: got %s want node-not-ready", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), c2, pod2, fdPolicy(), fdNow); res.Kind != evidence.NodeNotReady {
+		t.Errorf("evidence kind: got %s want node-not-ready", res.Kind)
 	}
 
 	// Unscheduled pod: nothing to prove dead — never actionable.
 	pod3 := fdTerminatingPod("wedge-2", "", overdueTS)
-	if res := stuckTerminatingEvidence(context.Background(), c2, pod3, fdPolicy(), fdNow); res.kind != evidenceUnscheduled {
-		t.Errorf("evidence kind: got %s want unscheduled", res.kind)
+	if res := evidence.StuckTerminating(context.Background(), c2, pod3, fdPolicy(), fdNow); res.Kind != evidence.Unscheduled {
+		t.Errorf("evidence kind: got %s want unscheduled", res.Kind)
 	}
 }
 
@@ -760,5 +762,254 @@ func TestForceDeletePods_NodeReadError_Propagates(t *testing.T) {
 	}
 	if len(deletes) != 0 {
 		t.Errorf("deletes on unreadable evidence: got %d want 0", len(deletes))
+	}
+}
+
+// Every update mode tears pods down and then waits for them to go away,
+// so the update pass runs the force-delete sweep over the Instance's pods
+// before it dispatches a mode: a source pod left Terminating on a dead
+// node is cleared whatever step the roll is parked at, and the wait that
+// would never end is unblocked.
+func TestUpdateWithPods_ForceDeletesStuckTerminatingSource(t *testing.T) {
+	for _, step := range []string{
+		workload.UpdateStepSurge,
+		workload.UpdateStepSurgeDrain,
+		workload.UpdateStepSurgeDrainSettle,
+		workload.UpdateStepInPlace,
+		workload.UpdateStepDrain,
+	} {
+		t.Run(step, func(t *testing.T) {
+			f := newMidSurgeFixture(t, step, true /* surgeReady */, false /* sourceServing */)
+			if err := f.client.Create(context.Background(), fdNodeUnreachable("dead-node", 10*time.Minute)); err != nil {
+				t.Fatalf("seed dead node: %v", err)
+			}
+
+			// The live view the dispatcher would hand the pass: the source
+			// is Terminating past its grace on the dead node. The stored
+			// object carries no deletionTimestamp, which is how the fake
+			// client represents a pod the apiserver has not yet collected.
+			stuck := f.sourcePod.DeepCopy()
+			dt := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+			stuck.DeletionTimestamp = &dt
+			stuck.Spec.NodeName = "dead-node"
+
+			rec := record.NewFakeRecorder(16)
+			input := legacyTestInput(f.isvc, f.client, workload.ComponentEngine)
+			input.ForceDelete = fdPolicy()
+			plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+
+			if _, err := UpdateWithPods(context.Background(), workload.Deps{Client: f.client, Recorder: rec},
+				input, plan, plan.Instances[0], f.targetCR, f.targetSpec,
+				[]*corev1.Pod{stuck, f.surgePod}); err != nil {
+				t.Fatalf("UpdateWithPods: %v", err)
+			}
+
+			events := fdDrainEvents(rec)
+			if n := fdCountEvents(events, workload.EventReasonPodForceDeleted); n != 1 {
+				t.Fatalf("PodForceDeleted events: got %d want 1 (events=%v)", n, events)
+			}
+			if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(stuck), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("the wedged source must be gone after the pass; get returned %v", err)
+			}
+		})
+	}
+}
+
+// A dead node is never an input of its own to the drain: it becomes
+// actionable only through a pod already Terminating on it, aged from the
+// taint's own TimeAdded. The same node under a pod nobody has deleted
+// yet buys nothing — that pod is the ordinary drain's business.
+func TestDeleteBatch_NodeDeathActsOnlyThroughATerminatingPod(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		terminating bool
+		wantForced  bool
+	}{
+		{name: "terminating pod on the dead node", terminating: true, wantForced: true},
+		{name: "live pod on the dead node", terminating: false, wantForced: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := deleteBatchOwner()
+			status := deleteOwnedStatus(0, fdNow.Add(-time.Minute))
+			pod := fdTerminatingPod("wedge-0", "dead-node", overdueTS)
+			if !tc.terminating {
+				pod.DeletionTimestamp = nil
+			}
+
+			var deletes []recordedDeleteOpts
+			funcs := fdDeleteRecorder(&deletes)
+			c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeUnreachable("dead-node", 10*time.Minute))
+
+			input := deleteBatchInput(owner, []workload.InstanceStatus{status})
+			input.Clock = clocktesting.NewFakeClock(fdNow)
+			input.ForceDelete = fdPolicy()
+			input.ApplyInstanceMutationsWithRetryBlock = newDeleteMutationStore(owner, []workload.InstanceStatus{status}).apply
+
+			if _, err := DeleteBatch(context.Background(), workload.Deps{
+				Client: c, Expectations: workload.NewExpectations(),
+			}, input, deleteBatchPlan(), nil, map[int32][]*corev1.Pod{0: {pod}}); err != nil {
+				t.Fatalf("DeleteBatch: %v", err)
+			}
+
+			var forced int
+			for _, d := range deletes {
+				if d.grace != nil && *d.grace == 0 {
+					forced++
+				}
+			}
+			if tc.wantForced && forced != 1 {
+				t.Fatalf("force-deletes: got %d want 1 (%+v)", forced, deletes)
+			}
+			if !tc.wantForced {
+				if forced != 0 {
+					t.Fatalf("force-deletes: got %d want 0 (%+v)", forced, deletes)
+				}
+				if len(deletes) != 1 {
+					t.Fatalf("deletes: got %+v want the ordinary drain's one", deletes)
+				}
+			}
+		})
+	}
+}
+
+// A drain reads the operator knobs that bound work it is not doing: a
+// PodGroup is built by a create, not torn down by a delete; the
+// migration caps bound requests the wave makes none of; and the
+// RetryBlock prune never reads a Deleting row. The requeue cadence is
+// read, but only to pace the next wake-up — the explicit wait this pass
+// already holds, a node-death boundary, outranks it. None of them
+// changes what the drain decides.
+func TestDeleteBatch_OperatorConfigChangesDoNotChangeWhatTheDrainDecides(t *testing.T) {
+	// A pod already Terminating on a node whose unreachable evidence is
+	// younger than the threshold: the drain is waiting on a boundary it
+	// computed, which is the case a cadence change could distort.
+	run := func(t *testing.T, change func(*workload.ReconcileInput, *workload.ComponentPlan)) (DeleteBatchResult, []recordedDeleteOpts) {
+		t.Helper()
+		owner := deleteBatchOwner()
+		status := deleteOwnedStatus(0, fdNow.Add(-time.Minute))
+		pod := fdTerminatingPod("wedge-0", "node-a", overdueTS)
+		var deletes []recordedDeleteOpts
+		funcs := fdDeleteRecorder(&deletes)
+		c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeNotReady("node-a", 2*time.Minute))
+
+		input := deleteBatchInput(owner, []workload.InstanceStatus{status})
+		input.Clock = clocktesting.NewFakeClock(fdNow)
+		input.ForceDelete = fdPolicy()
+		input.ScaleDownRequeueInterval = 30 * time.Second
+		input.ApplyInstanceMutationsWithRetryBlock = newDeleteMutationStore(owner, []workload.InstanceStatus{status}).apply
+		plan := deleteBatchPlan()
+		if change != nil {
+			change(&input, &plan)
+		}
+
+		result, err := DeleteBatch(context.Background(), workload.Deps{
+			Client: c, Expectations: workload.NewExpectations(),
+		}, input, plan, nil, map[int32][]*corev1.Pod{0: {pod}})
+		if err != nil {
+			t.Fatalf("DeleteBatch: %v", err)
+		}
+		return result, deletes
+	}
+
+	baseline, baselineDeletes := run(t, nil)
+	if len(baselineDeletes) != 0 {
+		t.Fatalf("baseline deletes: got %+v want none; the node evidence is still young", baselineDeletes)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		change func(*workload.ReconcileInput, *workload.ComponentPlan)
+	}{
+		{
+			name: "requeue cadence",
+			change: func(in *workload.ReconcileInput, _ *workload.ComponentPlan) {
+				in.ScaleDownRequeueInterval = 10 * time.Minute
+				in.Requeue = workload.RequeueIntervals{Operation: 9 * time.Minute, Gate: 8 * time.Minute}
+			},
+		},
+		{
+			name: "gang schedule clamp",
+			change: func(_ *workload.ReconcileInput, plan *workload.ComponentPlan) {
+				plan.GangScheduleTimeout = &workload.GangScheduleTimeoutClamp{Min: time.Minute, Max: 10 * time.Minute}
+			},
+		},
+		{
+			name: "migration audit caps",
+			change: func(in *workload.ReconcileInput, _ *workload.ComponentPlan) {
+				in.MigrationAudit = &workload.MigrationAuditPolicy{MaxInFlight: 1, MaxPerWindow: 2, Window: time.Hour}
+			},
+		},
+		{
+			name: "retry block history",
+			change: func(in *workload.ReconcileInput, _ *workload.ComponentPlan) {
+				in.ObservedState.RetryBlocks = []workload.RetryBlock{
+					{TargetRevision: "llama-engine-stale001", State: workload.RetryBlockHeld},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, deletes := run(t, tc.change)
+			if len(deletes) != 0 {
+				t.Errorf("deletes: got %+v want none", deletes)
+			}
+			if got != baseline {
+				t.Errorf("result: got %+v want the baseline %+v", got, baseline)
+			}
+		})
+	}
+}
+
+// A gang surge target marker is an index of its own, and the update pass
+// sweeps only the pods of the row it dispatches. The marker's own pods
+// are therefore outside every sweep the source's pass runs — the clock
+// elapsing on one of them force-deletes nothing, whether the marker is
+// still building its replacement gang or already retired. Which evidence
+// would have applied does not enter into it: the pod is never a
+// candidate, so neither node death nor deletion slack reaches it.
+func TestUpdateWithPods_MarkerPodsAreOutsideTheSourcesSweep(t *testing.T) {
+	f := newMidSurgeFixture(t, workload.UpdateStepSurge, false /* surgeReady */, true /* sourceServing */)
+	if err := f.client.Create(context.Background(), fdNodeUnreachable("dead-node", 10*time.Minute)); err != nil {
+		t.Fatalf("seed dead node: %v", err)
+	}
+
+	// A pod of the replacement gang's own index, wedged Terminating past
+	// its grace on the dead node — exactly the evidence that clears a
+	// source pod in TestUpdateWithPods_ForceDeletesStuckTerminatingSource.
+	markerPod := f.sourcePod.DeepCopy()
+	markerPod.ObjectMeta = metav1.ObjectMeta{
+		Namespace: f.sourcePod.Namespace,
+		Name:      f.sourcePod.Name + "-marker",
+		Labels:    map[string]string{},
+	}
+	for k, v := range f.sourcePod.Labels {
+		markerPod.Labels[k] = v
+	}
+	markerPod.Labels[query.LabelInstanceIdx] = "2"
+	markerPod.Spec.NodeName = "dead-node"
+	if err := f.client.Create(context.Background(), markerPod); err != nil {
+		t.Fatalf("seed marker pod: %v", err)
+	}
+	dt := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	markerPod.DeletionTimestamp = &dt
+
+	rec := record.NewFakeRecorder(16)
+	input := legacyTestInput(f.isvc, f.client, workload.ComponentEngine)
+	input.ForceDelete = fdPolicy()
+	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
+
+	// The dispatcher hands the pass the pods of the row it dispatches —
+	// the source's — so the marker's wedged pod is never a candidate.
+	if _, err := UpdateWithPods(context.Background(), workload.Deps{Client: f.client, Recorder: rec},
+		input, plan, plan.Instances[0], f.targetCR, f.targetSpec,
+		[]*corev1.Pod{f.sourcePod, f.surgePod}); err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+
+	if n := fdCountEvents(fdDrainEvents(rec), workload.EventReasonPodForceDeleted); n != 0 {
+		t.Errorf("PodForceDeleted events: got %d want 0", n)
+	}
+	if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(markerPod), &corev1.Pod{}); err != nil {
+		t.Fatalf("the marker's wedged pod must survive the source's sweep; get returned %v", err)
 	}
 }

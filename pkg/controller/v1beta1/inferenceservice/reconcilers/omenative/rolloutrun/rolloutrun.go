@@ -145,7 +145,14 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		if retargeted(isvc, active, targets) {
 			retargeting = true
 			for _, target := range active.TargetRevisions {
-				stableOverrides[target.Component] = target.StableRevision
+				// An unknown stable stays unknown only for a component that
+				// moved. A component still on its pinned revision is on its
+				// stable; carrying the unknown would make it look retargeted
+				// and arm a ladder it has no work for.
+				moved := targets[target.Component].target != "" && targets[target.Component].target != target.Revision
+				if target.StableRevision != "" || moved {
+					stableOverrides[target.Component] = target.StableRevision
+				}
 			}
 			closeRun(isvc, active, v1beta1.RolloutRunSuperseded, now)
 			recordRunClosed(isvc, v1beta1.RolloutRunSuperseded)
@@ -306,7 +313,15 @@ func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedP
 // canary and coordination engines own their counters and reset them under
 // their own rules (which is what makes adopt-in-place a no-op for a roll
 // already in flight).
+//
+// A Component whose observed target is the revision its own canary already
+// rejected is pinned at its stable revision instead. The run is opened for the
+// whole InferenceService, so any Component's retarget drags every other
+// Component's target into the pin; re-presenting a rejected revision would
+// re-arm a ladder already known to fail, and its rollback would then close the
+// shared run and discard the progress of the group that opened it.
 func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1beta1.ComponentType]targetPair, stableOverrides map[v1beta1.ComponentType]string, adopting bool, now metav1.Time) {
+	rejected := stickyRejectHashes(isvc, targets)
 	var pinned []v1beta1.RolloutRunTarget
 	seen := map[v1beta1.ComponentType]bool{}
 	for i := range plan.groups {
@@ -323,6 +338,9 @@ func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1be
 			stable, carried := stableOverrides[comp]
 			if !carried {
 				stable = componentStableRevision(isvc, comp, rev, t, adopting)
+			}
+			if hold := rejected[comp]; hold != "" && rev == hold && stable != "" {
+				rev = stable
 			}
 			pinned = append(pinned, v1beta1.RolloutRunTarget{
 				Component:      comp,
@@ -429,11 +447,32 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 	for i := range active.Plan.Groups {
 		g := &active.Plan.Groups[i].Group
 		if g.Canary != nil {
-			cs := rollout.CanaryStatusFor(&isvc.Status, primaryOfGroup(g))
+			primary := primaryOfGroup(g)
+			cs := rollout.CanaryStatusFor(&isvc.Status, primary)
 			if cs == nil {
-				return "", false
+				// A unit with no stable revision to shift from never arms; it
+				// is done once every member rests on the pinned revision.
+				for _, comp := range g.Components {
+					pinnedRev := pinnedFor[comp]
+					if pinnedRev == "" {
+						continue
+					}
+					obs := targets[comp]
+					if obs.current != pinnedRev || obs.target != pinnedRev || (obs.replicas > 0 && obs.updated < obs.replicas) {
+						return "", false
+					}
+				}
+				continue
 			}
 			if cs.RolledBackRevisionHash != "" {
+				// Only a rollback of what THIS run presented is this run's
+				// outcome. A group still holding an older rejection was pinned
+				// at its stable revision and is inert here; letting its
+				// standing failure close the run would end every other group's
+				// rollout for a revision this run never offered.
+				if pinnedFor[primary] != cs.RolledBackRevisionHash {
+					continue
+				}
 				if primaryPhase(isvc, g) == v1beta1.RolloutPhaseRolledBack {
 					return v1beta1.RolloutRunRolledBack, true
 				}

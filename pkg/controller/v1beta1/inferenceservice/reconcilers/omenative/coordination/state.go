@@ -9,7 +9,7 @@ import (
 // ComponentObservation captures the inputs the state machine reads for
 // one Component in a group: replica counts, per-revision pod counts,
 // in-flight failure / pause hints. Populated by the caller from
-// status_aggregate plus live pod reads.
+// the status aggregate plus live pod reads.
 type ComponentObservation struct {
 	// Component identifies this observation.
 	Component v1beta1.ComponentType
@@ -61,7 +61,7 @@ type ComponentObservation struct {
 	Partition int32
 
 	// AtDesiredShape is true when the component has converged to its desired
-	// staged shape (workload.ReachedDesiredShape): (Replicas-Partition)
+	// staged shape (status.ReachedDesiredShape): (Replicas-Partition)
 	// instances Ready on the target revision and Partition instances Ready on
 	// the prior revision. The state machine rests (Staged) and Sequential
 	// hands off on this.

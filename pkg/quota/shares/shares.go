@@ -32,10 +32,8 @@ import (
 
 // Weight is one cluster's contribution to the basis a total is split by.
 //
-// For the Proportional policy this is a snapshot of that cluster's allocatable
-// capacity of the flavor. It is a snapshot, and the caller holds it between
-// reconciles on purpose: apportioning against live capacity would move every
-// tenant's share whenever a node was drained anywhere in the fleet.
+// For the Proportional policy this is that cluster's schedulable capacity of
+// the flavor, as the cluster last reported it.
 type Weight struct {
 	Cluster  string
 	Capacity resource.Quantity

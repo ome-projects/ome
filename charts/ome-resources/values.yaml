@@ -235,20 +235,21 @@ ome:
     #     metrics-schema: ome-controller
     podAnnotations: {}
     deploymentMode: "RawDeployment"
-    # Admission-time component replica defaults stamped by the ISVC mutating
-    # webhook on unset minReplicas/maxReplicas. Source of truth for these
-    # values (the OME binary has NO built-in defaults; an omitted field means
-    # the defaulter leaves that field as authored). A filled maxReplicas is
-    # raised to an authored minReplicas so admission never manufactures a
-    # min>max conflict.
+    # Component replica defaults the reconciler fills when neither the
+    # InferenceService nor its ServingRuntime sets minReplicas/maxReplicas;
+    # never written to the object. Source of truth for these values (the OME
+    # binary has NO built-in defaults; an omitted field stays unset). A
+    # filled maxReplicas is raised to an authored minReplicas so the bounds
+    # never conflict.
     replicas:
       defaultMinReplicas: 1
       defaultMaxReplicas:
         engine: 3
         decoder: 3
         router: 2
-    # Admission-time pod termination grace stamped by the same webhook on any
-    # component that does not author terminationGracePeriodSeconds. Bounds how
+    # Pod termination grace the reconciler fills on any component whose
+    # InferenceService and ServingRuntime both leave
+    # terminationGracePeriodSeconds unset. Bounds how
     # long a component has to finish in-flight requests after SIGTERM; a
     # serving component whose requests outlive it loses them on every restart.
     # Same contract as replicas above: the binary has no built-in default, and
@@ -256,20 +257,22 @@ ome:
     # longest expected request, and keep any in-process drain the runtime
     # performs strictly under it so the runtime finishes first.
     terminationGracePeriodSeconds: 600
-    # Admission-time lifecycle.minReadySeconds stamped by the same webhook on
-    # every OMENative component that does not author one: how long a newly
+    # lifecycle.minReadySeconds the reconciler fills on every OMENative
+    # component whose InferenceService and ServingRuntime both leave it
+    # unset: how long a newly
     # Ready pod must stay Ready before a rollout drains or promotes past it
     # (the Deployment minReadySeconds rule, applied per pod). Opt-in: the
     # binary has no built-in default and an unset or 0 value leaves pods
     # Available as soon as they are Ready; an authored component value
     # always wins. Uncomment to pace every OMENative rollout in the cluster.
     # minReadySeconds: 30
-    # Admission-time lifecycle.updateStrategy stamped by the same webhook on
-    # OMENative components that do not author one: how each Instance is
+    # lifecycle.updateStrategy the reconciler fills on OMENative components
+    # whose InferenceService and ServingRuntime both leave it unset: how each
+    # Instance is
     # physically replaced, and how many may move at once. The binary has no
     # built-in default; an authored component value always wins.
     #
-    # Only the budget the resolved strategy reads is stamped. OME gates
+    # Only the budget the resolved strategy reads is filled. OME gates
     # SurgeThenDrain on maxSurge and every non-surge strategy (RecreatePod,
     # InPlaceIfPossible, InPlaceOnly) on maxUnavailable, and never consults
     # the other, so a field that is never read would sit in the spec looking

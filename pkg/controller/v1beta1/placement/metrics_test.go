@@ -56,7 +56,7 @@ func TestRecordPlacement_PublishesPhaseWinnerAndCandidates(t *testing.T) {
 		phase:  v1beta1.PlacementPhasePlaced,
 		candidates: []v1beta1.CandidatePlacement{
 			{Cluster: "cluster-a", Phase: v1beta1.CandidatePhaseAdmitted, AdmittedReplicas: 5, ReadyReplicas: 4},
-			{Cluster: "cluster-b", Phase: v1beta1.CandidatePhasePlaced, AdmittedReplicas: 3, ReadyReplicas: 0},
+			{Cluster: "cluster-b", Phase: v1beta1.CandidatePhaseAdmitting, AdmittedReplicas: 3, ReadyReplicas: 0},
 		},
 	}
 	recordPlacement(isvc, res)
@@ -82,7 +82,7 @@ func TestRecordPlacement_PublishesPhaseWinnerAndCandidates(t *testing.T) {
 }
 
 // TestRecordPlacement_NoStaleSeriesOnTransition is the reason every vector is
-// reset before it is written: an ISVC that moves Racing -> Placed, changes
+// reset before it is written: an ISVC that moves Admitting -> Placed, changes
 // winner, and drops a candidate must not keep reporting the old label values.
 func TestRecordPlacement_NoStaleSeriesOnTransition(t *testing.T) {
 	resetPlacementMetrics()
@@ -90,10 +90,10 @@ func TestRecordPlacement_NoStaleSeriesOnTransition(t *testing.T) {
 	isvc := splitISVC("ns", "svc", 8)
 	recordPlacement(isvc, placementResult{
 		winner: "cluster-a",
-		phase:  v1beta1.PlacementPhaseRacing,
+		phase:  v1beta1.PlacementPhaseAdmitting,
 		candidates: []v1beta1.CandidatePlacement{
-			{Cluster: "cluster-a", Phase: v1beta1.CandidatePhasePlaced},
-			{Cluster: "cluster-b", Phase: v1beta1.CandidatePhasePlaced},
+			{Cluster: "cluster-a", Phase: v1beta1.CandidatePhaseAdmitting},
+			{Cluster: "cluster-b", Phase: v1beta1.CandidatePhaseAdmitting},
 		},
 	})
 	recordPlacement(isvc, placementResult{
@@ -105,7 +105,7 @@ func TestRecordPlacement_NoStaleSeriesOnTransition(t *testing.T) {
 	})
 
 	if got := testutil.CollectAndCount(placementPhase); got != 1 {
-		t.Errorf("phase series = %d, want 1 (Racing must not linger)", got)
+		t.Errorf("phase series = %d, want 1 (Admitting must not linger)", got)
 	}
 	if got := testutil.ToFloat64(placementPhase.WithLabelValues("ns", "svc", "Placed")); got != 1 {
 		t.Errorf("phase{Placed} = %v, want 1", got)

@@ -16,6 +16,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
 const (
@@ -656,5 +657,305 @@ func TestPreserveNewerRunKeepsFresherPin(t *testing.T) {
 	PreserveNewerRun(staleOpen, liveClosed, false)
 	if staleOpen.Rollout.ActiveRun != nil || staleOpen.Rollout.LastRun == nil {
 		t.Fatal("a fresher close must not be resurrected by a stale open copy")
+	}
+}
+
+// twoUnitRun pins a run over two canary groups, one per unit, whose stable
+// revisions were unknown when it opened (the shape a run has at creation).
+func twoUnitRun(isvc *v1beta1.InferenceService, routerRev, engineRev string) {
+	groups := []v1beta1.RolloutRunGroup{
+		{Source: v1beta1.RolloutPlanSourceInline, Group: v1beta1.RolloutGroup{
+			Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: canaryBody(50, 100)}},
+		{Source: v1beta1.RolloutPlanSourceInline, Group: v1beta1.RolloutGroup{
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: canaryBody(25, 100)}},
+	}
+	concurrent := v1beta1.RolloutGroupOrderingConcurrent
+	isvc.Spec.Rollout = &v1beta1.RolloutSpec{GroupOrdering: &concurrent, Groups: []v1beta1.RolloutGroup{groups[0].Group, groups[1].Group}}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{ActiveRun: &v1beta1.RolloutRun{
+		RunID:    "creation",
+		OpenedAt: metav1.NewTime(time.Unix(900, 0)),
+		PinnedAt: metav1.NewTime(time.Unix(900, 0)),
+		TargetRevisions: []v1beta1.RolloutRunTarget{
+			{Component: v1beta1.RouterComponent, Revision: routerRev},
+			{Component: v1beta1.EngineComponent, Revision: engineRev},
+		},
+		Plan: v1beta1.RolloutRunPlan{Groups: groups},
+	}}
+}
+
+func routerIR(current, target string) *v1beta1.InferenceReplica {
+	return &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "llm-a-router", Namespace: "ns", Generation: 1},
+		Status: v1beta1.InferenceReplicaStatus{
+			ObservedGeneration: 1,
+			CurrentRevision:    current,
+			UpdateRevision:     target,
+			Replicas:           1,
+			UpdatedReplicas:    1,
+		},
+	}
+}
+
+// A retarget of one unit supersedes the open run and carries its stable
+// revisions forward. An unknown stable stays unknown only for the component
+// that moved; a component that stayed put is on the revision it targets, and
+// that is its stable. Carrying the unknown would make the idle unit look
+// retargeted and arm its ladder.
+func TestRetargetKeepsUnmovedComponentStableKnown(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{})
+	isvc.Spec.Router = &v1beta1.RouterSpec{}
+	twoUnitRun(isvc, "rrrrrrrr", "aaaaaaaa")
+	in := testInputs(t, isvc, routerIR("llm-a-router-rrrrrrrr", "llm-a-router-ssssssss"), irFixture(oldRev, oldRev))
+
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	active := isvc.Status.Rollout.ActiveRun
+	if active == nil || active.RunID == "creation" {
+		t.Fatalf("the router retarget must open a fresh run, got %+v", active)
+	}
+	got := map[v1beta1.ComponentType]v1beta1.RolloutRunTarget{}
+	for _, target := range active.TargetRevisions {
+		got[target.Component] = target
+	}
+	if got[v1beta1.RouterComponent].Revision != "ssssssss" || got[v1beta1.RouterComponent].StableRevision != "" {
+		t.Fatalf("moved router keeps its unknown stable: %+v", got[v1beta1.RouterComponent])
+	}
+	if got[v1beta1.EngineComponent].Revision != "aaaaaaaa" || got[v1beta1.EngineComponent].StableRevision != "aaaaaaaa" {
+		t.Fatalf("unmoved engine must record its current revision as stable: %+v", got[v1beta1.EngineComponent])
+	}
+}
+
+// A run opened with no stable revision (creation) whose canary unit never
+// armed must still close once the unit converges; otherwise the creation
+// plan stays pinned and later spec edits are ignored.
+func TestCreationRunClosesWithoutCanaryState(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{})
+	isvc.Spec.Router = &v1beta1.RouterSpec{}
+	twoUnitRun(isvc, "rrrrrrrr", "aaaaaaaa")
+	engine := irFixture(oldRev, oldRev)
+	engine.Status.Replicas, engine.Status.UpdatedReplicas = 1, 1
+	in := testInputs(t, isvc, routerIR("llm-a-router-rrrrrrrr", "llm-a-router-rrrrrrrr"), engine)
+
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if isvc.Status.Rollout.ActiveRun != nil {
+		t.Fatalf("a converged run with no canary state must close, still active: %+v", isvc.Status.Rollout.ActiveRun)
+	}
+	if last := isvc.Status.Rollout.LastRun; last == nil || last.Outcome != v1beta1.RolloutRunCompleted {
+		t.Fatalf("last run = %+v, want Completed", last)
+	}
+}
+
+// Concurrent groups: revisions for the two-group isolation fixtures.
+const (
+	routerStableRev   = "llm-a-router-11111111"
+	routerRejectedRev = "llm-a-router-22222222"
+	engineStableRev   = "llm-a-engine-33333333"
+	engineNewRev      = "llm-a-engine-44444444"
+)
+
+func hashOf(t *testing.T, revName string) string {
+	t.Helper()
+	h := query.RevisionFromName(revName).Hash()
+	if h == "" {
+		t.Fatalf("revision %q has no hash", revName)
+	}
+	return h
+}
+
+// concurrentCanaryISVC is the two-independent-canaries shape: a router group
+// and an engine group over disjoint Components, declared Concurrent. The
+// router carries a standing rollback; the engine has never failed.
+func concurrentCanaryISVC(t *testing.T) *v1beta1.InferenceService {
+	t.Helper()
+	one := 1
+	ordering := v1beta1.RolloutGroupOrderingConcurrent
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "llm-a", Namespace: "ns"},
+		Spec: v1beta1.InferenceServiceSpec{
+			Engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &one}},
+			Router: &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &one}},
+			Rollout: &v1beta1.RolloutSpec{
+				GroupOrdering: &ordering,
+				Groups: []v1beta1.RolloutGroup{
+					{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: canaryBody(10, 100)},
+					{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: canaryBody(10, 100)},
+				},
+			},
+		},
+	}
+	// The router's ladder failed and settled on its sticky hold; the engine's
+	// has no failure of its own.
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.RouterComponent: {
+			RolloutPhase: v1beta1.RolloutPhaseRolledBack,
+			Canary: &v1beta1.CanaryStatus{
+				CurrentStep:            2,
+				RolledBackRevisionHash: hashOf(t, routerRejectedRev),
+				StableRevisionHash:     hashOf(t, routerStableRev),
+			},
+		},
+	}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{
+		LastRun: &v1beta1.RolloutRunRecord{
+			Outcome: v1beta1.RolloutRunRolledBack,
+			TargetRevisions: []v1beta1.RolloutRunTarget{
+				{Component: v1beta1.RouterComponent, Revision: hashOf(t, routerRejectedRev), StableRevision: hashOf(t, routerStableRev)},
+				{Component: v1beta1.EngineComponent, Revision: hashOf(t, engineStableRev), StableRevision: hashOf(t, engineStableRev)},
+			},
+		},
+	}
+	return isvc
+}
+
+func namedIR(name, current, target string) *v1beta1.InferenceReplica {
+	return &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Generation: 1},
+		Status: v1beta1.InferenceReplicaStatus{
+			ObservedGeneration: 1,
+			CurrentRevision:    current,
+			UpdateRevision:     target,
+		},
+	}
+}
+
+func pinnedTargetFor(t *testing.T, run *v1beta1.RolloutRun, comp v1beta1.ComponentType) v1beta1.RolloutRunTarget {
+	t.Helper()
+	for _, target := range run.TargetRevisions {
+		if target.Component == comp {
+			return target
+		}
+	}
+	t.Fatalf("run pins no target for %s (pinned: %+v)", comp, run.TargetRevisions)
+	return v1beta1.RolloutRunTarget{}
+}
+
+func TestOpenDoesNotRearmAnotherGroupsRejectedRevision(t *testing.T) {
+	// An engine-only retarget opens the run. The router's IR target still
+	// points at the revision the router's own canary rejected — that is the
+	// sticky hold, not a fresh ask. Pinning it would re-present a revision
+	// already known to fail, and its rollback would close the shared run and
+	// throw away the engine's progress.
+	isvc := concurrentCanaryISVC(t)
+	in := testInputs(t, isvc,
+		namedIR("llm-a-router", routerStableRev, routerRejectedRev),
+		namedIR("llm-a-engine", engineStableRev, engineNewRev),
+	)
+
+	out, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !out.Opened {
+		t.Fatalf("engine retarget did not open a run (outcome %+v, planReady %+v)", out, planReady(isvc))
+	}
+	active := isvc.Status.Rollout.ActiveRun
+	if active == nil {
+		t.Fatal("no ActiveRun after open")
+	}
+
+	router := pinnedTargetFor(t, active, v1beta1.RouterComponent)
+	if router.Revision == hashOf(t, routerRejectedRev) {
+		t.Errorf("router re-armed at its rejected revision %s", router.Revision)
+	}
+	if router.Revision != hashOf(t, routerStableRev) {
+		t.Errorf("router Revision: got %s want its stable %s", router.Revision, hashOf(t, routerStableRev))
+	}
+	if engine := pinnedTargetFor(t, active, v1beta1.EngineComponent); engine.Revision != hashOf(t, engineNewRev) {
+		t.Errorf("engine Revision: got %s want the retarget %s", engine.Revision, hashOf(t, engineNewRev))
+	}
+}
+
+func TestStandingRollbackDoesNotCloseAnotherGroupsRun(t *testing.T) {
+	// The router's rollback is settled and this run never presented the
+	// rejected revision. Closing the run on it would end the engine's rollout
+	// for a failure that is not the engine's and that this run did not cause —
+	// the loop that makes a broken group block every other group forever.
+	isvc := concurrentCanaryISVC(t)
+	in := testInputs(t, isvc,
+		namedIR("llm-a-router", routerStableRev, routerRejectedRev),
+		namedIR("llm-a-engine", engineStableRev, engineNewRev),
+	)
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if isvc.Status.Rollout.ActiveRun == nil {
+		t.Fatal("no ActiveRun after open")
+	}
+
+	// Next pass, same observed state: the run must still be open and driving.
+	out, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if isvc.Status.Rollout.ActiveRun == nil {
+		last := isvc.Status.Rollout.LastRun
+		t.Fatalf("run closed on the router's standing rollback (lastRun %+v, outcome %+v)", last, out)
+	}
+}
+
+func TestStickyRejectIsScopedToTheGroupThatRolledBack(t *testing.T) {
+	// The rejection belongs to the router's ladder. Crediting it to the engine
+	// would read the engine's live target as a hold and stall it behind a
+	// failure it had no part in.
+	isvc := concurrentCanaryISVC(t)
+	targets := map[v1beta1.ComponentType]targetPair{
+		v1beta1.RouterComponent: {current: hashOf(t, routerStableRev), target: hashOf(t, routerRejectedRev)},
+		v1beta1.EngineComponent: {current: hashOf(t, engineStableRev), target: hashOf(t, engineNewRev)},
+	}
+	rejected := stickyRejectHashes(isvc, targets)
+	if got := rejected[v1beta1.RouterComponent]; got != hashOf(t, routerRejectedRev) {
+		t.Errorf("router reject: got %q want %q", got, hashOf(t, routerRejectedRev))
+	}
+	if got, ok := rejected[v1beta1.EngineComponent]; ok {
+		t.Errorf("engine carries a reject %q it never earned", got)
+	}
+	if !divergedMember(isvc, targets) {
+		t.Error("engine retarget must count as divergence; it is held behind the router's rollback")
+	}
+}
+
+func TestRolledBackRunStillClosesForTheGroupThatFailed(t *testing.T) {
+	// Per-group reject scoping must not swallow a real rollback: when the run
+	// pinned the revision the canary rejected, it closes RolledBack.
+	isvc := isvcFixture(v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Canary:     canaryBody(10, 100),
+	})
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {
+			RolloutPhase: v1beta1.RolloutPhaseRolledBack,
+			Canary: &v1beta1.CanaryStatus{
+				CurrentStep:            1,
+				RolledBackRevisionHash: hashOf(t, newRev),
+				StableRevisionHash:     hashOf(t, oldRev),
+			},
+		},
+	}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{
+		ActiveRun: &v1beta1.RolloutRun{
+			RunID: "llm-a-run",
+			TargetRevisions: []v1beta1.RolloutRunTarget{
+				{Component: v1beta1.EngineComponent, Revision: hashOf(t, newRev), StableRevision: hashOf(t, oldRev)},
+			},
+			Plan: v1beta1.RolloutRunPlan{Groups: []v1beta1.RolloutRunGroup{{
+				Group: v1beta1.RolloutGroup{
+					Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+					Canary:     canaryBody(10, 100),
+				},
+			}}},
+		},
+	}
+	in := testInputs(t, isvc, namedIR("llm-a-engine", oldRev, newRev))
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if isvc.Status.Rollout.ActiveRun != nil {
+		t.Fatal("run stayed open through its own rollback")
+	}
+	if last := isvc.Status.Rollout.LastRun; last == nil || last.Outcome != v1beta1.RolloutRunRolledBack {
+		t.Errorf("lastRun outcome: got %+v want RolledBack", last)
 	}
 }

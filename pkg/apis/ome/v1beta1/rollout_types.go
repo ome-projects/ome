@@ -161,6 +161,31 @@ type RolloutGroup struct {
 	MaintainRatio *MaintainRatio `json:"maintainRatio,omitempty"`
 }
 
+// DeclaredProgression resolves the progression kind a group DECLARES, without
+// dereferencing a policy: the inline arm when one is set (inline outranks the
+// ref), else the ref's declared kind, else the no-progression default,
+// blueGreen. This is the single answer to "what did the operator ask for" —
+// every consumer that keys on progression must use it rather than testing an
+// inline field, because a ref-only group's inline arms are all nil and testing
+// them reads a declared canary as a bare blueGreen, silently dropping the gate
+// the ref exists to declare.
+func (g *RolloutGroup) DeclaredProgression() RolloutProgressionKind {
+	if g == nil {
+		return RolloutProgressionBlueGreen
+	}
+	switch {
+	case g.Canary != nil:
+		return RolloutProgressionCanary
+	case g.BlueGreen != nil:
+		return RolloutProgressionBlueGreen
+	case g.RollingUpdate != nil:
+		return RolloutProgressionRollingUpdate
+	case g.PolicyRef != nil:
+		return g.PolicyRef.Progression
+	}
+	return RolloutProgressionBlueGreen
+}
+
 // GroupCanary is the stepped progression: bring up new-revision capacity and
 // shift service-level traffic through an ordered list of steps. How the canary
 // advances is a PER-STEP property (see RolloutGroupStep): each step is

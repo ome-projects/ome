@@ -356,6 +356,9 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 	if err := validation.ValidatePlacement(&isvc.Spec); err != nil {
 		return allWarnings, err
 	}
+	if err := validation.ValidateRouting(&isvc.Spec); err != nil {
+		return allWarnings, err
+	}
 
 	// Traffic block: typed core load-balancing config + ome.io/* annotations.
 	if err := validation.ValidateTrafficSpec(isvc.Spec.Traffic); err != nil {

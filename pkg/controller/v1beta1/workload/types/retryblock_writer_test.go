@@ -7,24 +7,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestIsWorkloadCausedReason(t *testing.T) {
-	for reason, want := range map[string]bool{
-		"ImagePullBackOff":           true,
-		"ErrImagePull":               true,
-		"InvalidImageName":           true,
-		"CreateContainerConfigError": true,
-		"CrashLoopBackOff":           false,
-		"RunContainerError":          false,
-		"CreateContainerError":       false,
-		"DeadlineExceeded":           false,
-		"":                           false,
-	} {
-		if got := IsWorkloadCausedReason(reason); got != want {
-			t.Errorf("IsWorkloadCausedReason(%q) = %v, want %v", reason, got, want)
-		}
-	}
-}
-
 func metaTimeAt(t time.Time) *metav1.Time {
 	v := metav1.NewTime(t)
 	return &v

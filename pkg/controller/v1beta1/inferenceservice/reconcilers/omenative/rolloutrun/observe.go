@@ -76,21 +76,9 @@ func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1
 	return out, fresh, nil
 }
 
-// groupKind mirrors validation's declared-kind resolution: the inline arm
-// when present (inline outranks the ref), else the ref's declared kind, else
-// the blueGreen default.
+// groupKind is the progression kind a spec group declares, ref included.
 func groupKind(g *v1beta1.RolloutGroup) v1beta1.RolloutProgressionKind {
-	switch {
-	case g.Canary != nil:
-		return v1beta1.RolloutProgressionCanary
-	case g.BlueGreen != nil:
-		return v1beta1.RolloutProgressionBlueGreen
-	case g.RollingUpdate != nil:
-		return v1beta1.RolloutProgressionRollingUpdate
-	case g.PolicyRef != nil:
-		return g.PolicyRef.Progression
-	}
-	return v1beta1.RolloutProgressionBlueGreen
+	return g.DeclaredProgression()
 }
 
 // primaryCanaryComponent is the externally routed member whose scalar canary
@@ -133,44 +121,17 @@ func primaryOfGroup(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
 	return ""
 }
 
-// stickyRejectHashes returns the rejected target for each Component in the
-// rolled-back canary group. Run status supplies the exact active or closed
-// target set. For legacy status, the primary scalar identifies whether the
-// current IR targets are still the rejected group; only then is it reconstructed.
+// stickyRejectHashes returns, per Component, the revision that Component's OWN
+// canary group rejected — the hold a rolled-back ladder rests on.
+//
+// The attribution is per group, because a rollback belongs to the ladder that
+// failed. Crediting one group's failure to every Component in the run would
+// read an unrelated group's live target as a hold and strand it behind a
+// failure it had no part in, which is the opposite of what independent groups
+// promise.
 func stickyRejectHashes(isvc *v1beta1.InferenceService, targets map[v1beta1.ComponentType]targetPair) map[v1beta1.ComponentType]string {
 	rejected := map[v1beta1.ComponentType]string{}
-	primary := primaryCanaryComponent(isvc)
-	if primary == "" {
-		return rejected
-	}
-	canaryStatus := rollout.CanaryStatusFor(&isvc.Status, primary)
-	if canaryStatus == nil || canaryStatus.RolledBackRevisionHash == "" {
-		return rejected
-	}
-	if isvc.Status.Rollout != nil {
-		if active := isvc.Status.Rollout.ActiveRun; active != nil {
-			for _, target := range active.TargetRevisions {
-				if target.Component == primary && target.Revision == canaryStatus.RolledBackRevisionHash {
-					for _, member := range active.TargetRevisions {
-						rejected[member.Component] = member.Revision
-					}
-					return rejected
-				}
-			}
-		}
-		if last := isvc.Status.Rollout.LastRun; last != nil && last.Outcome == v1beta1.RolloutRunRolledBack {
-			for _, target := range last.TargetRevisions {
-				if target.Component == primary && target.Revision == canaryStatus.RolledBackRevisionHash {
-					for _, member := range last.TargetRevisions {
-						rejected[member.Component] = member.Revision
-					}
-					return rejected
-				}
-			}
-		}
-	}
-	rejected[primary] = canaryStatus.RolledBackRevisionHash
-	if targets[primary].target != canaryStatus.RolledBackRevisionHash {
+	if isvc.Spec.Rollout == nil {
 		return rejected
 	}
 	for gi := range isvc.Spec.Rollout.Groups {
@@ -178,13 +139,84 @@ func stickyRejectHashes(isvc *v1beta1.InferenceService, targets map[v1beta1.Comp
 		if groupKind(g) != v1beta1.RolloutProgressionCanary {
 			continue
 		}
-		for _, comp := range g.Components {
-			if target := targets[comp].target; target != "" {
-				rejected[comp] = target
-			}
+		primary := primaryOfGroup(g)
+		if primary == "" {
+			continue
 		}
+		cs := rollout.CanaryStatusFor(&isvc.Status, primary)
+		if cs == nil || cs.RolledBackRevisionHash == "" {
+			continue
+		}
+		addGroupReject(isvc, g, primary, cs.RolledBackRevisionHash, targets, rejected)
 	}
 	return rejected
+}
+
+// addGroupReject records the rejected revision for every member of one
+// rolled-back canary group. A run whose pinned primary revision IS the
+// rejected one supplies the exact member set; failing that (status predating
+// the run model, or a later run that has since overwritten the record) only
+// the primary's hash is known, and the members are reconstructed from their
+// observed targets while those still point at the rejected roll.
+func addGroupReject(
+	isvc *v1beta1.InferenceService,
+	g *v1beta1.RolloutGroup,
+	primary v1beta1.ComponentType,
+	hash string,
+	targets map[v1beta1.ComponentType]targetPair,
+	out map[v1beta1.ComponentType]string,
+) {
+	if isvc.Status.Rollout != nil {
+		var records [][]v1beta1.RolloutRunTarget
+		if active := isvc.Status.Rollout.ActiveRun; active != nil {
+			records = append(records, active.TargetRevisions)
+		}
+		if last := isvc.Status.Rollout.LastRun; last != nil && last.Outcome == v1beta1.RolloutRunRolledBack {
+			records = append(records, last.TargetRevisions)
+		}
+		for _, pinned := range records {
+			if pinnedRevision(pinned, primary) != hash {
+				continue
+			}
+			// Members only: the same run pins other groups' Components, and
+			// their revisions were never the ones this ladder rejected.
+			for _, member := range pinned {
+				if groupHasComponent(g, member.Component) {
+					out[member.Component] = member.Revision
+				}
+			}
+			return
+		}
+	}
+	out[primary] = hash
+	if targets[primary].target != hash {
+		return
+	}
+	for _, comp := range g.Components {
+		if target := targets[comp].target; target != "" {
+			out[comp] = target
+		}
+	}
+}
+
+// pinnedRevision is the revision a run pinned for one Component, "" when the
+// run does not carry it.
+func pinnedRevision(pinned []v1beta1.RolloutRunTarget, comp v1beta1.ComponentType) string {
+	for _, t := range pinned {
+		if t.Component == comp {
+			return t.Revision
+		}
+	}
+	return ""
+}
+
+func groupHasComponent(g *v1beta1.RolloutGroup, comp v1beta1.ComponentType) bool {
+	for _, c := range g.Components {
+		if c == comp {
+			return true
+		}
+	}
+	return false
 }
 
 // divergedMember reports whether any grouped Component needs a roll: its

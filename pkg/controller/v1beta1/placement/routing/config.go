@@ -17,6 +17,11 @@ type Config struct {
 	// disabling the feature is reversible without stranding objects.
 	Enabled bool
 
+	// Observer bounds the controller and HTTP work shared by the optional probe
+	// and capacity inputs. Every limit is required when routing is enabled so an
+	// installation cannot accidentally run an unbounded observer.
+	Observer ObserverConfig
+
 	// Probe configures the active end-to-end health probe. Zero-valued (no path)
 	// means no probing, and the health gate stays readyReplicas > 0.
 	Probe ProbeConfig
@@ -30,11 +35,18 @@ type Config struct {
 	// enables the other.
 	Capacity CapacityConfig
 
-	// Publisher selects an optional deployment-specific backend for the existing
-	// endpoint publisher. Empty retains the Gateway API backend. Options are
-	// opaque here and validated by the selected publisher at manager startup.
+	// Publisher configures the TrafficMap publication backend. An empty name or
+	// "gatewayapi" selects the built-in Gateway API publisher.
 	Publisher PublisherConfig
 }
+
+type configValidationError struct {
+	section string
+	err     error
+}
+
+func (e *configValidationError) Error() string { return e.err.Error() }
+func (e *configValidationError) Unwrap() error { return e.err }
 
 // IsEnabled reports whether TrafficMap generation is on. When false the routing
 // controller publishes nothing and releases what it already owns.
@@ -42,14 +54,103 @@ func (c Config) IsEnabled() bool {
 	return c.Enabled
 }
 
+// Validate checks the operator-level routing policy before controllers start.
+// A disabled installation cannot run either observer, so staged observer and
+// format-plugin settings are intentionally inert until routing is enabled.
+func (c Config) Validate() error {
+	if c.Publisher.ResyncInterval < 0 {
+		return &configValidationError{section: "publisher", err: fmt.Errorf(
+			"routing.publisher.resyncInterval must not be negative")}
+	}
+	if !c.Enabled {
+		return nil
+	}
+	if err := c.Observer.Validate(); err != nil {
+		return &configValidationError{section: "observer", err: err}
+	}
+	if err := c.Probe.Validate(); err != nil {
+		return &configValidationError{section: "probe", err: err}
+	}
+	if c.Probe.IsEnabled() && c.Probe.Period < c.Observer.MinPeriod {
+		return &configValidationError{section: "probe", err: fmt.Errorf(
+			"routing.probe.period (%s) must be at least routing.observer.minPeriod (%s)",
+			c.Probe.Period, c.Observer.MinPeriod)}
+	}
+	if err := c.Capacity.Validate(); err != nil {
+		return &configValidationError{section: "capacity", err: err}
+	}
+	if c.Capacity.IsEnabled() && c.Capacity.Period < c.Observer.MinPeriod {
+		return &configValidationError{section: "capacity", err: fmt.Errorf(
+			"routing.capacity.period (%s) must be at least routing.observer.minPeriod (%s)",
+			c.Capacity.Period, c.Observer.MinPeriod)}
+	}
+	if c.Capacity.IsEnabled() && c.Capacity.samples() > c.Observer.MaxSamples {
+		return &configValidationError{section: "capacity", err: fmt.Errorf(
+			"routing.capacity.samples (%d) must not exceed routing.observer.maxSamples (%d)",
+			c.Capacity.samples(), c.Observer.MaxSamples)}
+	}
+	if c.Publisher.ResyncInterval <= 0 {
+		return &configValidationError{section: "publisher", err: fmt.Errorf(
+			"routing.publisher.resyncInterval must be positive when routing is enabled")}
+	}
+	return nil
+}
+
+// ObserverConfig sets process-wide resource limits for routing observations.
+// Values have no in-code defaults; deployment configuration owns the limits.
+//
+// +kubebuilder:object:generate=false
+type ObserverConfig struct {
+	// MaxConcurrentReconciles caps TrafficMap reconciles running in parallel.
+	MaxConcurrentReconciles int
+
+	// MaxConcurrentRequests caps in-flight probe and capacity HTTP requests.
+	MaxConcurrentRequests int
+
+	// MaxResponseBytes bounds the body read from one observed endpoint.
+	MaxResponseBytes int64
+
+	// MinPeriod is the shortest permitted probe or capacity polling period.
+	MinPeriod time.Duration
+
+	// MaxSamples caps the effective per-home capacity history window.
+	MaxSamples int
+}
+
+// Validate rejects absent or non-positive observer limits.
+func (c ObserverConfig) Validate() error {
+	if c.MaxConcurrentReconciles <= 0 {
+		return fmt.Errorf("routing.observer.maxConcurrentReconciles must be positive when routing is enabled")
+	}
+	if c.MaxConcurrentRequests <= 0 {
+		return fmt.Errorf("routing.observer.maxConcurrentRequests must be positive when routing is enabled")
+	}
+	if c.MaxResponseBytes <= 0 {
+		return fmt.Errorf("routing.observer.maxResponseBytes must be positive when routing is enabled")
+	}
+	if c.MinPeriod <= 0 {
+		return fmt.Errorf("routing.observer.minPeriod must be positive when routing is enabled")
+	}
+	if c.MaxSamples <= 0 {
+		return fmt.Errorf("routing.observer.maxSamples must be positive when routing is enabled")
+	}
+	return nil
+}
+
 // PublisherConfig selects one compiled-in TrafficMap publisher backend.
 //
 // +kubebuilder:object:generate=false
 type PublisherConfig struct {
-	// Name is the registered publisher name. Empty retains the Gateway API
-	// publisher. To disable a stateful publisher safely, leave its name selected
-	// while disabling routing so the shared reconciler can withdraw its state.
+	// Name is the registered publisher name. Empty or "gatewayapi" selects the
+	// built-in Gateway API publisher. To disable a stateful publisher safely,
+	// leave its name selected while disabling routing so the shared reconciler
+	// can withdraw its state.
 	Name string
+
+	// ResyncInterval is the safety cadence for reconciling publisher state.
+	// Active routing requires a positive interval. Disabled cleanup is driven by
+	// object events and permits zero.
+	ResyncInterval time.Duration
 
 	// Options are interpreted and validated only by the named publisher.
 	Options map[string]string
@@ -114,7 +215,23 @@ type ProbeConfig struct {
 	// SuccessThreshold is the number of consecutive passes before a gated home
 	// is restored.
 	SuccessThreshold int
+
+	// AllFailedPolicy controls what happens after every home has independently
+	// crossed the probe failure threshold. PreserveTraffic ignores only the probe
+	// gates and recomputes from ready capacity; Drain preserves the all-zero result
+	// so the publisher removes every route arm. It has no effect while any home is
+	// passing or has no conclusive verdict.
+	AllFailedPolicy AllFailedPolicy
 }
+
+// AllFailedPolicy controls whether a complete, conclusive probe failure is
+// allowed to remove every route arm.
+type AllFailedPolicy string
+
+const (
+	AllFailedPolicyPreserveTraffic AllFailedPolicy = "PreserveTraffic"
+	AllFailedPolicyDrain           AllFailedPolicy = "Drain"
+)
 
 // IsEnabled reports whether probing is configured. Path is the switch: without
 // a target there is nothing to probe and the health gate stays readyReplicas.
@@ -135,11 +252,29 @@ func (p ProbeConfig) Validate() error {
 	if p.Method == "" {
 		return fmt.Errorf("routing.probe.method is required when routing.probe.path is set")
 	}
+	switch p.Method {
+	case "GET", "HEAD", "POST":
+	default:
+		return fmt.Errorf("routing.probe.method %q must be GET, HEAD, or POST", p.Method)
+	}
 	if len(p.AcceptStatuses) == 0 {
 		return fmt.Errorf("routing.probe.acceptStatuses is required when routing.probe.path is set")
 	}
 	if len(p.GateStatuses) == 0 {
 		return fmt.Errorf("routing.probe.gateStatuses is required when routing.probe.path is set")
+	}
+	for _, status := range p.AcceptStatuses {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("routing.probe.acceptStatuses contains invalid HTTP status %d", status)
+		}
+	}
+	for _, status := range p.GateStatuses {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("routing.probe.gateStatuses contains invalid HTTP status %d", status)
+		}
+		if status == 401 || status == 403 || status == 429 {
+			return fmt.Errorf("routing.probe.gateStatuses must not contain %d", status)
+		}
 	}
 	for _, s := range p.AcceptStatuses {
 		for _, g := range p.GateStatuses {
@@ -165,6 +300,12 @@ func (p ProbeConfig) Validate() error {
 	}
 	if p.SuccessThreshold <= 0 {
 		return fmt.Errorf("routing.probe.successThreshold must be positive when routing.probe.path is set")
+	}
+	switch p.AllFailedPolicy {
+	case AllFailedPolicyPreserveTraffic, AllFailedPolicyDrain:
+	default:
+		return fmt.Errorf("routing.probe.allFailedPolicy %q must be %q or %q when routing.probe.path is set",
+			p.AllFailedPolicy, AllFailedPolicyPreserveTraffic, AllFailedPolicyDrain)
 	}
 	return nil
 }
@@ -218,10 +359,9 @@ type CapacityConfig struct {
 	// Method is the HTTP method for the capacity request.
 	Method string
 
-	// Format names the response shape the home answers with. Empty means
-	// FormatReport, the built-in shape. Other formats come from optional
-	// packages compiled into the binary; naming one this build does not carry
-	// is a startup error, not a silent fallback.
+	// Format names the response shape the home answers with. Other formats come
+	// from optional packages compiled into the binary; naming one this build
+	// does not carry is a startup error, not a silent fallback.
 	Format CapacityFormat
 
 	// Options carries format-specific settings, interpreted by the selected
@@ -237,7 +377,6 @@ type CapacityConfig struct {
 	Timeout time.Duration
 
 	// Samples is how many recent readings the applied ceiling is derived from.
-	// Zero uses DefaultCapacitySamples.
 	//
 	// The control plane polls one address per home, so behind a load balancer
 	// successive polls may sample different reporters. Keeping only the latest
@@ -251,7 +390,7 @@ type CapacityConfig struct {
 
 	// Quorum is how many readings in the window must corroborate a lower value
 	// before it is applied: the ceiling is the Quorum-th smallest reading, not
-	// the smallest. Zero uses DefaultCapacityQuorum.
+	// the smallest.
 	//
 	// It tolerates Quorum-1 misbehaving reporters. That is the difference
 	// between believing a pessimist and believing a bug: one router that has
@@ -264,10 +403,9 @@ type CapacityConfig struct {
 	// It is also the lag before a genuine drop is believed: Quorum polls.
 	Quorum int
 
-	// MaxAge is how old a report's observedAt stamp may be and still be
-	// applied. Beyond it the poller falls open to the plan, so a home whose
-	// reporter froze releases its ceiling instead of holding a stale one
-	// forever.
+	// MaxAge is the exclusive upper age bound for a report's observedAt stamp.
+	// At or beyond it the poller falls open to the plan, so a home whose reporter
+	// froze releases its ceiling instead of holding a stale one forever.
 	MaxAge time.Duration
 }
 
@@ -276,11 +414,8 @@ func (c CapacityConfig) IsEnabled() bool {
 	return c.Path != ""
 }
 
-// resolvedFormat returns the configured format, treating empty as FormatReport.
+// resolvedFormat returns the explicitly configured response format.
 func (c CapacityConfig) resolvedFormat() CapacityFormat {
-	if c.Format == "" {
-		return FormatReport
-	}
 	return c.Format
 }
 
@@ -295,6 +430,14 @@ func (c CapacityConfig) Validate() error {
 	}
 	if c.Method == "" {
 		return fmt.Errorf("routing.capacity.method is required when routing.capacity.path is set")
+	}
+	if c.Format == "" {
+		return fmt.Errorf("routing.capacity.format is required when routing.capacity.path is set")
+	}
+	switch c.Method {
+	case "GET", "HEAD", "POST":
+	default:
+		return fmt.Errorf("routing.capacity.method %q must be GET, HEAD, or POST", c.Method)
 	}
 	if c.Period <= 0 {
 		return fmt.Errorf("routing.capacity.period must be positive when routing.capacity.path is set")
@@ -311,16 +454,24 @@ func (c CapacityConfig) Validate() error {
 		// would pin a home's ceiling indefinitely.
 		return fmt.Errorf("routing.capacity.maxAge must be positive when routing.capacity.path is set")
 	}
-	if c.Samples < 0 {
-		return fmt.Errorf("routing.capacity.samples must not be negative")
+	if c.Samples <= 0 {
+		return fmt.Errorf("routing.capacity.samples must be positive when routing.capacity.path is set")
 	}
-	if c.Quorum < 0 {
-		return fmt.Errorf("routing.capacity.quorum must not be negative")
+	if c.Quorum <= 0 {
+		return fmt.Errorf("routing.capacity.quorum must be positive when routing.capacity.path is set")
 	}
 	if q, n := c.quorum(), c.samples(); q > n {
 		// A quorum larger than the window can never be reached, so no reading
 		// would ever lower a ceiling and the input would silently do nothing.
 		return fmt.Errorf("routing.capacity.quorum (%d) must not exceed routing.capacity.samples (%d)", q, n)
+	}
+	if q := c.quorum(); q > 1 {
+		intervals := time.Duration(q)
+		wholePeriods := c.MaxAge / c.Period
+		if wholePeriods < intervals {
+			return fmt.Errorf("routing.capacity.maxAge (%s) must span at least quorum (%d) routing.capacity.period intervals",
+				c.MaxAge, q)
+		}
 	}
 	if c.MaxAge < c.Period {
 		// Every report would age out before the next poll, so the ceiling would
@@ -343,26 +494,8 @@ func (c CapacityConfig) Validate() error {
 	return nil
 }
 
-// Defaults for the capacity sampling window. They live here, in the package
-// that owns the behavior, rather than in the config loader -- the same
-// single-sourcing the other control-plane tuning knobs use. These are algorithm
-// parameters with a safe universal choice, unlike a probe path or a gateway
-// host, which name a specific deployment and so have no default at all.
-const (
-	// DefaultCapacitySamples smooths over enough polls to see several reporters
-	// behind a balancer without making recovery from a low reading slow.
-	DefaultCapacitySamples = 10
-
-	// DefaultCapacityQuorum tolerates exactly one misbehaving reporter. Raise
-	// it if more than one reporter can plausibly be wrong at the same time.
-	DefaultCapacityQuorum = 2
-)
-
 // samples is the effective window length.
 func (c CapacityConfig) samples() int {
-	if c.Samples <= 0 {
-		return DefaultCapacitySamples
-	}
 	return c.Samples
 }
 
@@ -373,8 +506,5 @@ func (c CapacityConfig) samples() int {
 // operator a different corroboration guarantee than the one they configured --
 // and they would have no way to notice.
 func (c CapacityConfig) quorum() int {
-	if c.Quorum <= 0 {
-		return DefaultCapacityQuorum
-	}
 	return c.Quorum
 }

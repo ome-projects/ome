@@ -14,12 +14,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // irKind is the Kind string on the controller owner reference the
@@ -37,8 +38,8 @@ const perRevisionServiceInfix = "-rev-"
 // headless Service name (`<isvc>-<component>-headless`).
 const headlessServiceSuffix = "-headless"
 
-// podGroupPredicate ignores scheduler status churn while preserving changes
-// that can affect reconciliation or complete terminal cleanup.
+// podGroupPredicate ignores gang-scheduler status churn while preserving
+// changes that can affect reconciliation or complete terminal cleanup.
 func podGroupPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(event.CreateEvent) bool { return true },
@@ -51,11 +52,26 @@ func podGroupPredicate() predicate.Predicate {
 				!equality.Semantic.DeepEqual(e.ObjectOld.GetAnnotations(), e.ObjectNew.GetAnnotations()) ||
 				!equality.Semantic.DeepEqual(e.ObjectOld.GetOwnerReferences(), e.ObjectNew.GetOwnerReferences()) ||
 				!equality.Semantic.DeepEqual(e.ObjectOld.GetFinalizers(), e.ObjectNew.GetFinalizers()) ||
-				!equality.Semantic.DeepEqual(e.ObjectOld.GetDeletionTimestamp(), e.ObjectNew.GetDeletionTimestamp())
+				!equality.Semantic.DeepEqual(e.ObjectOld.GetDeletionTimestamp(), e.ObjectNew.GetDeletionTimestamp()) ||
+				podGroupVerdictChanged(e.ObjectOld, e.ObjectNew)
 		},
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
+}
+
+// podGroupVerdictChanged reports whether a status update carries the one
+// reading an Instance acts on: the gang scheduler's phase, which is what
+// says a group has to be rebuilt. Everything else on the status is
+// running member tallies nothing consults, and admitting those would
+// wake the owner on every member transition.
+func podGroupVerdictChanged(oldObj, newObj client.Object) bool {
+	before, okOld := oldObj.(*schedulingv1alpha1.PodGroup)
+	after, okNew := newObj.(*schedulingv1alpha1.PodGroup)
+	if !okOld || !okNew {
+		return false
+	}
+	return before.Status.Phase != after.Status.Phase
 }
 
 // EndpointSliceToIR maps an EndpointSlice for an OMENative drain Service
@@ -186,11 +202,15 @@ func managedByOMENativePredicate() predicate.Predicate {
 //
 //   - Status.Phase — Instance phase aggregation.
 //   - ContainersReady condition — CountReadyPods / AllPodsRuntimeReady.
+//   - PodReady condition — the bar every path stamps Ready on
+//     (query.PodSetPromotable). Kubelet folds the serving gate into it in a
+//     status write that touches nothing else, so without this the promote
+//     waits for the next poll instead of the observation.
 //   - ome.io/serving condition — CountServingPods / RatioBalanced gate.
 //   - ContainerStatuses / InitContainerStatuses — terminal-failure
 //     detection (CrashLoopBackOff / ImagePullBackOff escalation).
 //   - DeletionTimestamp — drain / recreate ordering.
-//   - Spec.SchedulingGates (via workload.PodAdmissionGated) — drives the
+//   - Spec.SchedulingGates (via types.PodAdmissionGated) — drives the
 //     edge-triggered InstanceReadyTimeout park/restart on Kueue gate-exit
 //     (a gate-removal update changes only SchedulingGates, Phase stays
 //     Pending, so without this it would be dropped).
@@ -215,13 +235,16 @@ func podReconcileRelevantChanged(oldPod, newPod *corev1.Pod) bool {
 	if (oldPod.DeletionTimestamp == nil) != (newPod.DeletionTimestamp == nil) {
 		return true
 	}
-	if workload.PodAdmissionGated(oldPod) != workload.PodAdmissionGated(newPod) {
+	if workloadtypes.PodAdmissionGated(oldPod) != workloadtypes.PodAdmissionGated(newPod) {
 		return true
 	}
 	if oldPod.Spec.NodeName != newPod.Spec.NodeName {
 		return true
 	}
 	if podreadiness.IsContainersReady(oldPod) != podreadiness.IsContainersReady(newPod) {
+		return true
+	}
+	if podreadiness.IsPodReady(oldPod) != podreadiness.IsPodReady(newPod) {
 		return true
 	}
 	if podreadiness.IsServing(oldPod) != podreadiness.IsServing(newPod) {
@@ -253,7 +276,7 @@ func podReconcileRelevantChanged(oldPod, newPod *corev1.Pod) bool {
 //     new image into Status.ContainerStatuses[*].Image, so that flip MUST
 //     wake the reconcile or the rollout stalls until the periodic resync.
 //   - State.Waiting (Reason+Message) — terminal-failure / stuck-pod
-//     escalation (workload.PodStuckPullFailure, types.PodTermination).
+//     escalation (evidence.PodStuckInTerminalWaiting, types.PodTermination).
 //   - State.Terminated (ExitCode+Reason+Message) — crash detection
 //     (types.PodTermination).
 //   - LastTerminationState.Terminated (ExitCode+Reason+Message) — a
@@ -355,19 +378,18 @@ var routingLabelKeys = []string{
 // next reconcile could read a stale expectation entry and stay parked
 // behind the create/delete gate until the 2-minute TTL.
 //
-// This mirrors omenative.NewPodEventHandler on the legacy ISVC path.
-// The IR controller needs its own copy because it dispatches the same
+// The IR controller owns this handler because it dispatches the
 // workload pipeline (ops.surgeUpdate / recreateUpdate / Migrate) whose
 // destructive steps gate on ExpectationsCache().Satisfied(); without an
 // observer feeding the SAME cache the dispatcher reads, those gates only
 // release on the TTL and every surge/recreate stalls (Instance pinned at
 // Phase=Updating, readyReplicas=0).
-func newPodEventHandler(exp *workload.Expectations) handler.EventHandler {
+func newPodEventHandler(exp *workloadtypes.Expectations) handler.EventHandler {
 	return &podEventHandler{expectations: exp}
 }
 
 type podEventHandler struct {
-	expectations *workload.Expectations
+	expectations *workloadtypes.Expectations
 }
 
 func (h *podEventHandler) Create(ctx context.Context, evt event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
@@ -447,7 +469,7 @@ func (h *podEventHandler) enqueueOwner(obj client.Object, q workqueue.TypedRateL
 // workloadKeyFromPod pulls (parent-ISVC name, component, instanceIdx)
 // from pod labels — the tuple the workload Expectations cache keys on.
 // Returns ok=false when any required label is missing/unparsable.
-func workloadKeyFromPod(pod *corev1.Pod) (string, workload.ComponentType, int32, bool) {
+func workloadKeyFromPod(pod *corev1.Pod) (string, workloadtypes.ComponentType, int32, bool) {
 	if pod == nil || pod.Labels == nil {
 		return "", "", 0, false
 	}
@@ -466,5 +488,5 @@ func workloadKeyFromPod(pod *corev1.Pod) (string, workload.ComponentType, int32,
 	if !ok {
 		return "", "", 0, false
 	}
-	return isvc, workload.ComponentType(comp), idx, true
+	return isvc, workloadtypes.ComponentType(comp), idx, true
 }

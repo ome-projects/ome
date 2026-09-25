@@ -71,9 +71,18 @@ func IsPodDrained(ctx context.Context, reader client.Reader, namespace, serviceN
 //
 // Not safe for concurrent use; scoped to one reconcile pass.
 type Batcher struct {
-	reader    client.Reader
-	namespace string
-	services  map[string]serviceDrainObservation
+	reader     client.Reader
+	namespace  string
+	services   map[string]serviceDrainObservation
+	sliceLists map[string]sliceListing
+}
+
+// sliceListing is one Service's EndpointSlice LIST, kept so both the
+// drain gate and the rotation observation are answered from the same
+// read of the same pass.
+type sliceListing struct {
+	slices []discoveryv1.EndpointSlice
+	err    error
 }
 
 type serviceDrainObservation struct {
@@ -96,10 +105,23 @@ type routablePodTargets struct {
 // per distinct serviceName.
 func NewBatcher(reader client.Reader, namespace string) *Batcher {
 	return &Batcher{
-		reader:    reader,
-		namespace: namespace,
-		services:  map[string]serviceDrainObservation{},
+		reader:     reader,
+		namespace:  namespace,
+		services:   map[string]serviceDrainObservation{},
+		sliceLists: map[string]sliceListing{},
 	}
+}
+
+// listSlices runs the Service's EndpointSlice LIST at most once per
+// Batcher, error included: a pass that could not read the slices must
+// not read them again and reach a different verdict halfway through.
+func (b *Batcher) listSlices(ctx context.Context, serviceName string) ([]discoveryv1.EndpointSlice, error) {
+	if listing, ok := b.sliceLists[serviceName]; ok {
+		return listing.slices, listing.err
+	}
+	slices, err := EndpointSlicesForService(ctx, b.reader, b.namespace, serviceName)
+	b.sliceLists[serviceName] = sliceListing{slices: slices, err: err}
+	return slices, err
 }
 
 func (b *Batcher) observeService(ctx context.Context, serviceName string) serviceDrainObservation {
@@ -108,7 +130,7 @@ func (b *Batcher) observeService(ctx context.Context, serviceName string) servic
 	}
 
 	observation := serviceDrainObservation{}
-	slices, err := EndpointSlicesForService(ctx, b.reader, b.namespace, serviceName)
+	slices, err := b.listSlices(ctx, serviceName)
 	if err != nil {
 		observation.err = err
 		b.services[serviceName] = observation
@@ -144,6 +166,33 @@ func (b *Batcher) IsPodDrained(ctx context.Context, serviceName string, pod *cor
 		return observation.drainedWithoutSlices, nil
 	}
 	return !observation.routableTargets.contains(pod), nil
+}
+
+// IsPodRouted reports whether pod is still taking traffic through
+// serviceName, off the same memoized slice list the drain gate reads.
+//
+// An empty slice list is not a reading here. IsPodDrained resolves that
+// case against the Service's existence, which is the right answer for a
+// delete gate — no Service, no traffic path, safe to proceed — and the
+// wrong one for an observation of the pod, where a missing or
+// not-yet-propagated Service is a fact about the Service and no evidence
+// that the pod stopped serving. This view abstains instead and reports
+// the pod routed.
+func (b *Batcher) IsPodRouted(ctx context.Context, serviceName string, pod *corev1.Pod) (bool, error) {
+	if pod == nil {
+		return false, fmt.Errorf("IsPodRouted: nil pod")
+	}
+	if serviceName == "" {
+		return false, fmt.Errorf("IsPodRouted: empty serviceName")
+	}
+	slices, err := b.listSlices(ctx, serviceName)
+	if err != nil {
+		return false, err
+	}
+	if len(slices) == 0 {
+		return true, nil
+	}
+	return !podDrainedInSlices(slices, pod), nil
 }
 
 func indexRoutablePodTargets(slices []discoveryv1.EndpointSlice) routablePodTargets {
@@ -258,7 +307,7 @@ func IsPodInRotation(ctx context.Context, reader client.Reader, namespace, servi
 // serviceName via the standard kubernetes.io/service-name label that the
 // in-tree endpointslice controller stamps on every slice it manages.
 //
-// Exported so status_aggregate's availablePodSet helper (which folds
+// Exported so status.AvailablePodSet (which folds
 // rotation across every pod into a single map) can reuse the same
 // label query and slice walk.
 func EndpointSlicesForService(ctx context.Context, reader client.Reader, namespace, serviceName string) ([]discoveryv1.EndpointSlice, error) {

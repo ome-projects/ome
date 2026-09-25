@@ -14,6 +14,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/trafficdrain"
 )
 
 // trafficAnnotationKind classifies an annotation key's expected value
@@ -28,6 +29,7 @@ const (
 	kindBool
 	kindRetryOnList
 	kindPromoteTarget // canary revision hash
+	kindTrafficDrain  // versioned JSON map of manual route-arm holds
 )
 
 // trafficAnnotationKinds is the authoritative classifier for every
@@ -55,6 +57,7 @@ var trafficAnnotationKinds = map[string]trafficAnnotationKind{
 	constants.TimeoutTCPConnectAnnotation:            kindDuration,
 
 	// Operational.
+	constants.TrafficDrainAnnotation:           kindTrafficDrain,
 	constants.ManagedByConflictAckedAnnotation: kindBool,
 	constants.RolloutReadyTimeoutAnnotation:    kindDuration,
 	constants.RevisionHistoryLimitAnnotation:   kindPositiveInt,
@@ -186,6 +189,10 @@ func validateAnnotationValue(key, value string, kind trafficAnnotationKind) erro
 		// nothing else — any other value would sit on the object doing nothing.
 		if !isRevisionHashToken(value) {
 			return fmt.Errorf("annotation %q value %q must be the canary revision hash to promote, copied from status.canary.canaryRevisionHash (lowercase alphanumeric, at least 6 chars); \"full\" is not a supported promotion target (InvalidRolloutPromoteTarget)", key, value)
+		}
+	case kindTrafficDrain:
+		if _, err := trafficdrain.Parse(value); err != nil {
+			return fmt.Errorf("annotation %q is not a valid traffic-drain value (InvalidTrafficDrain): %w", key, err)
 		}
 	}
 	return nil

@@ -62,4 +62,10 @@ type ComponentInputs struct {
 	// disabled feature is expressed via the resolver's Enabled=false, which
 	// fails refs closed instead of silently ignoring them.
 	PolicyResolver *autoscaler.PolicyResolver
+
+	// PacingPartition is the rollout-control partition the canary machine
+	// computed for this Component this reconcile (step hold or plan-gate
+	// hold), projected onto the InferenceReplica's spec.pacing.partition.
+	// nil when no canary governs the Component.
+	PacingPartition *int32
 }

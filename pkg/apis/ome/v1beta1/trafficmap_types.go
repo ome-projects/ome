@@ -3,13 +3,14 @@ package v1beta1
 import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"knative.dev/pkg/apis"
 )
 
-// TrafficMapProgrammed is the condition type reporting whether the active
+// TrafficMapPublished is the condition type reporting whether the active
 // publisher has realized this TrafficMap onto a concrete data plane (e.g. a
-// Gateway API HTTPRoute). Its status mirrors spec.programmed.
-const TrafficMapProgrammed = "Programmed"
+// Gateway API HTTPRoute).
+const TrafficMapPublished = "Published"
 
 // TrafficMapRoutable is the condition type reporting whether this map carries a
 // target a gateway can send traffic to. It is owned by the routing controller,
@@ -18,15 +19,59 @@ const TrafficMapProgrammed = "Programmed"
 // state of the map rather than its absence.
 const TrafficMapRoutable = "Routable"
 
-// Reasons for the Routable condition. NotPlaced and NoAddressableHome accompany
-// Routable=False and an empty table; AllHomesUnready accompanies Routable=True,
-// because the weight fallback still spreads traffic across homes that are
-// addressable but not yet ready rather than black-holing it.
+// TrafficMapOverrideActive reports whether source traffic-drain annotation IDs
+// currently override one or more route-arm weights.
+const TrafficMapOverrideActive = "OverrideActive"
+
+// Reasons for the OverrideActive condition.
 const (
-	TrafficMapReasonRoutable          = "Routable"
-	TrafficMapReasonNotPlaced         = "NotPlaced"
-	TrafficMapReasonNoAddressableHome = "NoAddressableHome"
-	TrafficMapReasonAllHomesUnready   = "AllHomesUnready"
+	TrafficMapReasonOverridesApplied = "OverridesApplied"
+	TrafficMapReasonOverridesPending = "OverridesPending"
+	TrafficMapReasonNoOverrides      = "NoOverrides"
+)
+
+// TrafficMapCapacityFallback is the condition type reporting whether one or
+// more homes are using the control-plane allocation because configured
+// endpoint capacity could not produce a usable ceiling. It is owned by the
+// routing controller.
+const TrafficMapCapacityFallback = "CapacityFallback"
+
+const (
+	// MaxTrafficMapPublisherNameLength bounds a registered publisher identifier
+	// without constraining its implementation-specific naming scheme.
+	MaxTrafficMapPublisherNameLength = 128
+
+	// MaxTrafficMapPublisherTargets bounds the durable publisher claim set.
+	MaxTrafficMapPublisherTargets = 128
+
+	// MaxTrafficMapPublisherTargetLength bounds one opaque canonical target.
+	MaxTrafficMapPublisherTargetLength = 512
+)
+
+// Reasons for the Routable condition. NotPlaced and NoAddressableHome accompany
+// an empty table. AllHomesUnready and NoRoutableCapacity accompany an all-zero
+// table. AllHomesProbeFailed accompanies either the all-zero Drain policy or a
+// positive PreserveTraffic fallback among homes with ready capacity.
+// TrafficDrain identifies an all-zero result caused by manual overrides.
+const (
+	TrafficMapReasonRoutable            = "Routable"
+	TrafficMapReasonNotPlaced           = "NotPlaced"
+	TrafficMapReasonNoAddressableHome   = "NoAddressableHome"
+	TrafficMapReasonAllHomesUnready     = "AllHomesUnready"
+	TrafficMapReasonNoRoutableCapacity  = "NoRoutableCapacity"
+	TrafficMapReasonAllHomesProbeFailed = "AllHomesProbeFailed"
+	TrafficMapReasonTrafficDrain        = "TrafficDrain"
+)
+
+// Reasons for the CapacityFallback condition. The condition has abnormal-true
+// polarity: True means at least one home has fallen open to the control-plane
+// allocation; False means fallback is inactive, including when polling is
+// disabled or there are no homes to observe.
+const (
+	TrafficMapReasonCapacityPollingDisabled   = "CapacityPollingDisabled"
+	TrafficMapReasonNoCapacityTargets         = "NoCapacityTargets"
+	TrafficMapReasonEndpointCapacityAvailable = "EndpointCapacityAvailable"
+	TrafficMapReasonEndpointCapacityFallback  = "EndpointCapacityUnavailable"
 )
 
 // CapacitySource names which input produced an entry's Allocated count.
@@ -74,17 +119,19 @@ const (
 //
 // One TrafficMap exists per routed ISVC, named after it and owned by it (so it
 // is garbage-collected with the ISVC), for as long as that ISVC is routed --
-// including while no home is routable, when the table is empty and the
-// Routable condition says why. The routing controller owns spec and the
-// Routable condition; the publisher owns the rest of status.
+// including while no home is routable, when the table is empty or all-zero and
+// the Routable condition says why. The routing controller owns spec, SourceUID,
+// and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the
+// rest of status.
 // +genclient
 // +k8s:openapi-gen=true
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=tm;tmap
 // +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.spec.mode`
-// +kubebuilder:printcolumn:name="Programmed",type=string,JSONPath=`.status.conditions[?(@.type=="Programmed")].status`
+// +kubebuilder:printcolumn:name="Published",type=string,JSONPath=`.status.conditions[?(@.type=="Published")].status`
 // +kubebuilder:printcolumn:name="Routable",type=string,JSONPath=`.status.conditions[?(@.type=="Routable")].status`
+// +kubebuilder:printcolumn:name="Override",type=string,JSONPath=`.status.conditions[?(@.type=="OverrideActive")].status`
 // +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Routable")].reason`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type TrafficMap struct {
@@ -147,22 +194,27 @@ type TrafficMapEntry struct {
 	Endpoint *apis.URL `json:"endpoint,omitempty"`
 
 	// Weight is the home's final, normalized, capacity-planned, health-gated
-	// traffic share as a relative non-negative integer (matching Gateway API and
-	// Envoy weighted-cluster semantics). A consumer either applies it verbatim or
-	// divides by the sum of weights for a percentage. When every home is unhealthy
-	// the controller writes equal weights rather than all-zero, so traffic is
-	// never black-holed.
+	// traffic share as a relative integer from 0 through 1,000,000. The upper
+	// bound matches the Gateway API backendRef weight limit, so a publisher can
+	// apply it verbatim; another consumer may divide by the sum of weights for a
+	// percentage. Unready and zero-capacity homes always have weight 0. When every
+	// probe conclusively fails, PreserveTraffic may retain capacity-derived
+	// weights for ready homes; Drain writes an authoritative all-zero table.
+	// Manual DrainRefs can force any arm to zero after these automatic inputs.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000000
 	Weight int32 `json:"weight"`
 
-	// Healthy is the health-gate result for this home (readyReplicas > 0). An
-	// unhealthy home is weighted 0 (unless every home is unhealthy).
+	// Healthy is the readiness-plus-probe result for this home. An unready home is
+	// always weighted 0; a probe-unhealthy home may retain a positive weight only
+	// under a fleet-wide PreserveTraffic fallback. A manual DrainRefs override
+	// can set a healthy home to zero without changing its health evidence.
 	// +optional
 	Healthy bool `json:"healthy"`
 
 	// Capacity is the provenance of Weight: weight is proportional to
-	// allocated * factor, gated to 0 when the home has no ready replicas.
+	// min(allocated, ready) * factor, then gated by the active probe.
 	// +optional
 	Capacity *TrafficMapCapacity `json:"capacity,omitempty"`
 
@@ -173,18 +225,37 @@ type TrafficMapEntry struct {
 	// path's (ingress, DNS, certificate, route).
 	// +optional
 	Probe *TrafficMapProbe `json:"probe,omitempty"`
+
+	// DrainRefs names the independent override IDs in the source
+	// InferenceService's ome.io/traffic-drain annotation that force this
+	// entry's weight to zero. Empty means no manual override contributed.
+	// +optional
+	// +listType=set
+	DrainRefs []string `json:"drainRefs,omitempty"`
 }
 
 // TrafficMapProbe records what the active end-to-end probe observed for one
 // home. The probe targets the entry's Endpoint — the URL a client uses — so it
 // covers the whole serving path rather than pod readiness inside the home.
 type TrafficMapProbe struct {
-	// Result is the most recent probe verdict. Only a sustained Failing gates
-	// the weight; Unknown never does.
+	// PolicyDigest identifies the effective probe policy that produced this
+	// observation. A controller may restore hysteresis state after a restart only
+	// when this digest and the entry identity still match.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PolicyDigest string `json:"policyDigest,omitempty"`
+
+	// Result is the most recent probe attempt's verdict. Failing gates only after
+	// the configured threshold. Unknown does not change the previous gate.
 	// +optional
 	Result ProbeResult `json:"result,omitempty"`
 
-	// LastProbeTime is when the probe last reached a verdict, so a stalled
+	// Gated is the current hysteresis gate. It remains true through an Unknown
+	// attempt until enough consecutive passing attempts reopen the home.
+	// +optional
+	Gated bool `json:"gated,omitempty"`
+
+	// LastProbeTime is when the latest probe attempt completed, so a stalled
 	// prober is visible rather than being read as a steady pass.
 	// +optional
 	LastProbeTime *metav1.Time `json:"lastProbeTime,omitempty"`
@@ -205,31 +276,29 @@ type TrafficMapProbe struct {
 
 // TrafficMapCapacity records why an entry's weight is what it is.
 type TrafficMapCapacity struct {
-	// Allocated is the number of replicas this home is intended to run for the
-	// ISVC — the Split apportionment intersected with what the home's
-	// AcceleratorQuota admitted. It is the count basis of the weight.
+	// Allocated is the effective allocation ceiling for this home: the
+	// control-plane-admitted count, optionally lowered by a capacity report.
+	// Ready independently caps it when computing Weight.
 	// +optional
 	Allocated int32 `json:"allocated,omitempty"`
 
-	// Ready is the home's live ready-replica count — the health signal. Zero
-	// means the entry is health-gated to weight 0.
+	// Ready is the home's live ready-replica count. It caps Allocated when
+	// computing Weight; zero health-gates the entry to weight 0.
 	// +optional
 	Ready int32 `json:"ready,omitempty"`
 
 	// Factor is the per-replica relative serving capacity of this home's
 	// accelerator (baseline "1", higher = faster), so heterogeneous hardware is
 	// weighted by capacity rather than raw replica count: weight is proportional
-	// to allocated * factor. Defaults to "1" (homogeneous) when unset — the
+	// to min(allocated, ready) * factor. Defaults to "1" (homogeneous) when unset — the
 	// multiplicative identity, i.e. no scaling. It is operator-supplied config,
 	// never derived from raw hardware FLOPS.
 	// +optional
-	// +kubebuilder:default="1"
 	Factor *resource.Quantity `json:"factor,omitempty"`
 
-	// Source names which input produced Allocated. Without it an operator
-	// reading an unexpected weight cannot tell "the home reported less capacity"
-	// from "the endpoint source was configured but failed open and the plan was
-	// used" — the same number with opposite remediations.
+	// Source names which input produced Allocated. FallbackReason separately
+	// distinguishes an intentionally control-plane-only allocation from a
+	// configured endpoint source that could not supply a usable ceiling.
 	// +optional
 	// +kubebuilder:default=ControlPlane
 	Source CapacitySource `json:"source,omitempty"`
@@ -242,22 +311,36 @@ type TrafficMapCapacity struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Reported *int32 `json:"reported,omitempty"`
+
+	// FallbackReason explains why a configured endpoint capacity source did not
+	// produce an applied ceiling and the control-plane allocation was retained.
+	// Empty means capacity polling is disabled or its latest result was usable.
+	// +optional
+	FallbackReason string `json:"fallbackReason,omitempty"`
 }
 
 // TrafficMapStatus reports whether the active publisher has realized this map
 // onto a concrete data plane, and whether the map has anything to realize.
-// Two writers share it: the publisher owns Programmed, GatewayRef and
-// ObservedTrafficMapGeneration, and the routing controller owns the Routable
-// condition. Conditions is keyed on type, so each writer must patch only its
-// own and never rewrite the list.
+// Two writers share it: the publisher owns Published, GatewayRef,
+// ObservedTrafficMapGeneration, Publisher, and the Published condition; the
+// routing controller owns SourceUID plus the Routable and CapacityFallback
+// conditions. Conditions is keyed on type, so each writer must patch only its
+// own fields and conditions.
 type TrafficMapStatus struct {
-	// Programmed reports whether the active publisher has realized this map onto
+	// SourceUID is the UID of the InferenceService that generated this map. The
+	// routing controller writes it through its own status field manager before a
+	// publisher may create external effects. It remains available if orphan
+	// deletion propagation removes the owner reference.
+	// +optional
+	SourceUID types.UID `json:"sourceUID,omitempty"`
+
+	// Published reports whether the active publisher has realized this map onto
 	// its data plane.
 	// +optional
-	Programmed bool `json:"programmed,omitempty"`
+	Published bool `json:"published,omitempty"`
 
 	// GatewayRef identifies the data plane object realizing this map (e.g. the
-	// HTTPRoute the Gateway API publisher created). Empty until programmed.
+	// HTTPRoute the Gateway API publisher created). Empty until published.
 	// +optional
 	GatewayRef *TrafficMapGatewayRef `json:"gatewayRef,omitempty"`
 
@@ -266,13 +349,51 @@ type TrafficMapStatus struct {
 	// +optional
 	ObservedTrafficMapGeneration int64 `json:"observedTrafficMapGeneration,omitempty"`
 
-	// Conditions carry the Programmed condition.
+	// Publisher records the durable target claims needed to recover or reverse
+	// data-plane mutations made while realizing this map.
+	// +optional
+	Publisher *TrafficMapPublisherStatus `json:"publisher,omitempty"`
+
+	// Conditions carry the routing controller's Routable and CapacityFallback
+	// conditions and the publisher's Published condition.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	// +patchStrategy=merge
 	// +patchMergeKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+}
+
+// TrafficMapPublisherStatus is the durable cleanup journal for one publisher.
+// Claims are persisted before external mutation and retained until their
+// targets have been cleaned up.
+type TrafficMapPublisherStatus struct {
+	// PublisherName identifies the publisher implementation whose cleanup
+	// semantics apply. An implementation upgraded under the same name must remain
+	// able to clean target identifiers written by its prior versions.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	PublisherName string `json:"publisherName"`
+
+	// ClaimedTargets are publisher-defined canonical identifiers owned by this
+	// map. The publisher records the complete claim set before mutating any target.
+	// Identifiers are status-visible and must not contain credentials or secrets.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=512
+	ClaimedTargets []string `json:"claimedTargets,omitempty"`
+
+	// ObservedOptionsDigest is the SHA-256 digest of the effective safe publisher
+	// options used by the most recent successful reconciliation. It is absent
+	// before the first successful reconciliation and does not determine target
+	// ownership.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	ObservedOptionsDigest string `json:"observedOptionsDigest,omitempty"`
 }
 
 // TrafficMapGatewayRef points at the data plane object a publisher created to

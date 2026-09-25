@@ -3,14 +3,17 @@ package ops_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -66,9 +69,11 @@ func sliceWithEndpoint(namespace, sliceName, serviceName string, pod *corev1.Pod
 // buildPlanSinglePodEngineForRestart is the per-Restart-test plan builder.
 // Same shape as buildPlanSinglePodEngine in create_test.go but reads the
 // incarnation from the existing InstanceStatus so subsequent passes drive
-// the post-bump value rather than re-stamping 1.
+// the post-bump value rather than re-stamping 1, and carries the restart
+// policy the pod-churn triggers answer to.
 func buildPlanSinglePodEngineForRestart(c client.Client, isvc *v1beta1.InferenceService) workload.ComponentPlan {
 	plan := buildPlanSinglePodEngine(1)
+	plan.RestartPolicy = workload.RestartPolicyRecreateInstance
 	for _, s := range instanceStatusesOnIR(c, isvc, workload.ComponentEngine) {
 		if s.Index == 0 && s.Incarnation > 0 {
 			plan.Instances[0].Incarnation = s.Incarnation
@@ -312,9 +317,11 @@ func TestRestart_ConvergesAcrossPasses(t *testing.T) {
 	t.Fatalf("Restart did not converge after %d passes", maxPasses)
 }
 
-// makeNewPodReady is a test helper that synthesizes ContainersReady=True
-// on the named pod if it exists and carries the given incarnation label.
-// It mimics what kubelet would write once the runtime is up.
+// makeNewPodReady is the fake kubelet a pass loop needs: on the named pod,
+// if it exists and carries the given incarnation label, it synthesizes
+// ContainersReady=True once the runtime is up and folds the controller's
+// serving gate into PodReady=True once that gate is satisfied — the order
+// kubelet writes them in, and the order the promote bar reads them in.
 func makeNewPodReady(t *testing.T, c client.Client, ns, name string, incarnation int64) {
 	t.Helper()
 	pod := &corev1.Pod{}
@@ -324,18 +331,28 @@ func makeNewPodReady(t *testing.T, c client.Client, ns, name string, incarnation
 	if got := pod.Labels[query.LabelInstanceIncarnation]; got != fmt.Sprintf("%d", incarnation) {
 		return
 	}
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.ContainersReady && cond.Status == corev1.ConditionTrue {
-			return
-		}
+	changed := false
+	if !podreadiness.IsContainersReady(pod) {
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type:               corev1.ContainersReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+		})
+		changed = true
 	}
-	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-		Type:               corev1.ContainersReady,
-		Status:             corev1.ConditionTrue,
-		LastTransitionTime: metav1.Now(),
-	})
+	if podreadiness.IsServing(pod) && !podreadiness.IsPodReady(pod) {
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type:               corev1.PodReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+		})
+		changed = true
+	}
+	if !changed {
+		return
+	}
 	if err := c.Status().Update(context.Background(), pod); err != nil {
-		t.Fatalf("synthesize ContainersReady: %v", err)
+		t.Fatalf("synthesize kubelet readiness: %v", err)
 	}
 }
 
@@ -792,6 +809,26 @@ func TestDetectRestartTrigger_MigratingPhaseWithoutOperation(t *testing.T) {
 	}
 }
 
+// A pair row that escalated keeps its Migrate operation while it reads
+// Failed. The record still owns its end, so neither the lost-member
+// rebuild nor any other restart trigger opens a Restart on it.
+func TestDetectRestartTrigger_FailedMigrateRowStaysClaimed(t *testing.T) {
+	status := workload.InstanceStatus{
+		Index: 0, Incarnation: 74, Phase: workload.InstancePhaseFailed, PodCount: 2,
+		RunningRevision: gangLossRevision,
+		Operation:       &workload.InstanceOperation{Type: workload.InstanceOperationMigrate, Step: "CreatePods"},
+	}
+	input := gangLossInput(status)
+	plan := workload.ComponentPlan{Component: workload.ComponentEngine, RestartPolicy: workload.RestartPolicyRecreateInstance}
+	inst := workload.InstancePlan{Index: 0, Incarnation: 74, Runners: []workload.RunnerPlan{
+		{Name: "leader", Size: 1}, {Name: "worker", Size: 1},
+	}}
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, inst, gangLossPods(1)); needs {
+		t.Fatalf("a Failed row claimed by a migration must not be recreated; got reason %q", reason)
+	}
+}
+
 // runnerStatus builds the runner container status for post-Ready restart
 // scenarios: startedAt is the current run's start; terminated, when
 // non-nil, is the previous run's termination record.
@@ -922,5 +959,726 @@ func TestDetectRestartTrigger_NilReadySinceStaysSilent(t *testing.T) {
 
 	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
 		t.Fatalf("nil ReadySince must not trigger; got reason %q", reason)
+	}
+}
+
+// TestRestart_PromotionWaitsForPodReadyAndWindow: Phase C writes the serving
+// gate on the rebuilt pod, then holds the Ready stamp at the shared promote
+// bar — first until kubelet folds that gate into PodReady, then until the pod
+// has held Ready for the Component's minReadySeconds window. The wait is
+// reported as the window's remainder so the pass wakes on it.
+func TestRestart_PromotionWaitsForPodReadyAndWindow(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 2)
+	ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceRestarting,
+		Operation: &v1beta1.InstanceOperation{
+			Type: v1beta1.InstanceOperationRestart, Step: "Drain", StartedAt: metav1.Now(),
+		},
+	}
+	// Phase A and B are done: the old incarnation is gone and the rebuilt pod
+	// is up but still held out of rotation by the lifecycle gate.
+	pod := podAtIncarnation(isvc, 0, 2, true /* ready */, false /* serving */)
+	c := newFakeClient(t, isvc, ir, pod)
+
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clk := clocktesting.NewFakeClock(start)
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.MinReadySeconds = 20
+
+	restart := func() (bool, *workload.PromoteWindow) {
+		t.Helper()
+		input := buildTestInput(isvc, c, workload.ComponentEngine)
+		input.Clock = clk
+		window := &workload.PromoteWindow{}
+		input.PromoteWindow = window
+		done, err := ops.Restart(context.Background(), workload.Deps{Client: c, Clock: clk}, input, plan, plan.Instances[0], "pod Failed")
+		if err != nil {
+			t.Fatalf("Restart: %v", err)
+		}
+		return done, window
+	}
+
+	done, _ := restart()
+	if done {
+		t.Fatal("promoted on ContainersReady: the pod is not PodReady yet")
+	}
+	live := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), live); err != nil {
+		t.Fatalf("get rebuilt pod: %v", err)
+	}
+	if !podreadiness.IsServing(live) {
+		t.Fatal("Phase C must write the serving gate before waiting on PodReady")
+	}
+	if s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0); s == nil || s.Phase != v1beta1.OMENativeInstanceRestarting {
+		t.Fatalf("row left Restart before the promote bar: %+v", s)
+	}
+
+	// Kubelet folds the gate into PodReady 5s into the 20s window.
+	makeNewPodReady(t, c, isvc.Namespace, pod.Name, 2)
+	live = &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), live); err != nil {
+		t.Fatalf("get PodReady pod: %v", err)
+	}
+	for i := range live.Status.Conditions {
+		if live.Status.Conditions[i].Type == corev1.PodReady {
+			live.Status.Conditions[i].LastTransitionTime = metav1.NewTime(start.Add(-5 * time.Second))
+		}
+	}
+	if err := c.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("age the Ready transition: %v", err)
+	}
+
+	done, window := restart()
+	if done {
+		t.Fatal("promoted inside the minReadySeconds window")
+	}
+	if got, want := window.Pending(), 15*time.Second; got != want {
+		t.Fatalf("reported window remainder: got %s, want %s", got, want)
+	}
+
+	clk.SetTime(start.Add(15 * time.Second))
+	done, window = restart()
+	if !done {
+		t.Fatal("expected the promote once the pod was PodReady past its window")
+	}
+	if got := window.Pending(); got != 0 {
+		t.Fatalf("promoted pass still reported a wait: %s", got)
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil {
+		t.Fatalf("promote: got %+v, want Phase=Ready with no operation", s)
+	}
+}
+
+// TestRestart_DeadlineFailedRowIsNotPromotedByAHealthyPodSet: past the
+// deadline the row reads Failed with the Restart operation preserved,
+// and nothing promotes from there — a healthy set on a spent attempt
+// raises no rebuild trigger, so the restart pass never runs on the row
+// and no Ready stamp is written. Recovery is the Failed machine's
+// business: a corrective revision or a due block.
+func TestRestart_DeadlineFailedRowIsNotPromotedByAHealthyPodSet(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 2)
+	spent := v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceFailed,
+		Operation: &v1beta1.InstanceOperation{
+			ID: "restart-0-1", Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "pod lost",
+			StartedAt: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
+			Deadline:  metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+	}
+	ir.Status.InstanceStatuses[0] = spent
+	// The rebuild came up after the deadline had already ended the attempt.
+	pod := podAtIncarnation(isvc, 0, 2, true /* ready */, true /* serving */)
+	c := newFakeClient(t, isvc, ir, pod)
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("restart trigger: got true (%q) want false; the set is complete and healthy", reason)
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed {
+		t.Fatalf("Phase: got %+v want Failed; nothing promotes a spent attempt", s)
+	}
+	if s.Operation == nil || s.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Errorf("Operation: got %+v want the Restart preserved for the Failed machine", s.Operation)
+	}
+}
+
+// TestRestart_OperatorConfigChangesDoNotChangeWhatItDecides: a repair
+// waiting out its promote window reads none of the knobs that belong to
+// other work — the gang clamp is applied where a PodGroup is built, the
+// migration caps bound requests a repair never raises, and the
+// RetryBlock history cap shapes a prune of superseded blocks. The
+// requeue cadence is read only to pace the next wake-up, and the window
+// remainder the pass already holds outranks it.
+func TestRestart_OperatorConfigChangesDoNotChangeWhatItDecides(t *testing.T) {
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	// One pass over a repair whose rebuilt pod is PodReady but still
+	// inside the Component's minReadySeconds window.
+	run := func(t *testing.T, change func(*workload.ReconcileInput, *workload.ComponentPlan)) (bool, time.Duration, v1beta1.OMENativeInstanceStatus) {
+		t.Helper()
+		resetExpectations(t)
+		isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 2)
+		ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+			Index:       0,
+			Incarnation: 2,
+			Phase:       v1beta1.OMENativeInstanceRestarting,
+			Operation: &v1beta1.InstanceOperation{
+				ID: "restart-0-1", Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "pod lost",
+				StartedAt: metav1.NewTime(start), LastProgressAt: metav1.NewTime(start),
+				Deadline: metav1.NewTime(start.Add(time.Hour)),
+			},
+		}
+		pod := podAtIncarnation(isvc, 0, 2, true /* ready */, true /* serving */)
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+			LastTransitionTime: metav1.NewTime(start.Add(-5 * time.Second)),
+		})
+		c := newFakeClient(t, isvc, ir, pod)
+		clk := clocktesting.NewFakeClock(start)
+		plan := buildPlanSinglePodEngineForRestart(c, isvc)
+		plan.MinReadySeconds = 20
+		input := buildTestInput(isvc, c, workload.ComponentEngine)
+		input.Clock = clk
+		window := &workload.PromoteWindow{}
+		input.PromoteWindow = window
+		if change != nil {
+			change(&input, &plan)
+		}
+
+		done, err := ops.Restart(context.Background(), workload.Deps{Client: c, Clock: clk}, input, plan, plan.Instances[0], "pod lost")
+		if err != nil {
+			t.Fatalf("Restart: %v", err)
+		}
+		s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+		if s == nil {
+			t.Fatalf("instance 0 status: missing")
+		}
+		return done, window.Pending(), *s
+	}
+
+	baseDone, basePending, baseStatus := run(t, nil)
+	if baseDone || basePending == 0 {
+		t.Fatalf("baseline: done=%v pending=%v want a repair still waiting out its window", baseDone, basePending)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		change func(*workload.ReconcileInput, *workload.ComponentPlan)
+	}{
+		{
+			name: "gang schedule clamp",
+			change: func(_ *workload.ReconcileInput, plan *workload.ComponentPlan) {
+				plan.GangScheduleTimeout = &workload.GangScheduleTimeoutClamp{Min: time.Minute, Max: 10 * time.Minute}
+			},
+		},
+		{
+			name: "requeue cadence",
+			change: func(in *workload.ReconcileInput, _ *workload.ComponentPlan) {
+				in.Requeue = workload.RequeueIntervals{Operation: 9 * time.Minute, Gate: 8 * time.Minute}
+			},
+		},
+		{
+			name: "migration audit caps",
+			change: func(in *workload.ReconcileInput, _ *workload.ComponentPlan) {
+				in.MigrationAudit = &workload.MigrationAuditPolicy{MaxInFlight: 1, MaxPerWindow: 2, Window: time.Hour}
+			},
+		},
+		{
+			name: "retry block history",
+			change: func(in *workload.ReconcileInput, _ *workload.ComponentPlan) {
+				in.ObservedState.RetryBlocks = []workload.RetryBlock{
+					{TargetRevision: "llama-70b-engine-stale001", State: workload.RetryBlockHeld},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			done, pending, status := run(t, tc.change)
+			if done != baseDone {
+				t.Errorf("done: got %v want %v", done, baseDone)
+			}
+			if pending != basePending {
+				t.Errorf("promote window remainder: got %v want the baseline %v", pending, basePending)
+			}
+			if !reflect.DeepEqual(status, baseStatus) {
+				t.Errorf("row: got %+v want the baseline %+v", status, baseStatus)
+			}
+		})
+	}
+}
+
+// Op-less crash-loop repair: a Ready row whose pod is wedged in a
+// terminal kubelet waiting reason on the revision it is supposed to be
+// running has no other repair path, so the restart trigger opens one
+// whatever the restart policy says.
+
+const crashLoopRevision = "llama-70b-engine-" + testRevisionHash
+
+// crashLoopingPod is a pod of instance 0 whose runner is parked in a
+// terminal waiting reason, created `age` ago.
+func crashLoopingPod(isvc *v1beta1.InferenceService, reason string, age time.Duration) *corev1.Pod {
+	pod := podForInstance(isvc, 0, false /* ready */, false /* serving */)
+	pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-age))
+	pod.Status.Phase = corev1.PodPending
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  constants.MainContainerName,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+	}}
+	return pod
+}
+
+// crashLoopInput wires a Ready, operation-free row on crashLoopRevision
+// with the stuck-pod grace configured.
+func crashLoopInput(t *testing.T, grace time.Duration) (workload.ReconcileInput, workload.ComponentPlan, *corev1.Pod) {
+	t.Helper()
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	ir.Status.InstanceStatuses[0].RunningRevision = crashLoopRevision
+	pod := crashLoopingPod(isvc, "CrashLoopBackOff", time.Hour)
+	c := newFakeClient(t, isvc, ir, pod)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = grace
+	input.ObservedState.CurrentRevision = crashLoopRevision
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+	return input, plan, pod
+}
+
+// A Ready row with no operation whose pod has been wedged in a terminal
+// waiting reason longer than the grace opens a Restart even under
+// RestartPolicy=None: the pod cannot recover on its own and nothing else
+// repairs it.
+func TestDetectRestartTrigger_OpLessCrashLoopRepairsUnderPolicyNone(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, time.Minute)
+
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod})
+	if !needs {
+		t.Fatalf("expected a restart trigger for an operation-less crash loop under RestartPolicy=None")
+	}
+	if !strings.Contains(reason, "CrashLoopBackOff") || !strings.Contains(reason, pod.Name) {
+		t.Errorf("reason must name the pod and the kubelet reason; got %q", reason)
+	}
+}
+
+// The repair is paced by the grace: evidence younger than
+// lifecycle.stuckPodGracePeriod is an ordinary backoff the kubelet may
+// still resolve.
+func TestDetectRestartTrigger_CrashLoopWithinGraceStaysSilent(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, 2*time.Hour)
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("a wedge inside the grace must not trigger; got reason %q", reason)
+	}
+}
+
+// An unconfigured grace disables the repair outright, exactly as it
+// disables the stuck-pod fast escalation.
+func TestDetectRestartTrigger_UnconfiguredGraceDisablesCrashLoopRepair(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, 0)
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("no configured grace means no repair; got reason %q", reason)
+	}
+}
+
+// A wedged pod whose revision-hash label disagrees with the Component's
+// current revision is a leftover, not this row's workload: there is no
+// revision for a repair to rebuild on, so it belongs to the escalation
+// pass's wedged-pod edge to Failed.
+func TestDetectRestartTrigger_OffRevisionWedgeLeftToEscalation(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, time.Minute)
+	pod.Labels[query.LabelRevisionHash] = "otherrev"
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("an off-revision leftover must not open a repair; got reason %q", reason)
+	}
+}
+
+// A serving pod set is never repaired on the strength of a container
+// waiting reason: the workload is answering traffic and a recycle would
+// take it out.
+func TestDetectRestartTrigger_CrashLoopOnServingPodSetStaysSilent(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, time.Minute)
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: query.ServingConditionType, Status: corev1.ConditionTrue},
+	}
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("a fully serving pod set must not be recycled; got reason %q", reason)
+	}
+}
+
+// The repair answers to the same RetryBlock authority every rebuild does:
+// a revision held after repeated failures is not re-materialized on a
+// loop. A Held block is the one gate verdict with no time bound: it
+// denies every fresh attempt at that target until a different target
+// arrives.
+func TestDetectRestartTrigger_CrashLoopDeniedByHeldRetryBlock(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, time.Minute)
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{{
+		TargetRevision: crashLoopRevision,
+		State:          workload.RetryBlockHeld,
+	}}
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("a held RetryBlock must deny the repair; got reason %q", reason)
+	}
+}
+
+// RestartPolicy=None keeps its meaning for mere container restarts: a
+// runner that died and came back inside the same pod is not a wedge, and
+// the operator asked for it to be left alone.
+func TestDetectRestartTrigger_ContainerRestartStillHonoursPolicyNone(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	readySince := metav1.NewTime(time.Now().Add(-time.Hour))
+	ir.Status.InstanceStatuses[0].ReadySince = &readySince
+
+	pod := podForInstance(isvc, 0, true, true)
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		runnerStatus(constants.MainContainerName, readySince.Add(10*time.Minute), &corev1.ContainerStateTerminated{
+			Reason:     "OOMKilled",
+			ExitCode:   137,
+			FinishedAt: metav1.NewTime(readySince.Add(9 * time.Minute)),
+		}),
+	}
+
+	c := newFakeClient(t, isvc, ir, pod)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = time.Minute
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("RestartPolicy=None must still ignore a bare container restart; got reason %q", reason)
+	}
+}
+
+// Once the repair is open, the row is re-selected on every pass so the
+// Restart state machine advances — a repair that stalls at Phase=Drain
+// under RestartPolicy=None would be worse than never opening one.
+func TestDetectRestartTrigger_OpenRepairKeepsDrivingUnderPolicyNone(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 1)
+	ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       v1beta1.OMENativeInstanceRestarting,
+		Operation:   &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationRestart, Step: "Drain"},
+	})
+	c := newFakeClient(t, isvc, ir)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+
+	if needs, _ := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); !needs {
+		t.Fatalf("an in-flight Restart must keep being driven under RestartPolicy=None")
+	}
+}
+
+// A row below Ready is not this trigger's: an Instance still forming
+// boots through waiting states the kubelet resolves on its own, and the
+// phases before Ready are owned by the passes that materialize them.
+func TestDetectRestartTrigger_PendingRowIsNotACrashLoopRepair(t *testing.T) {
+	input, plan, pod := crashLoopInput(t, time.Minute)
+	for i := range input.ObservedState.InstanceStatuses {
+		input.ObservedState.InstanceStatuses[i].Phase = workload.InstancePhasePending
+	}
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("a Pending row belongs to another pass; got reason %q", reason)
+	}
+}
+
+// A gang is repaired as a unit: one wedged member opens ONE Restart for
+// the Instance, which is what rebuilds the whole pod set. The repair is
+// selected per Instance, so the healthy members are neither separately
+// triggered nor separately counted.
+func TestDetectRestartTrigger_GangWedgedOnOneMemberOpensOneRepair(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	ir.Status.InstanceStatuses[0].RunningRevision = crashLoopRevision
+	ir.Status.InstanceStatuses[0].PodCount = 2
+
+	healthy := podForInstance(isvc, 0, true /* ready */, true /* serving */)
+	wedged := crashLoopingPod(isvc, "CrashLoopBackOff", time.Hour)
+	wedged.Name += "-1"
+	wedged.Labels[query.LabelPodOrdinal] = "1"
+
+	c := newFakeClient(t, isvc, ir, healthy, wedged)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = time.Minute
+	input.ObservedState.CurrentRevision = crashLoopRevision
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+	plan.Instances[0].Runners = []workload.RunnerPlan{{Name: "default", Size: 2}}
+
+	pods := []*corev1.Pod{healthy, wedged}
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], pods)
+	if !needs {
+		t.Fatal("a gang wedged on one member must open a repair for the Instance")
+	}
+	if !strings.Contains(reason, wedged.Name) {
+		t.Errorf("the repair must name the wedged member; got %q", reason)
+	}
+	if !ops.RestartOpensUnavailability(input, plan.Instances[0], pods) {
+		t.Error("the gang repair takes the Instance offline, so it must be admitted like any fresh attempt")
+	}
+}
+
+// Once the repair is stamped it owns the pod set, and the stamp is
+// idempotent: the same wedged pod re-observed on the next pass is the
+// same evidence the repair already acted on, so nothing is armed a
+// second time — no fresh incarnation, no second operation.
+func TestRestart_ReObservedCrashLoopArmsNothingASecondTime(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	ir.Status.InstanceStatuses[0].RunningRevision = crashLoopRevision
+	pod := crashLoopingPod(isvc, "CrashLoopBackOff", time.Hour)
+	c := newFakeClient(t, isvc, ir, pod)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = time.Minute
+	input.ObservedState.CurrentRevision = crashLoopRevision
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+
+	// The stamp lands: the row leaves Ready at a bumped incarnation.
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+		t.Fatalf("Restart (stamp): %v", err)
+	}
+	armed := instanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if armed.Phase != v1beta1.OMENativeInstanceRestarting || armed.Incarnation != 2 {
+		t.Fatalf("stamp: got Phase=%q Incarnation=%d want Restarting at 2", armed.Phase, armed.Incarnation)
+	}
+
+	// The same reason is read again on the next pass, off the same pod.
+	resetExpectations(t)
+	input = buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = time.Minute
+	input.ObservedState.CurrentRevision = crashLoopRevision
+	plan = buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+		t.Fatalf("Restart (re-observation): %v", err)
+	}
+
+	again := instanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if again.Incarnation != armed.Incarnation {
+		t.Errorf("Incarnation: got %d want %d (the stamp is idempotent)", again.Incarnation, armed.Incarnation)
+	}
+	if again.Phase != v1beta1.OMENativeInstanceRestarting {
+		t.Errorf("Phase: got %q want Restarting (the repair still owns the row)", again.Phase)
+	}
+	if again.Operation == nil || again.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Fatalf("Operation: got %+v want the one open repair", again.Operation)
+	}
+}
+
+// Losing the wedged pod in the same pass that stamps the repair only
+// completes work the repair was going to do: the drain has nothing left
+// to flip or delete, so the stamp lands unchanged. From there the
+// repair owns the pod set and recreates the missing member at the
+// bumped incarnation, which is the same answer whether the pod was lost
+// at the stamp or after it.
+func TestRestart_PodLostAsTheRepairStampCommitsStillDrains(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	ir.Status.InstanceStatuses[0].RunningRevision = crashLoopRevision
+	// The pod the crash-loop trigger read is gone by the time the stamp
+	// commits, so the pass sees the index with no pods at all.
+	c := newFakeClient(t, isvc, ir)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = time.Minute
+	input.ObservedState.CurrentRevision = crashLoopRevision
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+
+	s := instanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceRestarting {
+		t.Errorf("Phase: got %q want Restarting (the stamp lands whatever happened to the pod)", s.Phase)
+	}
+	if s.Incarnation != 2 {
+		t.Errorf("Incarnation: got %d want 2", s.Incarnation)
+	}
+	if s.Operation == nil || s.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Fatalf("Operation: got %+v want an open repair", s.Operation)
+	}
+
+	// The repair owns the pod set from here: the next pass rebuilds the
+	// missing member at the bumped incarnation.
+	resetExpectations(t)
+	input = buildTestInput(isvc, c, workload.ComponentEngine)
+	input.StuckPodGrace = time.Minute
+	input.ObservedState.CurrentRevision = crashLoopRevision
+	plan = buildPlanSinglePodEngineForRestart(c, isvc)
+	plan.RestartPolicy = workload.RestartPolicyNone
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+		t.Fatalf("Restart (rebuild): %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods: got %d want 1 (the repair recreates the lost member)", len(pods.Items))
+	}
+	if got := pods.Items[0].Labels[query.LabelInstanceIncarnation]; got != "2" {
+		t.Errorf("new pod %s incarnation label: got %q want 2", pods.Items[0].Name, got)
+	}
+}
+
+// A new target revision arriving while the repair is stamped or open
+// waits for it: the update trigger declines any row below Ready, so the
+// roll re-enters from Ready — or from Failed — once the repair resolves.
+func TestDetectUpdateTrigger_NewTargetWaitsForAnOpenCrashLoopRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		step string
+	}{
+		{name: "stamp landing", step: ""},
+		{name: "repair open", step: "Drain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetExpectations(t)
+			isvc := minimalISVC("llama-70b", "prod", 1)
+			op := &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationRestart, Reason: "pod CrashLoopBackOff"}
+			op.Step = tc.step
+			ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
+				Index:           0,
+				Incarnation:     2,
+				Phase:           v1beta1.OMENativeInstanceRestarting,
+				RunningRevision: crashLoopRevision,
+				Operation:       op,
+			})
+			c := newFakeClient(t, isvc, ir)
+			input := buildTestInput(isvc, c, workload.ComponentEngine)
+			input.ObservedState.CurrentRevision = crashLoopRevision
+			plan := buildPlanSinglePodEngineForRestart(c, isvc)
+
+			target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "prod", Name: "llama-70b-engine-newtarget",
+			}}
+			trigger, _, err := ops.DetectUpdateTriggerWithPods(context.Background(), workload.Deps{Client: c},
+				input, plan, plan.Instances[0], target, nil)
+			if err != nil {
+				t.Fatalf("DetectUpdateTriggerWithPods: %v", err)
+			}
+			if trigger {
+				t.Fatalf("a row below Ready must not be rolled; the new target waits for the repair")
+			}
+		})
+	}
+}
+
+// gangMarkerRevision is the replacement gang's target.
+const gangMarkerRevision = "llama-70b-engine-gangtgt1"
+
+// gangMarkerRow is the surge target marker at markerIndex: Creating with
+// an Update operation whose step says whose lifecycle owns it.
+func gangMarkerRow(markerIndex int32, step string) *workload.InstanceStatus {
+	return &workload.InstanceStatus{
+		Index:          markerIndex,
+		Incarnation:    1,
+		Phase:          workload.InstancePhaseCreating,
+		PodCount:       2,
+		TargetRevision: gangMarkerRevision,
+		Operation: &workload.InstanceOperation{
+			Type:           workload.InstanceOperationUpdate,
+			Step:           step,
+			TargetRevision: gangMarkerRevision,
+		},
+	}
+}
+
+// TestDetectRestartTrigger_GangSurgeMarkerIsNotRepairedOnItsOwn: the
+// restart trigger declines a row whose non-Create operation is
+// preserved, so a terminal replacement pod is not recreated behind the
+// surge's back. The marker converges only through the stuck or deadline
+// escalation, and the same holds once it has been retired.
+func TestDetectRestartTrigger_GangSurgeMarkerIsNotRepairedOnItsOwn(t *testing.T) {
+	for _, step := range []string{
+		workload.UpdateStepGangSurgeTarget,
+		workload.UpdateStepGangSurgeTargetCleanup,
+	} {
+		for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodSucceeded} {
+			t.Run(step+"/"+string(phase), func(t *testing.T) {
+				runGangMarkerTerminalPodCase(t, step, phase)
+			})
+		}
+	}
+}
+
+// runGangMarkerTerminalPodCase drives one (marker step, terminal phase)
+// pair through the restart trigger.
+func runGangMarkerTerminalPodCase(t *testing.T, step string, phase corev1.PodPhase) {
+	t.Helper()
+	markerIndex := int32(2)
+	marker := gangMarkerRow(markerIndex, step)
+	input := workload.ReconcileInput{
+		ObservedState: workload.WorkloadObservedState{
+			InstanceStatuses: []workload.InstanceStatus{*marker},
+			CurrentRevision:  gangMarkerRevision,
+		},
+		StuckPodGrace: time.Minute,
+	}
+	plan := workload.ComponentPlan{
+		RestartPolicy: workload.RestartPolicyRecreateInstance,
+		Instances: []workload.InstancePlan{{
+			Index: markerIndex, Incarnation: 1,
+			Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}},
+		}},
+	}
+	terminal := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "llama-70b-engine-2-leader-0",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+		Status: corev1.PodStatus{Phase: phase},
+	}
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{terminal}); needs {
+		t.Fatalf("the marker's pods belong to the surge, not the repair; got reason %q", reason)
+	}
+}
+
+// TestDetectRestartTrigger_PromotedGangTargetOwnsAMissingMember: the
+// promote clears the operation and stamps the index Ready, which is an
+// ordinary Instance in every respect. Losing a member as that lands, or
+// at any point after it, is therefore the restart pass's business — the
+// surge has no claim on the index any more.
+func TestDetectRestartTrigger_PromotedGangTargetOwnsAMissingMember(t *testing.T) {
+	markerIndex := int32(2)
+	promoted := workload.InstanceStatus{
+		Index:           markerIndex,
+		Incarnation:     1,
+		Phase:           workload.InstancePhaseReady,
+		PodCount:        2,
+		RunningRevision: gangMarkerRevision,
+		ReadySince:      &metav1.Time{Time: time.Now().Add(-time.Hour)},
+	}
+	input := workload.ReconcileInput{
+		ObservedState: workload.WorkloadObservedState{
+			InstanceStatuses: []workload.InstanceStatus{promoted},
+			CurrentRevision:  gangMarkerRevision,
+		},
+		StuckPodGrace: time.Minute,
+	}
+	plan := workload.ComponentPlan{
+		RestartPolicy: workload.RestartPolicyRecreateInstance,
+		Instances: []workload.InstancePlan{{
+			Index: markerIndex, Incarnation: 1,
+			Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}},
+		}},
+	}
+	survivor := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "llama-70b-engine-2-leader-0",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{survivor})
+	if !needs {
+		t.Fatalf("a promoted gang index missing a member must be repaired by the restart pass")
+	}
+	if reason == "" {
+		t.Errorf("the repair must name why it was opened")
 	}
 }

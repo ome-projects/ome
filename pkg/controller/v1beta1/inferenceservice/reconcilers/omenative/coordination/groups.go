@@ -71,7 +71,11 @@ func ResolveGroups(spec *v1beta1.RolloutSpec, defaults GroupDefaults) []Resolved
 	out := make([]ResolvedGroup, 0, len(spec.Groups))
 	for i := range spec.Groups {
 		g := &spec.Groups[i]
-		if g.Canary != nil {
+		// Keyed on the DECLARED progression, not an inline body: a group whose
+		// canary comes from a policyRef has no inline arm to test, and reading
+		// it as blueGreen would hand a gated Component to the coordination
+		// engine and surge it with nothing analysing the result.
+		if g.DeclaredProgression() == v1beta1.RolloutProgressionCanary {
 			continue // canary groups are the canary engine's responsibility
 		}
 		out = append(out, resolveGroup(i, g, defaults))
@@ -138,15 +142,15 @@ func resolveGroup(idx int, g *v1beta1.RolloutGroup, defaults GroupDefaults) Reso
 	if g.Soak != nil {
 		out.Soak = g.Soak.Duration
 	}
-	if g.RollingUpdate != nil {
+	// The DECLARED progression, so a ref-only group resolves to the policy it
+	// names rather than to the no-progression default. Canary groups were
+	// already skipped by the caller; rollingUpdate and blueGreen are the two
+	// coordination-style kinds left. "No progression" and explicit blueGreen
+	// share the blueGreen path, which is what lets collapseSequential fold a
+	// run of single-Component groups into the Sequential state machine.
+	if g.DeclaredProgression() == v1beta1.RolloutProgressionRollingUpdate {
 		out.Policy = v1beta1.CoordinationPolicyRollingUpdate
 	} else {
-		// blueGreen — either set explicitly, or the default when the group names no
-		// progression at all (the one-of is at-most-one). Canary groups were already
-		// skipped by the caller, so "no progression" and explicit blueGreen share
-		// this path. A single-Component no-progression group therefore resolves to
-		// BlueGreen, which is what lets collapseSequential fold a run of them into
-		// the Sequential state machine.
 		out.Policy = v1beta1.CoordinationPolicyBlueGreen
 	}
 	out.Pacing = groupPacing(g, len(components), defaults)

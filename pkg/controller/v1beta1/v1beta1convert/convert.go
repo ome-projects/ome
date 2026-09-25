@@ -21,35 +21,35 @@ package v1beta1convert
 
 import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // ComponentTypeToWorkload converts a v1beta1.ComponentType to a
 // workload.ComponentType. Unknown values map to the empty string so
 // adapters tolerate API-version skew without panicking.
-func ComponentTypeToWorkload(v v1beta1.ComponentType) workload.ComponentType {
+func ComponentTypeToWorkload(v v1beta1.ComponentType) workloadtypes.ComponentType {
 	switch v {
 	case v1beta1.RouterComponent:
-		return workload.ComponentRouter
+		return workloadtypes.ComponentRouter
 	case v1beta1.EngineComponent:
-		return workload.ComponentEngine
+		return workloadtypes.ComponentEngine
 	case v1beta1.DecoderComponent:
-		return workload.ComponentDecoder
+		return workloadtypes.ComponentDecoder
 	default:
-		return workload.ComponentType("")
+		return workloadtypes.ComponentType("")
 	}
 }
 
 // ComponentTypeFromWorkload converts a workload.ComponentType to a
 // v1beta1.ComponentType. Unknown values map to the empty string so
 // adapters tolerate API-version skew without panicking.
-func ComponentTypeFromWorkload(w workload.ComponentType) v1beta1.ComponentType {
+func ComponentTypeFromWorkload(w workloadtypes.ComponentType) v1beta1.ComponentType {
 	switch w {
-	case workload.ComponentRouter:
+	case workloadtypes.ComponentRouter:
 		return v1beta1.RouterComponent
-	case workload.ComponentEngine:
+	case workloadtypes.ComponentEngine:
 		return v1beta1.EngineComponent
-	case workload.ComponentDecoder:
+	case workloadtypes.ComponentDecoder:
 		return v1beta1.DecoderComponent
 	default:
 		return v1beta1.ComponentType("")
@@ -59,53 +59,53 @@ func ComponentTypeFromWorkload(w workload.ComponentType) v1beta1.ComponentType {
 // InstancePhaseToWorkload converts a v1beta1.OMENativeInstancePhase to
 // a workload.InstancePhase. Unknown values map to the empty phase so
 // adapters tolerate API-version skew without panicking.
-func InstancePhaseToWorkload(v v1beta1.OMENativeInstancePhase) workload.InstancePhase {
+func InstancePhaseToWorkload(v v1beta1.OMENativeInstancePhase) workloadtypes.InstancePhase {
 	switch v {
 	case "":
-		return workload.InstancePhaseEmpty
+		return workloadtypes.InstancePhaseEmpty
 	case v1beta1.OMENativeInstancePending:
-		return workload.InstancePhasePending
+		return workloadtypes.InstancePhasePending
 	case v1beta1.OMENativeInstanceCreating:
-		return workload.InstancePhaseCreating
+		return workloadtypes.InstancePhaseCreating
 	case v1beta1.OMENativeInstanceReady:
-		return workload.InstancePhaseReady
+		return workloadtypes.InstancePhaseReady
 	case v1beta1.OMENativeInstanceUpdating:
-		return workload.InstancePhaseUpdating
+		return workloadtypes.InstancePhaseUpdating
 	case v1beta1.OMENativeInstanceRestarting:
-		return workload.InstancePhaseRestarting
+		return workloadtypes.InstancePhaseRestarting
 	case v1beta1.OMENativeInstanceMigrating:
-		return workload.InstancePhaseMigrating
+		return workloadtypes.InstancePhaseMigrating
 	case v1beta1.OMENativeInstanceFailed:
-		return workload.InstancePhaseFailed
+		return workloadtypes.InstancePhaseFailed
 	case v1beta1.OMENativeInstanceDeleting:
-		return workload.InstancePhaseDeleting
+		return workloadtypes.InstancePhaseDeleting
 	default:
-		return workload.InstancePhaseEmpty
+		return workloadtypes.InstancePhaseEmpty
 	}
 }
 
 // InstancePhaseFromWorkload converts a workload.InstancePhase to a
 // v1beta1.OMENativeInstancePhase. Unknown values map to the empty
 // phase so adapters tolerate API-version skew without panicking.
-func InstancePhaseFromWorkload(w workload.InstancePhase) v1beta1.OMENativeInstancePhase {
+func InstancePhaseFromWorkload(w workloadtypes.InstancePhase) v1beta1.OMENativeInstancePhase {
 	switch w {
-	case workload.InstancePhaseEmpty:
+	case workloadtypes.InstancePhaseEmpty:
 		return v1beta1.OMENativeInstancePhase("")
-	case workload.InstancePhasePending:
+	case workloadtypes.InstancePhasePending:
 		return v1beta1.OMENativeInstancePending
-	case workload.InstancePhaseCreating:
+	case workloadtypes.InstancePhaseCreating:
 		return v1beta1.OMENativeInstanceCreating
-	case workload.InstancePhaseReady:
+	case workloadtypes.InstancePhaseReady:
 		return v1beta1.OMENativeInstanceReady
-	case workload.InstancePhaseUpdating:
+	case workloadtypes.InstancePhaseUpdating:
 		return v1beta1.OMENativeInstanceUpdating
-	case workload.InstancePhaseRestarting:
+	case workloadtypes.InstancePhaseRestarting:
 		return v1beta1.OMENativeInstanceRestarting
-	case workload.InstancePhaseMigrating:
+	case workloadtypes.InstancePhaseMigrating:
 		return v1beta1.OMENativeInstanceMigrating
-	case workload.InstancePhaseFailed:
+	case workloadtypes.InstancePhaseFailed:
 		return v1beta1.OMENativeInstanceFailed
-	case workload.InstancePhaseDeleting:
+	case workloadtypes.InstancePhaseDeleting:
 		return v1beta1.OMENativeInstanceDeleting
 	default:
 		return v1beta1.OMENativeInstancePhase("")
@@ -120,33 +120,33 @@ func InstancePhaseFromWorkload(w workload.InstancePhase) v1beta1.OMENativeInstan
 // constants exclusively — this converter is the only seam where the
 // CRD-shape strategy enters workload code, so any future drift between
 // the v1beta1 enum and the workload enum becomes a compile-time error.
-func UpdateStrategyTypeToWorkload(v v1beta1.UpdateStrategyType) workload.UpdateStrategyType {
+func UpdateStrategyTypeToWorkload(v v1beta1.UpdateStrategyType) workloadtypes.UpdateStrategyType {
 	switch v {
 	case v1beta1.UpdateStrategySurgeThenDrain:
-		return workload.UpdateStrategySurgeThenDrain
+		return workloadtypes.UpdateStrategySurgeThenDrain
 	case v1beta1.UpdateStrategyRecreatePod:
-		return workload.UpdateStrategyRecreatePod
+		return workloadtypes.UpdateStrategyRecreatePod
 	case v1beta1.UpdateStrategyInPlaceIfPossible:
-		return workload.UpdateStrategyInPlaceIfPossible
+		return workloadtypes.UpdateStrategyInPlaceIfPossible
 	case v1beta1.UpdateStrategyInPlaceOnly:
-		return workload.UpdateStrategyInPlaceOnly
+		return workloadtypes.UpdateStrategyInPlaceOnly
 	default:
-		return workload.UpdateStrategyType("")
+		return workloadtypes.UpdateStrategyType("")
 	}
 }
 
 // UpdateStrategyTypeFromWorkload converts a workload.UpdateStrategyType
 // to a v1beta1.UpdateStrategyType. Unknown values map to the
 // empty string so adapters tolerate API-version skew without panicking.
-func UpdateStrategyTypeFromWorkload(w workload.UpdateStrategyType) v1beta1.UpdateStrategyType {
+func UpdateStrategyTypeFromWorkload(w workloadtypes.UpdateStrategyType) v1beta1.UpdateStrategyType {
 	switch w {
-	case workload.UpdateStrategySurgeThenDrain:
+	case workloadtypes.UpdateStrategySurgeThenDrain:
 		return v1beta1.UpdateStrategySurgeThenDrain
-	case workload.UpdateStrategyRecreatePod:
+	case workloadtypes.UpdateStrategyRecreatePod:
 		return v1beta1.UpdateStrategyRecreatePod
-	case workload.UpdateStrategyInPlaceIfPossible:
+	case workloadtypes.UpdateStrategyInPlaceIfPossible:
 		return v1beta1.UpdateStrategyInPlaceIfPossible
-	case workload.UpdateStrategyInPlaceOnly:
+	case workloadtypes.UpdateStrategyInPlaceOnly:
 		return v1beta1.UpdateStrategyInPlaceOnly
 	default:
 		return v1beta1.UpdateStrategyType("")
@@ -156,37 +156,37 @@ func UpdateStrategyTypeFromWorkload(w workload.UpdateStrategyType) v1beta1.Updat
 // InstanceOperationTypeToWorkload converts a v1beta1.InstanceOperationType
 // to a workload.InstanceOperationType. Unknown values map to the empty
 // string so adapters tolerate API-version skew without panicking.
-func InstanceOperationTypeToWorkload(v v1beta1.InstanceOperationType) workload.InstanceOperationType {
+func InstanceOperationTypeToWorkload(v v1beta1.InstanceOperationType) workloadtypes.InstanceOperationType {
 	switch v {
 	case v1beta1.InstanceOperationCreate:
-		return workload.InstanceOperationCreate
+		return workloadtypes.InstanceOperationCreate
 	case v1beta1.InstanceOperationUpdate:
-		return workload.InstanceOperationUpdate
+		return workloadtypes.InstanceOperationUpdate
 	case v1beta1.InstanceOperationRestart:
-		return workload.InstanceOperationRestart
+		return workloadtypes.InstanceOperationRestart
 	case v1beta1.InstanceOperationMigrate:
-		return workload.InstanceOperationMigrate
+		return workloadtypes.InstanceOperationMigrate
 	case v1beta1.InstanceOperationDelete:
-		return workload.InstanceOperationDelete
+		return workloadtypes.InstanceOperationDelete
 	default:
-		return workload.InstanceOperationType("")
+		return workloadtypes.InstanceOperationType("")
 	}
 }
 
 // InstanceOperationTypeFromWorkload converts a workload.InstanceOperationType
 // to a v1beta1.InstanceOperationType. Unknown values map to the empty
 // string so adapters tolerate API-version skew without panicking.
-func InstanceOperationTypeFromWorkload(w workload.InstanceOperationType) v1beta1.InstanceOperationType {
+func InstanceOperationTypeFromWorkload(w workloadtypes.InstanceOperationType) v1beta1.InstanceOperationType {
 	switch w {
-	case workload.InstanceOperationCreate:
+	case workloadtypes.InstanceOperationCreate:
 		return v1beta1.InstanceOperationCreate
-	case workload.InstanceOperationUpdate:
+	case workloadtypes.InstanceOperationUpdate:
 		return v1beta1.InstanceOperationUpdate
-	case workload.InstanceOperationRestart:
+	case workloadtypes.InstanceOperationRestart:
 		return v1beta1.InstanceOperationRestart
-	case workload.InstanceOperationMigrate:
+	case workloadtypes.InstanceOperationMigrate:
 		return v1beta1.InstanceOperationMigrate
-	case workload.InstanceOperationDelete:
+	case workloadtypes.InstanceOperationDelete:
 		return v1beta1.InstanceOperationDelete
 	default:
 		return v1beta1.InstanceOperationType("")
@@ -198,11 +198,11 @@ func InstanceOperationTypeFromWorkload(w workload.InstanceOperationType) v1beta1
 // copied by value (the returned struct allocates a fresh *int32 so
 // callers can mutate it independently). HintTargetNodes is copied
 // element-by-element into a freshly allocated slice for the same reason.
-func InstanceOperationToWorkload(v *v1beta1.InstanceOperation) *workload.InstanceOperation {
+func InstanceOperationToWorkload(v *v1beta1.InstanceOperation) *workloadtypes.InstanceOperation {
 	if v == nil {
 		return nil
 	}
-	out := &workload.InstanceOperation{
+	out := &workloadtypes.InstanceOperation{
 		ID:             v.ID,
 		Type:           InstanceOperationTypeToWorkload(v.Type),
 		Step:           v.Step,
@@ -213,8 +213,13 @@ func InstanceOperationToWorkload(v *v1beta1.InstanceOperation) *workload.Instanc
 		TargetRevision: v.TargetRevision,
 		Reason:         v.Reason,
 		Waiting:        v.Waiting,
+		Strategy:       UpdateStrategyTypeToWorkload(v1beta1.UpdateStrategyType(v.Strategy)),
 		FromNode:       v.FromNode,
 		RequestUUID:    v.RequestUUID,
+	}
+	if v.CapacityRefusedAt != nil {
+		at := *v.CapacityRefusedAt
+		out.CapacityRefusedAt = &at
 	}
 	if v.SurgeIndex != nil {
 		s := *v.SurgeIndex
@@ -230,7 +235,7 @@ func InstanceOperationToWorkload(v *v1beta1.InstanceOperation) *workload.Instanc
 // to a *v1beta1.InstanceOperation. Returns nil if w is nil. Pointer and
 // slice fields are deep-copied for the same isolation reasons as
 // InstanceOperationToWorkload.
-func InstanceOperationFromWorkload(w *workload.InstanceOperation) *v1beta1.InstanceOperation {
+func InstanceOperationFromWorkload(w *workloadtypes.InstanceOperation) *v1beta1.InstanceOperation {
 	if w == nil {
 		return nil
 	}
@@ -245,8 +250,13 @@ func InstanceOperationFromWorkload(w *workload.InstanceOperation) *v1beta1.Insta
 		TargetRevision: w.TargetRevision,
 		Reason:         w.Reason,
 		Waiting:        w.Waiting,
+		Strategy:       string(UpdateStrategyTypeFromWorkload(w.Strategy)),
 		FromNode:       w.FromNode,
 		RequestUUID:    w.RequestUUID,
+	}
+	if w.CapacityRefusedAt != nil {
+		at := *w.CapacityRefusedAt
+		out.CapacityRefusedAt = &at
 	}
 	if w.SurgeIndex != nil {
 		s := *w.SurgeIndex
@@ -262,11 +272,11 @@ func InstanceOperationFromWorkload(w *workload.InstanceOperation) *v1beta1.Insta
 // to a *workload.InstanceTermination. Returns nil if v is nil. ExitCode is
 // copied by value (the returned struct allocates a fresh *int32) so callers
 // can mutate it independently.
-func InstanceTerminationToWorkload(v *v1beta1.InstanceTermination) *workload.InstanceTermination {
+func InstanceTerminationToWorkload(v *v1beta1.InstanceTermination) *workloadtypes.InstanceTermination {
 	if v == nil {
 		return nil
 	}
-	out := &workload.InstanceTermination{
+	out := &workloadtypes.InstanceTermination{
 		PodName:       v.PodName,
 		ContainerName: v.ContainerName,
 		Reason:        v.Reason,
@@ -283,7 +293,7 @@ func InstanceTerminationToWorkload(v *v1beta1.InstanceTermination) *workload.Ins
 // InstanceTerminationFromWorkload converts a *workload.InstanceTermination
 // to a *v1beta1.InstanceTermination. Returns nil if w is nil. ExitCode is
 // deep-copied for the same isolation reason as InstanceTerminationToWorkload.
-func InstanceTerminationFromWorkload(w *workload.InstanceTermination) *v1beta1.InstanceTermination {
+func InstanceTerminationFromWorkload(w *workloadtypes.InstanceTermination) *v1beta1.InstanceTermination {
 	if w == nil {
 		return nil
 	}
@@ -306,8 +316,8 @@ func InstanceTerminationFromWorkload(w *workload.InstanceTermination) *v1beta1.I
 // are deep-copied so the returned struct can be mutated independently
 // of the source. Operation is allocated via InstanceOperationToWorkload;
 // LastFailure via InstanceTerminationToWorkload.
-func InstanceStatusToWorkload(v v1beta1.OMENativeInstanceStatus) workload.InstanceStatus {
-	out := workload.InstanceStatus{
+func InstanceStatusToWorkload(v v1beta1.OMENativeInstanceStatus) workloadtypes.InstanceStatus {
+	out := workloadtypes.InstanceStatus{
 		Index:             v.Index,
 		Incarnation:       v.Incarnation,
 		Phase:             InstancePhaseToWorkload(v.Phase),
@@ -330,6 +340,9 @@ func InstanceStatusToWorkload(v v1beta1.OMENativeInstanceStatus) workload.Instan
 	if v.Conditions != nil {
 		out.Conditions = append(out.Conditions, v.Conditions...)
 	}
+	if v.Announced != nil {
+		out.Announced = append([]string(nil), v.Announced...)
+	}
 	return out
 }
 
@@ -337,7 +350,7 @@ func InstanceStatusToWorkload(v v1beta1.OMENativeInstanceStatus) workload.Instan
 // v1beta1.OMENativeInstanceStatus. Slices and Operation pointer are
 // deep-copied for the same isolation reasons as
 // InstanceStatusToWorkload.
-func InstanceStatusFromWorkload(w workload.InstanceStatus) v1beta1.OMENativeInstanceStatus {
+func InstanceStatusFromWorkload(w workloadtypes.InstanceStatus) v1beta1.OMENativeInstanceStatus {
 	out := v1beta1.OMENativeInstanceStatus{
 		Index:             w.Index,
 		Incarnation:       w.Incarnation,
@@ -361,17 +374,20 @@ func InstanceStatusFromWorkload(w workload.InstanceStatus) v1beta1.OMENativeInst
 	if w.Conditions != nil {
 		out.Conditions = append(out.Conditions, w.Conditions...)
 	}
+	if w.Announced != nil {
+		out.Announced = append([]string(nil), w.Announced...)
+	}
 	return out
 }
 
 // InstanceStatusSliceToWorkload converts a slice of
 // v1beta1.OMENativeInstanceStatus to a slice of workload.InstanceStatus.
 // Returns nil when in is nil so the round-trip preserves nilness.
-func InstanceStatusSliceToWorkload(in []v1beta1.OMENativeInstanceStatus) []workload.InstanceStatus {
+func InstanceStatusSliceToWorkload(in []v1beta1.OMENativeInstanceStatus) []workloadtypes.InstanceStatus {
 	if in == nil {
 		return nil
 	}
-	out := make([]workload.InstanceStatus, len(in))
+	out := make([]workloadtypes.InstanceStatus, len(in))
 	for i := range in {
 		out[i] = InstanceStatusToWorkload(in[i])
 	}
@@ -381,7 +397,7 @@ func InstanceStatusSliceToWorkload(in []v1beta1.OMENativeInstanceStatus) []workl
 // InstanceStatusSliceFromWorkload converts a slice of
 // workload.InstanceStatus to a slice of v1beta1.OMENativeInstanceStatus.
 // Returns nil when in is nil so the round-trip preserves nilness.
-func InstanceStatusSliceFromWorkload(in []workload.InstanceStatus) []v1beta1.OMENativeInstanceStatus {
+func InstanceStatusSliceFromWorkload(in []workloadtypes.InstanceStatus) []v1beta1.OMENativeInstanceStatus {
 	if in == nil {
 		return nil
 	}
@@ -395,68 +411,63 @@ func InstanceStatusSliceFromWorkload(in []workload.InstanceStatus) []v1beta1.OME
 // InstanceRestartPolicyToWorkload converts a v1beta1.InstanceRestartPolicy
 // to a workload.RestartPolicy. Unknown values map to the empty policy
 // so adapters tolerate API-version skew without panicking.
-func InstanceRestartPolicyToWorkload(v v1beta1.InstanceRestartPolicy) workload.RestartPolicy {
+func InstanceRestartPolicyToWorkload(v v1beta1.InstanceRestartPolicy) workloadtypes.RestartPolicy {
 	switch v {
 	case v1beta1.InstanceRestartPolicyNone:
-		return workload.RestartPolicyNone
+		return workloadtypes.RestartPolicyNone
 	case v1beta1.InstanceRestartPolicyRecreateInstance:
-		return workload.RestartPolicyRecreateInstance
+		return workloadtypes.RestartPolicyRecreateInstance
 	default:
-		return workload.RestartPolicy("")
+		return workloadtypes.RestartPolicy("")
 	}
 }
 
 // InstanceReadyPolicyToWorkload converts a v1beta1.InstanceReadyPolicy
 // to a workload.InstanceReadyPolicy. Unknown values map to the empty
 // policy so adapters tolerate API-version skew without panicking.
-func InstanceReadyPolicyToWorkload(v v1beta1.InstanceReadyPolicy) workload.InstanceReadyPolicy {
+func InstanceReadyPolicyToWorkload(v v1beta1.InstanceReadyPolicy) workloadtypes.InstanceReadyPolicy {
 	switch v {
 	case v1beta1.InstanceReadyPolicyAllPodReady:
-		return workload.InstanceReadyPolicyAllPodReady
+		return workloadtypes.InstanceReadyPolicyAllPodReady
 	case v1beta1.InstanceReadyPolicyNone:
-		return workload.InstanceReadyPolicyNone
+		return workloadtypes.InstanceReadyPolicyNone
 	default:
-		return workload.InstanceReadyPolicy("")
+		return workloadtypes.InstanceReadyPolicy("")
 	}
 }
 
 // MigrationModeToWorkload converts a v1beta1.MigrationPolicyMode to a
 // workload.MigrationMode. Unknown values map to the empty mode so
 // adapters tolerate API-version skew without panicking.
-func MigrationModeToWorkload(v v1beta1.MigrationPolicyMode) workload.MigrationMode {
+func MigrationModeToWorkload(v v1beta1.MigrationPolicyMode) workloadtypes.MigrationMode {
 	switch v {
 	case v1beta1.MigrationPolicyModeAuto:
-		return workload.MigrationModeAuto
+		return workloadtypes.MigrationModeAuto
 	case v1beta1.MigrationPolicyModeSurge:
-		return workload.MigrationModeSurge
+		return workloadtypes.MigrationModeSurge
 	case v1beta1.MigrationPolicyModeNever:
-		return workload.MigrationModeNever
+		return workloadtypes.MigrationModeNever
 	default:
-		return workload.MigrationMode("")
+		return workloadtypes.MigrationMode("")
 	}
 }
 
 // UpdateStrategyToWorkload converts a v1beta1.UpdateStrategy to a
-// workload.UpdateStrategy. The nested InPlaceUpdateStrategy and
-// RollingUpdate pointers are deep-copied so the returned struct can
-// be mutated independently of the source.
-func UpdateStrategyToWorkload(v v1beta1.UpdateStrategy) workload.UpdateStrategy {
-	out := workload.UpdateStrategy{
+// workload.UpdateStrategy. The nested strategy pointers are deep-copied
+// so the returned struct can be mutated independently of the source.
+func UpdateStrategyToWorkload(v v1beta1.UpdateStrategy) workloadtypes.UpdateStrategy {
+	out := workloadtypes.UpdateStrategy{
 		Type: UpdateStrategyTypeToWorkload(v.Type),
 	}
 	if v.InPlaceUpdateStrategy != nil {
-		out.InPlaceUpdateStrategy = &workload.InPlaceUpdateStrategy{}
-		if v.InPlaceUpdateStrategy.GracePeriodSeconds != nil {
-			g := *v.InPlaceUpdateStrategy.GracePeriodSeconds
-			out.InPlaceUpdateStrategy.GracePeriodSeconds = &g
-		}
+		out.InPlaceUpdateStrategy = &workloadtypes.InPlaceUpdateStrategy{}
 		if v.InPlaceUpdateStrategy.MarkNotReadyDuringLifecycle != nil {
 			m := *v.InPlaceUpdateStrategy.MarkNotReadyDuringLifecycle
 			out.InPlaceUpdateStrategy.MarkNotReadyDuringLifecycle = &m
 		}
 	}
 	if v.RollingUpdate != nil {
-		out.RollingUpdate = &workload.RollingUpdate{}
+		out.RollingUpdate = &workloadtypes.RollingUpdate{}
 		if v.RollingUpdate.Partition != nil {
 			p := *v.RollingUpdate.Partition
 			out.RollingUpdate.Partition = &p
@@ -478,8 +489,8 @@ func UpdateStrategyToWorkload(v v1beta1.UpdateStrategy) workload.UpdateStrategy 
 // struct can be mutated independently of the source. Use this at the
 // adapter boundary so the workload package itself stays free of
 // v1beta1 imports.
-func LifecycleSpecToWorkload(v v1beta1.LifecycleSpec) workload.Lifecycle {
-	out := workload.Lifecycle{}
+func LifecycleSpecToWorkload(v v1beta1.LifecycleSpec) workloadtypes.Lifecycle {
+	out := workloadtypes.Lifecycle{}
 	if v.RestartPolicy != nil {
 		p := InstanceRestartPolicyToWorkload(*v.RestartPolicy)
 		out.RestartPolicy = &p
@@ -497,7 +508,7 @@ func LifecycleSpecToWorkload(v v1beta1.LifecycleSpec) workload.Lifecycle {
 		out.InstanceReadyTimeout = &d
 	}
 	if v.MigrationPolicy != nil {
-		out.MigrationPolicy = &workload.MigrationPolicy{
+		out.MigrationPolicy = &workloadtypes.MigrationPolicy{
 			Mode: MigrationModeToWorkload(v.MigrationPolicy.Mode),
 		}
 	}

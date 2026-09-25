@@ -166,10 +166,10 @@ func TestInferenceReplicaCRD_ColumnSchema(t *testing.T) {
 	if index := entry.Properties["index"]; index.Format != "int32" || index.Minimum == nil || *index.Minimum != 0 {
 		t.Error("entry index must be int32 with minimum 0")
 	}
-	if len(entry.XValidations) != 1 || entry.XValidations[0].Rule != "has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure)" {
+	if len(entry.XValidations) != 1 || entry.XValidations[0].Rule != "has(self.conditions) || has(self.readySince) || has(self.operation) || has(self.lastFailure) || has(self.announced)" {
 		t.Errorf("entry rules = %v, want the nonempty-entry rule", entry.XValidations)
 	}
-	for _, name := range []string{"conditions", "readySince", "operation", "lastFailure"} {
+	for _, name := range []string{"conditions", "readySince", "operation", "lastFailure", "announced"} {
 		if _, ok := entry.Properties[name]; !ok {
 			t.Errorf("entry schema is missing %s", name)
 		}

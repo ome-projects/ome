@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // TeardownFinalizer gates IR deletion on the reconciled teardown path:
@@ -88,7 +89,7 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 	}
 
 	deadline, deadlineInvalidReason := r.resolveTeardownDeadline(log)
-	clockInput := workload.ReconcileInput{Clock: r.Clock}
+	clockInput := workloadtypes.ReconcileInput{Clock: r.Clock}
 	var deadlineAt time.Time
 	if deadline != nil {
 		deadlineAt = ir.DeletionTimestamp.Add(*deadline)
@@ -125,11 +126,23 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 	// index set is treated as empty); the input/plan only need to be
 	// well-formed so Delete can read Key/Component/InstanceReadyTimeout.
 	// The same-target update retry policy is nil: the Update pass never
-	// runs in teardown, and neither does the escalation pass (zero grace
-	// / zero relocation budget — wedge escalation belongs to the Delete
-	// pipeline's lifecycle.forceDelete). Coordination group defaults are
-	// likewise irrelevant: teardown never consults the update gate.
-	input := r.buildReconcileInput(ctx, ir, parent, nil, forceDeletePolicy, 0, 0, coordination.GroupDefaults{})
+	// runs in teardown, and neither does the escalation pass (zero
+	// escalation windows / zero relocation budget — wedge escalation
+	// belongs to the Delete pipeline's lifecycle.forceDelete). Only the
+	// readiness backstop is carried: the Drain operation stamps its
+	// deadline from it, so teardown resolves it from the same two levels
+	// the reconcile path does. The rest of the zero lifecycleSettings is
+	// safe for the same reason as the retry policy: the surge settle
+	// window and gang bounds belong to passes teardown does not run, the
+	// migration caps gate admission of work a deleting IR accepts none
+	// of, the retry-block history cap only prunes on a RetryBlock write
+	// teardown never makes, and the requeue cadence is not the Delete
+	// pipeline's — it paces itself with ScaleDownRequeueInterval plus the
+	// force-delete and teardown deadlines, set below. Coordination group
+	// defaults are likewise irrelevant: teardown never consults the
+	// update gate.
+	settings := lifecycleSettings{InstanceReadyTimeout: r.resolveConfiguredInstanceReadyTimeout(log)}
+	input := r.buildReconcileInput(ctx, ir, parent, nil, forceDeletePolicy, settings, 0, coordination.GroupDefaults{})
 	input.Teardown = true
 	input.ScaleDownPodBatchSize = r.ScaleDownPodBatchSize
 	input.ScaleDownRequeueInterval = r.ScaleDownRequeueInterval
@@ -138,6 +151,8 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 	if perr != nil {
 		return ctrl.Result{}, fmt.Errorf("InferenceReplica teardown: build plan (ir=%s/%s): %w", ir.Namespace, ir.Name, perr)
 	}
+	plan.InstanceReadyTimeout = workload.ResolveInstanceReadyTimeout(
+		input.DesiredSpec.Lifecycle.InstanceReadyTimeout, settings.InstanceReadyTimeout)
 	pods, lerr := query.LiveListPodsForComponent(ctx, r.APIReader, ir.Namespace, ir.Spec.ParentRef.Name,
 		v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component))
 	if lerr != nil {
@@ -149,7 +164,7 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 			"InferenceReplica teardown: authoritative snapshot contains %d UID-owned component pod(s) without a valid %s label; refusing teardown effects",
 			invalid, query.LabelInstanceIdx)
 	}
-	input.AuthoritativePods = &workload.ComponentPodSnapshot{
+	input.AuthoritativePods = &workloadtypes.ComponentPodSnapshot{
 		OwnerUID:   ir.UID,
 		Pods:       ownedPods,
 		ByInstance: query.BucketPodsByInstanceIdx(ownedPods),
@@ -172,7 +187,7 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 	// fight the scale-down pipeline that already owns wedge escalation (via
 	// lifecycle.forceDelete). Instance statuses complete through the atomic
 	// mutation batch after their Pods and per-Instance resources are gone.
-	deps := workload.Deps{
+	deps := workloadtypes.Deps{
 		Client:       r.Client,
 		APIReader:    r.APIReader,
 		Recorder:     r.Recorder,
@@ -300,7 +315,7 @@ func (r *Reconciler) closeDanglingLedgerEntries(ctx context.Context, log logr.Lo
 
 // deleteHeadlessService removes the IR-owned per-Component headless
 // Service — the one object the ensure path (buildHeadlessServiceSpec +
-// workload.ReconcileHeadlessService) maintains. Delete-by-name is the
+// service.ReconcileHeadlessService) maintains. Delete-by-name is the
 // live check; NotFound is success. Per-revision routed Services are
 // ISVC-controller-owned and not touched here.
 func (r *Reconciler) deleteHeadlessService(ctx context.Context, ir *v1beta1.InferenceReplica) error {

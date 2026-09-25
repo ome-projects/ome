@@ -125,3 +125,43 @@ func TestSyncLegacyCanaryAliasKeepsUnmigratedRun(t *testing.T) {
 		t.Fatalf("un-migrated run must survive a sync, got %+v", s.Canary)
 	}
 }
+
+func TestPrimaryOf(t *testing.T) {
+	cases := []struct {
+		members []v1beta1.ComponentType
+		want    v1beta1.ComponentType
+	}{
+		{[]v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}, v1beta1.RouterComponent},
+		{[]v1beta1.ComponentType{v1beta1.DecoderComponent, v1beta1.EngineComponent}, v1beta1.EngineComponent},
+		{[]v1beta1.ComponentType{v1beta1.DecoderComponent}, v1beta1.DecoderComponent},
+	}
+	for _, tc := range cases {
+		if got := PrimaryOf(&v1beta1.RolloutGroup{Components: tc.members}); got != tc.want {
+			t.Errorf("PrimaryOf(%v) = %q, want %q", tc.members, got, tc.want)
+		}
+	}
+	if got := PrimaryOf(nil); got != "" {
+		t.Errorf("PrimaryOf(nil) = %q, want empty", got)
+	}
+}
+
+// The run state of a group is stored under its primary; a member of the
+// group's other unit must resolve to that same state.
+func TestGroupCanaryStatusForFollowsTheGroupPrimary(t *testing.T) {
+	isvc := &v1beta1.InferenceService{
+		Spec: v1beta1.InferenceServiceSpec{Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent},
+			Canary:     &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{{Traffic: 100}}},
+		}}}},
+	}
+	want := &v1beta1.CanaryStatus{CanaryRevisionHash: "new", CurrentStep: 1}
+	SetCanaryStatusFor(&isvc.Status, v1beta1.RouterComponent, want)
+	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+		if got := GroupCanaryStatusFor(isvc, c); got != want {
+			t.Errorf("%s: GroupCanaryStatusFor = %+v, want the router's state", c, got)
+		}
+	}
+	if got := GroupCanaryStatusFor(&v1beta1.InferenceService{}, v1beta1.EngineComponent); got != nil {
+		t.Errorf("no canary group: got %+v, want nil", got)
+	}
+}

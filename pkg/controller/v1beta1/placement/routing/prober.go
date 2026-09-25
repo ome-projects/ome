@@ -2,349 +2,628 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
+	"net/url"
+	"path"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// Target is one home to probe: the entry's externally-addressable URL, keyed by
-// the TrafficMap it belongs to and the cluster it serves.
+// Target identifies one observed serving home and its externally addressable
+// endpoint. OwnerUID prevents a recreated InferenceService from inheriting
+// observations belonging to the previous object at the same name.
 type Target struct {
-	Map     types.NamespacedName
-	Cluster string
-	URL     string
+	OwnerUID     types.UID
+	Map          types.NamespacedName
+	Cluster      string
+	URL          string
+	PolicyDigest string
 }
 
-// key identifies a probed home across passes, so its consecutive-failure count
-// survives from one probe to the next.
-type key struct {
-	Map     types.NamespacedName
-	Cluster string
+// ProbeReconcileRequest is the complete probe input for one InferenceService.
+// Persisted is optional and is considered only when initializing state.
+type ProbeReconcileRequest struct {
+	OwnerUID  types.UID
+	Map       types.NamespacedName
+	Policy    ResolvedProbePolicy
+	Targets   []Target
+	Persisted *v1beta1.TrafficMap
 }
 
-// homeProbeState is the prober's running verdict for one home.
+type probeIdentity struct {
+	OwnerUID     types.UID
+	Map          types.NamespacedName
+	Cluster      string
+	Endpoint     string
+	PolicyDigest string
+}
+
+// homeProbeState is the prober's running verdict for one exact target identity.
 type homeProbeState struct {
-	// gated is the value ANDed into the health gate, flipped only when a
-	// threshold is crossed rather than on every probe.
-	gated bool
-	// consecutiveFailures and consecutivePasses drive the hysteresis; exactly one
-	// is non-zero at a time.
+	identity probeIdentity
+
+	gated               bool
 	consecutiveFailures int
 	consecutivePasses   int
+	hasConclusiveResult bool
 	lastResult          v1beta1.ProbeResult
 	lastMessage         string
 	lastProbeTime       time.Time
+	observed            bool
+
+	failureThreshold int
+	successThreshold int
+	nextProbeTime    time.Time
+	inFlight         bool
+	generation       uint64
 }
 
-// Prober runs the active end-to-end health probe and holds each
-// home's gate verdict.
-//
-// It probes an entry's endpoint — the URL a client uses — so the verdict covers
-// the whole serving path: the cluster's ingress gateway, DNS, the certificate,
-// the route object. None of that is visible to readyReplicas, which is pod
-// readiness observed inside the home, so a home can report every replica ready
-// while nothing can reach it.
-//
-// The gate flips only after a threshold of consecutive identical verdicts. A
-// single dropped packet must not move a large traffic share, and the
-// reprogramming churn from flapping would itself be the outage.
-//
-// The prober is a correlated component: one bug here, or one control-plane
-// network partition, marks every home down at once. Two things bound that. A
-// probe that could not run at all is inconclusive rather than a failure, so a
-// broken prober does not gate anything; and when every home is gated the weight
-// function falls back to equal weights rather than black-holing traffic.
+// Prober runs due endpoint probes through the shared ObserverExecutor. The
+// routing reconciler owns scheduling: each call submits all due targets, waits
+// for their bounded work, records the results, and receives the delay until the
+// next absolute deadline.
 type Prober struct {
-	Config ProbeConfig
-	Log    logr.Logger
+	Executor         *ObserverExecutor
+	Client           *http.Client
+	Clock            clock.Clock
+	MaxResponseBytes int64
+	Log              logr.Logger
 
-	// Client is the HTTP client used for probes. Its timeout is set from the
-	// config at construction.
-	Client *http.Client
-
-	// Targets supplies the homes to probe on each tick. It is a function rather
-	// than a stored list so the prober always sees the current routing tables
-	// without duplicating the controller's cache.
-	Targets func(context.Context) ([]Target, error)
-
-	// OnChange is called with the affected TrafficMap whenever a home's gate
-	// flips, so the routing controller can recompute and rewrite weights
-	// promptly instead of waiting for unrelated ISVC churn.
-	OnChange func(types.NamespacedName)
-
-	mu    sync.RWMutex
-	state map[key]*homeProbeState
+	mu        sync.RWMutex
+	state     map[probeIdentity]*homeProbeState
+	nextToken uint64
 }
 
-// NewProber builds a prober for the given config, using the supplied HTTP
-// client. The caller is responsible for checking cfg.IsEnabled(); a disabled
-// config yields a prober that reports Unknown for every home, which never
-// gates.
-//
-// The client carries no timeout of its own: each request is bounded by a
-// context deadline instead, so one client can be shared with the capacity
-// poller even though the two have different timeouts.
-func NewProber(cfg ProbeConfig, client *http.Client, log logr.Logger) *Prober {
+// NewProber builds a reconcile-driven prober with explicit process-wide
+// execution and response-size bounds.
+func NewProber(
+	executor *ObserverExecutor,
+	client *http.Client,
+	clk clock.Clock,
+	maxResponseBytes int64,
+	log logr.Logger,
+) (*Prober, error) {
+	if executor == nil {
+		return nil, errors.New("probe observer executor is nil")
+	}
+	if client == nil {
+		return nil, errors.New("probe HTTP client is nil")
+	}
+	if clk == nil {
+		return nil, errors.New("probe clock is nil")
+	}
+	if maxResponseBytes <= 0 {
+		return nil, fmt.Errorf("probe maximum response bytes must be positive, got %d", maxResponseBytes)
+	}
 	return &Prober{
-		Config: cfg,
-		Log:    log,
-		Client: client,
-		state:  map[key]*homeProbeState{},
-	}
+		Executor:         executor,
+		Client:           client,
+		Clock:            clk,
+		MaxResponseBytes: maxResponseBytes,
+		Log:              log,
+		state:            map[probeIdentity]*homeProbeState{},
+	}, nil
 }
 
-// NewObserverClient builds the HTTP client both observers share. They talk to
-// the same homes with the same credentials and fail the same ways, so a single
-// client keeps one transport, one connection pool and one auth path rather
-// than two of each.
+// NewObserverClient builds the HTTP client shared by routing observers.
+// Redirects are returned to the caller for policy classification instead of
+// following an untrusted endpoint to a different authority.
 func NewObserverClient() *http.Client {
-	// No client-level timeout: per-request context deadlines carry the probe's
-	// and the poller's different bounds.
-	return &http.Client{}
+	return &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
-// Reachable reports the probe's contribution to a home's health gate.
-//
-// Nil means "no verdict, do not gate": probing is off, the home has not been
-// probed yet, or its probes have been inconclusive. That is deliberately the
-// same answer a broken prober gives, because the alternative — treating an
-// absent verdict as failure — would zero every home at once.
-func (p *Prober) Reachable(m types.NamespacedName, cluster string) *bool {
-	if p == nil || !p.Config.IsEnabled() {
-		return nil
+// Reconcile synchronously runs every due probe for one InferenceService and
+// returns the delay until its earliest absolute probe deadline. A zero delay
+// with an enabled non-empty request means the deadline is already due.
+func (p *Prober) Reconcile(ctx context.Context, req ProbeReconcileRequest) (time.Duration, error) {
+	if p == nil {
+		return 0, errors.New("prober is nil")
 	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	st, ok := p.state[key{Map: m, Cluster: cluster}]
-	if !ok || st.lastResult == v1beta1.ProbeResultUnknown {
-		return nil
+	if ctx == nil {
+		return 0, errors.New("probe reconcile context is nil")
 	}
-	ok2 := !st.gated
-	return &ok2
-}
+	if req.OwnerUID == "" {
+		return 0, errors.New("probe reconcile owner UID is empty")
+	}
+	if req.Map.Namespace == "" || req.Map.Name == "" {
+		return 0, errors.New("probe reconcile TrafficMap namespace and name are required")
+	}
+	if !req.Policy.IsEnabled() {
+		p.Forget(req.Map)
+		return 0, nil
+	}
+	if err := req.Policy.Probe.Validate(); err != nil {
+		return 0, err
+	}
+	wantDigest, err := probePolicyDigest(req.Policy.Probe)
+	if err != nil {
+		return 0, err
+	}
+	if req.Policy.PolicyDigest != wantDigest {
+		return 0, fmt.Errorf("probe policy digest %q does not match effective policy", req.Policy.PolicyDigest)
+	}
 
-// Provenance renders a home's probe state for the TrafficMap entry, or nil when
-// there is nothing observed to report. Healthy alone does not say whether
-// readiness or reachability failed, and those are different faults with
-// different owners.
-func (p *Prober) Provenance(m types.NamespacedName, cluster string) *v1beta1.TrafficMapProbe {
-	if p == nil || !p.Config.IsEnabled() {
-		return nil
+	targets, err := normalizeProbeTargets(req)
+	if err != nil {
+		return 0, err
 	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	st, ok := p.state[key{Map: m, Cluster: cluster}]
-	if !ok {
-		return nil
-	}
-	pr := &v1beta1.TrafficMapProbe{
-		Result:              st.lastResult,
-		ConsecutiveFailures: int32(st.consecutiveFailures),
-		Message:             st.lastMessage,
-	}
-	if !st.lastProbeTime.IsZero() {
-		t := metav1.NewTime(st.lastProbeTime)
-		pr.LastProbeTime = &t
-	}
-	return pr
-}
-
-// Start runs the probe loop until the context is cancelled, satisfying
-// manager.Runnable. It returns immediately when probing is not configured, so
-// the prober can be wired unconditionally and stay inert by config alone.
-func (p *Prober) Start(ctx context.Context) error {
-	if !p.Config.IsEnabled() {
-		p.Log.Info("end-to-end health probing disabled (no probe path configured)")
-		return nil
-	}
-	p.Log.Info("starting end-to-end health probing",
-		"path", p.Config.Path, "method", p.Config.Method, "period", p.Config.Period,
-		"timeout", p.Config.Timeout, "failureThreshold", p.Config.FailureThreshold,
-		"successThreshold", p.Config.SuccessThreshold)
-
-	t := time.NewTicker(p.Config.Period)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	jobs := p.prepare(req, targets)
+	var reconcileErrs []error
+	accepted := make([]*scheduledProbe, 0, len(jobs))
+	for i := range jobs {
+		job := &jobs[i]
+		future, submitErr := p.Executor.Submit(ctx, req.Policy.Probe.Timeout, func(jobCtx context.Context) error {
+			verdict, message := p.probeOne(jobCtx, job.target, req.Policy.Probe)
+			job.recorded.Store(p.record(job.identity, job.generation, verdict, message, p.Clock.Now()))
 			return nil
-		case <-t.C:
-			p.probeAll(ctx)
+		})
+		if submitErr != nil {
+			p.abandon(job.identity, job.generation)
+			reconcileErrs = append(reconcileErrs,
+				fmt.Errorf("submit probe for cluster %q: %w", job.target.Cluster, submitErr))
+			for j := i + 1; j < len(jobs); j++ {
+				p.abandon(jobs[j].identity, jobs[j].generation)
+			}
+			break
+		}
+		job.future = future
+		accepted = append(accepted, job)
+	}
+
+	for _, job := range accepted {
+		if waitErr := job.future.Wait(ctx); waitErr != nil && !job.recorded.Load() {
+			p.abandon(job.identity, job.generation)
+			reconcileErrs = append(reconcileErrs,
+				fmt.Errorf("wait for probe of cluster %q: %w", job.target.Cluster, waitErr))
+		}
+	}
+	if len(reconcileErrs) != 0 {
+		return 0, errors.Join(reconcileErrs...)
+	}
+	return p.nextDelay(req.OwnerUID, req.Map, targets, p.Clock.Now()), nil
+}
+
+type scheduledProbe struct {
+	target     Target
+	identity   probeIdentity
+	generation uint64
+	future     *ObserverFuture
+	recorded   atomic.Bool
+}
+
+func (p *Prober) prepare(req ProbeReconcileRequest, targets []Target) []scheduledProbe {
+	now := p.Clock.Now()
+	live := make(map[probeIdentity]struct{}, len(targets))
+	jobs := make([]scheduledProbe, 0, len(targets))
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, target := range targets {
+		identity := identityForTarget(target)
+		live[identity] = struct{}{}
+		state, found := p.state[identity]
+		if !found {
+			state = &homeProbeState{
+				identity:         identity,
+				lastResult:       v1beta1.ProbeResultUnknown,
+				failureThreshold: req.Policy.Probe.FailureThreshold,
+				successThreshold: req.Policy.Probe.SuccessThreshold,
+				nextProbeTime:    now,
+			}
+			p.hydrate(state, req.Persisted, req.Policy.Probe.Period, now)
+			p.state[identity] = state
+		}
+		if state.inFlight || state.nextProbeTime.After(now) {
+			continue
+		}
+		p.nextToken++
+		if p.nextToken == 0 {
+			p.nextToken++
+		}
+		state.generation = p.nextToken
+		state.inFlight = true
+		state.nextProbeTime = advanceProbeDeadline(state.nextProbeTime, now, req.Policy.Probe.Period)
+		jobs = append(jobs, scheduledProbe{
+			target:     target,
+			identity:   identity,
+			generation: state.generation,
+		})
+	}
+	for identity := range p.state {
+		if identity.Map != req.Map {
+			continue
+		}
+		if _, found := live[identity]; !found {
+			delete(p.state, identity)
+		}
+	}
+	return jobs
+}
+
+func normalizeProbeTargets(req ProbeReconcileRequest) ([]Target, error) {
+	targets := make([]Target, len(req.Targets))
+	seen := make(map[string]struct{}, len(req.Targets))
+	for i, target := range req.Targets {
+		if target.OwnerUID == "" {
+			return nil, fmt.Errorf("probe target cluster %q has an empty owner UID", target.Cluster)
+		}
+		if target.OwnerUID != req.OwnerUID {
+			return nil, fmt.Errorf("probe target cluster %q has owner UID %q, want %q",
+				target.Cluster, target.OwnerUID, req.OwnerUID)
+		}
+		if target.Map.Namespace == "" || target.Map.Name == "" {
+			return nil, fmt.Errorf("probe target cluster %q has an empty TrafficMap identity", target.Cluster)
+		}
+		if target.Map != req.Map {
+			return nil, fmt.Errorf("probe target cluster %q belongs to TrafficMap %q, want %q",
+				target.Cluster, target.Map.String(), req.Map.String())
+		}
+		if target.PolicyDigest == "" {
+			return nil, fmt.Errorf("probe target cluster %q has an empty policy digest", target.Cluster)
+		}
+		if target.PolicyDigest != req.Policy.PolicyDigest {
+			return nil, fmt.Errorf("probe target cluster %q has policy digest %q, want %q",
+				target.Cluster, target.PolicyDigest, req.Policy.PolicyDigest)
+		}
+		if target.Cluster == "" {
+			return nil, errors.New("probe target cluster is empty")
+		}
+		if _, found := seen[target.Cluster]; found {
+			return nil, fmt.Errorf("probe target cluster %q is duplicated", target.Cluster)
+		}
+		seen[target.Cluster] = struct{}{}
+		endpoint, err := CanonicalEndpoint(target.URL)
+		if err != nil {
+			return nil, fmt.Errorf("probe target cluster %q: %w", target.Cluster, err)
+		}
+		target.OwnerUID = req.OwnerUID
+		target.Map = req.Map
+		target.URL = endpoint
+		target.PolicyDigest = req.Policy.PolicyDigest
+		targets[i] = target
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Cluster < targets[j].Cluster })
+	return targets, nil
+}
+
+func advanceProbeDeadline(deadline, now time.Time, period time.Duration) time.Time {
+	if deadline.IsZero() {
+		return now.Add(period)
+	}
+	if deadline.After(now) {
+		return deadline
+	}
+	return deadline.Add((now.Sub(deadline)/period + 1) * period)
+}
+
+func (p *Prober) nextDelay(ownerUID types.UID, mapKey types.NamespacedName, targets []Target, now time.Time) time.Duration {
+	var (
+		found bool
+		next  time.Time
+	)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, target := range targets {
+		identity := identityForTarget(target)
+		if identity.OwnerUID != ownerUID || identity.Map != mapKey {
+			continue
+		}
+		state, ok := p.state[identity]
+		if !ok || (found && !state.nextProbeTime.Before(next)) {
+			continue
+		}
+		found = true
+		next = state.nextProbeTime
+	}
+	if !found || !next.After(now) {
+		return 0
+	}
+	return next.Sub(now)
+}
+
+// Reachable reports the probe gate for the exact target identity. Nil means no
+// conclusive evidence exists for this identity.
+func (p *Prober) Reachable(target Target) *bool {
+	state := p.lookup(target)
+	if state == nil || !state.hasConclusiveResult {
+		return nil
+	}
+	reachable := !state.gated
+	return &reachable
+}
+
+// Provenance renders the latest observation for the exact target identity.
+func (p *Prober) Provenance(target Target) *v1beta1.TrafficMapProbe {
+	state := p.lookup(target)
+	if state == nil || !state.observed {
+		return nil
+	}
+	probe := &v1beta1.TrafficMapProbe{
+		PolicyDigest:        state.identity.PolicyDigest,
+		Result:              state.lastResult,
+		Gated:               state.gated,
+		ConsecutiveFailures: int32(state.consecutiveFailures),
+		Message:             state.lastMessage,
+	}
+	if !state.lastProbeTime.IsZero() {
+		timestamp := metav1.NewTime(state.lastProbeTime)
+		probe.LastProbeTime = &timestamp
+	}
+	return probe
+}
+
+func (p *Prober) lookup(target Target) *homeProbeState {
+	if p == nil || target.PolicyDigest == "" {
+		return nil
+	}
+	endpoint, err := CanonicalEndpoint(target.URL)
+	if err != nil {
+		return nil
+	}
+	identity := identityForTarget(target)
+	identity.Endpoint = endpoint
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	state, found := p.state[identity]
+	if !found {
+		return nil
+	}
+	copy := *state
+	return &copy
+}
+
+func identityForTarget(target Target) probeIdentity {
+	return probeIdentity{
+		OwnerUID:     target.OwnerUID,
+		Map:          target.Map,
+		Cluster:      target.Cluster,
+		Endpoint:     target.URL,
+		PolicyDigest: target.PolicyDigest,
+	}
+}
+
+// Forget removes all probe state for a TrafficMap. An in-flight result carries
+// its old identity and generation and cannot recreate forgotten state.
+func (p *Prober) Forget(mapKey types.NamespacedName) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for identity := range p.state {
+		if identity.Map == mapKey {
+			delete(p.state, identity)
 		}
 	}
 }
 
-// NeedLeaderElection keeps probing on the elected leader only. Every replica
-// probing would multiply load on the homes by the replica count for no extra
-// signal, and only the leader writes the resulting weights.
-func (p *Prober) NeedLeaderElection() bool { return true }
-
-// probeAll probes every current target once, concurrently, and notifies the
-// controller for each home whose gate flipped.
-func (p *Prober) probeAll(ctx context.Context) {
-	targets, err := p.Targets(ctx)
-	if err != nil {
-		// Inconclusive by construction: without targets nothing is observed, so
-		// no gate moves and the previous verdicts stand.
-		p.Log.Error(err, "listing probe targets")
-		return
-	}
-
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		changed = map[types.NamespacedName]struct{}{}
-		// Bound concurrency so a large fleet does not open one socket per home
-		// simultaneously.
-		sem = make(chan struct{}, probeConcurrency)
-	)
-	for _, tgt := range targets {
-		wg.Add(1)
-		go func(tgt Target) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			verdict, msg := p.probeOne(ctx, tgt)
-			if p.record(tgt, verdict, msg) {
-				mu.Lock()
-				changed[tgt.Map] = struct{}{}
-				mu.Unlock()
-			}
-		}(tgt)
-	}
-	wg.Wait()
-
-	p.forget(targets)
-
-	if p.OnChange == nil {
-		return
-	}
-	for m := range changed {
-		p.OnChange(m)
-	}
-}
-
-// probeConcurrency bounds simultaneous in-flight probes.
-const probeConcurrency = 16
-
-// probeOne issues a single probe and classifies the outcome.
-//
-// It distinguishes "the probe failed" from "the probe could not run". A request
-// we could not even construct is our own defect, not the home's, and is
-// reported inconclusive so a misconfigured prober cannot gate the fleet.
-func (p *Prober) probeOne(ctx context.Context, tgt Target) (Verdict, string) {
-	url := tgt.URL + p.Config.Path
-
-	rctx, cancel := context.WithTimeout(ctx, p.Config.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(rctx, p.Config.Method, url, nil)
+// probeOne issues one request. Its context deadline is supplied by the
+// ObserverExecutor after the job leaves the queue.
+func (p *Prober) probeOne(ctx context.Context, target Target, config ProbeConfig) (Verdict, string) {
+	probeURL, err := url.JoinPath(target.URL, config.Path)
 	if err != nil {
 		return VerdictInconclusive, fmt.Sprintf("probe could not run: %v", err)
 	}
-	resp, err := p.Client.Do(req)
+	req, err := http.NewRequestWithContext(ctx, config.Method, probeURL, nil)
 	if err != nil {
-		// A transport error or timeout is the home's failure: the path did not
-		// carry a request a client would have sent.
+		return VerdictInconclusive, fmt.Sprintf("probe could not run: %v", err)
+	}
+	response, err := p.Client.Do(req)
+	if err != nil {
 		return VerdictFail, fmt.Sprintf("transport error: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() { _ = response.Body.Close() }()
+	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, p.MaxResponseBytes)); err != nil {
+		return VerdictFail, fmt.Sprintf("response body error: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return VerdictFail, fmt.Sprintf("transport error: %v", err)
+	}
 
-	switch v := p.Config.ClassifyStatus(resp.StatusCode); v {
+	switch verdict := config.ClassifyStatus(response.StatusCode); verdict {
 	case VerdictPass:
-		return VerdictPass, fmt.Sprintf("HTTP %d", resp.StatusCode)
+		return VerdictPass, fmt.Sprintf("HTTP %d", response.StatusCode)
 	case VerdictFail:
-		return VerdictFail, fmt.Sprintf("HTTP %d", resp.StatusCode)
+		return VerdictFail, fmt.Sprintf("HTTP %d", response.StatusCode)
 	default:
-		return VerdictInconclusive, fmt.Sprintf("HTTP %d (not in accept or gate list)", resp.StatusCode)
+		return VerdictInconclusive, fmt.Sprintf("HTTP %d (not in accept or gate list)", response.StatusCode)
 	}
 }
 
-// record folds one verdict into a home's state and reports whether the gate
-// flipped. Only a flip is worth waking the controller for: the counts move on
-// every probe, but the weights only change when the gate does.
-func (p *Prober) record(tgt Target, v Verdict, msg string) bool {
+func (p *Prober) record(
+	identity probeIdentity,
+	generation uint64,
+	verdict Verdict,
+	message string,
+	observedAt time.Time,
+) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	k := key{Map: tgt.Map, Cluster: tgt.Cluster}
-	st, ok := p.state[k]
-	if !ok {
-		st = &homeProbeState{lastResult: v1beta1.ProbeResultUnknown}
-		p.state[k] = st
+	state, found := p.state[identity]
+	if !found || !state.inFlight || state.generation != generation {
+		return false
 	}
-	st.lastMessage = msg
-	st.lastProbeTime = time.Now()
+	state.inFlight = false
+	state.observed = true
+	state.lastMessage = message
+	state.lastProbeTime = observedAt
 
-	switch v {
+	switch verdict {
 	case VerdictInconclusive:
-		// Neither counter moves and lastResult is left alone: an inconclusive
-		// probe is not evidence either way, so a run of them must neither drift
-		// a home toward a flip nor erase the verdict that came before.
-		return false
+		state.lastResult = v1beta1.ProbeResultUnknown
 	case VerdictFail:
-		st.consecutivePasses = 0
-		st.consecutiveFailures++
-		st.lastResult = v1beta1.ProbeResultFailing
-		if !st.gated && st.consecutiveFailures >= p.Config.FailureThreshold {
-			st.gated = true
-			return true
+		state.consecutivePasses = 0
+		if state.consecutiveFailures < math.MaxInt32 {
+			state.consecutiveFailures++
 		}
-		return false
-	default: // VerdictPass
-		st.consecutiveFailures = 0
-		st.consecutivePasses++
-		st.lastResult = v1beta1.ProbeResultPassing
-		if st.gated && st.consecutivePasses >= p.Config.SuccessThreshold {
-			st.gated = false
-			return true
+		state.lastResult = v1beta1.ProbeResultFailing
+		state.hasConclusiveResult = true
+		if state.consecutiveFailures >= state.failureThreshold {
+			state.gated = true
 		}
-		return false
+	case VerdictPass:
+		state.consecutiveFailures = 0
+		state.lastResult = v1beta1.ProbeResultPassing
+		state.hasConclusiveResult = true
+		if !state.gated {
+			state.consecutivePasses = 0
+			break
+		}
+		if state.consecutivePasses < math.MaxInt32 {
+			state.consecutivePasses++
+		}
+		if state.consecutivePasses >= state.successThreshold {
+			state.gated = false
+			state.consecutivePasses = 0
+		}
 	}
+	return true
 }
 
-// forget drops state for homes that are no longer targets, so a deleted ISVC or
-// a removed home does not leak an entry — and so a home that comes back is
-// re-evaluated from scratch rather than inheriting a stale gate.
-func (p *Prober) forget(targets []Target) {
-	live := make(map[key]struct{}, len(targets))
-	for _, t := range targets {
-		live[key{Map: t.Map, Cluster: t.Cluster}] = struct{}{}
-	}
+func (p *Prober) abandon(identity probeIdentity, generation uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for k := range p.state {
-		if _, ok := live[k]; !ok {
-			delete(p.state, k)
-		}
+	state, found := p.state[identity]
+	if !found || !state.inFlight || state.generation != generation {
+		return
 	}
+	state.inFlight = false
+	state.nextProbeTime = p.Clock.Now()
 }
 
-// TargetsFromTrafficMaps builds the probe target list from the TrafficMaps a
-// lister returns: every entry that carries an addressable endpoint.
-//
-// Sorted for a deterministic probe order, which keeps logs and tests stable.
+func (p *Prober) hydrate(state *homeProbeState, persisted *v1beta1.TrafficMap, period time.Duration, now time.Time) {
+	probe := persistedProbe(persisted, state.identity)
+	if probe == nil {
+		return
+	}
+	state.gated = probe.Gated
+	state.consecutiveFailures = max(0, int(probe.ConsecutiveFailures))
+	state.consecutivePasses = 0
+	state.lastResult = probe.Result
+	if state.lastResult == "" {
+		state.lastResult = v1beta1.ProbeResultUnknown
+	}
+	state.hasConclusiveResult = state.gated || state.consecutiveFailures > 0 ||
+		state.lastResult == v1beta1.ProbeResultPassing || state.lastResult == v1beta1.ProbeResultFailing
+	state.lastMessage = probe.Message
+	state.observed = true
+	if probe.LastProbeTime != nil {
+		state.lastProbeTime = probe.LastProbeTime.Time
+		if state.lastProbeTime.After(now) {
+			state.nextProbeTime = now
+			return
+		}
+		state.nextProbeTime = state.lastProbeTime.Add(period)
+		return
+	}
+	state.nextProbeTime = now
+}
+
+func persistedProbe(persisted *v1beta1.TrafficMap, identity probeIdentity) *v1beta1.TrafficMapProbe {
+	if persisted == nil ||
+		persisted.Namespace != identity.Map.Namespace || persisted.Name != identity.Map.Name {
+		return nil
+	}
+	ownerUID, owned := trafficMapOwnerUID(persisted)
+	if !owned || ownerUID != identity.OwnerUID {
+		return nil
+	}
+	for i := range persisted.Spec.Entries {
+		entry := &persisted.Spec.Entries[i]
+		if entry.Cluster != identity.Cluster || entry.Endpoint == nil || entry.Probe == nil ||
+			entry.Probe.PolicyDigest != identity.PolicyDigest {
+			continue
+		}
+		endpoint, err := CanonicalEndpoint(entry.Endpoint.String())
+		if err == nil && endpoint == identity.Endpoint {
+			return entry.Probe.DeepCopy()
+		}
+	}
+	return nil
+}
+
+// CanonicalEndpoint returns a stable identity for an absolute endpoint URL.
+func CanonicalEndpoint(raw string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse endpoint URL: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" || parsed.Opaque != "" {
+		return "", fmt.Errorf("endpoint URL %q must be absolute", raw)
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("endpoint URL %q must use HTTP or HTTPS", raw)
+	}
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	escapedPath := parsed.EscapedPath()
+	if escapedPath == "" {
+		return parsed.String(), nil
+	}
+	escapedPath = path.Clean(escapedPath)
+	if escapedPath == "." || escapedPath == "/" {
+		parsed.Path = ""
+		parsed.RawPath = ""
+		return parsed.String(), nil
+	}
+	decodedPath, err := url.PathUnescape(escapedPath)
+	if err != nil {
+		return "", fmt.Errorf("parse endpoint URL path: %w", err)
+	}
+	parsed.Path = decodedPath
+	parsed.RawPath = escapedPath
+	return parsed.String(), nil
+}
+
+// TargetsFromTrafficMaps builds the observer target list from addressable
+// TrafficMap entries.
 func TargetsFromTrafficMaps(maps []v1beta1.TrafficMap) []Target {
 	var targets []Target
 	for i := range maps {
-		tm := &maps[i]
-		for _, e := range tm.Spec.Entries {
-			if e.Endpoint == nil || e.Endpoint.Host == "" {
+		trafficMap := &maps[i]
+		ownerUID, owned := trafficMapOwnerUID(trafficMap)
+		if !owned {
+			continue
+		}
+		for j := range trafficMap.Spec.Entries {
+			entry := &trafficMap.Spec.Entries[j]
+			if entry.Endpoint == nil || entry.Endpoint.Host == "" {
 				continue
 			}
+			endpoint := entry.Endpoint.String()
+			if canonical, err := CanonicalEndpoint(endpoint); err == nil {
+				endpoint = canonical
+			}
+			var policyDigest string
+			if entry.Probe != nil {
+				policyDigest = entry.Probe.PolicyDigest
+			}
 			targets = append(targets, Target{
-				Map:     types.NamespacedName{Name: tm.Name, Namespace: tm.Namespace},
-				Cluster: e.Cluster,
-				URL:     e.Endpoint.String(),
+				OwnerUID:     ownerUID,
+				Map:          types.NamespacedName{Name: trafficMap.Name, Namespace: trafficMap.Namespace},
+				Cluster:      entry.Cluster,
+				URL:          endpoint,
+				PolicyDigest: policyDigest,
 			})
 		}
 	}
@@ -355,4 +634,19 @@ func TargetsFromTrafficMaps(maps []v1beta1.TrafficMap) []Target {
 		return targets[i].Cluster < targets[j].Cluster
 	})
 	return targets
+}
+
+func trafficMapOwnerUID(trafficMap *v1beta1.TrafficMap) (types.UID, bool) {
+	if trafficMap == nil || trafficMap.Spec.Service == "" ||
+		trafficMap.Spec.Service != trafficMap.Name {
+		return "", false
+	}
+	owner := metav1.GetControllerOf(trafficMap)
+	if owner == nil || owner.UID == "" ||
+		owner.APIVersion != v1beta1.SchemeGroupVersion.String() ||
+		owner.Kind != "InferenceService" ||
+		owner.Name != trafficMap.Name || owner.Name != trafficMap.Spec.Service {
+		return "", false
+	}
+	return owner.UID, true
 }

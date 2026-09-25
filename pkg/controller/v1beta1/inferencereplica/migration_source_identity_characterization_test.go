@@ -8,8 +8,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // This characterizes the v1 mailbox contract, not a Pod identity guarantee:
@@ -37,7 +37,7 @@ func TestConsumeMigrationRequests_SourcePodRecreatedBeforeConsumption(t *testing
 		t.Fatalf("create successor source: %v", err)
 	}
 
-	requeue, err := r.consumeMigrationRequests(ctx, r.Log, ir, parent, workload.MigrationModeAuto, migrationTestTimeout)
+	requeue, err := r.consumeMigrationRequests(ctx, r.Log, ir, parent, workloadtypes.MigrationModeAuto, migrationTestTimeout)
 	if err != nil || requeue {
 		t.Fatalf("consume: requeue=%v err=%v", requeue, err)
 	}

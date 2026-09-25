@@ -11,15 +11,16 @@ import (
 	placementendpoint "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/endpoint"
 )
 
-// TrafficMapPublisher adapts an optional deployment-specific backend to the
-// endpoint publisher reconciliation that already consumes TrafficMap weights.
+// TrafficMapPublisher carries a selected backend and its validated,
+// installation-wide reconciliation inputs.
 type TrafficMapPublisher struct {
-	Publisher      placementendpoint.EndpointPublisher
+	Publisher      placementendpoint.TrafficMapPublisher
+	GlobalOptions  map[string]string
 	ResyncInterval time.Duration
 }
 
 // TrafficMapPublisherFactory validates the selected publisher's opaque options
-// and constructs its endpoint-publisher implementation.
+// and constructs its TrafficMap publisher implementation.
 type TrafficMapPublisherFactory func(
 	config PublisherConfig,
 	kubeClient client.Client,
@@ -57,6 +58,9 @@ func NewTrafficMapPublisher(
 	kubeClient client.Client,
 	apiReader client.Reader,
 ) (*TrafficMapPublisher, error) {
+	if cfg.ResyncInterval < 0 {
+		return nil, fmt.Errorf("TrafficMap publisher resync interval must not be negative")
+	}
 	if !cfg.IsEnabled() {
 		if len(cfg.Options) != 0 {
 			return nil, fmt.Errorf("TrafficMap publisher options require a publisher name")
@@ -70,11 +74,7 @@ func NewTrafficMapPublisher(
 		return nil, fmt.Errorf("TrafficMap publisher %q is not compiled into this manager (available: %v)",
 			cfg.Name, RegisteredTrafficMapPublishers())
 	}
-	options := make(map[string]string, len(cfg.Options))
-	for key, value := range cfg.Options {
-		options[key] = value
-	}
-	cfg.Options = options
+	cfg.Options = cloneStringMap(cfg.Options)
 	publisher, err := factory(cfg, kubeClient, apiReader)
 	if err != nil {
 		return nil, fmt.Errorf("configure TrafficMap publisher %q: %w", cfg.Name, err)
@@ -86,9 +86,8 @@ func NewTrafficMapPublisher(
 		return nil, fmt.Errorf("TrafficMap publisher %q factory returned publisher named %q",
 			cfg.Name, publisher.Publisher.Name())
 	}
-	if publisher.ResyncInterval < 0 {
-		return nil, fmt.Errorf("TrafficMap publisher %q returned a negative resync interval", cfg.Name)
-	}
+	publisher.ResyncInterval = cfg.ResyncInterval
+	publisher.GlobalOptions = cloneStringMap(publisher.GlobalOptions)
 	return publisher, nil
 }
 

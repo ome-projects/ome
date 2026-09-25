@@ -61,7 +61,7 @@ func TestProjectStatusPlacementDoesNotAggregateTruncatedCandidates(t *testing.T)
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			v := typedISVC()
 			v.Spec.Placement = &ome.PlacementSpec{Mode: ome.PlacementModeSplit}
-			v.Status.Placement = &ome.PlacementStatus{Phase: ome.PlacementPhaseRacing}
+			v.Status.Placement = &ome.PlacementStatus{Phase: ome.PlacementPhaseRacing} //nolint:staticcheck // legacy wire value an older controller may still write
 			for i := 0; i < size; i++ {
 				v.Status.Placement.Candidates = append(v.Status.Placement.Candidates, ome.CandidatePlacement{Cluster: fmt.Sprintf("home-%03d", i), AdmittedReplicas: 1, ReadyReplicas: 1})
 			}

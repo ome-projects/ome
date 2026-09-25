@@ -14,11 +14,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	kubefake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,113 +30,16 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
-	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
-
-// testScheme returns a runtime.Scheme with the types the IR reconciler
-// exercises registered: v1beta1 (with status subresource for IR),
-// corev1 (Pods, EndpointSlices), appsv1 (ControllerRevisions),
-// discoveryv1 (EndpointSlices), and schedulingv1alpha1 (PodGroups).
-func testScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	s := runtime.NewScheme()
-	if err := v1beta1.AddToScheme(s); err != nil {
-		t.Fatalf("v1beta1.AddToScheme: %v", err)
-	}
-	if err := corev1.AddToScheme(s); err != nil {
-		t.Fatalf("corev1.AddToScheme: %v", err)
-	}
-	if err := appsv1.AddToScheme(s); err != nil {
-		t.Fatalf("appsv1.AddToScheme: %v", err)
-	}
-	if err := discoveryv1.AddToScheme(s); err != nil {
-		t.Fatalf("discoveryv1.AddToScheme: %v", err)
-	}
-	if err := schedulingv1alpha1.AddToScheme(s); err != nil {
-		t.Fatalf("schedulingv1alpha1.AddToScheme: %v", err)
-	}
-	return s
-}
-
-// baselineIR returns a controller-write-stamped, single-pod
-// InferenceReplica matching the shape the ISVC controller will project.
-// Single Runner named "default" with size 1, one container, no
-// lifecycle defaults (workload.BuildPlan applies them).
-func baselineIR(name, namespace string, replicas int32) *v1beta1.InferenceReplica {
-	r := replicas
-	return &v1beta1.InferenceReplica{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			UID:       types.UID(name + "-uid"),
-			Annotations: map[string]string{
-				constants.InferenceReplicaControllerWriteAnnotationKey: constants.InferenceReplicaControllerWriteAnnotationVal,
-			},
-			Generation: 1,
-			// Controller-owner = parent ISVC. The IR reconciler reads
-			// this to derive scopeUID for revision partitioning (parent
-			// ISVC UID). The projector stamps the live ISVC; here we
-			// stamp a synthetic UID matching the well-known parent name.
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: v1beta1.SchemeGroupVersion.String(),
-				Kind:       "InferenceService",
-				Name:       "llama",
-				UID:        types.UID("llama-isvc-uid"),
-				Controller: ptr.To(true),
-			}},
-		},
-		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{
-				Name: "llama",
-			},
-			Component: v1beta1.EngineComponent,
-			Replicas:  &r,
-			Runners: []v1beta1.Runner{
-				{
-					Name: v1beta1.RunnerNameDefault,
-					Size: 1,
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "ome-container", Image: "sgl:1.0"}},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-// newReconciler builds a fake-client-backed Reconciler with the IR
-// status subresource wired and a fresh Expectations cache so per-test
-// create attempts aren't blocked by entries from a previous test.
-const testScaleDownRequeueInterval = 37 * time.Second
-
-func newReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Client) {
-	t.Helper()
-	c := fake.NewClientBuilder().
-		WithScheme(testScheme(t)).
-		WithObjects(objs...).
-		WithStatusSubresource(&v1beta1.InferenceReplica{}).
-		WithIndex(&schedulingv1alpha1.PodGroup{}, workloadgang.PodGroupControllerUIDIndexField, workloadgang.PodGroupControllerUIDIndexExtractor).
-		Build()
-	return &Reconciler{
-		Client:                   c,
-		APIReader:                c,
-		Log:                      logf.Log.WithName("test"),
-		InstanceStatusTarget:     irstatus.EncodingDenseV1,
-		Expectations:             workload.NewExpectations(),
-		ScaleDownRequeueInterval: testScaleDownRequeueInterval,
-	}, c
-}
 
 // TestReconcile_NotFound_NoError pins the early-return contract: an IR
 // deleted between enqueue and reconcile must be a clean no-op (owner-ref
@@ -199,7 +103,7 @@ func TestScaleDownSeriesCacheReplacesIdentityAndSupportsConcurrentKeys(t *testin
 
 func TestApplyRollbackPayload_RecordedTopologyIsAuthoritative(t *testing.T) {
 	stableTopology := "topology.example.com/stable"
-	desired := workload.WorkloadDesiredSpec{TopologyKey: "topology.example.com/canary"}
+	desired := workloadtypes.WorkloadDesiredSpec{TopologyKey: "topology.example.com/canary"}
 	payload := &revision.DataPayload{TopologyKey: &stableTopology}
 
 	r := &Reconciler{APIReader: podListFailingReader{}}
@@ -225,7 +129,7 @@ func TestApplyRollbackPayload_LegacyTopologyRecovery(t *testing.T) {
 	r, _ := newReconciler(t, worker, otherRevision)
 	// Recovery must still inspect the stable revision when the canary removed
 	// topology; live stable workers prove the rollback target used this key.
-	desired := workload.WorkloadDesiredSpec{}
+	desired := workloadtypes.WorkloadDesiredSpec{}
 
 	if err := r.applyRollbackPayload(context.Background(), ir, &desired, payload, target); err != nil {
 		t.Fatalf("applyRollbackPayload: %v", err)
@@ -243,7 +147,7 @@ func TestApplyRollbackPayload_LegacyTopologyWithoutEvidenceFailsClosed(t *testin
 		WorkerPodSpec: &corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}}},
 	}
 	r, _ := newReconciler(t)
-	desired := workload.WorkloadDesiredSpec{TopologyKey: "topology.example.com/current"}
+	desired := workloadtypes.WorkloadDesiredSpec{TopologyKey: "topology.example.com/current"}
 
 	err := r.applyRollbackPayload(context.Background(), ir, &desired, payload, target)
 	if err == nil || !strings.Contains(err.Error(), "no unambiguous OME-generated topology") {
@@ -261,7 +165,7 @@ func TestApplyRollbackPayload_LegacyTopologyAmbiguityFailsClosed(t *testing.T) {
 	podA := rollbackTopologyWorker(ir, "worker-a", "0", "stablehash", "topology.example.com/a")
 	podB := rollbackTopologyWorker(ir, "worker-b", "1", "stablehash", "topology.example.com/b")
 	r, _ := newReconciler(t, podA, podB)
-	desired := workload.WorkloadDesiredSpec{TopologyKey: "topology.example.com/current"}
+	desired := workloadtypes.WorkloadDesiredSpec{TopologyKey: "topology.example.com/current"}
 
 	err := r.applyRollbackPayload(context.Background(), ir, &desired, payload, target)
 	if err == nil || !strings.Contains(err.Error(), "conflicting OME-generated topology") {
@@ -270,7 +174,7 @@ func TestApplyRollbackPayload_LegacyTopologyAmbiguityFailsClosed(t *testing.T) {
 }
 
 func TestApplyRollbackPayload_LegacyTopologyFreeDoesNotBlock(t *testing.T) {
-	desired := workload.WorkloadDesiredSpec{}
+	desired := workloadtypes.WorkloadDesiredSpec{}
 	payload := &revision.DataPayload{
 		PodSpec:       &corev1.PodSpec{Containers: []corev1.Container{{Name: "leader"}}},
 		WorkerPodSpec: &corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}}},
@@ -313,17 +217,6 @@ func rollbackTopologyWorker(ir *v1beta1.InferenceReplica, name, index, revisionH
 	}
 }
 
-type podListFailingReader struct {
-	client.Reader
-}
-
-func (r podListFailingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	if _, ok := list.(*corev1.PodList); ok {
-		return errors.New("injected live pod list failure")
-	}
-	return r.Reader.List(ctx, list, opts...)
-}
-
 type podGroupListCountingReader struct {
 	client.Reader
 	lists int
@@ -351,7 +244,11 @@ func (r *firstStaleInferenceReplicaReader) Get(ctx context.Context, key client.O
 	return r.Reader.Get(ctx, key, obj, opts...)
 }
 
-func TestReconcile_TerminatingPodGroupUsesConfiguredPoll(t *testing.T) {
+// TestReconcile_TerminatingPodGroupHoldsWithoutPods: a deterministic
+// PodGroup name still occupied by an object being collected withholds
+// that Instance's members and records the wait on its operation, so an
+// operator sees why the gang has not started instead of a silent poll.
+func TestReconcile_TerminatingPodGroupHoldsWithoutPods(t *testing.T) {
 	ir := baselineIR("llama-engine", "prod", 1)
 	ir.Spec.Runners = []v1beta1.Runner{
 		{Name: v1beta1.RunnerNameLeader, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "leader", Image: "test:v1"}}}}},
@@ -359,7 +256,7 @@ func TestReconcile_TerminatingPodGroupUsesConfiguredPoll(t *testing.T) {
 	}
 	now := metav1.Now()
 	pg := &schedulingv1alpha1.PodGroup{ObjectMeta: metav1.ObjectMeta{
-		Name:              query.PodGroupName(ir.Spec.ParentRef.Name, workload.ComponentEngine, 0),
+		Name:              query.PodGroupName(ir.Spec.ParentRef.Name, workloadtypes.ComponentEngine, 0),
 		Namespace:         ir.Namespace,
 		UID:               "terminating-pg",
 		DeletionTimestamp: &now,
@@ -370,12 +267,12 @@ func TestReconcile_TerminatingPodGroupUsesConfiguredPoll(t *testing.T) {
 	r.APIReader = c
 	r.GangSchedulingAvailable = true
 
-	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)})
-	if err != nil {
-		t.Fatalf("reconcile terminating PodGroup: %v", err)
-	}
-	if result.Requeue || result.RequeueAfter != testScaleDownRequeueInterval {
-		t.Fatalf("terminating PodGroup must use the configured poll interval, got %+v", result)
+	// Two passes: the first commits the Create marker the hold is recorded
+	// on, the second observes that marker and parks it.
+	for pass := 0; pass < 2; pass++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+			t.Fatalf("reconcile terminating PodGroup (pass %d): %v", pass, err)
+		}
 	}
 	pods := &corev1.PodList{}
 	if err := c.List(context.Background(), pods, client.InNamespace(ir.Namespace)); err != nil {
@@ -383,6 +280,17 @@ func TestReconcile_TerminatingPodGroupUsesConfiguredPoll(t *testing.T) {
 	}
 	if len(pods.Items) != 0 {
 		t.Fatalf("created %d pods while their PodGroup name was terminating", len(pods.Items))
+	}
+	got := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), got); err != nil {
+		t.Fatalf("get InferenceReplica: %v", err)
+	}
+	if len(got.Status.InstanceStatuses) != 1 {
+		t.Fatalf("instance statuses: got %d want 1", len(got.Status.InstanceStatuses))
+	}
+	op := got.Status.InstanceStatuses[0].Operation
+	if op == nil || op.Waiting != workloadtypes.WaitingReasonPodGroupTerminating {
+		t.Fatalf("Operation.Waiting: got %+v want %q", op, workloadtypes.WaitingReasonPodGroupTerminating)
 	}
 }
 
@@ -407,12 +315,12 @@ func TestReconcile_GangCleanupRetainsStatusUntilPodGroupAbsent(t *testing.T) {
 			TargetRevision: "llama-engine-retired",
 			Operation: &v1beta1.InstanceOperation{
 				ID: "target-2", Type: v1beta1.InstanceOperationUpdate,
-				Step: workload.UpdateStepGangSurgeTarget, TargetRevision: "llama-engine-retired",
+				Step: workloadtypes.UpdateStepGangSurgeTarget, TargetRevision: "llama-engine-retired",
 			},
 		},
 	}
 	targetPG := &schedulingv1alpha1.PodGroup{ObjectMeta: metav1.ObjectMeta{
-		Name:            query.PodGroupName(ir.Spec.ParentRef.Name, workload.ComponentEngine, surgeIndex),
+		Name:            query.PodGroupName(ir.Spec.ParentRef.Name, workloadtypes.ComponentEngine, surgeIndex),
 		Namespace:       ir.Namespace,
 		UID:             "target-pg",
 		Finalizers:      []string{"example.com/hold"},
@@ -775,16 +683,16 @@ func TestReconcile_Create_ConfiguredBatchSizeCapsPods(t *testing.T) {
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
 	})
 	g.Expect(err).NotTo(gomega.HaveOccurred())
-	g.Expect(result.RequeueAfter).NotTo(gomega.BeZero(),
-		"deferred Instances must cause a follow-up reconcile")
+	g.Expect(result.Requeue || result.RequeueAfter > 0).To(gomega.BeTrue(),
+		"deferred Instances must cause a follow-up reconcile; with no configured cadence that is the rate-limited requeue")
 
 	pods := &corev1.PodList{}
 	g.Expect(c.List(context.Background(), pods, client.InNamespace(ir.Namespace))).To(gomega.Succeed())
 	g.Expect(pods.Items).To(gomega.HaveLen(2),
 		"configured scale-up Pod batch size must cap a reconcile to two missing Pods")
 	g.Expect(podNames(pods.Items)).To(gomega.ConsistOf(
-		query.PodName("llama", workload.ComponentEngine, 0, "default", 0),
-		query.PodName("llama", workload.ComponentEngine, 1, "default", 0),
+		query.PodName("llama", workloadtypes.ComponentEngine, 0, "default", 0),
+		query.PodName("llama", workloadtypes.ComponentEngine, 1, "default", 0),
 	))
 
 	got := &v1beta1.InferenceReplica{}
@@ -799,10 +707,10 @@ func TestReconcile_Create_ConfiguredBatchSizeCapsPods(t *testing.T) {
 
 // TestReconcile_Create_AlsoCreatesHeadlessService pins the headless
 // Service wire-in: a fresh IR reconcile must call
-// workload.ReconcileHeadlessService alongside workload.Reconcile so a
+// service.ReconcileHeadlessService alongside workload.Reconcile so a
 // per-Component headless Service appears in the same pass that creates
 // the pods. The Service rendering itself is unit-tested in
-// workload/services_test.go — this test only verifies the wire-in.
+// workload/service/service_test.go — this test only verifies the wire-in.
 //
 // Asserts on the canonical shape:
 //   - Name == query.HeadlessServiceName(parent, component) so any
@@ -1184,42 +1092,42 @@ func TestReconcile_SteadySinglePodSkipsAuthoritativePodGroupInventory(t *testing
 func TestRequiresAuthoritativePodGroupInventoryLifecycleTriggers(t *testing.T) {
 	ir := baselineIR("llama-engine", "podgroup-inventory-triggers", 1)
 	r, _ := newReconciler(t, ir)
-	singlePlan := workload.ComponentPlan{
-		Component: workload.ComponentEngine,
-		Instances: []workload.InstancePlan{{
+	singlePlan := workloadtypes.ComponentPlan{
+		Component: workloadtypes.ComponentEngine,
+		Instances: []workloadtypes.InstancePlan{{
 			Index:   0,
-			Runners: []workload.RunnerPlan{{Name: "default", Size: 1}},
+			Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
 		}},
 	}
 	multiPlan := singlePlan
-	multiPlan.Instances = []workload.InstancePlan{{
+	multiPlan.Instances = []workloadtypes.InstancePlan{{
 		Index: 0,
-		Runners: []workload.RunnerPlan{
+		Runners: []workloadtypes.RunnerPlan{
 			{Name: "leader", Size: 1},
 			{Name: "worker", Size: 1},
 		},
 	}}
-	steadyInput := workload.ReconcileInput{
+	steadyInput := workloadtypes.ReconcileInput{
 		OwnerObject: ir,
-		ObservedState: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{{
+		ObservedState: workloadtypes.WorkloadObservedState{InstanceStatuses: []workloadtypes.InstanceStatus{{
 			Index: 0,
-			Phase: workload.InstancePhaseReady,
+			Phase: workloadtypes.InstancePhaseReady,
 		}}},
 	}
 	scaleDownInput := steadyInput
 	scaleDownInput.ObservedState.InstanceStatuses = append(
-		append([]workload.InstanceStatus(nil), steadyInput.ObservedState.InstanceStatuses...),
-		workload.InstanceStatus{Index: 1, Phase: workload.InstancePhaseReady})
+		append([]workloadtypes.InstanceStatus(nil), steadyInput.ObservedState.InstanceStatuses...),
+		workloadtypes.InstanceStatus{Index: 1, Phase: workloadtypes.InstancePhaseReady})
 	terminalInput := steadyInput
-	terminalInput.ObservedState.Migrations = []workload.MigrationRecord{{
+	terminalInput.ObservedState.Migrations = []workloadtypes.MigrationRecord{{
 		SourceInstance: 0,
-		Phase:          workload.MigrationPhaseDraining,
+		Phase:          workloadtypes.MigrationPhaseDraining,
 	}}
 
 	for _, tc := range []struct {
 		name  string
-		input workload.ReconcileInput
-		plan  workload.ComponentPlan
+		input workloadtypes.ReconcileInput
+		plan  workloadtypes.ComponentPlan
 		want  bool
 	}{
 		{name: "steady single pod", input: steadyInput, plan: singlePlan, want: false},
@@ -1544,7 +1452,7 @@ func TestReconcile_MultiToSinglePodGroupSkipsStaleDeleteOwnedRebound(t *testing.
 		APIReader:               liveClient,
 		Log:                     logf.Log.WithName("test"),
 		InstanceStatusTarget:    irstatus.EncodingDenseV1,
-		Expectations:            workload.NewExpectations(),
+		Expectations:            workloadtypes.NewExpectations(),
 		GangSchedulingAvailable: true,
 	}
 
@@ -1639,60 +1547,6 @@ func TestReconcile_NilPodSpec_NoRevisionEnsured(t *testing.T) {
 	g.Expect(err.Error()).NotTo(gomega.ContainSubstring("runtime error"))
 }
 
-// podForIR builds a fake pod matching what workload/ops/render would
-// produce for a given (IR, instance, runner, ordinal) tuple. The
-// label set mirrors render.go's podLabels(); the pod's
-// ContainersReady + ome.io/serving conditions are toggled by the
-// (ready, serving) booleans.
-//
-// Owner ref points at the IR (Kind=InferenceReplica) so the
-// expectation cache + workload-side query.ListOMENativePods see this
-// as a real workload pod, not a foreign one.
-func podForIR(ir *v1beta1.InferenceReplica, instanceIdx int32, runnerName string, ordinal int32, ready, serving bool) *corev1.Pod {
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      query.PodName(ir.Spec.ParentRef.Name, v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component), instanceIdx, runnerName, ordinal),
-			Namespace: ir.Namespace,
-			UID:       types.UID(fmt.Sprintf("%s-%d-%s-%d-uid", ir.Name, instanceIdx, runnerName, ordinal)),
-			Labels: map[string]string{
-				constants.InferenceServicePodLabelKey: ir.Spec.ParentRef.Name,
-				constants.OMEComponentLabel:           string(ir.Spec.Component),
-				query.LabelInstanceIdx:                intToLabel(int64(instanceIdx)),
-				query.LabelInstanceIncarnation:        "1",
-				query.LabelRunner:                     runnerName,
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-				query.LabelPodOrdinal:                 intToLabel(int64(ordinal)),
-			},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: v1beta1.SchemeGroupVersion.String(),
-				Kind:       "InferenceReplica",
-				Name:       ir.Name,
-				UID:        ir.UID,
-				Controller: ptr.To(true),
-			}},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "ome-container", Image: "sgl:1.0"}},
-		},
-	}
-	now := metav1.Now()
-	if ready {
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type:               corev1.ContainersReady,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: now,
-		})
-	}
-	if serving {
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type:               query.ServingConditionType,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: now,
-		})
-	}
-	return pod
-}
-
 // podNames extracts the names from a slice of pods for assertion
 // readability.
 func podNames(pods []corev1.Pod) []string {
@@ -1701,94 +1555,6 @@ func podNames(pods []corev1.Pod) []string {
 		out = append(out, p.Name)
 	}
 	return out
-}
-
-// sliceForIRPod constructs an EndpointSlice carrying one endpoint for
-// pod against the IR's per-Component headless Service. Used by status
-// tests that need AvailableReplicas to mirror ReadyReplicas — the
-// aggregator reads availability off the EndpointSlice (same
-// as the omenative direct path), so without a slice every pod is
-// invisible to the availability counter regardless of ContainersReady.
-//
-// Returns a slice with Endpoints[0].Conditions.Ready set to ready —
-// the same toggle the omenative sliceWithEndpoint helper exposes.
-// AddressType=IPv4 + a fixed bogus address keep the fake-client
-// validation happy; the controller's availability counter only reads
-// TargetRef.Name + Ready, not the IP.
-func sliceForIRPod(ir *v1beta1.InferenceReplica, pod *corev1.Pod, ready bool) *discoveryv1.EndpointSlice {
-	serviceName := query.HeadlessServiceName(ir.Spec.ParentRef.Name, v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component))
-	return &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      pod.Name + "-slice",
-			Namespace: ir.Namespace,
-			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
-		},
-		AddressType: discoveryv1.AddressTypeIPv4,
-		Endpoints: []discoveryv1.Endpoint{
-			{
-				Addresses: []string{"10.0.0.1"},
-				Conditions: discoveryv1.EndpointConditions{
-					Ready: ptr.To(ready),
-				},
-				TargetRef: &corev1.ObjectReference{
-					Kind:      "Pod",
-					Namespace: pod.Namespace,
-					Name:      pod.Name,
-				},
-			},
-		},
-	}
-}
-
-// intToLabel formats a non-negative int64 as the label-safe ASCII
-// string the workload-side pod label helpers produce. Mirrors the
-// helper in omenative/test_helpers_test.go (test packages can't
-// share unexported helpers across directory boundaries).
-func intToLabel(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	pos := len(b)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		pos--
-		b[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
-}
-
-// newReconcilerWithGrace returns a reconciler with a fake clientset that
-// supplies the given stuck-pod grace period, so fast-escalation tests work
-// without wiring a real config cache.
-func newReconcilerWithGrace(t *testing.T, grace time.Duration, objs ...client.Object) (*Reconciler, client.Client) {
-	t.Helper()
-	r, c := newReconciler(t, objs...)
-
-	// Wire a fake clientset + config cache that resolves the grace.
-	lifecycleCfg := fmt.Sprintf(`{"stuckPodGracePeriod":"%s"}`, grace.String())
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "inferenceservice-config",
-			Namespace: "ome",
-		},
-		Data: map[string]string{
-			"lifecycle": lifecycleCfg,
-		},
-	}
-	fakeCS := kubefake.NewSimpleClientset(cm)
-	r.Clientset = fakeCS
-	r.ConfigCache = controllerconfig.NewConfigCache(0) // zero TTL = always refetch
-
-	return r, c
 }
 
 // A deferred status-write failure must not skip the retention sweep:
@@ -1836,7 +1602,7 @@ func TestReconcile_StatusWriteFailureStillSweepsRevisions(t *testing.T) {
 		APIReader:            c,
 		Log:                  logf.Log.WithName("test"),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 	}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -1880,21 +1646,21 @@ func TestReconcileRelocationDirectives_ProjectionUsesCachedClient(t *testing.T) 
 
 func TestTerminalFinalizationOwned_GangSourceMarkerSurvivesRemovalRetry(t *testing.T) {
 	surgeIndex := int32(7)
-	observed := workload.WorkloadObservedState{
-		InstanceStatuses: []workload.InstanceStatus{
+	observed := workloadtypes.WorkloadObservedState{
+		InstanceStatuses: []workloadtypes.InstanceStatus{
 			{
 				Index: 3,
-				Operation: &workload.InstanceOperation{
-					Type:       workload.InstanceOperationUpdate,
-					Step:       workloadops.UpdateStepSurgeDrain,
+				Operation: &workloadtypes.InstanceOperation{
+					Type:       workloadtypes.InstanceOperationUpdate,
+					Step:       workloadtypes.UpdateStepSurgeDrain,
 					SurgeIndex: &surgeIndex,
 				},
 			},
 			{
 				Index: surgeIndex,
-				Operation: &workload.InstanceOperation{
-					Type: workload.InstanceOperationUpdate,
-					Step: workload.UpdateStepGangSurgeTargetCleanup,
+				Operation: &workloadtypes.InstanceOperation{
+					Type: workloadtypes.InstanceOperationUpdate,
+					Step: workloadtypes.UpdateStepGangSurgeTargetCleanup,
 				},
 			},
 		},
@@ -1908,8 +1674,8 @@ func TestTerminalFinalizationOwned_GangSourceMarkerSurvivesRemovalRetry(t *testi
 		t.Fatal("persisted gang target cleanup marker did not suppress PodGroup ensure")
 	}
 
-	observed.InstanceStatuses[0].Operation.Step = workloadops.UpdateStepSurge
-	observed.InstanceStatuses[1].Operation.Step = workload.UpdateStepGangSurgeTarget
+	observed.InstanceStatuses[0].Operation.Step = workloadtypes.UpdateStepSurge
+	observed.InstanceStatuses[1].Operation.Step = workloadtypes.UpdateStepGangSurgeTarget
 	if _, found := terminalFinalizationOwned(observed)[3]; found {
 		t.Fatal("pre-terminal gang source unexpectedly suppressed PodGroup ensure")
 	}
@@ -1917,42 +1683,43 @@ func TestTerminalFinalizationOwned_GangSourceMarkerSurvivesRemovalRetry(t *testi
 		t.Fatal("pre-terminal gang target unexpectedly suppressed PodGroup ensure")
 	}
 }
+
 func TestTerminalFinalizationOwned_MigrationAndOrdinaryDelete(t *testing.T) {
 	const index int32 = 4
 	tests := []struct {
 		name     string
-		observed workload.WorkloadObservedState
+		observed workloadtypes.WorkloadObservedState
 		want     bool
 	}{
 		{
 			name: "draining migration owns finalization",
-			observed: workload.WorkloadObservedState{Migrations: []workload.MigrationRecord{{
+			observed: workloadtypes.WorkloadObservedState{Migrations: []workloadtypes.MigrationRecord{{
 				SourceInstance: index,
-				Phase:          workload.MigrationPhaseDraining,
+				Phase:          workloadtypes.MigrationPhaseDraining,
 			}}},
 			want: true,
 		},
 		{
 			name: "surge-ready migration does not own finalization",
-			observed: workload.WorkloadObservedState{Migrations: []workload.MigrationRecord{{
+			observed: workloadtypes.WorkloadObservedState{Migrations: []workloadtypes.MigrationRecord{{
 				SourceInstance: index,
-				Phase:          workload.MigrationPhaseSurgeReady,
+				Phase:          workloadtypes.MigrationPhaseSurgeReady,
 			}}},
 		},
 		{
 			name: "completed migration does not own finalization",
-			observed: workload.WorkloadObservedState{Migrations: []workload.MigrationRecord{{
+			observed: workloadtypes.WorkloadObservedState{Migrations: []workloadtypes.MigrationRecord{{
 				SourceInstance: index,
-				Phase:          workload.MigrationPhaseCompleted,
+				Phase:          workloadtypes.MigrationPhaseCompleted,
 			}}},
 		},
 		{
 			name: "ordinary delete owns finalization",
-			observed: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{{
+			observed: workloadtypes.WorkloadObservedState{InstanceStatuses: []workloadtypes.InstanceStatus{{
 				Index: index,
-				Phase: workload.InstancePhaseDeleting,
-				Operation: &workload.InstanceOperation{
-					Type: workload.InstanceOperationDelete,
+				Phase: workloadtypes.InstancePhaseDeleting,
+				Operation: &workloadtypes.InstanceOperation{
+					Type: workloadtypes.InstanceOperationDelete,
 				},
 			}}},
 			want: true,
@@ -1967,4 +1734,1370 @@ func TestTerminalFinalizationOwned_MigrationAndOrdinaryDelete(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The gang-member-loss rebuild below Ready, driven through the adapter.
+//
+// Outside Phase=Ready the rebuild trigger compares the live pods of an
+// Instance against the pod count the row RECORDS, and that counter is
+// written only by the adapter's status publication — never by
+// workload.Reconcile. A harness that drives the engine alone can never
+// put a complete count on a row whose pods are already gone, so these
+// two arrows are covered here, where the published counter is part of
+// the persisted status the reconcile reads.
+
+// gangLossIR is a two-pod Instance (one leader, one worker) under the
+// RecreateInstanceOnPodRestart policy, its single row parked at Pending
+// with the published pod count reporting the complete gang.
+func gangLossIR(name, namespace string) *v1beta1.InferenceReplica {
+	ir := baselineIR(name, namespace, 1)
+	ir.Spec.Runners = []v1beta1.Runner{
+		{Name: v1beta1.RunnerNameLeader, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "ome-container", Image: "sgl:1.0"}},
+		}}},
+		{Name: v1beta1.RunnerNameWorker, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "ome-container", Image: "sgl:1.0"}},
+		}}},
+	}
+	ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{
+		RestartPolicy: ptr.To(v1beta1.InstanceRestartPolicyRecreateInstance),
+	}
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+		Index:       0,
+		Incarnation: 1,
+		Phase:       v1beta1.OMENativeInstancePending,
+		PodCount:    2,
+	}}
+	return ir
+}
+
+// instanceRow reads the single Instance row back off the stored IR.
+func instanceRow(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica) v1beta1.OMENativeInstanceStatus {
+	t.Helper()
+	fresh := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	if len(fresh.Status.InstanceStatuses) != 1 {
+		t.Fatalf("instance statuses: %+v", fresh.Status.InstanceStatuses)
+	}
+	return fresh.Status.InstanceStatuses[0]
+}
+
+// TestRestart_PendingGangMemberTerminal_RebuildsInstance drives the
+// rebuild off a terminal member: the row still reports both pods, but
+// one of them is Failed and therefore holds no capacity, so the survivor
+// is drained and the gang rebuilt at a bumped incarnation.
+func TestRestart_PendingGangMemberTerminal_RebuildsInstance(t *testing.T) {
+	ir := gangLossIR("llama-engine", "prod")
+	survivor := podForIR(ir, 0, string(v1beta1.RunnerNameLeader), 0, true, true)
+	terminal := podForIR(ir, 0, string(v1beta1.RunnerNameWorker), 0, false, false)
+	terminal.Status.Phase = corev1.PodFailed
+	r, c := newReconciler(t, ir, survivor, terminal)
+	rec := record.NewFakeRecorder(32)
+	r.Recorder = rec
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	row := instanceRow(t, c, ir)
+	if row.Phase != v1beta1.OMENativeInstanceRestarting ||
+		row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationRestart || row.Operation.Step != "Drain" {
+		t.Fatalf("terminal gang member must open a Restart Drain, got %+v (op %+v)", row, row.Operation)
+	}
+	if len(eventsContaining(drainEvents(rec), "gang member lost")) == 0 {
+		t.Errorf("the RestartTriggered event must name the loss")
+	}
+}
+
+// TestRestart_PendingGangMemberLost_RebuildsOnceRetryBlockIsDue drives
+// the rebuild off the retry clock: the partial gang is rebuilt on the
+// pass where the RetryBlock recorded against its revision has come due,
+// and is not while the block still denies the revision.
+//
+// While the block denies, the rebuild is not merely postponed — the
+// Create pass fills the missing member instead, because below Ready it
+// owns an Instance the rebuild gate declined. That is the behavior the
+// held case records.
+func TestRestart_PendingGangMemberLost_RebuildsOnceRetryBlockIsDue(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		block         v1beta1.RetryBlockState
+		nextRetryAt   *metav1.Time
+		wantRestarted bool
+	}{
+		{name: "due", block: v1beta1.RetryBlockBackoff, nextRetryAt: ptr.To(metav1.NewTime(time.Now().Add(-time.Minute))), wantRestarted: true},
+		{name: "held", block: v1beta1.RetryBlockHeld, wantRestarted: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := time.Now()
+			ir := gangLossIR("llama-engine", "prod")
+			survivor := podForIR(ir, 0, string(v1beta1.RunnerNameLeader), 0, true, true)
+			worker := podForIR(ir, 0, string(v1beta1.RunnerNameWorker), 0, true, true)
+			r, c := newReconciler(t, ir, survivor, worker)
+			r.Clock = clocktesting.NewFakeClock(base)
+			r.Recorder = record.NewFakeRecorder(32)
+			request := ctrl.Request{NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}}
+
+			// One settling pass names the revision the gang runs, which is
+			// the revision a rebuild would re-materialize and therefore the
+			// one a RetryBlock has to answer for.
+			if _, err := r.Reconcile(context.Background(), request); err != nil {
+				t.Fatalf("settle Reconcile: %v", err)
+			}
+			fresh := &v1beta1.InferenceReplica{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh); err != nil {
+				t.Fatalf("get IR: %v", err)
+			}
+			blocked := fresh.Status.UpdateRevision
+			if blocked == "" {
+				t.Fatalf("no update revision on the settled IR: %+v", fresh.Status)
+			}
+			fresh.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+				Index:           0,
+				Incarnation:     1,
+				Phase:           v1beta1.OMENativeInstancePending,
+				PodCount:        2,
+				RunningRevision: blocked,
+			}}
+			fresh.Status.RetryBlocks = []v1beta1.RetryBlock{{
+				TargetRevision:  blocked,
+				State:           tc.block,
+				AttemptsStarted: 1,
+				NextRetryAt:     tc.nextRetryAt,
+			}}
+			if err := c.Status().Update(context.Background(), fresh); err != nil {
+				t.Fatalf("seed the row: %v", err)
+			}
+			// The worker is gone: one of the two recorded pods is lost.
+			if err := c.Delete(context.Background(), worker); err != nil {
+				t.Fatalf("lose the worker: %v", err)
+			}
+			r.Expectations = workloadtypes.NewExpectations()
+
+			if _, err := r.Reconcile(context.Background(), request); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			row := instanceRow(t, c, ir)
+			restarted := row.Phase == v1beta1.OMENativeInstanceRestarting &&
+				row.Operation != nil && row.Operation.Type == v1beta1.InstanceOperationRestart && row.Operation.Step == "Drain"
+			if restarted != tc.wantRestarted {
+				t.Fatalf("restarted=%v want %v; row %+v (op %+v)", restarted, tc.wantRestarted, row, row.Operation)
+			}
+		})
+	}
+}
+
+// reconcileForReadyTimeout runs one pass over a fresh IR and returns the
+// stored object. lifecycleJSON of "" leaves the operator ConfigMap
+// unwired, which is how an operator who supplies no lifecycle block at
+// all is seen from inside the controller.
+func reconcileForReadyTimeout(t *testing.T, ir *v1beta1.InferenceReplica, lifecycleJSON string) (*v1beta1.InferenceReplica, []string) {
+	t.Helper()
+	g := gomega.NewWithT(t)
+	r, c := newReconciler(t, ir)
+	rec := record.NewFakeRecorder(16)
+	r.Recorder = rec
+	if lifecycleJSON != "" {
+		withLifecycleConfig(r, lifecycleJSON)
+	}
+
+	key := client.ObjectKeyFromObject(ir)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	stored := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, stored)).To(gomega.Succeed())
+	return stored, drainEvents(rec)
+}
+
+func conditionOfType(conds []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conds {
+		if conds[i].Type == condType {
+			return &conds[i]
+		}
+	}
+	return nil
+}
+
+// TestInstanceReadyTimeout_UnconfiguredOpensWithNoDeadline pins the
+// honest-unconfigured contract: with no readiness window at either level
+// the Create operation opens with NO deadline — never one equal to its
+// own start, which the next pass would read as elapsed — and the
+// Component says so through a condition and a Warning event.
+func TestInstanceReadyTimeout_UnconfiguredOpensWithNoDeadline(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	stored, events := reconcileForReadyTimeout(t, baselineIR("llama-engine", "default", 1), "")
+
+	g.Expect(stored.Status.InstanceStatuses).To(gomega.HaveLen(1))
+	op := stored.Status.InstanceStatuses[0].Operation
+	g.Expect(op).NotTo(gomega.BeNil())
+	g.Expect(op.Deadline.IsZero()).To(gomega.BeTrue(),
+		"an unconfigured readiness window must open the operation with no deadline")
+
+	cond := conditionOfType(stored.Status.Conditions, string(workloadtypes.ConditionInstanceReadyTimeoutUnconfigured))
+	g.Expect(cond).NotTo(gomega.BeNil())
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(gomega.Equal(string(workloadtypes.ReasonInstanceReadyTimeoutUnconfigured)))
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonInstanceReadyTimeoutUnconfigured))).To(gomega.HaveLen(1))
+}
+
+// TestInstanceReadyTimeout_ConfigSuppliesTheWindow pins the fallback: a
+// Component that sets none of its own takes the operator's
+// lifecycle.instanceReadyTimeout, and the condition clears.
+func TestInstanceReadyTimeout_ConfigSuppliesTheWindow(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	before := time.Now()
+	stored, events := reconcileForReadyTimeout(t, baselineIR("llama-engine", "default", 1),
+		`{"instanceReadyTimeout":"30m"}`)
+
+	g.Expect(stored.Status.InstanceStatuses).To(gomega.HaveLen(1))
+	op := stored.Status.InstanceStatuses[0].Operation
+	g.Expect(op).NotTo(gomega.BeNil())
+	g.Expect(op.Deadline.Time).To(gomega.BeTemporally("~", before.Add(30*time.Minute), time.Minute))
+
+	cond := conditionOfType(stored.Status.Conditions, string(workloadtypes.ConditionInstanceReadyTimeoutUnconfigured))
+	g.Expect(cond).NotTo(gomega.BeNil())
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
+	g.Expect(cond.Reason).To(gomega.Equal(string(workloadtypes.ReasonInstanceReadyTimeoutConfigured)))
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonInstanceReadyTimeoutUnconfigured))).To(gomega.BeEmpty())
+}
+
+// TestInstanceReadyTimeout_SpecWinsOverConfig pins the precedence: an
+// explicit per-resource window overrides the operator's.
+func TestInstanceReadyTimeout_SpecWinsOverConfig(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	ir := baselineIR("llama-engine", "default", 1)
+	ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{
+		InstanceReadyTimeout: &metav1.Duration{Duration: 5 * time.Minute},
+	}
+
+	before := time.Now()
+	stored, _ := reconcileForReadyTimeout(t, ir, `{"instanceReadyTimeout":"30m"}`)
+
+	g.Expect(stored.Status.InstanceStatuses).To(gomega.HaveLen(1))
+	op := stored.Status.InstanceStatuses[0].Operation
+	g.Expect(op).NotTo(gomega.BeNil())
+	g.Expect(op.Deadline.Time).To(gomega.BeTemporally("~", before.Add(5*time.Minute), time.Minute))
+}
+
+func TestReconcileDenseV1IsUnchangedByTheDecoder(t *testing.T) {
+	ctx := context.Background()
+	ir := decodeFixtureIR()
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	plain, cPlain := newReconciler(t, ir.DeepCopy())
+	bounded, cBounded := newReconciler(t, ir.DeepCopy())
+	bounded.InstanceStatusDecoder = irstatus.NewDecoder(8)
+	// Both reconciles stamp the attempts they open at "now"; a second
+	// boundary between the two runs would otherwise make the published
+	// timestamps differ for a reason unrelated to the decoder.
+	fixed := clocktesting.NewFakeClock(time.Now())
+	plain.Clock, bounded.Clock = fixed, fixed
+
+	resPlain, errPlain := plain.Reconcile(ctx, req)
+	resBounded, errBounded := bounded.Reconcile(ctx, req)
+	if resPlain != resBounded || (errPlain == nil) != (errBounded == nil) {
+		t.Fatalf("a configured bound must not change DenseV1 reconciliation: %+v/%v vs %+v/%v", resPlain, errPlain, resBounded, errBounded)
+	}
+	storedPlain, storedBounded := &v1beta1.InferenceReplica{}, &v1beta1.InferenceReplica{}
+	if err := cPlain.Get(ctx, req.NamespacedName, storedPlain); err != nil {
+		t.Fatal(err)
+	}
+	if err := cBounded.Get(ctx, req.NamespacedName, storedBounded); err != nil {
+		t.Fatal(err)
+	}
+	storedPlain.Status.Conditions, storedBounded.Status.Conditions = nil, nil
+	if !equality.Semantic.DeepEqual(storedPlain.Status, storedBounded.Status) {
+		t.Fatalf("published DenseV1 status differs with a configured bound:\n plain:   %+v\n bounded: %+v", storedPlain.Status, storedBounded.Status)
+	}
+}
+
+// TestReconcileMetadataWriteKeepsDecodedRows pins the in-memory object after
+// the entry pass's finalizer write: the API response carries the stored
+// representation, so a ColumnarV2 object must be decoded again before the
+// lifecycle observes it. A ColumnarV2-stored object under the ColumnarV2
+// target must plan exactly what its DenseV1 twin plans; observing an empty
+// row set would recreate every Instance.
+func TestReconcileMetadataWriteKeepsDecodedRows(t *testing.T) {
+	ctx := context.Background()
+	dense := fixtureIRWithRows("llama-engine", uniformFixtureRows(64))
+	if len(dense.Finalizers) != 0 {
+		t.Fatal("fixture must start without the teardown finalizer")
+	}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(dense)}
+
+	rDense, cDense := newReconciler(t, dense.DeepCopy())
+	denseResult, err := rDense.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("dense reconcile: %v", err)
+	}
+	rColumnar, cColumnar := newColumnarReconciler(t, columnarTwin(t, dense))
+	columnarResult, err := rColumnar.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("columnar reconcile: %v", err)
+	}
+	if columnarResult != denseResult {
+		t.Fatalf("results differ by stored encoding: dense %+v, columnar %+v", denseResult, columnarResult)
+	}
+
+	rowsOf := func(r *Reconciler) ([]v1beta1.OMENativeInstanceStatus, []string) {
+		ir := &v1beta1.InferenceReplica{}
+		if _, err := irstatus.GetDecoded(ctx, r.cachedReader(), req.NamespacedName, ir); err != nil {
+			t.Fatalf("decoded read: %v", err)
+		}
+		return ir.Status.InstanceStatuses, ir.Finalizers
+	}
+	denseRows, denseFinalizers := rowsOf(rDense)
+	columnarRows, columnarFinalizers := rowsOf(rColumnar)
+	if len(denseFinalizers) != 1 || !reflect.DeepEqual(denseFinalizers, columnarFinalizers) {
+		t.Fatalf("finalizer write differs: dense %v, columnar %v", denseFinalizers, columnarFinalizers)
+	}
+	if len(columnarRows) != len(denseRows) {
+		t.Fatalf("row count differs: dense %d, columnar %d", len(denseRows), len(columnarRows))
+	}
+	for i := range denseRows {
+		want, got := denseRows[i], columnarRows[i]
+		if want.Index != got.Index || want.Phase != got.Phase || (want.Operation == nil) != (got.Operation == nil) ||
+			(want.Operation != nil && want.Operation.Type != got.Operation.Type) {
+			t.Fatalf("lifecycle decision differs at row %d: dense phase %s op %+v, columnar phase %s op %+v", i, want.Phase, want.Operation, got.Phase, got.Operation)
+		}
+	}
+	if got, want := len(listPods(t, cColumnar, dense.Namespace)), len(listPods(t, cDense, dense.Namespace)); got != want {
+		t.Fatalf("Pod effect differs: dense %d, columnar %d", want, got)
+	}
+}
+
+// The force-delete sweep inside the migration source drain, driven
+// through the adapter.
+//
+// The sweep runs after the surge has passed its rotation and
+// availability gates, and the availability half reads the row's PodCount
+// and AvailablePodCount — counters only the adapter's status publication
+// writes. Driving the arrow therefore needs a walk that publishes them,
+// which is what this full-loop reconcile does.
+
+// TestReconcile_MigrationSourceWedged_ForceDeletesAndCompletes drives the
+// migration whose source pods never leave: the kubelet behind them is
+// gone, so the graceful delete the drain issues leaves a Terminating
+// object nothing will ever clear. With lifecycle.forceDelete configured
+// the drain force-deletes them at grace zero and the migration completes
+// on the resulting absence.
+func TestReconcile_MigrationSourceWedged_ForceDeletesAndCompletes(t *testing.T) {
+	base := time.Now()
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Spec.Runners = []v1beta1.Runner{
+		{Name: v1beta1.RunnerNameLeader, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "ome-container", Image: "test:v1",
+				Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+		}}},
+		{Name: v1beta1.RunnerNameWorker, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "ome-container", Image: "test:v1",
+				Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+		}}},
+	}
+
+	// The kubelet behind the source Instance is gone: its pods keep the
+	// deletion timestamp the graceful delete stamped and no finalizer,
+	// and only a grace-zero delete takes them out. The fake client cannot
+	// store a DeletionTimestamp without finalizers, so the wedge is held
+	// here and presented on every List, the way the apiserver would.
+	wedged := map[string]metav1.Time{}
+	var forced []string
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(ir).
+		WithStatusSubresource(&v1beta1.InferenceReplica{}).
+		WithIndex(&schedulingv1alpha1.PodGroup{}, workloadgang.PodGroupControllerUIDIndexField, workloadgang.PodGroupControllerUIDIndexExtractor).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if err := cl.List(ctx, list, opts...); err != nil {
+					return err
+				}
+				pl, ok := list.(*corev1.PodList)
+				if !ok {
+					return nil
+				}
+				for i := range pl.Items {
+					if dt, stuck := wedged[pl.Items[i].Name]; stuck {
+						pl.Items[i].DeletionTimestamp = &dt
+					}
+				}
+				return nil
+			},
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				pod, ok := obj.(*corev1.Pod)
+				if !ok {
+					return cl.Delete(ctx, obj, opts...)
+				}
+				do := &client.DeleteOptions{}
+				for _, o := range opts {
+					o.ApplyToDelete(do)
+				}
+				if do.GracePeriodSeconds != nil && *do.GracePeriodSeconds == 0 {
+					forced = append(forced, pod.Name)
+					return cl.Delete(ctx, obj, opts...)
+				}
+				if pod.Labels[query.LabelInstanceIdx] == "0" {
+					// Graceful delete on a pod whose node is dead: the
+					// object stays, overdue from the instant of the request.
+					wedged[pod.Name] = metav1.NewTime(base.Add(-10 * time.Minute))
+					return nil
+				}
+				return cl.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	rec := record.NewFakeRecorder(256)
+	r := &Reconciler{
+		Client:                   c,
+		APIReader:                c,
+		Log:                      logf.Log.WithName("test"),
+		InstanceStatusTarget:     irstatus.EncodingDenseV1,
+		Expectations:             workloadtypes.NewExpectations(),
+		ScaleDownRequeueInterval: testScaleDownRequeueInterval,
+		Recorder:                 rec,
+		Clock:                    clocktesting.NewFakeClock(base),
+		GangSchedulingAvailable:  true,
+	}
+	withLifecycleConfig(r, `{"audit":{"maxInFlightMigrations":3,"maxMigrationsPerWindow":10,"window":"1h"},`+
+		`"forceDelete":{"overdueSlack":"2m","nodeUnreachableThreshold":"5m"}}`)
+
+	ctx := context.Background()
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	var events []string
+	step := func(tag string) {
+		r.Expectations = workloadtypes.NewExpectations()
+		if _, err := r.Reconcile(ctx, request); err != nil {
+			t.Fatalf("%s reconcile: %v", tag, err)
+		}
+		events = append(events, drainEvents(rec)...)
+		gangMigSimulate(t, c, ir.Namespace, ir.Spec.ParentRef.Name)
+	}
+	get := func() *v1beta1.InferenceReplica {
+		fresh := &v1beta1.InferenceReplica{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(ir), fresh); err != nil {
+			t.Fatalf("get IR: %v", err)
+		}
+		return fresh
+	}
+
+	for i := 0; i < 10; i++ {
+		step("startup")
+	}
+	if fresh := get(); len(fresh.Status.InstanceStatuses) != 1 ||
+		fresh.Status.InstanceStatuses[0].Phase != v1beta1.OMENativeInstanceReady {
+		t.Fatalf("gang did not reach Ready: %+v", fresh.Status.InstanceStatuses)
+	}
+
+	fresh := get()
+	fresh.Status.Migrations = []v1beta1.MigrationStatus{{
+		RequestUUID:    "mig-source-wedged",
+		Trigger:        v1beta1.MigrationTriggerManual,
+		Phase:          v1beta1.MigrationPhaseAccepted,
+		SourceInstance: 0,
+		FromNode:       gangMigSourceNode,
+		Reason:         "test",
+		StartedAt:      metav1.NewTime(base),
+		Deadline:       metav1.NewTime(base.Add(30 * time.Minute)),
+	}}
+	if err := c.Status().Update(ctx, fresh); err != nil {
+		t.Fatalf("seed migration record: %v", err)
+	}
+
+	completed := false
+	for i := 0; i < 30 && !completed; i++ {
+		step("migration")
+		got := get()
+		if len(got.Status.Migrations) != 1 {
+			t.Fatalf("migration record count: %+v", got.Status.Migrations)
+		}
+		switch got.Status.Migrations[0].Phase {
+		case v1beta1.MigrationPhaseCompleted:
+			completed = true
+		case v1beta1.MigrationPhaseFailed:
+			t.Fatalf("migration failed: %+v", got.Status.Migrations[0])
+		}
+	}
+	if !completed {
+		got := get()
+		t.Fatalf("migration never completed: record=%+v instances=%+v wedged=%v forced=%v",
+			got.Status.Migrations[0], got.Status.InstanceStatuses, wedged, forced)
+	}
+
+	if len(wedged) == 0 {
+		t.Fatal("the source pods were never wedged, so the sweep was not the thing that cleared them")
+	}
+	for name := range wedged {
+		if !containsString(forced, name) {
+			t.Errorf("wedged source pod %s was not force-deleted at grace zero; forced=%v", name, forced)
+		}
+	}
+	if len(eventsContaining(events, string(workloadtypes.EventReasonPodForceDeleted))) == 0 {
+		t.Errorf("the sweep must warn PodForceDeleted; events=%v", events)
+	}
+	if got := get(); len(got.Status.InstanceStatuses) != 1 || got.Status.InstanceStatuses[0].Index == 0 {
+		t.Errorf("only the promoted surge survives, got %+v", got.Status.InstanceStatuses)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if strings.EqualFold(v, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// Full-loop gang migration walk through the real Reconcile dispatch
+// (plan build, EnsurePodGroups, Migrate op, guarded status seams)
+// against a lockstep-simulated environment: scheduler binding, kubelet
+// readiness (gate-aware PodReady), the coordination layer's
+// per-revision routing Service, and the endpointslice controller.
+//
+// The walk crosses the window the ops-level fixtures cannot reach: the
+// plan releases the source index the moment the surge is promoted
+// Ready, while the migration record is still Draining. The completion
+// tail must keep computing the gang-shaped desired pod set from the
+// surge's own plan entry — losing the shape collapses the surge to the
+// single-pod fallback, renders a spurious "default" runner pod that
+// can never enter the leader-only routing rotation, and parks the
+// record at Draining forever.
+
+const (
+	gangMigSourceNode = "node-a"
+	gangMigOtherNode  = "node-b"
+)
+
+// gangMigSimulate advances the simulated environment one step:
+// binds unscheduled pods (the source leader to gangMigSourceNode,
+// everything else — including the NotIn[source-node] surge — to
+// gangMigOtherNode), flips ContainersReady, computes PodReady as
+// ContainersReady AND the ome.io/serving gate (kubelet's readiness-gate
+// contract), and mirrors pod state into EndpointSlices for the
+// per-revision routing Service (leaders only, ready follows PodReady)
+// and the component headless Service (all pods, publishNotReadyAddresses
+// semantics).
+func gangMigSimulate(t *testing.T, c client.Client, ns, isvcName string) {
+	t.Helper()
+	ctx := context.Background()
+	pods := &corev1.PodList{}
+	if err := c.List(ctx, pods, client.InNamespace(ns)); err != nil {
+		t.Fatalf("sim list pods: %v", err)
+	}
+
+	leadersByHash := map[string][]*corev1.Pod{}
+	all := []*corev1.Pod{}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		all = append(all, p)
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		if p.Spec.NodeName == "" {
+			node := gangMigOtherNode
+			if p.Labels[query.LabelRunner] == "leader" && p.Labels[query.LabelInstanceIdx] == "0" {
+				node = gangMigSourceNode
+			}
+			p.Spec.NodeName = node
+			if err := c.Update(ctx, p); err != nil {
+				t.Fatalf("sim bind pod: %v", err)
+			}
+		}
+		changed := gangMigSetCond(p, corev1.ContainersReady, corev1.ConditionTrue)
+		ready := corev1.ConditionFalse
+		if podreadiness.IsServing(p) {
+			ready = corev1.ConditionTrue
+		}
+		changed = gangMigSetCond(p, corev1.PodReady, ready) || changed
+		p.Status.Phase = corev1.PodRunning
+		if changed {
+			if err := c.Status().Update(ctx, p); err != nil {
+				t.Fatalf("sim kubelet status: %v", err)
+			}
+		}
+		if p.Labels[query.LabelRunner] == "leader" {
+			if hash := p.Labels[query.LabelRevisionHash]; hash != "" {
+				leadersByHash[hash] = append(leadersByHash[hash], p)
+			}
+		}
+	}
+
+	for hash, leaders := range leadersByHash {
+		svcName := query.PerRevisionServiceName(isvcName, workloadtypes.ComponentEngine, hash)
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: svcName}}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(svc), svc); apierrors.IsNotFound(err) {
+			svc.Spec = corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 8080}}}
+			if err := c.Create(ctx, svc); err != nil {
+				t.Fatalf("sim create routing svc: %v", err)
+			}
+		}
+		eps := make([]discoveryv1.Endpoint, 0, len(leaders))
+		for i, p := range leaders {
+			podReady := gangMigHasCond(p, corev1.PodReady, corev1.ConditionTrue)
+			eps = append(eps, discoveryv1.Endpoint{
+				Addresses: []string{fmt.Sprintf("10.0.0.%d", i+1)},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready:       ptr.To(podReady && p.DeletionTimestamp == nil),
+					Serving:     ptr.To(podReady),
+					Terminating: ptr.To(p.DeletionTimestamp != nil),
+				},
+				TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: p.Namespace, Name: p.Name, UID: p.UID},
+			})
+		}
+		gangMigUpsertSlice(t, c, ns, svcName, eps)
+	}
+
+	headless := query.HeadlessServiceName(isvcName, workloadtypes.ComponentEngine)
+	eps := make([]discoveryv1.Endpoint, 0, len(all))
+	for i, p := range all {
+		eps = append(eps, discoveryv1.Endpoint{
+			Addresses: []string{fmt.Sprintf("10.0.1.%d", i+1)},
+			Conditions: discoveryv1.EndpointConditions{
+				Ready:       ptr.To(p.DeletionTimestamp == nil),
+				Serving:     ptr.To(true),
+				Terminating: ptr.To(p.DeletionTimestamp != nil),
+			},
+			TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: p.Namespace, Name: p.Name, UID: p.UID},
+		})
+	}
+	gangMigUpsertSlice(t, c, ns, headless, eps)
+}
+
+func gangMigUpsertSlice(t *testing.T, c client.Client, ns, svcName string, eps []discoveryv1.Endpoint) {
+	t.Helper()
+	ctx := context.Background()
+	name := svcName + "-sim"
+	existing := &discoveryv1.EndpointSlice{}
+	err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, existing)
+	if apierrors.IsNotFound(err) {
+		slice := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns, Name: name,
+				Labels: map[string]string{discoveryv1.LabelServiceName: svcName},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   eps,
+		}
+		if cerr := c.Create(ctx, slice); cerr != nil {
+			t.Fatalf("sim create slice: %v", cerr)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("sim get slice: %v", err)
+	}
+	existing.Endpoints = eps
+	if uerr := c.Update(ctx, existing); uerr != nil {
+		t.Fatalf("sim update slice: %v", uerr)
+	}
+}
+
+func gangMigSetCond(p *corev1.Pod, ct corev1.PodConditionType, st corev1.ConditionStatus) bool {
+	for i := range p.Status.Conditions {
+		if p.Status.Conditions[i].Type == ct {
+			if p.Status.Conditions[i].Status == st {
+				return false
+			}
+			p.Status.Conditions[i].Status = st
+			p.Status.Conditions[i].LastTransitionTime = metav1.Now()
+			return true
+		}
+	}
+	p.Status.Conditions = append(p.Status.Conditions, corev1.PodCondition{
+		Type: ct, Status: st, LastTransitionTime: metav1.Now(),
+	})
+	return true
+}
+
+func gangMigHasCond(p *corev1.Pod, ct corev1.PodConditionType, st corev1.ConditionStatus) bool {
+	for _, cond := range p.Status.Conditions {
+		if cond.Type == ct {
+			return cond.Status == st
+		}
+	}
+	return false
+}
+
+// The walk also carries the migration tail's two terminal arrows, which
+// need the published pod counters the surge availability gate reads:
+// the surge promotes to Ready on the source's revision with its pin
+// cleared, and the drained source's row is then removed with the record
+// stamped Completed.
+func TestReconcile_GangMigrationCompletesAfterSourcePlanRelease(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Spec.Runners = []v1beta1.Runner{
+		{Name: v1beta1.RunnerNameLeader, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "ome-container", Image: "test:v1",
+				Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+		}}},
+		{Name: v1beta1.RunnerNameWorker, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "ome-container", Image: "test:v1",
+				Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+		}}},
+	}
+	r, c := newReconciler(t, ir)
+	withMigrationCapacityConfig(r)
+	r.GangSchedulingAvailable = true
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	ctx := context.Background()
+
+	get := func() *v1beta1.InferenceReplica {
+		fresh := &v1beta1.InferenceReplica{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(ir), fresh); err != nil {
+			t.Fatalf("get IR: %v", err)
+		}
+		return fresh
+	}
+	// One reconcile + one environment step; expectations are reset first
+	// (a fresh cache reads as satisfied — the informer-caught-up state).
+	step := func(tag string) {
+		r.Expectations = workloadtypes.NewExpectations()
+		if _, err := r.Reconcile(ctx, request); err != nil {
+			t.Fatalf("%s reconcile: %v", tag, err)
+		}
+		gangMigSimulate(t, c, ir.Namespace, ir.Spec.ParentRef.Name)
+	}
+
+	for i := 0; i < 10; i++ {
+		step("startup")
+	}
+	fresh := get()
+	if len(fresh.Status.InstanceStatuses) != 1 || fresh.Status.InstanceStatuses[0].Phase != v1beta1.OMENativeInstanceReady {
+		t.Fatalf("gang did not reach Ready: %+v", fresh.Status.InstanceStatuses)
+	}
+
+	// Accept-shaped record: migrate the gang off the leader's node.
+	fresh.Status.Migrations = []v1beta1.MigrationStatus{{
+		RequestUUID:    "mig-gang-release",
+		Trigger:        v1beta1.MigrationTriggerManual,
+		Phase:          v1beta1.MigrationPhaseAccepted,
+		SourceInstance: 0,
+		FromNode:       gangMigSourceNode,
+		Reason:         "test",
+		StartedAt:      metav1.Now(),
+		Deadline:       metav1.NewTime(time.Now().Add(30 * time.Minute)),
+	}}
+	if err := c.Status().Update(ctx, fresh); err != nil {
+		t.Fatalf("seed migration record: %v", err)
+	}
+
+	completed := false
+	for i := 0; i < 30 && !completed; i++ {
+		step("migration")
+		got := get()
+		if len(got.Status.Migrations) != 1 {
+			t.Fatalf("migration record count: %+v", got.Status.Migrations)
+		}
+		switch got.Status.Migrations[0].Phase {
+		case v1beta1.MigrationPhaseCompleted:
+			completed = true
+		case v1beta1.MigrationPhaseFailed:
+			t.Fatalf("migration failed: %+v", got.Status.Migrations[0])
+		}
+	}
+	if !completed {
+		got := get()
+		t.Fatalf("migration never completed: record=%+v instances=%+v",
+			got.Status.Migrations[0], got.Status.InstanceStatuses)
+	}
+
+	// Exactly the promoted surge survives, unpinned.
+	got := get()
+	if len(got.Status.InstanceStatuses) != 1 {
+		t.Fatalf("instance statuses after completion: %+v", got.Status.InstanceStatuses)
+	}
+	surge := got.Status.InstanceStatuses[0]
+	if surge.Index == 0 || surge.Phase != v1beta1.OMENativeInstanceReady || surge.Operation != nil {
+		t.Fatalf("promoted surge shape: %+v", surge)
+	}
+
+	// The surge kept the gang shape end to end: one leader + one worker,
+	// no single-pod-fallback "default" runner pod, and no source pod left.
+	pods := &corev1.PodList{}
+	if err := c.List(ctx, pods, client.InNamespace(ir.Namespace)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	runners := map[string]int{}
+	for i := range pods.Items {
+		p := pods.Items[i]
+		if p.Labels[query.LabelInstanceIdx] == "0" {
+			t.Fatalf("source gang pod survived completion: %s", p.Name)
+		}
+		runners[p.Labels[query.LabelRunner]]++
+	}
+	if runners["default"] != 0 || runners["leader"] != 1 || runners["worker"] != 1 {
+		t.Fatalf("surge runner layout: %+v", runners)
+	}
+}
+
+// directiveEntry builds one terminal relocation-directive ledger row.
+func directiveEntry(uid, component string, idx int32, node string) audit.Entry {
+	return audit.Entry{
+		RequestUUID:    uid,
+		Component:      component,
+		SourceInstance: idx,
+		Phase:          audit.PhaseCompleted,
+		Reason:         audit.ReasonAutoRecover,
+		Outcome:        audit.OutcomeRelocateRecreate,
+		FromNode:       node,
+		StartedAt:      time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC).Format(time.RFC3339),
+	}
+}
+
+// reconcileRelocationDirectives projects the exclusion map from the
+// ledger's AutoRecover directives, bounded to the most recent
+// autoMigrateBudget DISTINCT nodes per instance, scoped to the IR's
+// component, and ignoring non-AutoRecover rows.
+func TestReconcileRelocationDirectives_BuildsBoundedExclusionMap(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate}},
+	}
+	r, c := newReconciler(t, ir)
+
+	ledger := &audit.Ledger{}
+	// Five directives for instance 0 — dedup happens BEFORE the budget
+	// window, so the repeated n4 doesn't shrink the memory: the last
+	// three DISTINCT nodes {n2,n3,n4} survive.
+	for i, node := range []string{"n1", "n2", "n3", "n4", "n4"} {
+		ledger.UpsertEntry(directiveEntry(fmt.Sprintf("u%d", i), "engine", 0, node))
+	}
+	// Noise: other component + non-AutoRecover operator migration.
+	ledger.UpsertEntry(directiveEntry("dec", "decoder", 0, "n9"))
+	ledger.UpsertEntry(audit.Entry{RequestUUID: "op1", Component: "engine", SourceInstance: 0,
+		Phase: audit.PhaseStarted, Reason: "fragmentation", FromNode: "n8",
+		StartedAt: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)})
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+
+	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
+	if len(got) != 1 {
+		t.Fatalf("map: got %v want exactly instance 0", got)
+	}
+	nodes := got[0]
+	if len(nodes) != 3 || nodes[0] != "n2" || nodes[1] != "n3" || nodes[2] != "n4" {
+		t.Errorf("instance 0 exclusions: got %v want [n2 n3 n4] (last 3 distinct nodes)", nodes)
+	}
+
+	// Budget 0 (unconfigured) → no exclusions at all.
+	if got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 0); got != nil {
+		t.Errorf("budget 0: got %v want nil", got)
+	}
+}
+
+// An instance observed Phase=Ready with no in-flight Operation has
+// proven its placement: its AutoRecover directives are pruned from the
+// persisted ledger (success-prune mirror of the RetryBlock prune) and
+// drop out of the exclusion map. Foreign entries survive.
+func TestReconcileRelocationDirectives_PrunesOnReady(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate}},
+	}
+	r, c := newReconciler(t, ir)
+
+	ledger := &audit.Ledger{}
+	ledger.UpsertEntry(directiveEntry("u0", "engine", 0, "n1"))
+	ledger.UpsertEntry(directiveEntry("u1", "engine", 1, "n2"))
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+
+	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n2" {
+		t.Fatalf("map: got %v want only instance 1 → [n2] (instance 0 pruned on Ready)", got)
+	}
+
+	// The prune persisted: instance 0's directive is gone from the CM,
+	// instance 1's survives.
+	after, err := audit.LoadLedgerForOwner(context.Background(), c, ir)
+	if err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 0) != 0 {
+		t.Errorf("instance 0 directives not pruned: %+v", after.Entries)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 1) != 1 {
+		t.Errorf("instance 1 directives must survive: %+v", after.Entries)
+	}
+}
+
+// The prune-persist branch re-loads the ledger LIVE and re-prunes
+// before writing: the persist writes the snapshot wholesale, so basing
+// it on a lagged cache would drop rows written concurrently by sibling
+// IRs. The sibling decoder row here exists ONLY behind APIReader and
+// must survive the persisted prune.
+func TestReconcileRelocationDirectives_PrunePersistsFromLiveSnapshot(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate}},
+	}
+	r, c := newReconciler(t, ir)
+
+	cached := &audit.Ledger{}
+	cached.UpsertEntry(directiveEntry("u0", "engine", 0, "n1"))
+	cached.UpsertEntry(directiveEntry("u1", "engine", 1, "n2"))
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, cached); err != nil {
+		t.Fatalf("seed cached ledger: %v", err)
+	}
+	readerClient := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	live := &audit.Ledger{}
+	live.UpsertEntry(directiveEntry("u0", "engine", 0, "n1"))
+	live.UpsertEntry(directiveEntry("u1", "engine", 1, "n2"))
+	live.UpsertEntry(directiveEntry("dec", "decoder", 0, "n9"))
+	if err := audit.PersistLedgerForOwner(context.Background(), readerClient, ir, irGVK, live); err != nil {
+		t.Fatalf("seed live ledger: %v", err)
+	}
+	r.APIReader = readerClient
+
+	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n2" {
+		t.Fatalf("map: got %v want only instance 1 → [n2]", got)
+	}
+
+	after, err := audit.LoadLedgerForOwner(context.Background(), c, ir)
+	if err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 0) != 0 {
+		t.Errorf("instance 0 directives not pruned: %+v", after.Entries)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 1) != 1 {
+		t.Errorf("instance 1 directives must survive: %+v", after.Entries)
+	}
+	if audit.CountAutoRecoverAttempts(after, "decoder", 0) != 1 {
+		t.Errorf("sibling decoder row must survive the wholesale persist: %+v", after.Entries)
+	}
+}
+
+// failingGetReader errors every Get — stands in for a live re-load
+// failure inside the prune-persist branch.
+type failingGetReader struct{ client.Reader }
+
+func (failingGetReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return fmt.Errorf("live read down")
+}
+
+// A live re-load failure in the persist branch fails open: the
+// projection still uses the cache-pruned in-memory view, and the
+// persisted ledger stays untouched so the prune retries next pass.
+func TestReconcileRelocationDirectives_LiveReloadFailureSkipsPersist(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate}},
+	}
+	r, c := newReconciler(t, ir)
+
+	ledger := &audit.Ledger{}
+	ledger.UpsertEntry(directiveEntry("u0", "engine", 0, "n1"))
+	ledger.UpsertEntry(directiveEntry("u1", "engine", 1, "n2"))
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+	r.APIReader = failingGetReader{}
+
+	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n2" {
+		t.Fatalf("map: got %v want only instance 1 → [n2] (cache-pruned view)", got)
+	}
+
+	after, err := audit.LoadLedgerForOwner(context.Background(), c, ir)
+	if err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 0) != 1 {
+		t.Errorf("persist must be skipped on live re-load failure (prune retries next pass): %+v", after.Entries)
+	}
+}
+
+// autoRecord builds one born-terminal Auto migration status record.
+func autoRecord(uuid string, idx int32, node string, startedAt time.Time) v1beta1.MigrationStatus {
+	started := metav1.NewTime(startedAt)
+	completed := started
+	return v1beta1.MigrationStatus{
+		RequestUUID:    uuid,
+		Trigger:        v1beta1.MigrationTriggerAuto,
+		SourceInstance: idx,
+		FromNode:       node,
+		Phase:          v1beta1.MigrationPhaseRelocated,
+		Attempt:        1,
+		Reason:         audit.ReasonAutoRecover,
+		StartedAt:      started,
+		Deadline:       started,
+		CompletedAt:    &completed,
+	}
+}
+
+// The success touch: an instance observed Ready with no in-flight
+// Operation stamps Succeeded=true + CompletedAt on its NEWEST
+// un-Succeeded Auto record only — older un-Succeeded records and other
+// instances' records stay untouched — while the same pass prunes the
+// instance's ledger rows. The asymmetry is deliberate: ledger =
+// working memory for exclusions (pruned on Ready), record = visible
+// history (persists until the trim window).
+func TestReconcileRelocationDirectives_SuccessTouchStampsNewestAutoRecord(t *testing.T) {
+	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	ir := baselineIR("llama-engine", "prod", 2)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate}},
+	}
+	ir.Status.Migrations = []v1beta1.MigrationStatus{
+		autoRecord("u-old", 0, "n1", t0.Add(-10*time.Minute)),
+		autoRecord("u-new", 0, "n2", t0.Add(-5*time.Minute)),
+		autoRecord("u-other", 1, "n3", t0.Add(-5*time.Minute)),
+	}
+	r, c := newReconciler(t, ir)
+
+	ledger := &audit.Ledger{}
+	ledger.UpsertEntry(directiveEntry("u-old", "engine", 0, "n1"))
+	ledger.UpsertEntry(directiveEntry("u-new", "engine", 0, "n2"))
+	ledger.UpsertEntry(directiveEntry("u-other", "engine", 1, "n3"))
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+
+	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n3" {
+		t.Fatalf("exclusion map: got %v want only instance 1 → [n3]", got)
+	}
+
+	fresh := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh); err != nil {
+		t.Fatalf("re-read IR: %v", err)
+	}
+	byUUID := map[string]v1beta1.MigrationStatus{}
+	for _, e := range fresh.Status.Migrations {
+		byUUID[e.RequestUUID] = e
+	}
+	newest := byUUID["u-new"]
+	if newest.Succeeded == nil || !*newest.Succeeded {
+		t.Errorf("u-new Succeeded: got %v want true (newest record for the Ready instance)", newest.Succeeded)
+	}
+	if newest.CompletedAt == nil || !newest.CompletedAt.Time.After(t0.Add(-5*time.Minute)) {
+		t.Errorf("u-new CompletedAt: got %v want restamped at success time", newest.CompletedAt)
+	}
+	if older := byUUID["u-old"]; older.Succeeded != nil {
+		t.Errorf("u-old Succeeded: got %v want nil (only the newest record is stamped)", *older.Succeeded)
+	}
+	if other := byUUID["u-other"]; other.Succeeded != nil {
+		t.Errorf("u-other Succeeded: got %v want nil (instance 1 is not Ready)", *other.Succeeded)
+	}
+	if len(ir.Status.Migrations) != 3 || ir.Status.Migrations[1].Succeeded == nil {
+		t.Errorf("in-memory mirror: got %+v want the committed stamp mirrored back", ir.Status.Migrations)
+	}
+
+	// The ledger rows for instance 0 pruned in the same pass; the
+	// status records persist — the asymmetry under test.
+	after, err := audit.LoadLedgerForOwner(context.Background(), c, ir)
+	if err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 0) != 0 {
+		t.Errorf("instance 0 ledger rows must prune on Ready: %+v", after.Entries)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 1) != 1 {
+		t.Errorf("instance 1 ledger rows must survive: %+v", after.Entries)
+	}
+}
+
+// Crash-window heal: the ledger rows were already pruned (prior pass
+// crashed between the prune persist and the stamp) — the success touch
+// still fires because it is keyed on the status records, not the
+// ledger.
+func TestReconcileRelocationDirectives_SuccessTouchIndependentOfLedger(t *testing.T) {
+	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
+	}
+	ir.Status.Migrations = []v1beta1.MigrationStatus{autoRecord("u-orphan", 0, "n1", t0)}
+	r, c := newReconciler(t, ir)
+
+	// No ledger seeded at all.
+	if got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3); got != nil {
+		t.Fatalf("exclusion map: got %v want nil (empty ledger)", got)
+	}
+
+	fresh := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh); err != nil {
+		t.Fatalf("re-read IR: %v", err)
+	}
+	if len(fresh.Status.Migrations) != 1 || fresh.Status.Migrations[0].Succeeded == nil || !*fresh.Status.Migrations[0].Succeeded {
+		t.Errorf("record: got %+v want u-orphan stamped Succeeded=true without any ledger rows", fresh.Status.Migrations)
+	}
+}
+
+func TestStampAutoRelocationSuccess_SameNameReplacementUntouched(t *testing.T) {
+	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	stale := baselineIR("llama-engine", "prod", 1)
+	stale.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
+	}
+	stale.Status.Migrations = []v1beta1.MigrationStatus{autoRecord("u-stale", 0, "n1", t0)}
+
+	replacement := stale.DeepCopy()
+	replacement.UID = "replacement-uid"
+	r, c := newReconciler(t, replacement)
+
+	err := r.stampAutoRelocationSuccess(context.Background(), stale)
+	if !errors.Is(err, workloadtypes.ErrStatusOwnerGone) {
+		t.Fatalf("stamp error: got %v want ErrStatusOwnerGone", err)
+	}
+
+	fresh := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(replacement), fresh); err != nil {
+		t.Fatalf("re-read replacement: %v", err)
+	}
+	if got := fresh.Status.Migrations[0].Succeeded; got != nil {
+		t.Fatalf("replacement Succeeded: got %v want nil", *got)
+	}
+	if got := stale.Status.Migrations[0].Succeeded; got != nil {
+		t.Fatalf("stale in-memory Succeeded: got %v want nil", *got)
+	}
+}
+
+// A Ready instance with an in-flight Operation (e.g. a fresh update
+// just stamped) is NOT pruned — only settled Ready-no-op instances
+// reset their relocation memory.
+func TestReconcileRelocationDirectives_ReadyWithOpNotPruned(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate,
+				StartedAt: metav1.NewTime(time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC))}},
+	}
+	r, c := newReconciler(t, ir)
+	ledger := &audit.Ledger{}
+	ledger.UpsertEntry(directiveEntry("u0", "engine", 0, "n1"))
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+
+	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
+	if len(got) != 1 || len(got[0]) != 1 || got[0][0] != "n1" {
+		t.Fatalf("map: got %v want instance 0 → [n1] (no prune while op in flight)", got)
+	}
+}
+
+func TestBumpCollisionCount_SameNameReplacementUntouched(t *testing.T) {
+	stale := baselineIR("llama-engine", "prod", 1)
+	replacement := stale.DeepCopy()
+	replacement.UID = "replacement-uid"
+	count := int32(7)
+	replacement.Status.CollisionCount = &count
+	r, c := newReconciler(t, replacement)
+
+	bumped, err := r.bumpCollisionCount(context.Background(), stale)
+	if !errors.Is(err, workloadtypes.ErrStatusOwnerGone) {
+		t.Fatalf("bump error: got %v want ErrStatusOwnerGone", err)
+	}
+	if bumped != nil {
+		t.Fatalf("bumped count: got %d want nil", *bumped)
+	}
+
+	fresh := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(replacement), fresh); err != nil {
+		t.Fatalf("re-read replacement: %v", err)
+	}
+	if fresh.Status.CollisionCount == nil || *fresh.Status.CollisionCount != count {
+		t.Fatalf("replacement CollisionCount: got %v want %d", fresh.Status.CollisionCount, count)
+	}
+	if stale.Status.CollisionCount != nil {
+		t.Fatalf("stale in-memory CollisionCount: got %d want nil", *stale.Status.CollisionCount)
+	}
+}
+
+func TestParseExcludedAnnotationKeys(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	g.Expect(parseExcludedAnnotationKeys(&v1beta1.InferenceReplica{})).To(gomega.BeNil(),
+		"no annotation -> nil")
+
+	ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		constants.RevisionExcludedAnnotationKeysAnnotationKey: "a,b,,c",
+	}}}
+	got := parseExcludedAnnotationKeys(ir)
+	g.Expect(got).To(gomega.HaveLen(3), "empty split entries are dropped")
+	g.Expect(got).To(gomega.HaveKey("a"))
+	g.Expect(got).To(gomega.HaveKey("b"))
+	g.Expect(got).To(gomega.HaveKey("c"))
+}
+
+func TestStripExcludedAnnotations(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	// nil excluded -> same pointer, untouched.
+	meta := &metav1.ObjectMeta{Annotations: map[string]string{"a": "1"}}
+	g.Expect(stripExcludedAnnotations(meta, nil)).To(gomega.BeIdenticalTo(meta))
+
+	// nil meta -> nil.
+	g.Expect(stripExcludedAnnotations(nil, map[string]struct{}{"x": {}})).To(gomega.BeNil())
+
+	excluded := map[string]struct{}{"drop": {}}
+	in := &metav1.ObjectMeta{
+		Labels:      map[string]string{"l": "1"},
+		Annotations: map[string]string{"keep": "1", "drop": "2"},
+	}
+	out := stripExcludedAnnotations(in, excluded)
+	g.Expect(out).NotTo(gomega.BeIdenticalTo(in), "must return a copy, not mutate in place")
+	g.Expect(out.Annotations).To(gomega.HaveKey("keep"))
+	g.Expect(out.Annotations).NotTo(gomega.HaveKey("drop"))
+	g.Expect(in.Annotations).To(gomega.HaveKey("drop"),
+		"input must be untouched — pod rendering still uses the full annotation set")
+	g.Expect(out.Labels).To(gomega.HaveKeyWithValue("l", "1"), "labels must be preserved")
+
+	// nothing to drop -> same pointer (no needless copy).
+	g.Expect(stripExcludedAnnotations(in, map[string]struct{}{"absent": {}})).
+		To(gomega.BeIdenticalTo(in))
+}
+
+// TestRevisionHashStableUnderExcludedAnnotations verifies inherited ISVC annotations do not
+// affect revision identity while component annotations remain hash inputs.
+func TestRevisionHashStableUnderExcludedAnnotations(t *testing.T) {
+	g := gomega.NewWithT(t)
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img:1"}}}
+
+	base := &metav1.ObjectMeta{
+		Labels:      map[string]string{"app": "x"},
+		Annotations: map[string]string{"ome.io/declared": "1"},
+	}
+	baseHash, _, err := revision.HashWithWorker(podSpec, nil, base, nil, "uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	// Projected metadata retains the inherited annotation for pod rendering.
+	withAmbient := &metav1.ObjectMeta{
+		Labels: map[string]string{"app": "x"},
+		Annotations: map[string]string{
+			"ome.io/declared":                     "1",
+			"editor.example.com/resource-version": "v1beta1",
+		},
+	}
+	excluded := parseExcludedAnnotationKeys(&v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			constants.RevisionExcludedAnnotationKeysAnnotationKey: "editor.example.com/resource-version",
+		}},
+	})
+
+	strippedHash, _, err := revision.HashWithWorker(
+		podSpec, nil, stripExcludedAnnotations(withAmbient, excluded), nil, "uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(strippedHash).To(gomega.Equal(baseHash),
+		"an excluded inherited annotation must not change the revision hash")
+
+	// The unfiltered metadata remains a distinct revision input.
+	unstrippedHash, _, err := revision.HashWithWorker(podSpec, nil, withAmbient, nil, "uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(unstrippedHash).NotTo(gomega.Equal(baseHash),
+		"the inherited annotation must change the hash before filtering")
+
+	// A component annotation remains part of the revision identity.
+	declaredChanged := &metav1.ObjectMeta{
+		Labels:      map[string]string{"app": "x"},
+		Annotations: map[string]string{"ome.io/declared": "2"},
+	}
+	declHash, _, err := revision.HashWithWorker(
+		podSpec, nil, stripExcludedAnnotations(declaredChanged, excluded), nil, "uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(declHash).NotTo(gomega.Equal(baseHash),
+		"a deliberate declared-annotation change must still produce a new revision")
+}
+
+// TestRevisionHashUnchangedByIROperatorVerbAnnotations verifies the
+// InferenceReplica operator verbs (release-held-revision, reset-instances)
+// never mint a revision: stamped on the IR object they are not hash
+// inputs at all, and even inherited onto the pod-template metadata they
+// are filtered as lifecycle annotations. Each hash is computed on a fresh
+// Reconciler so the memoization cache cannot mask a drift.
+func TestRevisionHashUnchangedByIROperatorVerbAnnotations(t *testing.T) {
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img:1"}}}
+	templateMeta := &metav1.ObjectMeta{Annotations: map[string]string{"ome.io/declared": "1"}}
+	input := workloadtypes.ReconcileInput{DesiredSpec: workloadtypes.WorkloadDesiredSpec{
+		PodSpec:               podSpec,
+		PodTemplateObjectMeta: templateMeta,
+	}}
+	ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
+		Name: "engine", Namespace: "default", UID: "ir-uid", Generation: 1,
+	}}
+	verbs := map[string]string{
+		constants.ReleaseHeldRevisionAnnotationKey: "llama-engine-aaaaaaaa",
+		constants.ResetInstancesAnnotationKey:      "13,14",
+	}
+	for key, val := range verbs {
+		t.Run(key, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+
+			baseHash, _, err := (&Reconciler{}).revisionHash(ir, input, nil, "scope-uid")
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+
+			annotated := ir.DeepCopy()
+			annotated.Annotations = map[string]string{key: val}
+			objectHash, _, err := (&Reconciler{}).revisionHash(annotated, input, nil, "scope-uid")
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(objectHash).To(gomega.Equal(baseHash),
+				"%s on the IR object must not change the revision", key)
+
+			inherited := input
+			inherited.DesiredSpec.PodTemplateObjectMeta = &metav1.ObjectMeta{Annotations: map[string]string{
+				"ome.io/declared": "1",
+				key:               val,
+			}}
+			templateHash, _, err := (&Reconciler{}).revisionHash(ir, inherited, nil, "scope-uid")
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(templateHash).To(gomega.Equal(baseHash),
+				"%s inherited onto the pod template must be filtered from the revision", key)
+		})
+	}
+}
+
+func TestRevisionHashCacheInvalidatesWhenExcludedAnnotationsChange(t *testing.T) {
+	g := gomega.NewWithT(t)
+	const inheritedKey = "editor.example.com/resource-version"
+
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img:1"}}}
+	meta := &metav1.ObjectMeta{Annotations: map[string]string{inheritedKey: "v1beta1"}}
+	input := workloadtypes.ReconcileInput{DesiredSpec: workloadtypes.WorkloadDesiredSpec{
+		PodSpec:               podSpec,
+		PodTemplateObjectMeta: meta,
+	}}
+	ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
+		Name:       "engine",
+		Namespace:  "default",
+		UID:        "ir-uid",
+		Generation: 1,
+	}}
+	r := &Reconciler{}
+
+	initialHash, _, err := r.revisionHash(ir, input, nil, "scope-uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	ir.Annotations = map[string]string{
+		constants.RevisionExcludedAnnotationKeysAnnotationKey: inheritedKey,
+	}
+	updatedHash, _, err := r.revisionHash(ir, input, nil, "scope-uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	expectedMeta := stripExcludedAnnotations(meta, map[string]struct{}{inheritedKey: {}})
+	expectedHash, _, err := revision.HashWithWorkerAndTopology(
+		podSpec, nil, expectedMeta, "", nil, "scope-uid")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(initialHash).NotTo(gomega.Equal(expectedHash))
+	g.Expect(updatedHash).To(gomega.Equal(expectedHash))
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +15,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // countingReader wraps a client.Reader and counts List calls, so tests can
@@ -50,10 +50,10 @@ func snapshotScheme(t *testing.T) *runtime.Scheme {
 func TestObservedSnapshot_LivePodsMemoized(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(snapshotScheme(t)).Build()
 	cr := &countingReader{Client: fc}
-	deps := workload.Deps{Client: fc, APIReader: cr}
-	input := workload.ReconcileInput{Key: workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"}}
+	deps := types.Deps{Client: fc, APIReader: cr}
+	input := types.ReconcileInput{Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"}}
 
-	snap := workload.NewObservedSnapshot(deps, input, workload.ComponentEngine, nil)
+	snap := workload.NewObservedSnapshot(deps, input, types.ComponentEngine, nil)
 	for i := 0; i < 3; i++ {
 		if _, err := snap.LivePods(context.Background()); err != nil {
 			t.Fatalf("LivePods: %v", err)
@@ -64,42 +64,12 @@ func TestObservedSnapshot_LivePodsMemoized(t *testing.T) {
 	}
 
 	// A fresh snapshot re-reads (memoization is per-reconcile, not global).
-	snap2 := workload.NewObservedSnapshot(deps, input, workload.ComponentEngine, nil)
+	snap2 := workload.NewObservedSnapshot(deps, input, types.ComponentEngine, nil)
 	if _, err := snap2.LivePods(context.Background()); err != nil {
 		t.Fatalf("LivePods (snap2): %v", err)
 	}
 	if cr.lists != 2 {
 		t.Errorf("fresh snapshot must re-List: got %d want 2", cr.lists)
-	}
-}
-
-// TestObservedSnapshot_EvidenceDeadline: EvidenceFor reports DeadlinePassed
-// for a transient-phase instance whose Operation.Deadline is in the past,
-// and not otherwise. Evidence only — no writes. (No stuck pod: the empty
-// client yields no pods, so StuckPod stays nil.)
-func TestObservedSnapshot_EvidenceDeadline(t *testing.T) {
-	fc := fake.NewClientBuilder().WithScheme(snapshotScheme(t)).Build()
-	deps := workload.Deps{Client: fc, APIReader: fc}
-	input := workload.ReconcileInput{Key: workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"}}
-
-	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
-	insts := []workload.InstanceStatus{
-		{ // deadline in the past → DeadlinePassed
-			Index: 0, Phase: workload.InstancePhaseUpdating,
-			Operation: &workload.InstanceOperation{Deadline: metav1.NewTime(now.Add(-time.Minute))},
-		},
-		{ // deadline in the future → not passed
-			Index: 1, Phase: workload.InstancePhaseUpdating,
-			Operation: &workload.InstanceOperation{Deadline: metav1.NewTime(now.Add(time.Minute))},
-		},
-	}
-	snap := workload.NewObservedSnapshot(deps, input, workload.ComponentEngine, insts)
-
-	if ev := snap.EvidenceFor(context.Background(), 0, now, 30*time.Second); !ev.DeadlinePassed || ev.StuckPod != nil {
-		t.Errorf("instance 0: got DeadlinePassed=%v StuckPod=%v, want true/nil", ev.DeadlinePassed, ev.StuckPod)
-	}
-	if ev := snap.EvidenceFor(context.Background(), 1, now, 30*time.Second); ev.DeadlinePassed {
-		t.Errorf("instance 1: future deadline must not be passed")
 	}
 }
 
@@ -115,17 +85,17 @@ func TestObservedSnapshotKeepsCachedAndLiveObservationsSeparate(t *testing.T) {
 	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(livePod).Build()
 	cached := &countingReader{Client: cachedClient}
 	live := &countingReader{Client: liveClient}
-	input := workload.ReconcileInput{
-		Key: workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"},
-		ObservedState: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{
+	input := types.ReconcileInput{
+		Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"},
+		ObservedState: types.WorkloadObservedState{InstanceStatuses: []types.InstanceStatus{
 			{Index: 0},
 			{Index: 1},
 		}},
 	}
 	snapshot := workload.NewObservedSnapshot(
-		workload.Deps{Client: cached, APIReader: live},
+		types.Deps{Client: cached, APIReader: live},
 		input,
-		workload.ComponentEngine,
+		types.ComponentEngine,
 		input.ObservedState.InstanceStatuses,
 	)
 
@@ -167,20 +137,20 @@ func TestObservedSnapshotAuthoritativeEmptyObservationDoesNotList(t *testing.T) 
 	fc := fake.NewClientBuilder().WithScheme(snapshotScheme(t)).WithObjects(snapshotPod("live-pod", "0")).Build()
 	live := &countingReader{Client: fc}
 	owner := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{UID: "owner-uid"}}
-	input := workload.ReconcileInput{
+	input := types.ReconcileInput{
 		OwnerObject:   owner,
-		Key:           workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"},
-		ObservedState: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{{Index: 0}}},
-		AuthoritativePods: &workload.ComponentPodSnapshot{
+		Key:           types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"},
+		ObservedState: types.WorkloadObservedState{InstanceStatuses: []types.InstanceStatus{{Index: 0}}},
+		AuthoritativePods: &types.ComponentPodSnapshot{
 			OwnerUID:   owner.UID,
 			Pods:       []*corev1.Pod{},
 			ByInstance: map[int32][]*corev1.Pod{},
 		},
 	}
 	snapshot := workload.NewObservedSnapshot(
-		workload.Deps{Client: fc, APIReader: live},
+		types.Deps{Client: fc, APIReader: live},
 		input,
-		workload.ComponentEngine,
+		types.ComponentEngine,
 		input.ObservedState.InstanceStatuses,
 	)
 
@@ -209,17 +179,17 @@ func TestObservedSnapshotReportsUnprovenAuthoritativeScopeAsUnknown(t *testing.T
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			input := workload.ReconcileInput{
+			input := types.ReconcileInput{
 				OwnerObject: owner,
-				Key:         workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"},
-				AuthoritativePods: &workload.ComponentPodSnapshot{
+				Key:         types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"},
+				AuthoritativePods: &types.ComponentPodSnapshot{
 					OwnerUID: test.ownerUID,
 					ByInstance: map[int32][]*corev1.Pod{
 						0: {snapshotPod("preloaded", "0")},
 					},
 				},
 			}
-			snapshot := workload.NewObservedSnapshot(workload.Deps{Client: fc}, input, workload.ComponentEngine, nil)
+			snapshot := workload.NewObservedSnapshot(types.Deps{Client: fc}, input, types.ComponentEngine, nil)
 			observation, err := snapshot.LiveObservation(context.Background())
 			if err != nil {
 				t.Fatalf("LiveObservation: %v", err)
@@ -235,10 +205,10 @@ func TestObservedSnapshotReportsUnprovenAuthoritativeScopeAsUnknown(t *testing.T
 func TestObservedSnapshotTagsLiveFallbackAsCache(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(snapshotScheme(t)).WithObjects(snapshotPod("cached-pod", "0")).Build()
 	cached := &countingReader{Client: fc}
-	input := workload.ReconcileInput{
-		Key: workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"},
+	input := types.ReconcileInput{
+		Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"},
 	}
-	snapshot := workload.NewObservedSnapshot(workload.Deps{Client: cached}, input, workload.ComponentEngine, nil)
+	snapshot := workload.NewObservedSnapshot(types.Deps{Client: cached}, input, types.ComponentEngine, nil)
 
 	observation, err := snapshot.LiveObservation(context.Background())
 	if err != nil {
@@ -258,8 +228,8 @@ func TestObservedSnapshotMemoizesReadErrors(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(snapshotScheme(t)).Build()
 	cached := &countingReader{Client: fc, listErr: wantErr}
 	live := &countingReader{Client: fc, listErr: wantErr}
-	input := workload.ReconcileInput{Key: workload.Key{Namespace: "ns", Component: workload.ComponentEngine, OwnerName: "own"}}
-	snapshot := workload.NewObservedSnapshot(workload.Deps{Client: cached, APIReader: live}, input, workload.ComponentEngine, nil)
+	input := types.ReconcileInput{Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"}}
+	snapshot := workload.NewObservedSnapshot(types.Deps{Client: cached, APIReader: live}, input, types.ComponentEngine, nil)
 
 	for i := 0; i < 3; i++ {
 		if _, err := snapshot.CachedObservation(context.Background()); !errors.Is(err, wantErr) {
@@ -280,7 +250,7 @@ func snapshotPod(name, index string) *corev1.Pod {
 		Namespace: "ns",
 		Labels: map[string]string{
 			constants.InferenceServicePodLabelKey: "own",
-			constants.OMEComponentLabel:           string(workload.ComponentEngine),
+			constants.OMEComponentLabel:           string(types.ComponentEngine),
 			query.LabelManagedBy:                  query.ManagedByOMENative,
 			query.LabelInstanceIdx:                index,
 		},

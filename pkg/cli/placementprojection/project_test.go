@@ -180,9 +180,9 @@ func TestAcknowledgementFalseDefaultDoesNotContradictTrueCondition(t *testing.T)
 		{true, metav1.ConditionTrue, 3, "Invalid"},
 	} {
 		s := fixture(t)
-		s.TrafficMap.Status.Programmed = tc.scalar
+		s.TrafficMap.Status.Published = tc.scalar
 		s.TrafficMap.Status.ObservedTrafficMapGeneration = tc.generation
-		s.TrafficMap.Status.Conditions = append(s.TrafficMap.Status.Conditions, metav1.Condition{Type: "Programmed", Status: tc.condition, Reason: "Programmed", ObservedGeneration: 4, LastTransitionTime: metav1.NewTime(fixtureClock.Now().Add(-time.Hour))})
+		s.TrafficMap.Status.Conditions = append(s.TrafficMap.Status.Conditions, metav1.Condition{Type: "Published", Status: tc.condition, Reason: "Published", ObservedGeneration: 4, LastTransitionTime: metav1.NewTime(fixtureClock.Now().Add(-time.Hour))})
 		got, _ := ProjectEndpoint(s, fixtureClock)
 		if string(got.Content.Routing.Acknowledgement) != tc.want {
 			t.Fatalf("ack=%+v want%s", got.Content.Routing, tc.want)

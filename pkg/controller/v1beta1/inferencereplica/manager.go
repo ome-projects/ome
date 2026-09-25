@@ -20,8 +20,8 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
@@ -67,7 +67,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// would fall back to the global singleton, which the pod handler does
 	// not feed.
 	if r.Expectations == nil {
-		r.Expectations = workload.NewExpectations()
+		r.Expectations = workloadtypes.NewExpectations()
 	}
 	if r.Clock == nil {
 		r.Clock = clock.RealClock{}

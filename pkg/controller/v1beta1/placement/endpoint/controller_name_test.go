@@ -50,6 +50,8 @@ func TestEndpointPublisher_NoControllerNameCollision(t *testing.T) {
 
 	// The endpoint publisher must register under a DISTINCT name.
 	require.NoError(t,
-		(&endpoint.Reconciler{Client: mgr.GetClient(), Log: logr.Discard()}).SetupWithManager(mgr),
+		(&endpoint.Reconciler{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Log: logr.Discard(),
+		}).SetupWithManager(mgr),
 		"endpoint publisher must not collide with the 'inferenceservice' controller name")
 }

@@ -24,10 +24,8 @@ func TestPtrIntOrStringFromString(t *testing.T) {
 	}
 }
 
-// legacySurgeFromPercent is a verbatim copy of the now-deleted
-// coordination/status.go surgeFromPercent + workload/budget.go
-// ceilPercent (they were byte-identical). It serves as the oracle the
-// new ScaledCountFromIntOrString must match on the percent branch.
+// legacySurgeFromPercent is the reference percent-to-count rounding: the
+// oracle ScaledCountFromIntOrString must match on the percent branch.
 func legacySurgeFromPercent(percent int, replicas int32) int32 {
 	if percent <= 0 || replicas <= 0 {
 		return 0

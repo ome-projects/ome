@@ -32,15 +32,6 @@ func conversionEvents(recorder *capturingRecorder) []capturedEvent {
 	return events
 }
 
-func listPods(t *testing.T, c client.Client, namespace string) []corev1.Pod {
-	t.Helper()
-	pods := &corev1.PodList{}
-	if err := c.List(context.Background(), pods, client.InNamespace(namespace)); err != nil {
-		t.Fatalf("list pods: %v", err)
-	}
-	return pods.Items
-}
-
 // TestReconcileConvertsStoredColumnarV2ToDenseV1 pins the transition gate: an
 // object stored as ColumnarV2 is rewritten as DenseV1 with identical logical
 // rows and no Pod effect on that pass, and the converted object then
@@ -293,16 +284,6 @@ func TestConversionWriterRefusesConvergedSource(t *testing.T) {
 }
 
 var denseToColumnarLabels = map[string]string{"from": obsmetrics.IRStatusEncodingDenseV1, "to": obsmetrics.IRStatusEncodingColumnarV2}
-
-// newColumnarReconciler is newReconciler under the ColumnarV2 target with the
-// package's test row bound.
-func newColumnarReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Client) {
-	t.Helper()
-	r, c := newReconciler(t, objs...)
-	r.InstanceStatusTarget = irstatus.EncodingColumnarV2
-	r.InstanceStatusDecoder = irstatus.NewDecoder(testColumnarBound)
-	return r, c
-}
 
 // TestReconcileConvertsStoredDenseV1ToColumnarV2 pins the forward direction
 // of the transition gate: under a ColumnarV2 target an object stored as

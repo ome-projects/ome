@@ -1,12 +1,21 @@
 package audit
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	apitypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -42,8 +51,32 @@ func mkAllocatedRecord(uuid string, phase types.MigrationPhase, startedOffset, a
 	return r
 }
 
+// testAuditPolicy is the capacity policy the capacity tests admit
+// against. The caps live in operator config, so every test states the
+// ones it is pinning rather than reading them back from the package.
+var testAuditPolicy = &types.MigrationAuditPolicy{MaxInFlight: 3, MaxPerWindow: 10, Window: time.Hour}
+
+const (
+	testMaxInFlight  = 3
+	testMaxPerWindow = 10
+	testWindow       = time.Hour
+)
+
+// TestValidateCapacity_UnconfiguredRejects pins the unset path: with no
+// operator-configured caps there is nothing bounding destructive
+// migration churn, so nothing is admitted.
+func TestValidateCapacity_UnconfiguredRejects(t *testing.T) {
+	ok, reason := ValidateCapacity(nil, nil, "u-new", fixedNow)
+	if ok {
+		t.Fatalf("an unconfigured capacity policy must admit nothing")
+	}
+	if reason == "" {
+		t.Errorf("rejection reason must name the missing configuration")
+	}
+}
+
 func TestValidateCapacity_NoRecordsAllowed(t *testing.T) {
-	ok, reason := ValidateCapacity(nil, "u-new", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, nil, "u-new", fixedNow)
 	if !ok || reason != "" {
 		t.Errorf("no records should admit; got ok=%v reason=%q", ok, reason)
 	}
@@ -60,7 +93,7 @@ func TestValidateCapacity_InFlightCapTrips(t *testing.T) {
 		mkAllocatedRecord("u3", types.MigrationPhaseDraining, -1*time.Minute, -1*time.Minute),
 		mkRecord("u4", types.MigrationPhaseAccepted, -time.Second),
 	}
-	ok, reason := ValidateCapacity(records, "u4", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u4", fixedNow)
 	if ok {
 		t.Fatalf("expected reject when in-flight cap reached; got ok=true")
 	}
@@ -78,7 +111,7 @@ func TestValidateCapacity_QueuedDoesNotCountAsInFlight(t *testing.T) {
 		mkRecord("u3", types.MigrationPhaseAccepted, -3*time.Minute),
 		mkRecord("u4", types.MigrationPhaseAccepted, -time.Second),
 	}
-	ok, reason := ValidateCapacity(records, "u4", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u4", fixedNow)
 	if !ok {
 		t.Errorf("queued (unallocated) records must not consume in-flight capacity: %s", reason)
 	}
@@ -92,7 +125,7 @@ func TestValidateCapacity_OwnRecordExcluded(t *testing.T) {
 		mkAllocatedRecord("u2", types.MigrationPhaseSurgeReady, -5*time.Minute, -4*time.Minute),
 		mkRecord("u3", types.MigrationPhaseAccepted, -time.Second),
 	}
-	ok, reason := ValidateCapacity(records, "u3", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u3", fixedNow)
 	if !ok {
 		t.Errorf("a request's own record must not count against it: %s", reason)
 	}
@@ -108,7 +141,7 @@ func TestValidateCapacity_TerminalDoesNotCountAsInFlight(t *testing.T) {
 		mkAllocatedRecord("u2", types.MigrationPhaseFailed, -25*time.Hour, -25*time.Hour),
 		mkRecord("u3", types.MigrationPhaseRelocated, -20*time.Hour),
 	}
-	ok, _ := ValidateCapacity(records, "u-new", fixedNow)
+	ok, _ := ValidateCapacity(testAuditPolicy, records, "u-new", fixedNow)
 	if !ok {
 		t.Errorf("terminal records must not consume in-flight capacity")
 	}
@@ -120,8 +153,8 @@ func TestValidateCapacity_TerminalDoesNotCountAsInFlight(t *testing.T) {
 // AllocatedAt) — even a burst of fresh Auto records admits new Manual
 // work. Auto churn is bounded separately by maxAttempts per instance.
 func TestValidateCapacity_AutoRecordsCountTowardNeitherCap(t *testing.T) {
-	records := make([]types.MigrationRecord, 0, DefaultPerHourCap+DefaultInFlightCap)
-	for i := 0; i < DefaultPerHourCap+DefaultInFlightCap; i++ {
+	records := make([]types.MigrationRecord, 0, testMaxPerWindow+testMaxInFlight)
+	for i := 0; i < testMaxPerWindow+testMaxInFlight; i++ {
 		completed := metav1.NewTime(fixedNow.Add(-time.Duration(i+1) * time.Minute))
 		records = append(records, types.MigrationRecord{
 			RequestUUID:    "u-auto-" + strconv.Itoa(i),
@@ -134,22 +167,22 @@ func TestValidateCapacity_AutoRecordsCountTowardNeitherCap(t *testing.T) {
 			CompletedAt:    &completed,
 		})
 	}
-	ok, reason := ValidateCapacity(records, "u-new", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u-new", fixedNow)
 	if !ok {
 		t.Errorf("Auto records must count toward neither cap: %s", reason)
 	}
 }
 
 func TestValidateCapacity_PerHourCapTrips(t *testing.T) {
-	// DefaultPerHourCap records (any phase) whose AllocatedAt lies inside
+	// testMaxPerWindow records (any phase) whose AllocatedAt lies inside
 	// the trailing window: per-hour cap reached even though nothing is in
 	// flight (all terminal).
-	records := make([]types.MigrationRecord, 0, DefaultPerHourCap)
-	for i := 0; i < DefaultPerHourCap; i++ {
+	records := make([]types.MigrationRecord, 0, testMaxPerWindow)
+	for i := 0; i < testMaxPerWindow; i++ {
 		off := -time.Duration(i+1) * time.Minute
 		records = append(records, mkAllocatedRecord("u-recent-"+strconv.Itoa(i), types.MigrationPhaseCompleted, off, off))
 	}
-	ok, reason := ValidateCapacity(records, "u-new", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u-new", fixedNow)
 	if ok {
 		t.Fatalf("expected reject when per-hour cap reached; got ok=true")
 	}
@@ -161,12 +194,12 @@ func TestValidateCapacity_PerHourCapTrips(t *testing.T) {
 func TestValidateCapacity_OlderThanWindowDoesNotCount(t *testing.T) {
 	// Records whose execution started before the trailing window don't
 	// count toward the per-hour cap.
-	records := make([]types.MigrationRecord, 0, DefaultPerHourCap)
-	for i := 0; i < DefaultPerHourCap; i++ {
-		off := -(CapacityRateWindow + 30*time.Minute + time.Duration(i)*time.Minute)
+	records := make([]types.MigrationRecord, 0, testMaxPerWindow)
+	for i := 0; i < testMaxPerWindow; i++ {
+		off := -(testWindow + 30*time.Minute + time.Duration(i)*time.Minute)
 		records = append(records, mkAllocatedRecord("u-old-"+strconv.Itoa(i), types.MigrationPhaseCompleted, off, off))
 	}
-	ok, _ := ValidateCapacity(records, "u-new", fixedNow)
+	ok, _ := ValidateCapacity(testAuditPolicy, records, "u-new", fixedNow)
 	if !ok {
 		t.Errorf("records allocated before the window should not consume per-hour capacity")
 	}
@@ -189,7 +222,7 @@ func TestValidateCapacity_BurstAcceptedExecutedSlowly(t *testing.T) {
 		records = append(records, mkRecord("u-queued-"+strconv.Itoa(i), types.MigrationPhaseAccepted, -30*time.Minute))
 	}
 	records = append(records, mkRecord("u-next", types.MigrationPhaseAccepted, -30*time.Minute))
-	ok, reason := ValidateCapacity(records, "u-next", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u-next", fixedNow)
 	if !ok {
 		t.Errorf("a burst-accepted, slowly-executed batch must not trip the per-hour cap: %s", reason)
 	}
@@ -204,7 +237,7 @@ func TestValidateCapacity_QueuedBurstDoesNotTripCaps(t *testing.T) {
 	for i := 0; i < 11; i++ {
 		records = append(records, mkRecord("u-burst-"+strconv.Itoa(i), types.MigrationPhaseAccepted, -time.Duration(i+1)*time.Minute))
 	}
-	ok, reason := ValidateCapacity(records, "u-burst-10", fixedNow)
+	ok, reason := ValidateCapacity(testAuditPolicy, records, "u-burst-10", fixedNow)
 	if !ok {
 		t.Errorf("queued-Accepted records must be unbounded (execution not started); got rejection: %s", reason)
 	}
@@ -237,5 +270,354 @@ func TestParseTime_EmptyOrInvalid(t *testing.T) {
 		if _, ok := parseTime(in); ok {
 			t.Errorf("parse of %q should fail", in)
 		}
+	}
+}
+
+// Ledger round-trip + annotation-parsing tests. The ledger is
+// audit-only; dedup and trim behavior guard the history surface.
+
+func TestExtractRequestUUID(t *testing.T) {
+	if got := ExtractRequestUUID(MigrationRequestAnnotationPrefix + "abc-123"); got != "abc-123" {
+		t.Errorf("uuid: got %q want abc-123", got)
+	}
+	if got := ExtractRequestUUID("ome.io/something-else"); got != "" {
+		t.Errorf("non-migration key should return empty, got %q", got)
+	}
+}
+
+func TestParseMigrationRequest_Valid(t *testing.T) {
+	raw, _ := json.Marshal(MigrationRequest{
+		SchemaVersion:   SchemaV1,
+		Component:       "engine",
+		Instance:        0,
+		FromNode:        "node5",
+		HintTargetNodes: []string{"node3", "node7"},
+		Reason:          "fragmentation",
+	})
+	req, err := ParseMigrationRequest(string(raw))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.Instance != 0 || req.FromNode != "node5" || req.Component != "engine" {
+		t.Errorf("parsed request mismatch: %+v", req)
+	}
+	if len(req.HintTargetNodes) != 2 {
+		t.Errorf("hint targets: got %d want 2", len(req.HintTargetNodes))
+	}
+}
+
+func TestParseMigrationRequest_UnsupportedSchema(t *testing.T) {
+	raw := `{"schemaVersion":"v99","component":"engine","instance":0,"from_node":"n"}`
+	if _, err := ParseMigrationRequest(raw); err == nil {
+		t.Fatal("expected UnsupportedSchemaVersion error")
+	}
+}
+
+func TestAuditLedger_TrimDropsOldestTerminalButKeepsStarted(t *testing.T) {
+	l := &Ledger{}
+	// Seed an in-flight entry first — must survive trim.
+	l.UpsertEntry(Entry{RequestUUID: "in-flight-pinned", Phase: PhaseStarted})
+	for i := 0; i < MaxTerminalEntries+50; i++ {
+		l.UpsertEntry(Entry{
+			RequestUUID: fmt.Sprintf("done-%04d", i),
+			Phase:       PhaseCompleted,
+		})
+	}
+	terminalCount := 0
+	startedSurvived := false
+	for _, e := range l.Entries {
+		switch e.Phase {
+		case PhaseCompleted, PhaseFailed:
+			terminalCount++
+		case PhaseStarted:
+			if e.RequestUUID == "in-flight-pinned" {
+				startedSurvived = true
+			}
+		}
+	}
+	if terminalCount != MaxTerminalEntries {
+		t.Errorf("terminal entries: got %d want %d", terminalCount, MaxTerminalEntries)
+	}
+	if !startedSurvived {
+		t.Errorf("Started entry must survive trim; ledger=%v", l.Entries)
+	}
+	// The oldest terminal (done-0000) should have been dropped.
+	for _, e := range l.Entries {
+		if e.RequestUUID == "done-0000" {
+			t.Errorf("oldest terminal entry should have been trimmed; got %+v", e)
+		}
+	}
+}
+
+func TestAuditLedger_DedupAcrossPersist(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+	owner := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "llama-70b", Namespace: "prod", UID: apitypes.UID("owner-uid"),
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner).Build()
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+
+	ledger, err := LoadLedgerForOwner(context.Background(), c, owner)
+	if err != nil {
+		t.Fatalf("load empty ledger: %v", err)
+	}
+	if len(ledger.Entries) != 0 {
+		t.Fatalf("expected empty ledger, got %d entries", len(ledger.Entries))
+	}
+
+	ledger.UpsertEntry(Entry{RequestUUID: "abc", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(context.Background(), c, owner, gvk, ledger); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	reloaded, err := LoadLedgerForOwner(context.Background(), c, owner)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.HasCompletedOrFailedRequest("abc") {
+		t.Errorf("expected reloaded ledger to record abc as completed")
+	}
+	if reloaded.HasCompletedOrFailedRequest("xyz") {
+		t.Errorf("unrelated UUID should not be flagged")
+	}
+}
+
+func newLedgerTestClient(t *testing.T) (client.Client, *corev1.ConfigMap, schema.GroupVersionKind) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+	owner := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "llama-70b", Namespace: "prod", UID: apitypes.UID("owner-uid"),
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner).Build()
+	return c, owner, corev1.SchemeGroupVersion.WithKind("ConfigMap")
+}
+
+func TestPersistLedgerForOwner_ConflictOnConcurrentUpdate(t *testing.T) {
+	c, owner, gvk := newLedgerTestClient(t)
+	ctx := context.Background()
+
+	seed, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("seed load: %v", err)
+	}
+	seed.UpsertEntry(Entry{RequestUUID: "seed", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, seed); err != nil {
+		t.Fatalf("seed persist: %v", err)
+	}
+
+	// Two writers load the same revision; A lands first, B must 409
+	// rather than erase A's row.
+	a, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load A: %v", err)
+	}
+	b, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load B: %v", err)
+	}
+	a.UpsertEntry(Entry{RequestUUID: "from-a", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, a); err != nil {
+		t.Fatalf("persist A: %v", err)
+	}
+	b.UpsertEntry(Entry{RequestUUID: "from-b", Phase: PhaseCompleted})
+	err = PersistLedgerForOwner(ctx, c, owner, gvk, b)
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("persist B: want conflict, got %v", err)
+	}
+
+	// B's retry path: reload, re-apply, persist. Both rows survive.
+	b2, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("reload B: %v", err)
+	}
+	b2.UpsertEntry(Entry{RequestUUID: "from-b", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, b2); err != nil {
+		t.Fatalf("persist B retry: %v", err)
+	}
+	final, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("final load: %v", err)
+	}
+	for _, uuid := range []string{"seed", "from-a", "from-b"} {
+		if !final.HasCompletedOrFailedRequest(uuid) {
+			t.Errorf("entry %q lost after concurrent persists", uuid)
+		}
+	}
+}
+
+func TestPersistLedgerForOwner_ConflictOnCreateRace(t *testing.T) {
+	c, owner, gvk := newLedgerTestClient(t)
+	ctx := context.Background()
+
+	// Loaded before the CM existed.
+	stale, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	// Concurrent writer creates the CM with its own entry.
+	other, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load other: %v", err)
+	}
+	other.UpsertEntry(Entry{RequestUUID: "winner", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, other); err != nil {
+		t.Fatalf("persist other: %v", err)
+	}
+
+	stale.UpsertEntry(Entry{RequestUUID: "loser", Phase: PhaseCompleted})
+	err = PersistLedgerForOwner(ctx, c, owner, gvk, stale)
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("want conflict on create race, got %v", err)
+	}
+	final, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("final load: %v", err)
+	}
+	if !final.HasCompletedOrFailedRequest("winner") {
+		t.Errorf("winner's entry erased by create race")
+	}
+}
+
+func TestPersistLedgerForOwner_SequentialPersistsSamePass(t *testing.T) {
+	c, owner, gvk := newLedgerTestClient(t)
+	ctx := context.Background()
+
+	l, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	l.UpsertEntry(Entry{RequestUUID: "u1", Phase: PhaseStarted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, l); err != nil {
+		t.Fatalf("first persist: %v", err)
+	}
+	// Same in-memory ledger persisted again (migrate.go's Started →
+	// Completed tail within one pass) must chain, not self-conflict.
+	l.UpsertEntry(Entry{RequestUUID: "u1", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, l); err != nil {
+		t.Fatalf("second persist: %v", err)
+	}
+	final, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("final load: %v", err)
+	}
+	if !final.HasCompletedOrFailedRequest("u1") {
+		t.Errorf("second persist of the same ledger did not land")
+	}
+}
+
+func TestPersistLedgerForOwner_ConflictWhenDeletedSinceLoad(t *testing.T) {
+	c, owner, gvk := newLedgerTestClient(t)
+	ctx := context.Background()
+
+	l, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	l.UpsertEntry(Entry{RequestUUID: "u1", Phase: PhaseStarted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, l); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: ConfigMapNameForOwner(owner), Namespace: owner.Namespace,
+	}}
+	if err := c.Delete(ctx, cm); err != nil {
+		t.Fatalf("delete cm: %v", err)
+	}
+	l.UpsertEntry(Entry{RequestUUID: "u1", Phase: PhaseCompleted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, l); !apierrors.IsConflict(err) {
+		t.Fatalf("want conflict when CM deleted since load, got %v", err)
+	}
+}
+
+func TestPersistLedgerForOwner_ReplacesStaleControllerRef(t *testing.T) {
+	c, owner, gvk := newLedgerTestClient(t)
+	ctx := context.Background()
+
+	// A predecessor owner (same name, different UID) left its
+	// controller ref behind; a non-controller ref must survive.
+	truePtr := true
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConfigMapNameForOwner(owner),
+			Namespace: owner.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: gvk.GroupVersion().String(), Kind: gvk.Kind,
+					Name: owner.Name, UID: apitypes.UID("stale-owner-uid"),
+					Controller: &truePtr, BlockOwnerDeletion: &truePtr,
+				},
+				{
+					APIVersion: gvk.GroupVersion().String(), Kind: gvk.Kind,
+					Name: "bystander", UID: apitypes.UID("bystander-uid"),
+				},
+			},
+		},
+		Data: map[string]string{LedgerKey: `{"entries":[]}`},
+	}
+	if err := c.Create(ctx, cm); err != nil {
+		t.Fatalf("seed cm: %v", err)
+	}
+
+	l, err := LoadLedgerForOwner(ctx, c, owner)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	l.UpsertEntry(Entry{RequestUUID: "u1", Phase: PhaseStarted})
+	if err := PersistLedgerForOwner(ctx, c, owner, gvk, l); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	got := &corev1.ConfigMap{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: cm.Name}, got); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	controllers := 0
+	bystanderKept := false
+	for _, ref := range got.OwnerReferences {
+		if ref.Controller != nil && *ref.Controller {
+			controllers++
+			if ref.UID != owner.UID {
+				t.Errorf("controller ref points at %q, want current owner %q", ref.UID, owner.UID)
+			}
+		}
+		if ref.UID == apitypes.UID("bystander-uid") {
+			bystanderKept = true
+		}
+	}
+	if controllers != 1 {
+		t.Errorf("controller refs: got %d want exactly 1 (%+v)", controllers, got.OwnerReferences)
+	}
+	if !bystanderKept {
+		t.Errorf("non-controller ownerRef dropped during adoption: %+v", got.OwnerReferences)
+	}
+}
+
+func TestInFlightEntry_ReturnsCopyNotAlias(t *testing.T) {
+	l := &Ledger{}
+	l.UpsertEntry(Entry{RequestUUID: "u1", Phase: PhaseStarted, FromNode: "n1"})
+
+	e := l.InFlightEntry("u1")
+	if e == nil {
+		t.Fatal("expected in-flight entry")
+	}
+	e.Phase = PhaseFailed
+	if l.Entries[0].Phase != PhaseStarted {
+		t.Errorf("mutating InFlightEntry result leaked into the ledger: %+v", l.Entries[0])
+	}
+
+	// Compaction must not re-point a held result at a different row.
+	held := l.InFlightEntry("u1")
+	for i := 0; i < MaxTerminalEntries+10; i++ {
+		l.UpsertEntry(Entry{RequestUUID: fmt.Sprintf("t-%04d", i), Phase: PhaseCompleted})
+	}
+	if held.RequestUUID != "u1" || held.Phase != PhaseStarted {
+		t.Errorf("held entry mutated by trim/upsert compaction: %+v", held)
 	}
 }

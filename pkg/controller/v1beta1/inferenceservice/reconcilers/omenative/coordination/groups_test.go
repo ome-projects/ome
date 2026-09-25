@@ -403,3 +403,132 @@ func TestValidateGroupShape_SequentialSingleComponent(t *testing.T) {
 		t.Errorf("Sequential single-Component: want error")
 	}
 }
+
+func TestResolveGroups_PolicyRefCanarySkipped(t *testing.T) {
+	// A group whose progression comes from a policyRef has no inline canary arm
+	// to test. Resolving it here would hand a Component with a declared analysis
+	// gate to the coordination engine, which would surge it blue-green with
+	// nothing evaluating the result.
+	spec := &v1beta1.RolloutSpec{
+		Groups: []v1beta1.RolloutGroup{
+			{
+				Components: []v1beta1.ComponentType{v1beta1.RouterComponent},
+				PolicyRef: &v1beta1.RolloutPolicyRef{
+					Name:        "router-standard",
+					Progression: v1beta1.RolloutProgressionCanary,
+				},
+			},
+			{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				PolicyRef: &v1beta1.RolloutPolicyRef{
+					Name:        "engine-standard",
+					Progression: v1beta1.RolloutProgressionCanary,
+				},
+			},
+		},
+	}
+	if got := ResolveGroups(spec, GroupDefaults{}); len(got) != 0 {
+		t.Errorf("policyRef-canary groups: got %+v want none (canary is the canary engine's)", got)
+	}
+}
+
+func TestResolveGroups_PolicyRefCanaryDoesNotCollapseSequential(t *testing.T) {
+	// The collapse fires on 2+ single-Component blueGreen groups. Two
+	// policyRef-canary groups must not reach it: folding them would publish a
+	// Sequential policy, ordering Components the operator declared independent,
+	// that appears nowhere in the spec.
+	spec := &v1beta1.RolloutSpec{
+		GroupOrdering: ptr.To(v1beta1.RolloutGroupOrderingConcurrent),
+		Groups: []v1beta1.RolloutGroup{
+			{
+				Components: []v1beta1.ComponentType{v1beta1.RouterComponent},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "r", Progression: v1beta1.RolloutProgressionCanary},
+			},
+			{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "e", Progression: v1beta1.RolloutProgressionCanary},
+			},
+		},
+	}
+	for _, g := range ResolveGroups(spec, GroupDefaults{}) {
+		if g.Policy == v1beta1.CoordinationPolicySequential {
+			t.Errorf("synthesized Sequential group %+v from two policyRef-canary groups", g)
+		}
+	}
+}
+
+func TestResolveGroups_InlineProgressionOutranksPolicyRef(t *testing.T) {
+	// The ref is a sibling of the progression one-of, not an arm of it: an
+	// inline body wins and the ref is preview-only. A group spelling blueGreen
+	// inline stays a coordination group even while its ref declares canary.
+	spec := &v1beta1.RolloutSpec{
+		Groups: []v1beta1.RolloutGroup{
+			{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				BlueGreen:  &v1beta1.GroupBlueGreen{},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "e", Progression: v1beta1.RolloutProgressionCanary},
+			},
+		},
+	}
+	groups := ResolveGroups(spec, GroupDefaults{})
+	if len(groups) != 1 {
+		t.Fatalf("groups: got %d want 1", len(groups))
+	}
+	if groups[0].Policy != v1beta1.CoordinationPolicyBlueGreen {
+		t.Errorf("Policy: got %q want BlueGreen", groups[0].Policy)
+	}
+}
+
+func TestResolveGroups_PolicyRefRollingUpdateResolvesRollingUpdate(t *testing.T) {
+	// Same misread as the canary case, milder blast radius: a ref-only
+	// rollingUpdate group has no inline arm, and reading it as the blueGreen
+	// default both runs the wrong progression and makes the group collapsible
+	// into Sequential.
+	spec := &v1beta1.RolloutSpec{
+		Groups: []v1beta1.RolloutGroup{
+			{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "e", Progression: v1beta1.RolloutProgressionRollingUpdate},
+			},
+			{
+				Components: []v1beta1.ComponentType{v1beta1.RouterComponent},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "r", Progression: v1beta1.RolloutProgressionRollingUpdate},
+			},
+		},
+	}
+	groups := ResolveGroups(spec, GroupDefaults{})
+	if len(groups) != 2 {
+		t.Fatalf("groups: got %d want 2 (rollingUpdate never collapses)", len(groups))
+	}
+	for _, g := range groups {
+		if g.Policy != v1beta1.CoordinationPolicyRollingUpdate {
+			t.Errorf("group %s Policy: got %q want RollingUpdate", g.Name, g.Policy)
+		}
+	}
+}
+
+func TestResolveGroups_PolicyRefBlueGreenStillCollapses(t *testing.T) {
+	// The ref declares blueGreen, which is a coordination progression, so the
+	// pair is the classic one-at-a-time shape and must sequence exactly as the
+	// inline spelling does — admission accepted it on that promise.
+	spec := &v1beta1.RolloutSpec{
+		Groups: []v1beta1.RolloutGroup{
+			{
+				Components: []v1beta1.ComponentType{v1beta1.DecoderComponent},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "d", Progression: v1beta1.RolloutProgressionBlueGreen},
+			},
+			{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "e", Progression: v1beta1.RolloutProgressionBlueGreen},
+			},
+		},
+	}
+	groups := ResolveGroups(spec, GroupDefaults{})
+	if len(groups) != 1 || groups[0].Policy != v1beta1.CoordinationPolicySequential {
+		t.Fatalf("policyRef-blueGreen pair: got %+v want one Sequential group", groups)
+	}
+	want := []v1beta1.ComponentType{v1beta1.DecoderComponent, v1beta1.EngineComponent}
+	if len(groups[0].Order) != 2 || groups[0].Order[0] != want[0] || groups[0].Order[1] != want[1] {
+		t.Errorf("Order: got %v want %v", groups[0].Order, want)
+	}
+}

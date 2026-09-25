@@ -1292,3 +1292,146 @@ func TestEnsureInferenceReplica_ProjectsMinReadySeconds(t *testing.T) {
 	g.Expect(got.Spec.MinReadySeconds).To(gomega.Equal(int32(0)),
 		"clearing the field must re-project 0 rather than keep the stale window")
 }
+
+// TestEnsureInferenceReplica_ProjectsPacingPartition pins where the canary
+// partition lands: on the rollout-control spec.pacing.partition, while the
+// user's spec.lifecycle rollingUpdate partition is copied verbatim and left
+// alone. Clearing the pacing partition removes the block again so an IR
+// outside any canary keeps a stable spec.
+func TestEnsureInferenceReplica_ProjectsPacingPartition(t *testing.T) {
+	g := gomega.NewWithT(t)
+	isvc := baselineISVC("llama", "prod")
+	// The user's own strategy carries a partition of 1 across the canary.
+	isvc.Spec.Engine.Lifecycle.UpdateStrategy = &v1beta1.UpdateStrategy{
+		RollingUpdate: &v1beta1.RollingUpdate{Partition: ptr.To(int32(1))},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+
+	// Create with no canary: no pacing block, user partition verbatim.
+	_, err := EnsureInferenceReplica(context.Background(), minimalParams(t, isvc, c))
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	got := &v1beta1.InferenceReplica{}
+	key := types.NamespacedName{Name: "llama-engine", Namespace: "prod"}
+	g.Expect(c.Get(context.Background(), key, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing).To(gomega.BeNil(), "no canary must project no pacing block")
+	g.Expect(got.Spec.Lifecycle.UpdateStrategy.RollingUpdate.Partition).To(gomega.HaveValue(gomega.Equal(int32(1))))
+
+	// A canary step: partition 2 (of MinReplicas=2 the step holds both).
+	step := minimalParams(t, isvc, c)
+	step.PacingPartition = ptr.To(int32(2))
+	_, err = EnsureInferenceReplica(context.Background(), step)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(c.Get(context.Background(), key, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing).NotTo(gomega.BeNil())
+	g.Expect(got.Spec.Pacing.Partition).To(gomega.HaveValue(gomega.Equal(int32(2))),
+		"the canary partition must travel on spec.pacing.partition")
+	g.Expect(got.Spec.Lifecycle.UpdateStrategy.RollingUpdate.Partition).To(gomega.HaveValue(gomega.Equal(int32(1))),
+		"the user's rollingUpdate.partition must survive the canary untouched")
+
+	// The final step releases with an explicit 0, still on the pacing block.
+	release := minimalParams(t, isvc, c)
+	release.PacingPartition = ptr.To(int32(0))
+	_, err = EnsureInferenceReplica(context.Background(), release)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(c.Get(context.Background(), key, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing).NotTo(gomega.BeNil())
+	g.Expect(got.Spec.Pacing.Partition).To(gomega.HaveValue(gomega.Equal(int32(0))),
+		"an explicit 0 is a projected value, distinct from no canary")
+
+	// Canary gone: the pacing block is removed, the user partition stays.
+	_, err = EnsureInferenceReplica(context.Background(), minimalParams(t, isvc, c))
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(c.Get(context.Background(), key, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing).To(gomega.BeNil(), "no canary must clear the projected partition")
+	g.Expect(got.Spec.Lifecycle.UpdateStrategy.RollingUpdate.Partition).To(gomega.HaveValue(gomega.Equal(int32(1))))
+}
+
+// TestEnsureInferenceReplica_PacingPartitionPreservesRollbackTarget pins
+// that re-stamping the partition never clobbers the rollback target the
+// canary executor writes to the same block directly, and that clearing the
+// partition keeps the block while the target is still set.
+func TestEnsureInferenceReplica_PacingPartitionPreservesRollbackTarget(t *testing.T) {
+	g := gomega.NewWithT(t)
+	isvc := baselineISVC("llama", "prod")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	key := types.NamespacedName{Name: "llama-engine", Namespace: "prod"}
+
+	step := minimalParams(t, isvc, c)
+	step.PacingPartition = ptr.To(int32(1))
+	_, err := EnsureInferenceReplica(context.Background(), step)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	// The executor arms a rollback on the live IR.
+	live := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, live)).To(gomega.Succeed())
+	live.Spec.Pacing.RollbackToRevision = ptr.To("llama-engine-stable")
+	g.Expect(c.Update(context.Background(), live)).To(gomega.Succeed())
+
+	// Rollback releases the hold (partition 0); the target must remain.
+	release := minimalParams(t, isvc, c)
+	release.PacingPartition = ptr.To(int32(0))
+	_, err = EnsureInferenceReplica(context.Background(), release)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	got := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing.Partition).To(gomega.HaveValue(gomega.Equal(int32(0))))
+	g.Expect(got.Spec.Pacing.RollbackToRevision).To(gomega.HaveValue(gomega.Equal("llama-engine-stable")),
+		"the projector owns only the partition; the rollback target is the executor's")
+
+	// No canary partition at all: the block stays because the target is set.
+	_, err = EnsureInferenceReplica(context.Background(), minimalParams(t, isvc, c))
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(c.Get(context.Background(), key, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing).NotTo(gomega.BeNil())
+	g.Expect(got.Spec.Pacing.Partition).To(gomega.BeNil())
+	g.Expect(got.Spec.Pacing.RollbackToRevision).To(gomega.HaveValue(gomega.Equal("llama-engine-stable")))
+}
+
+// TestEnsureInferenceReplica_PacingPartitionCappedAtReplicas pins the
+// admission-safe bound: a partition above the projected replica count is
+// written as the replica count. Holding every Instance is the same hold at
+// either number, and the IR webhook rejects anything larger.
+func TestEnsureInferenceReplica_PacingPartitionCappedAtReplicas(t *testing.T) {
+	g := gomega.NewWithT(t)
+	isvc := baselineISVC("llama", "prod") // MinReplicas=2
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+
+	p := minimalParams(t, isvc, c)
+	p.PacingPartition = ptr.To(int32(5))
+	_, err := EnsureInferenceReplica(context.Background(), p)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	got := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(),
+		types.NamespacedName{Name: "llama-engine", Namespace: "prod"}, got)).To(gomega.Succeed())
+	g.Expect(got.Spec.Pacing.Partition).To(gomega.HaveValue(gomega.Equal(int32(2))),
+		"partition must be capped at the projected replica count")
+}
+
+// TestEnsureInferenceReplica_UnchangedPacingPartition_NoWrite pins that a
+// steady canary step does not churn the IR: re-projecting the same pacing
+// partition is a no-op write.
+func TestEnsureInferenceReplica_UnchangedPacingPartition_NoWrite(t *testing.T) {
+	g := gomega.NewWithT(t)
+	isvc := baselineISVC("llama", "prod")
+	var patches int
+	count := interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patches++
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithInterceptorFuncs(count).Build()
+
+	p := minimalParams(t, isvc, c)
+	p.PacingPartition = ptr.To(int32(1))
+	_, err := EnsureInferenceReplica(context.Background(), p)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	patches = 0
+	again := minimalParams(t, isvc, c)
+	again.PacingPartition = ptr.To(int32(1))
+	_, err = EnsureInferenceReplica(context.Background(), again)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(patches).To(gomega.Equal(0), "an unchanged pacing partition must not write")
+}

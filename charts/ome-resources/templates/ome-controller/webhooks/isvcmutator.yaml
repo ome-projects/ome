@@ -7,40 +7,6 @@ metadata:
   annotations:
     cert-manager.io/inject-ca-from: ome/serving-cert
 webhooks:
-{{- /*
-  The ISVC defaulter runtime-selects against the local catalog, which
-  is empty on the control plane, so the manager skips this handler there.
-  Installing the config (failurePolicy: Fail) would 404 and reject every user
-  ISVC, so skip the defaulter entry under the control-plane role. The pod
-  mutator entry below stays so the webhook list is never empty.
-*/ -}}
-{{- if ne .Values.ome.multicluster.role "control-plane" }}
-  - clientConfig:
-      caBundle: Cg==
-      service:
-        name: ome-webhook-server-service
-        namespace: {{ .Release.Namespace }}
-        path: /mutate-ome-io-v1beta1-inferenceservice
-    failurePolicy: Fail
-    name: inferenceservice.ome-webhook-server.defaulter
-    sideEffects: None
-    admissionReviewVersions: ["v1beta1"]
-    # Skip on objects already being deleted: finalizer-only patches
-    # shouldn't trigger spec-invariant checks (would deadlock GC).
-    matchConditions:
-      - name: skip-deletion
-        expression: "!has(object.metadata.deletionTimestamp)"
-    rules:
-      - apiGroups:
-          - ome.io
-        apiVersions:
-          - v1beta1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - inferenceservices
-{{- end }}
   - clientConfig:
       caBundle: Cg==
       service:

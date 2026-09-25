@@ -35,6 +35,20 @@ func BindRun(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, adopting b
 	if !ok || target.Revision == "" {
 		return
 	}
+	// No stable revision means nothing to shift traffic from: the unit's
+	// first rollout is not a canary. The step machine arms later only if a
+	// stable revision becomes known.
+	if target.StableRevision == "" {
+		return
+	}
+	// A run is opened for the whole InferenceService, so a group whose unit
+	// did not retarget is still handed a target. State is what arms the step
+	// machine; an idle unit must sit the run out with none, or it walks its
+	// ladder, spends its analysis budget, and can reach a rollback over a
+	// rollout that never happened.
+	if !groupRetargeted(isvc, g, primary) {
+		return
+	}
 	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
 	if cs == nil {
 		cs = &v1beta1.CanaryStatus{}

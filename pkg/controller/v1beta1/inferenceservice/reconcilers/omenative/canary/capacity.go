@@ -14,7 +14,7 @@ func resolveStepNewCount(step v1beta1.RolloutGroupStep, desired int32) int32 {
 }
 
 // partitionForNewCount maps a desired new-revision count to the StatefulSet-style
-// RollingUpdate.Partition the workload reconcile honors: instances with index <
+// partition the workload reconcile honors: instances with index <
 // Partition are held on the old revision, so (desired - newCount) old instances
 // are held and newCount roll to the canary revision. Clamped to [0, desired].
 func partitionForNewCount(desired, newCount int32) int32 {

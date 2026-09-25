@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -267,14 +268,14 @@ func TestIsMultiPodComponent(t *testing.T) {
 			want:      false,
 		},
 		{
-			name: "Engine.Worker present but Size nil → single-pod (defaulter not yet run)",
+			name: "Engine.Worker present but Size nil → multi-pod (size resolves to one worker at reconcile)",
 			isvc: &v1beta1.InferenceService{
 				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{
 					Worker: &v1beta1.WorkerSpec{},
 				}},
 			},
 			component: v1beta1.EngineComponent,
-			want:      false,
+			want:      true,
 		},
 		{
 			name: "Engine.Worker.Size = 0 → single-pod (validator should reject before reconcile)",
@@ -343,4 +344,98 @@ func TestIsMultiPodComponent(t *testing.T) {
 			assert.Equal(t, tt.want, IsMultiPodComponent(tt.isvc, tt.component))
 		})
 	}
+}
+
+func TestInferenceServiceDeploymentMode(t *testing.T) {
+	one := 1
+	omeNative := constants.OMENative
+	withAnnotation := func(mode string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Annotations: map[string]string{constants.DeploymentMode: mode}}
+	}
+	tests := []struct {
+		name string
+		isvc *v1beta1.InferenceService
+		def  constants.DeploymentModeType
+		want constants.DeploymentModeType
+	}{
+		{name: "nil object resolves to the operator default", isvc: nil, def: constants.RawDeployment, want: constants.RawDeployment},
+		{
+			name: "top-level annotation wins over the spec field",
+			isvc: &v1beta1.InferenceService{
+				ObjectMeta: withAnnotation(string(constants.VirtualDeployment)),
+				Spec:       v1beta1.InferenceServiceSpec{DeploymentMode: &omeNative, Engine: &v1beta1.EngineSpec{}},
+			},
+			def:  constants.RawDeployment,
+			want: constants.VirtualDeployment,
+		},
+		{
+			name: "spec field wins over the declared shape",
+			isvc: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+				DeploymentMode: &omeNative,
+				Engine:         &v1beta1.EngineSpec{},
+				Decoder:        &v1beta1.DecoderSpec{},
+			}},
+			def:  constants.RawDeployment,
+			want: constants.OMENative,
+		},
+		{
+			name: "engine plus decoder is PD-disaggregated",
+			isvc: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+				Engine:  &v1beta1.EngineSpec{},
+				Decoder: &v1beta1.DecoderSpec{},
+			}},
+			def:  constants.RawDeployment,
+			want: constants.PDDisaggregated,
+		},
+		{
+			name: "leader plus worker without a size is OMENative",
+			isvc: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+				Engine: &v1beta1.EngineSpec{Leader: &v1beta1.LeaderSpec{}, Worker: &v1beta1.WorkerSpec{}},
+			}},
+			def:  constants.RawDeployment,
+			want: constants.OMENative,
+		},
+		{
+			name: "sized leader plus worker is OMENative",
+			isvc: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+				Engine: &v1beta1.EngineSpec{Leader: &v1beta1.LeaderSpec{}, Worker: &v1beta1.WorkerSpec{Size: &one}},
+			}},
+			def:  constants.RawDeployment,
+			want: constants.OMENative,
+		},
+		{
+			name: "single-pod engine falls to the operator default",
+			isvc: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}}},
+			def:  constants.RawDeployment,
+			want: constants.RawDeployment,
+		},
+		{
+			name: "invalid annotation is ignored",
+			isvc: &v1beta1.InferenceService{
+				ObjectMeta: withAnnotation("Bogus"),
+				Spec:       v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}},
+			},
+			def:  constants.RawDeployment,
+			want: constants.RawDeployment,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, InferenceServiceDeploymentMode(tc.isvc, tc.def))
+		})
+	}
+}
+
+func TestIsMultiPodComponent_UnsetSize(t *testing.T) {
+	zero := 0
+	engine := func(worker *v1beta1.WorkerSpec) *v1beta1.InferenceService {
+		return &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+			Engine: &v1beta1.EngineSpec{Leader: &v1beta1.LeaderSpec{}, Worker: worker},
+		}}
+	}
+	assert.True(t, IsMultiPodComponent(engine(&v1beta1.WorkerSpec{}), v1beta1.EngineComponent),
+		"a declared worker with an unset size resolves to one worker, so the Component is multi-pod")
+	assert.False(t, IsMultiPodComponent(engine(&v1beta1.WorkerSpec{Size: &zero}), v1beta1.EngineComponent),
+		"an explicit size of 0 spawns no workers")
+	assert.False(t, IsMultiPodComponent(engine(nil), v1beta1.EngineComponent))
 }

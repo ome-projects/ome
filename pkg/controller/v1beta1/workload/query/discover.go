@@ -1,5 +1,5 @@
 // Package query holds the read-side primitives shared between the
-// workload pipeline (workload/status_aggregate.go, workload/ops/...)
+// workload pipeline (workload/status/aggregate.go, workload/ops/...)
 // and the per-Component dispatch surfaces still on the ISVC controller
 // (omenative/watches.go). Lives as a leaf so the workload package can
 // import it without closing a cycle.
@@ -9,6 +9,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -321,6 +322,64 @@ func IsTerminalPod(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
 }
 
+const (
+	// ReasonUnexpectedAdmissionError is the kubelet's pod-level reason
+	// when it refuses a pod the scheduler already placed on its node for
+	// any cause other than a specific resource shortfall.
+	ReasonUnexpectedAdmissionError = "UnexpectedAdmissionError"
+	// outOfResourceReasonPrefix is how the kubelet names a refusal for a
+	// specific resource shortfall: "OutOf" concatenated with the resource
+	// ("OutOfcpu", "OutOfmemory", "OutOfpods", "OutOfnvidia.com/gpu").
+	// Matched by prefix because extended-resource names are
+	// cluster-defined and cannot be enumerated.
+	outOfResourceReasonPrefix = "OutOf"
+)
+
+// PodAdmissionRejected reports whether the kubelet refused to admit the
+// pod after the scheduler had already placed it, and returns the reason
+// it recorded.
+//
+// ENVIRONMENT-CAUSED: the node's own picture of its capacity disagreed
+// with what the scheduler assumed, which says nothing about the pod
+// template. No container ever ran, yet the object still holds its stable
+// name, so the owning operation must delete it before that name can be
+// used again.
+func PodAdmissionRejected(pod *corev1.Pod) (string, bool) {
+	if pod == nil || pod.Status.Phase != corev1.PodFailed {
+		return "", false
+	}
+	reason := pod.Status.Reason
+	if reason == ReasonUnexpectedAdmissionError || isOutOfResourceReason(reason) {
+		return reason, true
+	}
+	return "", false
+}
+
+// isOutOfResourceReason matches the kubelet's OutOf<resource> family
+// without swallowing every other reason that opens with the same
+// letters. The suffix has to look like the resource name the kubelet
+// concatenated: non-empty, starting with a lowercase letter, and built
+// only from characters a (possibly domain-qualified) resource name may
+// contain, as in nvidia.com/gpu.
+func isOutOfResourceReason(reason string) bool {
+	resource, ok := strings.CutPrefix(reason, outOfResourceReasonPrefix)
+	if !ok || resource == "" {
+		return false
+	}
+	if resource[0] < 'a' || resource[0] > 'z' {
+		return false
+	}
+	for _, r := range resource {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '/', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // ExcludeTerminalPods returns the pods that are not terminal — the set a
 // presence or liveness decision may count. Nil entries are dropped too.
 func ExcludeTerminalPods(pods []*corev1.Pod) []*corev1.Pod {
@@ -349,6 +408,79 @@ func AllPodsRuntimeReady(pods []*corev1.Pod) bool {
 		}
 	}
 	return true
+}
+
+// PodSetPromotable reports whether a pod set clears the one bar every path
+// stamping an Instance Ready shares: the set is non-empty, no pod is
+// terminal, every pod is PodReady — the readiness gates the controller
+// writes are folded by kubelet into that condition, so a PodReady pod is
+// eligible for its Service — and every pod has held Ready for the
+// Component's minReadySeconds window. A window <= 0 reduces the bar to
+// PodReady. Each extra predicate is an additional per-path requirement on
+// every pod (the in-place roll confirms its runtime images there).
+//
+// The duration is how long until the last pod inside its window clears it,
+// so a caller waiting on the window wakes when it elapses instead of
+// polling; it is 0 when the set is promotable and when something other than
+// the window holds it back. A pod that goes ContainersReady=false and back
+// inside the window moves the Ready condition's lastTransitionTime, so the
+// window restarts from that latest transition and the set is not promotable
+// until the flapping pod has held Ready for a full window.
+func PodSetPromotable(pods []*corev1.Pod, minReadySeconds int32, now time.Time, extra ...func(*corev1.Pod) bool) (bool, time.Duration) {
+	if len(pods) == 0 {
+		return false, 0
+	}
+	var wait time.Duration
+	for _, pod := range pods {
+		if IsTerminalPod(pod) || !podreadiness.IsContainersReady(pod) {
+			return false, 0
+		}
+		for _, satisfied := range extra {
+			if !satisfied(pod) {
+				return false, 0
+			}
+		}
+		available, remaining := podreadiness.IsPodAvailable(pod, minReadySeconds, now)
+		if available {
+			continue
+		}
+		if remaining <= 0 {
+			// Not PodReady, or Ready with no provable age: no later instant
+			// is known to promote this set.
+			return false, 0
+		}
+		if remaining > wait {
+			wait = remaining
+		}
+	}
+	return wait == 0, wait
+}
+
+// PodSetFullyServing reports whether the pod set is fully healthy in
+// the rotation: at least `desired` live (non-deleting) pods, every one
+// of them ContainersReady AND carrying the serving gate. Deleting pods
+// are excluded rather than disqualifying — a completed surge leaves the
+// old pod draining next to the serving replacement. A terminal pod is
+// never live and disqualifies the set outright: it is failure evidence
+// that must reach the escalation pass even when stale conditions on it
+// still read healthy, or when a serving sibling would otherwise cover
+// the count. desired <= 0 never counts as serving (nothing is expected,
+// so nothing can prove health).
+func PodSetFullyServing(pods []*corev1.Pod, desired int32) bool {
+	if desired <= 0 {
+		return false
+	}
+	var live int32
+	for _, p := range pods {
+		if p == nil || p.DeletionTimestamp != nil {
+			continue
+		}
+		if IsTerminalPod(p) || !podreadiness.IsContainersReady(p) || !podreadiness.IsServing(p) {
+			return false
+		}
+		live++
+	}
+	return live >= desired
 }
 
 // AllTerminating reports whether every pod in the slice carries a

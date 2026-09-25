@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -25,28 +27,13 @@ func updateDrainKey(idx int32, incarnation int64) string {
 	return strconv.Itoa(int(idx)) + "-" + strconv.FormatInt(incarnation, 10)
 }
 
-// drainServiceForPod is declared in migrate.go — Update and Migrate
-// share the same per-revision routed Service lookup.
-
 // UpdateRequeueInterval is the wait between passes while an Update is
-// in flight. Exported so the dispatcher's requeue cadence stays in
-// lockstep with the per-Instance state machine.
-const UpdateRequeueInterval = 5 * time.Second
-
-// podsAvailable reports whether every pod has been Ready for the
-// Component's minReadySeconds window (podreadiness.IsPodAvailable). A zero
-// window reduces to every pod being PodReady. Rollouts pace on this rather
-// than on Ready: a drain or promotion that ran the moment a pod flipped
-// Ready would release its budget slot before the pod proved it stays up.
-// The in-flight Update keeps the dispatcher polling at UpdateRequeueInterval
-// until the window elapses.
-func podsAvailable(pods []*corev1.Pod, minReadySeconds int32, now time.Time) bool {
-	for _, pod := range pods {
-		if available, _ := podreadiness.IsPodAvailable(pod, minReadySeconds, now); !available {
-			return false
-		}
-	}
-	return true
+// in flight, from the operator's lifecycle.requeue.operation. Exported
+// so the dispatcher's requeue cadence stays in lockstep with the
+// per-Instance state machine. Zero means unconfigured: the caller
+// requeues on the controller's rate-limited backoff instead.
+func UpdateRequeueInterval(input workload.ReconcileInput) time.Duration {
+	return input.Requeue.Operation
 }
 
 // surgeWindowApplies reports whether the minReadySeconds window still gates a
@@ -55,7 +42,7 @@ func podsAvailable(pods []*corev1.Pod, minReadySeconds int32, now time.Time) boo
 // that step the source is already draining, and a replacement that flaps
 // Ready must not hold the drained source out of service for another window.
 func surgeWindowApplies(s *workload.InstanceStatus) bool {
-	return s == nil || s.Operation == nil || s.Operation.Step == updateStepSurge
+	return s == nil || s.Operation == nil || s.Operation.Step == workload.UpdateStepSurge
 }
 
 // Update drives one Instance toward the target ControllerRevision.
@@ -109,16 +96,18 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 	}
 
 	// UpdateStrategy is not part of the revision payload, so a strategy edit
-	// retargets nothing: the same roll continues under a different mechanism,
-	// and the mode resolved below can differ from the one that opened the
-	// Operation. Only SurgeThenDrain leaves state another mode cannot see —
-	// a second pod at the alternate ordinal slot, the ActiveOrdinal advance
-	// that ends the cycle, and a drain hold on the source released only by
-	// the source's deletion. Dispatching another mode over that drains or
-	// deletes the source while its replacement is still coming up, and
-	// strands the surge pod. Keep the surge machine in control; it decides
-	// whether to unwind (still uncommitted) or finish the cycle.
-	if isSurgeOwnedStatus(findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index)) {
+	// retargets nothing — and every mode leaves state the others cannot see:
+	// a patch already applied to a live pod, a second pod at the alternate
+	// ordinal slot, a drain hold released only by the source's deletion.
+	// An attempt therefore runs to its end on the mechanism it opened with,
+	// and the edit reaches this Instance at its next admitted attempt.
+	observed := input.ObservedState.Instance(inst.Index)
+	plan.UpdateStrategy.Type = effectiveUpdateStrategy(observed, plan.UpdateStrategy.Type)
+
+	// A surge-owned status resumes on the surge machine whatever the plan
+	// says: it holds the ordinal slot and the source's drain hold, which no
+	// other mode knows how to release.
+	if isSurgeOwnedStatus(observed) {
 		return surgeUpdate(ctx, deps, input, plan, inst, target, pods)
 	}
 
@@ -128,21 +117,22 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 	// against the freshly-rendered target would always declare ineligible.
 	// The recorded revision's PodSpec is the pre-defaulted canonical form
 	// the target hashes against.
-	runningSpec, err := loadRunningRevisionPodSpec(ctx, deps.Reader(), input, input.Key.Component, inst.Index)
+	runningSpec, err := loadRunningRevisionPodSpec(ctx, deps.Reader(), input, inst.Index)
 	if err != nil {
 		return false, fmt.Errorf("Update: load running revision (instance=%d): %w", inst.Index, err)
 	}
 
 	multiPod := inst.TotalPods() > 1
 	// Strategy on the plan is the workload-mirror UpdateStrategyType;
-	// the chooser compares against the workload constants directly.
+	// the chooser compares against the workload constants directly. It is
+	// the attempt's pinned strategy once one is in flight.
 	strategy := plan.UpdateStrategy.Type
 	mode, err := chooseUpdateModeForInstance(strategy, runningSpec, targetSpec, multiPod)
 	if err != nil {
 		// InPlaceOnly + ineligible diff is the only error path here.
-		recordWarning(deps.Recorder, eventTarget(input), workload.EventReasonInPlaceUpdateNotPossible,
+		workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInPlaceUpdateNotPossible,
 			"OMENative %s rejected update: %v",
-			instanceKey(input.Key.Component, inst.Index), err)
+			workload.InstanceKey(input.Key.Component, inst.Index), err)
 		return false, fmt.Errorf("choose update mode (instance=%d): %w", inst.Index, err)
 	}
 
@@ -239,8 +229,8 @@ func chooseUpdateMode(strategy workload.UpdateStrategyType, running, target *cor
 		}
 		return updateModeRecreate, nil
 	case "":
-		// Default matches SurgeThenDrain so direct callers (tests,
-		// fuzz) skipping the defaulter get safe behavior.
+		// An unset type runs as SurgeThenDrain, the same reading
+		// BuildPlan applies.
 		return updateModeSurge, nil
 	default:
 		return 0, fmt.Errorf("unknown UpdateStrategy.Type %q", strategy)
@@ -271,11 +261,7 @@ func inPlaceEligible(running, target *corev1.PodSpec) bool {
 // InstanceStatus.RunningRevision. Returns (nil, nil) when no status
 // exists, no RunningRevision is recorded, or the CR is gone — callers
 // treat that as no baseline and route to recreate.
-//
-// component is unused (the InstanceStatus lookup keys on idx alone)
-// but kept for symmetry and future evolution toward multi-Component
-// input payloads.
-func loadRunningRevisionPodSpec(ctx context.Context, reads client.Reader, input workload.ReconcileInput, _ workload.ComponentType, idx int32) (*corev1.PodSpec, error) {
+func loadRunningRevisionPodSpec(ctx context.Context, reads client.Reader, input workload.ReconcileInput, idx int32) (*corev1.PodSpec, error) {
 	payload, err := loadRunningRevisionPayload(ctx, reads, input, idx)
 	if err != nil || payload == nil {
 		return nil, err
@@ -287,7 +273,7 @@ func loadRunningRevisionPodSpec(ctx context.Context, reads client.Reader, input 
 // (PodSpec + PodMeta + WorkerPodSpec). Used by inPlaceUpdate's
 // annotation-reconciliation pass.
 func loadRunningRevisionPayload(ctx context.Context, reads client.Reader, input workload.ReconcileInput, idx int32) (*revision.DataPayload, error) {
-	s := findInstanceStatus(input.ObservedState.InstanceStatuses, idx)
+	s := input.ObservedState.Instance(idx)
 	if s == nil || s.RunningRevision == "" {
 		return nil, nil
 	}
@@ -350,8 +336,8 @@ func podSpecWithoutImages(spec *corev1.PodSpec) ([]byte, error) {
 // retryAfter > 0 means the trigger was denied by a not-yet-due Backoff
 // RetryBlock for the current target; re-evaluate then. 0 otherwise
 // (including Held, which has no time bound).
-func DetectUpdateTrigger(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, targetSpec *corev1.PodSpec) (trigger bool, retryAfter time.Duration, err error) {
-	return DetectUpdateTriggerWithPods(ctx, deps, input, plan, inst, target, targetSpec, nil)
+func DetectUpdateTrigger(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision) (trigger bool, retryAfter time.Duration, err error) {
+	return DetectUpdateTriggerWithPods(ctx, deps, input, plan, inst, target, nil)
 }
 
 // DetectUpdateTriggerWithPods is DetectUpdateTrigger with this Instance's
@@ -364,7 +350,7 @@ func DetectUpdateTrigger(ctx context.Context, deps workload.Deps, input workload
 // Composition of the pure evaluation (EvaluateUpdateTrigger) with its
 // two effects: the fallback self-list and the AdoptRevision backfill
 // write (BackfillRunningRevision).
-func DetectUpdateTriggerWithPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, targetSpec *corev1.PodSpec, instancePods []*corev1.Pod) (trigger bool, retryAfter time.Duration, err error) {
+func DetectUpdateTriggerWithPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) (trigger bool, retryAfter time.Duration, err error) {
 	dec, needPods := evaluateUpdateTriggerFast(input, inst, target)
 	if needPods {
 		pods := instancePods
@@ -375,7 +361,7 @@ func DetectUpdateTriggerWithPods(ctx context.Context, deps workload.Deps, input 
 			}
 			pods = filterPodsByInstance(all, inst.Index)
 		}
-		dec = evaluateUpdateTriggerPods(pods, targetSpec)
+		dec = evaluateUpdateTriggerPods(pods, target)
 	}
 	if dec.AdoptRevision {
 		if err := BackfillRunningRevision(ctx, input, inst.Index, target.Name); err != nil {
@@ -408,12 +394,12 @@ type UpdateTriggerDecision struct {
 // filtered to inst.Index (nil is an empty pod set); they are consulted
 // only on the empty-RunningRevision fallback path. The clock is read
 // through input.Now.
-func EvaluateUpdateTrigger(input workload.ReconcileInput, inst workload.InstancePlan, target *appsv1.ControllerRevision, targetSpec *corev1.PodSpec, instancePods []*corev1.Pod) UpdateTriggerDecision {
+func EvaluateUpdateTrigger(input workload.ReconcileInput, inst workload.InstancePlan, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) UpdateTriggerDecision {
 	dec, needPods := evaluateUpdateTriggerFast(input, inst, target)
 	if !needPods {
 		return dec
 	}
-	return evaluateUpdateTriggerPods(instancePods, targetSpec)
+	return evaluateUpdateTriggerPods(instancePods, target)
 }
 
 // evaluateUpdateTriggerFast runs the status-only portion of the
@@ -421,7 +407,7 @@ func EvaluateUpdateTrigger(input workload.ReconcileInput, inst workload.Instance
 // decide (empty RunningRevision) and the caller must run
 // evaluateUpdateTriggerPods over the Instance's pods.
 func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.InstancePlan, target *appsv1.ControllerRevision) (dec UpdateTriggerDecision, needPods bool) {
-	s := findInstanceStatus(input.ObservedState.InstanceStatuses, inst.Index)
+	s := input.ObservedState.Instance(inst.Index)
 	if s == nil {
 		return UpdateTriggerDecision{}, false
 	}
@@ -451,15 +437,12 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 		return UpdateTriggerDecision{}, false
 	}
 
-	// Same-target retry gate: a persisted RetryBlock for the
-	// CURRENT target denies FRESH re-triggering. A different target
-	// revision is a different RetrySubject and passes (the Failed-wedge
-	// fix stands). Phase=Failed with an in-flight Update Operation is a
-	// CONTINUATION (teardown/abandon of the failed candidate) and is
-	// exempt — mirrors the dispatcher's startingFresh carve-out.
-	failedContinuation := s.Phase == workload.InstancePhaseFailed &&
-		s.Operation != nil && s.Operation.Type == workload.InstanceOperationUpdate
-	if b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, target.Name); b != nil && !failedContinuation {
+	// Same-target retry gate: a persisted RetryBlock for the CURRENT
+	// target denies FRESH re-triggering. A different target revision is
+	// a different RetrySubject and passes. A continuation (the teardown
+	// or abandon of a failed candidate) is exempt, by the same predicate
+	// the dispatcher admits and charges with.
+	if b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, target.Name); b != nil && !workload.UpdateContinuation(s) {
 		denied, retryAfter := evaluateRetryBlockGate(b, input.Now(),
 			anyInFlightUpdateAt(input.ObservedState.InstanceStatuses, target.Name))
 		if denied {
@@ -479,24 +462,44 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 }
 
 // evaluateUpdateTriggerPods runs the empty-RunningRevision fallback:
-// per-pod diff against the target spec, and the AdoptRevision
+// the per-pod revision check against the target, and the AdoptRevision
 // selection.
-func evaluateUpdateTriggerPods(pods []*corev1.Pod, targetSpec *corev1.PodSpec) UpdateTriggerDecision {
-	for _, pod := range pods {
-		if !podMatchesTarget(pod, targetSpec) {
-			return UpdateTriggerDecision{Trigger: true}
-		}
-	}
-	// Spec-match alone proves nothing about health: a wedged pod (e.g.
-	// ImagePullBackOff) spec-matches the very revision that broke it, and
-	// the adoption stamp prunes that revision's RetryBlock — Ready is
-	// only stamped on proof. Require the same runtime-readiness the
-	// canonical Ready promotions gate on before adopting; unproven pods
-	// are simply left alone (a corrective target re-triggers via the
-	// per-pod diff above, and pods that later become ready are adopted
-	// on a subsequent pass).
-	if !query.AllPodsRuntimeReady(pods) {
+//
+// A pod's revision is its ome.io/revision-hash label — the identity
+// every other pass reads, and the only one that can be right here. The
+// renderer stamps hostname, subdomain and the serving readiness gate
+// onto each pod it writes, so a live pod's PodSpec never equals the
+// unrendered desired template and a spec comparison can only ever say
+// "different". A pod carrying no label cannot be proven on target and
+// is rolled.
+//
+// Exactly one shape is adopted: every pod on the target revision and
+// runtime-ready. Every other shape takes the roll, so a Failed row keeps
+// the recovery its strategy and disposition give it.
+func evaluateUpdateTriggerPods(pods []*corev1.Pod, target *appsv1.ControllerRevision) UpdateTriggerDecision {
+	// An empty pod set proves nothing in either direction; the Create
+	// and demotion passes own a row with no pods.
+	if len(pods) == 0 {
 		return UpdateTriggerDecision{}
+	}
+	if !existingPodsMatchTargetRevision(pods, target) {
+		return UpdateTriggerDecision{Trigger: true}
+	}
+	// Carrying the target revision proves nothing about health: a wedged
+	// pod (e.g. ImagePullBackOff) is labelled with the very revision that
+	// broke it, and the adoption stamp prunes that revision's RetryBlock —
+	// Ready is only stamped on proof. An unhealthy pod set on the target is
+	// a row to recover, not a row to stamp: it takes the ordinary roll, which
+	// is the retry, recreate or relocation its strategy and the disposition's
+	// node-exclusion overlay resolve. Leaving it alone would end the row's
+	// recovery — no further attempt is opened, so the RetryBlock ladder never
+	// advances and a stuck pod is never recreated off its suspect node.
+	// Adoption is the narrow case: every pod on the target AND runtime-ready.
+	// It backfills the revision an already running pod set carries, so it is
+	// not one of the promote paths and does not consult the availability
+	// window.
+	if !query.AllPodsRuntimeReady(pods) {
+		return UpdateTriggerDecision{Trigger: true}
 	}
 	return UpdateTriggerDecision{AdoptRevision: true}
 }
@@ -506,75 +509,85 @@ func evaluateUpdateTriggerPods(pods []*corev1.Pod, targetSpec *corev1.PodSpec) U
 // AdoptRevision effect, so future trigger evaluations take the
 // RunningRevision fast path.
 func BackfillRunningRevision(ctx context.Context, input workload.ReconcileInput, idx int32, rev string) error {
-	if err := patchInstanceStatusReadyOnRevision(ctx, input, idx, rev); err != nil {
+	if err := status.StampReadyOnRevision(ctx, input, idx, rev); err != nil {
 		return fmt.Errorf("backfill RunningRevision (instance=%d): %w", idx, err)
 	}
 	return nil
 }
 
-// isMigrateOwnedStatus reports whether the InstanceStatus carries an
-// in-flight Migrate operation (either source-side or surge-side). The
-// post-promote scale-down pass briefly leaves RunningRevision pointing
-// at the source rev while the surge has already been promoted; without
-// this guard a spec-bump arriving during that window would race the
-// surge promote.
+// isMigrateOwnedStatus reports whether the migration record has a hold
+// on the row: the Migrating pin on the phase, or a Migrate operation
+// whatever the phase — a pair row that escalated keeps its claim while
+// it reads Failed. No trigger starts an Update or a Restart on such a
+// row; the record ends both pair rows through itself.
 func isMigrateOwnedStatus(s *workload.InstanceStatus) bool {
-	if s == nil {
-		return false
-	}
-	if s.Phase == workload.InstancePhaseMigrating {
-		return true
-	}
-	if s.Operation != nil && s.Operation.Type == workload.InstanceOperationMigrate {
+	return s != nil && (s.Phase == workload.InstancePhaseMigrating ||
+		workload.ClaimOf(s) == workload.OwnerMigrate)
+}
+
+// surgeClaim reports whether the row's operation is a surge cycle's.
+//
+// Read from the operation, not from the ownership table: a surge that
+// escalated keeps its claim — the pinned revision, the replacement index
+// — while the row reads Failed, and the table answers OwnerNone for
+// every Failed row. Who drives the row and what the row still claims are
+// different questions, and the recovery paths ask the second one.
+func surgeClaim(s *workload.InstanceStatus) bool {
+	return s != nil && s.Operation != nil &&
+		s.Operation.Type == workload.InstanceOperationUpdate &&
+		status.SurgeUpdateStep(s.Operation.Step)
+}
+
+// gangSurgeSourceClaim is surgeClaim plus the replacement index a gang
+// source pins for the duration of its cycle.
+func gangSurgeSourceClaim(s *workload.InstanceStatus) bool {
+	return surgeClaim(s) && s.Operation.SurgeIndex != nil
+}
+
+// isSurgeOwnedStatus reports whether the SurgeThenDrain sub-machine is
+// running on this row, so a mode resolved from a since-edited strategy must
+// not be dispatched over it.
+//
+// Two halves. Ownership: the update pass drives the row at all — which a
+// Failed row is not, since a failed surge has already escalated to operator
+// attention and editing the strategy is one of the levers used to rescue it.
+// Mechanism: of the update pass's sub-machines, the one in flight is the
+// surge cycle.
+func isSurgeOwnedStatus(s *workload.InstanceStatus) bool {
+	switch workload.StateOf(s) {
+	case workload.StateUpdateSurge, workload.StateUpdateSurgeDrain:
 		return true
 	}
 	return false
 }
 
-// isSurgeOwnedStatus reports whether the SurgeThenDrain state machine owns
-// this Instance's in-flight Operation, so a mode resolved from a since-edited
-// strategy must not be dispatched over it.
-//
-// Phase=Failed is excluded. A failed surge has already escalated to operator
-// attention, and editing the strategy is one of the levers used to rescue it;
-// holding the Instance on the surge machine would take that lever away.
-func isSurgeOwnedStatus(s *workload.InstanceStatus) bool {
-	return s != nil && s.Phase != workload.InstancePhaseFailed &&
-		s.Operation != nil && s.Operation.Type == workload.InstanceOperationUpdate &&
-		isSurgeUpdateStep(s.Operation.Step)
+// effectiveUpdateStrategy returns the strategy an attempt runs under: the
+// one pinned on the operation in flight, or the desired one when no attempt
+// owns the Instance. A Failed row holds no attempt — editing the strategy is
+// the operator's way out of a mode that cannot make progress — so its
+// preserved operation does not pin anything.
+func effectiveUpdateStrategy(s *workload.InstanceStatus, desired workload.UpdateStrategyType) workload.UpdateStrategyType {
+	if workload.Owner(s) != workload.OwnerUpdate || s.Operation.Strategy == "" {
+		return desired
+	}
+	return s.Operation.Strategy
 }
 
 // isGangSurgeTargetMarker reports whether s is a gang surge-target marker —
-// the transient replacement-gang index stamped by patchInstanceStatusGangSurgeTarget
+// the transient replacement-gang index stamped by status.StampGangSurgeTarget
 // (Op{Update, Step=GangSurgeTarget}). Its lifecycle is owned by the source
 // instance's gangSurgeUpdate, so the update trigger must not treat it as an
 // independent target.
+//
+// Read from the operation and not from the ownership table: a marker whose
+// gang escalated keeps the claim on its index while the row reads Failed,
+// and the table answers OwnerNone for every Failed row. The claim is what
+// this asks about, not who drives the row.
 func isGangSurgeTargetMarker(s *workload.InstanceStatus) bool {
 	return s != nil && s.Operation != nil &&
 		s.Operation.Type == workload.InstanceOperationUpdate &&
 		(s.Operation.Step == workload.UpdateStepGangSurgeTarget ||
 			s.Operation.Step == workload.UpdateStepGangSurgeTargetCleanup)
-}
-
-// podMatchesTarget compares pod's runtime PodSpec to target — same
-// image-stripped JSON AND matching container images. Used when
-// RunningRevision is missing.
-func podMatchesTarget(pod *corev1.Pod, target *corev1.PodSpec) bool {
-	if pod == nil || target == nil {
-		return false
-	}
-	gotStripped, err := podSpecWithoutImages(&pod.Spec)
-	if err != nil {
-		return false
-	}
-	wantStripped, err := podSpecWithoutImages(target)
-	if err != nil {
-		return false
-	}
-	if string(gotStripped) != string(wantStripped) {
-		return false
-	}
-	return podImagesMatch(pod, target)
 }
 
 // anyInFlightUpdateAt reports whether any Instance carries an in-flight
@@ -589,4 +602,195 @@ func anyInFlightUpdateAt(statuses []workload.InstanceStatus, rev string) bool {
 		}
 	}
 	return false
+}
+
+// Wreckage is per-instance rollout debris keyed to a SUPERSEDED
+// revision: state that no revision-diff update trigger can ever reach,
+// because the trigger's predicate is "this instance must move to a
+// different revision" while the wreckage sits at zero revision distance
+// (a corrective roll-back) or on a third-party revision. Two shapes:
+//
+//   - GANG: a Failed source still carrying its gang-surge continuation
+//     (Op{Update, SurgeIndex}) toward a revision that is no longer the
+//     roll target. When the corrective target equals the source's
+//     RunningRevision the trigger never fires, so the abandon
+//     continuation must be dispatched explicitly.
+//   - ALIEN PODS: live pods whose revision-hash label matches neither
+//     the instance's RunningRevision nor the current roll target — the
+//     dead pod an exhausted attempt toward a superseded revision left
+//     behind (e.g. parked at the surge ordinal).
+//
+// Cleanup restores the invariant that nothing keyed to a superseded
+// revision gates, steers, or occupies reconciliation.
+
+// EvaluateWreckage is the pure wreckage predicate for one Instance.
+// Plan consults it only for instances the update trigger declined
+// (in-flight and re-triggered instances clean their own debris through
+// the update machinery). instancePods must already be filtered to the
+// instance's index; the clock is not read.
+//
+// Excluded by design: migrate-owned statuses (the migration record owns
+// them), gang surge-target markers (a live marker is owned by its
+// source; an orphaned one is collected by the plan's marker-liveness
+// scale-down), and transient phases (Creating / Deleting / Restarting
+// are not interruptible).
+func EvaluateWreckage(s *workload.InstanceStatus, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) bool {
+	if s == nil || target == nil {
+		return false
+	}
+	if isMigrateOwnedStatus(s) || isGangSurgeTargetMarker(s) {
+		return false
+	}
+	if s.Phase != workload.InstancePhaseReady && s.Phase != workload.InstancePhaseFailed {
+		return false
+	}
+	if failedGangSurgeContinuation(s, target.Name) {
+		return true
+	}
+	return len(alienRevisionPods(s, target.Name, instancePods)) > 0
+}
+
+// failedGangSurgeContinuation reports the gang wreckage shape: a Failed
+// source whose preserved gang-surge operation targets a revision other
+// than the current roll target.
+func failedGangSurgeContinuation(s *workload.InstanceStatus, targetName string) bool {
+	return s.Phase == workload.InstancePhaseFailed &&
+		s.Operation != nil && s.Operation.Type == workload.InstanceOperationUpdate &&
+		s.Operation.SurgeIndex != nil &&
+		s.Operation.TargetRevision != targetName
+}
+
+// alienRevisionPods returns the instance's live pods labeled with a
+// revision that matches neither the instance's RunningRevision nor the
+// current roll target. Unlabeled pods are never selected (legacy pods
+// are the ordinal partition's business). An empty RunningRevision
+// yields no aliens: with no recorded baseline, alienness is
+// undecidable — that state is owned by the trigger's per-pod diff /
+// adoption path, and deleting an unproven-but-innocent pod there would
+// destroy the very pod adoption is waiting on.
+func alienRevisionPods(s *workload.InstanceStatus, targetName string, pods []*corev1.Pod) []*corev1.Pod {
+	if s.RunningRevision == "" {
+		return nil
+	}
+	running := query.RevisionFromName(s.RunningRevision)
+	target := query.RevisionFromName(targetName)
+	var out []*corev1.Pod
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp != nil {
+			continue
+		}
+		hash, ok := pod.Labels[query.LabelRevisionHash]
+		if !ok || hash == "" {
+			continue
+		}
+		rev := query.RevisionFromPod(pod)
+		if rev.Same(running) || rev.Same(target) {
+			continue
+		}
+		out = append(out, pod)
+	}
+	return out
+}
+
+// CleanupWreckage abandons one instance's superseded-revision wreckage
+// toward the CURRENT desired state — legal when target equals the
+// instance's RunningRevision (the corrective roll-back), where the
+// update machinery is unreachable. Effects route through the existing
+// machinery:
+//
+//   - gang continuation → abandonFailedGangSurge (deletes the dead
+//     replacement gang, drops its marker, records the failure on the
+//     superseded revision's RetryBlock, resets the source Ready on its
+//     running revision);
+//   - alien-revision pods → taken out of rotation, then deleted on a later
+//     pass, the same eviction the superseded-surge redirect applies to a
+//     not-yet-promoted surge pod.
+//
+// The serving source is never touched: no serving-gate flip, no status
+// stamp — after the debris is gone the Create pass re-proves readiness
+// and promotes. done=true means no wreckage remains for this instance.
+func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) (bool, error) {
+	if deps.Client == nil {
+		return false, fmt.Errorf("CleanupWreckage: nil client")
+	}
+	if target == nil {
+		return true, nil
+	}
+	s := input.ObservedState.Instance(inst.Index)
+	if s == nil {
+		return true, nil
+	}
+
+	if failedGangSurgeContinuation(s, target.Name) {
+		return abandonFailedGangSurge(ctx, deps, input, plan, inst.Index, *s.Operation.SurgeIndex,
+			s.RunningRevision, s.Operation.TargetRevision,
+			instanceFailureReason(s, "gang surge abandoned after a corrective edit"), instanceFailureWorkloadCaused(s))
+	}
+
+	aliens := alienRevisionPods(s, target.Name, instancePods)
+	if len(aliens) == 0 {
+		return true, nil
+	}
+	return deleteSupersededRevisionPods(ctx, deps, input, inst.Index, aliens, target.Name)
+}
+
+// deleteSupersededRevisionPods evicts an Instance's pods keyed to a revision
+// it is not converging to — the wreckage sweep's aliens, and the pods a
+// retired Create attempt still holds the names of. A pod that is still
+// routed is taken out of rotation and left for the next pass: deleting it in
+// the same pass gives the endpoint controllers no window to act on the
+// withdrawal, and a bare delete drops the connections it is carrying.
+// Deletes are counted on the expectations cache before they are issued, and
+// compensated when the apiserver refuses, so the next pass reads a pod set
+// it can trust.
+//
+// done=false whenever there is still work here: outstanding expectations,
+// a pod just unrouted, or pods deleted that the next pass has to re-read.
+func deleteSupersededRevisionPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, pods []*corev1.Pod, targetName string) (bool, error) {
+	cache := deps.ExpectationsCache()
+	ns, owner, component := input.Key.Namespace, input.Key.OwnerName, input.Key.Component
+	if !cache.Satisfied(ns, owner, component, idx) {
+		return false, nil
+	}
+	unrouted := false
+	for _, pod := range pods {
+		if !podreadiness.IsServing(pod) {
+			continue
+		}
+		if err := podreadiness.MarkPodNotServing(ctx, deps.Client, deps.Reader(), pod,
+			podreadiness.WriterDeleteDrain, deleteDrainKey(idx)); err != nil {
+			// A pod that has vanished, or come back under a new UID, is out
+			// of rotation by other means already; the delete resolves it.
+			if !apierrors.IsNotFound(err) && !errors.Is(err, podreadiness.ErrPodIdentityChanged) {
+				return false, fmt.Errorf("unroute superseded-revision pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			}
+			continue
+		}
+		unrouted = true
+	}
+	// Deleting in the pass that unrouted gives the endpoint controllers no
+	// window to act on the withdrawal, so a pod that was still carrying
+	// traffic goes on the next pass. One that was already out of rotation
+	// has nothing to wait for and goes now.
+	if unrouted {
+		return false, nil
+	}
+	deleted := 0
+	for _, pod := range pods {
+		cache.ExpectDeletes(ns, owner, component, idx, 1)
+		if err := deps.Client.Delete(ctx, pod); err != nil {
+			cache.ObservedDelete(ns, owner, component, idx)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, fmt.Errorf("delete superseded-revision pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSupersededWreckageCleaned,
+			"OMENative %s deleted %d superseded-revision pod(s); current target %s",
+			workload.InstanceKey(component, idx), deleted, targetName)
+	}
+	return false, nil
 }

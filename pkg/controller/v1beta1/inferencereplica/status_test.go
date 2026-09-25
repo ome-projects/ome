@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -30,12 +31,15 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // writeStatus runs aggregateAndWriteStatus for tests that only care about the
 // write outcome, discarding the availability wake.
-func writeStatus(r *Reconciler, ir *v1beta1.InferenceReplica, plan workload.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workload.RolloutHold) error {
+func writeStatus(r *Reconciler, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold) error {
 	_, err := r.aggregateAndWriteStatus(context.Background(), ir, plan, target, holdObserved, hold)
 	return err
 }
@@ -45,7 +49,7 @@ func materializeInlinePublicationStatuses(t *testing.T, insts []v1beta1.OMENativ
 	observation, err := workload.NewOwnedPublicationObservation(
 		v1beta1convert.InstanceStatusSliceToWorkload(insts),
 		workload.NewCachedSelectorPodObservation(nil, byIndex),
-		availableByPod, workload.AvailabilityWindow{},
+		availableByPod, workloadstatus.AvailabilityWindow{},
 	)
 	if err != nil {
 		t.Fatalf("build publication observation: %v", err)
@@ -193,11 +197,11 @@ func TestAggregateAndWriteStatusPersistsCompactRowsAndMirrorsCurrentObservations
 		},
 	})
 	r.APIReader = r.Client
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{{
-			Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}},
+		Instances: []workloadtypes.InstancePlan{{
+			Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
 		}},
 	}
 
@@ -236,7 +240,7 @@ func TestMirrorInstanceCountersUsesTransientPublicationIntersection(t *testing.T
 		{Index: 9, Phase: v1beta1.OMENativeInstanceReady, PodCount: 7, ReadyPodCount: 6},
 		{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating},
 	}}
-	publication := []workload.InstanceStatus{
+	publication := []workloadtypes.InstanceStatus{
 		{Index: 1, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1, ScheduledPodCount: 1, AvailablePodCount: 1, NodesOccupied: []string{"node-a"}},
 		{Index: 3, PodCount: 2, ReadyPodCount: 2, NodesOccupied: []string{"superseded"}},
 		{Index: 3, PodCount: 4, ReadyPodCount: 3, ServingPodCount: 2, ScheduledPodCount: 4, AvailablePodCount: 1},
@@ -324,6 +328,11 @@ func TestReconcile_WakesWhenMinReadyWindowElapses(t *testing.T) {
 				PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1, ActiveOrdinal: 0},
 		}
 		pod0 := podForIR(ir, 0, "default", 0, true, true)
+		// The row is steady-state on the target, which the engine reads
+		// from the pod's revision-hash label; without it the update
+		// trigger rolls the row and the wake under test never applies.
+		pod0.Labels[query.LabelRevisionHash] =
+			query.RevisionHashFromControllerRevisionName(targetRevisionNameFor(t, ir))
 		pod0.Status.Conditions = append(pod0.Status.Conditions, corev1.PodCondition{
 			Type:               corev1.PodReady,
 			Status:             corev1.ConditionTrue,
@@ -491,6 +500,67 @@ func TestAggregateStatus_ReadyCondition_StagedAtPartition(t *testing.T) {
 	cond = computeReadyCondition(status, nil, nil, &v1beta1.InferenceReplicaPacing{Partition: &part})
 	g.Expect(cond.Reason).To(gomega.Equal(ReasonRolloutInProgress),
 		"not staged until the partitioned shape is fully reached")
+}
+
+// TestAggregateStatus_ReadyCondition_StagedReadsSamePartitionAsPlan pins
+// that the Staged decision reads the partition from the same sources, in
+// the same order, as the engine's hold: the projected spec.pacing.partition
+// (a canary step) first, else the user's lifecycle rollingUpdate partition.
+// A held canary step therefore reports Ready=True/Staged, and so does a
+// user partition with no canary; a pacing partition that disagrees with the
+// user's is the one the condition describes.
+func TestAggregateStatus_ReadyCondition_StagedReadsSamePartitionAsPlan(t *testing.T) {
+	g := gomega.NewWithT(t)
+	one, two := int32(1), int32(2)
+	staged := func() *v1beta1.InferenceReplicaStatus {
+		return &v1beta1.InferenceReplicaStatus{
+			Replicas:             3,
+			ReadyReplicas:        3,
+			UpdatedReadyReplicas: 2,
+			CurrentRevision:      "rev-a",
+			UpdateRevision:       "rev-b",
+			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+				{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-b"},
+				{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-b"},
+				{Index: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-a"},
+			},
+		}
+	}
+	userPartition := func(p int32) *v1beta1.LifecycleSpec {
+		return &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
+			RollingUpdate: &v1beta1.RollingUpdate{Partition: &p}}}
+	}
+
+	// Canary step held at partition 1, no user partition: Staged.
+	cond := computeReadyCondition(staged(), nil, nil, &v1beta1.InferenceReplicaPacing{Partition: &one})
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonStaged))
+
+	// User partition 1 with no canary: the engine holds one Instance, so
+	// the condition must call that Staged too.
+	cond = computeReadyCondition(staged(), nil, userPartition(1), nil)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue),
+		"a user rollingUpdate.partition is the partition the engine holds at when no canary projects one")
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonStaged))
+
+	// Canary step partition 1 over a user partition 2: the pacing value is
+	// the one the engine held at, so the 1-held shape is Staged.
+	cond = computeReadyCondition(staged(), nil, userPartition(2), &v1beta1.InferenceReplicaPacing{Partition: &one})
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonStaged),
+		"the projected pacing partition, not the user's, decides the staged shape")
+
+	// Canary partition 0 (released) over a user partition 1: the engine
+	// rolls every Instance, so a 1-held shape is still in progress.
+	zero := int32(0)
+	cond = computeReadyCondition(staged(), nil, userPartition(1), &v1beta1.InferenceReplicaPacing{Partition: &zero})
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionUnknown),
+		"an explicit pacing partition 0 releases every Instance even over a user partition")
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonRolloutInProgress))
+
+	// Shape disagreement with the pacing partition is not Staged.
+	cond = computeReadyCondition(staged(), nil, nil, &v1beta1.InferenceReplicaPacing{Partition: &two})
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonRolloutInProgress),
+		"one held Instance does not satisfy a partition of two")
 }
 
 // TestAggregateStatus_ReadyCondition_FalseOnStuck pins the
@@ -809,11 +879,11 @@ func TestAggregateAndWriteStatus_NoWriteWhenUnchanged(t *testing.T) {
 	slice0 := sliceForIRPod(ir, pod0, true)
 	r, c := newReconciler(t, ir, pod0, slice0)
 
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 	key := types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}
@@ -894,12 +964,12 @@ func TestAggregateAndWriteStatusReusesPublicationReadsAcrossConflictRetry(t *tes
 		WithIndex(&corev1.Pod{}, query.OMENativePodIndexField, query.OMENativePodIndexExtractor).
 		WithInterceptorFuncs(funcs).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
-	plan := workload.ComponentPlan{
+	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workloadtypes.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{{
-			Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}},
+		Instances: []workloadtypes.InstancePlan{{
+			Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
 		}},
 	}
 
@@ -954,14 +1024,14 @@ func TestAggregateAndWriteStatus_RebasesAfterAdjacentLifecycleWrite(t *testing.T
 		Client:               &staleReadingClient{Client: apiClient, reader: staleCache},
 		APIReader:            apiClient,
 		Log:                  logf.Log.WithName("test"),
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{{
-			Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}},
+		Instances: []workloadtypes.InstancePlan{{
+			Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
 		}},
 	}
 
@@ -991,14 +1061,14 @@ func TestAggregateAndWriteStatus_SameNameReplacementIsUntouched(t *testing.T) {
 		Client:               live,
 		APIReader:            live,
 		Log:                  logf.Log.WithName("test"),
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(stale.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{{
-			Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}},
+		Instances: []workloadtypes.InstancePlan{{
+			Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
 		}},
 	}
 
@@ -1023,14 +1093,14 @@ func TestAggregateAndWriteStatus_GenerationChangeAborts(t *testing.T) {
 		Client:               live,
 		APIReader:            live,
 		Log:                  logf.Log.WithName("test"),
-		Expectations:         workload.NewExpectations(),
+		Expectations:         workloadtypes.NewExpectations(),
 		InstanceStatusTarget: irstatus.EncodingDenseV1,
 	}
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(stale.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{{
-			Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}},
+		Instances: []workloadtypes.InstancePlan{{
+			Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
 		}},
 	}
 	metricBefore := make(map[string]float64)
@@ -1039,7 +1109,7 @@ func TestAggregateAndWriteStatus_GenerationChangeAborts(t *testing.T) {
 	}
 
 	err := writeStatus(r, stale, plan, nil, false, nil)
-	g.Expect(errors.Is(err, workload.ErrStatusMutationPrecondition)).To(gomega.BeTrue())
+	g.Expect(errors.Is(err, workloadtypes.ErrStatusMutationPrecondition)).To(gomega.BeTrue())
 	g.Expect(*writes).To(gomega.Equal(0))
 	for result, before := range metricBefore {
 		g.Expect(irStatusUpdateMetric(t, result)).To(gomega.Equal(before),
@@ -1177,13 +1247,13 @@ func TestAggregateAndWriteStatus_ConflictSurfacesAsConflict(t *testing.T) {
 		WithStatusSubresource(&v1beta1.InferenceReplica{}).
 		WithInterceptorFuncs(conflict).
 		Build()
-	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workload.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
+	r := &Reconciler{Client: c, APIReader: c, Log: logf.Log.WithName("test"), Expectations: workloadtypes.NewExpectations(), InstanceStatusTarget: irstatus.EncodingDenseV1}
 
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 
@@ -1243,7 +1313,7 @@ func TestAggregateStatus_BadImageSurge_EscalatesInstanceToFailed(t *testing.T) {
 	oldPod := podForIR(ir, 0, "default", 0, true /*ready*/, true /*serving*/)
 	// Surge pod at ordinal 1 — image pulled into ImagePullBackOff.
 	// CreationTimestamp set well past the grace window so
-	// PodStuckPullFailure's age check fires.
+	// PodStuckInTerminalWaiting's age check fires.
 	surgePod := podForIR(ir, 0, "default", 1, false /*ready*/, false /*serving*/)
 	surgePod.CreationTimestamp = metav1.NewTime(time.Now().Add(-5 * time.Second))
 	surgePod.Status.ContainerStatuses = []corev1.ContainerStatus{
@@ -1409,7 +1479,7 @@ func TestAggregateStatus_DeadlineExpired_EscalatesInstanceToFailed(t *testing.T)
 	g.Expect(got.Status.InstanceStatuses[0].LastFailure).NotTo(gomega.BeNil(),
 		"deadline escalation must record a LastFailure diagnostic")
 	g.Expect(got.Status.InstanceStatuses[0].LastFailure.Reason).
-		To(gomega.Equal(workload.DeadlineExceededReason))
+		To(gomega.Equal(escalation.DeadlineExceededReason))
 }
 
 // TestAggregateStatus_GatedInstance_DeadlineParked_NotEscalated pins the
@@ -1496,7 +1566,7 @@ func TestReconcileHeldDeadlines_GangSurgeSourceParked(t *testing.T) {
 			Phase:       v1beta1.OMENativeInstanceCreating,
 			Operation: &v1beta1.InstanceOperation{
 				Type:     v1beta1.InstanceOperationUpdate,
-				Step:     workload.UpdateStepGangSurgeTarget,
+				Step:     workloadtypes.UpdateStepGangSurgeTarget,
 				Deadline: future,
 			},
 		},
@@ -1841,13 +1911,13 @@ func TestEffectiveRolloutHold(t *testing.T) {
 
 	// No rollout in flight: nothing to hold, even with an exec verdict.
 	noRollout := &v1beta1.InferenceReplicaStatus{}
-	if h := effectiveRolloutHold(true, &workload.RolloutHold{Gate: workload.RolloutHoldGateBudget, Reason: "x", Target: "y"}, noRollout, now); h != nil {
+	if h := effectiveRolloutHold(true, &workloadtypes.RolloutHold{Gate: workloadtypes.RolloutHoldGateBudget, Reason: "x", Target: "y"}, noRollout, now); h != nil {
 		t.Errorf("no UpdateRevision must clear regardless of exec verdict: got %+v", h)
 	}
 
 	// Converged (CurrentRevision == UpdateRevision): nothing to hold.
 	converged := &v1beta1.InferenceReplicaStatus{CurrentRevision: "rev-a", UpdateRevision: "rev-a"}
-	if h := effectiveRolloutHold(true, &workload.RolloutHold{Gate: workload.RolloutHoldGateBudget, Reason: "x", Target: "rev-a"}, converged, now); h != nil {
+	if h := effectiveRolloutHold(true, &workloadtypes.RolloutHold{Gate: workloadtypes.RolloutHoldGateBudget, Reason: "x", Target: "rev-a"}, converged, now); h != nil {
 		t.Errorf("converged rollout must clear regardless of exec verdict: got %+v", h)
 	}
 
@@ -1861,8 +1931,8 @@ func TestEffectiveRolloutHold(t *testing.T) {
 
 	// Update pass ran and denied a fresh start -> the exec verdict wins,
 	// converted to the v1beta1 shape.
-	h := effectiveRolloutHold(true, &workload.RolloutHold{
-		Gate: workload.RolloutHoldGateSequential, Reason: "Sequential waiting on decoder", Target: "rev-b",
+	h := effectiveRolloutHold(true, &workloadtypes.RolloutHold{
+		Gate: workloadtypes.RolloutHoldGateSequential, Reason: "Sequential waiting on decoder", Target: "rev-b",
 	}, inFlight, now)
 	if h == nil || h.Gate != v1beta1.RolloutHoldGateSequential || h.Reason != "Sequential waiting on decoder" || h.Target != "rev-b" {
 		t.Errorf("an observed exec denial must be surfaced verbatim: got %+v", h)
@@ -1894,19 +1964,19 @@ func TestAggregateAndWriteStatus_RolloutHold_ChurnSafeAcrossReconciles(t *testin
 	slice0 := sliceForIRPod(ir, pod0, true)
 	r, c := newReconciler(t, ir, pod0, slice0)
 
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "rev-target"}}
 	key := client.ObjectKeyFromObject(ir)
 
-	budgetHold := func(inFlight int) *workload.RolloutHold {
-		return &workload.RolloutHold{
-			Gate:   workload.RolloutHoldGateBudget,
+	budgetHold := func(inFlight int) *workloadtypes.RolloutHold {
+		return &workloadtypes.RolloutHold{
+			Gate:   workloadtypes.RolloutHoldGateBudget,
 			Reason: fmt.Sprintf("per-Component surge budget 2 exhausted (would become %d)", inFlight),
 			Target: target.Name,
 		}
@@ -1963,11 +2033,11 @@ func TestAggregateAndWriteStatus_RolloutHold_SoakChurnSafeAcrossMultipleReconcil
 	slice0 := sliceForIRPod(ir, pod0, true)
 	r, c := newReconciler(t, ir, pod0, slice0)
 
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "rev-target"}}
@@ -1976,8 +2046,8 @@ func TestAggregateAndWriteStatus_RolloutHold_SoakChurnSafeAcrossMultipleReconcil
 	// coordination.CheckSequential's soak-denial message carries only stable
 	// facts for the whole soak window: component, configured duration, and the
 	// completed predecessor, with no elapsed/remaining countdown.
-	soakHold := &workload.RolloutHold{
-		Gate:   workload.RolloutHoldGateSequential,
+	soakHold := &workloadtypes.RolloutHold{
+		Gate:   workloadtypes.RolloutHoldGateSequential,
 		Reason: "Sequential.Soak: engine waiting out the 15s soak after decoder",
 		Target: target.Name,
 	}
@@ -2032,11 +2102,11 @@ func TestAggregateAndWriteStatus_RolloutHold_PausedRetryBlockFallbackChurnSafe(t
 	slice0 := sliceForIRPod(ir, pod0, true)
 	r, c := newReconciler(t, ir, pod0, slice0)
 
-	plan := workload.ComponentPlan{
+	plan := workloadtypes.ComponentPlan{
 		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
 		Replicas:  1,
-		Instances: []workload.InstancePlan{
-			{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}},
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
 		},
 	}
 	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "rev-target"}}
@@ -2064,4 +2134,718 @@ func TestAggregateAndWriteStatus_RolloutHold_PausedRetryBlockFallbackChurnSafe(t
 			"paused reconcile %d must not fabricate a fresh Since", i+2)
 		live = next
 	}
+}
+
+// TestAggregateStatus_PreservesMigrations pins the status aggregator
+// against silently dropping the migration authority: an IR whose status
+// carries Migrations must still carry them after a full
+// aggregateAndWriteStatus pass (which re-reads, recomputes counters and
+// conditions, and issues a Status().Update). Mirrors
+// TestAggregateStatus_PreservesRetryBlocks.
+func TestAggregateStatus_PreservesMigrations(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady},
+	}
+	entry := acceptedEntry("u-keep")
+	// Whole-second local-zone times so the fake client's serialization
+	// round-trip compares DeepEqual (same trick as retryblock's mt()).
+	entry.StartedAt = metav1.NewTime(migrationTestNow.Local())
+	entry.Deadline = metav1.NewTime(migrationTestNow.Add(migrationTestTimeout).Local())
+	ir.Status.Migrations = []v1beta1.MigrationStatus{entry}
+	pod0 := podForIR(ir, 0, "default", 0, true, true)
+	r, c := newReconciler(t, ir, pod0)
+
+	plan := workloadtypes.ComponentPlan{
+		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
+		Replicas:  1,
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+	}
+
+	g.Expect(writeStatus(r, ir, plan, nil, false, nil)).To(gomega.Succeed())
+
+	got := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, got)).To(gomega.Succeed())
+	g.Expect(got.Status.Migrations).To(gomega.Equal([]v1beta1.MigrationStatus{entry}),
+		"aggregateAndWriteStatus must never drop or rewrite persisted Migrations")
+}
+
+func TestPublicationObservationMatchesInlineV1Projection(t *testing.T) {
+	ir := baselineIR("model-engine", "default", 10)
+	ready := podForIR(ir, 0, "default", 0, true, true)
+	ready.Spec.NodeName = "node-b"
+	notReady := podForIR(ir, 1, "default", 0, false, false)
+	notReady.Spec.NodeName = "node-a"
+	gated := podForIR(ir, 2, "default", 0, false, false)
+	gated.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example-gate"}}
+	terminating := podForIR(ir, 3, "default", 0, true, true)
+	terminating.Spec.NodeName = "node-c"
+	now := metav1.Now()
+	terminating.DeletionTimestamp = &now
+	foreignOwner := podForIR(ir, 4, "default", 0, true, true)
+	foreignOwner.OwnerReferences = []metav1.OwnerReference{{UID: "different-owner", Controller: boolPointer(true)}}
+	malformed := podForIR(ir, 5, "default", 0, true, true)
+	malformed.Labels[query.LabelInstanceIdx] = "invalid"
+	liveOnly := podForIR(ir, 99, "default", 0, true, true)
+
+	gangPods := make([]*corev1.Pod, 0, 8)
+	for i := 0; i < 8; i++ {
+		pod := podForIR(ir, 7, "worker", int32(i), true, true)
+		if i%2 == 0 {
+			pod.Spec.NodeName = "node-b"
+		} else {
+			pod.Spec.NodeName = "node-a"
+		}
+		gangPods = append(gangPods, pod)
+	}
+
+	tests := []struct {
+		name      string
+		statuses  []v1beta1.OMENativeInstanceStatus
+		pods      []*corev1.Pod
+		available map[string]struct{}
+		desired   map[int32]int32
+	}{
+		{
+			name: "stale status trails a ready singleton",
+			statuses: []v1beta1.OMENativeInstanceStatus{{
+				Index: 0, Phase: v1beta1.OMENativeInstanceUpdating,
+			}},
+			pods:      []*corev1.Pod{ready},
+			available: map[string]struct{}{ready.Name: {}},
+			desired:   map[int32]int32{0: 1},
+		},
+		{
+			name:     "scale-down row falls back to observed pod count",
+			statuses: []v1beta1.OMENativeInstanceStatus{fullyPopulatedInstanceStatus(0)},
+			pods:     []*corev1.Pod{ready},
+			available: map[string]struct{}{
+				ready.Name: {},
+			},
+			desired: map[int32]int32{9: 1},
+		},
+		{
+			name: "stale status leads a non-ready singleton",
+			statuses: []v1beta1.OMENativeInstanceStatus{{
+				Index: 1, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1,
+				AvailablePodCount: 1, ScheduledPodCount: 1, Admitted: true,
+				NodesOccupied: []string{"old-node"},
+			}},
+			pods:    []*corev1.Pod{notReady},
+			desired: map[int32]int32{1: 1},
+		},
+		{
+			name:     "zero-pod create window",
+			statuses: []v1beta1.OMENativeInstanceStatus{fullyPopulatedInstanceStatus(6)},
+			desired:  map[int32]int32{6: 1},
+		},
+		{
+			name: "admission-gated pod",
+			statuses: []v1beta1.OMENativeInstanceStatus{{
+				Index: 2, Admitted: true,
+			}},
+			pods:    []*corev1.Pod{gated},
+			desired: map[int32]int32{2: 1},
+		},
+		{
+			name: "eight-pod gang with duplicate nodes",
+			statuses: []v1beta1.OMENativeInstanceStatus{
+				fullyPopulatedInstanceStatus(7),
+				fullyPopulatedInstanceStatus(7),
+			},
+			pods: gangPods,
+			available: map[string]struct{}{
+				gangPods[0].Name: {}, gangPods[1].Name: {}, gangPods[2].Name: {}, gangPods[3].Name: {},
+			},
+			desired: map[int32]int32{7: 8},
+		},
+		{
+			name: "selector membership includes terminating and foreign-owner pods",
+			statuses: []v1beta1.OMENativeInstanceStatus{
+				{Index: 3},
+				{Index: 4},
+			},
+			pods:      []*corev1.Pod{terminating, foreignOwner},
+			available: map[string]struct{}{foreignOwner.Name: {}},
+			desired:   map[int32]int32{3: 1, 4: 1},
+		},
+		{
+			name: "malformed and rowless pod indexes do not create rows",
+			statuses: []v1beta1.OMENativeInstanceStatus{
+				fullyPopulatedInstanceStatus(5),
+				fullyPopulatedInstanceStatus(8),
+			},
+			pods:    []*corev1.Pod{malformed, liveOnly},
+			desired: map[int32]int32{5: 1, 8: 1},
+		},
+		{
+			name:     "nil status remains nil",
+			statuses: nil,
+			pods:     []*corev1.Pod{liveOnly},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := cloneAPIInstanceStatuses(test.statuses)
+			byIndex := query.BucketPodsByInstanceIdx(test.pods)
+			want := legacyInlineV1Projection(test.statuses, byIndex, test.available)
+			wantCounters := legacyInlineV1ComponentCounters(want, test.desired, "rev-running")
+
+			observation, err := workload.NewOwnedPublicationObservation(
+				v1beta1convert.InstanceStatusSliceToWorkload(test.statuses),
+				workload.NewCachedSelectorPodObservation(test.pods, nil),
+				test.available, workloadstatus.AvailabilityWindow{},
+			)
+			if err != nil {
+				t.Fatalf("NewOwnedPublicationObservation: %v", err)
+			}
+			materialized, gotCounters, err := observation.TakeInlineV1Publication(test.desired, "rev-running")
+			if err != nil {
+				t.Fatalf("TakeInlineV1Publication: %v", err)
+			}
+			got := v1beta1convert.InstanceStatusSliceFromWorkload(materialized)
+
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("publication projection mismatch\n got: %#v\nwant: %#v", got, want)
+			}
+			if !reflect.DeepEqual(test.statuses, original) {
+				t.Fatalf("input status mutated\n got: %#v\nwant: %#v", test.statuses, original)
+			}
+			if gotCounters != wantCounters {
+				t.Fatalf("publication counters mismatch\n got: %+v\nwant: %+v", gotCounters, wantCounters)
+			}
+		})
+	}
+}
+
+func TestPublicationObservationMatchesInlineV1ProjectionAtScale(t *testing.T) {
+	tests := []struct {
+		name                   string
+		instances              int
+		podsPerInstance        int
+		desiredPodsPerInstance int
+		readyPodsPerInstance   int
+		assertReadyReplicas    bool
+		wantReadyReplicas      int32
+	}{
+		{name: "empty", instances: 0, podsPerInstance: 1},
+		{name: "singleton", instances: 1, podsPerInstance: 1},
+		{
+			name: "eight-pod gang with one surge pod", instances: 1, podsPerInstance: 9,
+			desiredPodsPerInstance: 8, readyPodsPerInstance: 8,
+			assertReadyReplicas: true, wantReadyReplicas: 1,
+		},
+		{name: "one hundred single-pod instances", instances: 100, podsPerInstance: 1},
+		{name: "two thousand single-pod instances", instances: 2000, podsPerInstance: 1},
+		{name: "one hundred eight-pod gangs", instances: 100, podsPerInstance: 8},
+		{name: "two thousand eight-pod gangs", instances: 2000, podsPerInstance: 8},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			desiredPods := test.desiredPodsPerInstance
+			if desiredPods == 0 {
+				desiredPods = test.podsPerInstance
+			}
+			ir := baselineIR("model-engine", "default", int32(test.instances))
+			statuses := make([]v1beta1.OMENativeInstanceStatus, test.instances)
+			pods := make([]*corev1.Pod, 0, test.instances*test.podsPerInstance+2)
+			available := make(map[string]struct{})
+			desired := make(map[int32]int32, test.instances)
+			for index := 0; index < test.instances; index++ {
+				statuses[index] = fullyPopulatedInstanceStatus(int32(index))
+				desired[int32(index)] = int32(desiredPods)
+				for ordinal := 0; ordinal < test.podsPerInstance; ordinal++ {
+					ready := (index+ordinal)%3 != 0
+					if test.readyPodsPerInstance > 0 {
+						ready = ordinal < test.readyPodsPerInstance
+					}
+					serving := ready && (index+ordinal)%2 == 0
+					runner := "default"
+					if test.podsPerInstance > 1 {
+						runner = "worker"
+					}
+					pod := podForIR(ir, int32(index), runner, int32(ordinal), ready, serving)
+					if ordinal%5 != 0 {
+						pod.Spec.NodeName = fmt.Sprintf("node-%02d", ordinal%4)
+					}
+					if (index+ordinal)%17 == 0 {
+						pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example-gate"}}
+					}
+					if ready && (index+ordinal)%4 != 0 {
+						available[pod.Name] = struct{}{}
+					}
+					pods = append(pods, pod)
+				}
+			}
+			rowless := podForIR(ir, int32(test.instances+10), "default", 0, true, true)
+			malformed := podForIR(ir, int32(test.instances+11), "default", 0, true, true)
+			malformed.Labels[query.LabelInstanceIdx] = "invalid"
+			pods = append(pods, rowless, malformed)
+
+			byIndex := query.BucketPodsByInstanceIdx(pods)
+			want := legacyInlineV1Projection(statuses, byIndex, available)
+			wantCounters := legacyInlineV1ComponentCounters(want, desired, "rev-running")
+			observation, err := workload.NewOwnedPublicationObservation(
+				v1beta1convert.InstanceStatusSliceToWorkload(statuses),
+				workload.NewCachedSelectorPodObservation(pods, nil),
+				available, workloadstatus.AvailabilityWindow{},
+			)
+			if err != nil {
+				t.Fatalf("NewOwnedPublicationObservation: %v", err)
+			}
+			materialized, gotCounters, err := observation.TakeInlineV1Publication(desired, "rev-running")
+			if err != nil {
+				t.Fatalf("TakeInlineV1Publication: %v", err)
+			}
+			got := v1beta1convert.InstanceStatusSliceFromWorkload(materialized)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%d x %d projection differed", test.instances, test.podsPerInstance)
+			}
+			if gotCounters != wantCounters {
+				t.Fatalf("%d x %d counters differed: got %+v want %+v", test.instances, test.podsPerInstance, gotCounters, wantCounters)
+			}
+			if test.assertReadyReplicas && gotCounters.ReadyReplicas != test.wantReadyReplicas {
+				t.Fatalf("ReadyReplicas = %d, want %d", gotCounters.ReadyReplicas, test.wantReadyReplicas)
+			}
+		})
+	}
+}
+
+func legacyInlineV1Projection(instances []v1beta1.OMENativeInstanceStatus, byIndex map[int32][]*corev1.Pod, available map[string]struct{}) []v1beta1.OMENativeInstanceStatus {
+	out := cloneAPIInstanceStatuses(instances)
+	for i := range out {
+		pods := byIndex[out[i].Index]
+		out[i].PodCount = int32(len(pods))
+		out[i].ReadyPodCount = workloadstatus.CountReadyPods(pods)
+		out[i].ServingPodCount = workloadstatus.CountServingPods(pods)
+		out[i].AvailablePodCount, _ = workloadstatus.CountAvailablePods(pods, available, workloadstatus.AvailabilityWindow{})
+		out[i].ScheduledPodCount = workloadstatus.CountScheduledPods(pods)
+		out[i].Admitted = legacyPodsAdmitted(pods)
+		out[i].NodesOccupied = workloadstatus.UniqueNodes(pods)
+	}
+	return out
+}
+
+func legacyInlineV1ComponentCounters(instances []v1beta1.OMENativeInstanceStatus, desiredByIdx map[int32]int32, targetRevision string) workload.ComponentCounters {
+	counters := workload.ComponentCounters{Replicas: int32(len(instances))}
+	target := query.RevisionFromName(targetRevision)
+	for _, instance := range instances {
+		desired := legacyDesiredPodCount(desiredByIdx, instance.Index, instance.PodCount)
+		if legacyInstanceMeetsThreshold(instance.PodCount, instance.ReadyPodCount, desired) {
+			counters.ReadyReplicas++
+		}
+		if legacyInstanceMeetsThreshold(instance.PodCount, instance.ServingPodCount, desired) {
+			counters.ServingReplicas++
+		}
+		if legacyInstanceMeetsThreshold(instance.PodCount, instance.AvailablePodCount, desired) {
+			counters.AvailableReplicas++
+		}
+		if targetRevision != "" && query.RevisionFromName(instance.RunningRevision).Same(target) {
+			counters.UpdatedReplicas++
+			if legacyInstanceMeetsThreshold(instance.PodCount, instance.ReadyPodCount, desired) {
+				counters.UpdatedReadyReplicas++
+			}
+		}
+	}
+	return counters
+}
+
+func legacyDesiredPodCount(desiredByIdx map[int32]int32, index, observed int32) int32 {
+	if desiredByIdx != nil {
+		if desired, ok := desiredByIdx[index]; ok {
+			return desired
+		}
+	}
+	return observed
+}
+
+func legacyInstanceMeetsThreshold(observed, satisfying, desired int32) bool {
+	if observed == 0 {
+		return false
+	}
+	if desired <= 0 {
+		return satisfying == observed
+	}
+	return satisfying >= desired
+}
+
+func cloneAPIInstanceStatuses(in []v1beta1.OMENativeInstanceStatus) []v1beta1.OMENativeInstanceStatus {
+	return v1beta1convert.InstanceStatusSliceFromWorkload(v1beta1convert.InstanceStatusSliceToWorkload(in))
+}
+
+func legacyPodsAdmitted(pods []*corev1.Pod) bool {
+	if len(pods) == 0 {
+		return false
+	}
+	for _, pod := range pods {
+		if workloadtypes.PodAdmissionGated(pod) {
+			return false
+		}
+	}
+	return true
+}
+
+func boolPointer(value bool) *bool { return &value }
+
+// TestAggregateStatus_PreservesRetryBlocks pins the status aggregator
+// against silently dropping the persisted retry authority: an IR whose
+// status carries a RetryBlock must still carry it after a full
+// aggregateAndWriteStatus pass (which re-reads, recomputes counters and
+// conditions, and issues a Status().Update). A status rebuild that
+// reconstructs Status from scratch instead of mutating the re-read
+// object would fail here.
+func TestAggregateStatus_PreservesRetryBlocks(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady},
+	}
+	block := v1beta1.RetryBlock{
+		TargetRevision:  "rev-broken",
+		State:           v1beta1.RetryBlockHeld,
+		AttemptsStarted: 3,
+		FirstFailureAt:  mt(9, 0),
+		LastFailureAt:   mt(10, 0),
+		Reason:          "ImagePullBackOff",
+	}
+	ir.Status.RetryBlocks = []v1beta1.RetryBlock{block}
+	pod0 := podForIR(ir, 0, "default", 0, true, true)
+	r, c := newReconciler(t, ir, pod0)
+
+	plan := workloadtypes.ComponentPlan{
+		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
+		Replicas:  1,
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+	}
+
+	// The first pass over a fresh IR stamps counters/conditions, so a
+	// real Status().Update lands — this is the write that would drop the
+	// block if the aggregator rebuilt status instead of mutating it.
+	g.Expect(writeStatus(r, ir, plan, nil, false, nil)).To(gomega.Succeed())
+
+	got := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, got)).To(gomega.Succeed())
+	g.Expect(got.Status.RetryBlocks).To(gomega.Equal([]v1beta1.RetryBlock{block}),
+		"aggregateAndWriteStatus must never drop or rewrite persisted RetryBlocks")
+}
+
+// TestReadyCondition_NoReplicas_ScaledToZero pins the scaled-to-zero
+// branch: Replicas == 0 with no rollout in flight must read
+// Ready=False/NoReplicas. The zero-replica check sits BEFORE the
+// ReadyReplicas == Replicas comparison in the precedence chain — without
+// that ordering, 0 == 0 would satisfy the AllInstancesReady branch and a
+// Component with zero desired Instances would read Ready=True.
+func TestReadyCondition_NoReplicas_ScaledToZero(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:        0,
+		ReadyReplicas:   0,
+		CurrentRevision: "rev-a",
+		UpdateRevision:  "rev-a",
+	}
+	cond := computeReadyCondition(status, nil, nil, nil)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse),
+		"zero desired Instances must NOT read Ready=True via the 0==0 AllInstancesReady comparison")
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonNoReplicas))
+}
+
+// TestReadyCondition_RolloutOutranksNoReplicas pins the documented
+// precedence between the rollout-in-flight branch and the zero-replica
+// branch: a Component mid-rollout with a momentary zero Replicas counter
+// reads Unknown/RolloutInProgress ("churning, check back"), not the
+// steady-state False/NoReplicas signal.
+func TestReadyCondition_RolloutOutranksNoReplicas(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:        0,
+		CurrentRevision: "rev-a",
+		UpdateRevision:  "rev-b",
+	}
+	cond := computeReadyCondition(status, nil, nil, nil)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonRolloutInProgress),
+		"an in-flight rollout outranks the zero-replica branch in the precedence chain")
+}
+
+// TestReadyCondition_FailedOutranksNoReplicas pins that the
+// InstanceFailed override is the highest-priority branch even against a
+// zero Replicas counter: a lingering Failed Instance row must surface as
+// False/InstanceFailed, not the softer False/NoReplicas.
+func TestReadyCondition_FailedOutranksNoReplicas(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:        0,
+		CurrentRevision: "rev-a",
+		UpdateRevision:  "rev-a",
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, Phase: v1beta1.OMENativeInstanceFailed},
+		},
+	}
+	cond := computeReadyCondition(status, nil, nil, nil)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonInstanceFailed),
+		"a Failed Instance is the most specific signal and must outrank NoReplicas")
+}
+
+// TestReadyCondition_ZeroPartitionIsNotStaged pins that an explicit
+// partition of zero means "full rollout", never Staged: a shape fully
+// converged onto the target revision but not yet promoted
+// (CurrentRevision != UpdateRevision) reads Unknown/RolloutInProgress.
+// Staged is reserved for a non-zero partition intentionally holding
+// Instances on the prior revision.
+func TestReadyCondition_ZeroPartitionIsNotStaged(t *testing.T) {
+	g := gomega.NewWithT(t)
+	part := int32(0)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:             2,
+		ReadyReplicas:        2,
+		UpdatedReadyReplicas: 2,
+		CurrentRevision:      "rev-a",
+		UpdateRevision:       "rev-b",
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-b"},
+			{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-b"},
+		},
+	}
+	cond := computeReadyCondition(status, nil, nil, &v1beta1.InferenceReplicaPacing{Partition: &part})
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionUnknown))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonRolloutInProgress),
+		"partition=0 is a full rollout: convergence completes via promotion, not the Staged branch")
+}
+
+// TestRolloutStalledCondition_NoRolloutEver pins the empty-UpdateRevision
+// branch: before any rollout has ever targeted a revision the condition
+// is False/Progressing with the no-rollout message, even when an
+// Instance carries a recorded failure.
+func TestRolloutStalledCondition_NoRolloutEver(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas: 1,
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, LastFailure: &v1beta1.InstanceTermination{Reason: "CrashLoopBackOff"}},
+		},
+	}
+	cond := computeRolloutStalledCondition(status)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonRolloutProgressing))
+	g.Expect(cond.Message).To(gomega.Equal("no rollout in flight"))
+}
+
+// TestRolloutStalledCondition_ObservedGenerationStamped pins that the
+// advisory condition carries ObservedGeneration off
+// status.ObservedGeneration, matching the Ready condition's contract so
+// consumers can correlate both conditions to a spec generation.
+func TestRolloutStalledCondition_ObservedGenerationStamped(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		ObservedGeneration: 9,
+		Replicas:           1,
+		CurrentRevision:    "rev-a",
+		UpdateRevision:     "rev-b",
+	}
+	cond := computeRolloutStalledCondition(status)
+	g.Expect(cond.ObservedGeneration).To(gomega.Equal(int64(9)))
+}
+
+// TestRolloutStalledCondition_MultiReasonSummarySorted pins the message
+// contract for a stall with heterogeneous failures: reasons are counted,
+// rendered as "Reason xN", and sorted by reason so the message is
+// byte-stable across reconciles (an unstable message would defeat the
+// no-op write short-circuit and churn status every pass).
+func TestRolloutStalledCondition_MultiReasonSummarySorted(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:        4,
+		CurrentRevision: "rev-a",
+		UpdateRevision:  "rev-b",
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, RunningRevision: "rev-a", LastFailure: &v1beta1.InstanceTermination{Reason: "ErrImagePull"}},
+			{Index: 1, RunningRevision: "rev-a", LastFailure: &v1beta1.InstanceTermination{Reason: "CrashLoopBackOff"}},
+			{Index: 2, RunningRevision: "rev-a", LastFailure: &v1beta1.InstanceTermination{Reason: "CrashLoopBackOff"}},
+			// Already on target: its stale failure must not count.
+			{Index: 3, RunningRevision: "rev-b", LastFailure: &v1beta1.InstanceTermination{Reason: "ErrImagePull"}},
+		},
+	}
+	cond := computeRolloutStalledCondition(status)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonInstancesFailing))
+	g.Expect(cond.Message).To(gomega.Equal(
+		"3/4 Instance(s) failing rollout to rev-b (CrashLoopBackOff x2, ErrImagePull x1)"))
+	g.Expect(computeRolloutStalledCondition(status).Message).To(gomega.Equal(cond.Message),
+		"the failure summary must be byte-stable across recomputations")
+}
+
+// TestRolloutStalledCondition_EmptyReasonFallback pins the summary
+// fallback: a terminal failure recorded without a reason string still
+// renders a meaningful message instead of an empty parenthetical.
+func TestRolloutStalledCondition_EmptyReasonFallback(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:        1,
+		CurrentRevision: "rev-a",
+		UpdateRevision:  "rev-b",
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, RunningRevision: "rev-a", LastFailure: &v1beta1.InstanceTermination{}},
+		},
+	}
+	cond := computeRolloutStalledCondition(status)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+	g.Expect(cond.Message).To(gomega.ContainSubstring("terminal failure"))
+}
+
+// TestAggregateAndWriteStatus_ObservedGenerationFollowsGeneration pins
+// the end-to-end ObservedGeneration contract through the aggregator: the
+// persisted status stamps ObservedGeneration off metadata.generation, and
+// BOTH persisted conditions (Ready + RolloutStalled) carry the same
+// value, so `kubectl wait` style consumers can tell whether a condition
+// reflects the spec they just wrote.
+func TestAggregateAndWriteStatus_ObservedGenerationFollowsGeneration(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("status-c-engine", "status-c", 1)
+	ir.Generation = 4
+	r, c := newReconciler(t, ir)
+	plan := workloadtypes.ComponentPlan{
+		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
+		Replicas:  1,
+		Instances: []workloadtypes.InstancePlan{{
+			Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
+		}},
+	}
+
+	g.Expect(writeStatus(r, ir, plan, nil, false, nil)).To(gomega.Succeed())
+
+	got := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(),
+		types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, got)).To(gomega.Succeed())
+	g.Expect(got.Status.ObservedGeneration).To(gomega.Equal(int64(4)),
+		"status.observedGeneration must track metadata.generation after aggregation")
+
+	ready := apimeta.FindStatusCondition(got.Status.Conditions, InferenceReplicaConditionReady)
+	g.Expect(ready).NotTo(gomega.BeNil())
+	g.Expect(ready.ObservedGeneration).To(gomega.Equal(int64(4)))
+	// No Instance rows and no live pods: the aggregator publishes zero
+	// counters, so the scaled-to-zero contract applies end to end.
+	g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+	g.Expect(ready.Reason).To(gomega.Equal(ReasonNoReplicas))
+
+	stalled := apimeta.FindStatusCondition(got.Status.Conditions, InferenceReplicaConditionRolloutStalled)
+	g.Expect(stalled).NotTo(gomega.BeNil())
+	g.Expect(stalled.ObservedGeneration).To(gomega.Equal(int64(4)))
+
+	g.Expect(ir.Status.ObservedGeneration).To(gomega.Equal(int64(4)),
+		"the caller's in-memory IR must mirror the committed ObservedGeneration")
+}
+
+// TestPublicationCounters_DeriveFromPodsNotPhases pins the Component
+// counter contract: Replicas/Ready/Serving/Available derive from the
+// live pod observation, never from the persisted per-Instance lifecycle
+// Phase, while Updated/UpdatedReady additionally key off the durable
+// RunningRevision row matching the target revision. A Phase that lags or
+// contradicts the pod state (Failed row with a healthy pod, Ready row
+// with an unready pod) must not skew any counter.
+func TestPublicationCounters_DeriveFromPodsNotPhases(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("status-c-engine", "status-c", 3)
+	// Phase deliberately contradicts the live pod state on every row.
+	insts := []v1beta1.OMENativeInstanceStatus{
+		// Row says Failed; pod is ready+serving+available, on target.
+		{Index: 0, Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: "rev-b"},
+		// Row says Ready; pod exists but is not ContainersReady. On target.
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-b"},
+		// Row says Ready; pod ready+serving but held on the prior revision.
+		{Index: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-a"},
+	}
+	pod0 := podForIR(ir, 0, "default", 0, true, true)
+	pod1 := podForIR(ir, 1, "default", 0, false, false)
+	pod2 := podForIR(ir, 2, "default", 0, true, true)
+
+	observation, err := workload.NewOwnedPublicationObservation(
+		v1beta1convert.InstanceStatusSliceToWorkload(insts),
+		workload.NewCachedSelectorPodObservation(nil, map[int32][]*corev1.Pod{
+			0: {pod0},
+			1: {pod1},
+			2: {pod2},
+		}),
+		map[string]struct{}{pod0.Name: {}}, workloadstatus.AvailabilityWindow{},
+	)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	desired := map[int32]int32{0: 1, 1: 1, 2: 1}
+	_, counters, err := observation.TakeInlineV1Publication(desired, "rev-b")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	g.Expect(counters.Replicas).To(gomega.Equal(int32(3)),
+		"Replicas counts every published row regardless of Phase")
+	g.Expect(counters.ReadyReplicas).To(gomega.Equal(int32(2)),
+		"ReadyReplicas follows ContainersReady pods, ignoring the Failed lifecycle row")
+	g.Expect(counters.ServingReplicas).To(gomega.Equal(int32(2)),
+		"ServingReplicas follows the serving gate on live pods")
+	g.Expect(counters.AvailableReplicas).To(gomega.Equal(int32(1)),
+		"AvailableReplicas follows EndpointSlice membership only")
+	g.Expect(counters.UpdatedReplicas).To(gomega.Equal(int32(2)),
+		"UpdatedReplicas counts rows whose RunningRevision matches the target")
+	g.Expect(counters.UpdatedReadyReplicas).To(gomega.Equal(int32(1)),
+		"UpdatedReadyReplicas requires BOTH the target revision and a Ready pod")
+}
+
+// TestDrainOverdueCondition_CountsDeletingRowsPastTheirDeadline pins the
+// advisory DrainOverdue condition: it counts the Deleting rows the
+// delete pass announced as overdue, names them, and ignores rows in any
+// other phase as well as ordinary failures.
+func TestDrainOverdueCondition_CountsDeletingRowsPastTheirDeadline(t *testing.T) {
+	g := gomega.NewWithT(t)
+	overdue := &v1beta1.InstanceTermination{Reason: workloadtypes.DrainOverdueReason, Time: metav1.Now()}
+	status := &v1beta1.InferenceReplicaStatus{
+		ObservedGeneration: 4,
+		Replicas:           4,
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, Phase: v1beta1.OMENativeInstanceDeleting, LastFailure: overdue},
+			{Index: 2, Phase: v1beta1.OMENativeInstanceDeleting, LastFailure: overdue},
+			// Draining inside its deadline: nothing announced it.
+			{Index: 3, Phase: v1beta1.OMENativeInstanceDeleting},
+			// A real failure on a row that is not leaving.
+			{Index: 4, Phase: v1beta1.OMENativeInstanceFailed,
+				LastFailure: &v1beta1.InstanceTermination{Reason: "CrashLoopBackOff"}},
+		},
+	}
+	cond := computeDrainOverdueCondition(status)
+	g.Expect(cond.Type).To(gomega.Equal(InferenceReplicaConditionDrainOverdue))
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonDrainsOverdue))
+	g.Expect(cond.ObservedGeneration).To(gomega.Equal(int64(4)))
+	g.Expect(cond.Message).To(gomega.Equal("2 Instance(s) draining past their deadline (0, 2)"))
+	g.Expect(computeDrainOverdueCondition(status).Message).To(gomega.Equal(cond.Message),
+		"the overdue summary must be byte-stable across recomputations")
+}
+
+// TestDrainOverdueCondition_ClearsWhenNoRowIsOverdue pins the clearing
+// half: with the announced rows gone the condition reads False, and an
+// announcement never makes a rollout look stalled — it records a row on
+// its way out, not a failure to reach the target revision.
+func TestDrainOverdueCondition_ClearsWhenNoRowIsOverdue(t *testing.T) {
+	g := gomega.NewWithT(t)
+	status := &v1beta1.InferenceReplicaStatus{
+		Replicas:        2,
+		CurrentRevision: "rev-a",
+		UpdateRevision:  "rev-b",
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-b"},
+			{Index: 1, Phase: v1beta1.OMENativeInstanceDeleting, RunningRevision: "rev-a",
+				LastFailure: &v1beta1.InstanceTermination{Reason: workloadtypes.DrainOverdueReason}},
+		},
+	}
+	g.Expect(computeRolloutStalledCondition(status).Status).To(gomega.Equal(metav1.ConditionFalse),
+		"an overdue drain is not a rollout failure")
+
+	status.InstanceStatuses = status.InstanceStatuses[:1]
+	cond := computeDrainOverdueCondition(status)
+	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
+	g.Expect(cond.Reason).To(gomega.Equal(ReasonDrainsWithinDeadline))
 }

@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -19,6 +18,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -158,6 +158,17 @@ func DeleteBatch(
 			result.RequeueAfter = remaining
 		}
 	}
+	// Visibility for the rows this wave is still waiting on. Runs after
+	// the drive so it reports the wave's own effects, and it changes
+	// nothing the completion below reads: the record it writes is not
+	// part of the delete identity the completion guard tests.
+	if err := announceOverdueDrains(ctx, deps, input, plan, podsByInstance); err != nil {
+		if errors.Is(err, workload.ErrStatusMutationPrecondition) || errors.Is(err, workload.ErrStatusOwnerGone) {
+			result.ImmediateRequeue = true
+			return result, nil
+		}
+		return DeleteBatchResult{}, err
+	}
 	if len(completed) == 0 {
 		return result, nil
 	}
@@ -190,10 +201,10 @@ func selectDeleteBatch(
 	owned := make([]deleteBatchCandidate, 0)
 	fresh := make([]deleteBatchCandidate, 0, len(extras))
 	for _, original := range statuses {
-		status := cloneDeleteInstanceStatus(original)
+		row := status.CloneDeleteInstanceStatus(original)
 		candidate := deleteBatchCandidate{
-			status: status,
-			pods:   append([]*corev1.Pod(nil), podsByInstance[status.Index]...),
+			status: row,
+			pods:   append([]*corev1.Pod(nil), podsByInstance[row.Index]...),
 		}
 		sort.SliceStable(candidate.pods, func(i, j int) bool {
 			left, right := candidate.pods[i], candidate.pods[j]
@@ -209,11 +220,11 @@ func selectDeleteBatch(
 		if candidate.cost == 0 {
 			candidate.cost = 1
 		}
-		if deleteOwned(status) {
+		if deleteOwned(row) {
 			owned = append(owned, candidate)
 			continue
 		}
-		if _, ok := extraSet[status.Index]; ok {
+		if _, ok := extraSet[row.Index]; ok {
 			fresh = append(fresh, candidate)
 		}
 	}
@@ -253,38 +264,16 @@ func selectDeleteBatch(
 }
 
 func admitDeleteBatch(ctx context.Context, input workload.ReconcileInput, plan workload.ComponentPlan, candidates []deleteBatchCandidate) (bool, error) {
-	mutations := make([]workload.InstanceMutation, 0, len(candidates))
-	expected := make(map[int32]workload.InstanceStatus, len(candidates))
+	return status.StampDeletingBatch(ctx, input, plan.InstanceReadyTimeout, candidateStatuses(candidates))
+}
+
+// candidateStatuses is the rows of a wave, in selection order.
+func candidateStatuses(candidates []deleteBatchCandidate) []workload.InstanceStatus {
+	rows := make([]workload.InstanceStatus, 0, len(candidates))
 	for _, candidate := range candidates {
-		expected[candidate.status.Index] = cloneDeleteInstanceStatus(candidate.status)
-		now := metav1.NewTime(input.Now())
-		operation := workload.InstanceOperation{
-			ID:             fmt.Sprintf("delete-%d-%d", candidate.status.Index, now.Unix()),
-			Type:           workload.InstanceOperationDelete,
-			Step:           "Drain",
-			StartedAt:      now,
-			LastProgressAt: now,
-			Deadline:       metav1.NewTime(now.Add(plan.InstanceReadyTimeout)),
-		}
-		index := candidate.status.Index
-		incarnation := candidate.status.Incarnation
-		mutation := workload.InstanceMutation{
-			Index: index,
-			Mutate: func(status *workload.InstanceStatus) bool {
-				status.Phase = workload.InstancePhaseDeleting
-				status.Operation = cloneDeleteOperation(&operation)
-				return true
-			},
-			Postcondition: func(status *workload.InstanceStatus) bool {
-				return status != nil && status.Index == index && status.Incarnation == incarnation &&
-					status.Phase == workload.InstancePhaseDeleting && status.Operation != nil &&
-					status.Operation.ID == operation.ID && status.Operation.Type == operation.Type && status.Operation.Step == operation.Step
-			},
-		}
-		mutations = append(mutations, mutation)
+		rows = append(rows, candidate.status)
 	}
-	mutations[0].BatchPrecondition = deleteAdmissionGuard(input, expected, input.ObservedState.InstanceStatuses)
-	return applyDeleteMutationBatch(ctx, input, mutations)
+	return rows
 }
 
 func preflightDeleteOwnedBatch(ctx context.Context, input workload.ReconcileInput, candidates []deleteBatchCandidate) (map[int32]struct{}, error) {
@@ -317,7 +306,7 @@ func preflightDeleteOwnedBatch(ctx context.Context, input workload.ReconcileInpu
 				continue
 			}
 			if current.Incarnation != candidate.status.Incarnation || current.Phase != workload.InstancePhaseDeleting ||
-				!sameDeleteOperation(current.Operation, candidate.status.Operation) {
+				!status.SameDeleteOperation(current.Operation, candidate.status.Operation) {
 				return false
 			}
 		}
@@ -444,127 +433,165 @@ func earlierTime(current, candidate time.Time) time.Time {
 }
 
 func completeDeleteBatch(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, candidates []deleteBatchCandidate) (bool, error) {
-	expected := make(map[int32]workload.InstanceStatus, len(candidates))
-	mutations := make([]workload.InstanceMutation, 0, len(candidates))
-	for _, candidate := range candidates {
-		expected[candidate.status.Index] = cloneDeleteInstanceStatus(candidate.status)
-		index := candidate.status.Index
-		mutations = append(mutations, workload.InstanceMutation{
-			Index:  index,
-			Remove: true,
-			OnCommit: func(previous, _ *workload.InstanceStatus) {
-				deps.ExpectationsCache().Forget(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, index)
-				if previous != nil && previous.Operation != nil && !previous.Operation.StartedAt.IsZero() {
-					seconds := input.Now().Sub(previous.Operation.StartedAt.Time).Seconds()
-					if seconds >= 0 {
-						obsmetrics.RecordScaleDownInstanceDuration(string(input.Key.Component), seconds)
-					}
-				}
-			},
-		})
-	}
-	mutations[0].BatchPrecondition = deleteCompletionGuard(input, expected)
-	return applyDeleteMutationBatch(ctx, input, mutations)
-}
-
-func applyDeleteMutationBatch(ctx context.Context, input workload.ReconcileInput, mutations []workload.InstanceMutation) (bool, error) {
-	if len(mutations) == 0 {
-		return false, nil
-	}
-	if input.ApplyInstanceMutationsWithRetryBlock == nil {
-		return false, fmt.Errorf("DeleteBatch: owner-aware atomic status adapter is required")
-	}
-	committed := 0
-	for i := range mutations {
-		callback := mutations[i].OnCommit
-		mutations[i].OnCommit = func(previous, current *workload.InstanceStatus) {
-			committed++
-			if callback != nil {
-				callback(previous, current)
-			}
-		}
-	}
-	if err := input.ApplyInstanceMutationsWithRetryBlock(ctx, mutations, "", nil); err != nil {
-		return false, err
-	}
-	if committed != len(mutations) {
-		return false, fmt.Errorf("DeleteBatch: status adapter confirmed %d of %d mutations", committed, len(mutations))
-	}
-	return true, nil
-}
-
-func deleteAdmissionGuard(input workload.ReconcileInput, expected map[int32]workload.InstanceStatus, planned []workload.InstanceStatus) func(workload.InstanceMutationSnapshot) bool {
-	uid := input.OwnerObject.GetUID()
-	generation := input.OwnerObject.GetGeneration()
-	plannedIdentities := make(map[int32]workload.InstanceStatus, len(planned))
-	for _, status := range planned {
-		plannedIdentities[status.Index] = cloneDeleteInstanceStatus(status)
-	}
-	return func(snapshot workload.InstanceMutationSnapshot) bool {
-		if snapshot.OwnerUID != uid || snapshot.OwnerGeneration != generation {
-			return false
-		}
-		if len(snapshot.Instances) != len(plannedIdentities) {
-			return false
-		}
-		for index, plannedStatus := range plannedIdentities {
-			current, found := snapshot.Instances[index]
-			if !found || !sameDeleteCandidate(current, plannedStatus) {
-				return false
-			}
-		}
-		for index, planned := range expected {
-			current, found := snapshot.Instances[index]
-			if !found || !sameDeleteCandidate(current, planned) {
-				return false
-			}
-		}
-		return true
-	}
-}
-
-func deleteCompletionGuard(input workload.ReconcileInput, expected map[int32]workload.InstanceStatus) func(workload.InstanceMutationSnapshot) bool {
-	uid := input.OwnerObject.GetUID()
-	return func(snapshot workload.InstanceMutationSnapshot) bool {
-		if snapshot.OwnerUID != uid {
-			return false
-		}
-		for index, planned := range expected {
-			current, found := snapshot.Instances[index]
-			if !found || current.Incarnation != planned.Incarnation || current.Phase != workload.InstancePhaseDeleting ||
-				!sameDeleteOperation(current.Operation, planned.Operation) {
-				return false
-			}
-		}
-		return true
-	}
+	return status.RemoveDeletedBatch(ctx, deps, input, candidateStatuses(candidates))
 }
 
 func deleteOwned(status workload.InstanceStatus) bool {
-	return status.Phase == workload.InstancePhaseDeleting && status.Operation != nil && status.Operation.Type == workload.InstanceOperationDelete
+	return workload.Owner(&status) == workload.OwnerDelete
 }
 
-func sameDeleteCandidate(current, planned workload.InstanceStatus) bool {
-	return current.Index == planned.Index && current.Incarnation == planned.Incarnation && current.Phase == planned.Phase &&
-		reflect.DeepEqual(current.Operation, planned.Operation)
-}
+// What an elapsed drain deadline does.
+//
+// A Delete operation carries the same deadline every other operation
+// does, but a drain has no backstop to hand it to: the phase must not
+// move (the row is on its way out), the delete wave keeps the index,
+// and force-deleting a wedged pod is gated on the configured policy
+// plus node evidence. What is missing without this pass is the operator
+// ever being told. So the deadline is consumed for visibility: one
+// Warning naming the Instance, its pods and how far past the deadline
+// the drain is, plus a record on the row that readers of the status can
+// aggregate. Announced once per episode, keyed by the deadline itself.
 
-func sameDeleteOperation(current, planned *workload.InstanceOperation) bool {
-	return current != nil && planned != nil && current.Type == workload.InstanceOperationDelete && planned.Type == workload.InstanceOperationDelete &&
-		current.ID == planned.ID
-}
-
-func cloneDeleteInstanceStatus(status workload.InstanceStatus) workload.InstanceStatus {
-	copy := status
-	copy.Operation = cloneDeleteOperation(status.Operation)
-	return copy
-}
-
-func cloneDeleteOperation(operation *workload.InstanceOperation) *workload.InstanceOperation {
-	if operation == nil {
+// announceOverdueDrains records and reports every delete-owned row
+// whose drain is past its operation deadline. The record lands first
+// and the event fires from the commit callback, so an announcement
+// survives exactly as long as the write that earned it: a failed write
+// emits nothing and the next pass re-announces.
+//
+// Every owned row, not only the wave this pass drives. A row deferred
+// behind the pod budget is the one an operator is least likely to
+// notice and most likely to be waiting on, and reporting it costs
+// nothing: the announcement reads the observation the wave was selected
+// from and takes no external effect.
+func announceOverdueDrains(
+	ctx context.Context,
+	deps workload.Deps,
+	input workload.ReconcileInput,
+	plan workload.ComponentPlan,
+	podsByInstance map[int32][]*corev1.Pod,
+) error {
+	now := input.Now()
+	statuses := input.ObservedState.InstanceStatuses
+	mutations := make([]workload.InstanceMutation, 0, len(statuses))
+	for _, row := range statuses {
+		pods := sortedInstancePods(podsByInstance[row.Index])
+		overdue, ok := overdueDrain(row, pods, now)
+		if !ok {
+			continue
+		}
+		deadline := row.Operation.Deadline
+		index := row.Index
+		detail := overdueDrainPodDetail(pods)
+		record := &workload.InstanceTermination{
+			PodName: overdueDrainPodName(pods),
+			Reason:  workload.DrainOverdueReason,
+			Message: detail,
+			Time:    deadline,
+		}
+		mutations = append(mutations, workload.InstanceMutation{
+			Index:  index,
+			Mutate: status.AnnounceDrainOverdue(deadline, record),
+			OnCommit: func(*workload.InstanceStatus, *workload.InstanceStatus) {
+				workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonDrainOverdue,
+					"OMENative %s: drain overdue by %s (deadline %s); %s",
+					workload.InstanceKey(plan.Component, index), overdue.Round(time.Second),
+					deadline.UTC().Format(time.RFC3339), detail)
+			},
+		})
+	}
+	if len(mutations) == 0 {
 		return nil
 	}
-	copy := *operation
-	copy.HintTargetNodes = append([]string(nil), operation.HintTargetNodes...)
-	return &copy
+	if input.ApplyInstanceMutationsWithRetryBlock == nil {
+		return fmt.Errorf("DeleteBatch: owner-aware atomic status adapter is required")
+	}
+	if err := input.ApplyInstanceMutationsWithRetryBlock(ctx, mutations, "", nil); err != nil {
+		return fmt.Errorf("DeleteBatch: announce overdue drain: %w", err)
+	}
+	return nil
+}
+
+// sortedInstancePods copies a row's pod bucket into namespace/name
+// order, so the names an announcement reports are stable across passes
+// whatever order the observation arrived in. The authoritative bucket
+// is left untouched.
+func sortedInstancePods(pods []*corev1.Pod) []*corev1.Pod {
+	out := append([]*corev1.Pod(nil), pods...)
+	sort.SliceStable(out, func(i, j int) bool {
+		left, right := out[i], out[j]
+		if left == nil || right == nil {
+			return left == nil && right != nil
+		}
+		if left.Namespace != right.Namespace {
+			return left.Namespace < right.Namespace
+		}
+		return left.Name < right.Name
+	})
+	return out
+}
+
+// overdueDrain reports how far past its deadline a Delete-owned row's
+// drain is, and whether it is overdue at all. A row with no pods left
+// has nothing to wait on — it is completing this pass — and a zero
+// deadline means the operation was never given one.
+func overdueDrain(s workload.InstanceStatus, pods []*corev1.Pod, now time.Time) (time.Duration, bool) {
+	if !deleteOwned(s) || len(pods) == 0 {
+		return 0, false
+	}
+	deadline := s.Operation.Deadline
+	if deadline.IsZero() || !now.After(deadline.Time) {
+		return 0, false
+	}
+	if status.Announced(s, workload.EventReasonDrainOverdue) {
+		return 0, false
+	}
+	return now.Sub(deadline.Time), true
+}
+
+// overdueDrainPodDetail names what the drain is still waiting on, as
+// the pass observed it. Pods already on their way out are the common
+// wedge and are reported as such; pods the wave has not asked to
+// terminate are still in rotation, so an operator can tell a stuck
+// kubelet from a stuck drain gate.
+func overdueDrainPodDetail(pods []*corev1.Pod) string {
+	terminating := make([]string, 0, len(pods))
+	pending := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		if pod == nil {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			terminating = append(terminating, pod.Name)
+			continue
+		}
+		pending = append(pending, pod.Name)
+	}
+	parts := make([]string, 0, 2)
+	if len(terminating) > 0 {
+		parts = append(parts, fmt.Sprintf("%d pod(s) still Terminating (%s)", len(terminating), strings.Join(terminating, ", ")))
+	}
+	if len(pending) > 0 {
+		parts = append(parts, fmt.Sprintf("%d pod(s) still draining (%s)", len(pending), strings.Join(pending, ", ")))
+	}
+	if len(parts) == 0 {
+		return "no pods observed"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// overdueDrainPodName picks the record's representative pod: the first
+// pod still Terminating, else the first pod of the row. The slice is
+// already sorted by namespace and name, so the choice is stable.
+func overdueDrainPodName(pods []*corev1.Pod) string {
+	for _, pod := range pods {
+		if pod != nil && pod.DeletionTimestamp != nil {
+			return pod.Name
+		}
+	}
+	for _, pod := range pods {
+		if pod != nil {
+			return pod.Name
+		}
+	}
+	return ""
 }

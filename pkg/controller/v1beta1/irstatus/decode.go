@@ -328,6 +328,9 @@ func (p *decodePlan) expand(columns *v1beta1.InstanceStatusColumns) []v1beta1.OM
 		row.ReadySince = entry.ReadySince.DeepCopy()
 		row.Operation = entry.Operation.DeepCopy()
 		row.LastFailure = entry.LastFailure.DeepCopy()
+		if len(entry.Announced) > 0 {
+			row.Announced = append([]string(nil), entry.Announced...)
+		}
 	}
 	return rows
 }

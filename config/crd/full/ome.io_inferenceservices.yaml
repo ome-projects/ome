@@ -29,6 +29,10 @@ spec:
         - jsonPath: .spec.runtime.name
           name: Runtime
           type: string
+        - jsonPath: .status.placement.phase
+          name: Placement
+          priority: 1
+          type: string
         - jsonPath: .status.rollout.activeRun.plan.groups[0].source
           name: Plan-Source
           priority: 1
@@ -31383,6 +31387,145 @@ spec:
                         - name
                       x-kubernetes-list-type: map
                   type: object
+                routing:
+                  properties:
+                    capacity:
+                      properties:
+                        disabled:
+                          type: boolean
+                        format:
+                          minLength: 1
+                          type: string
+                        maxAge:
+                          type: string
+                        method:
+                          enum:
+                            - GET
+                            - HEAD
+                            - POST
+                          type: string
+                        options:
+                          additionalProperties:
+                            type: string
+                          type: object
+                        path:
+                          minLength: 1
+                          pattern: ^/
+                          type: string
+                        period:
+                          type: string
+                        quorum:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        samples:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        timeout:
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                        - message: disabled must not be combined with capacity configuration fields
+                          rule: '!(has(self.disabled) && self.disabled) || (!has(self.path) && !has(self.method) && !has(self.format) && !has(self.options) && !has(self.period) && !has(self.timeout) && !has(self.samples) && !has(self.quorum) && !has(self.maxAge))'
+                        - message: an enabled capacity poll must specify path, method, format, period, timeout, samples, quorum, and maxAge
+                          rule: (has(self.disabled) && self.disabled) || (has(self.path) && has(self.method) && has(self.format) && has(self.period) && has(self.timeout) && has(self.samples) && has(self.quorum) && has(self.maxAge))
+                        - message: period must be positive
+                          rule: '!has(self.period) || duration(self.period) > duration(''0s'')'
+                        - message: timeout must be positive
+                          rule: '!has(self.timeout) || duration(self.timeout) > duration(''0s'')'
+                        - message: timeout must be shorter than period
+                          rule: '!has(self.period) || !has(self.timeout) || duration(self.timeout) < duration(self.period)'
+                        - message: maxAge must be at least period
+                          rule: '!has(self.period) || !has(self.maxAge) || duration(self.maxAge) >= duration(self.period)'
+                        - message: quorum must not exceed samples
+                          rule: '!has(self.samples) || !has(self.quorum) || self.quorum <= self.samples'
+                    capacityFactors:
+                      additionalProperties:
+                        anyOf:
+                          - type: integer
+                          - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      type: object
+                    enabled:
+                      type: boolean
+                    probe:
+                      properties:
+                        acceptStatuses:
+                          items:
+                            format: int32
+                            maximum: 599
+                            minimum: 100
+                            type: integer
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
+                        allFailedPolicy:
+                          enum:
+                            - PreserveTraffic
+                            - Drain
+                          type: string
+                        disabled:
+                          type: boolean
+                        failureThreshold:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        gateStatuses:
+                          items:
+                            format: int32
+                            maximum: 599
+                            minimum: 100
+                            type: integer
+                          maxItems: 500
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
+                        method:
+                          enum:
+                            - GET
+                            - HEAD
+                            - POST
+                          type: string
+                        path:
+                          minLength: 1
+                          pattern: ^/
+                          type: string
+                        period:
+                          type: string
+                        successThreshold:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        timeout:
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                        - message: disabled must not be combined with probe configuration fields
+                          rule: '!(has(self.disabled) && self.disabled) || (!has(self.path) && !has(self.method) && !has(self.acceptStatuses) && !has(self.gateStatuses) && !has(self.period) && !has(self.timeout) && !has(self.failureThreshold) && !has(self.successThreshold) && !has(self.allFailedPolicy))'
+                        - message: an enabled probe must specify path, method, acceptStatuses, gateStatuses, period, timeout, failureThreshold, successThreshold, and allFailedPolicy
+                          rule: (has(self.disabled) && self.disabled) || (has(self.path) && has(self.method) && has(self.acceptStatuses) && has(self.gateStatuses) && has(self.period) && has(self.timeout) && has(self.failureThreshold) && has(self.successThreshold) && has(self.allFailedPolicy))
+                        - message: period must be positive
+                          rule: '!has(self.period) || duration(self.period) > duration(''0s'')'
+                        - message: timeout must be positive
+                          rule: '!has(self.timeout) || duration(self.timeout) > duration(''0s'')'
+                        - message: timeout must be shorter than period
+                          rule: '!has(self.period) || !has(self.timeout) || duration(self.timeout) < duration(self.period)'
+                        - message: gateStatuses must not contain 401, 403, or 429
+                          rule: '!has(self.gateStatuses) || !self.gateStatuses.exists(s, s == 401 || s == 403 || s == 429)'
+                    publisher:
+                      properties:
+                        options:
+                          additionalProperties:
+                            type: string
+                          maxProperties: 32
+                          type: object
+                          x-kubernetes-validations:
+                            - message: publisher option keys must contain 1-128 characters and values must contain 1-4096 characters
+                              rule: self.all(k, size(k) > 0 && size(k) <= 128 && size(self[k]) > 0 && size(self[k]) <= 4096)
+                      type: object
+                  type: object
                 runtime:
                   properties:
                     apiGroup:
@@ -31498,6 +31641,9 @@ spec:
                       type: object
                   type: object
               type: object
+              x-kubernetes-validations:
+                - message: spec.routing.capacityFactors and deprecated spec.placement.capacityFactors must not both be set
+                  rule: '!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement) && has(self.placement.capacityFactors))'
             status:
               properties:
                 address:
@@ -32165,6 +32311,7 @@ spec:
                             type: string
                           phase:
                             enum:
+                              - Admitting
                               - Placed
                               - Admitted
                             type: string
@@ -32220,6 +32367,7 @@ spec:
                     phase:
                       enum:
                         - Pending
+                        - Admitting
                         - Racing
                         - Placed
                         - Failed

@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // Re-exported workload value types. Type aliases (`type A = B`) so
@@ -25,19 +25,19 @@ import (
 // onto a `core.ComponentPlan` are holding the exact same memory as
 // `workload.ComponentPlan`.
 type (
-	ComponentPlan    = workload.ComponentPlan
-	InstancePlan     = workload.InstancePlan
-	RunnerPlan       = workload.RunnerPlan
-	MigrationOverlay = workload.MigrationOverlay
-	Expectations     = workload.Expectations
+	ComponentPlan    = workloadtypes.ComponentPlan
+	InstancePlan     = workloadtypes.InstancePlan
+	RunnerPlan       = workloadtypes.RunnerPlan
+	MigrationOverlay = workloadtypes.MigrationOverlay
+	Expectations     = workloadtypes.Expectations
 )
 
 // Re-exported constructors. `var` rather than `func` re-exports so
 // callers that took a value pointer (e.g., `f := core.NewExpectations`)
 // keep the same observable identity.
 var (
-	NewExpectations     = workload.NewExpectations
-	DefaultExpectations = workload.DefaultExpectations
+	NewExpectations     = workloadtypes.NewExpectations
+	DefaultExpectations = workloadtypes.DefaultExpectations
 )
 
 // ReconcileParams is the input bag consumed by the ISVC-side
@@ -61,8 +61,8 @@ type ReconcileParams struct {
 	// reconciled.
 	Component v1beta1.ComponentType
 
-	// ComponentExt is the merged ComponentExtensionSpec, including the
-	// `omenative` sub-block populated by the mutating webhook defaulter.
+	// ComponentExt is the merged ComponentExtensionSpec, with the values the
+	// reconciler fills after the runtime merge already applied.
 	ComponentExt *v1beta1.ComponentExtensionSpec
 
 	// WorkerSize is Worker.Size for multi-pod Instances. Zero when the

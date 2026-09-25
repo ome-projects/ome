@@ -1704,14 +1704,14 @@
       }
     },
     "v1beta1.CandidatePlacement": {
-      "description": "CandidatePlacement is the per-cluster state of a fan-out candidate in the placement race.",
+      "description": "CandidatePlacement is the per-cluster state of a fan-out candidate.",
       "type": "object",
       "required": [
         "cluster"
       ],
       "properties": {
         "admittedReplicas": {
-          "description": "AdmittedReplicas is how many replicas this home's Kueue has admitted (only meaningful in Split, where a home serves a fraction of the desired count). It drives global accounting — the control plane sums it across homes to decide whether the desired count is met. Zero/unset outside Split.",
+          "description": "AdmittedReplicas is how many replicas this home's Kueue has admitted. In Split it also drives global accounting: the control plane sums it across homes to decide whether the desired count is met.",
           "type": "integer",
           "format": "int32"
         },
@@ -1733,7 +1733,7 @@
           "type": "string"
         },
         "readyReplicas": {
-          "description": "ReadyReplicas is how many of this home's replicas are serving traffic. In Split it is the weight an external LB uses to split traffic across homes (traffic follows where the replicas actually landed). Zero/unset outside Split.",
+          "description": "ReadyReplicas is how many of this home's replicas are serving traffic. It is the live count basis and health gate for routing across homes.",
           "type": "integer",
           "format": "int32"
         },
@@ -2056,7 +2056,7 @@
           }
         },
         "lifecycle": {
-          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
+          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
           "$ref": "#/definitions/v1beta1.LifecycleSpec"
         },
         "maxReplicas": {
@@ -2397,7 +2397,7 @@
           "$ref": "#/definitions/v1beta1.LeaderSpec"
         },
         "lifecycle": {
-          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
+          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
           "$ref": "#/definitions/v1beta1.LifecycleSpec"
         },
         "maxReplicas": {
@@ -2876,7 +2876,7 @@
           "$ref": "#/definitions/v1beta1.LeaderSpec"
         },
         "lifecycle": {
-          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
+          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
           "$ref": "#/definitions/v1beta1.LifecycleSpec"
         },
         "maxReplicas": {
@@ -3351,16 +3351,16 @@
       }
     },
     "v1beta1.InPlaceUpdateStrategy": {
-      "description": "InPlaceUpdateStrategy tunes per-pod lifecycle drain timing.",
+      "description": "InPlaceUpdateStrategy tunes the per-pod in-place update sequence.",
       "type": "object",
       "properties": {
         "gracePeriodSeconds": {
-          "description": "GracePeriodSeconds is the time OMENative waits between marking the pod not-ready and applying an in-place mutation. SurgeThenDrain also waits this long after EndpointSlice removal before deleting the old pod, allowing persistent load-balancer connections to drain while its workers remain available.",
+          "description": "GracePeriodSeconds is accepted so manifests that set it keep validating and has no effect on the roll: a drained pod is deleted as soon as it leaves rotation, and its own terminationGracePeriodSeconds and preStop hooks cover the in-flight work it still owes.",
           "type": "integer",
           "format": "int32"
         },
         "markNotReadyDuringLifecycle": {
-          "description": "MarkNotReadyDuringLifecycle, when true, flips ome.io/serving=False on the pod before the in-place mutation so EndpointSlice drains traffic first. Defaults to true.",
+          "description": "MarkNotReadyDuringLifecycle, when true, flips ome.io/serving=False on the pod before the in-place mutation so EndpointSlice drains traffic first. Unset inherits the ServingRuntime's value, then true.",
           "type": "boolean"
         }
       }
@@ -3768,6 +3768,10 @@
           "description": "Router defines the router spec",
           "$ref": "#/definitions/v1beta1.RouterSpec"
         },
+        "routing": {
+          "description": "Routing configures cross-cluster traffic distribution for this InferenceService. Unset fields inherit the operator-level routing configuration. Only consulted on the control-plane cluster; ignored in single-cluster deployments. Alpha; the API may change without notice.",
+          "$ref": "#/definitions/v1beta1.RoutingSpec"
+        },
         "runtime": {
           "description": "Runtime defines the serving runtime environment that will be used to execute the model. It is an inference service spec template that determines how the service should be deployed. Runtime is optional - if not defined, the operator will automatically select the best runtime based on the model's size, architecture, format, quantization, and framework.",
           "$ref": "#/definitions/v1beta1.ServingRuntimeRef"
@@ -3901,6 +3905,10 @@
         "lastProgressAt"
       ],
       "properties": {
+        "capacityRefusedAt": {
+          "description": "CapacityRefusedAt is when admission last refused one of the operation's pod creates for lack of quota. The refusal is an apiserver answer to a call the create pass made, so it cannot be read off the cluster on a later pass: it is recorded here, and the hold pass converts it into the Waiting token and the deadline park on every pass it stands. Cleared by a create that completes with no refusal. Empty means the last create was not refused for capacity.",
+          "$ref": "#/definitions/v1.Time"
+        },
         "deadline": {
           "description": "Deadline is the hard timeout for the current Step. Zero (null) means the step clock is parked (e.g. while the instance's pods are admission-gated); optional + nullable so the parked null is accepted by the apiserver.",
           "$ref": "#/definitions/v1.Time"
@@ -3948,6 +3956,10 @@
           "description": "Step is the fine-grained resume point within the operation (e.g., Drain, DeletePods, WaitZero, Recreate, WaitReady).",
           "type": "string",
           "default": ""
+        },
+        "strategy": {
+          "description": "Strategy is the update strategy the operation runs under, pinned when the operation opens. UpdateStrategy is not part of the revision payload, so editing it retargets nothing: an attempt keeps the mechanism it started with — a patch already under way is not re-dispatched as a recreate, a surge already spent is not unwound — and the edit reaches the Instance at its next admitted attempt. Set only when Type=Update.",
+          "type": "string"
         },
         "surgeIndex": {
           "description": "SurgeIndex is the Instance index allocated for a surge replacement. Set only when Type=Migrate.",
@@ -4102,6 +4114,15 @@
         "index"
       ],
       "properties": {
+        "announced": {
+          "description": "Announced is the Instance's record of once-only messages already delivered.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "set"
+        },
         "conditions": {
           "description": "Conditions is the Instance's conditions.",
           "type": "array",
@@ -4685,16 +4706,16 @@
           "$ref": "#/definitions/v1beta1.MigrationPolicy"
         },
         "minReadySeconds": {
-          "description": "MinReadySeconds is the minimum time a newly Ready pod must stay Ready before OMENative treats it as Available. A pod is Available when its PodReady condition is True and that condition's lastTransitionTime plus MinReadySeconds is not after the current time, evaluated per pod (the Deployment.spec.minReadySeconds rule). Ready remains the health signal; Available is the pacing signal: a rollout drains or promotes an Instance only once its new pods are Available, so the maxSurge / maxUnavailable budgets stay held for the whole window, and availableReplicas / availablePodCount count only Available pods. Unset or 0 means Available as soon as Ready. A value authored on the InferenceService always wins. Clusters may supply an admission-time default through the inferenceservice-config ConfigMap; it is stamped onto the InferenceService, so it also takes precedence over a value authored in the ServingRuntime's engineConfig / decoderConfig / routerConfig lifecycle (the InferenceService overrides the runtime when the two merge), as terminationGracePeriodSeconds does.",
+          "description": "MinReadySeconds is the minimum time a newly Ready pod must stay Ready before OMENative treats it as Available. A pod is Available when its PodReady condition is True and that condition's lastTransitionTime plus MinReadySeconds is not after the current time, evaluated per pod (the Deployment.spec.minReadySeconds rule). Ready remains the health signal; Available is the pacing signal: a rollout drains or promotes an Instance only once its new pods are Available, so the maxSurge / maxUnavailable budgets stay held for the whole window, and availableReplicas / availablePodCount count only Available pods. Unset or 0 means Available as soon as Ready. A value authored on the InferenceService wins; an unset value inherits the ServingRuntime's; when neither sets it, the cluster default from the inferenceservice-config ConfigMap applies.",
           "type": "integer",
           "format": "int32"
         },
         "readyPolicy": {
-          "description": "ReadyPolicy controls how Instance-level readiness is aggregated from the underlying pods. None is accepted only for single-pod Instances, where it is equivalent to AllPodReady; admission rejects None on multi-pod OMENative Components because per-pod readiness reporting is not supported.",
+          "description": "ReadyPolicy controls how Instance-level readiness is aggregated from the underlying pods. None is accepted only for single-pod Instances, where it is equivalent to AllPodReady; admission rejects None on multi-pod OMENative Components because per-pod readiness reporting is not supported. Unset inherits the ServingRuntime's value; when neither sets it, multi-pod Instances use AllPodReady and single-pod Instances use None.",
           "type": "string"
         },
         "restartPolicy": {
-          "description": "RestartPolicy controls what OMENative does when a managed pod fails. Distinct from the inlined corev1.PodSpec.RestartPolicy: that one tells kubelet whether to restart a container in-place; this one tells the OMENative controller whether to recreate the whole Instance.",
+          "description": "RestartPolicy controls what OMENative does when a managed pod fails. Distinct from the inlined corev1.PodSpec.RestartPolicy: that one tells kubelet whether to restart a container in-place; this one tells the OMENative controller whether to recreate the whole Instance. Unset inherits the ServingRuntime's value; when neither sets it, multi-pod Instances use RecreateInstanceOnPodRestart and single-pod Instances use None.",
           "type": "string"
         },
         "updateStrategy": {
@@ -4900,7 +4921,7 @@
       "type": "object",
       "properties": {
         "mode": {
-          "description": "Mode gates migration: Auto enables both deadline-disposition relocation and explicit migration requests; Never disables both. Defaults to Auto.",
+          "description": "Mode gates migration: Auto enables both deadline-disposition relocation and explicit migration requests; Never disables both. Unset inherits the ServingRuntime's value, then Auto.",
           "type": "string"
         }
       }
@@ -5303,6 +5324,15 @@
           "description": "Admitted is true when this Instance's pods have left the Kueue admission scheduling gate (quota granted): the Instance has pods and none are admission-gated. False while gated/queued or before pods exist. Used by the control plane to decide the fan-out race winner.",
           "type": "boolean"
         },
+        "announced": {
+          "description": "Announced records the once-only messages this Instance has already emitted, one entry per message: the event reason it was emitted under and the episode it was emitted in, joined by \"@\". A warning an operator needs to see once — the gang has no co-location term, the PodGroup was rebuilt, a repair is held, a drain is past its deadline — is emitted only when its entry is absent, and is stamped in the same write that emits it. Recording it on the Instance rather than in controller memory is what makes the once-only property hold per workload rather than per process, and survive a controller restart.\n\nThe episode is the in-flight operation, or the incarnation when there is none: a new attempt or a rebuilt Instance has its own messages to deliver, and the entries of the episode it replaced no longer match.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "set"
+        },
         "availablePodCount": {
           "description": "AvailablePodCount is the number of pods that are Available: in rotation on the Component's headless Service and, when lifecycle.minReadySeconds is set, Ready for at least that long.",
           "type": "integer",
@@ -5417,14 +5447,14 @@
       "type": "object",
       "properties": {
         "capacityFactors": {
-          "description": "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters, keyed by WorkloadCluster name. It weights traffic for heterogeneous hardware where one cluster's replica serves more (or less) than another's: a home's routed share scales with its admitted replicas times this factor. A quantity of \"2\" means each replica on that cluster carries twice the share of a factor-1 replica; \"500m\" means half. A cluster absent from the map (or the whole field unset) uses the identity factor 1. This is a routing weight only — it does not influence placement or how many replicas a cluster admits.",
+          "description": "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters, keyed by WorkloadCluster name. It weights traffic for heterogeneous hardware where one cluster's replica serves more (or less) than another's: a home's routed share scales with its admitted replicas times this factor. A quantity of \"2\" means each replica on that cluster carries twice the share of a factor-1 replica; \"500m\" means half. A cluster absent from the map (or the whole field unset) uses the identity factor 1. This is a routing weight only — it does not influence placement or how many replicas a cluster admits.\n\nDeprecated: use spec.routing.capacityFactors.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/resource.Quantity"
           }
         },
         "clusterSelector": {
-          "description": "ClusterSelector is an optional operator-imposed routing overlay (label-selector string) AND-ed onto Requirements to further narrow candidates (e.g. \"provider=cloud-a\"). Structured equivalent of the ome.io/cluster-selector annotation.",
+          "description": "ClusterSelector is an optional operator-imposed routing overlay (label-selector string) AND-ed onto Requirements to further narrow candidates. It can select WorkloadCluster labels (e.g. \"provider=cloud-a\") or immutable object names (e.g. \"metadata.name in (cluster-a,cluster-c)\"). Structured equivalent of the ome.io/cluster-selector annotation.",
           "type": "string"
         },
         "mode": {
@@ -5432,7 +5462,7 @@
           "type": "string"
         },
         "requirements": {
-          "description": "Requirements is the intrinsic capability selector a candidate workload cluster MUST satisfy, expressed as a Kubernetes label-selector string matched against WorkloadCluster labels (e.g. \"accelerator in (gb300, tpu7x)\"). It is the structured equivalent of the ome.io/accelerator-requirements annotation. Empty means no intrinsic requirement.",
+          "description": "Requirements is the intrinsic capability selector a candidate workload cluster MUST satisfy, expressed as a Kubernetes label-selector string matched against WorkloadCluster labels plus the virtual, immutable metadata.name key (e.g. \"accelerator in (gb300, tpu7x)\"). It is the structured equivalent of the ome.io/accelerator-requirements annotation. Empty means no intrinsic requirement.",
           "type": "string"
         },
         "split": {
@@ -5442,11 +5472,11 @@
       }
     },
     "v1beta1.PlacementStatus": {
-      "description": "PlacementStatus is the multi-cluster placement status: which workload cluster an InferenceService is placed on and a coarse phase.",
+      "description": "PlacementStatus is the multi-cluster placement status: its coarse phase and the candidate clusters participating in placement.",
       "type": "object",
       "properties": {
         "candidates": {
-          "description": "Candidates are the clusters this ISVC has been fanned out to during the placement race. Populated by the control plane.",
+          "description": "Candidates are the clusters this ISVC has been fanned out to during placement. Populated by the control plane.",
           "type": "array",
           "items": {
             "default": {},
@@ -5458,11 +5488,11 @@
           "x-kubernetes-list-type": "map"
         },
         "cluster": {
-          "description": "Cluster is the WorkloadCluster the ISVC is currently placed on. Empty while pending (no candidate yet, or transport not connected).",
+          "description": "Cluster is the winning WorkloadCluster in Single mode. It is empty before admission and in All/Split modes, where Candidates is authoritative.",
           "type": "string"
         },
         "endpoint": {
-          "description": "Endpoint is the externally-addressable URL of the winning cluster's placement, mirrored from the derived InferenceService's status.url once it is admitted AND addressable. Empty while pending/racing/failed or before the winner reports a URL. An external global LB/DNS consumes this to route traffic to the winning cluster.",
+          "description": "Endpoint is the externally-addressable URL of the winning cluster in Single mode, mirrored from the derived InferenceService's status.url once it is admitted AND addressable. It is empty before the winner reports a URL and in All/Split modes, where per-candidate endpoints are authoritative.",
           "$ref": "#/definitions/knative.URL"
         },
         "phase": {
@@ -5905,11 +5935,11 @@
       "type": "object",
       "properties": {
         "maxSurge": {
-          "description": "MaxSurge is the maximum number of extra Instances (or fraction) the rollout may create above the Component's desired replica count during a rolling update. Accepts either an absolute integer count (e.g. 1) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time. Mirrors the semantics of upstream appsv1.Deployment.Strategy.RollingUpdate.MaxSurge — extra capacity is created and brought to Ready before old Instances are drained, enabling zero-capacity-dip rollouts.\n\nWhen the Component participates in a RolloutCoordinationGroup with a non-zero CoordinationPacing.MaxSurge, the group-wide ceiling caps the per-Component MaxSurge.",
+          "description": "MaxSurge is the maximum number of extra Instances (or fraction) the rollout may create above the Component's desired replica count during a rolling update. Accepts either an absolute integer count (e.g. 1) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time. Mirrors the semantics of upstream appsv1.Deployment.Strategy.RollingUpdate.MaxSurge — extra capacity is created and brought to Ready before old Instances are drained, enabling zero-capacity-dip rollouts.\n\nWhen the Component participates in a RolloutCoordinationGroup with a non-zero CoordinationPacing.MaxSurge, the group-wide ceiling caps the per-Component MaxSurge. Unset inherits the ServingRuntime's value; when neither sets it and the strategy is SurgeThenDrain, the cluster default applies, and without one this layer sets no cap.",
           "$ref": "#/definitions/k8s.io.apimachinery.pkg.util.intstr.IntOrString"
         },
         "maxUnavailable": {
-          "description": "MaxUnavailable is the maximum number of Instances (or fraction) allowed to be in a non-Ready state during the rollout. Accepts either an absolute integer count (e.g. 2) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time so the budget scales with the Component's replica count.",
+          "description": "MaxUnavailable is the maximum number of Instances (or fraction) allowed to be in a non-Ready state during the rollout. Accepts either an absolute integer count (e.g. 2) or a percent string (e.g. \"25%\"). Percent values resolve to ceil(replicas * percent / 100) at reconcile time so the budget scales with the Component's replica count. Unset inherits the ServingRuntime's value; when neither sets it and the strategy is not SurgeThenDrain, the cluster default applies, and without one this layer sets no cap.",
           "$ref": "#/definitions/k8s.io.apimachinery.pkg.util.intstr.IntOrString"
         },
         "partition": {
@@ -6780,7 +6810,7 @@
           }
         },
         "lifecycle": {
-          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
+          "description": "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.\u003ccomponent\u003e.lifecycle.",
           "$ref": "#/definitions/v1beta1.LifecycleSpec"
         },
         "maxReplicas": {
@@ -6970,6 +7000,161 @@
           "x-kubernetes-list-type": "map",
           "x-kubernetes-patch-merge-key": "name",
           "x-kubernetes-patch-strategy": "merge,retainKeys"
+        }
+      }
+    },
+    "v1beta1.RoutingCapacitySpec": {
+      "description": "RoutingCapacitySpec configures polling each serving home for its current servable capacity.",
+      "type": "object",
+      "properties": {
+        "disabled": {
+          "description": "Disabled explicitly disables capacity polling. No other field may be set when true.",
+          "type": "boolean"
+        },
+        "format": {
+          "description": "Format names the response shape returned by the capacity endpoint.",
+          "type": "string"
+        },
+        "maxAge": {
+          "description": "MaxAge is the maximum accepted age of a capacity report.",
+          "$ref": "#/definitions/v1.Duration"
+        },
+        "method": {
+          "description": "Method is the HTTP method used by the capacity request.",
+          "type": "string"
+        },
+        "options": {
+          "description": "Options contains format-specific settings interpreted by the configured capacity format.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "default": ""
+          }
+        },
+        "path": {
+          "description": "Path is appended to each serving home's endpoint and must start with \"/\".",
+          "type": "string"
+        },
+        "period": {
+          "description": "Period is how often each serving home is polled.",
+          "$ref": "#/definitions/v1.Duration"
+        },
+        "quorum": {
+          "description": "Quorum is the number of readings required to corroborate a lower capacity.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "samples": {
+          "description": "Samples is the number of recent readings in the capacity window.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "timeout": {
+          "description": "Timeout bounds one capacity request and must be shorter than Period.",
+          "$ref": "#/definitions/v1.Duration"
+        }
+      }
+    },
+    "v1beta1.RoutingProbeSpec": {
+      "description": "RoutingProbeSpec configures an active end-to-end health probe for each serving home's externally addressable endpoint.",
+      "type": "object",
+      "properties": {
+        "acceptStatuses": {
+          "description": "AcceptStatuses are response codes counted as a successful probe.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0
+          },
+          "x-kubernetes-list-type": "set"
+        },
+        "allFailedPolicy": {
+          "description": "AllFailedPolicy controls the result when every serving home has crossed the failure threshold.",
+          "type": "string"
+        },
+        "disabled": {
+          "description": "Disabled explicitly disables probing. No other field may be set when true.",
+          "type": "boolean"
+        },
+        "failureThreshold": {
+          "description": "FailureThreshold is the number of consecutive failures required to gate a serving home.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "gateStatuses": {
+          "description": "GateStatuses are response codes counted as a failed probe. A code in neither status list is inconclusive.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0
+          },
+          "x-kubernetes-list-type": "set"
+        },
+        "method": {
+          "description": "Method is the HTTP method used by the probe.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path is appended to each serving home's endpoint and must start with \"/\".",
+          "type": "string"
+        },
+        "period": {
+          "description": "Period is how often each serving home is probed.",
+          "$ref": "#/definitions/v1.Duration"
+        },
+        "successThreshold": {
+          "description": "SuccessThreshold is the number of consecutive successes required to restore a gated serving home.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "timeout": {
+          "description": "Timeout bounds one probe request and must be shorter than Period.",
+          "$ref": "#/definitions/v1.Duration"
+        }
+      }
+    },
+    "v1beta1.RoutingPublisherSpec": {
+      "description": "RoutingPublisherSpec provides per-InferenceService behavior options to the single publisher selected by the operator.",
+      "type": "object",
+      "properties": {
+        "options": {
+          "description": "Options are interpreted and validated by the operator-selected publisher.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    },
+    "v1beta1.RoutingSpec": {
+      "description": "RoutingSpec configures cross-cluster traffic distribution for an InferenceService. Fields that are unset inherit the operator-level routing configuration.",
+      "type": "object",
+      "properties": {
+        "capacity": {
+          "description": "Capacity overrides the operator-level endpoint capacity poll. The block is a complete replacement; set disabled to explicitly turn polling off.",
+          "$ref": "#/definitions/v1beta1.RoutingCapacitySpec"
+        },
+        "capacityFactors": {
+          "description": "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters. Every quantity must be greater than zero. A cluster absent from the map uses the identity factor 1.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/resource.Quantity"
+          }
+        },
+        "enabled": {
+          "description": "Enabled overrides routing for this InferenceService. Nil inherits the operator-level setting; false opts this InferenceService out. True opts in only when routing is enabled for the installation and cannot bypass a disabled installation gate.",
+          "type": "boolean"
+        },
+        "probe": {
+          "description": "Probe overrides the operator-level endpoint health probe. The block is a complete replacement; set disabled to explicitly turn probing off.",
+          "$ref": "#/definitions/v1beta1.RoutingProbeSpec"
+        },
+        "publisher": {
+          "description": "Publisher supplies behavior options to the operator-selected publisher. Publisher identity, transport, and credentials remain operator-level configuration.",
+          "$ref": "#/definitions/v1beta1.RoutingPublisherSpec"
         }
       }
     },
@@ -7833,7 +8018,7 @@
       }
     },
     "v1beta1.TrafficMap": {
-      "description": "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty and the Routable condition says why. The routing controller owns spec and the Routable condition; the publisher owns the rest of status.",
+      "description": "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -7863,16 +8048,20 @@
       "type": "object",
       "properties": {
         "allocated": {
-          "description": "Allocated is the number of replicas this home is intended to run for the ISVC — the Split apportionment intersected with what the home's AcceleratorQuota admitted. It is the count basis of the weight.",
+          "description": "Allocated is the effective allocation ceiling for this home: the control-plane-admitted count, optionally lowered by a capacity report. Ready independently caps it when computing Weight.",
           "type": "integer",
           "format": "int32"
         },
         "factor": {
-          "description": "Factor is the per-replica relative serving capacity of this home's accelerator (baseline \"1\", higher = faster), so heterogeneous hardware is weighted by capacity rather than raw replica count: weight is proportional to allocated * factor. Defaults to \"1\" (homogeneous) when unset — the multiplicative identity, i.e. no scaling. It is operator-supplied config, never derived from raw hardware FLOPS.",
+          "description": "Factor is the per-replica relative serving capacity of this home's accelerator (baseline \"1\", higher = faster), so heterogeneous hardware is weighted by capacity rather than raw replica count: weight is proportional to min(allocated, ready) * factor. Defaults to \"1\" (homogeneous) when unset — the multiplicative identity, i.e. no scaling. It is operator-supplied config, never derived from raw hardware FLOPS.",
           "$ref": "#/definitions/resource.Quantity"
         },
+        "fallbackReason": {
+          "description": "FallbackReason explains why a configured endpoint capacity source did not produce an applied ceiling and the control-plane allocation was retained. Empty means capacity polling is disabled or its latest result was usable.",
+          "type": "string"
+        },
         "ready": {
-          "description": "Ready is the home's live ready-replica count — the health signal. Zero means the entry is health-gated to weight 0.",
+          "description": "Ready is the home's live ready-replica count. It caps Allocated when computing Weight; zero health-gates the entry to weight 0.",
           "type": "integer",
           "format": "int32"
         },
@@ -7882,7 +8071,7 @@
           "format": "int32"
         },
         "source": {
-          "description": "Source names which input produced Allocated. Without it an operator reading an unexpected weight cannot tell \"the home reported less capacity\" from \"the endpoint source was configured but failed open and the plan was used\" — the same number with opposite remediations.",
+          "description": "Source names which input produced Allocated. FallbackReason separately distinguishes an intentionally control-plane-only allocation from a configured endpoint source that could not supply a usable ceiling.",
           "type": "string"
         }
       }
@@ -7895,7 +8084,7 @@
       ],
       "properties": {
         "capacity": {
-          "description": "Capacity is the provenance of Weight: weight is proportional to allocated * factor, gated to 0 when the home has no ready replicas.",
+          "description": "Capacity is the provenance of Weight: weight is proportional to min(allocated, ready) * factor, then gated by the active probe.",
           "$ref": "#/definitions/v1beta1.TrafficMapCapacity"
         },
         "cluster": {
@@ -7903,12 +8092,21 @@
           "type": "string",
           "default": ""
         },
+        "drainRefs": {
+          "description": "DrainRefs names the independent override IDs in the source InferenceService's ome.io/traffic-drain annotation that force this entry's weight to zero. Empty means no manual override contributed.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "set"
+        },
         "endpoint": {
           "description": "Endpoint is the home's externally-addressable URL, taken from status.placement.candidates[].endpoint.",
           "$ref": "#/definitions/knative.URL"
         },
         "healthy": {
-          "description": "Healthy is the health-gate result for this home (readyReplicas \u003e 0). An unhealthy home is weighted 0 (unless every home is unhealthy).",
+          "description": "Healthy is the readiness-plus-probe result for this home. An unready home is always weighted 0; a probe-unhealthy home may retain a positive weight only under a fleet-wide PreserveTraffic fallback. A manual DrainRefs override can set a healthy home to zero without changing its health evidence.",
           "type": "boolean",
           "default": false
         },
@@ -7917,7 +8115,7 @@
           "$ref": "#/definitions/v1beta1.TrafficMapProbe"
         },
         "weight": {
-          "description": "Weight is the home's final, normalized, capacity-planned, health-gated traffic share as a relative non-negative integer (matching Gateway API and Envoy weighted-cluster semantics). A consumer either applies it verbatim or divides by the sum of weights for a percentage. When every home is unhealthy the controller writes equal weights rather than all-zero, so traffic is never black-holed.",
+          "description": "Weight is the home's final, normalized, capacity-planned, health-gated traffic share as a relative integer from 0 through 1,000,000. The upper bound matches the Gateway API backendRef weight limit, so a publisher can apply it verbatim; another consumer may divide by the sum of weights for a percentage. Unready and zero-capacity homes always have weight 0. When every probe conclusively fails, PreserveTraffic may retain capacity-derived weights for ready homes; Drain writes an authoritative all-zero table. Manual DrainRefs can force any arm to zero after these automatic inputs.",
           "type": "integer",
           "format": "int32",
           "default": 0
@@ -7988,17 +8186,52 @@
           "type": "integer",
           "format": "int32"
         },
+        "gated": {
+          "description": "Gated is the current hysteresis gate. It remains true through an Unknown attempt until enough consecutive passing attempts reopen the home.",
+          "type": "boolean"
+        },
         "lastProbeTime": {
-          "description": "LastProbeTime is when the probe last reached a verdict, so a stalled prober is visible rather than being read as a steady pass.",
+          "description": "LastProbeTime is when the latest probe attempt completed, so a stalled prober is visible rather than being read as a steady pass.",
           "$ref": "#/definitions/v1.Time"
         },
         "message": {
           "description": "Message explains the current Result — the observed status code, the transport error, or why the probe could not run.",
           "type": "string"
         },
-        "result": {
-          "description": "Result is the most recent probe verdict. Only a sustained Failing gates the weight; Unknown never does.",
+        "policyDigest": {
+          "description": "PolicyDigest identifies the effective probe policy that produced this observation. A controller may restore hysteresis state after a restart only when this digest and the entry identity still match.",
           "type": "string"
+        },
+        "result": {
+          "description": "Result is the most recent probe attempt's verdict. Failing gates only after the configured threshold. Unknown does not change the previous gate.",
+          "type": "string"
+        }
+      }
+    },
+    "v1beta1.TrafficMapPublisherStatus": {
+      "description": "TrafficMapPublisherStatus is the durable cleanup journal for one publisher. Claims are persisted before external mutation and retained until their targets have been cleaned up.",
+      "type": "object",
+      "required": [
+        "publisherName"
+      ],
+      "properties": {
+        "claimedTargets": {
+          "description": "ClaimedTargets are publisher-defined canonical identifiers owned by this map. The publisher records the complete claim set before mutating any target. Identifiers are status-visible and must not contain credentials or secrets.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "set"
+        },
+        "observedOptionsDigest": {
+          "description": "ObservedOptionsDigest is the SHA-256 digest of the effective safe publisher options used by the most recent successful reconciliation. It is absent before the first successful reconciliation and does not determine target ownership.",
+          "type": "string"
+        },
+        "publisherName": {
+          "description": "PublisherName identifies the publisher implementation whose cleanup semantics apply. An implementation upgraded under the same name must remain able to clean target identifiers written by its prior versions.",
+          "type": "string",
+          "default": ""
         }
       }
     },
@@ -8038,11 +8271,11 @@
       }
     },
     "v1beta1.TrafficMapStatus": {
-      "description": "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Programmed, GatewayRef and ObservedTrafficMapGeneration, and the routing controller owns the Routable condition. Conditions is keyed on type, so each writer must patch only its own and never rewrite the list.",
+      "description": "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Published, GatewayRef, ObservedTrafficMapGeneration, Publisher, and the Published condition; the routing controller owns SourceUID plus the Routable and CapacityFallback conditions. Conditions is keyed on type, so each writer must patch only its own fields and conditions.",
       "type": "object",
       "properties": {
         "conditions": {
-          "description": "Conditions carry the Programmed condition.",
+          "description": "Conditions carry the routing controller's Routable and CapacityFallback conditions and the publisher's Published condition.",
           "type": "array",
           "items": {
             "default": {},
@@ -8056,7 +8289,7 @@
           "x-kubernetes-patch-strategy": "merge"
         },
         "gatewayRef": {
-          "description": "GatewayRef identifies the data plane object realizing this map (e.g. the HTTPRoute the Gateway API publisher created). Empty until programmed.",
+          "description": "GatewayRef identifies the data plane object realizing this map (e.g. the HTTPRoute the Gateway API publisher created). Empty until published.",
           "$ref": "#/definitions/v1beta1.TrafficMapGatewayRef"
         },
         "observedTrafficMapGeneration": {
@@ -8064,9 +8297,17 @@
           "type": "integer",
           "format": "int64"
         },
-        "programmed": {
-          "description": "Programmed reports whether the active publisher has realized this map onto its data plane.",
+        "published": {
+          "description": "Published reports whether the active publisher has realized this map onto its data plane.",
           "type": "boolean"
+        },
+        "publisher": {
+          "description": "Publisher records the durable target claims needed to recover or reverse data-plane mutations made while realizing this map.",
+          "$ref": "#/definitions/v1beta1.TrafficMapPublisherStatus"
+        },
+        "sourceUID": {
+          "description": "SourceUID is the UID of the InferenceService that generated this map. The routing controller writes it through its own status field manager before a publisher may create external effects. It remains available if orphan deletion propagation removes the owner reference.",
+          "type": "string"
         }
       }
     },
@@ -8136,7 +8377,7 @@
           "$ref": "#/definitions/v1beta1.RollingUpdate"
         },
         "type": {
-          "description": "Type selects the rollout mechanism. Defaults to SurgeThenDrain for safety — preserves serving capacity throughout the rollout.",
+          "description": "Type selects the rollout mechanism. Unset inherits the ServingRuntime's value, then the cluster default from the inferenceservice-config ConfigMap, then SurgeThenDrain, which preserves serving capacity throughout the rollout.",
           "type": "string"
         }
       }
@@ -8371,7 +8612,7 @@
           "type": "boolean"
         },
         "size": {
-          "description": "Size of the worker, this is the number of pods in the worker. Controls how many worker pod instances will be deployed for horizontal scaling.",
+          "description": "Size of the worker, this is the number of pods in the worker. Controls how many worker pod instances will be deployed for horizontal scaling. Unset inherits the ServingRuntime's value; when neither sets it, a declared leader gets one worker.",
           "type": "integer",
           "format": "int32"
         },

@@ -28,6 +28,7 @@ func TestTrafficAnnotations_Prefix(t *testing.T) {
 		{"TimeoutMaxConnectionDurationAnnotation", TimeoutMaxConnectionDurationAnnotation},
 		{"TimeoutTCPConnectAnnotation", TimeoutTCPConnectAnnotation},
 		// Operational.
+		{"TrafficDrainAnnotation", TrafficDrainAnnotation},
 		{"ManagedByConflictAckedAnnotation", ManagedByConflictAckedAnnotation},
 		{"RolloutReadyTimeoutAnnotation", RolloutReadyTimeoutAnnotation},
 		{"RevisionHistoryLimitAnnotation", RevisionHistoryLimitAnnotation},
@@ -39,6 +40,13 @@ func TestTrafficAnnotations_Prefix(t *testing.T) {
 		if !strings.HasPrefix(k.value, wantPrefix) {
 			t.Errorf("%s = %q does not start with %q", k.name, k.value, wantPrefix)
 		}
+	}
+}
+
+func TestTrafficDrainAnnotation_StableKey(t *testing.T) {
+	want := OMEAPIGroupName + "/traffic-drain"
+	if TrafficDrainAnnotation != want {
+		t.Fatalf("TrafficDrainAnnotation = %q, want %q", TrafficDrainAnnotation, want)
 	}
 }
 
@@ -57,6 +65,7 @@ func TestTrafficAnnotations_Unique(t *testing.T) {
 		TimeoutIdleAnnotation,
 		TimeoutMaxConnectionDurationAnnotation,
 		TimeoutTCPConnectAnnotation,
+		TrafficDrainAnnotation,
 		ManagedByConflictAckedAnnotation,
 		RolloutReadyTimeoutAnnotation,
 		RevisionHistoryLimitAnnotation,
@@ -107,6 +116,7 @@ func TestKnownAnnotation_NoCollisionWithPassthrough(t *testing.T) {
 		TimeoutIdleAnnotation,
 		TimeoutMaxConnectionDurationAnnotation,
 		TimeoutTCPConnectAnnotation,
+		TrafficDrainAnnotation,
 		ManagedByConflictAckedAnnotation,
 		RolloutReadyTimeoutAnnotation,
 		RevisionHistoryLimitAnnotation,

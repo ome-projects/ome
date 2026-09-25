@@ -828,3 +828,97 @@ func TestIsPodInRotation_ReadyTrueNotTerminatingReportedInRotation(t *testing.T)
 		t.Errorf("non-terminating Ready endpoint must be reported as in-rotation")
 	}
 }
+
+// TestBatcher_IsPodRoutedAbstainsWithoutSlices: the drain gate needs an
+// answer either way and resolves an empty slice list against the
+// Service's existence. An observation of the pod must not: a missing or
+// not-yet-propagated Service is a fact about the Service, not evidence
+// that the pod stopped serving, so the reading abstains and the pod
+// stays routed — and the Service lookup the gate needs is never made.
+func TestBatcher_IsPodRoutedAbstainsWithoutSlices(t *testing.T) {
+	tests := []struct {
+		name string
+		objs []client.Object
+	}{
+		{name: "absent service"},
+		{
+			name: "service without slices",
+			objs: []client.Object{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cr := &countingReader{Reader: newDrainTestClient(t, tt.objs...)}
+			routed, err := NewBatcher(cr, "ns").IsPodRouted(context.Background(), "svc", testPod("ns", "p1"))
+			if err != nil {
+				t.Fatalf("IsPodRouted: %v", err)
+			}
+			if !routed {
+				t.Errorf("IsPodRouted: got false want true; an empty slice list is not a reading")
+			}
+			if cr.serviceGets != 0 {
+				t.Errorf("Service GETs: got %d want 0; the abstain needs no Service lookup", cr.serviceGets)
+			}
+		})
+	}
+}
+
+// TestBatcher_IsPodRoutedReadsTheSameSlicesAsTheGate pins the two views
+// against one read: with slices present they are exact opposites, and
+// the LIST behind them runs once.
+func TestBatcher_IsPodRoutedReadsTheSameSlicesAsTheGate(t *testing.T) {
+	pod := testPod("ns", "p1")
+	tests := []struct {
+		name       string
+		endpoints  []endpointSpec
+		wantRouted bool
+	}{
+		{
+			name:       "ready endpoint",
+			endpoints:  []endpointSpec{{podName: "p1", address: "10.0.0.1", ready: ptr.To(true)}},
+			wantRouted: true,
+		},
+		{
+			name:      "endpoint for another pod",
+			endpoints: []endpointSpec{{podName: "p-other", address: "10.0.0.2", ready: ptr.To(true)}},
+		},
+		{
+			name:      "endpoint not ready",
+			endpoints: []endpointSpec{{podName: "p1", address: "10.0.0.1", ready: ptr.To(false)}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cr := &countingReader{Reader: newDrainTestClient(t, sliceForService("ns", "svc-1", "svc", tt.endpoints...))}
+			b := NewBatcher(cr, "ns")
+			routed, err := b.IsPodRouted(context.Background(), "svc", pod)
+			if err != nil {
+				t.Fatalf("IsPodRouted: %v", err)
+			}
+			drained, err := b.IsPodDrained(context.Background(), "svc", pod)
+			if err != nil {
+				t.Fatalf("IsPodDrained: %v", err)
+			}
+			if routed != tt.wantRouted || drained == routed {
+				t.Errorf("routed=%v drained=%v, want routed=%v and the two opposed", routed, drained, tt.wantRouted)
+			}
+			if cr.sliceLists != 1 {
+				t.Errorf("EndpointSlice LISTs: got %d want 1 for both views", cr.sliceLists)
+			}
+		})
+	}
+}
+
+func TestBatcher_IsPodRoutedRejectsInvalidInput(t *testing.T) {
+	cr := &countingReader{Reader: newDrainTestClient(t)}
+	b := NewBatcher(cr, "ns")
+	if _, err := b.IsPodRouted(context.Background(), "svc", nil); err == nil {
+		t.Error("expected error for nil pod")
+	}
+	if _, err := b.IsPodRouted(context.Background(), "", testPod("ns", "p1")); err == nil {
+		t.Error("expected error for empty service name")
+	}
+	if cr.sliceLists != 0 || cr.serviceGets != 0 {
+		t.Errorf("invalid inputs must perform no reads, got LIST=%d GET=%d", cr.sliceLists, cr.serviceGets)
+	}
+}

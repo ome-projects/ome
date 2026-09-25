@@ -5,6 +5,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 )
 
 // validateMultiPodReadyPolicyNone rejects writes that put
@@ -47,18 +48,18 @@ func validateMultiPodReadyPolicyNone(oldIsvc, isvc *v1beta1.InferenceService) er
 // set lifecycle.readyPolicy=None while resolving to a multi-pod OMENative
 // shape from the InferenceService spec alone (a declared Leader+Worker
 // pair with positive Worker.Size). It applies the same shape and mode
-// resolution as the lifecycle defaulter, so the set of Components
-// rejected here is exactly the set the defaulter would default to
-// AllPodReady. Router is always single-pod and never reported.
+// resolution as dispatch, so the set of Components rejected here is
+// exactly the set the workload engine runs as AllPodReady. Router is
+// always single-pod and never reported.
 func multiPodReadyPolicyNoneComponents(isvc *v1beta1.InferenceService) []string {
 	mode := effectiveDeploymentModeForValidation(isvc)
 	var names []string
-	if isvc.Spec.Engine != nil && engineIsMultiPod(isvc.Spec.Engine) &&
+	if isvc.Spec.Engine != nil && declaredMultiPod(isvc.Spec.Engine.Leader, isvc.Spec.Engine.Worker) &&
 		componentReadyPolicyIsNone(&isvc.Spec.Engine.ComponentExtensionSpec) &&
 		componentResolvesToOMENative(isvc.Spec.Engine.Annotations, mode) {
 		names = append(names, "engine")
 	}
-	if isvc.Spec.Decoder != nil && decoderIsMultiPod(isvc.Spec.Decoder) &&
+	if isvc.Spec.Decoder != nil && declaredMultiPod(isvc.Spec.Decoder.Leader, isvc.Spec.Decoder.Worker) &&
 		componentReadyPolicyIsNone(&isvc.Spec.Decoder.ComponentExtensionSpec) &&
 		componentResolvesToOMENative(isvc.Spec.Decoder.Annotations, mode) {
 		names = append(names, "decoder")
@@ -73,26 +74,34 @@ func componentReadyPolicyIsNone(ext *v1beta1.ComponentExtensionSpec) bool {
 		*ext.Lifecycle.ReadyPolicy == v1beta1.InstanceReadyPolicyNone
 }
 
-// effectiveDeploymentModeForValidation resolves the deployment mode the
-// same way the mutating webhook does: the canonical top-level
-// ome.io/deploymentMode annotation when present, then the structural
-// heuristics (Engine+Decoder ⇒ PDDisaggregated; Engine Leader+Worker
-// with positive Size ⇒ OMENative), then the typed spec.deploymentMode.
-// Replicating the heuristics keeps validation correct when an object
-// reaches the validator without the defaulter having stamped the
-// annotation.
+// effectiveDeploymentModeForValidation resolves the InferenceService-level
+// mode the same way the controller does (annotation, then
+// spec.deploymentMode, then the declared shape); nil when none of them
+// names a mode.
 func effectiveDeploymentModeForValidation(isvc *v1beta1.InferenceService) *constants.DeploymentModeType {
-	if m := isvc.Annotations[constants.DeploymentMode]; m != "" {
-		mm := constants.DeploymentModeType(m)
-		return &mm
+	mode := isvcutils.InferenceServiceDeploymentMode(isvc, "")
+	if mode == "" {
+		return nil
 	}
-	if isvc.Spec.Engine != nil && isvc.Spec.Decoder != nil {
-		mm := constants.PDDisaggregated
-		return &mm
+	return &mode
+}
+
+// declaredMultiPod reports whether a Component declares a Leader+Worker pair
+// whose size is unset or positive; an unset size resolves to one worker at
+// reconcile time.
+func declaredMultiPod(leader *v1beta1.LeaderSpec, worker *v1beta1.WorkerSpec) bool {
+	return leader != nil && worker != nil && (worker.Size == nil || *worker.Size > 0)
+}
+
+// componentResolvesToOMENative reports whether a Component dispatches to
+// the OMENative backend: the per-Component ome.io/deploymentMode annotation
+// wins, then the InferenceService-level mode.
+func componentResolvesToOMENative(annotations map[string]string, specMode *constants.DeploymentModeType) bool {
+	if annotations[constants.DeploymentMode] != "" {
+		return annotations[constants.DeploymentMode] == string(constants.OMENative)
 	}
-	if engineIsMultiPod(isvc.Spec.Engine) {
-		mm := constants.OMENative
-		return &mm
+	if specMode != nil {
+		return *specMode == constants.OMENative
 	}
-	return isvc.Spec.DeploymentMode
+	return false
 }

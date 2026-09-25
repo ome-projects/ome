@@ -70,15 +70,6 @@ var (
 	ErrPodGroupOwnershipConflict = errors.New("PodGroup is controlled by another owner")
 )
 
-// maxScheduleTimeoutSeconds caps the per-PodGroup schedule timeout derived
-// from InstanceReadyTimeout. Runtime readiness can legitimately take longer,
-// but gang admission should release an infeasible attempt within ten minutes.
-const maxScheduleTimeoutSeconds int32 = 600
-
-// minScheduleTimeoutSeconds matches the scheduler-plugins default and covers
-// zero, negative, and sub-minute InstanceReadyTimeout values.
-const minScheduleTimeoutSeconds int32 = 60
-
 // IsMultiPodInstance reports whether the Instance has more than one pod
 // across all Runners — i.e., it needs a PodGroup. Wraps
 // InstancePlan.TotalPods with the multi-pod threshold (>=2) so callers
@@ -95,9 +86,9 @@ func IsMultiPodInstance(inst workload.InstancePlan) bool {
 // members).
 //
 // Spec.MinMember = TotalPods(inst) — every leader + worker pod must be
-// schedulable for the gang to land. Spec.ScheduleTimeoutSeconds is clamped
-// from InstanceReadyTimeout into [minScheduleTimeoutSeconds,
-// maxScheduleTimeoutSeconds]. When plan.TopologyKey is set, the PodGroup
+// schedulable for the gang to land. Spec.ScheduleTimeoutSeconds comes from
+// InstanceReadyTimeout, bounded by plan.GangScheduleTimeout when the
+// operator configured one. When plan.TopologyKey is set, the PodGroup
 // advertises that same configured key through
 // query.AnnotationTopologyKey.
 //
@@ -119,12 +110,17 @@ func BuildPodGroup(owner client.Object, ownerGVK schema.GroupVersionKind, ownerN
 	}
 
 	minMember := inst.TotalPods()
-	timeout := clampScheduleTimeoutSeconds(int32(plan.InstanceReadyTimeout.Seconds()))
+	timeout, bounded := scheduleTimeoutSeconds(plan)
 
 	labels := podGroupLabels(ownerName, plan.Component, inst.Index)
 	var annotations map[string]string
 	if topologyKey := plan.TopologyKeyForInstance(inst.Index); topologyKey != "" {
 		annotations = map[string]string{query.AnnotationTopologyKey: topologyKey}
+	}
+
+	spec := schedulingv1alpha1.PodGroupSpec{MinMember: minMember}
+	if bounded {
+		spec.ScheduleTimeoutSeconds = &timeout
 	}
 
 	return &schedulingv1alpha1.PodGroup{
@@ -137,24 +133,31 @@ func BuildPodGroup(owner client.Object, ownerGVK schema.GroupVersionKind, ownerN
 				*metav1.NewControllerRef(owner, ownerGVK),
 			},
 		},
-		Spec: schedulingv1alpha1.PodGroupSpec{
-			MinMember:              minMember,
-			ScheduleTimeoutSeconds: &timeout,
-		},
+		Spec: spec,
 	}, nil
 }
 
-func clampScheduleTimeoutSeconds(in int32) int32 {
-	if in <= 0 {
-		return minScheduleTimeoutSeconds
+// scheduleTimeoutSeconds derives the gang's ScheduleTimeoutSeconds from
+// the Component's InstanceReadyTimeout and bounds it with the operator's
+// clamp. ok=false means the field stays unset, which leaves the timeout
+// to the scheduler's own default: that is what an unconfigured clamp
+// gives a Component whose InstanceReadyTimeout is unusable as a gang
+// deadline, since there is no in-code window to fall back on.
+func scheduleTimeoutSeconds(plan workload.ComponentPlan) (seconds int32, ok bool) {
+	derived := int32(plan.InstanceReadyTimeout.Seconds())
+	clamp := plan.GangScheduleTimeout
+	if clamp == nil {
+		return derived, derived > 0
 	}
-	if in > maxScheduleTimeoutSeconds {
-		return maxScheduleTimeoutSeconds
+	minSeconds := int32(clamp.Min.Seconds())
+	maxSeconds := int32(clamp.Max.Seconds())
+	if derived <= 0 || derived < minSeconds {
+		return minSeconds, true
 	}
-	if in < minScheduleTimeoutSeconds {
-		return minScheduleTimeoutSeconds
+	if derived > maxSeconds {
+		return maxSeconds, true
 	}
-	return in
+	return derived, true
 }
 
 // podGroupLabels are the Component-scoped labels stamped on every
@@ -341,7 +344,7 @@ func EffectiveTopologyKeyForPods(desiredKey, ownerName string, component workloa
 func GeneratedTopologyKeyFromPods(ownerName string, component workload.ComponentType, pods []*corev1.Pod) (string, bool, error) {
 	keys := make(map[string]struct{})
 	for _, pod := range pods {
-		if pod == nil || pod.Labels[query.LabelRunner] != "worker" ||
+		if pod == nil || pod.Labels[query.LabelRunner] != workload.RunnerWorker ||
 			pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
 			continue
 		}
@@ -358,7 +361,7 @@ func GeneratedTopologyKeyFromPods(ownerName string, component workload.Component
 			if labels[constants.InferenceServicePodLabelKey] == ownerName &&
 				labels[constants.OMEComponentLabel] == string(component) &&
 				labels[query.LabelInstanceIdx] == wantIndex &&
-				labels[query.LabelRunner] == "leader" {
+				labels[query.LabelRunner] == workload.RunnerLeader {
 				keys[term.TopologyKey] = struct{}{}
 			}
 		}
@@ -414,7 +417,7 @@ func topologyKeyFromLivePods(ownerName string, component workload.ComponentType,
 	exact := make(map[string]struct{})
 	wantIndex := fmt.Sprintf("%d", instanceIdx)
 	for _, pod := range pods {
-		if pod == nil || pod.Labels[query.LabelRunner] != "worker" ||
+		if pod == nil || pod.Labels[query.LabelRunner] != workload.RunnerWorker ||
 			pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
 			continue
 		}
@@ -430,7 +433,7 @@ func topologyKeyFromLivePods(ownerName string, component workload.ComponentType,
 			if labels[constants.InferenceServicePodLabelKey] == ownerName &&
 				labels[constants.OMEComponentLabel] == string(component) &&
 				labels[query.LabelInstanceIdx] == wantIndex &&
-				labels[query.LabelRunner] == "leader" {
+				labels[query.LabelRunner] == workload.RunnerLeader {
 				exact[term.TopologyKey] = struct{}{}
 			}
 		}

@@ -220,7 +220,7 @@ type PlacementRouting struct {
 	Routable              PlacementCondition   `json:"routable"`
 	Acknowledgement       PlacementValue       `json:"acknowledgement"`
 	AcknowledgementSource PlacementEvidence    `json:"acknowledgementSource"`
-	Programmed            PlacementCondition   `json:"programmed"`
+	Published             PlacementCondition   `json:"published"`
 	Gateway               *PlacementGateway    `json:"gateway,omitempty"`
 }
 

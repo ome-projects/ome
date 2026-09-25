@@ -16,9 +16,10 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // resetInstancesRequest is the parsed ome.io/reset-instances value:
@@ -50,7 +51,7 @@ type resetSkip struct {
 // keeps serving on its old pods) is skipped untouched: draining a
 // serving source is the rollout machinery's job, not this verb's. And
 // only repair-owned parked attempts are in scope (no Operation, Create,
-// Restart — workload.ResetOwnsOperation): an Instance parked behind an
+// Restart — status.ResetOwnsOperation): an Instance parked behind an
 // Update or Migrate continuation is skipped, because the gang abandon,
 // wreckage cleanup, release-held, and migration-expiry paths own those
 // continuations and clearing one here would orphan its surge marker or
@@ -90,7 +91,7 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 		log.Info("Instance reset requested with a malformed value; consuming as no-op",
 			"value", val, "error", perr.Error())
 		if r.Recorder != nil {
-			r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, string(workload.EventReasonInstancesResetRejected),
+			r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, string(workloadtypes.EventReasonInstancesResetRejected),
 				"InferenceReplica %s/%s component=%s: %s=%q rejected: %v; nothing reset",
 				ir.Namespace, ir.Name, ir.Spec.Component, constants.ResetInstancesAnnotationKey, val, perr)
 		}
@@ -103,17 +104,17 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 		}
 		if r.Recorder != nil {
 			if len(reset) > 0 {
-				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workload.EventReasonInstancesReset),
+				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesReset),
 					"InferenceReplica %s/%s component=%s: reset instance(s) %s at operator request (%s annotation): pods deleted and preserved operation cleared; the lifecycle passes rebuild them",
 					ir.Namespace, ir.Name, ir.Spec.Component, formatIndices(reset), constants.ResetInstancesAnnotationKey)
 			}
 			switch {
 			case len(skipped) > 0:
-				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workload.EventReasonInstancesResetSkipped),
+				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesResetSkipped),
 					"InferenceReplica %s/%s component=%s: reset skipped for instance(s) %s",
 					ir.Namespace, ir.Name, ir.Spec.Component, formatSkips(skipped))
 			case len(reset) == 0:
-				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workload.EventReasonInstancesResetSkipped),
+				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesResetSkipped),
 					"InferenceReplica %s/%s component=%s: reset requested for all instances but none is Failed; nothing to reset",
 					ir.Namespace, ir.Name, ir.Spec.Component)
 			}
@@ -174,7 +175,7 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 	// skipped with its owner named.
 	var candidates []int32
 	classify := func(idx int32, s *v1beta1.OMENativeInstanceStatus) {
-		if !workload.ResetOwnsOperation(v1beta1convert.InstanceOperationToWorkload(s.Operation)) {
+		if !status.ResetOwnsOperation(v1beta1convert.InstanceOperationToWorkload(s.Operation)) {
 			skipped = append(skipped, resetSkip{index: idx, reason: "owned by " + string(s.Operation.Type)})
 			return
 		}
@@ -211,7 +212,7 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 	key := buildKey(ir)
 	expectations := r.Expectations
 	if expectations == nil {
-		expectations = workload.DefaultExpectations
+		expectations = workloadtypes.DefaultExpectations
 	}
 	mutateInstance := buildMutateInstance(r.statusWriter(), r.liveReader(), ir)
 	for _, idx := range candidates {
@@ -246,7 +247,7 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 		// The transition write itself belongs to the workload layer; the
 		// seam re-checks Phase=Failed and the Operation owner on the
 		// fresh read.
-		cleared, merr := workload.ClearFailedInstanceOperation(ctx, mutateInstance, idx)
+		cleared, merr := status.ClearFailedInstanceOperation(ctx, mutateInstance, idx)
 		if merr != nil {
 			return reset, skipped, fmt.Errorf("clear preserved operation (instance=%d): %w", idx, merr)
 		}
