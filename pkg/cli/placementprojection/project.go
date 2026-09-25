@@ -144,6 +144,9 @@ func projectStatus(parent *ome.InferenceService) (v.PlacementStatusContent, labe
 		return content, selector, nil
 	}
 	content.Placement.Phase = placementPhase(p.Phase)
+	if p.Phase != "" && content.Placement.Phase == "Unknown" {
+		addIssue(&content.Issues, "PlacementPhase", "UnknownValue")
+	}
 	if p.Cluster != "" {
 		if publicName(p.Cluster) {
 			content.Placement.ReportedCluster = p.Cluster
@@ -160,6 +163,7 @@ func projectStatus(parent *ome.InferenceService) (v.PlacementStatusContent, labe
 	}
 	seen := map[string]*ome.CandidatePlacement{}
 	projected := map[string]v.PlacementHome{}
+	var candidateIssues []v.PlacementIssue
 	content.Placement.ProvenancePreview.State = "Validated"
 	for i := range p.Candidates {
 		h := &p.Candidates[i]
@@ -179,11 +183,16 @@ func projectStatus(parent *ome.InferenceService) (v.PlacementStatusContent, labe
 		seen[h.Cluster] = h
 		prov := provenance(h)
 		if prov.State == "MalformedPayload" || prov.State == "BudgetExceeded" {
-			addIssue(&content.Issues, "CandidateProvenance", prov.State)
+			addIssue(&candidateIssues, "CandidateProvenance", prov.State)
 			content.Placement.ProvenancePreview.State = "Unavailable"
 		}
-		projected[h.Cluster] = v.PlacementHome{Cluster: h.Cluster, Phase: candidatePhase(h.Phase), Address: address(h.Endpoint), Source: reported(), AdmittedReplicas: count(h.AdmittedReplicas, inputs.Mode == "Split"), ReadyReplicas: count(h.ReadyReplicas, inputs.Mode == "Split"), Provenance: prov}
+		phase := candidatePhase(h.Phase)
+		if h.Phase != "" && phase == "Unknown" {
+			addIssue(&candidateIssues, "CandidatePhase", "UnknownValue")
+		}
+		projected[h.Cluster] = v.PlacementHome{Cluster: h.Cluster, Phase: phase, Address: address(h.Endpoint), Source: reported(), AdmittedReplicas: count(h.AdmittedReplicas, inputs.Mode == "Split"), ReadyReplicas: count(h.ReadyReplicas, inputs.Mode == "Split"), Provenance: prov}
 	}
+	content.Issues = append(content.Issues, candidateIssues...)
 	names := make([]string, 0, len(seen))
 	for name := range seen {
 		names = append(names, name)

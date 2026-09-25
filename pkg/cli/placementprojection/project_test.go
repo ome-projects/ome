@@ -3,6 +3,7 @@ package placementprojection
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -36,6 +37,352 @@ func fixture(t *testing.T) c.Result {
 		}
 	}
 	return c.Result{InferenceService: &parent, WorkloadClusters: []ome.WorkloadCluster{cluster}, Fleet: v.PlacementAcquisition{State: "Observed", Returned: 1, Admitted: 1, Pages: 1, Complete: true}, TrafficMap: &tm, TrafficMapAcquisition: v.PlacementAcquisition{State: "Observed", Returned: 1, Admitted: 1, Pages: 1, Complete: true}}
+}
+
+func TestProjectStatusPreservesAdmittingPhases(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		placement     ome.PlacementPhase
+		candidate     ome.CandidatePlacementPhase
+		wantPlacement v.PlacementValue
+		wantCandidate v.PlacementValue
+	}{
+		{"admitting", ome.PlacementPhaseAdmitting, ome.CandidatePhaseAdmitting, "Admitting", "Admitting"},
+		{"legacy-racing-admitted", "Racing", "Admitted", "Racing", "Admitted"},
+		{"placed", ome.PlacementPhasePlaced, ome.CandidatePhasePlaced, "Placed", "Placed"}, //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
+		{"empty", "", "", "NotRecorded", "NotRecorded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			s.InferenceService.Status.Placement.Phase = tc.placement
+			s.InferenceService.Status.Placement.Candidates = []ome.CandidatePlacement{{Cluster: "west", Phase: tc.candidate}}
+			got, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Content.Placement.Phase != tc.wantPlacement {
+				t.Errorf("placement phase=%q want %q", got.Content.Placement.Phase, tc.wantPlacement)
+			}
+			if len(got.Content.Placement.Homes) != 1 {
+				t.Fatalf("homes=%+v", got.Content.Placement.Homes)
+			}
+			if got.Content.Placement.Homes[0].Phase != tc.wantCandidate {
+				t.Errorf("candidate phase=%q want %q", got.Content.Placement.Homes[0].Phase, tc.wantCandidate)
+			}
+			if len(got.Content.Issues) != 0 {
+				t.Errorf("unexpected issues=%+v", got.Content.Issues)
+			}
+		})
+	}
+}
+
+func TestProjectStatusFlagsUnknownPhasesWithoutEchoingThem(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		placement string
+		candidate string
+		malformed bool
+	}{
+		{"future", "FuturePlacement", "FutureCandidate", false},
+		{"placement-control-text", "FuturePlacement\nplacement-control\x1b[31m", "FutureCandidate", false},
+		{"candidate-control-text", "FuturePlacement", "FutureCandidate\rcandidate-control\x1b[2J", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			s.InferenceService.Status.Placement.Phase = ome.PlacementPhase(tc.placement)
+			s.InferenceService.Status.Placement.Candidates = []ome.CandidatePlacement{
+				{Cluster: "west", Phase: ome.CandidatePlacementPhase(tc.candidate)},
+				{Cluster: "east", Phase: ome.CandidatePlacementPhase(tc.candidate)},
+				{Cluster: "empty"},
+			}
+			got, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Content.Placement.Phase != "Unknown" {
+				t.Errorf("placement phase=%q want Unknown", got.Content.Placement.Phase)
+			}
+			wantHomes := 3
+			if tc.malformed {
+				wantHomes = 0
+				if got.Content.Placement.HomePreview.State != "MalformedPayload" {
+					t.Errorf("home preview=%+v want MalformedPayload", got.Content.Placement.HomePreview)
+				}
+			}
+			if len(got.Content.Placement.Homes) != wantHomes {
+				t.Fatalf("homes=%+v", got.Content.Placement.Homes)
+			}
+			for _, home := range got.Content.Placement.Homes {
+				want := v.PlacementValue("Unknown")
+				if home.Cluster == "empty" {
+					want = "NotRecorded"
+				}
+				if home.Phase != want {
+					t.Errorf("home %s phase=%q want %q", home.Cluster, home.Phase, want)
+				}
+			}
+			wantIssues := []v.PlacementIssue{
+				{Group: "CandidatePhase", Code: "UnknownValue", Count: 2},
+				{Group: "PlacementPhase", Code: "UnknownValue", Count: 1},
+			}
+			if tc.malformed {
+				wantIssues = wantIssues[1:]
+			}
+			if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+				t.Errorf("issues=%+v want %+v", got.Content.Issues, wantIssues)
+			}
+			candidates := s.InferenceService.Status.Placement.Candidates
+			candidates[0], candidates[2] = candidates[2], candidates[0]
+			reordered, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+				var out, reorderedOut bytes.Buffer
+				if err := report.Write(&out, format, got); err != nil {
+					t.Fatal(err)
+				}
+				if err := report.Write(&reorderedOut, format, reordered); err != nil {
+					t.Fatal(err)
+				}
+				if out.String() != reorderedOut.String() {
+					t.Errorf("%s output changed after reordering candidates", format)
+				}
+				for _, raw := range []string{tc.placement, tc.candidate, "FuturePlacement", "FutureCandidate", "placement-control", "candidate-control", "\x1b"} {
+					if strings.Contains(out.String(), raw) {
+						t.Errorf("%s output leaked %q: %s", format, raw, out.String())
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestProjectStatusDiscardsCandidatePhaseIssuesOnInvalidHomes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		other     ome.CandidatePlacement
+		wantState v.PlacementValue
+	}{
+		{"malformed", ome.CandidatePlacement{Cluster: "east", Phase: "FutureCandidate\ncontrol-text\x1b[2J"}, "MalformedPayload"},
+		{"conflicting-duplicate", ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced}, "ConflictingDuplicates"}, //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			s.InferenceService.Status.Placement.Phase = "FuturePlacement"
+			unknown := ome.CandidatePlacement{Cluster: "west", Phase: "FutureCandidate"}
+			outputs := map[report.Format]string{}
+			for i, candidates := range [][]ome.CandidatePlacement{{unknown, tc.other}, {tc.other, unknown}} {
+				s.InferenceService.Status.Placement.Candidates = candidates
+				got, err := ProjectStatus(s, fixtureClock)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Content.Placement.HomePreview.State != tc.wantState || len(got.Content.Placement.Homes) != 0 {
+					t.Errorf("order %d: placement=%+v", i, got.Content.Placement)
+				}
+				wantIssues := []v.PlacementIssue{{Group: "PlacementPhase", Code: "UnknownValue", Count: 1}}
+				if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+					t.Errorf("order %d: issues=%+v want %+v", i, got.Content.Issues, wantIssues)
+				}
+				for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+					var out bytes.Buffer
+					if err := report.Write(&out, format, got); err != nil {
+						t.Fatal(err)
+					}
+					if i == 0 {
+						outputs[format] = out.String()
+					} else if out.String() != outputs[format] {
+						t.Errorf("%s output changed after reordering invalid candidates", format)
+					}
+					for _, raw := range []string{"FuturePlacement", "FutureCandidate", "control-text", "\x1b"} {
+						if strings.Contains(out.String(), raw) {
+							t.Errorf("%s output leaked %q: %s", format, raw, out.String())
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestProjectStatusDiscardsCandidateDerivedIssuesOnRejectedCandidateSet(t *testing.T) {
+	provenanceCases := []struct {
+		name       string
+		candidate  ome.CandidatePlacement
+		privateRaw string
+	}{
+		{
+			name: "malformed-provenance",
+			candidate: ome.CandidatePlacement{
+				Cluster: "west",
+				Phase:   "FutureCandidate",
+				Autoscaling: &ome.CandidateAutoscalingStatus{Policies: []ome.CandidatePolicyDigest{{
+					Name:           "safe-policy",
+					PortableDigest: "pv1:malformed-provenance-control\n\x1b[31m",
+				}}},
+			},
+			privateRaw: "malformed-provenance-control",
+		},
+		{
+			name: "budget-exceeded-provenance",
+			candidate: ome.CandidatePlacement{
+				Cluster: "west",
+				Phase:   "FutureCandidate",
+				Autoscaling: &ome.CandidateAutoscalingStatus{
+					Policies: make([]ome.CandidatePolicyDigest, 65),
+				},
+			},
+			privateRaw: "budget-provenance-control",
+		},
+	}
+	provenanceCases[1].candidate.Autoscaling.Policies[0] = ome.CandidatePolicyDigest{
+		Name:           "budget-provenance-control\n\x1b[31m",
+		PortableDigest: "pv1:hidden",
+	}
+
+	rejectionCases := []struct {
+		name      string
+		candidate ome.CandidatePlacement
+		wantState v.PlacementValue
+	}{
+		{
+			name:      "malformed-candidate",
+			candidate: ome.CandidatePlacement{Cluster: "east", Phase: "RejectedCandidate\ncandidate-control\x1b[2J"},
+			wantState: "MalformedPayload",
+		},
+		{
+			name:      "conflicting-duplicate",
+			candidate: ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced}, //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
+			wantState: "ConflictingDuplicates",
+		},
+	}
+
+	for _, provenanceCase := range provenanceCases {
+		for _, rejectionCase := range rejectionCases {
+			t.Run(provenanceCase.name+"/"+rejectionCase.name, func(t *testing.T) {
+				outputs := map[report.Format]string{}
+				orders := [][]ome.CandidatePlacement{
+					{provenanceCase.candidate, rejectionCase.candidate},
+					{rejectionCase.candidate, provenanceCase.candidate},
+				}
+				for i, candidates := range orders {
+					s := fixture(t)
+					s.InferenceService.Status.Placement.Phase = "FuturePlacement"
+					s.InferenceService.Status.Placement.Candidates = candidates
+					got, err := ProjectStatus(s, fixtureClock)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got.Content.Placement.HomePreview.State != rejectionCase.wantState ||
+						got.Content.Placement.HomePreview.Total != len(candidates) ||
+						got.Content.Placement.HomePreview.Kept != 0 ||
+						got.Content.Placement.ProvenancePreview.State != "Unavailable" ||
+						got.Content.Placement.ProvenancePreview.Total != len(candidates) ||
+						got.Content.Placement.ProvenancePreview.Kept != 0 ||
+						len(got.Content.Placement.Homes) != 0 {
+						t.Errorf("order %d: rejected placement=%+v", i, got.Content.Placement)
+					}
+					wantIssues := []v.PlacementIssue{{Group: "PlacementPhase", Code: "UnknownValue", Count: 1}}
+					if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+						t.Errorf("order %d: issues=%+v want %+v", i, got.Content.Issues, wantIssues)
+					}
+					for _, issue := range got.Content.Issues {
+						if issue.Group == "CandidateProvenance" || issue.Group == "CandidatePhase" {
+							t.Errorf("order %d: provisional candidate issue survived rejection: %+v", i, issue)
+						}
+					}
+					for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+						var out bytes.Buffer
+						if err := report.Write(&out, format, got); err != nil {
+							t.Fatal(err)
+						}
+						if i == 0 {
+							outputs[format] = out.String()
+						} else if out.String() != outputs[format] {
+							t.Errorf("%s output changed after reordering rejected candidates", format)
+						}
+						for _, raw := range []string{
+							"FuturePlacement",
+							"FutureCandidate",
+							"RejectedCandidate",
+							provenanceCase.privateRaw,
+							"candidate-control",
+							"\x1b",
+						} {
+							if strings.Contains(out.String(), raw) {
+								t.Errorf("%s output leaked %q: %s", format, raw, out.String())
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProjectStatusAggregatesUnknownCandidatePhasesAcrossBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		unique         int
+		unknownFrom    int
+		duplicate      bool
+		wantIssueCount int
+		wantKept       int
+		wantState      v.PlacementValue
+		wantPhase      v.PlacementValue
+	}{
+		{"identical-duplicate", 1, 0, true, 1, 1, "Validated", "Unknown"},
+		{"unknown-beyond-preview", 65, 64, false, 1, 64, "Validated", "Placed"},
+		{"at-scan-budget", 256, 0, false, 256, 64, "Validated", "Unknown"},
+		{"over-scan-budget", 257, 0, false, 0, 0, "BudgetExceeded", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fixture(t)
+			candidates := make([]ome.CandidatePlacement, tc.unique)
+			for i := range candidates {
+				phase := ome.CandidatePhasePlaced //nolint:staticcheck // Deliberately exercise legacy wire compatibility.
+				if i >= tc.unknownFrom {
+					phase = "FutureCandidate"
+				}
+				candidates[i] = ome.CandidatePlacement{Cluster: fmt.Sprintf("home-%03d", i), Phase: phase}
+			}
+			if tc.duplicate {
+				candidates = append(candidates, candidates[0])
+			}
+			s.InferenceService.Status.Placement.Candidates = candidates
+			got, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantIssues := []v.PlacementIssue{}
+			if tc.wantIssueCount > 0 {
+				wantIssues = append(wantIssues, v.PlacementIssue{Group: "CandidatePhase", Code: "UnknownValue", Count: tc.wantIssueCount})
+			}
+			if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+				t.Errorf("issues=%+v want %+v", got.Content.Issues, wantIssues)
+			}
+			preview := got.Content.Placement.HomePreview
+			if preview.State != tc.wantState || preview.Total != tc.unique || preview.Kept != tc.wantKept || len(got.Content.Placement.Homes) != tc.wantKept {
+				t.Errorf("preview=%+v homes=%d", preview, len(got.Content.Placement.Homes))
+			}
+			for _, home := range got.Content.Placement.Homes {
+				if home.Phase != tc.wantPhase {
+					t.Errorf("home %s phase=%q want %q", home.Cluster, home.Phase, tc.wantPhase)
+				}
+			}
+			for i, j := 0, len(candidates)-1; i < j; i, j = i+1, j-1 {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+			reordered, err := ProjectStatus(s, fixtureClock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, reordered) {
+				t.Error("report changed after reversing candidate order")
+			}
+		})
+	}
 }
 
 func TestSplitReportedNotFloorFulfillmentAndOriginPrivacy(t *testing.T) {
