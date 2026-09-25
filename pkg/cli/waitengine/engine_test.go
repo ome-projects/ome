@@ -28,14 +28,19 @@ type response struct {
 	snapshot Snapshot[bool]
 	err      error
 }
+
+type watchResponse struct {
+	watcher watch.Interface
+	err     error
+}
+
 type scriptedSource struct {
-	mu           sync.Mutex
-	responses    []response
-	watcher      watch.Interface
-	watchErr     error
-	requests     chan string
-	blockGet     bool
-	watchFactory func() watch.Interface
+	mu             sync.Mutex
+	responses      []response
+	watchResponses []watchResponse
+	watchIndex     int
+	requests       chan string
+	blockGet       bool
 }
 
 func (s *scriptedSource) Get(ctx context.Context) (Snapshot[bool], error) {
@@ -54,10 +59,14 @@ func (s *scriptedSource) Get(ctx context.Context) (Snapshot[bool], error) {
 }
 func (s *scriptedSource) Watch(_ context.Context, rv string) (watch.Interface, error) {
 	s.requests <- "watch:" + rv
-	if s.watchFactory != nil {
-		return s.watchFactory(), s.watchErr
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.watchIndex >= len(s.watchResponses) {
+		return nil, errors.New("unexpected watch opening")
 	}
-	return s.watcher, s.watchErr
+	r := s.watchResponses[s.watchIndex]
+	s.watchIndex++
+	return r.watcher, r.err
 }
 func (*scriptedSource) Decode(obj runtime.Object) (Snapshot[bool], error) {
 	m, ok := obj.(*metav1.PartialObjectMetadata)
@@ -71,6 +80,15 @@ func falseSnapshot() Snapshot[bool] {
 }
 func object(uid, rv, name string) *metav1.PartialObjectMetadata {
 	return &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{UID: types.UID(uid), ResourceVersion: rv, Name: name}}
+}
+func retryAfterStatus(seconds int32) *metav1.Status {
+	return &metav1.Status{
+		Status:  metav1.StatusFailure,
+		Reason:  metav1.StatusReasonTooManyRequests,
+		Code:    429,
+		Message: "PRIVATE",
+		Details: &metav1.StatusDetails{RetryAfterSeconds: seconds},
+	}
 }
 func boolPredicate(v bool) (Decision, error) {
 	if v {
@@ -110,7 +128,15 @@ func finish(t *testing.T, ch <-chan completion) completion {
 	}
 }
 func sourceFor(r ...response) *scriptedSource {
-	return &scriptedSource{responses: r, requests: make(chan string, 20), watcher: watch.NewRaceFreeFake()}
+	return &scriptedSource{
+		responses:      r,
+		watchResponses: []watchResponse{{watcher: watch.NewRaceFreeFake()}},
+		requests:       make(chan string, 20),
+	}
+}
+
+func fakeWatcher(s *scriptedSource, index int) *watch.RaceFreeFakeWatcher {
+	return s.watchResponses[index].watcher.(*watch.RaceFreeFakeWatcher)
 }
 
 func TestWatchMatchAndOpaqueResourceVersion(t *testing.T) {
@@ -120,8 +146,8 @@ func TestWatchMatchAndOpaqueResourceVersion(t *testing.T) {
 	done := startEngine(t, s, ctx, Options{Timeout: time.Minute})
 	request(t, s, "get")
 	request(t, s, "watch:opaque:rv")
-	w := s.watcher.(*watch.RaceFreeFakeWatcher)
-	w.Action(watch.Bookmark, &metav1.PartialObjectMetadata{})
+	w := fakeWatcher(s, 0)
+	w.Action(watch.Bookmark, object("", "bookmark:rv", ""))
 	w.Modify(object("uid-a", "not-a-number", "ready"))
 	c := finish(t, done)
 	require.NoError(t, c.err)
@@ -130,6 +156,160 @@ func TestWatchMatchAndOpaqueResourceVersion(t *testing.T) {
 	require.Equal(t, 2, c.result.Counts.Observations)
 	require.True(t, w.IsStopped())
 }
+
+func TestBookmarkAdvancesReconnectResourceVersionWithoutObservation(t *testing.T) {
+	first := watch.NewRaceFreeFake()
+	second := watch.NewRaceFreeFake()
+	s := sourceFor(response{snapshot: falseSnapshot()})
+	s.watchResponses = []watchResponse{{watcher: first}, {watcher: second}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startEngine(t, s, ctx, Options{Timeout: time.Minute})
+	request(t, s, "get")
+	request(t, s, "watch:opaque:rv")
+	first.Action(watch.Bookmark, object("", "bookmark:rv", ""))
+	first.Stop()
+	request(t, s, "watch:bookmark:rv")
+	second.Modify(object("uid-a", "ready:rv", "ready"))
+	c := finish(t, done)
+	require.NoError(t, c.err)
+	require.Equal(t, OutcomeMatched, c.result.Outcome)
+	require.Equal(t, MethodWatch, c.result.Method)
+	require.False(t, c.result.Fallback)
+	require.Equal(t, Counts{Gets: 1, Watches: 2, Events: 2, Observations: 2}, c.result.Counts)
+	require.True(t, c.result.Last)
+	require.Empty(t, s.requests)
+}
+
+func TestMalformedBookmarkFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		object runtime.Object
+	}{
+		{name: "missing resource version", object: &metav1.PartialObjectMetadata{}},
+		{name: "non-metadata status", object: &metav1.Status{Message: "PRIVATE"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := sourceFor(response{snapshot: falseSnapshot()})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := startEngine(t, s, ctx, Options{Timeout: time.Minute})
+			request(t, s, "get")
+			request(t, s, "watch:opaque:rv")
+			fakeWatcher(s, 0).Action(watch.Bookmark, tc.object)
+			c := finish(t, done)
+			require.Error(t, c.err)
+			require.Equal(t, ReasonInvalidIdentity, c.err.(*Error).Reason)
+			require.NotContains(t, c.err.Error(), "PRIVATE")
+			require.Equal(t, Counts{Gets: 1, Watches: 1, Events: 1, Observations: 1}, c.result.Counts)
+			require.Empty(t, s.requests)
+		})
+	}
+}
+
+func TestExpiredStreamRefreshesNamedObjectBeforeResume(t *testing.T) {
+	refreshed := falseSnapshot()
+	refreshed.ResourceVersion = "rv-fresh"
+	first := watch.NewRaceFreeFake()
+	second := watch.NewRaceFreeFake()
+	s := sourceFor(response{snapshot: falseSnapshot()}, response{snapshot: refreshed})
+	s.watchResponses = []watchResponse{{watcher: first}, {watcher: second}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startEngine(t, s, ctx, Options{Timeout: time.Minute})
+	request(t, s, "get")
+	request(t, s, "watch:opaque:rv")
+	first.Error(&metav1.Status{Status: metav1.StatusFailure, Reason: metav1.StatusReasonExpired, Code: 410, Message: "PRIVATE"})
+	request(t, s, "get")
+	request(t, s, "watch:rv-fresh")
+	second.Modify(object("uid-a", "ready:rv", "ready"))
+	c := finish(t, done)
+	require.NoError(t, c.err)
+	require.Equal(t, OutcomeMatched, c.result.Outcome)
+	require.Equal(t, MethodWatch, c.result.Method)
+	require.False(t, c.result.Fallback)
+	require.Equal(t, Counts{Gets: 2, Watches: 2, Events: 2, Observations: 3}, c.result.Counts)
+	require.Empty(t, s.requests)
+}
+
+func TestRetryAfterDelaysOneBoundedWatchResume(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		retrySeconds int32
+		wantDelay    time.Duration
+	}{
+		{name: "reported delay", retrySeconds: 3, wantDelay: 3 * time.Second},
+		{name: "delay capped", retrySeconds: 3600, wantDelay: 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+			first := watch.NewRaceFreeFake()
+			second := watch.NewRaceFreeFake()
+			s := sourceFor(response{snapshot: falseSnapshot()})
+			s.watchResponses = []watchResponse{{watcher: first}, {watcher: second}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk})
+			request(t, s, "get")
+			request(t, s, "watch:opaque:rv")
+			first.Error(retryAfterStatus(tc.retrySeconds))
+			require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+			require.Empty(t, s.requests)
+			clk.Step(tc.wantDelay - time.Nanosecond)
+			require.Empty(t, s.requests)
+			clk.Step(time.Nanosecond)
+			request(t, s, "watch:opaque:rv")
+			second.Modify(object("uid-a", "ready:rv", "ready"))
+			c := finish(t, done)
+			require.NoError(t, c.err)
+			require.Equal(t, OutcomeMatched, c.result.Outcome)
+			require.Equal(t, MethodWatch, c.result.Method)
+			require.False(t, c.result.Fallback)
+			require.Equal(t, Counts{Gets: 1, Watches: 2, Events: 2, Observations: 2}, c.result.Counts)
+			require.Empty(t, s.requests)
+		})
+	}
+
+	t.Run("parent cancellation", func(t *testing.T) {
+		clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+		first := watch.NewRaceFreeFake()
+		s := sourceFor(response{snapshot: falseSnapshot()})
+		s.watchResponses = []watchResponse{{watcher: first}, {watcher: watch.NewRaceFreeFake()}}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk})
+		request(t, s, "get")
+		request(t, s, "watch:opaque:rv")
+		first.Error(retryAfterStatus(3))
+		require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+		cancel()
+		c := finish(t, done)
+		require.Error(t, c.err)
+		require.Equal(t, ReasonCanceled, c.err.(*Error).Reason)
+		require.Equal(t, Counts{Gets: 1, Watches: 1, Events: 1, Observations: 1}, c.result.Counts)
+		require.Empty(t, s.requests)
+		require.Eventually(t, func() bool { return clk.Waiters() == 0 }, time.Second, time.Millisecond)
+	})
+}
+
+func TestRetryAfterAtOverallDeadlineDoesNotReopenWatch(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	first := watch.NewRaceFreeFake()
+	s := sourceFor(response{snapshot: falseSnapshot()})
+	s.watchResponses = []watchResponse{{watcher: first}, {watcher: watch.NewRaceFreeFake()}}
+	done := startEngine(t, s, context.Background(), Options{Timeout: 3 * time.Second, Clock: clk})
+	request(t, s, "get")
+	request(t, s, "watch:opaque:rv")
+	first.Error(retryAfterStatus(3))
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	clk.Step(3 * time.Second)
+	c := finish(t, done)
+	require.NoError(t, c.err)
+	require.Equal(t, OutcomeTimedOut, c.result.Outcome)
+	require.False(t, c.result.Fallback)
+	require.Equal(t, Counts{Gets: 1, Watches: 1, Events: 1, Observations: 1}, c.result.Counts)
+	require.Empty(t, s.requests)
+}
+
 func TestDeletionAndReplacementNeverMatch(t *testing.T) {
 	for _, tc := range []struct {
 		name, uid string
@@ -143,7 +323,7 @@ func TestDeletionAndReplacementNeverMatch(t *testing.T) {
 			done := startEngine(t, s, ctx, Options{Timeout: time.Minute})
 			request(t, s, "get")
 			request(t, s, "watch:opaque:rv")
-			w := s.watcher.(*watch.RaceFreeFakeWatcher)
+			w := fakeWatcher(s, 0)
 			if tc.deleted {
 				w.Delete(object(tc.uid, "rv2", "ready"))
 			} else {
@@ -179,7 +359,7 @@ func TestTimeoutAndParentCancelCloseWatch(t *testing.T) {
 				require.NoError(t, c.err)
 				require.Equal(t, OutcomeTimedOut, c.result.Outcome)
 			}
-			require.True(t, s.watcher.(*watch.RaceFreeFakeWatcher).IsStopped())
+			require.True(t, fakeWatcher(s, 0).IsStopped())
 		})
 	}
 }
@@ -202,7 +382,7 @@ func TestForbiddenWatchFallsBackToBoundedPolling(t *testing.T) {
 	ready := snap
 	ready.Value = true
 	s := sourceFor(response{snapshot: snap}, response{snapshot: ready})
-	s.watchErr = apierrors.NewForbidden(schema.GroupResource{Resource: "inferenceservices"}, "service", errors.New("secret"))
+	s.watchResponses[0].err = apierrors.NewForbidden(schema.GroupResource{Resource: "inferenceservices"}, "service", errors.New("secret"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk})
@@ -220,6 +400,29 @@ func TestForbiddenWatchFallsBackToBoundedPolling(t *testing.T) {
 	require.Equal(t, MethodPoll, c.result.Method)
 	require.Equal(t, 1, c.result.Counts.Polls)
 }
+
+func TestPollTimerAtOverallDeadlineDoesNotRecordPoll(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
+	s := sourceFor(response{snapshot: falseSnapshot()})
+	s.watchResponses[0].err = apierrors.NewForbidden(
+		schema.GroupResource{Resource: "inferenceservices"},
+		"service",
+		errors.New("secret"),
+	)
+	done := startEngine(t, s, context.Background(), Options{Timeout: 5 * time.Second, Clock: clk})
+	request(t, s, "get")
+	request(t, s, "watch:opaque:rv")
+	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
+	clk.Step(5 * time.Second)
+	c := finish(t, done)
+	require.NoError(t, c.err)
+	require.Equal(t, OutcomeTimedOut, c.result.Outcome)
+	require.False(t, c.result.Fallback)
+	require.Equal(t, MethodInitialGET, c.result.Method)
+	require.Equal(t, Counts{Gets: 1, Watches: 1, Observations: 1}, c.result.Counts)
+	require.Empty(t, s.requests)
+}
+
 func TestPollOnlySkipsWatchAndKeepsFallbackFalse(t *testing.T) {
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	snap := falseSnapshot()
@@ -310,7 +513,7 @@ func TestInitialAndLaterNotFound(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, OutcomeNotFound, r.Outcome)
 	s = sourceFor(response{snapshot: falseSnapshot()}, response{err: nf})
-	s.watchErr = apierrors.NewResourceExpired("private")
+	s.watchResponses[0].err = apierrors.NewResourceExpired("private")
 	r, err = Run(context.Background(), s, boolPredicate, Options{Timeout: time.Minute})
 	require.NoError(t, err)
 	require.Equal(t, OutcomeDeleted, r.Outcome)
@@ -322,7 +525,7 @@ func TestExpiredWatchCanMatchRefreshedNamedGet(t *testing.T) {
 	matched.Value = true
 	matched.ResourceVersion = "opaque-refresh"
 	s := sourceFor(response{snapshot: snap}, response{snapshot: matched})
-	s.watchErr = apierrors.NewResourceExpired("PRIVATE")
+	s.watchResponses[0].err = apierrors.NewResourceExpired("PRIVATE")
 	r, err := Run(context.Background(), s, boolPredicate, Options{Timeout: time.Minute})
 	require.NoError(t, err)
 	require.Equal(t, OutcomeMatched, r.Outcome)
@@ -357,10 +560,10 @@ func TestEventBudgetStopsWatch(t *testing.T) {
 	done := startEngine(t, s, ctx, Options{Timeout: time.Minute, EventBudget: 2})
 	request(t, s, "get")
 	request(t, s, "watch:opaque:rv")
-	w := s.watcher.(*watch.RaceFreeFakeWatcher)
-	w.Action(watch.Bookmark, &metav1.PartialObjectMetadata{})
-	w.Action(watch.Bookmark, &metav1.PartialObjectMetadata{})
-	w.Action(watch.Bookmark, &metav1.PartialObjectMetadata{})
+	w := fakeWatcher(s, 0)
+	w.Action(watch.Bookmark, object("", "bookmark:1", ""))
+	w.Action(watch.Bookmark, object("", "bookmark:2", ""))
+	w.Action(watch.Bookmark, object("", "bookmark:3", ""))
 	c := finish(t, done)
 	require.Equal(t, ReasonEventLimit, c.err.(*Error).Reason)
 	require.True(t, w.IsStopped())
@@ -375,9 +578,9 @@ func TestFirstAndLastAdmittedEventCanMatch(t *testing.T) {
 			done := startEngine(t, s, ctx, Options{Timeout: time.Minute, EventBudget: budget})
 			request(t, s, "get")
 			request(t, s, "watch:opaque:rv")
-			w := s.watcher.(*watch.RaceFreeFakeWatcher)
+			w := fakeWatcher(s, 0)
 			if budget == 2 {
-				w.Action(watch.Bookmark, &metav1.PartialObjectMetadata{})
+				w.Action(watch.Bookmark, object("", "bookmark:rv", ""))
 			}
 			w.Modify(object("uid-a", "rv2", "ready"))
 			c := finish(t, done)
@@ -396,23 +599,32 @@ func TestShortPollingIntervalDoesNotExpandAcquisitionBudget(t *testing.T) {
 }
 
 func TestWatchServerAndStreamErrorCanPoll(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		t.Run(map[bool]string{false: "server", true: "stream"}[stream], func(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		openErr      error
+		streamStatus *metav1.Status
+	}{
+		{name: "server internal", openErr: apierrors.NewInternalError(errors.New("PRIVATE"))},
+		{name: "stream internal", streamStatus: &metav1.Status{Reason: metav1.StatusReasonInternalError, Code: 500, Message: "PRIVATE"}},
+		{name: "server too many requests without delay", openErr: apierrors.NewTooManyRequests("PRIVATE", 0)},
+		{name: "stream server timeout without delay", streamStatus: &metav1.Status{Reason: metav1.StatusReasonServerTimeout, Code: 504, Message: "PRIVATE"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 			snap := falseSnapshot()
 			matched := snap
 			matched.Value = true
 			s := sourceFor(response{snapshot: snap}, response{snapshot: matched})
-			if !stream {
-				s.watchErr = apierrors.NewInternalError(errors.New("PRIVATE"))
+			if tc.openErr != nil {
+				s.watchResponses[0] = watchResponse{err: tc.openErr}
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk})
 			request(t, s, "get")
 			request(t, s, "watch:opaque:rv")
-			if stream {
-				s.watcher.(*watch.RaceFreeFakeWatcher).Error(&metav1.Status{Reason: metav1.StatusReasonInternalError, Code: 500, Message: "PRIVATE"})
+			if tc.streamStatus != nil {
+				fakeWatcher(s, 0).Error(tc.streamStatus)
 			}
 			require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
 			clk.Step(5 * time.Second)
@@ -421,22 +633,30 @@ func TestWatchServerAndStreamErrorCanPoll(t *testing.T) {
 			require.NoError(t, c.err)
 			require.Equal(t, OutcomeMatched, c.result.Outcome)
 			require.True(t, c.result.Fallback)
+			require.Equal(t, MethodPoll, c.result.Method)
+			require.Equal(t, 1, c.result.Counts.Watches)
+			require.Equal(t, 1, c.result.Counts.Polls)
+			require.Equal(t, 2, c.result.Counts.Gets)
+			if tc.streamStatus == nil {
+				require.Zero(t, c.result.Counts.Events)
+			} else {
+				require.Equal(t, 1, c.result.Counts.Events)
+			}
 		})
 	}
 }
-func TestTwoEarlyEOFsThrottleIntoPolling(t *testing.T) {
+func TestTwoEarlyEOFsResumeThenThrottleIntoPolling(t *testing.T) {
 	clk := clocktesting.NewFakeClock(time.Unix(1000, 0))
 	snap := falseSnapshot()
 	matched := snap
 	matched.Value = true
-	s := sourceFor(response{snapshot: snap}, response{snapshot: snap}, response{snapshot: matched})
-	s.watchFactory = func() watch.Interface { return watch.NewEmptyWatch() }
+	s := sourceFor(response{snapshot: snap}, response{snapshot: matched})
+	s.watchResponses = []watchResponse{{watcher: watch.NewEmptyWatch()}, {watcher: watch.NewEmptyWatch()}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := startEngine(t, s, ctx, Options{Timeout: time.Minute, Clock: clk})
 	request(t, s, "get")
 	request(t, s, "watch:opaque:rv")
-	request(t, s, "get")
 	request(t, s, "watch:opaque:rv")
 	require.Eventually(t, func() bool { return clk.Waiters() == 2 }, time.Second, time.Millisecond)
 	require.Empty(t, s.requests)
@@ -445,8 +665,13 @@ func TestTwoEarlyEOFsThrottleIntoPolling(t *testing.T) {
 	c := finish(t, done)
 	require.NoError(t, c.err)
 	require.Equal(t, OutcomeMatched, c.result.Outcome)
+	require.Equal(t, MethodPoll, c.result.Method)
+	require.True(t, c.result.Fallback)
 	require.Equal(t, 2, c.result.Counts.Watches)
-	require.Equal(t, 3, c.result.Counts.Gets)
+	require.Equal(t, 2, c.result.Counts.Gets)
+	require.Equal(t, 1, c.result.Counts.Polls)
+	require.Equal(t, 2, c.result.Counts.Observations)
+	require.Empty(t, s.requests)
 }
 func TestWatchFailureAndMalformedEventsAreGeneral(t *testing.T) {
 	for _, tc := range []struct {
@@ -465,17 +690,17 @@ func TestWatchFailureAndMalformedEventsAreGeneral(t *testing.T) {
 			done := startEngine(t, s, ctx, Options{Timeout: time.Minute})
 			request(t, s, "get")
 			request(t, s, "watch:opaque:rv")
-			s.watcher.(*watch.RaceFreeFakeWatcher).Action(tc.event.Type, tc.event.Object)
+			fakeWatcher(s, 0).Action(tc.event.Type, tc.event.Object)
 			c := finish(t, done)
 			require.Equal(t, tc.want, c.err.(*Error).Reason)
 		})
 	}
 	s := sourceFor(response{snapshot: falseSnapshot()})
-	s.watchErr = apierrors.NewUnauthorized("PRIVATE")
+	s.watchResponses[0].err = apierrors.NewUnauthorized("PRIVATE")
 	_, err := Run(context.Background(), s, boolPredicate, Options{Timeout: time.Minute})
 	require.Equal(t, ReasonAcquisitionFailed, err.(*Error).Reason)
 	s = sourceFor(response{snapshot: falseSnapshot()})
-	s.watcher = nil
+	s.watchResponses[0].watcher = nil
 	_, err = Run(context.Background(), s, boolPredicate, Options{Timeout: time.Minute})
 	require.Error(t, err)
 }

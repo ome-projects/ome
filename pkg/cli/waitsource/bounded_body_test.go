@@ -17,6 +17,33 @@ type errorReader struct{}
 func (errorReader) Read([]byte) (int, error) {
 	return 0, errors.New("PRIVATE response-body credential")
 }
+
+type eofThenErrorReader struct{ calls int }
+
+func (r *eofThenErrorReader) Read(p []byte) (int, error) {
+	r.calls++
+	if r.calls == 1 {
+		return copy(p, "frame"), io.EOF
+	}
+	return 0, errors.New("PRIVATE post-EOF read")
+}
+
+func TestBoundedBodyLatchesTerminalEOF(t *testing.T) {
+	reader := &eofThenErrorReader{}
+	body := &trackedBody{Reader: reader}
+	bounded := &boundedBody{body: body, remaining: responseByteLimit + 1}
+	buffer := make([]byte, 16)
+	n, err := bounded.Read(buffer)
+	require.Equal(t, 5, n)
+	require.Equal(t, "frame", string(buffer[:n]))
+	require.ErrorIs(t, err, io.EOF)
+	n, err = bounded.Read(buffer)
+	require.Zero(t, n)
+	require.ErrorIs(t, err, io.EOF)
+	require.Equal(t, 1, reader.calls)
+	require.Equal(t, int32(1), body.closed.Load())
+}
+
 func TestUnreadableBodyNeverReturnsRawReaderError(t *testing.T) {
 	body := &trackedBody{Reader: errorReader{}}
 	bounded := &boundedBody{body: body, remaining: responseByteLimit + 1}
