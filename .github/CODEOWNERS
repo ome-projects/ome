@@ -16,7 +16,7 @@
 /charts/ @slin1237 @XinyueZhang369
 
 # cmd
-/cmd/ @slin1237 @pallasathena92 @beiguo218 @op109lvb
+/cmd/ @slin1237 @pallasathena92 @beiguo218 @op109lvb @fanyang-real @Huang-Wei
 
 # config
 /config/ @slin1237 @CatherineSue @XinyueZhang369
@@ -34,41 +34,41 @@
 /oeps/ @slin1237
 
 # pkg
-/pkg/ @slin1237
-/pkg/acceleratorclassselector/ @slin1237
-/pkg/afero/ @slin1237
-/pkg/apis/ @slin1237 @pallasathena92 @beiguo218
-/pkg/auth/ @slin1237
-/pkg/auth/aws/ @slin1237
-/pkg/auth/azure/ @slin1237
-/pkg/auth/gcp/ @slin1237
-/pkg/auth/oci/ @slin1237
-/pkg/configutils/ @slin1237
-/pkg/constants/ @slin1237
-/pkg/controller/ @slin1237
-/pkg/controller/v1beta1/ @slin1237
-/pkg/controller/v1beta1/acceleratorclass/ @slin1237
-/pkg/controller/v1beta1/basemodel/ @slin1237
-/pkg/controller/v1beta1/benchmark/ @slin1237 @CatherineSue
-/pkg/controller/v1beta1/controllerconfig/ @slin1237
-/pkg/controller/v1beta1/inferenceservice/ @slin1237 @CatherineSue @YouNeedCryDear @pallasathena92 @beiguo218
+/pkg/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/acceleratorclassselector/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/afero/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/apis/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/auth/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/auth/aws/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/auth/azure/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/auth/gcp/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/auth/oci/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/configutils/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/constants/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/controller/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/controller/v1beta1/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/controller/v1beta1/acceleratorclass/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/controller/v1beta1/basemodel/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/controller/v1beta1/benchmark/ @slin1237 @CatherineSue @fanyang-real @Huang-Wei
+/pkg/controller/v1beta1/controllerconfig/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/controller/v1beta1/inferenceservice/ @slin1237 @CatherineSue @YouNeedCryDear @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
 
-/pkg/hfutil/ @slin1237 @pallasathena92 @beiguo218
-/pkg/imds/ @slin1237
-/pkg/logging/ @slin1237
-/pkg/modelagent/ @slin1237 @pallasathena92 @beiguo218 @truddy0 @op109lvb
-/pkg/modelver/ @slin1237 @pallasathena92 @beiguo218
-/pkg/ociobjectstore/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218
-/pkg/principals/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218
-/pkg/runtimeselector/ @slin1237 @pallasathena92
-/pkg/storage/ @slin1237
-/pkg/utils/ @slin1237
-/pkg/utils/storage/ @slin1237 @beiguo218
-/pkg/vault/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218
-/pkg/version/ @slin1237
-/pkg/webhook/ @slin1237 @pallasathena92 @beiguo218
-/pkg/xet/ @slin1237 @pallasathena92 @beiguo218
-/pkg/zipper/ @slin1237
+/pkg/hfutil/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/imds/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/logging/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/modelagent/ @slin1237 @pallasathena92 @beiguo218 @truddy0 @op109lvb @fanyang-real @Huang-Wei
+/pkg/modelver/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/ociobjectstore/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218 @fanyang-real @Huang-Wei
+/pkg/principals/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218 @fanyang-real @Huang-Wei
+/pkg/runtimeselector/ @slin1237 @pallasathena92 @fanyang-real @Huang-Wei
+/pkg/storage/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/utils/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/utils/storage/ @slin1237 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/vault/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218 @fanyang-real @Huang-Wei
+/pkg/version/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/webhook/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/xet/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/zipper/ @slin1237 @fanyang-real @Huang-Wei
 
 # site (documentation)
 /site/ @slin1237 @pallasathena92 @beiguo218
