@@ -163,7 +163,7 @@ func projectStatus(parent *ome.InferenceService) (v.PlacementStatusContent, labe
 	}
 	seen := map[string]*ome.CandidatePlacement{}
 	projected := map[string]v.PlacementHome{}
-	var candidatePhaseIssues []v.PlacementIssue
+	var candidateIssues []v.PlacementIssue
 	content.Placement.ProvenancePreview.State = "Validated"
 	for i := range p.Candidates {
 		h := &p.Candidates[i]
@@ -183,16 +183,16 @@ func projectStatus(parent *ome.InferenceService) (v.PlacementStatusContent, labe
 		seen[h.Cluster] = h
 		prov := provenance(h)
 		if prov.State == "MalformedPayload" || prov.State == "BudgetExceeded" {
-			addIssue(&content.Issues, "CandidateProvenance", prov.State)
+			addIssue(&candidateIssues, "CandidateProvenance", prov.State)
 			content.Placement.ProvenancePreview.State = "Unavailable"
 		}
 		phase := candidatePhase(h.Phase)
 		if h.Phase != "" && phase == "Unknown" {
-			addIssue(&candidatePhaseIssues, "CandidatePhase", "UnknownValue")
+			addIssue(&candidateIssues, "CandidatePhase", "UnknownValue")
 		}
 		projected[h.Cluster] = v.PlacementHome{Cluster: h.Cluster, Phase: phase, Address: address(h.Endpoint), Source: reported(), AdmittedReplicas: count(h.AdmittedReplicas, inputs.Mode == "Split"), ReadyReplicas: count(h.ReadyReplicas, inputs.Mode == "Split"), Provenance: prov}
 	}
-	content.Issues = append(content.Issues, candidatePhaseIssues...)
+	content.Issues = append(content.Issues, candidateIssues...)
 	names := make([]string, 0, len(seen))
 	for name := range seen {
 		names = append(names, name)

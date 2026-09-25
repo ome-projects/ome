@@ -206,6 +206,121 @@ func TestProjectStatusDiscardsCandidatePhaseIssuesOnInvalidHomes(t *testing.T) {
 	}
 }
 
+func TestProjectStatusDiscardsCandidateDerivedIssuesOnRejectedCandidateSet(t *testing.T) {
+	provenanceCases := []struct {
+		name       string
+		candidate  ome.CandidatePlacement
+		privateRaw string
+	}{
+		{
+			name: "malformed-provenance",
+			candidate: ome.CandidatePlacement{
+				Cluster: "west",
+				Phase:   "FutureCandidate",
+				Autoscaling: &ome.CandidateAutoscalingStatus{Policies: []ome.CandidatePolicyDigest{{
+					Name:           "safe-policy",
+					PortableDigest: "pv1:malformed-provenance-control\n\x1b[31m",
+				}}},
+			},
+			privateRaw: "malformed-provenance-control",
+		},
+		{
+			name: "budget-exceeded-provenance",
+			candidate: ome.CandidatePlacement{
+				Cluster: "west",
+				Phase:   "FutureCandidate",
+				Autoscaling: &ome.CandidateAutoscalingStatus{
+					Policies: make([]ome.CandidatePolicyDigest, 65),
+				},
+			},
+			privateRaw: "budget-provenance-control",
+		},
+	}
+	provenanceCases[1].candidate.Autoscaling.Policies[0] = ome.CandidatePolicyDigest{
+		Name:           "budget-provenance-control\n\x1b[31m",
+		PortableDigest: "pv1:hidden",
+	}
+
+	rejectionCases := []struct {
+		name      string
+		candidate ome.CandidatePlacement
+		wantState v.PlacementValue
+	}{
+		{
+			name:      "malformed-candidate",
+			candidate: ome.CandidatePlacement{Cluster: "east", Phase: "RejectedCandidate\ncandidate-control\x1b[2J"},
+			wantState: "MalformedPayload",
+		},
+		{
+			name:      "conflicting-duplicate",
+			candidate: ome.CandidatePlacement{Cluster: "west", Phase: ome.CandidatePhasePlaced},
+			wantState: "ConflictingDuplicates",
+		},
+	}
+
+	for _, provenanceCase := range provenanceCases {
+		for _, rejectionCase := range rejectionCases {
+			t.Run(provenanceCase.name+"/"+rejectionCase.name, func(t *testing.T) {
+				outputs := map[report.Format]string{}
+				orders := [][]ome.CandidatePlacement{
+					{provenanceCase.candidate, rejectionCase.candidate},
+					{rejectionCase.candidate, provenanceCase.candidate},
+				}
+				for i, candidates := range orders {
+					s := fixture(t)
+					s.InferenceService.Status.Placement.Phase = "FuturePlacement"
+					s.InferenceService.Status.Placement.Candidates = candidates
+					got, err := ProjectStatus(s, fixtureClock)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got.Content.Placement.HomePreview.State != rejectionCase.wantState ||
+						got.Content.Placement.HomePreview.Total != len(candidates) ||
+						got.Content.Placement.HomePreview.Kept != 0 ||
+						got.Content.Placement.ProvenancePreview.State != "Unavailable" ||
+						got.Content.Placement.ProvenancePreview.Total != len(candidates) ||
+						got.Content.Placement.ProvenancePreview.Kept != 0 ||
+						len(got.Content.Placement.Homes) != 0 {
+						t.Errorf("order %d: rejected placement=%+v", i, got.Content.Placement)
+					}
+					wantIssues := []v.PlacementIssue{{Group: "PlacementPhase", Code: "UnknownValue", Count: 1}}
+					if !reflect.DeepEqual(got.Content.Issues, wantIssues) {
+						t.Errorf("order %d: issues=%+v want %+v", i, got.Content.Issues, wantIssues)
+					}
+					for _, issue := range got.Content.Issues {
+						if issue.Group == "CandidateProvenance" || issue.Group == "CandidatePhase" {
+							t.Errorf("order %d: provisional candidate issue survived rejection: %+v", i, issue)
+						}
+					}
+					for _, format := range []report.Format{report.FormatJSON, report.FormatYAML, report.FormatTable} {
+						var out bytes.Buffer
+						if err := report.Write(&out, format, got); err != nil {
+							t.Fatal(err)
+						}
+						if i == 0 {
+							outputs[format] = out.String()
+						} else if out.String() != outputs[format] {
+							t.Errorf("%s output changed after reordering rejected candidates", format)
+						}
+						for _, raw := range []string{
+							"FuturePlacement",
+							"FutureCandidate",
+							"RejectedCandidate",
+							provenanceCase.privateRaw,
+							"candidate-control",
+							"\x1b",
+						} {
+							if strings.Contains(out.String(), raw) {
+								t.Errorf("%s output leaked %q: %s", format, raw, out.String())
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestProjectStatusAggregatesUnknownCandidatePhasesAcrossBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
