@@ -84,11 +84,13 @@ func TestTrafficActionsHelpContract(t *testing.T) {
 	}
 	drain, _, err := cmd.Find([]string{"drain"})
 	require.NoError(t, err)
-	require.NotNil(t, drain.Flags().Lookup("cluster"))
+	require.NotNil(t, drain.Flags().Lookup("workload-cluster"))
+	require.Nil(t, drain.Flags().Lookup("cluster"), "the API cluster flag must not be shadowed")
 	require.NotNil(t, drain.Flags().Lookup("reason"))
 	undrain, _, err := cmd.Find([]string{"undrain"})
 	require.NoError(t, err)
 	require.Nil(t, undrain.Flags().Lookup("cluster"))
+	require.Nil(t, undrain.Flags().Lookup("workload-cluster"))
 	require.Nil(t, undrain.Flags().Lookup("reason"))
 }
 
@@ -98,7 +100,7 @@ func TestTrafficActionClientDryRunUsesOneExactReadAndNoPatch(t *testing.T) {
 		annotations map[string]string
 		args        []string
 	}{
-		{action: "drain", args: []string{"drain", "chat", "--cluster=worker-a", "--id=maintenance-a", "--reason=planned maintenance"}},
+		{action: "drain", args: []string{"drain", "chat", "--workload-cluster=worker-a", "--id=maintenance-a", "--reason=planned maintenance"}},
 		{action: "undrain", annotations: map[string]string{constants.TrafficDrainAnnotation: `{"maintenance-a":{"cluster":"worker-a","reason":"planned maintenance"}}`}, args: []string{"undrain", "chat", "--id=maintenance-a"}},
 	} {
 		t.Run(tc.action, func(t *testing.T) {
@@ -145,7 +147,7 @@ func TestTrafficActionSendsExactPatchForApplyAndServerDryRun(t *testing.T) {
 				annotations := map[string]string{"example.com/keep": "yes"}
 				args := []string{action, "chat", "--id=maintenance-a", "--yes", "--dry-run=" + mode, "-o=json"}
 				if action == "drain" {
-					args = append(args, "--cluster=worker-a", "--reason=planned maintenance")
+					args = append(args, "--workload-cluster=worker-a", "--reason=planned maintenance")
 				} else {
 					annotations[constants.TrafficDrainAnnotation] = `{"maintenance-a":{"cluster":"worker-a","reason":"planned maintenance"},"keep":{"cluster":"worker-b","reason":"still active"}}`
 				}
@@ -198,15 +200,15 @@ func TestTrafficActionRejectsInvalidInputBeforeAPI(t *testing.T) {
 	private := "PRIVATE_SENTINEL"
 	tests := [][]string{
 		{"drain"},
-		{"drain", "chat", "extra", "--id=safe", "--cluster=worker-a", "--reason=safe"},
-		{"drain", "Bad_Name", "--id=safe", "--cluster=worker-a", "--reason=safe"},
-		{"drain", "chat", "--id=Bad_ID", "--cluster=worker-a", "--reason=safe"},
-		{"drain", "chat", "--id=safe", "--cluster=BAD_CLUSTER", "--reason=safe"},
-		{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=line\nbreak"},
-		{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=sk-123456789012345678901234"},
-		{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=safe", "--dry-run=bad"},
-		{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=safe", "-o=bad"},
-		{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=safe", "--yes=" + private},
+		{"drain", "chat", "extra", "--id=safe", "--workload-cluster=worker-a", "--reason=safe"},
+		{"drain", "Bad_Name", "--id=safe", "--workload-cluster=worker-a", "--reason=safe"},
+		{"drain", "chat", "--id=Bad_ID", "--workload-cluster=worker-a", "--reason=safe"},
+		{"drain", "chat", "--id=safe", "--workload-cluster=BAD_CLUSTER", "--reason=safe"},
+		{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=line\nbreak"},
+		{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=sk-123456789012345678901234"},
+		{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=safe", "--dry-run=bad"},
+		{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=safe", "-o=bad"},
+		{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=safe", "--yes=" + private},
 		{"undrain", "chat"},
 		{"undrain", "chat", "--id=safe", "--dry-run=" + private},
 		{"undrain", "chat", "--id=safe", "--unknown=" + private},
@@ -264,7 +266,7 @@ func TestTrafficActionRefusesIneligibleServiceBeforePreviewOrPatch(t *testing.T)
 	var out, stderr bytes.Buffer
 	cmd := NewCmd(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
 	cmd.SilenceErrors, cmd.SilenceUsage = true, true
-	cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=maintenance", "--yes"})
+	cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=maintenance", "--yes"})
 	err := cmd.Execute()
 	require.ErrorIs(t, err, mutate.ErrTrafficDrainIneligible)
 	assert.Equal(t, int32(1), gets.Load(), "eligibility is proven from one exact target read")
@@ -279,7 +281,7 @@ func TestTrafficActionRequiresTTYOrYes(t *testing.T) {
 	var out, stderr bytes.Buffer
 	cmd := NewCmd(f, genericiooptions.IOStreams{In: bytes.NewBufferString("yes\n"), Out: &out, ErrOut: &stderr})
 	cmd.SilenceErrors, cmd.SilenceUsage = true, true
-	cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=maintenance", "--dry-run=client"})
+	cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=maintenance", "--dry-run=client"})
 	err := cmd.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "noninteractive input requires --yes")
@@ -308,7 +310,7 @@ func TestTrafficActionCancellationAndReadTimeout(t *testing.T) {
 			f := &trafficActionFactory{Static: factory.Static{OME: omefake.NewSimpleClientset(trafficActionService(nil)), NS: "prod", Context: "moirai"}}
 			cmd := NewCmd(f, genericiooptions.IOStreams{})
 			cmd.SetContext(ctx)
-			cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=maintenance", "--yes", "--dry-run=client"})
+			cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=maintenance", "--yes", "--dry-run=client"})
 			err := cmd.Execute()
 			require.ErrorIs(t, err, tc.want)
 		})
@@ -332,7 +334,7 @@ func TestTrafficActionCancelsAnInFlightTargetRead(t *testing.T) {
 	cmd := NewCmd(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
 	cmd.SilenceErrors, cmd.SilenceUsage = true, true
 	cmd.SetContext(ctx)
-	cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=maintenance", "--yes", "--dry-run=client"})
+	cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=maintenance", "--yes", "--dry-run=client"})
 	err = cmd.Execute()
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	select {
@@ -383,7 +385,7 @@ func TestTrafficActionSanitizesPatchFailuresAndUnknownOutcomes(t *testing.T) {
 			var out, stderr bytes.Buffer
 			cmd := NewCmd(f, genericiooptions.IOStreams{Out: &out, ErrOut: &stderr})
 			cmd.SilenceErrors, cmd.SilenceUsage = true, true
-			cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=maintenance", "--yes", "-o=json"})
+			cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=maintenance", "--yes", "-o=json"})
 			err := cmd.Execute()
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.match)
@@ -399,7 +401,7 @@ func TestTrafficActionOutputFormats(t *testing.T) {
 			f := &trafficActionFactory{Static: factory.Static{OME: omefake.NewSimpleClientset(trafficActionService(nil)), NS: "prod", Context: "moirai"}}
 			var out bytes.Buffer
 			cmd := NewCmd(f, genericiooptions.IOStreams{Out: &out, ErrOut: io.Discard})
-			cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--cluster=worker-a", "--reason=maintenance", "--yes", "--dry-run=client", "-o=" + format})
+			cmd.SetArgs([]string{"drain", "chat", "--id=safe", "--workload-cluster=worker-a", "--reason=maintenance", "--yes", "--dry-run=client", "-o=" + format})
 			require.NoError(t, cmd.Execute())
 			assert.Contains(t, out.String(), "traffic drain")
 			if format == "json" || format == "yaml" {

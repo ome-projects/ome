@@ -22,14 +22,14 @@ import (
 const trafficActionResponseLimit = 1024 * 1024
 
 type actionOptions struct {
-	streams        genericiooptions.IOStreams
-	clock          reportv1alpha1.Clock
-	action         string
-	overrideID     string
-	cluster        string
-	reason         string
-	dryRun, output string
-	yes            bool
+	streams         genericiooptions.IOStreams
+	clock           reportv1alpha1.Clock
+	action          string
+	overrideID      string
+	workloadCluster string
+	reason          string
+	dryRun, output  string
+	yes             bool
 }
 
 func newActionCmd(f factory.Factory, streams genericiooptions.IOStreams, clock reportv1alpha1.Clock, action string) *cobra.Command {
@@ -41,6 +41,10 @@ func newActionCmd(f factory.Factory, streams genericiooptions.IOStreams, clock r
 Drain adds one independently removable ome.io/traffic-drain override. Undrain
 removes exactly one existing ID. Existing annotation JSON is parsed strictly;
 unknown fields, duplicates, unsafe values, and bounded-state overflow refuse.
+
+Drain requires --workload-cluster to identify the WorkloadCluster to drain.
+The global --cluster flag selects the Kubernetes API cluster from kubeconfig;
+it is not an alias for --workload-cluster.
 
 The request tests the exact InferenceService UID and resourceVersion. It
 preserves unrelated annotations and every other override ID. Confirmation or
@@ -71,7 +75,10 @@ cancellation.`,
 			if !mutate.SafeScalar(args[0]) || len(validation.IsDNS1123Subdomain(args[0])) != 0 {
 				return errors.New("invalid inference service name")
 			}
-			request := mutate.TrafficDrainRequest{Action: action, ID: o.overrideID, Cluster: o.cluster, Reason: o.reason}
+			if action == "drain" && o.workloadCluster == "" {
+				return errors.New("traffic drain requires --workload-cluster; --cluster selects the Kubernetes API cluster")
+			}
+			request := mutate.TrafficDrainRequest{Action: action, ID: o.overrideID, Cluster: o.workloadCluster, Reason: o.reason}
 			if err := mutate.ValidateTrafficDrainRequest(request); err != nil {
 				return err
 			}
@@ -83,7 +90,7 @@ cancellation.`,
 	})
 	cmd.Flags().StringVar(&o.overrideID, "id", "", "DNS-1123 override ID (required)")
 	if action == "drain" {
-		cmd.Flags().StringVar(&o.cluster, "cluster", "", "WorkloadCluster DNS name to drain (required)")
+		cmd.Flags().StringVar(&o.workloadCluster, "workload-cluster", "", "WorkloadCluster DNS name to drain (required)")
 		cmd.Flags().StringVar(&o.reason, "reason", "", "Bounded non-secret operator reason (required)")
 	}
 	cmd.Flags().BoolVar(&o.yes, "yes", false, "Confirm the exact preview without an interactive prompt")

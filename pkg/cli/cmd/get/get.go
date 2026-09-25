@@ -13,13 +13,14 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/apierror"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/printers"
+	omescheme "sigs.k8s.io/ome/pkg/client/clientset/versioned/scheme"
 )
 
 type Options struct {
 	genericiooptions.IOStreams
 	Resource      string
 	Name          string
-	Output        string // "", "wide", "json", "yaml"
+	Output        string // "", "table", "wide", "json", "yaml"
 	AllNamespaces bool
 	Selector      string
 
@@ -46,7 +47,7 @@ ClusterBaseModels) or "runtimes" (ServingRuntimes + ClusterServingRuntimes).`,
 			return o.Run(cmd.Context(), f)
 		},
 	}
-	cmd.Flags().StringVarP(&o.Output, "output", "o", "", "Output format: wide, json or yaml")
+	cmd.Flags().StringVarP(&o.Output, "output", "o", "", "Output format: table (default), wide, json or yaml")
 	cmd.Flags().BoolVarP(&o.AllNamespaces, "all-namespaces", "A", false, "List across all namespaces")
 	cmd.Flags().StringVarP(&o.Selector, "selector", "l", "", "Label selector to filter on")
 	return cmd
@@ -85,9 +86,9 @@ func (o *Options) Complete(f factory.Factory, args []string) error {
 
 func (o *Options) Validate() error {
 	switch o.Output {
-	case "", "wide", "json", "yaml":
+	case "", "table", "wide", "json", "yaml":
 	default:
-		return fmt.Errorf("unsupported output format %q (supported: wide, json, yaml)", o.Output)
+		return fmt.Errorf("unsupported output format %q (supported: table, wide, json, yaml)", o.Output)
 	}
 	if o.Name != "" && o.AllNamespaces {
 		return fmt.Errorf("a resource name cannot be combined with --all-namespaces")
@@ -123,6 +124,21 @@ func (o *Options) Run(ctx context.Context, f factory.Factory) error {
 		}
 	}
 	if o.Output == "json" || o.Output == "yaml" {
+		// Typed client responses can omit TypeMeta, including list items.
+		// Derive it from each concrete type (including merged views), and
+		// leave fetched objects untouched.
+		for i, source := range objs {
+			kinds, _, err := omescheme.Scheme.ObjectKinds(source)
+			if err != nil {
+				return fmt.Errorf("resolve resource type for output: %w", err)
+			}
+			if len(kinds) != 1 {
+				return fmt.Errorf("resource type for output is ambiguous")
+			}
+			obj := source.DeepCopyObject()
+			obj.GetObjectKind().SetGroupVersionKind(kinds[0])
+			objs[i] = obj
+		}
 		if o.Name != "" {
 			return printers.PrintObj(objs[0], o.Output, o.Out)
 		}

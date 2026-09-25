@@ -33,15 +33,16 @@ func (c *syncGetHookClient) Get(ctx context.Context, key ctrlclient.ObjectKey, o
 	return nil
 }
 
-func TestRuntimeSyncReadEvidenceRefusesCanceledWrongGVKAndDisabledSources(t *testing.T) {
-	for _, scenario := range []string{"canceled successful read", "wrong GVK", "disabled namespaced source"} {
+func TestRuntimeSyncReadEvidenceRefusesCanceledWrongGVKAndDeletingSources(t *testing.T) {
+	for _, scenario := range []string{"canceled successful read", "wrong GVK", "deleting namespaced source"} {
 		t.Run(scenario, func(t *testing.T) {
 			_, _, live := runtimeSyncSourceFixture(t)
 			var stored, received ctrlclient.Object = live, &v1beta1.ClusterServingRuntime{}
-			if scenario == "disabled namespaced source" {
+			if scenario == "deleting namespaced source" {
 				stored = &v1beta1.ServingRuntime{ObjectMeta: live.ObjectMeta, Spec: live.Spec}
 				stored.SetNamespace("workloads")
-				stored.(*v1beta1.ServingRuntime).Spec.Disabled = ptr.To(true)
+				stored.SetDeletionTimestamp(ptr.To(metav1.Now()))
+				stored.SetFinalizers([]string{"test"})
 				received = &v1beta1.ServingRuntime{}
 			}
 			ctx, cancel := context.WithCancel(context.Background())

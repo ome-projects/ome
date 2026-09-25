@@ -136,16 +136,9 @@ func (c *syncReadClient) Get(ctx context.Context, key ctrlclient.ObjectKey, obje
 	if gvk.Kind != "" && gvk.Kind != kind || gvk.Group != "" && gvk.Group != "ome.io" || gvk.Version != "" && gvk.Version != "v1beta1" {
 		return ErrRuntimeSyncEvidence
 	}
-	switch typed := object.(type) {
-	case *v1beta1.ServingRuntime:
-		if typed.Spec.IsDisabled() {
-			return ErrRuntimeSyncEvidence
-		}
-	case *v1beta1.ClusterServingRuntime:
-		if typed.Spec.IsDisabled() {
-			return ErrRuntimeSyncEvidence
-		}
-	}
+	// Profile ancestors are deliberately disabled; an enabled child can override
+	// that field. Check the merged runtime in prepareRuntimeSyncEvidence instead,
+	// while retaining every ancestor's identity and content in this snapshot.
 	return recordSyncRead(c.reads, kind+"/"+key.Namespace+"/"+key.Name, object)
 }
 func (c *syncReadClient) List(context.Context, ctrlclient.ObjectList, ...ctrlclient.ListOption) error {

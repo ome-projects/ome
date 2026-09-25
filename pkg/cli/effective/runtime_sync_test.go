@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -401,4 +402,74 @@ func TestRuntimeSyncInheritanceHashesMergedSpecAndPreservesModelFallback(t *test
 	e, err = resolver.Resolve(context.Background(), v)
 	require.NoError(t, err)
 	require.Equal(t, []string{"engine"}, e.NativeComponents())
+}
+
+func TestRuntimeSyncAllowsDisabledProfileAncestorsWithEnabledLeaf(t *testing.T) {
+	for _, scope := range []struct {
+		name            string
+		leafKind        string
+		leafNamespace   string
+		parentKind      string
+		parentNamespace string
+	}{
+		{"namespaced", "ServingRuntime", "workloads", "ServingRuntime", "workloads"},
+		{"cluster", "ClusterServingRuntime", "", "ClusterServingRuntime", ""},
+		{"namespaced with cluster profiles", "ServingRuntime", "workloads", "ClusterServingRuntime", ""},
+	} {
+		t.Run(scope.name, func(t *testing.T) {
+			makeRuntime := func(kind, namespace, name, parent string, spec *v1beta1.ServingRuntimeSpec) ctrlclient.Object {
+				metadata := metav1.ObjectMeta{
+					Name: name, Namespace: namespace, UID: "source-" + types.UID(name),
+					ResourceVersion: "17", Generation: 2,
+					Annotations: map[string]string{constants.RuntimeInheritFromAnnotationKey: parent},
+				}
+				if name != "runtime" {
+					metadata.Annotations[constants.RuntimeProfileAnnotationKey] = "true"
+				}
+				if kind == "ServingRuntime" {
+					return &v1beta1.ServingRuntime{ObjectMeta: metadata, Spec: *spec}
+				}
+				return &v1beta1.ClusterServingRuntime{ObjectMeta: metadata, Spec: *spec}
+			}
+			v, _, _ := runtimeSyncSourceFixture(t)
+			v.Spec.Runtime.Kind = ptr.To(scope.leafKind)
+			revision := revisionFixture(t, scope.leafKind, scope.leafNamespace, "runtime", runtimeSpecFixture("old"))
+			revision.UID, revision.ResourceVersion = "revision-uid", "15"
+			v.Status.PinnedRevisionName = revision.Name
+			baseSpec := runtimeSpecFixture("inherited")
+			baseSpec.Disabled = ptr.To(true)
+			base := makeRuntime(scope.parentKind, scope.parentNamespace, "base", "", baseSpec)
+			profile := makeRuntime(scope.parentKind, scope.parentNamespace, "profile", "base", &v1beta1.ServingRuntimeSpec{Disabled: ptr.To(true)})
+			leafSpec := &v1beta1.ServingRuntimeSpec{Disabled: ptr.To(false)}
+			leaf := makeRuntime(scope.leafKind, scope.leafNamespace, "runtime", "profile", leafSpec)
+			resolver := runtimeSyncSourceResolver(t, kfake.NewSimpleClientset(revision), leaf, profile, base)
+
+			evidence, err := resolver.Resolve(context.Background(), v)
+			require.NoError(t, err)
+			require.True(t, evidence.MatchesInferenceService(v))
+			require.Empty(t, evidence.NativeComponents(), "portable sync needs no InferenceReplica")
+			for _, name := range []string{"base", "profile"} {
+				require.Contains(t, evidence.PreviewRows(), [2]string{"Source", scope.parentKind + "/" + scope.parentNamespace + "/" + name})
+			}
+			require.Contains(t, evidence.PreviewRows(), [2]string{"Source", scope.leafKind + "/" + scope.leafNamespace + "/runtime"})
+
+			for _, disabled := range []*bool{nil, ptr.To(true)} {
+				leafSpec.Disabled = disabled
+				invalidLeaf := makeRuntime(scope.leafKind, scope.leafNamespace, "runtime", "profile", leafSpec)
+				_, err := runtimeSyncSourceResolver(t, kfake.NewSimpleClientset(revision), invalidLeaf, profile, base).Resolve(context.Background(), v)
+				require.ErrorIs(t, err, ErrRuntimeSyncEvidence, "disabled effective runtime remains forbidden")
+			}
+			for _, ancestor := range []ctrlclient.Object{base, profile} {
+				originalUID := ancestor.GetUID()
+				ancestor.SetUID("")
+				_, err := runtimeSyncSourceResolver(t, kfake.NewSimpleClientset(revision), leaf, profile, base).Resolve(context.Background(), v)
+				require.ErrorIs(t, err, ErrRuntimeSyncEvidence, "profile identity is still required")
+				ancestor.SetUID(originalUID)
+			}
+			base.SetResourceVersion("18")
+			changed, err := runtimeSyncSourceResolver(t, kfake.NewSimpleClientset(revision), leaf, profile, base).Resolve(context.Background(), v)
+			require.NoError(t, err)
+			require.False(t, evidence.SameSnapshot(changed), "profile changes remain bound into action evidence")
+		})
+	}
 }
