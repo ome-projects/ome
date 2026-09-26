@@ -228,6 +228,10 @@ def output(**values):
 
 def apply_mode(inputs, event):
     """Honor reusable-call inputs even when the caller runs an automatic sweep."""
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, dict):
+        raise ValueError('Workflow inputs must be an object')
     if 'apply' in inputs:
         if type(inputs['apply']) is not bool:
             raise ValueError('apply must be a boolean')
@@ -619,7 +623,7 @@ def main():
     apply = os.getenv("APPLY") == "true"
     force = os.getenv("FORCE") == "true"
     if command == 'mode':
-        output(apply=str(apply_mode(json.loads(os.environ['INPUTS_JSON']), os.environ['RUN_EVENT'])).lower())
+        output(apply=str(apply_mode(json.loads(os.getenv('INPUTS_JSON') or '{}'), os.environ['RUN_EVENT'])).lower())
         return
     if command == "select":
         select(number, force, os.getenv("ALLOW_MERGE") == "true")

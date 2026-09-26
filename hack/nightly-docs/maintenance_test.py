@@ -155,7 +155,8 @@ class PolicyTests(unittest.TestCase):
             for number in ['', '1072']:
                 self.assertFalse(m.apply_mode({'apply': False, 'pr_number': number}, event))
                 self.assertTrue(m.apply_mode({'apply': True, 'pr_number': number}, event))
-            self.assertEqual(m.apply_mode({}, event), event in {'schedule', 'issue_comment', 'workflow_run'})
+            for raw in ['{}', 'null']:
+                self.assertEqual(m.apply_mode(json.loads(raw), event), event in {'schedule', 'issue_comment', 'workflow_run'})
         with self.assertRaises(ValueError):
             m.apply_mode({'apply': 'false'}, 'schedule')
 
