@@ -150,6 +150,15 @@ class PolicyTests(unittest.TestCase):
                 self.assertIn(step['name'], ['Refresh only unrelated new documentation on main',
                                              'Publish guarded repair and record the actual PR-head check'])
 
+    def test_reusable_sweeps_honor_apply_false_for_every_caller_event(self):
+        for event in ['schedule', 'issue_comment', 'workflow_run', 'workflow_dispatch', 'push']:
+            for number in ['', '1072']:
+                self.assertFalse(m.apply_mode({'apply': False, 'pr_number': number}, event))
+                self.assertTrue(m.apply_mode({'apply': True, 'pr_number': number}, event))
+            self.assertEqual(m.apply_mode({}, event), event in {'schedule', 'issue_comment', 'workflow_run'})
+        with self.assertRaises(ValueError):
+            m.apply_mode({'apply': 'false'}, 'schedule')
+
     def test_bulk_dispatch_rejects_single_pr_options(self):
         with patch.dict(os.environ, {'EXTRA_FEEDBACK': 'Fix one thing'}), self.assertRaisesRegex(ValueError, 'PR number'):
             m.select(0, False, False)

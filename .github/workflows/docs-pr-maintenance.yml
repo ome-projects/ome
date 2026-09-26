@@ -90,14 +90,9 @@ jobs:
       - name: Select mode
         id: mode
         env:
-          MANUAL: ${{ github.event_name == 'workflow_dispatch' || inputs.pr_number != '' }}
-          REQUESTED_APPLY: ${{ inputs.apply }}
-        run: |
-          if [ "$MANUAL" = true ]; then
-            echo "apply=$REQUESTED_APPLY" >> "$GITHUB_OUTPUT"
-          else
-            echo 'apply=true' >> "$GITHUB_OUTPUT"
-          fi
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+          RUN_EVENT: ${{ github.event_name }}
+        run: python3 hack/nightly-docs/maintenance.py mode
       - name: Reconcile eligible PRs and skip unchanged work
         id: select
         run: python3 hack/nightly-docs/maintenance.py select

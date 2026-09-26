@@ -226,6 +226,15 @@ def output(**values):
             stream.write(f"{key}={json.dumps(value) if not isinstance(value, str) else value}\n")
 
 
+def apply_mode(inputs, event):
+    """Honor reusable-call inputs even when the caller runs an automatic sweep."""
+    if 'apply' in inputs:
+        if type(inputs['apply']) is not bool:
+            raise ValueError('apply must be a boolean')
+        return inputs['apply']
+    return event in {'schedule', 'issue_comment', 'workflow_run'}
+
+
 def select(number, force, merge):
     """Reconcile all eligible PRs on each wake so replaced queued events are safe."""
     if not number and (force or os.getenv('EXTRA_FEEDBACK')):
@@ -609,6 +618,9 @@ def main():
     number = int(os.getenv("PR_NUMBER") or "0")
     apply = os.getenv("APPLY") == "true"
     force = os.getenv("FORCE") == "true"
+    if command == 'mode':
+        output(apply=str(apply_mode(json.loads(os.environ['INPUTS_JSON']), os.environ['RUN_EVENT'])).lower())
+        return
     if command == "select":
         select(number, force, os.getenv("ALLOW_MERGE") == "true")
         return
