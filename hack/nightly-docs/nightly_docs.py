@@ -67,21 +67,42 @@ def validate_item(item):
     return {**item, "key": key, "branch": f'codex/nightly-docs-{digest}'}
 
 
+def open_pr_files(repo, numbers):
+    # Fetch the common case in batches instead of one API round trip per PR in
+    # every publisher. Large PRs still use the fully paginated REST endpoint.
+    owner, name = repo.split("/")
+    result = {}
+    for start in range(0, len(numbers), 25):
+        batch = numbers[start:start + 25]
+        fields = " ".join(f"p{number}: pullRequest(number: {number}) {{ files(first: 100) "
+                          "{ nodes { path } pageInfo { hasNextPage } } }" for number in batch)
+        query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){" + fields + "}}"
+        response = json.loads(run("gh", "api", "graphql", "-f", "query=" + query,
+                                  "-f", "owner=" + owner, "-f", "name=" + name))
+        data = response["data"]["repository"]
+        for number in batch:
+            files = data[f"p{number}"]["files"]
+            if files["pageInfo"]["hasNextPage"]:
+                result[number] = [f["filename"] for f in pages(
+                    f"repos/{repo}/pulls/{number}/files?per_page=100")]
+            else:
+                result[number] = [f["path"] for f in files["nodes"]]
+    return result
+
+
 def existing_prs(repo):
     # All states are needed to remember declined proposals and merged fixes.
+    prs = pages(f"repos/{repo}/pulls?state=all&per_page=100")
+    files_by_pr = open_pr_files(repo, [pr["number"] for pr in prs if pr["state"] == "open"])
     result = []
-    for pr in pages(f"repos/{repo}/pulls?state=all&per_page=100"):
+    for pr in prs:
         body = pr.get("body") or ""
         if pr["state"] != "open" and MARKER not in body:
             continue
-        files = []
-        if pr["state"] == "open":
-            files = [f["filename"] for f in pages(
-                f'repos/{repo}/pulls/{pr["number"]}/files?per_page=100')]
         result.append({"number": pr["number"], "title": pr["title"],
                        "body": body, "state": pr["state"],
                        "merged": bool(pr["merged_at"]),
-                       "branch": pr["head"]["ref"], "files": files})
+                       "branch": pr["head"]["ref"], "files": files_by_pr.get(pr["number"], [])})
     return result
 
 
