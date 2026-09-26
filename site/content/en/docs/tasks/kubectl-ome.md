@@ -44,7 +44,44 @@ kubectl krew install --manifest-url \
 Every command accepts the standard kubectl connection flags
 (`--kubeconfig`, `--context`, `-n`); listings accept `-o json|yaml|wide`,
 `-A` and `-l`. Human-readable output is not a stable scripting interface
-before GA — script against `-o json`.
+before GA — script against `-o json` and the [exit codes](#exit-codes)
+below.
+
+## Exit codes
+
+Every command exits through one shared mapping, so scripts can branch on
+the exit code without parsing error text:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | General error — invalid invocation, kubeconfig, API, RBAC or output failure, or cancellation |
+| 2 | Assertion unmet — the command completed and wrote its report, but the asserted state does not hold |
+| 3 | Guarded mutation rejected — the target changed after its precondition was verified; the mutation was not applied |
+
+Exit 2 is the read-only "checked, and it is not so" signal. `wait` returns
+it when timeout, absence, deletion or replacement leaves the `--for`
+predicate unmet; `rollout validate` when validation is Invalid or
+Unverifiable; `admin doctor` when a required API is provably not
+discoverable (a forbidden discovery response is not proof and does not by
+itself cause exit 2); and `quota validate` when the complete snapshot
+contains violations. In every exit-2 case the full report has already been
+written to stdout, so a script can capture `-o json` output and still
+branch on the code. Exit 1 means the command could not complete its
+observation — do not treat any partial output as a report.
+
+Exit 3 comes only from the action commands — `rollout
+pause/resume/promote/rollback/repin`, `traffic drain/undrain`,
+`migration start`, `scale`, `runtime sync` and `instance release-held` —
+and means the mutation was not applied: either the refreshed target no
+longer matched the preview, or the server rejected the guarded patch.
+Re-inspect current state and issue a new request rather than retrying the
+old one. Exit 1 from an action command carries no such guarantee — the
+request outcome may be unknown.
+
+Whatever the code, a failed command writes a single `error: <message>`
+line to stderr (action previews and confirmation prompts also go to
+stderr, not stdout).
 
 ## Required RBAC
 
