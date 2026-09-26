@@ -3,7 +3,7 @@ title: "Controller Configuration"
 linkTitle: "Controller Configuration"
 weight: 6
 description: >
-  Command-line flags for the OME controller manager, including runtime-revision garbage collection.
+  Command-line flags for the OME controller manager, including reconcile throughput tuning and runtime-revision garbage collection.
 ---
 
 The OME controller manager (`ome-manager`) is configured through command-line flags passed to its container. This page documents those flags and how to change them on a running cluster.
@@ -58,6 +58,17 @@ The three timing flags have no in-binary default and must be supplied together o
 | `--metrics-bind-address` | string | `:8080`  | Address the metrics endpoint binds to (`:8443` for HTTPS, `:8080` for HTTP, `0` to disable).   |
 | `--metrics-secure`       | bool   | `false`  | Serve metrics over HTTPS.                                                                        |
 
+### Reconcile throughput
+
+| Flag                                            | Type  | Default | Description                                                                                                       |
+|-------------------------------------------------|-------|---------|--------------------------------------------------------------------------------------------------------------------|
+| `--inferenceservice-max-concurrent-reconciles`  | int   | unset   | Max InferenceService reconciles running in parallel (distinct objects only).                                       |
+| `--inferencereplica-max-concurrent-reconciles`  | int   | unset   | Max InferenceReplica reconciles running in parallel (distinct objects only).                                       |
+| `--kube-api-qps`                                | float | unset   | Steady-state client-side request rate to the apiserver, shared by the manager cache/client, the direct clientset, and the webhook handlers. |
+| `--kube-api-burst`                              | int   | unset   | Token-bucket burst above `--kube-api-qps`, absorbing the request spikes of a reconcile fan-out or an informer resync. |
+
+None of the four has an in-binary default. The `ome-resources` chart supplies the operative values (`4`/`4`/`100`/`200`); zero or unset falls back to controller-runtime's defaults — one worker per controller and `20` QPS / `30` burst. See [Tuning reconcile throughput](#tuning-reconcile-throughput).
+
 ### Runtime-revision garbage collection
 
 These control cleanup of the OME-managed `ControllerRevision` snapshots created for [runtime pinning](/ome/docs/concepts/runtime-revision).
@@ -90,6 +101,45 @@ The three durations constrain each other, and the manager validates them at star
 - **`--leader-elect-renew-deadline` must exceed 1.2× `--leader-elect-retry-period`** (the retry period jittered by client-go's jitter factor). Otherwise a renew window cannot hold one complete renewal attempt.
 
 When sizing the values: controller-runtime caps each renewal request at half the renew deadline, so a renew window holds two attempts and the leader survives exactly one hung apiserver request. At controller-runtime's defaults that is a ~10s budget, which a routine etcd stall can exhaust — costing the leader its lease and restarting the pod. The chart's `40s` renew deadline buys two 20s attempts instead. The cost is failover latency: a standby waits up to the lease duration (`60s` at the chart default) before taking over, so raise these values only as far as your cluster's apiserver latency actually needs.
+
+## Tuning reconcile throughput
+
+These four flags answer one symptom: on a large cluster (thousands of InferenceServices), spec changes take a long time to be acted on because the controllers cannot drain their reconcile backlog. Two separate limits cap that throughput, and they need to be raised together.
+
+**Worker concurrency.** `--inferenceservice-max-concurrent-reconciles` and `--inferencereplica-max-concurrent-reconciles` set how many reconciles each controller runs in parallel. Concurrency applies across distinct objects only — controller-runtime serializes per object key, so a single InferenceService is never reconciled by two workers at once, and raising the counts is safe. The binary has no built-in value; the chart supplies `4` for each controller, and `0`/unset falls back to controller-runtime's single worker.
+
+**Client-side API rate limits.** `--kube-api-qps` and `--kube-api-burst` set the client-go rate limit on the one `rest.Config` every connection to the local apiserver is built from, so the manager's cache and client, the direct clientset, and the webhook handlers all draw from the same budget. QPS is the steady-state request rate; burst is the token-bucket headroom above it that absorbs the request spike of a reconcile fan-out or an informer resync. Again there is no in-binary value — the chart supplies `100` QPS / `200` burst, and `0`/unset falls back to controller-runtime's `20` QPS / `30` burst. The two limits are independent: supplying only one is honored, and the other keeps its fallback.
+
+The chart values, under `ome.controller`:
+
+```yaml
+ome:
+  controller:
+    inferenceServiceMaxConcurrentReconciles: 4
+    inferenceReplicaMaxConcurrentReconciles: 4
+    kubeAPIQPS: 100
+    kubeAPIBurst: 200
+```
+
+The chart renders each flag only when its value is non-zero, so setting a value to `0` omits the flag and restores the controller-runtime fallback.
+
+The rate-limit floor scales with the worker counts: each worker issues several reads and writes per reconcile pass, so adding workers while leaving the `20` QPS fallback in place just moves the queue from the controller into the client rate limiter — the reconciles start, but each one stalls waiting for request tokens, long before the apiserver itself is the bottleneck.
+
+### Recognizing client-side throttling
+
+That stall is visible in the manager log. Requests delayed by the local limiter are logged by client-go as:
+
+```
+Waited for 1.034s due to client-side throttling, not priority and fairness, request: GET:https://10.96.0.1:443/apis/ome.io/v1beta1/...
+```
+
+As the message itself says, this is the client's own limiter, not apiserver-side API Priority and Fairness — the fix is raising `--kube-api-qps` / `--kube-api-burst`, not apiserver capacity. Sustained lines like this during steady operation mean the rate limit, not the worker count, is the current bottleneck.
+
+The manager logs the effective limits at startup, so you can confirm a change landed (the controller-runtime fallback shows as `"qps": 20, "burst": 30`):
+
+```bash
+kubectl -n ome logs deploy/<ome-controller-manager> | grep 'Configured API client rate limits'
+```
 
 ## Tuning runtime-revision garbage collection
 

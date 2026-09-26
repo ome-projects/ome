@@ -19,13 +19,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  plan:
+  prepare:
     if: github.repository == 'ome-projects/ome' && (github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ome-runner-cpu
     timeout-minutes: 45
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      count: ${{ steps.plan.outputs.count }}
+      scans: ${{ steps.partition.outputs.matrix }}
       base_sha: ${{ steps.baseline.outputs.sha }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -66,35 +65,115 @@ jobs:
           python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" site "$RUNNER_TEMP/nightly-docs-base-site" "$RUNNER_TEMP/nightly-docs-bin/hugo"
       - name: Gather code history and existing documentation PRs
         env:
-          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
+          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context/context.json
         run: |
+          mkdir -p "$RUNNER_TEMP/nightly-docs-context"
           python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" context
+      - name: Partition discovery by subsystem
+        id: partition
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/discovery.py" partition
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-docs-context
+          path: ${{ runner.temp }}/nightly-docs-context
+          if-no-files-found: error
+          retention-days: 2
+
+  discover:
+    needs: prepare
+    runs-on: ome-runner-cpu
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.scans) }}
+    name: 'Discover: ${{ matrix.shard }}'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ needs.prepare.outputs.base_sha }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: nightly-docs-context
+          path: ${{ runner.temp }}/nightly-docs-context
+      - name: Prepare this subsystem's discovery context
+        env:
+          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-scan-context.json
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/discovery.py" context
       - name: Identify separate documentation concerns
         id: discover
         uses: anthropics/claude-code-action@v1
-        env:
-          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/plan.md. The context file is ${{ runner.temp }}/nightly-docs-context.json.
+          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/plan.md. The context file is ${{ runner.temp }}/nightly-docs-scan-context.json.
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
             --max-turns 100
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_sha":{"type":"string"},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["area","concern","source_sha","title","question","evidence","doc_paths"]}}},"required":["concerns"]}'
-      - name: Validate plan and remove duplicate concerns
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_commit":{"type":"integer","minimum":1},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["area","concern","source_commit","title","question","evidence","doc_paths"]}},"inspected_commits":{"type":"array","items":{"type":"integer","minimum":1}},"remaining_work":{"type":"string"}},"required":["concerns","inspected_commits","remaining_work"]}'
+      - name: Validate and record scan coverage
+        env:
+          PLAN_JSON: ${{ steps.discover.outputs.structured_output }}
+          SCAN_OUTPUT: ${{ runner.temp }}/nightly-docs-scan-${{ matrix.shard }}.json
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/discovery.py" scan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-docs-scan-${{ matrix.shard }}
+          path: ${{ runner.temp }}/nightly-docs-scan-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 2
+
+  plan:
+    needs: [prepare, discover]
+    runs-on: ome-runner-cpu
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      base_sha: ${{ needs.prepare.outputs.base_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ needs.prepare.outputs.base_sha }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: nightly-docs-context
+          path: ${{ runner.temp }}/nightly-docs-context
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: nightly-docs-scan-*
+          path: ${{ runner.temp }}/nightly-docs-scans
+          merge-multiple: true
+      - name: Combine scans and defer duplicate or conflicting concerns
         id: plan
         env:
-          NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context.json
-          PLAN_JSON: ${{ steps.discover.outputs.structured_output }}
-        run: python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" plan
-      - name: Planning summary
-        env:
-          COUNT: ${{ steps.plan.outputs.count }}
-        run: echo "Selected ${COUNT} separate documentation concerns (maximum 100)." >> "$GITHUB_STEP_SUMMARY"
+          SCAN_DIR: ${{ runner.temp }}/nightly-docs-scans
+          REPORT_OUTPUT: ${{ runner.temp }}/nightly-docs-discovery-report.json
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/discovery.py" combine
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-docs-discovery-report
+          path: ${{ runner.temp }}/nightly-docs-discovery-report.json
+          if-no-files-found: error
+          retention-days: 14
 
   write:
     needs: plan
@@ -106,7 +185,7 @@ jobs:
       pull-requests: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: 'Document: ${{ matrix.concern }}'
     env:
@@ -139,7 +218,7 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 60
+            --max-turns 120
             --tools "Read,Glob,Grep,Edit,Write"
             --allowedTools "Read,Glob,Grep,Edit,Write"
       - name: Export untrusted documentation data
@@ -166,7 +245,7 @@ jobs:
       pull-requests: write
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: 'Validate and publish: ${{ matrix.concern }}'
     env:
@@ -224,7 +303,7 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 60
+            --max-turns 120
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
             --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"}},"required":["single_concern","accurate","reason"]}'
