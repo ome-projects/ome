@@ -16,13 +16,10 @@ import (
 
 // This is local file safety, not serving-demand authorization. Persisted claims
 // always count; placement only filters unpersisted live Model references.
-func (s *Gopher) sharedEvictionPathReferenced(ctx context.Context, task *GopherTask, path string, child bool) (bool, error) {
+// data is the fresh ConfigMap snapshot from the current validation boundary.
+func (s *Gopher) sharedEvictionPathReferenced(ctx context.Context, task *GopherTask, data map[string]string, path string, child bool) (bool, error) {
 	if s.modelClient == nil || s.kubeClient == nil {
 		return false, fmt.Errorf("shared cleanup requires live Model and node clients")
-	}
-	cm, err := s.configMapReconciler.getConfigMap(ctx)
-	if err != nil {
-		return false, err
 	}
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
 	// The operation lock already validated the stored target. Normalize only
@@ -32,7 +29,7 @@ func (s *Gopher) sharedEvictionPathReferenced(ctx context.Context, task *GopherT
 		return false, err
 	}
 	path = filepath.Join(directory, filepath.Base(path))
-	owner, err := existingModelEntry(cm.Data, key)
+	owner, err := existingModelEntry(data, key)
 	if err != nil {
 		return false, err
 	}
@@ -46,7 +43,7 @@ func (s *Gopher) sharedEvictionPathReferenced(ctx context.Context, task *GopherT
 		}
 		return artifactReferenceUsesPath(reference, path)
 	}
-	for otherKey, raw := range cm.Data {
+	for otherKey, raw := range data {
 		if otherKey == key {
 			continue
 		}
@@ -70,7 +67,7 @@ func (s *Gopher) sharedEvictionPathReferenced(ctx context.Context, task *GopherT
 			}
 			continue
 		}
-		entry, err := existingModelEntry(cm.Data, otherKey)
+		entry, err := existingModelEntry(data, otherKey)
 		if err != nil {
 			return false, err
 		}
@@ -80,7 +77,7 @@ func (s *Gopher) sharedEvictionPathReferenced(ctx context.Context, task *GopherT
 			}
 		}
 	}
-	return s.liveArtifactReferenceMatches(ctx, task, cm.Data, check)
+	return s.liveArtifactReferenceMatches(ctx, task, data, check)
 }
 
 // Pending cleanup retains its original paths even after CR removal or movement.

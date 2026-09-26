@@ -10,7 +10,11 @@ func (s *Gopher) validateArtifactRepair(ctx context.Context, task *GopherTask, p
 		return err
 	}
 	checkReferences := func() error {
-		used, err := s.sharedEvictionPathReferenced(ctx, task, path, false)
+		cm, err := s.configMapReconciler.getConfigMap(ctx)
+		if err != nil {
+			return err
+		}
+		used, err := s.sharedEvictionPathReferenced(ctx, task, cm.Data, path, false)
 		if err != nil {
 			return err
 		}

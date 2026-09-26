@@ -5,10 +5,52 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 
 	"sigs.k8s.io/ome/pkg/constants"
 )
+
+func TestSharedCleanupReadsOneSnapshotPerBoundary(t *testing.T) {
+	for _, boundary := range []string{"eviction validation", "eviction path", "cleanup path"} {
+		t.Run(boundary, func(t *testing.T) {
+			ctx := context.Background()
+			g, task, input := newSharedEvictionTestModel(t)
+			g.guardSharedEvictionCleanup(task, &input)
+			if boundary == "cleanup path" {
+				task.TaskType = Delete
+				g.guardSharedArtifactCleanup(task, &input)
+			}
+			check := func() (bool, error) {
+				if boundary == "eviction validation" {
+					return false, input.validateDeletion(ctx)
+				}
+				return input.pathReferenced(ctx, input.ChildModelPath)
+			}
+			client := g.kubeClient.(*k8sfake.Clientset)
+			client.ClearActions()
+			used, err := check()
+			require.NoError(t, err)
+			require.False(t, used)
+			require.Equal(t, 1, countConfigMapGets(client))
+
+			require.NoError(t, g.configMapReconciler.mutateConfigMapWithRetry(ctx, func(cm *corev1.ConfigMap) (bool, error) {
+				return writeModelEntry(cm.Data, "default.basemodel.borrower", ModelEntry{ModelUID: "borrower",
+					Status: ModelStatusReady, DirectArtifactPath: input.ChildModelPath})
+			}))
+			client.ClearActions()
+			used, err = check()
+			if boundary == "eviction validation" {
+				require.ErrorContains(t, err, "shared child path remains referenced")
+			} else {
+				require.NoError(t, err)
+				require.True(t, used, "each boundary must reload newly persisted borrowers")
+			}
+			require.Equal(t, 1, countConfigMapGets(client))
+		})
+	}
+}
 
 func TestSharedCleanupValidationIsReadOnly(t *testing.T) {
 	for _, restoring := range []bool{false, true} {

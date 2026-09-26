@@ -103,7 +103,10 @@ func TestArtifactCleanupDeleteRequiresOriginalModelUID(t *testing.T) {
 			}
 			for _, validate := range []func() error{
 				func() error { return g.validateArtifactCleanupRequest(context.Background(), task) },
-				func() error { return g.validateSharedCleanupOwnership(context.Background(), task, input) },
+				func() error {
+					_, err := g.validateSharedCleanupOwnership(context.Background(), task, input)
+					return err
+				},
 			} {
 				err := validate()
 				switch state {

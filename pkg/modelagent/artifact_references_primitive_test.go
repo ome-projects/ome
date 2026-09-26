@@ -57,7 +57,9 @@ func TestLiveArtifactReferencesFilterOnlyUnpersistedPlacement(t *testing.T) {
 							return writeModelEntry(cm.Data, key, ModelEntry{ModelUID: other.UID, Status: ModelStatusReady})
 						}))
 					}
-					used, err := g.sharedEvictionPathReferenced(ctx, owner, path, false)
+					cm, err := g.configMapReconciler.getConfigMap(ctx)
+					require.NoError(t, err)
+					used, err := g.sharedEvictionPathReferenced(ctx, owner, cm.Data, path, false)
 					require.NoError(t, err)
 					require.Equal(t, persisted || eligible, used)
 				})
@@ -75,10 +77,12 @@ func TestPersistedSharedReceiptProtectsAliasedDirectPath(t *testing.T) {
 		return writeModelEntry(cm.Data, "default.basemodel.old-reader", ModelEntry{ModelUID: "old-reader", Status: ModelStatusUpdating,
 			HfArtifactPendingDeletion: &HfArtifactPendingDeletion{ParentPath: alias, ChildPath: filepath.Join(g.modelRootDir, "child")}})
 	}))
-	used, err := g.sharedEvictionPathReferenced(ctx, owner, path, false)
+	cm, err := g.configMapReconciler.getConfigMap(ctx)
+	require.NoError(t, err)
+	used, err := g.sharedEvictionPathReferenced(ctx, owner, cm.Data, path, false)
 	require.NoError(t, err)
 	require.True(t, used, "pending parent ownership survives absent CR and alias spelling")
-	used, err = g.sharedEvictionPathReferenced(ctx, owner, path, true)
+	used, err = g.sharedEvictionPathReferenced(ctx, owner, cm.Data, path, true)
 	require.NoError(t, err)
 	require.False(t, used, "a receipt parent is not a reference to every child beneath it")
 }

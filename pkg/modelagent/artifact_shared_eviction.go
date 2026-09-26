@@ -139,7 +139,7 @@ func (s *Gopher) validateSharedEvictionCleanup(ctx context.Context, task *Gopher
 	if _, err := sharedEvictionEntry(cm.Data, task, input); err != nil {
 		return err
 	}
-	used, err := s.sharedEvictionPathReferenced(ctx, task, input.ChildModelPath, true)
+	used, err := s.sharedEvictionPathReferenced(ctx, task, cm.Data, input.ChildModelPath, true)
 	if err != nil {
 		return err
 	}
@@ -192,6 +192,6 @@ func (s *Gopher) guardSharedEvictionCleanup(task *GopherTask, input *hfArtifactT
 		if _, err := sharedEvictionEntry(cm.Data, task, *input); err != nil {
 			return false, err
 		}
-		return s.sharedEvictionPathReferenced(ctx, task, path, path == input.ChildModelPath)
+		return s.sharedEvictionPathReferenced(ctx, task, cm.Data, path, path == input.ChildModelPath)
 	}
 }
