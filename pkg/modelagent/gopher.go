@@ -377,6 +377,19 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 			return nil
 		}
 	}
+	if validateCurrent != nil && s.nodeUID != "" && op.ModelStateOnNode == Ready {
+		// The durable report is the evidence for this paired Ready publication.
+		// Retrying a lost node patch must not manufacture a new acknowledgement.
+		if err := s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
+			validateCurrent: validateCurrent, acknowledgedNodeUID: s.nodeUID,
+			ModelStatus: ModelStatusReady, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel,
+		}); err != nil {
+			return err
+		}
+		labelOp.artifactRehydrationID = taskModelMeta(task).Annotations[constants.ModelArtifactRehydrationIDAnnotation]
+		labelOp.nodeUID = s.nodeUID
+		return s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
+	}
 	labelOp.nodeUID = s.nodeUID
 	err = s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
 	if err != nil {

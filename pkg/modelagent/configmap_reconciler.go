@@ -71,10 +71,11 @@ type ConfigMapReconciler struct {
 // ConfigMapStatusOp represents an operation to update model status in ConfigMap.
 // It contains the necessary information to identify the model and its new status.
 type ConfigMapStatusOp struct {
-	validateCurrent  func() error
-	ModelStatus      ModelStatus               // The updated status of the model
-	BaseModel        *v1beta1.BaseModel        // Reference to a namespace-scoped BaseModel (nil if using ClusterBaseModel)
-	ClusterBaseModel *v1beta1.ClusterBaseModel // Reference to a cluster-scoped BaseModel (nil if using BaseModel)
+	validateCurrent     func() error
+	acknowledgedNodeUID types.UID
+	ModelStatus         ModelStatus               // The updated status of the model
+	BaseModel           *v1beta1.BaseModel        // Reference to a namespace-scoped BaseModel (nil if using ClusterBaseModel)
+	ClusterBaseModel    *v1beta1.ClusterBaseModel // Reference to a cluster-scoped BaseModel (nil if using BaseModel)
 }
 
 // ConfigMapMetadataOp represents an operation to update model metadata in ConfigMap.
@@ -722,6 +723,10 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 			}
 		}
 		modelEntry.Status = op.ModelStatus
+		if op.ModelStatus == ModelStatusReady && op.acknowledgedNodeUID != "" {
+			modelEntry.NodeUID = op.acknowledgedNodeUID
+			modelEntry.ArtifactRehydrationID = taskModelMeta(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}).Annotations[constants.ModelArtifactRehydrationIDAnnotation]
+		}
 		if modelEntry.ModelUID == "" {
 			modelEntry.ModelUID = modelUID
 		}
