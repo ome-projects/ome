@@ -15,7 +15,7 @@ import nightly_docs as docs
 
 STATE = "<!-- docs-maintenance-state:"
 CHECK = "Docs maintenance"
-BOTS = {"claude[bot]", "coderabbitai[bot]"}
+BOTS = {"claude", "coderabbitai"}
 MAX_ATTEMPTS = 3
 
 
@@ -107,7 +107,7 @@ def feedback(pr):
       repository(owner:$owner,name:$name){pullRequest(number:$number){
         reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
           nodes{id isResolved isOutdated path line comments(first:100){
-            pageInfo{hasNextPage} nodes{author{login} body url}}}}
+            pageInfo{hasNextPage} nodes{author{__typename login} body url}}}}
       }}}"""
     while True:
         data = api("graphql", "POST", {"query": query, "variables": {
@@ -374,8 +374,10 @@ def checked_threads(verdict, ctx):
                                            for n in numbers) or len(numbers) != len(set(numbers))):
         raise ValueError("Invalid addressed-thread report")
     return [threads[n - 1]["id"] for n in numbers
-            if threads[n - 1]["comments"] and all(c.get("author") and c["author"]["login"] in BOTS
-                                                 for c in threads[n - 1]["comments"])]
+            if threads[n - 1]["comments"] and all(
+                c.get("author") and c["author"].get("__typename") == "Bot"
+                and c["author"]["login"].removesuffix("[bot]") in BOTS
+                for c in threads[n - 1]["comments"])]
 
 
 def record_check(ctx, head, accepted, reason):

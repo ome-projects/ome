@@ -99,8 +99,8 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(m.substantive_comment(comment))
 
     def test_human_threads_are_never_resolved(self):
-        bot = {"author": {"login": "claude[bot]"}, "body": "fix link"}
-        human = {"author": {"login": "maintainer"}, "body": "also clarify"}
+        bot = {"author": {"__typename": "Bot", "login": "claude"}, "body": "fix link"}
+        human = {"author": {"__typename": "User", "login": "claude"}, "body": "also clarify"}
         ctx = {"feedback": {"threads": [{"id": "bot", "comments": [bot]},
                                          {"id": "human", "comments": [bot, human]}]}}
         self.assertEqual(m.checked_threads({"addressed_threads": [1, 2]}, ctx), ["bot"])
