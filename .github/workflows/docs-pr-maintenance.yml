@@ -2,7 +2,7 @@ name: Documentation PR Maintenance
 
 on:
   schedule:
-    - cron: '11,41 * * * *'
+    - cron: '11 */2 * * *'
   workflow_dispatch:
     inputs:
       pr_number:

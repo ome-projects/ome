@@ -131,9 +131,9 @@ own Python environment.
 ## Maintenance of existing documentation PRs
 
 `docs-pr-maintenance.yml` reconciles up to 100 eligible open PRs on each sweep,
-with four concurrent workers on `ome-runner-cpu`. Sweeps run at minutes 11 and
-41 every hour; issue comments and completion of the nightly, PR validation or
-code review workflow also wake it. Submitted reviews and inline replies are
+with four concurrent workers on `ome-runner-cpu`. Sweeps run every two hours,
+at minute 11 of even-numbered UTC hours. Issue comments and completion of the
+nightly, PR validation or code review workflow also wake it. Submitted reviews and inline replies are
 picked up by the sweep, avoiding privileged execution from a PR merge ref.
 Schedules/events use default-branch workflow code. Manual dispatch can use a
 trusted implementation branch. No PR-controlled scripts or Git metadata are
