@@ -31,6 +31,20 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) {
 	if q.closed {
 		return
 	}
+	if task.artifactAcknowledgementRecovery {
+		// Keep at most one pending periodic task per Model UID, even while a
+		// worker is validating. Explicit refreshes are never coalesced away.
+		for _, queue := range [][]*GopherTask{q.high, q.normalDownload, q.normalRevalidation} {
+			for _, pending := range queue {
+				if pending.artifactAcknowledgementRecovery && gopherTaskModelKey(pending) == gopherTaskModelKey(task) && pending.Sequence >= task.Sequence {
+					return
+				}
+			}
+		}
+		q.high = removePendingArtifactRecovery(q.high, task)
+		q.normalDownload = removePendingArtifactRecovery(q.normalDownload, task)
+		q.normalRevalidation = removePendingArtifactRecovery(q.normalRevalidation, task)
+	}
 	if task.TaskType == Delete || task.TaskType == Evict {
 		// Delete preempts pending work for the same model and should run before
 		// reuse-wait tasks, so it is the only non-FIFO insertion.
@@ -46,6 +60,16 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) {
 		q.normalDownload = append(q.normalDownload, task)
 	}
 	q.cond.Broadcast()
+}
+
+func removePendingArtifactRecovery(tasks []*GopherTask, incoming *GopherTask) []*GopherTask {
+	kept := tasks[:0]
+	for _, task := range tasks {
+		if !task.artifactAcknowledgementRecovery || gopherTaskModelKey(task) != gopherTaskModelKey(incoming) {
+			kept = append(kept, task)
+		}
+	}
+	return kept
 }
 
 func (q *gopherTaskQueue) popNormal() (*GopherTask, bool) {

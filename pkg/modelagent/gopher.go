@@ -44,14 +44,15 @@ const (
 
 type GopherTask struct {
 	// Pin direct Delete cleanup to its immutable first receipt/history snapshot.
-	directEvictionDelete   *ModelEntry
-	TaskType               GopherTaskType
-	BaseModel              *v1beta1.BaseModel
-	ClusterBaseModel       *v1beta1.ClusterBaseModel
-	TensorRTLLMShapeFilter *TensorRTLLMShapeFilter
-	SamePathWaitStartedAt  time.Time
-	NormalPriorityOnly     bool
-	RevalidationReplay     bool
+	directEvictionDelete            *ModelEntry
+	artifactAcknowledgementRecovery bool // Periodic validation, not an explicit refresh.
+	TaskType                        GopherTaskType
+	BaseModel                       *v1beta1.BaseModel
+	ClusterBaseModel                *v1beta1.ClusterBaseModel
+	TensorRTLLMShapeFilter          *TensorRTLLMShapeFilter
+	SamePathWaitStartedAt           time.Time
+	NormalPriorityOnly              bool
+	RevalidationReplay              bool
 	// Sequence is assigned once and retained when this logical task is requeued.
 	Sequence uint64
 	// SharedArtifact selects ownership-aware handling; ordinary tasks keep the legacy path.
@@ -483,6 +484,14 @@ func (s *Gopher) processTask(task *GopherTask) error {
 func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload bool) error {
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
+	}
+	if task.artifactAcknowledgementRecovery {
+		// A satisfied periodic task must not enter admission: advancing its
+		// sequence could otherwise discard an earlier explicit override.
+		current, err := s.artifactRecoveryAlreadyAcknowledged(context.Background(), task)
+		if err != nil || current {
+			return err
+		}
 	}
 	// Get model info for logging
 	modelInfo := getModelInfoForLogging(task)

@@ -229,6 +229,7 @@ func initializeComponents(
 	scout, err := modelagent.NewScout(
 		ctx,
 		cfg.nodeName,
+		cfg.namespace,
 		baseModelInformer,
 		clusterBaseModelInformer,
 		omeInformerFactory,

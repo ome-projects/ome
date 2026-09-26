@@ -27,18 +27,20 @@ import (
 )
 
 type Scout struct {
-	ctx                    context.Context
-	baseModelLister        omev1beta1lister.BaseModelLister
-	baseModelSynced        cache.InformerSynced
-	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister
-	clusterBaseModelSynced cache.InformerSynced
-	informerFactory        omev1beta1informers.SharedInformerFactory
-	gopherChan             chan<- *GopherTask
-	nodeName               string
-	nodeInfo               *v1.Node
-	nodeShapeAlias         string
-	kubeClient             *kubernetes.Clientset
-	logger                 *zap.SugaredLogger
+	ctx                     context.Context
+	baseModelLister         omev1beta1lister.BaseModelLister
+	baseModelSynced         cache.InformerSynced
+	clusterBaseModelLister  omev1beta1lister.ClusterBaseModelLister
+	clusterBaseModelSynced  cache.InformerSynced
+	informerFactory         omev1beta1informers.SharedInformerFactory
+	gopherChan              chan<- *GopherTask
+	nodeName                string
+	nodeInfo                *v1.Node
+	nodeShapeAlias          string
+	kubeClient              kubernetes.Interface
+	configMapNamespace      string
+	acknowledgementInterval time.Duration
+	logger                  *zap.SugaredLogger
 }
 
 type TensorRTLLMShapeFilter struct {
@@ -58,12 +60,12 @@ type downloadOverrideInputs struct {
 	TensorRTLLMModelType string
 }
 
-func NewScout(ctx context.Context, nodeName string,
+func NewScout(ctx context.Context, nodeName string, configMapNamespace string,
 	baseModelInformer omev1beta1.BaseModelInformer,
 	clusterBaseModelInformer omev1beta1.ClusterBaseModelInformer,
 	informerFactory omev1beta1informers.SharedInformerFactory,
 	gopherChan chan<- *GopherTask,
-	kubeClient *kubernetes.Clientset,
+	kubeClient kubernetes.Interface,
 	logger *zap.SugaredLogger) (*Scout, error) {
 
 	logger.Infof("Initializing Scout for node: %s", nodeName)
@@ -99,6 +101,7 @@ func NewScout(ctx context.Context, nodeName string,
 		gopherChan:             gopherChan,
 		nodeName:               nodeName,
 		kubeClient:             kubeClient,
+		configMapNamespace:     configMapNamespace,
 		logger:                 logger,
 	}
 
@@ -237,7 +240,7 @@ syncComplete:
 	// This ensures we catch any deletion requests that occurred while the agent was down
 	w.reconcilePendingDeletions()
 
-	<-stopCh
+	w.runArtifactAcknowledgementRecovery(stopCh)
 	close(w.gopherChan)
 	w.logger.Info("Shutting down scout")
 
@@ -652,21 +655,10 @@ for the provided ClusterBaseModel.
 The task is sent to w.gopherChan for processing by Gopher workers.
 */
 func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseModel *v1beta1.ClusterBaseModel) {
-	IsTensorrtLLMModel := clusterBaseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-	modelType := string(constants.ServingBaseModel)
-	if modelTypeFromMetadata, ok := clusterBaseModel.Spec.AdditionalMetadata["type"]; ok {
-		modelType = modelTypeFromMetadata
-	}
-
 	gopherTask := &GopherTask{
-		TaskType:         DownloadOverride,
-		ClusterBaseModel: clusterBaseModel,
-		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-			IsTensorrtLLMModel: IsTensorrtLLMModel,
-			ShapeAlias:         w.nodeShapeAlias,
-			ModelType:          modelType,
-		},
+		TaskType:               DownloadOverride,
+		ClusterBaseModel:       clusterBaseModel,
+		TensorRTLLMShapeFilter: artifactTaskShapeFilter(clusterBaseModel.Spec, w.nodeShapeAlias),
 	}
 
 	w.logger.Infof("generate DownloadOverride task %v", clusterBaseModel.Spec.DisplayName)
@@ -674,21 +666,19 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseM
 }
 
 func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.BaseModel) {
-	IsTensorrtLLMModel := baseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-	modelType := string(constants.ServingBaseModel)
-	if modelTypeFromMetadata, ok := baseModel.Spec.AdditionalMetadata["type"]; ok {
-		modelType = modelTypeFromMetadata
-	}
 	gopherTask := &GopherTask{
-		TaskType:  DownloadOverride,
-		BaseModel: baseModel,
-		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-			IsTensorrtLLMModel: IsTensorrtLLMModel,
-			ShapeAlias:         w.nodeShapeAlias,
-			ModelType:          modelType,
-		},
+		TaskType:               DownloadOverride,
+		BaseModel:              baseModel,
+		TensorRTLLMShapeFilter: artifactTaskShapeFilter(baseModel.Spec, w.nodeShapeAlias),
 	}
 	w.logger.Infof("generate DownloadOverride task %v", baseModel.Spec.DisplayName)
 	w.gopherChan <- gopherTask
+}
+
+func artifactTaskShapeFilter(spec v1beta1.BaseModelSpec, shape string) *TensorRTLLMShapeFilter {
+	modelType := string(constants.ServingBaseModel)
+	if value, ok := spec.AdditionalMetadata["type"]; ok {
+		modelType = value
+	}
+	return &TensorRTLLMShapeFilter{IsTensorrtLLMModel: spec.ModelFormat.Name == constants.TensorRTLLM, ShapeAlias: shape, ModelType: modelType}
 }
