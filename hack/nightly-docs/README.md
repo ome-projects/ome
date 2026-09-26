@@ -8,23 +8,32 @@ the existing release-driven Pages workflow publishes the website separately.
 ## Scope and lifecycle
 
 1. Build the unchanged base site first to catch runner/dependency failures before
-   calling a model. Inspect the full first-parent history of code/configuration changes on the
-   default branch and compare candidate changes with current code and docs.
+   calling a model. Partition the full first-parent code/configuration history
+   into eight focused scans: CLI observation, CLI actions, model storage,
+   runtimes/accelerators, workloads/rollouts, networking/traffic,
+   autoscaling/quota, and operations. Each scan has its own 100-turn budget
+   (80 turns for discovery, reserving headroom for the result). Commits touching
+   several areas can appear in several scans; otherwise-unassigned commits go
+   to operations. No eligible commit is dropped by the partition.
    There is no date cutoff or persisted success cursor: older gaps and failed or
    deferred work remain eligible. Discovery is model-guided, not an exhaustive
    guarantee that every gap will be found in a single run.
-2. Select **at most 100 independent concerns per run**. Each concern answers
+2. Combine the eight validated results in round-robin order and select
+   **at most 100 independent concerns per run**, not 100 per scan. Each concern answers
    one concrete user question or corrects one stale claim and cites a source
    commit. Sharing a subsystem or source commit never justifies bundling fixes.
 3. Give each concern its own fresh checkout and allowlist of handwritten
    Markdown files. Each PR must have **fewer than 1,000 added plus deleted lines
    (999 maximum)**, with **no file-count limit**. Generated API
    reference files, code, configuration, file deletion, and symlinks are blocked.
-4. Reject overlapping files within a plan; defer files touched by any open PR.
+4. Defer duplicate concern keys, area/concern identities, identical normalized
+   questions, and overlapping files across scans; defer files touched by any
+   open PR. Conflicts do not discard other useful proposals from a scan.
    Examine human PRs too. Stable source/area/concern markers and branch names
    deduplicate retries and remember closed-unmerged proposals as declined.
    Semantic duplicate detection across different source commits/slugs also
-   relies on the planner reading existing PRs; it is not a text-matching proof.
+   relies on the planners reading existing PRs and honoring their separate
+   responsibilities; matching keys/questions is not a semantic equivalence proof.
 5. Transfer only a JSON bundle of documentation text to a **separate publisher
    job with a fresh checkout**. Revalidate the bundle with pristine guards before
    writing allowed documentation paths. No writer scripts, Git metadata, hooks,
@@ -39,6 +48,11 @@ the existing release-driven Pages workflow publishes the website separately.
    `fail-fast: false` lets other concerns finish when one fails. The publisher
    skips concerns whose writer failed to produce an artifact.
 
+Writers and independent reviewers each have a 120-turn ceiling, with a prompt
+target of 60 turns for investigation/editing or evidence gathering. This leaves
+headroom for tool batches and the final result; exceeding the ceiling still
+fails the job rather than bypassing review.
+
 The writer has a read-only GitHub token and cannot publish. The planner and
 publisher's reviewer have only Read, Glob, and Grep tools (no shell, editing, or
 agent tools); source diffs are prepared by the workflow. The publisher does not
@@ -51,7 +65,21 @@ branch's source SHA once, before calling the model; every job then checks out
 that same source SHA. A manual run from a fix branch therefore tests that
 branch's tooling while all generated PRs contain only documentation changes
 against the pinned default branch. The model cannot choose either revision.
-Run-level concurrency prevents overlapping nightlies.
+Run-level concurrency prevents overlapping nightlies. Discovery, writing, and
+publication each allow four concurrent jobs. This increases total model work
+and may increase model cost; the 100-PR ceiling is not a daily output target.
+Publisher overlap checks batch open-PR file lists with GraphQL and fall back to
+fully paginated REST for PRs changing more than 100 files.
+
+Models select numbered entries from a trusted per-scan commit index; the
+workflow resolves them to full source SHAs, avoiding hash transcription errors.
+Each scan reports inspected source commits and remaining work. These are model
+self-reports, not a tool-level audit; inspecting a commit subject does not count.
+The `nightly-docs-discovery-report` artifact (14-day retention) contains every
+scan, the selected plan, and reasons for deferring proposals. Job summaries show
+eligible commits, reported inspected commits and candidate counts by scan.
+A missing/invalid scan fails planning rather than silently treating it as an
+empty result. This makes incomplete discovery visible and retryable.
 Existing PR branches are never force-pushed or overwritten. If a previous run
 pushed a branch but failed to open its PR, an exact retry can reuse that tree;
 otherwise the job fails for maintainer inspection instead of overwriting it.

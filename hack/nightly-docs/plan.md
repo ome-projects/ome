@@ -1,8 +1,12 @@
 Read AGENTS.md and the context JSON at the path in NIGHTLY_CONTEXT.
 The documentation source is site/content/en/docs/ in this repository.
 
+You own ONLY the user-facing concerns described in the context's focus field.
+Other scans own the other scan_responsibilities. Shared source files/commits are
+not permission to duplicate another scan's user question. CLI scans own command
+syntax and reports; subsystem scans own API/controller behavior.
 Compare merged code on the checked-out default branch against CURRENT docs.
-Use the complete first-parent code-change history in the context as discovery
+Use the subsystem-filtered first-parent code-change history in the context as discovery
 evidence, not as proof that documentation is missing. Inspect code, tests, related
 OEP status, and relevant docs before selecting a gap. Include older undocumented
 changes, not just yesterday's commits. Balance recent regressions with older gaps.
@@ -12,10 +16,22 @@ Internal refactors without a user-visible documentation impact need no PR.
 Do not describe planned or partially implemented features as working features.
 
 Return JSON matching the supplied schema, with at most max_prs concerns.
-Return an empty concerns list when no well-supported gaps remain.
+First survey the supplied history across both recent and older changes, and
+identify the subsystem's independent candidate gaps before investigating them.
+Continue across those candidates: do not stop after a handful of easy findings
+while other promising candidates remain unexamined. Aim for broad coverage,
+not a quota of PRs; never invent gaps or lower accuracy to fill the cap.
 Finish evidence gathering within 80 turns and reserve the remaining budget for
-the structured plan. Return the well-supported concerns found so far; discovery
-can continue on later nights and need not exhaust the history in this run.
+the structured plan. Return an empty concerns list when no supported gaps remain.
+Every code_history line begins with an integer commit ID, then its full SHA.
+Use the integer ID for source_commit and inspected_commits; the workflow owns
+resolving IDs to exact hashes. Never retype a SHA in a structured source field.
+Also return inspected_commits: distinct commit IDs whose source diff AND current
+implementation/docs you actually examined (reading a commit subject is not an
+inspection). Every concern's source_commit must be in that list. Return remaining_work
+as a concise description of unexamined candidates and why you stopped, or state
+that the supplied candidates have been exhausted. This is a self-reported
+coverage measure, not proof of an exhaustive audit.
 
 ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
 - Each item must answer ONE concrete user question or correct ONE stale claim
@@ -25,7 +41,7 @@ ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
 - Bad: "Update InferenceService docs for rollout, routing, and autoscaling."
 - area is a stable subsystem slug; concern is a stable, narrowly descriptive
   slug for the behavior, without a date. Preserve existing slugs for the same gap.
-- source_sha must be a full SHA from the supplied code-change history. Confirm
+- source_commit must be an integer ID from the supplied code-change history. Confirm
   that the behavior still exists on the current default branch.
 - title must be a nonempty printable single line, at most 120 characters
   including the `[Docs] ` prefix. Include that prefix in every title.
@@ -43,7 +59,10 @@ PRs and closed nightly PRs. Do not duplicate a concern already being addressed,
 even if its title, slug, or source commit differs. A closed-unmerged nightly PR
 means a maintainer declined that concern: do not recreate it. A merged PR should
 already be reflected in current docs; only a genuinely later code change can
-justify another update. No two selected items may touch the same doc file; defer
+justify another update. Prefer focused task/reference pages where they are a natural home for an
+independent concern, rather than putting every CLI topic in the overview. Do not
+create duplicate pages merely to evade an open PR or file conflict.
+No two selected items may touch the same doc file; defer
 overlapping items to a later night after the first PR merges. Also defer files
 touched by any open PR. Never broaden an item to get around these limits.
 

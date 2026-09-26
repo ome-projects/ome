@@ -20,7 +20,7 @@ comparing it to anything. Use `status` to see what is reported now; use
 
 ## Before you begin
 
-- Install the [kubectl-ome plugin](/docs/tasks/kubectl-ome/).
+- Install the [kubectl-ome plugin](/ome/docs/tasks/kubectl-ome/).
 - The command is read-only: it performs a single `get` on the
   InferenceService and nothing else. The `kubectl-ome-reader` ClusterRole
   from the plugin page is sufficient.
