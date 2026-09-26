@@ -10,13 +10,30 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 import nightly_docs as docs
 
 STATE = "<!-- docs-maintenance-state:"
 CHECK = "Docs maintenance"
 BOTS = {"claude", "coderabbitai"}
+TRUSTED_ASSOCIATIONS = {'OWNER', 'MEMBER', 'COLLABORATOR'}
 MAX_ATTEMPTS = 3
+
+
+def reject_secrets(text):
+    """Reject known live credentials and recognizable token literals without echoing them."""
+    values = [os.getenv(name, '') for name in ('ANTHROPIC_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN')]
+    if (any(len(value) >= 8 and value in text for value in values)
+            or re.search(r'(?:sk-ant-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]{20,}', text)):
+        raise ValueError('Credential-like content detected; refusing public output')
+
+
+def trusted_feedback(author, association):
+    """Only maintainers and authenticated review bots can spend model budget."""
+    return bool(author) and (association in TRUSTED_ASSOCIATIONS or (
+        (author.get('__typename') or author.get('type')) == 'Bot'
+        and author['login'].removesuffix('[bot]') in BOTS))
 
 
 def api(endpoint, method="GET", payload=None):
@@ -86,6 +103,8 @@ def decode_state(comments):
 def substantive_comment(comment):
     """Bookkeeping and bot skip notices are not new review feedback."""
     author, body = comment["user"]["login"], comment["body"]
+    if not trusted_feedback(comment['user'], comment.get('author_association')):
+        return False
     if author == "github-actions[bot]" and body.startswith(STATE):
         return False
     if (author == "coderabbitai[bot]"
@@ -102,12 +121,12 @@ def feedback(pr):
     state, state_id = decode_state(comments)
     reviews = docs.pages(f"repos/{repo()}/pulls/{number}/reviews?per_page=100")
     owner, name = repo().split("/")
-    threads, cursor = [], None
+    threads, cursor, unresolved, protected = [], None, [], []
     query = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){
       repository(owner:$owner,name:$name){pullRequest(number:$number){
         reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
           nodes{id isResolved isOutdated path line comments(first:100){
-            pageInfo{hasNextPage} nodes{author{__typename login} body url}}}}
+            pageInfo{hasNextPage} nodes{author{__typename login} authorAssociation body url}}}}
       }}}"""
     while True:
         data = api("graphql", "POST", {"query": query, "variables": {
@@ -116,10 +135,15 @@ def feedback(pr):
         for thread in connection["nodes"]:
             if thread["isResolved"]:
                 continue
+            unresolved.append(thread['id'])
             if thread["comments"]["pageInfo"]["hasNextPage"]:
                 raise ValueError("A review thread exceeds 100 comments; human triage required")
-            threads.append({**thread, "comments": thread["comments"]["nodes"],
-                            "number": len(threads) + 1})
+            comments_in_thread = thread['comments']['nodes']
+            trusted = [c for c in comments_in_thread if trusted_feedback(c.get('author'), c.get('authorAssociation'))]
+            if len(trusted) != len(comments_in_thread):
+                protected.append(thread['id'])
+            if trusted:
+                threads.append({**thread, "comments": trusted, "number": len(threads) + 1})
         if not connection["pageInfo"]["hasNextPage"]:
             break
         cursor = connection["pageInfo"]["endCursor"]
@@ -132,8 +156,10 @@ def feedback(pr):
                             for c in comments if substantive_comment(c)],
                "reviews": [{"id": r["id"], "author": r["user"]["login"], "body": r["body"],
                             "state": r["state"], "commit": r["commit_id"]}
-                           for r in reviews if r["body"] or r["state"] == "CHANGES_REQUESTED"],
-               "threads": threads, "failed_checks": failed_checks}
+                           for r in reviews if trusted_feedback(r['user'], r.get('author_association'))
+                           and (r["body"] or r["state"] == "CHANGES_REQUESTED")],
+               "threads": threads, "failed_checks": failed_checks,
+               "unresolved_threads": unresolved, "protected_threads": protected}
     if len(json.dumps(details).encode()) > 2 * 1024 * 1024:
         raise ValueError("Feedback exceeds 2 MiB; human triage required")
     return details, state, state_id
@@ -148,8 +174,10 @@ def check_runs(head):
 
 def signature(pr, details, extra=""):
     """A cached review is invalidated by content, base, or substantive feedback."""
+    substantive = {key: value for key, value in details.items()
+                   if key not in {'unresolved_threads', 'protected_threads'}}
     return hashlib.sha256(json.dumps([pr["head"]["sha"], pr["base"]["sha"],
-                                     details, extra], sort_keys=True).encode()).hexdigest()
+                                     substantive, extra], sort_keys=True).encode()).hexdigest()
 
 
 def decision(state, digest, force=False):
@@ -165,7 +193,12 @@ def decision(state, digest, force=False):
 
 def state_body(state):
     """Expose a single readable status with machine-readable retry history."""
-    encoded = base64.b64encode(json.dumps(state).encode()).decode()
+    state = dict(state)
+    for key, limit in [('reason', 4000), ('extra_feedback', 2000)]:
+        if key in state:
+            state[key] = state[key][:limit]
+    reject_secrets(json.dumps(state))
+    encoded = base64.b64encode(json.dumps(state, ensure_ascii=False).encode()).decode()
     return (f"{STATE}{encoded} -->\n"
             f"Documentation maintenance: **{state['phase']}**. "
             f"Unsuccessful-round budget used: {state['attempts']}/{MAX_ATTEMPTS}.\n\n"
@@ -194,6 +227,10 @@ def output(**values):
 
 def select(number, force, merge):
     """Reconcile all eligible PRs on each wake so replaced queued events are safe."""
+    if not number and (force or os.getenv('EXTRA_FEEDBACK')):
+        raise ValueError('feedback and force require an explicit PR number')
+    if len(os.getenv('EXTRA_FEEDBACK', '')) > 2000:
+        raise ValueError('Additional feedback is limited to 2000 characters')
     prs = ([get_pr(int(number))] if number else
            docs.pages(f"repos/{repo()}/pulls?state=open&per_page=100"))
     base = current_base()
@@ -207,11 +244,12 @@ def select(number, force, merge):
             return None
         try:
             eligible(pr)
-        except ValueError:
+            details, state, _ = feedback(pr)
+        except ValueError as error:
             if number:
                 raise
+            print(f"Skipping PR #{pr['number']}: {type(error).__name__}; inspect it with an explicit dispatch")
             return None
-        details, state, _ = feedback(pr)
         extra = os.getenv("EXTRA_FEEDBACK") or state.get("extra_feedback", "")
         action = decision(state, signature(pr, details, extra), force)
         if action == "needs-human" or (action == "cached" and not merge):
@@ -234,7 +272,12 @@ def context(pr):
     if any(not re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
         raise ValueError("Expected immutable commits")
     docs.mutate_git("fetch", "--no-tags", "origin", base, head)
-    docs.git("merge-base", "--is-ancestor", source, base)
+    try:
+        docs.git("merge-base", "--is-ancestor", source, base)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            raise ValueError('The source commit is not an ancestor of main') from error
+        raise
     fork = docs.git("merge-base", base, head)
     files = {}
     for line in docs.git("diff", "--name-status", fork, head).splitlines():
@@ -273,12 +316,26 @@ def restore(ctx, bundle=None):
 def prepare(number, directory, apply, force):
     """Reserve one bounded attempt under the workflow's per-PR concurrency lock."""
     import maintenance_checks as checks
-    ctx = context(get_pr(number))
+    pr = get_pr(number)
+    eligible(pr)
+    try:
+        ctx = context(pr)
+        reject_secrets(json.dumps(ctx))
+        restore(ctx)
+    except ValueError as error:
+        if apply:
+            _, state_id = decode_state(docs.pages(f"repos/{repo()}/issues/{number}/comments?per_page=100"))
+            rejected = {'number': number, 'state_id': state_id, 'base': pr['base']['sha'],
+                        'run_url': f"https://github.com/{repo()}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+            save_state(rejected, {'phase': 'needs-human', 'attempts': MAX_ATTEMPTS,
+                                  'head': pr['head']['sha'], 'base': pr['base']['sha'],
+                                  'reason': str(error), 'run_url': rejected['run_url']})
+            record_check(rejected, pr['head']['sha'], False, str(error))
+        raise
     action = decision(ctx["state"], ctx["signature"], force)
     directory.mkdir(parents=True, exist_ok=True)
     ctx["action"] = action
     if action == "work":
-        restore(ctx)
         ctx["findings"] = checks.document_findings(ctx["files"], Path.cwd())
         attempts = 1 if force else ctx["state"].get("attempts", 0) + 1
         ctx["attempts"] = attempts
@@ -287,6 +344,7 @@ def prepare(number, directory, apply, force):
                              "base": ctx["base"], "run_url": ctx["run_url"],
                              "extra_feedback": ctx["extra_feedback"],
                              "reason": "Repair/validation in progress; no merge authorization implied."})
+    reject_secrets(json.dumps(ctx))
     (directory / "context.json").write_text(json.dumps(ctx, indent=2))
     output(work=str(action == "work").lower(), cached=str(action == "cached").lower(), base=ctx["base"])
 
@@ -377,7 +435,8 @@ def checked_threads(verdict, ctx):
                                            for n in numbers) or len(numbers) != len(set(numbers))):
         raise ValueError("Invalid addressed-thread report")
     return [threads[n - 1]["id"] for n in numbers
-            if threads[n - 1]["comments"] and all(
+            if threads[n - 1]['id'] not in ctx['feedback'].get('protected_threads', [])
+            and threads[n - 1]["comments"] and all(
                 c.get("author") and c["author"].get("__typename") == "Bot"
                 and c["author"]["login"].removesuffix("[bot]") in BOTS
                 for c in threads[n - 1]["comments"])]
@@ -385,6 +444,7 @@ def checked_threads(verdict, ctx):
 
 def record_check(ctx, head, accepted, reason):
     """Attach the verdict to the actual PR commit, not the dispatcher commit."""
+    reject_secrets(reason)
     api(f"repos/{repo()}/check-runs", "POST", {
         "name": CHECK, "head_sha": head, "status": "completed",
         "conclusion": "success" if accepted else "failure", "details_url": ctx["run_url"],
@@ -395,7 +455,8 @@ def record_check(ctx, head, accepted, reason):
 
 def finish(ctx, directory, apply):
     """Publish bounded progress and record an honest success/failure verdict."""
-    raw = os.getenv("REVIEW_JSON", "")
+    raw = (directory / 'review.json').read_text() if (directory / 'review.json').exists() else os.getenv("REVIEW_JSON", "")
+    reject_secrets(raw)
     verdict = docs.review_verdict(raw) if raw else {
         "single_concern": False, "accurate": False, "reason": "Review did not complete."}
     threads = checked_threads(verdict, ctx)
@@ -408,25 +469,26 @@ def finish(ctx, directory, apply):
     if not technical:
         reason += "\nProduction build or deterministic validation did not pass."
     head = ctx["head"]
+    reject_secrets(reason)
     if apply:
-        live_match(ctx)
-        # A sound, single-concern partial repair can remain in an OPEN PR. Its
-        # failing quality check and stored reviewer findings prohibit merging.
-        if technical and verdict["single_concern"]:
+        if accepted:
             head = publish_repair(ctx)
+        else:
+            live_match(ctx)
+        current = published_pr(ctx, head)
         record_check(ctx, head, accepted, reason)
         expected_details = json.loads(json.dumps(ctx["feedback"]))
         # Checks on the old commit are evidence for the repair, not failures on
         # its successor. Any newly arriving result invalidates the saved digest.
         if head != ctx["head"]:
             expected_details["failed_checks"] = []
-        if accepted:
-            current = get_pr(ctx['number'])
+        if accepted and threads:
             fresh, _, _ = feedback(current)
             original_threads = {t["id"]: t for t in ctx["feedback"]["threads"]}
             fresh_threads = {t["id"]: t for t in fresh["threads"]}
             for thread in threads:
-                if fresh_threads.get(thread) != original_threads[thread]:
+                if (fresh_threads.get(thread) != original_threads[thread]
+                        or thread in fresh.get('protected_threads', [])):
                     continue
                 api("graphql", "POST", {"query": "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}",
                                         "variables": {"id": thread}})
@@ -434,24 +496,38 @@ def finish(ctx, directory, apply):
                 expected_details["threads"] = [t for t in expected_details["threads"] if t["id"] != thread]
             for index, thread in enumerate(expected_details["threads"], 1):
                 thread["number"] = index
-        current = get_pr(ctx['number'])
-        details, _, _ = feedback(current)
-        if current["head"]["sha"] != head or current["base"]["sha"] != ctx["base"]:
-            raise ValueError("PR changed after publication; a fresh review is required")
+        current = published_pr(ctx, head)
         attempts = 0 if accepted else ctx["attempts"]
         state = {"phase": "ready" if accepted else ("needs-human" if attempts >= MAX_ATTEMPTS else "needs-repair"),
                  "attempts": attempts, "head": head, "base": ctx["base"], "reason": reason,
                  "signature": signature(current, expected_details, ctx["extra_feedback"]),
                  "extra_feedback": ctx["extra_feedback"], "run_url": ctx["run_url"]}
         save_state(ctx, state)
-    result = {"number": ctx["number"], "applied": apply, "accepted": accepted, "head": head,
+    result = {"number": ctx["number"], "applied": apply, "published": head != ctx['head'],
+              "accepted": accepted, "head": head,
               "base": ctx["base"], "review_base": ctx.get("review_base", ctx["base"]),
               "reason": reason, "resolved_bot_threads": resolved}
     (directory / "result.json").write_text(json.dumps(result, indent=2))
+    publication = ('dry run, no repository writes' if not apply else
+                   ('repair published' if head != ctx['head'] else 'no repair published'))
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
         summary.write(f"PR #{ctx['number']}: {'validated' if accepted else 'needs repair'}; "
-                      f"{'changes published' if apply else 'dry run, no repository writes'}.\n\n"
+                      f"{publication}.\n\n"
                       f"<pre>{html.escape(reason)}</pre>\n")
+
+
+def published_pr(ctx, head):
+    """Tolerate propagation of our push, but never accept a competing head/base."""
+    for attempt in range(12):
+        current = get_pr(ctx['number'])
+        eligible(current)
+        if current['base']['sha'] != ctx['base']:
+            raise ValueError('Main changed after publication; a fresh review is required')
+        if current['head']['sha'] == head:
+            return current
+        if current['head']['sha'] != ctx['head'] or attempt == 11:
+            raise ValueError('PR changed after publication or our push did not propagate')
+        time.sleep(2)
 
 
 def failure(ctx):
@@ -503,7 +579,7 @@ def merge(number, enabled):
     digest = signature(pr, details, state.get("extra_feedback", ""))
     info = json.loads(docs.run("gh", "pr", "view", str(number), "--repo", repo(),
                               "--json", "reviewDecision,mergeStateStatus,statusCheckRollup"))
-    info["unresolved"] = bool(details["threads"])
+    info["unresolved"] = bool(details.get('unresolved_threads', details['threads']))
     info["checks"] = info.pop("statusCheckRollup")
     checks = check_runs(pr["head"]["sha"])
     blockers = merge_blockers(pr, state, digest, info, checks)
@@ -545,8 +621,13 @@ def main():
     if command == "restore":
         restore(ctx)
     elif command == "export":
+        for path in ctx['item']['doc_paths']:
+            if Path(path).is_file():
+                reject_secrets(Path(path).read_text())
         docs.export_bundle(ctx["item"], ctx["base"], directory / "bundle.json")
+        reject_secrets((directory / 'bundle.json').read_text())
     elif command == "import":
+        reject_secrets((directory / 'bundle.json').read_text())
         changed = restore(ctx, (directory / "bundle.json").read_text())
         (directory / "full-pr.patch").write_text(docs.git("diff", "--cached", ctx["base"]))
         output(changed=str(changed).lower())
@@ -561,6 +642,21 @@ def main():
         refresh_base(ctx, directory)
     elif command == "finish":
         finish(ctx, directory, apply)
+    elif command == 'review-export':
+        raw = os.getenv('REVIEW_JSON', '')
+        verdict = docs.review_verdict(raw) if raw else {
+            'single_concern': False, 'accurate': False, 'reason': 'Review did not complete.', 'addressed_threads': []}
+        reject_secrets(json.dumps(verdict))
+        (directory / 'review.json').write_text(json.dumps(verdict))
+    elif command == 'review-gate':
+        raw = (directory / 'review.json').read_text()
+        reject_secrets(raw)
+        verdict = docs.review_verdict(raw)
+        output(accepted=str(verdict['single_concern'] and verdict['accurate']).lower())
+    elif command == 'scan':
+        for path in directory.rglob('*'):
+            if path.is_file():
+                reject_secrets(path.read_text())
     elif command == "failure":
         failure(ctx)
     else:

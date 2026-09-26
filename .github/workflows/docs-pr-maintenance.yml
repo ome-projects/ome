@@ -61,6 +61,10 @@ jobs:
       && vars.DOCS_MAINTENANCE_ENABLED != 'false'
       && (github.event_name != 'issue_comment' || github.event.issue.pull_request)
       && (github.event_name != 'issue_comment' || !startsWith(github.event.comment.body, '<!-- docs-maintenance-state:'))
+      && (github.event_name != 'issue_comment'
+          || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+          || (github.event.comment.user.type == 'Bot'
+              && contains(fromJSON('["claude[bot]","coderabbitai[bot]"]'), github.event.comment.user.login)))
     runs-on: ome-runner-cpu
     timeout-minutes: 20
     outputs:
@@ -81,6 +85,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/nightly-docs-setup
         with:
+          export-api-key: 'false'
           source-sha: ${{ github.sha }}
       - name: Select mode
         id: mode

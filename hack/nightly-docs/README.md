@@ -149,6 +149,10 @@ Each activation does one repair round:
 
 1. Pin the PR head, current main and review feedback. Read unresolved threads,
    review/issue comments, failed CI check summaries and previous repair findings.
+   Only OWNER, MEMBER and COLLABORATOR feedback and authenticated Claude/CodeRabbit
+   bot feedback can invalidate the model cache. Outsider comments cannot start
+   model rounds; all unresolved threads still block merging, and a human reply
+   of any association protects a thread from automatic resolution.
    Read main's live Git ref because the PR API's `base.sha` can lag updates.
    Ignore maintenance bookkeeping and CodeRabbit's informational skip notices.
    Overlay only the PR's Markdown on trusted main; changes to the same pages on
@@ -159,8 +163,13 @@ Each activation does one repair round:
    whitespace and **999 changed-line maximum** checks, validates YAML examples
    against current OME CRD schemas, and catches incorrect `/docs/` prefixes.
    There is no file-count limit; repairs stay within the original PR's paths.
-4. A second, independent **claude-fable-5** review checks the whole PR, behavior
+4. A second, independent **claude-fable-5** review in a read-only job checks the whole PR, behavior
    claims, feedback and semantic correctness against implementation and tests.
+   A separate publisher revalidates the data and requires both accuracy and scope
+   approval. Its write token is scoped to API/publication steps, with no model
+   running in that job. Known live credentials and recognizable token literals
+   are rejected before artifact upload and public reporting. Non-model setup
+   does not copy the runner API key into the GitHub environment file.
    Build the production Hugo site, then check internal docs links and anchors
    from the rendered pages. Fenced YAML is data: shell heredocs, CEL rules and
    admission webhooks are not executed. These checks do not prove every example
@@ -174,9 +183,10 @@ Each activation does one repair round:
 5. Append a signed-off repair commit to the **same branch**, including current
    main when necessary, using a normal push. The committed tree must exactly
    match the validated tree. Concurrent changes invalidate publication; no
-   force-push is used. A technically valid, single-concern partial repair may be
-   published with a **failing** quality check so another round can address the
-   remaining accuracy findings. Rejected/malformed scope cannot be published.
+   force-push is used. Rejected accuracy, rejected scope, failed deterministic
+   checks or malformed verdicts cannot publish a repair. Their findings remain
+   in bounded retry state and artifacts for the next round. The publisher waits
+   briefly for its new head to propagate, rejecting any competing head or base.
 6. Record `Docs maintenance` on the actual PR head and update one bot status
    comment. Verified bot-only threads may be resolved; human discussions never
    are. New head/base/feedback invalidates a cached successful result. The same
@@ -225,4 +235,8 @@ pilots. `maintenance_feedback` supplies specific additional feedback;
 `maintenance_force=true` explicitly resumes an exhausted PR. After installation,
 `docs-pr-maintenance.yml` also supports direct dispatch with `pr_number`, `apply`,
 `feedback` and `force`. A dispatch without a PR number scans all eligible PRs;
-manual dispatch defaults to dry-run mode.
+manual dispatch defaults to dry-run mode. `feedback` (at most 2,000 characters)
+and `force` require an explicit PR number; they cannot fan out across a sweep.
+A PR with malformed feedback is skipped with a diagnostic during a sweep, while
+an explicit dispatch fails loudly. Scope/conflict rejections during preparation
+are marked `needs-human` rather than repeatedly launching workers.

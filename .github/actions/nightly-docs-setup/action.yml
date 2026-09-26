@@ -1,6 +1,9 @@
 name: Set up nightly documentation tools
 description: Prepare Python, gh, and the runner-provided Anthropic key
 inputs:
+  export-api-key:
+    description: Export the runner API key for a model step
+    default: 'true'
   source-sha:
     description: Immutable default-branch commit to document
     required: true
@@ -11,6 +14,7 @@ runs:
       with:
         python-version: '3.12'
     - name: Export API key from pod environment
+      if: inputs.export-api-key == 'true'
       shell: bash
       run: |
         : "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the ome-runner-cpu pod environment}"

@@ -96,16 +96,125 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(m.decode_state([comment]), ({}, None))
 
     def test_bot_skip_notice_is_not_a_repair_request(self):
-        comment = {'user': {'login': 'coderabbitai[bot]'},
+        comment = {'user': {'login': 'coderabbitai[bot]', 'type': 'Bot'},
                    'body': '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n'
                            '<!-- This is an auto-generated comment: skip review by coderabbit.ai -->\nReview skipped'}
         self.assertFalse(m.substantive_comment(comment))
         comment['user']['login'] = 'maintainer'
+        comment['author_association'] = 'COLLABORATOR'
         self.assertTrue(m.substantive_comment(comment))
         comment['user']['login'] = 'coderabbitai[bot]'
         comment['body'] = 'Fix this incorrect example'
         self.assertTrue(m.substantive_comment(comment))
 
+    def test_untrusted_feedback_does_not_invalidate_a_successful_review(self):
+        outsider = {'login': 'claude', '__typename': 'User'}
+        self.assertFalse(m.trusted_feedback(outsider, 'NONE'))
+        self.assertTrue(m.trusted_feedback(outsider, 'COLLABORATOR'))
+        self.assertTrue(m.trusted_feedback({'login': 'claude', '__typename': 'Bot'}, 'NONE'))
+        details = {'threads': [], 'unresolved_threads': [], 'protected_threads': []}
+        self.assertEqual(m.signature(pull(), details), m.signature(pull(), {
+            **details, 'unresolved_threads': ['external-thread'], 'protected_threads': ['T']}))
+
+    def test_feedback_filters_outsiders_but_preserves_merge_blockers(self):
+        bot = {'author': {'__typename': 'Bot', 'login': 'claude'}, 'authorAssociation': 'NONE', 'body': 'Fix link'}
+        outsider = {'author': {'__typename': 'User', 'login': 'visitor'}, 'authorAssociation': 'NONE', 'body': 'Untrusted text'}
+        threads = [{'id': 'T', 'isResolved': False, 'comments': {'pageInfo': {'hasNextPage': False}, 'nodes': [bot, outsider]}},
+                   {'id': 'external', 'isResolved': False, 'comments': {'pageInfo': {'hasNextPage': False}, 'nodes': [outsider]}}]
+        response = {'data': {'repository': {'pullRequest': {'reviewThreads': {
+            'nodes': threads, 'pageInfo': {'hasNextPage': False}}}}}}
+        comments = [{'id': 1, 'user': {'login': 'visitor', 'type': 'User'}, 'author_association': 'NONE', 'body': 'Spend budget'}]
+        reviews = [{'id': 2, 'user': {'login': 'visitor', 'type': 'User'}, 'author_association': 'NONE',
+                    'body': 'External review', 'state': 'CHANGES_REQUESTED', 'commit_id': 'b' * 40}]
+        with patch.object(m.docs, 'pages', side_effect=[comments, reviews]), \
+                patch.object(m, 'api', return_value=response), patch.object(m, 'check_runs', return_value=[]):
+            details, _, _ = m.feedback(pull())
+        self.assertEqual(details['comments'], [])
+        self.assertEqual(details['reviews'], [])
+        self.assertEqual(details['threads'][0]['comments'], [bot])
+        self.assertEqual(details['unresolved_threads'], ['T', 'external'])
+        self.assertEqual(m.checked_threads({'addressed_threads': [1]}, {'feedback': details}), [])
+
+    def test_model_jobs_are_read_only_and_publisher_scopes_credentials(self):
+        import yaml
+        root = Path(__file__).resolve().parents[2]
+        workflow = yaml.load((root / '.github/workflows/docs-pr-worker.yml').read_text(), Loader=yaml.BaseLoader)
+        for name in ['repair', 'review']:
+            self.assertEqual(workflow['jobs'][name]['permissions']['contents'], 'read')
+            self.assertEqual(workflow['jobs'][name]['permissions']['pull-requests'], 'read')
+        publisher = workflow['jobs']['validate-publish']
+        self.assertNotIn('GH_TOKEN', publisher.get('env', {}))
+        for step in publisher['steps']:
+            self.assertFalse(step.get('uses', '').startswith('anthropics/'))
+            if 'GH_TOKEN' in step.get('env', {}):
+                self.assertIn(step['name'], ['Refresh only unrelated new documentation on main',
+                                             'Publish guarded repair and record the actual PR-head check'])
+
+    def test_bulk_dispatch_rejects_single_pr_options(self):
+        with patch.dict(os.environ, {'EXTRA_FEEDBACK': 'Fix one thing'}), self.assertRaisesRegex(ValueError, 'PR number'):
+            m.select(0, False, False)
+        with patch.dict(os.environ, {'EXTRA_FEEDBACK': ''}), self.assertRaisesRegex(ValueError, 'PR number'):
+            m.select(0, True, False)
+
+    def test_bad_feedback_does_not_abort_other_prs(self):
+        prs = [{**pull(), 'number': 1}, {**pull(), 'number': 2}]
+        def feedback(pr):
+            if pr['number'] == 1:
+                raise ValueError('Feedback requires triage')
+            return {}, {}, None
+        with patch.object(m.docs, 'pages', return_value=prs), \
+                patch.object(m, 'feedback', side_effect=feedback), patch.object(m, 'output') as output:
+            m.select(0, False, False)
+        self.assertEqual(output.call_args.kwargs['matrix']['include'], [{'number': 2}])
+
+    def test_secret_content_and_oversized_status_are_handled(self):
+        for text in ['sk-ant-' + 'x' * 40, 'ghs_' + 'x' * 40, 'prefix private-test-key suffix']:
+            with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'private-test-key'}), self.assertRaisesRegex(ValueError, 'Credential'):
+                m.reject_secrets(text)
+        state = {'phase': 'needs-repair', 'attempts': 1, 'head': 'a', 'base': 'b', 'run_url': 'url',
+                 'reason': '<&😀' * 100000, 'extra_feedback': '😀' * 100000}
+        self.assertLess(len(m.state_body(state).encode()), 65536)
+
+    def test_publication_waits_only_for_our_own_head(self):
+        ctx = {'number': 7, 'head': 'b' * 40, 'base': 'a' * 40}
+        old, new = pull(), pull()
+        new['head']['sha'] = 'c' * 40
+        with patch.object(m, 'get_pr', side_effect=[old, old, new]), patch.object(m.time, 'sleep') as sleep:
+            self.assertEqual(m.published_pr(ctx, 'c' * 40), new)
+            self.assertEqual(sleep.call_count, 2)
+        with patch.object(m, 'get_pr', return_value=new), patch.object(m.time, 'sleep') as sleep:
+            with self.assertRaises(ValueError):
+                m.published_pr(ctx, 'd' * 40)
+            sleep.assert_not_called()
+
+    def test_prepare_scope_rejection_is_terminal_without_model_work(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'GITHUB_RUN_ID': '1'}), \
+                patch.object(m, 'get_pr', return_value=pull()), \
+                patch.object(m, 'context', side_effect=ValueError('Scope violation')), \
+                patch.object(m.docs, 'pages', return_value=[]), patch.object(m, 'save_state') as save, \
+                patch.object(m, 'record_check') as record, self.assertRaisesRegex(ValueError, 'Scope'):
+            m.prepare(7, Path(directory), True, False)
+        self.assertEqual(save.call_args.args[1]['phase'], 'needs-human')
+        self.assertEqual(save.call_args.args[1]['attempts'], 3)
+        self.assertFalse(record.call_args.args[2])
+
+    def test_inaccurate_review_cannot_publish_even_valid_single_concern(self):
+        ctx = {'number': 7, 'head': 'b' * 40, 'base': 'a' * 40, 'feedback': {'threads': []},
+               'attempts': 1, 'extra_feedback': '', 'run_url': 'url'}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'checks.json').write_text('[]')
+            with patch.dict(os.environ, {'BUILD_OK': 'true', 'CHECKS_OK': 'true',
+                    'GITHUB_STEP_SUMMARY': str(root / 'summary'),
+                    'REVIEW_JSON': json.dumps({'single_concern': True, 'accurate': False, 'reason': 'Wrong behavior'})}), \
+                    patch.object(m, 'live_match'), patch.object(m, 'published_pr', return_value=pull()), \
+                    patch.object(m, 'publish_repair') as publish, patch.object(m, 'record_check') as record, \
+                    patch.object(m, 'save_state'):
+                m.finish(ctx, root, True)
+            publish.assert_not_called()
+            self.assertFalse(record.call_args.args[2])
+            self.assertFalse(json.loads((root / 'result.json').read_text())['published'])
+            self.assertIn('no repair published', (root / 'summary').read_text())
     def test_human_threads_are_never_resolved(self):
         bot = {"author": {"__typename": "Bot", "login": "claude"}, "body": "fix link"}
         human = {"author": {"__typename": "User", "login": "claude"}, "body": "also clarify"}
