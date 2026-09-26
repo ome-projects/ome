@@ -8,8 +8,6 @@ on:
       - 'go.sum'
       - 'hack/internal/tools/go.mod'
       - 'hack/internal/tools/go.sum'
-      - 'site/go.mod'
-      - 'site/go.sum'
 
 permissions:
   contents: write
@@ -44,11 +42,8 @@ jobs:
           go mod download
           cd -
 
-          # Update site module
-          cd site
-          go mod tidy
-          go mod download
-          cd -
+          # Never tidy site/: its Docsy requirement is used only by Hugo, so
+          # `go mod tidy` deletes it (see site/go.mod).
 
       - name: Check for changes
         id: check
