@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	modelslister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -60,6 +61,7 @@ func TestGopherHfArtifactDeleteRetainsReceiptUntilModelRemoval(t *testing.T) {
 				// A new process must discover the receipt without the old cache.
 				s = &Gopher{configMapReconciler: NewConfigMapReconciler(s.configMapReconciler.nodeName, s.configMapReconciler.namespace,
 					s.configMapReconciler.kubeClient, s.logger), modelRootDir: s.modelRootDir, logger: s.logger,
+					modelClient: s.modelClient, kubeClient: s.kubeClient,
 					baseModelLister: s.baseModelLister, clusterBaseModelLister: s.clusterBaseModelLister}
 			}
 			require.NoError(t, s.configMapReconciler.DeleteModelFromConfigMap(ctx, task.BaseModel, nil))
@@ -281,6 +283,8 @@ func TestGopherHfArtifactDeleteAllowsCurrentUIDHandoff(t *testing.T) {
 	require.NoError(t, err)
 	task.TaskType, task.SharedArtifact = Delete, true
 	task.BaseModel.UID = "replacement-uid"
+	_, err = s.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	require.NoError(t, indexer.Add(task.BaseModel))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
@@ -467,6 +471,11 @@ func TestHfArtifactPendingDeletionGopherRecreatedUID(t *testing.T) {
 			}
 			current := input
 			current.ChildModelUID = "replacement-uid"
+			if cluster {
+				s.modelClient = omefake.NewSimpleClientset(task.ClusterBaseModel)
+			} else {
+				s.modelClient = omefake.NewSimpleClientset(task.BaseModel)
+			}
 			// This ordinary update cannot register the new UID while the old
 			// cache owner remains. The cleanup handoff must break that cycle.
 			require.NoError(t, s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
@@ -517,6 +526,8 @@ func TestHfArtifactPendingDeletionGopherRetriesUIDHandoffFailures(t *testing.T) 
 			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 			require.NoError(t, indexer.Add(task.BaseModel))
 			s.baseModelLister = modelslister.NewBaseModelLister(indexer)
+			_, err = s.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+			require.NoError(t, err)
 
 			client := h.repository.configMaps.kubeClient.(*fake.Clientset)
 			committed, injected, failNextGet := false, false, false
@@ -627,6 +638,7 @@ func TestHfArtifactPendingDeletionPreservesDifferentParentReplacement(t *testing
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	require.NoError(t, indexer.Add(otherModel))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
+	s.modelClient = omefake.NewSimpleClientset(task.BaseModel, otherModel)
 	result, err = s.runHfArtifactDownload(context.Background(), &GopherTask{TaskType: Download, BaseModel: otherModel}, other, true, nil, writeTestHfArtifactFiles)
 	require.NoError(t, err)
 	require.Equal(t, hfArtifactTaskDone, result.Outcome)
@@ -688,30 +700,37 @@ func TestHfArtifactSourceTransitionPreservesSamePathConsumer(t *testing.T) {
 				require.NoError(t, runTestHfArtifactDownload(h, input))
 				path := input.ChildModelPath + "/"
 				localURI := "local://" + path
-				consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default"}, Spec: v1beta1.BaseModelSpec{
+				consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default", UID: "consumer"}, Spec: v1beta1.BaseModelSpec{
 					Storage: &v1beta1.StorageSpec{StorageUri: &localURI, Path: &path},
 				}}
 				indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 				s.baseModelLister = modelslister.NewBaseModelLister(indexer)
+				require.NoError(t, s.kubeClient.(*fake.Clientset).Tracker().Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: s.configMapReconciler.nodeName}}))
 				if lateConsumer {
 					client := h.repository.configMaps.kubeClient.(*fake.Clientset)
+					added := false
 					client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
 						cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 						child, err := existingModelEntry(cm.Data, input.ChildModelKey)
 						require.NoError(t, err)
-						if child.HfArtifactPendingDeletion != nil {
+						if child.HfArtifactPendingDeletion != nil && !added {
 							require.NoError(t, indexer.Add(consumer))
+							require.NoError(t, s.modelClient.(*omefake.Clientset).Tracker().Add(consumer))
+							added = true
 						}
 						return false, nil, nil
 					})
 				} else {
 					require.NoError(t, indexer.Add(consumer))
+					require.NoError(t, s.modelClient.(*omefake.Clientset).Tracker().Add(consumer))
 				}
 				policy := v1beta1.AlwaysDownload
 				task.BaseModel.Spec.Storage.DownloadPolicy = &policy
 				if source == "hf" {
 					uri := "hf://org/model"
 					task.BaseModel.Spec.Storage.StorageUri = &uri
+					_, err := s.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(context.Background(), task.BaseModel, metav1.UpdateOptions{})
+					require.NoError(t, err)
 					waiting, err := s.detachHfArtifactForDefaultDownload(context.Background(), task, task.BaseModel.Spec, true)
 					require.Error(t, err, "a preserved shared symlink must never reach ordinary HF download")
 					require.False(t, waiting)

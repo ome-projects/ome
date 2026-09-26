@@ -333,7 +333,21 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 
 // runHfArtifactDownload keeps expensive validation and writes on normal workers.
 // A Failed parent with children is repaired in place, never reset as a new copy.
-func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (hfArtifactTaskResult, error) {
+func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (result hfArtifactTaskResult, err error) {
+	input.validateDownload = func(ctx context.Context) error {
+		return s.validateArtifactDownload(ctx, task)
+	}
+	defer func() {
+		if ctx.Err() != nil {
+			result, err = hfArtifactTaskResult{}, ctx.Err()
+			return
+		}
+		if err == nil && result.Outcome == hfArtifactTaskDone && (allowDownload || !task.NormalPriorityOnly) {
+			if operation := directArtifactDownloadOperationFromContext(ctx); operation != nil {
+				operation.sharedCompleted = true
+			}
+		}
+	}()
 	handler := s.sharedHfArtifactHandler()
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil

@@ -56,6 +56,8 @@ type hfArtifactTaskInput struct {
 	RetainDeletionReceipt bool
 	// A reserve-artifact delete must preserve its symlink on cleanup retries too.
 	PreserveChildPath bool
+	// Downloads and attachments recheck live child intent under both file locks.
+	validateDownload func(context.Context) error
 }
 
 func (input hfArtifactTaskInput) modelStoreRoot() (string, error) {

@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	modelslister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
@@ -172,6 +173,8 @@ func TestGopherHfArtifactSourceTransitionClearsSharedReference(t *testing.T) {
 	uri := "hf://org/model"
 	task.BaseModel.Spec.Storage.StorageUri = &uri
 	task.BaseModel.Spec.Storage.DownloadPolicy = nil
+	_, err := s.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(context.Background(), task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
 	waiting, err := s.detachHfArtifactForDefaultDownload(context.Background(), task, task.BaseModel.Spec, true)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -197,10 +200,12 @@ func TestGopherHfArtifactPendingDeletePreservesLocalConsumer(t *testing.T) {
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	uri := "local://" + input.ChildModelPath
 	consumerPath := input.ChildModelPath + "/"
-	consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "local-consumer", Namespace: "default"}, Spec: v1beta1.BaseModelSpec{
+	consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "local-consumer", Namespace: "default", UID: "consumer"}, Spec: v1beta1.BaseModelSpec{
 		Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &consumerPath},
 	}}
 	require.NoError(t, indexer.Add(consumer))
+	require.NoError(t, s.modelClient.(*omefake.Clientset).Tracker().Add(consumer))
+	require.NoError(t, s.kubeClient.(*k8sfake.Clientset).Tracker().Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: s.configMapReconciler.nodeName}}))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
 	task.TaskType = Delete
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
@@ -232,16 +237,20 @@ func TestGopherHfArtifactSourceTransitionResumesPendingDeletion(t *testing.T) {
 	// A local consumer adopts the old path while the source transition is queued.
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	localURI := "local://" + input.ChildModelPath
-	consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "local-consumer", Namespace: "default"}, Spec: v1beta1.BaseModelSpec{
+	consumer := &v1beta1.BaseModel{ObjectMeta: metav1.ObjectMeta{Name: "local-consumer", Namespace: "default", UID: "consumer"}, Spec: v1beta1.BaseModelSpec{
 		Storage: &v1beta1.StorageSpec{StorageUri: &localURI, Path: &input.ChildModelPath},
 	}}
 	require.NoError(t, indexer.Add(consumer))
+	require.NoError(t, s.modelClient.(*omefake.Clientset).Tracker().Add(consumer))
+	require.NoError(t, s.kubeClient.(*k8sfake.Clientset).Tracker().Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: s.configMapReconciler.nodeName}}))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
 	uri := "hf://org/model"
 	path := filepath.Join(input.ModelStoreRoot, "replacement")
 	task.BaseModel.Spec.Storage.StorageUri = &uri
 	task.BaseModel.Spec.Storage.Path = &path
 	task.BaseModel.Spec.Storage.DownloadPolicy = nil
+	_, err = s.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
 	waiting, err := s.detachHfArtifactForDefaultDownload(ctx, task, task.BaseModel.Spec, true)
 	require.NoError(t, err)
 	assert.False(t, waiting, "finished receipt must not strand the source transition")
@@ -320,6 +329,7 @@ func newTestHfArtifactGopher(t *testing.T) (*Gopher, *GopherTask, hfArtifactTask
 		Spec: v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &input.ChildModelPath, DownloadPolicy: &policy}},
 	}}
 	gopher := &Gopher{configMapReconciler: repository.configMaps, modelRootDir: input.ModelStoreRoot,
+		kubeClient: repository.configMaps.kubeClient, modelClient: omefake.NewSimpleClientset(task.BaseModel),
 		logger: zap.NewNop().Sugar(), gopherChan: make(chan *GopherTask, 10), taskQueue: newGopherTaskQueue(),
 		baseModelLister:        modelslister.NewBaseModelLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
 		clusterBaseModelLister: modelslister.NewClusterBaseModelLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))}

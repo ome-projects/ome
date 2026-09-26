@@ -94,6 +94,8 @@ func TestCancellationCoverageSharedOCIFailureStillPublishesFailed(t *testing.T) 
 	require.NoError(t, err)
 	g.nodeLabelReconciler = NewNodeLabelReconciler(g.configMapReconciler.nodeName, client, 1, g.logger)
 	task.BaseModel.Spec.Storage.Parameters = &map[string]string{"auth": "unsupported-test-auth"}
+	_, err = g.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(context.Background(), task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
 
 	err = g.processTask(task)
 	require.ErrorContains(t, err, "failed to create object storage client")
@@ -672,6 +674,8 @@ func TestCanceledConfigParsingIsNotOptional(t *testing.T) {
 				seedTestChildModelEntry(t, g.sharedHfArtifactHandler().repository, input)
 				task.BaseModel.Name, task.BaseModel.UID = "model-2", input.ChildModelUID
 				task.BaseModel.Spec.Storage.Path = &input.ChildModelPath
+				_, err := g.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Create(ctx, task.BaseModel, metav1.CreateOptions{})
+				require.NoError(t, err)
 				run = func() error {
 					_, _, err := g.processHfOCIArtifact(ctx, task, task.BaseModel.Spec, true)
 					return err

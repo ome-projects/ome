@@ -18,6 +18,11 @@ func (h *hfArtifactTaskHandler) handleDownload(
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
+	if input.validateDownload != nil {
+		if err := input.validateDownload(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
@@ -156,6 +161,12 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 	input hfArtifactTaskInput,
 	parent HfArtifactEntry,
 ) (hfArtifactTaskResult, error) {
+	// The download may have taken long enough for intent or CR identity to change.
+	if input.validateDownload != nil {
+		if err := input.validateDownload(ctx); err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
+	}
 	if !h.files.ParentReadyMarkerExists(parent) {
 		// Normal reuse must not reset a parent whose existing children may need repair.
 		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("shared Hugging Face parent %s requires repair", parent.Key)), nil
