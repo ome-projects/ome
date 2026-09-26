@@ -210,6 +210,14 @@ func (s *Gopher) artifactDestination(task *GopherTask) (string, error) {
 		return "", nil
 	}
 	if spec.Storage.Path != nil && *spec.Storage.Path != "" {
+		// OCI joins object keys with filepath.Join; match that effective
+		// directory before resolving aliases or choosing its writer lock.
+		if spec.Storage.StorageUri != nil {
+			source, err := storage.GetStorageType(*spec.Storage.StorageUri)
+			if err == nil && source == storage.StorageTypeOCI {
+				return filepath.Clean(*spec.Storage.Path), nil
+			}
+		}
 		return *spec.Storage.Path, nil
 	}
 	if spec.Storage.StorageUri == nil {
@@ -233,6 +241,9 @@ func (s *Gopher) artifactDestination(task *GopherTask) (string, error) {
 		empty := ""
 		storageSpec.Path = &empty
 		spec.Storage = &storageSpec
+		if source == storage.StorageTypeOCI {
+			return filepath.Clean(getDestPath(&spec, s.modelRootDir)), nil
+		}
 		return getDestPath(&spec, s.modelRootDir), nil
 	}
 	return "", nil

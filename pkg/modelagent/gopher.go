@@ -69,6 +69,7 @@ type Gopher struct {
 	modelVerificationLimiter *verificationLimiter
 	modelRootDir             string
 	xetConfig                *xet.Config
+	ociStore                 func(v1beta1.BaseModelSpec) (*ociobjectstore.OCIOSDataStore, error)
 	nodeUID                  types.UID // Pinned at startup; never adopt a replacement Node.
 	modelClient              omeclient.Interface
 	kubeClient               kubernetes.Interface
@@ -505,6 +506,12 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	if (task.TaskType == Download || task.TaskType == DownloadOverride) && artifactEvictionRequested(task) {
 		return nil
 	}
+	if task.TaskType == Download || task.TaskType == DownloadOverride {
+		if waiting, err := s.prepareArtifactRestoration(ctx, task, allowFallbackDownload); waiting || err != nil {
+			return err
+		}
+	}
+
 	// Get model type, namespace, and name for metrics
 	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
 
@@ -942,7 +949,7 @@ func (s *Gopher) isStartupRevalidation(task *GopherTask) bool {
 }
 
 func shouldUseSamePathObjectStorageReuse(task *GopherTask) bool {
-	return task != nil && task.TaskType == Download
+	return task != nil && task.TaskType == Download && !artifactRestorationRequested(task)
 }
 
 func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
@@ -1193,6 +1200,9 @@ func getTargetDirPath(baseModel *v1beta1.BaseModelSpec) (*ociobjectstore.ObjectU
 
 // createOCIOSDataStore creates an OCIOSDataStore client based on storage parameters in the model spec
 func (s *Gopher) createOCIOSDataStore(baseModelSpec v1beta1.BaseModelSpec) (*ociobjectstore.OCIOSDataStore, error) {
+	if s.ociStore != nil {
+		return s.ociStore(baseModelSpec)
+	}
 	// Default auth type is InstancePrincipal if not specified
 	authType := principals.InstancePrincipal
 
@@ -1490,6 +1500,27 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 			Prefix:     uri.Prefix,
 		})
 	}
+	if len(objectUris) == 0 {
+		return fmt.Errorf("no named model objects under %s", uri.Prefix)
+	}
+	reuseValidatedCopy := false
+	if artifactRestorationRequested(task) {
+		// Only a proven bad copy permits repair; an inspection error must
+		// not authorize writes. Healthy restoration remains read-only.
+		valid, err := inspectOCIArtifactObjects(ctx, objectUris, destPath, ociOSDataStore.IsLocalCopyValid)
+		if err != nil {
+			return err
+		}
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return err
+		}
+		reuseValidatedCopy = valid
+		if !valid {
+			if err := s.validateArtifactRepair(ctx, task, filepath.Clean(destPath)); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Check context before starting bulk download
 	select {
@@ -1498,22 +1529,24 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	default:
 	}
 
-	// TODO: BulkDownload doesn't support context cancellation yet
-	// This means downloads may continue even after deletion request
-	// Future enhancement: modify ociobjectstore to support context
-	errs := ociOSDataStore.BulkDownload(objectUris, destPath, s.concurrency,
-		ociobjectstore.WithThreads(s.multipartConcurrency),
-		ociobjectstore.WithChunkSize(BigFileSizeInMB),
-		ociobjectstore.WithSizeThreshold(BigFileSizeInMB),
-		ociobjectstore.WithOverrideEnabled(false),
-		ociobjectstore.WithStripPrefix(uri.Prefix))
-	if errs != nil {
-		// Check if we were cancelled during download
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("download cancelled during bulk download: %w", ctx.Err())
-		default:
-			return fmt.Errorf("failed to download objects: %v", errs)
+	if !reuseValidatedCopy {
+		// TODO: BulkDownload doesn't support context cancellation yet
+		// This means downloads may continue even after deletion request
+		// Future enhancement: modify ociobjectstore to support context
+		errs := ociOSDataStore.BulkDownload(objectUris, destPath, s.concurrency,
+			ociobjectstore.WithThreads(s.multipartConcurrency),
+			ociobjectstore.WithChunkSize(BigFileSizeInMB),
+			ociobjectstore.WithSizeThreshold(BigFileSizeInMB),
+			ociobjectstore.WithOverrideEnabled(false),
+			ociobjectstore.WithStripPrefix(uri.Prefix))
+		if errs != nil {
+			// Check if we were cancelled during download
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("download cancelled during bulk download: %w", ctx.Err())
+			default:
+				return fmt.Errorf("failed to download objects: %v", errs)
+			}
 		}
 	}
 
@@ -1542,6 +1575,11 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 			s.logger.Errorf("Verification failed for %s: %v", file, err)
 		}
 		return fmt.Errorf("integrity verification failed for %d/%d files: %s", len(verificationErrors), len(objects), strings.Join(errMsgs, "; "))
+	}
+	if artifactRestorationRequested(task) {
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return err
+		}
 	}
 
 	// Calculate and record total bytes transferred

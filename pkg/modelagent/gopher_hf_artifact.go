@@ -699,6 +699,9 @@ func isSharedHfArtifactSymlink(childPath string) bool {
 // validateHfOCIArtifact checks existing bytes without downloading. An inspection
 // error is not evidence of corruption and must not trigger destructive repair.
 func (s *Gopher) validateHfOCIArtifact(ctx context.Context, task *GopherTask, uri *ociobjectstore.ObjectURI, parentPath string) (bool, error) {
+	if err := validateHfArtifactCleanPath(parentPath); err != nil {
+		return false, err
+	}
 	spec := taskModelSpec(task)
 	store, err := s.createOCIOSDataStore(spec)
 	if err != nil {
@@ -709,25 +712,51 @@ func (s *Gopher) validateHfOCIArtifact(ctx context.Context, task *GopherTask, ur
 		return false, err
 	}
 	objects = filterInternalArtifactObjectSummaries(objects)
+	objects = filterObjectStorageObjectsForTask(objects, task)
 	if len(objects) == 0 {
 		return false, fmt.Errorf("no model objects under %s", uri.Prefix)
 	}
+	uris := make([]ociobjectstore.ObjectURI, 0, len(objects))
 	for _, object := range objects {
-		if err := ctx.Err(); err != nil {
+		if object.Name == nil {
+			return false, fmt.Errorf("model object has no name")
+		}
+		if _, err := hfArtifactObjectPath(parentPath, uri.Prefix, *object.Name); err != nil {
 			return false, err
 		}
 		objectURI := *uri
 		objectURI.ObjectName = *object.Name
-		localPath, err := hfArtifactObjectPath(parentPath, uri.Prefix, *object.Name)
+		uris = append(uris, objectURI)
+	}
+	return inspectOCIArtifactObjects(ctx, uris, parentPath, store.IsLocalCopyValid)
+}
+
+// Inspect every selected object before repair. A later inspection error is not
+// made safe by an earlier corrupt file. Final download verification retains its
+// existing concurrent limiter and per-object diagnostics.
+func inspectOCIArtifactObjects(ctx context.Context, uris []ociobjectstore.ObjectURI, path string, validate localCopyValidator) (bool, error) {
+	// Match OCI's filepath.Join target semantics before resolving aliases.
+	// Literal spaces remain part of the destination, including the URI fallback.
+	path, err := resolveArtifactPathWithMissingLinks(filepath.Clean(path), true)
+	if err != nil {
+		return false, err
+	}
+	allValid := true
+	for _, object := range uris {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		localPath, err := ociArtifactObjectPath(path, object.Prefix, object.ObjectName)
 		if err != nil {
 			return false, err
 		}
-		valid, err := store.IsLocalCopyValid(objectURI, localPath)
-		if err != nil || !valid {
+		valid, err := validate(object, localPath)
+		if err != nil {
 			return false, err
 		}
+		allValid = allValid && valid
 	}
-	return true, nil
+	return allValid, ctx.Err()
 }
 
 func taskModelSpec(task *GopherTask) v1beta1.BaseModelSpec {

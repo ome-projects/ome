@@ -17,6 +17,12 @@ func hfArtifactObjectPath(parentPath, prefix, objectName string) (string, error)
 	if err := validateHfArtifactCleanPath(parentPath); err != nil {
 		return "", err
 	}
+	return ociArtifactObjectPath(parentPath, prefix, objectName)
+}
+
+// The parent is already resolved by the caller. Keep literal destination spaces
+// while rejecting remote-key traversal and symlinks below that destination.
+func ociArtifactObjectPath(parentPath, prefix, objectName string) (string, error) {
 	if parentPath == string(filepath.Separator) {
 		return "", fmt.Errorf("shared HF object parent cannot be the filesystem root")
 	}
