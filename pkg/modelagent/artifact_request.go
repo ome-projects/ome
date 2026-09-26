@@ -95,11 +95,11 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	skip, err := s.shouldSkipArtifactTask(ctx, task)
+	current, err := s.currentArtifactTask(ctx, task)
 	if err != nil {
 		return err
 	}
-	if skip {
+	if current == nil {
 		return fmt.Errorf("artifact task is no longer current")
 	}
 	if request := taskModelMeta(task).Annotations[constants.ModelArtifactRehydrationIDAnnotation]; request != "" {
@@ -110,13 +110,25 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 			return fmt.Errorf("invalid artifact rehydration label key: %v", errors)
 		}
 	}
-	if s.nodeUID != "" {
+	spec := taskModelSpec(current)
+	checkPlacement := task.TaskType != Evict && spec.Storage != nil &&
+		(len(spec.Storage.NodeSelector) != 0 || spec.Storage.NodeAffinity != nil)
+	if s.nodeUID != "" || checkPlacement {
+		if s.kubeClient == nil || s.configMapReconciler == nil || s.configMapReconciler.nodeName == "" {
+			return fmt.Errorf("artifact operation requires current node eligibility")
+		}
 		node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
-		if node.UID != s.nodeUID {
+		if s.nodeUID != "" && node.UID != s.nodeUID {
 			return fmt.Errorf("model-agent node identity changed")
+		}
+		if checkPlacement {
+			scout := Scout{nodeInfo: node, logger: s.logger}
+			if !scout.shouldDownloadModel(spec.Storage) {
+				return fmt.Errorf("artifact task is no longer current")
+			}
 		}
 	}
 	return ctx.Err()
@@ -139,13 +151,14 @@ func (s *Gopher) isBoundedDirectArtifactTask(task *GopherTask) bool {
 	return err == nil
 }
 
-// Read live ownership and download inputs before writing or publishing.
-func (s *Gopher) shouldSkipArtifactTask(ctx context.Context, task *GopherTask) (bool, error) {
+// Return the live task after ownership, input, policy, and intent checks, or nil
+// for stale, missing, or deleting Models. Callers validate Node eligibility separately.
+func (s *Gopher) currentArtifactTask(ctx context.Context, task *GopherTask) (*GopherTask, error) {
 	if taskModelMeta(task) == nil || taskModelMeta(task).UID == "" {
-		return false, fmt.Errorf("artifact operation requires a model UID")
+		return nil, fmt.Errorf("artifact operation requires a model UID")
 	}
 	if s.modelClient == nil {
-		return false, fmt.Errorf("artifact operation requires a live model client")
+		return nil, fmt.Errorf("artifact operation requires a live model client")
 	}
 	latest := *task
 	var err error
@@ -155,49 +168,40 @@ func (s *Gopher) shouldSkipArtifactTask(ctx context.Context, task *GopherTask) (
 		latest.ClusterBaseModel, err = s.modelClient.OmeV1beta1().ClusterBaseModels().Get(ctx, task.ClusterBaseModel.Name, metav1.GetOptions{})
 	}
 	if apierrors.IsNotFound(err) {
-		return true, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	meta := taskModelMeta(&latest)
 	if meta.UID != taskModelMeta(task).UID ||
 		!reflect.DeepEqual(artifactDownloadInputs(taskModelSpec(task)), artifactDownloadInputs(taskModelSpec(&latest))) ||
 		!reflect.DeepEqual(downloadAnnotations(meta.Annotations), downloadAnnotations(taskModelMeta(task).Annotations)) {
-		return true, nil
+		return nil, nil
 	}
 	if !meta.DeletionTimestamp.IsZero() {
-		return true, nil
+		return nil, nil
 	}
 	if artifactRestorationRequested(task) &&
 		downloadPolicyOrDefault(taskModelSpec(task).Storage) != downloadPolicyOrDefault(taskModelSpec(&latest).Storage) {
-		return true, nil
+		return nil, nil
 	}
 	if task.TaskType == Evict {
 		// Local cleanup applies even after this node loses placement eligibility.
 		// Unlike an ordinary OCI refresh, eviction must not outlive a changed
 		// shared-reuse policy while retaining an old cleanup snapshot.
 		if downloadPolicyOrDefault(taskModelSpec(task).Storage) != downloadPolicyOrDefault(taskModelSpec(&latest).Storage) {
-			return true, nil
+			return nil, nil
 		}
-		return !artifactEvictionRequested(&latest), nil
+		if !artifactEvictionRequested(&latest) {
+			return nil, nil
+		}
+		return &latest, nil
 	}
 	if artifactEvictionRequested(&latest) {
-		return true, nil
+		return nil, nil
 	}
-	spec := taskModelSpec(&latest)
-	if spec.Storage == nil || len(spec.Storage.NodeSelector) == 0 && spec.Storage.NodeAffinity == nil {
-		return false, nil
-	}
-	if s.kubeClient == nil || s.configMapReconciler == nil || s.configMapReconciler.nodeName == "" {
-		return false, fmt.Errorf("artifact operation requires current node eligibility")
-	}
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	if err != nil {
-		return false, err
-	}
-	scout := Scout{nodeInfo: node, logger: s.logger}
-	return !scout.shouldDownloadModel(spec.Storage), nil
+	return &latest, nil
 }
 
 // Scout handles placement separately and only refreshes HF downloads for

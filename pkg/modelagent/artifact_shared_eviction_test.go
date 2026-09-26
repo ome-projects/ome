@@ -86,6 +86,30 @@ func TestSharedEvictionCompletesInCleanupPhase(t *testing.T) {
 	require.Equal(t, ModelStatusEvicted, directArtifactEntry(t, g, task).Status)
 }
 
+func TestSharedEvictionRetryStopsWhenIntentWithdrawn(t *testing.T) {
+	ctx := context.Background()
+	g, task, _ := newSharedEvictionTestModel(t)
+	g.nodeUID = "old-node"
+	live := task.BaseModel.DeepCopy()
+	delete(live.Annotations, ArtifactResidencyAnnotation)
+	live.Spec.Storage.NodeSelector = map[string]string{"pool": "other"}
+	_, err := g.modelClient.OmeV1beta1().BaseModels(live.Namespace).Update(ctx, live, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	client := g.kubeClient.(*k8sfake.Clientset)
+	client.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("cleanup lookup unavailable")
+	})
+	client.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		t.Fatal("withdrawn eviction must release retry without reading Node")
+		return false, nil, nil
+	})
+	handled, waiting, err := g.processSharedArtifactEviction(ctx, task)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.False(t, waiting, "withdrawn eviction must release its delete barrier")
+	require.Empty(t, g.gopherChan)
+}
+
 func TestSharedEvictionCompletionRequiresExactReceipt(t *testing.T) {
 	ctx := context.Background()
 	g, task, input := newSharedEvictionTestModel(t)

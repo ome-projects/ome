@@ -79,9 +79,8 @@ func TestArtifactPlacementChangeKeepsEligibleDownload(t *testing.T) {
 					}}
 				}
 				g.modelClient = omefake.NewSimpleClientset(live)
-				skip, err := g.shouldSkipArtifactTask(context.Background(), task)
-				require.NoError(t, err)
-				require.Equal(t, !eligible, skip)
+				err = g.validateArtifactDownload(context.Background(), task)
+				require.Equal(t, !eligible, err != nil)
 				if eligible {
 					require.NoError(t, g.safeNodeLabelReconciliation(context.Background(), &NodeLabelOp{
 						BaseModel: task.BaseModel, ModelStateOnNode: Ready,
@@ -104,9 +103,9 @@ func TestArtifactContentChangeStillRejectsDownload(t *testing.T) {
 		live := task.BaseModel.DeepCopy()
 		change(live)
 		g.modelClient = omefake.NewSimpleClientset(live)
-		skip, err := g.shouldSkipArtifactTask(context.Background(), task)
+		current, err := g.currentArtifactTask(context.Background(), task)
 		require.NoError(t, err)
-		require.True(t, skip)
+		require.Nil(t, current)
 	}
 }
 
@@ -127,9 +126,9 @@ func TestArtifactPolicyComparisonMatchesScout(t *testing.T) {
 			live := task.BaseModel.DeepCopy()
 			live.Spec.Storage.DownloadPolicy = &tc.policy
 			g.modelClient = omefake.NewSimpleClientset(live)
-			skip, err := g.shouldSkipArtifactTask(context.Background(), task)
+			current, err := g.currentArtifactTask(context.Background(), task)
 			require.NoError(t, err)
-			require.Equal(t, tc.stale, skip)
+			require.Equal(t, tc.stale, current == nil)
 		})
 	}
 }

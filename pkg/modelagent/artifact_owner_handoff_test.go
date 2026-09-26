@@ -24,9 +24,9 @@ func TestOrdinaryReplacementCanPublishAfterAgentRestart(t *testing.T) {
 
 	// The previous process left a Ready entry owned by "uid". The new
 	// process sees only the replacement CR, so no old delete event arrives.
-	skip, err := g.shouldSkipArtifactTask(context.Background(), task)
+	current, err := g.currentArtifactTask(context.Background(), task)
 	require.NoError(t, err)
-	require.False(t, skip)
+	require.NotNil(t, current)
 	release, acquired, err := g.acquireDirectArtifactDownload(context.Background(), task)
 	require.NoError(t, err)
 	require.True(t, acquired)
