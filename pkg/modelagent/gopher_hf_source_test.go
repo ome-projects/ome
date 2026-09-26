@@ -763,8 +763,9 @@ func TestDirectHfSourceRejectsSharedAncestorForOrdinaryWrites(t *testing.T) {
 	require.NoError(t, os.Symlink(input.Parent.LocalPath, alias))
 	destination := filepath.Join(alias, "ordinary")
 	task.BaseModel.Spec.Storage.Path = &destination
-	_, err := source.process(context.Background(), s, task, task.BaseModel.Spec, true)
-	require.ErrorContains(t, err, "resolves inside a shared artifact")
+	waiting, err := source.process(context.Background(), s, task, task.BaseModel.Spec, true)
+	require.NoError(t, err)
+	require.True(t, waiting)
 	assert.Zero(t, *downloads)
 }
 

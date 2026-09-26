@@ -20,7 +20,16 @@ var errArtifactStatusLiveValidation = errors.New("artifact status live validatio
 // Name-based readiness belongs to the current UID. An old deletion may still
 // remove its own UID-derived request key, but never a replacement's Ready key.
 func (s *Gopher) ownsArtifactDeletionLabel(ctx context.Context, task *GopherTask) (bool, error) {
+	return s.artifactDeletionOwner(ctx, task, false)
+}
+
+// Cross-UID bookkeeping handoff needs affirmative live ownership; label
+// cleanup may also proceed when its original CR is already absent.
+func (s *Gopher) artifactDeletionOwner(ctx context.Context, task *GopherTask, requireLive bool) (bool, error) {
 	meta := taskModelMeta(task)
+	if requireLive && (meta == nil || meta.UID == "" || s.modelClient == nil) {
+		return false, fmt.Errorf("ordinary deletion handoff requires live Model identity")
+	}
 	if meta == nil {
 		return true, ctx.Err()
 	}
@@ -38,7 +47,7 @@ func (s *Gopher) ownsArtifactDeletionLabel(ctx context.Context, task *GopherTask
 		latest, err = s.modelClient.OmeV1beta1().ClusterBaseModels().Get(ctx, meta.Name, metav1.GetOptions{})
 	}
 	if apierrors.IsNotFound(err) {
-		return true, nil
+		return !requireLive, nil
 	}
 	if err != nil {
 		return false, err

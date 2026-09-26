@@ -2,6 +2,7 @@ package modelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -237,25 +238,37 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	}
 	task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
 	spec := taskModelSpec(task)
+	operation := directArtifactDownloadOperationFromContext(ctx)
+	if operation != nil && operation.sharedReader != nil {
+		// The read-only operation already owns this parent's and child's locks.
+		return noop, s.validateSharedArtifactReader(ctx, task, *operation.sharedReader)
+	}
+	requireShared := op.ModelStateOnNode == Ready && operation != nil && operation.sharedCompleted
 	_, eligible, _ := newHfArtifactTaskInputForOCI(task, spec.Storage, s.modelRootDir)
 	sharedLink := spec.Storage != nil && spec.Storage.Path != nil && isSharedHfArtifactSymlink(*spec.Storage.Path)
-	if !eligible && !sharedLink {
+	if !eligible && !sharedLink && !requireShared {
 		return noop, nil
 	}
 	handler := s.sharedHfArtifactHandler()
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
 	parent, found, err := handler.repository.GetParentForChild(ctx, key)
 	if apierrors.IsNotFound(err) {
+		if requireShared || sharedLink && op.ModelStateOnNode == Ready {
+			return noop, fmt.Errorf("shared artifact link has no persisted owner")
+		}
 		return noop, nil
 	}
 	if err != nil || !found {
+		if err == nil && (requireShared || sharedLink && op.ModelStateOnNode == Ready) {
+			err = fmt.Errorf("shared artifact link has no persisted owner")
+		}
 		return noop, err
 	}
 	input, err := s.hfArtifactInputForChild(task, parent)
 	if err != nil {
 		return noop, err
 	}
-	unlock, acquired, err := handler.tryParentFileOperation(parent, input.ModelStoreRoot)
+	unlock, acquired, err := handler.tryArtifactOperation(input)
 	if err != nil {
 		return noop, err
 	}
@@ -272,6 +285,9 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	}
 	if err == nil {
 		err = input.validateFilesystemPaths(parent)
+	}
+	if err == nil && op.ModelStateOnNode == Ready && !handler.files.IsChildLinkedToParent(input.ChildModelPath, parent.LocalPath) {
+		err = fmt.Errorf("shared artifact child link is absent before Ready publication")
 	}
 	if err == nil && found && (op.ModelStateOnNode == Ready || len(parent.ChildStatusesBeforeRepair) != 0) &&
 		(parent.Status != HfArtifactStatusReady || !handler.files.ParentReadyMarkerExists(parent)) {
@@ -323,6 +339,15 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 				return err
 			}
 			op.BaseModel = model
+		}
+		task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
+		if status == ModelStatusReady && artifactRestorationRequested(task) {
+			// Parent repair proves shared bytes, not this sibling's captured
+			// request. Scout schedules its own validation/acknowledgement.
+			continue
+		}
+		if s.nodeUID != "" {
+			op.validateCurrent = func() error { return s.validateArtifactDownload(ctx, task) }
 		}
 		if err := s.nodeLabelReconciler.ReconcileNodeLabels(op); err != nil {
 			return err
@@ -658,6 +683,27 @@ func (s *Gopher) requeueHfArtifactTask(task *GopherTask, result hfArtifactTaskRe
 // finishDownloadStatus reports whether Ready was published. A queued retry is
 // not a completed download and must not increment success metrics.
 func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op *NodeLabelOp) (bool, error) {
+	held := directArtifactDownloadOperationFromContext(ctx)
+	if held != nil && held.release != nil {
+		validate := func() error { return s.validateDirectArtifactPublication(ctx, task, held.path) }
+		if held.sharedReader != nil {
+			validate = func() error { return s.validateSharedArtifactReader(ctx, task, *held.sharedReader) }
+		}
+		if err := validate(); err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		}
+		if !held.readOnly {
+			if err := s.persistDirectArtifactPath(ctx, task, held.path); err != nil {
+				if ctx.Err() != nil {
+					return false, ctx.Err()
+				}
+				return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+		}
+	}
 	err := s.safeNodeLabelReconciliation(ctx, op)
 	// A canceled task must not be revived by the shared-parent retry path.
 	if ctx.Err() != nil {
@@ -667,8 +713,7 @@ func (s *Gopher) finishDownloadStatus(ctx context.Context, task *GopherTask, op 
 		return true, nil
 	}
 	s.logger.Errorf("Failed to mark model %s as Ready: %v", getModelInfoForLogging(task), err)
-	spec := taskModelSpec(task)
-	if isSharedHfArtifactSymlink(getDestPath(&spec, s.modelRootDir)) {
+	if s.hasSharedArtifactPublication(ctx, task) || errors.Is(err, errArtifactStatusLiveValidation) {
 		// A sibling may acquire the parent after this child attaches. Keep the
 		// successful task queued until its final Ready update is safe.
 		return false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))

@@ -60,6 +60,10 @@ func TestOrdinaryConfigMapDeletionClearsStaleCachedUID(t *testing.T) {
 				c.modelCache[key].ModelEntryJSON = cm.Data[key]
 			}
 			model.UID = "new-uid"
+			// Removing an older ordinary record requires explicit live-verified
+			// handoff; a delete operation cannot infer which UID is newer.
+			require.Error(t, c.DeleteModelFromConfigMap(ctx, model, nil))
+			require.NoError(t, c.handoffOrdinaryModelOwner(ctx, key, model.UID, func() error { return nil }))
 			if scenario == "CR deletion" || scenario == "CR deletion after opt-out" {
 				now := metav1.Now()
 				model.DeletionTimestamp = &now

@@ -257,6 +257,8 @@ func (r *HfArtifactRepository) finishPendingDeletion(ctx context.Context, key st
 			return false, fmt.Errorf("pending shared deletion for %s changed", key)
 		}
 		child.HfArtifactPendingDeletion = nil
+		// The verified receipt owner also owns the ordinary record after cleanup.
+		child.ModelUID = expected.ModelUID
 		return writeModelEntry(cm.Data, key, child)
 	})
 }

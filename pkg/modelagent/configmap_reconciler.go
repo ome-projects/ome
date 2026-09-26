@@ -71,6 +71,7 @@ type ConfigMapReconciler struct {
 // ConfigMapStatusOp represents an operation to update model status in ConfigMap.
 // It contains the necessary information to identify the model and its new status.
 type ConfigMapStatusOp struct {
+	validateCurrent  func() error
 	ModelStatus      ModelStatus               // The updated status of the model
 	BaseModel        *v1beta1.BaseModel        // Reference to a namespace-scoped BaseModel (nil if using ClusterBaseModel)
 	ClusterBaseModel *v1beta1.ClusterBaseModel // Reference to a cluster-scoped BaseModel (nil if using BaseModel)
@@ -79,6 +80,7 @@ type ConfigMapStatusOp struct {
 // ConfigMapMetadataOp represents an operation to update model metadata in ConfigMap.
 // It contains the necessary information to identify the model and its metadata.
 type ConfigMapMetadataOp struct {
+	validateCurrent  func() error
 	ModelMetadata    ModelMetadata             // The metadata to be stored for the model
 	BaseModel        *v1beta1.BaseModel        // Reference to a namespace-scoped BaseModel (nil if using ClusterBaseModel)
 	ClusterBaseModel *v1beta1.ClusterBaseModel // Reference to a cluster-scoped BaseModel (nil if using BaseModel)
@@ -87,6 +89,7 @@ type ConfigMapMetadataOp struct {
 // ConfigMapProgressOp represents an operation to update model download progress in ConfigMap.
 // It contains the necessary information to identify the model and its progress.
 type ConfigMapProgressOp struct {
+	validateCurrent  func() error
 	Progress         *DownloadProgress         // The download progress to be stored
 	BaseModel        *v1beta1.BaseModel        // Reference to a namespace-scoped BaseModel (nil if using ClusterBaseModel)
 	ClusterBaseModel *v1beta1.ClusterBaseModel // Reference to a cluster-scoped BaseModel (nil if using BaseModel)
@@ -321,6 +324,11 @@ func (c *ConfigMapReconciler) updateModelProgressInConfigMap(ctx context.Context
 	}
 
 	return c.mutateModelEntryWithRetry(ctx, key, modelUID, false, func(data map[string]string) (bool, error) {
+		if op.validateCurrent != nil {
+			if err := op.validateCurrent(); err != nil {
+				return false, err
+			}
+		}
 		modelEntry := ModelEntry{
 			Name:   modelName,
 			Status: ModelStatusUpdating,
@@ -334,6 +342,9 @@ func (c *ConfigMapReconciler) updateModelProgressInConfigMap(ctx context.Context
 			}
 		}
 		modelEntry.Progress = op.Progress
+		if modelEntry.ModelUID == "" {
+			modelEntry.ModelUID = modelUID
+		}
 
 		entryJSON, err := json.Marshal(modelEntry)
 		if err != nil {
@@ -367,19 +378,8 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 	defer c.configMapMutationMutex.Unlock()
 	c.cacheMutex.Lock()
 	if cached := c.modelCache[modelID]; cached != nil && cached.ModelUID != "" && modelUID != "" && cached.ModelUID != modelUID {
-		// A completed UID handoff stays fenced after the replacement opts out
-		// of reuse and no longer carries a shared reference or cleanup receipt.
-		if c.isModelUIDInvalidatedLocked(modelID, modelUID) {
-			c.cacheMutex.Unlock()
-			return fmt.Errorf("cannot delete model %s from a superseded UID", modelID)
-		}
-		// Shared ownership needs an explicit UID handoff. Ordinary entries,
-		// including completed opt-outs, retain their existing deletion behavior.
-		var child ModelEntry
-		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil) {
-			c.cacheMutex.Unlock()
-			return fmt.Errorf("cannot delete shared model %s owned by another UID", modelID)
-		}
+		c.cacheMutex.Unlock()
+		return fmt.Errorf("cannot delete model %s owned by another UID without verified handoff", modelID)
 	}
 	if isModelResourceDeleting(baseModel, clusterBaseModel) {
 		// A deleting CR instance must never be restored or updated again.
@@ -400,6 +400,12 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 		// after file cleanup. Check ownership on every final-removal CAS attempt.
 		var child ModelEntry
 		if json.Unmarshal([]byte(raw), &child) == nil {
+			if child.ModelUID != "" && child.ModelUID != modelUID {
+				return false, fmt.Errorf("cannot delete model %s owned by another UID without verified handoff", modelID)
+			}
+			if child.DirectArtifactPendingEviction != nil {
+				return false, fmt.Errorf("model %s still has pending local eviction", modelID)
+			}
 			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil && child.HfArtifactPendingDeletion.ModelUID != modelUID {
 				return false, fmt.Errorf("shared artifact ownership changed before deleting model %s", modelID)
 			}
@@ -582,6 +588,9 @@ func (c *ConfigMapReconciler) mutateModelEntryWithRetry(
 			configMap.Data = make(map[string]string)
 		}
 		if !allowDeleting {
+			if entry, err := existingModelEntry(configMap.Data, modelID); err == nil && entry.ModelUID != "" && entry.ModelUID != modelUID {
+				return false, fmt.Errorf("model %s is owned by UID %s, not %s", modelID, entry.ModelUID, modelUID)
+			}
 			if err := c.validateHfArtifactChildMutation(configMap.Data, modelID); err != nil {
 				return false, err
 			}
@@ -683,6 +692,11 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 
 	readyBlocked := false
 	err := c.mutateModelEntryWithRetry(ctx, key, modelUID, false, func(data map[string]string) (bool, error) {
+		if op.validateCurrent != nil {
+			if err := op.validateCurrent(); err != nil {
+				return false, err
+			}
+		}
 		readyBlocked = false
 		if op.ModelStatus == ModelStatusDeleted {
 			if _, exists := data[key]; !exists {
@@ -708,6 +722,9 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 			}
 		}
 		modelEntry.Status = op.ModelStatus
+		if modelEntry.ModelUID == "" {
+			modelEntry.ModelUID = modelUID
+		}
 		if op.ModelStatus == ModelStatusReady || op.ModelStatus == ModelStatusFailed {
 			modelEntry.Progress = nil
 		}
@@ -745,6 +762,11 @@ func (c *ConfigMapReconciler) updateModelMetadataInConfigMap(ctx context.Context
 
 	modelConfig := ConvertMetadataToModelConfig(op.ModelMetadata)
 	return c.mutateModelEntryWithRetry(ctx, key, modelUID, false, func(data map[string]string) (bool, error) {
+		if op.validateCurrent != nil {
+			if err := op.validateCurrent(); err != nil {
+				return false, err
+			}
+		}
 		modelEntry := ModelEntry{
 			Name:   modelName,
 			Status: ModelStatusReady,
@@ -758,6 +780,9 @@ func (c *ConfigMapReconciler) updateModelMetadataInConfigMap(ctx context.Context
 			}
 		}
 		modelEntry.Config = modelConfig
+		if modelEntry.ModelUID == "" {
+			modelEntry.ModelUID = modelUID
+		}
 
 		entryJSON, err := json.Marshal(modelEntry)
 		if err != nil {

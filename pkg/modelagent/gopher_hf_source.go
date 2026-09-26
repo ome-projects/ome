@@ -216,6 +216,14 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 		s.demoteToNormalPriority(task)
 		return true, nil
 	}
+	unlock, acquired, err := s.acquireDirectArtifactDownload(ctx, task)
+	if err != nil || !acquired {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+	}
+	defer unlock()
 	if err := checkDirectHfDestinationAncestors(destination); err != nil {
 		return false, err
 	}
@@ -363,6 +371,11 @@ func (s *Gopher) parseDirectHfConfig(ctx context.Context, task *GopherTask, dest
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.requiresArtifactRequestValidation(ctx, task) {
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return err
+		}
+	}
 	if s.modelConfigParser != nil {
 		s.logger.Debugf("Using %s for config parsing", getModelInfoForLogging(task))
 		if err := s.safeParseAndUpdateModelConfig(ctx, destination, task.BaseModel, task.ClusterBaseModel, artifact); err != nil {
@@ -393,6 +406,9 @@ func (s *Gopher) updateDirectHfProgress(ctx context.Context, task *GopherTask, p
 		return
 	}
 	op := &ConfigMapProgressOp{Progress: progress, BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel}
+	if s.requiresArtifactRequestValidation(ctx, task) {
+		op.validateCurrent = func() error { return s.validateArtifactDownload(ctx, task) }
+	}
 	if err := s.configMapReconciler.ReconcileModelProgress(ctx, op); err != nil {
 		s.logger.Warnf("Failed to update direct HF download progress: %v", err)
 	}

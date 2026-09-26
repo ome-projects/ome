@@ -3,6 +3,7 @@ package modelagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -319,7 +320,55 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 		return err
 	}
 	defer unlock()
-	err = s.nodeLabelReconciler.ReconcileNodeLabels(op)
+	task := &GopherTask{TaskType: Download, BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
+	var validateCurrent func() error
+	if s.requiresArtifactRequestValidation(ctx, task) {
+		if op.ModelStateOnNode == Ready || op.ModelStateOnNode == Updating || op.ModelStateOnNode == Failed {
+			validateCurrent = func() error {
+				if err := s.validateArtifactDownload(ctx, task); err != nil {
+					return fmt.Errorf("%w: %w", errArtifactStatusLiveValidation, err)
+				}
+				return nil
+			}
+			if err := validateCurrent(); err != nil {
+				return err
+			}
+		}
+	}
+	if meta := taskModelMeta(task); meta != nil && meta.UID != "" && s.configMapReconciler != nil &&
+		(op.ModelStateOnNode == Ready || op.ModelStateOnNode == Updating || op.ModelStateOnNode == Failed) {
+		if err := s.handoffOrdinaryArtifactOwner(ctx, task); err != nil {
+			return err
+		}
+	}
+	labelOp := *op
+	labelOp.validateCurrent = validateCurrent
+	if op.ModelStateOnNode == Deleted {
+		owned, err := s.ownsArtifactDeletionLabel(ctx, task)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			labelOp.requestLabelOnly = true
+			// Do not touch the replacement's ConfigMap ownership either.
+			return s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
+		}
+		if err := s.handoffOrdinaryArtifactDeletion(ctx, task); err != nil {
+			return err
+		}
+		labelOp.validateCurrent = func() error {
+			owned, err := s.ownsArtifactDeletionLabel(ctx, task)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				return fmt.Errorf("artifact label owner changed")
+			}
+			return nil
+		}
+	}
+	labelOp.nodeUID = s.nodeUID
+	err = s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
 	if err != nil {
 		return err
 	}
@@ -342,6 +391,7 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 
 		// Create StatusOp for ConfigMap update
 		statusOp := &ConfigMapStatusOp{
+			validateCurrent:  validateCurrent,
 			ModelStatus:      status,
 			BaseModel:        op.BaseModel,
 			ClusterBaseModel: op.ClusterBaseModel,
@@ -365,6 +415,14 @@ func (s *Gopher) safeParseAndUpdateModelConfig(ctx context.Context, modelPath st
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	task := &GopherTask{TaskType: Download, BaseModel: baseModel, ClusterBaseModel: clusterBaseModel}
+	var validateCurrent func() error
+	if s.requiresArtifactRequestValidation(ctx, task) {
+		validateCurrent = func() error { return s.validateArtifactDownload(ctx, task) }
+		if err := validateCurrent(); err != nil {
+			return err
+		}
+	}
 
 	// First parse the configuration without updating the ConfigMap
 	// This call will return model metadata
@@ -381,6 +439,7 @@ func (s *Gopher) safeParseAndUpdateModelConfig(ctx context.Context, modelPath st
 	// If valid metadata was found, update the ConfigMap while still holding the lock
 	if metadata != nil {
 		op := &ConfigMapMetadataOp{
+			validateCurrent:  validateCurrent,
 			ModelMetadata:    *metadata,
 			BaseModel:        baseModel,
 			ClusterBaseModel: clusterBaseModel,
@@ -408,10 +467,11 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	if err != nil || !proceed {
 		return err
 	}
+	ctx, releaseDirectArtifact := withDirectArtifactDownloadOperation(ctx)
+	defer releaseDirectArtifact()
 	keepDeleteBarrier := false
 	defer func() { finish(keepDeleteBarrier) }()
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
-
 	// Get model type, namespace, and name for metrics
 	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
 
@@ -453,7 +513,10 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 		if err != nil {
 			s.logger.Errorf("Failed to set model %s status to Updating: %v", modelInfo, err)
-			// Continue with download anyway
+			if errors.Is(err, errArtifactStatusLiveValidation) {
+				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+			// Preserve ordinary label-error handling for current tasks.
 		}
 	}
 
@@ -497,6 +560,14 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			if handled {
 				break
 			}
+			unlock, acquired, err := s.acquireDirectArtifactDownload(ctx, task)
+			if err != nil || !acquired {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+			defer unlock()
 			osUri, err := getTargetDirPath(&baseModelSpec)
 			destPath := getDestPath(&baseModelSpec, s.modelRootDir)
 			if err != nil {
@@ -548,6 +619,9 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				} else if err := downloadObjectStorageModel(); err != nil {
 					return err
 				}
+			} else if !allowFallbackDownload {
+				s.demoteToNormalPriority(task)
+				return nil
 			} else if err := downloadObjectStorageModel(); err != nil {
 				return err
 			}
@@ -600,6 +674,14 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			return nil
 		case storage.StorageTypeLocal:
 			s.logger.Infof("Processing local storage type for model %s", modelInfo)
+			unlock, acquired, err := s.acquireLocalArtifactReader(ctx, task)
+			if err != nil || !acquired {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
+			defer unlock()
 			// For local storage, we just need to validate the path exists and parse model config
 			if err := s.processLocalStorageModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
 				return err
@@ -1043,7 +1125,10 @@ func (s *Gopher) getHuggingFaceToken(ctx context.Context, task *GopherTask, base
 func getDestPath(baseModel *v1beta1.BaseModelSpec, modelRootDir string) string {
 
 	storagePath := *baseModel.Storage.StorageUri
-	destPath := *baseModel.Storage.Path
+	destPath := ""
+	if baseModel.Storage.Path != nil {
+		destPath = *baseModel.Storage.Path
+	}
 
 	if len(destPath) == 0 {
 		if strings.HasSuffix(modelRootDir, "/") {
