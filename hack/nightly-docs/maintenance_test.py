@@ -157,6 +157,24 @@ class PolicyTests(unittest.TestCase):
             state = save.call_args.args[1]
             self.assertEqual(m.decision(state, m.signature(pr, fresh)), 'work')
 
+    def test_enabled_merge_uses_normal_squash_and_expected_head(self):
+        pr = pull()
+        details = {'threads': []}
+        state = {'phase': 'ready', 'attempts': 0, 'head': pr['head']['sha'],
+                 'base': pr['base']['sha'], 'signature': m.signature(pr, details)}
+        info = {'reviewDecision': 'APPROVED', 'mergeStateStatus': 'CLEAN', 'statusCheckRollup': []}
+        runs = [{'id': 1, 'name': m.CHECK, 'app': {'slug': 'github-actions'},
+                 'external_id': f"docs-maintenance:7:{pr['base']['sha']}", 'conclusion': 'success'}]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'GITHUB_STEP_SUMMARY': str(Path(directory) / 'summary')}), \
+                patch.object(m, 'api', side_effect=[pr, pr, {'merged': True, 'sha': 'd' * 40}]) as api, \
+                patch.object(m, 'feedback', return_value=(details, state, None)), \
+                patch.object(m.docs, 'run', return_value=json.dumps(info)), \
+                patch.object(m, 'check_runs', return_value=runs):
+            m.merge(7, True)
+        self.assertEqual(api.call_args.args, ('repos/ome-projects/ome/pulls/7/merge', 'PUT',
+                                             {'sha': pr['head']['sha'], 'merge_method': 'squash'}))
+
 
 class ExampleTests(unittest.TestCase):
     def test_manifest_schema_and_prefix(self):
