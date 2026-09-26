@@ -37,6 +37,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if waiting, err := s.prepareArtifactRestoration(ctx, task, allowDownload); waiting || err != nil {
+		return waiting, err
+	}
 	if task == nil || (task.BaseModel == nil) == (task.ClusterBaseModel == nil) ||
 		(task.TaskType != Download && task.TaskType != DownloadOverride) ||
 		spec.Storage == nil || spec.Storage.StorageUri == nil {
@@ -97,6 +100,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 			if err == nil {
 				err = fmt.Errorf("HF revision resolution returned no immutable revision for %s", config.RepoID)
 			}
+			if artifactRestorationRequested(task) {
+				return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			}
 			// Unknown identity is not an identity change. Keep an existing shared
 			// copy attached until resolution can authorize any replacement.
 			if s.configMapReconciler != nil {
@@ -135,55 +141,10 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if waiting, err := s.detachChangedDirectHfReference(ctx, task, spec, input, eligible, allowDownload); waiting || err != nil {
 		return waiting, err
 	}
+	validate, download := source.snapshotCallbacks(ctx, task, config)
 	if eligible {
 		// Fetch at most once in this attempt, only if shared validation or a
 		// download needs it. Ordinary ready reuse requires no extra Hub call.
-		var manifest hfSnapshotManifest
-		var manifestErr error
-		var manifestOnce sync.Once
-		getManifest := func() (hfSnapshotManifest, error) {
-			manifestOnce.Do(func() {
-				manifest, manifestErr = source.manifest(ctx, config.RepoID, config.Revision, config.Token, config.Endpoint)
-				if manifestErr == nil {
-					manifestErr = manifest.check(config.Revision)
-				}
-			})
-			return manifest, manifestErr
-		}
-		validate := func(parentPath string) (bool, error) {
-			manifest, err := getManifest()
-			if err != nil {
-				return false, err
-			}
-			return manifest.validate(ctx, parentPath)
-		}
-		download := func(parentPath string) error {
-			manifest, err := getManifest()
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(parentPath, 0o755); err != nil {
-				return err
-			}
-			// The shared handler owns the parent and has failed all children
-			// before reaching this callback. Xet otherwise skips same-size damage.
-			if err := manifest.removeInvalidFiles(ctx, parentPath); err != nil {
-				return err
-			}
-			parentConfig := *config
-			parentConfig.LocalDir = parentPath
-			if err := source.download(ctx, task, &parentConfig); err != nil {
-				return err
-			}
-			valid, err := manifest.validate(ctx, parentPath)
-			if err != nil {
-				return err
-			}
-			if !valid {
-				return fmt.Errorf("downloaded HF snapshot %s@%s failed content validation", config.RepoID, config.Revision)
-			}
-			return nil
-		}
 		result, err := s.runHfArtifactDownload(ctx, task, input, allowDownload, validate, download)
 		if ctx.Err() != nil {
 			return false, ctx.Err()
@@ -237,10 +198,76 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if len(artifact.ChildrenPaths) != 0 {
 		return false, fmt.Errorf("legacy HF artifact has descendants; use a different destination before replacing its contents")
 	}
-	if err := source.download(ctx, task, config); err != nil {
+	if artifactRestorationRequested(task) {
+		valid, err := validate(destination)
+		if err != nil {
+			return false, err
+		}
+		if valid {
+			return false, s.parseDirectHfConfig(ctx, task, destination, artifact)
+		}
+		if err := s.validateArtifactRepair(ctx, task, destination); err != nil {
+			return false, err
+		}
+		if err := download(destination); err != nil {
+			return false, err
+		}
+	} else if err := source.download(ctx, task, config); err != nil {
 		return false, err
 	}
 	return false, s.parseDirectHfConfig(ctx, task, destination, artifact)
+}
+
+// Callers retain their own ownership/repair checks and locks. These callbacks
+// share only the byte operations and fetch one immutable manifest per attempt.
+func (source directHfSource) snapshotCallbacks(ctx context.Context, task *GopherTask, config *xet.DownloadConfig) (hfArtifactValidateFunc, hfArtifactDownloadFunc) {
+	var manifest hfSnapshotManifest
+	var manifestErr error
+	var manifestOnce sync.Once
+	getManifest := func() (hfSnapshotManifest, error) {
+		manifestOnce.Do(func() {
+			manifest, manifestErr = source.manifest(ctx, config.RepoID, config.Revision, config.Token, config.Endpoint)
+			if manifestErr == nil {
+				manifestErr = manifest.check(config.Revision)
+			}
+		})
+		return manifest, manifestErr
+	}
+	validate := func(path string) (bool, error) {
+		manifest, err := getManifest()
+		if err != nil {
+			return false, err
+		}
+		return manifest.validate(ctx, path)
+	}
+	download := func(path string) error {
+		manifest, err := getManifest()
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			return err
+		}
+		// Ownership wrappers authorize repair before this callback. Xet skips
+		// same-size damage unless invalid files are removed first.
+		if err := manifest.removeInvalidFiles(ctx, path); err != nil {
+			return err
+		}
+		downloadConfig := *config
+		downloadConfig.LocalDir = path
+		if err := source.download(ctx, task, &downloadConfig); err != nil {
+			return err
+		}
+		valid, err := manifest.validate(ctx, path)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return fmt.Errorf("downloaded HF snapshot %s@%s failed content validation", config.RepoID, config.Revision)
+		}
+		return nil
+	}
+	return validate, download
 }
 
 // Matching shared children stay attached. Only a policy/identity/path change
@@ -274,6 +301,11 @@ func (s *Gopher) directHfLegacyArtifact(ctx context.Context, task *GopherTask, d
 		return nil, err
 	}
 	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if artifactRestorationRequested(task) {
+			if err := s.validateArtifactRepair(ctx, task, destination); err != nil {
+				return nil, err
+			}
+		}
 		if len(old.ChildrenPaths) != 0 {
 			return nil, fmt.Errorf("legacy HF artifact has descendants; refusing to replace its link")
 		}

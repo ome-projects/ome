@@ -302,6 +302,31 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 	input.validateDownload = func(ctx context.Context) error {
 		return s.validateArtifactDownload(ctx, task)
 	}
+	if artifactRestorationRequested(task) && validate != nil {
+		validateBytes := validate
+		validate = func(path string) (bool, error) {
+			valid, err := validateBytes(path)
+			if err == nil {
+				err = s.validateArtifactDownload(ctx, task)
+			}
+			if err == nil && !valid {
+				err = s.validateArtifactRepair(ctx, task, path)
+			}
+			return valid, err
+		}
+	}
+	if artifactRestorationRequested(task) && download != nil {
+		downloadBytes := download
+		download = func(path string) error {
+			if err := s.validateArtifactRepair(ctx, task, path); err != nil {
+				return err
+			}
+			if err := downloadBytes(path); err != nil {
+				return err
+			}
+			return s.validateArtifactDownload(ctx, task)
+		}
+	}
 	defer func() {
 		if ctx.Err() != nil {
 			result, err = hfArtifactTaskResult{}, ctx.Err()
@@ -339,7 +364,7 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 	if handler.childPathConflictsWithParent(input.ChildModelPath, input.Parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
-	needsRepair := task.TaskType == DownloadOverride || (found && parent.Status != HfArtifactStatusUpdating &&
+	needsRepair := task.TaskType == DownloadOverride || artifactRestorationRequested(task) || (found && parent.Status != HfArtifactStatusUpdating &&
 		(parent.Status == HfArtifactStatusFailed || !handler.files.ParentReadyMarkerExists(parent)))
 	startupValidation := s.hfArtifactStartup.needsValidation(input.Parent.Key)
 	if !allowDownload && (needsRepair || !found || startupValidation) {

@@ -77,6 +77,31 @@ func newTestDirectHfSource(t *testing.T) (*Gopher, *GopherTask, hfArtifactTaskIn
 	return s, task, input, source, downloads
 }
 
+func TestHfSnapshotCallbacksShareLazyManifest(t *testing.T) {
+	_, task, input, source, downloads := newTestDirectHfSource(t)
+	config := &xet.DownloadConfig{RepoID: input.Parent.Identity.ModelID, Revision: input.Parent.Identity.CommitSHA,
+		Token: "fallback-token", LocalDir: "unchanged"}
+	manifestCalls := 0
+	manifest := source.manifest
+	source.manifest = func(ctx context.Context, id, revision, token, endpoint string) (hfSnapshotManifest, error) {
+		manifestCalls++
+		return manifest(ctx, id, revision, token, endpoint)
+	}
+	validate, download := source.snapshotCallbacks(context.Background(), task, config)
+	require.Zero(t, manifestCalls)
+	path := filepath.Join(t.TempDir(), "snapshot")
+	valid, err := validate(path)
+	require.NoError(t, err)
+	require.False(t, valid)
+	require.NoError(t, download(path))
+	valid, err = validate(path)
+	require.NoError(t, err)
+	require.True(t, valid)
+	require.Equal(t, 1, manifestCalls)
+	require.Equal(t, 1, *downloads)
+	require.Equal(t, "unchanged", config.LocalDir)
+}
+
 func TestDirectHfSourcePinsRevisionAcrossRequeue(t *testing.T) {
 	s, task, input, source, downloads := newTestDirectHfSource(t)
 	resolves := 0

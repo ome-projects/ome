@@ -9,16 +9,30 @@ func (s *Gopher) validateArtifactRepair(ctx context.Context, task *GopherTask, p
 	if err := s.validateArtifactDownload(ctx, task); err != nil {
 		return err
 	}
-	used, err := s.sharedEvictionPathReferenced(ctx, task, path, false)
-	if err != nil {
-		return err
+	checkReferences := func() error {
+		used, err := s.sharedEvictionPathReferenced(ctx, task, path, false)
+		if err != nil {
+			return err
+		}
+		if used {
+			return fmt.Errorf("cannot repair bytes referenced by another local Model")
+		}
+		return nil
 	}
-	if used {
-		return fmt.Errorf("cannot repair bytes referenced by another local Model")
+	if err := checkReferences(); err != nil {
+		return err
 	}
 	// Initial Updating publication may have failed. Destructive repair must
 	// verify withdrawal under the operation lock, just like receipt cleanup.
-	return s.withdrawRestorationReadiness(ctx, task)
+	if err := s.withdrawRestorationReadiness(ctx, task); err != nil {
+		return err
+	}
+	// Withdrawal is an API boundary: a new reference may have appeared while
+	// it was in flight. Recheck without repeating the readiness side effect.
+	if err := checkReferences(); err != nil {
+		return err
+	}
+	return s.validateArtifactDownload(ctx, task)
 }
 
 // A receipt response may have been lost before eviction withdrew Ready. Keep
