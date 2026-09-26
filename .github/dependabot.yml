@@ -40,15 +40,9 @@ updates:
       - "go"
       - "tools"
 
-  # Site Go module (Hugo/Docsy)
-  - package-ecosystem: "gomod"
-    directory: "/site"
-    schedule:
-      interval: "weekly"
-      day: "saturday"
-    labels:
-      - "dependencies"
-      - "documentation"
+  # site/go.mod is intentionally absent: Dependabot tidies Go modules after
+  # an update, and tidying deletes the Hugo-only Docsy requirement. Upgrade
+  # Docsy by hand with `hugo mod get` (see site/go.mod).
 
   # NPM dependencies for documentation site
   - package-ecosystem: "npm"
