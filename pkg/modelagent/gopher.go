@@ -43,6 +43,8 @@ const (
 )
 
 type GopherTask struct {
+	// Pin direct Delete cleanup to its immutable first receipt/history snapshot.
+	directEvictionDelete   *ModelEntry
 	TaskType               GopherTaskType
 	BaseModel              *v1beta1.BaseModel
 	ClusterBaseModel       *v1beta1.ClusterBaseModel

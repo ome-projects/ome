@@ -76,7 +76,10 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
+	if entry.ModelUID == "" && (model.NodeUID != "" || model.DirectArtifactPath != "" || model.DirectArtifactPendingEviction != nil || model.Status == ModelStatusEvicted) {
+		entry.ModelUID = model.ModelUID
+	}
+	if model.NodeUID == "" && model.ArtifactRehydrationID == "" && model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.DirectArtifactPath == "" && model.DirectArtifactPendingEviction == nil && model.Status != ModelStatusEvicted && entry.ModelEntryJSON == "" {
 		// Only explicit ordinary writes may seed typed recovery. Observing
 		// unrelated records, including at startup, must not adopt them.
 		if modelID == "" && before[key] != raw && c.modelCache[key] == nil {
@@ -180,6 +183,9 @@ func (c *ConfigMapReconciler) cachedConfigMapEntries() (map[string]string, map[s
 // but must not erase a known shared relationship or interrupted cleanup receipt.
 func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]string, key string) error {
 	child, childErr := existingModelEntry(data, key)
+	if childErr == nil && (child.DirectArtifactPendingEviction != nil || child.Status == ModelStatusEvicted) {
+		return fmt.Errorf("local artifact for model %s is evicted or awaiting eviction", key)
+	}
 	for parentKey, raw := range data {
 		if !isHfArtifactConfigMapKey(parentKey) {
 			continue
@@ -198,6 +204,9 @@ func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]st
 	var cached ModelEntry
 	if cachedJSON == "" || json.Unmarshal([]byte(cachedJSON), &cached) != nil {
 		return nil
+	}
+	if cached.DirectArtifactPendingEviction != nil || cached.Status == ModelStatusEvicted {
+		return fmt.Errorf("local artifact for model %s requires eviction reconciliation", key)
 	}
 	if cached.HfArtifactKey != "" && (childErr != nil || child.HfArtifactKey == "") ||
 		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) {

@@ -22,6 +22,8 @@ const (
 	ModelStatusFailed ModelStatus = "Failed"
 	// ModelStatusDeleted indicates the model was deleted
 	ModelStatusDeleted ModelStatus = "Deleted"
+	// ModelStatusEvicting withdraws readiness while durable local cleanup runs.
+	ModelStatusEvicting ModelStatus = "Evicting"
 	// ModelStatusEvicted reports local cleanup complete; the Model CR remains.
 	ModelStatusEvicted ModelStatus = "Evicted"
 )
@@ -85,6 +87,8 @@ func (p *DownloadProgress) Percentage() float64 {
 // ModelEntry represents an entry in the node model ConfigMap
 // This is the top-level structure stored for each model in the ConfigMap
 type ModelEntry struct {
+	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`
+	NodeUID               types.UID `json:"nodeUID,omitempty"`
 	// ModelUID binds persisted state to the CR instance, not its reusable name.
 	ModelUID      types.UID         `json:"modelUID,omitempty"`
 	Name          string            `json:"name"`                    // Name of the model
