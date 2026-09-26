@@ -3,7 +3,6 @@ package modelagent
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -572,138 +571,20 @@ func (w *Scout) shouldDownloadModelCommon(storageSpec *v1beta1.StorageSpec, defa
 		}
 	}
 
-	// Check NodeSelector if specified
-	if len(storageSpec.NodeSelector) > 0 {
-		for key, value := range storageSpec.NodeSelector {
-			nodeValue, exists := w.nodeInfo.Labels[key]
-			if !exists || nodeValue != value {
-				return false
-			}
-		}
-	}
-
-	// Check NodeAffinity if specified
-	if storageSpec.NodeAffinity != nil && storageSpec.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
-		nodeSelectorTerms := storageSpec.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-		if len(nodeSelectorTerms) > 0 {
-			matches := false
-			for _, term := range nodeSelectorTerms {
-				if w.nodeMatchesSelectorTerm(term) {
-					matches = true
-					break
-				}
-			}
-			if !matches {
-				return false
-			}
-		}
-	}
-
-	// Return the caller-provided default when no other condition rejected it
-	return defaultDecision
+	return utils.ModelMatchesNodePlacement(storageSpec, w.nodeInfo) && defaultDecision
 }
 
-// shouldDownloadModel checks if a model should be downloaded to this node based on node selector and node affinity
+// shouldDownloadModel checks whether storage placement permits this node.
 func (w *Scout) shouldDownloadModel(storageSpec *v1beta1.StorageSpec) bool {
 	return w.shouldDownloadModelCommon(storageSpec, true)
 }
 
 func (w *Scout) nodeMatchesSelectorTerm(term v1.NodeSelectorTerm) bool {
-	// Check match expressions
-	for _, expr := range term.MatchExpressions {
-		if !w.nodeMatchesExpression(expr) {
-			return false
-		}
-	}
-
-	// Check match fields
-	for _, field := range term.MatchFields {
-		if !w.nodeMatchesExpression(field) {
-			return false
-		}
-	}
-
-	return true
+	return utils.NodeMatchesModelSelectorTerm(w.nodeInfo, term)
 }
 
 func (w *Scout) nodeMatchesExpression(expr v1.NodeSelectorRequirement) bool {
-	// Get the field value based on whether it's a label or field selector
-	var values []string
-	var exists bool
-
-	// For label selectors, get the label values
-	labelValue, labelExists := w.nodeInfo.Labels[expr.Key]
-	if labelExists {
-		values = []string{labelValue}
-		exists = true
-	}
-
-	// If not found in labels, try fields (only for special fields)
-	if !exists {
-		switch expr.Key {
-		case "metadata.name":
-			values = []string{w.nodeInfo.Name}
-			exists = true
-			// Add other field cases as needed
-		}
-	}
-
-	if !exists {
-		return expr.Operator == v1.NodeSelectorOpDoesNotExist
-	}
-
-	switch expr.Operator {
-	case v1.NodeSelectorOpIn:
-		for _, v := range values {
-			for _, requiredValue := range expr.Values {
-				if v == requiredValue {
-					return true
-				}
-			}
-		}
-		return false
-	case v1.NodeSelectorOpNotIn:
-		for _, v := range values {
-			for _, requiredValue := range expr.Values {
-				if v == requiredValue {
-					return false
-				}
-			}
-		}
-		return true
-	case v1.NodeSelectorOpExists:
-		return true
-	case v1.NodeSelectorOpDoesNotExist:
-		return false
-	case v1.NodeSelectorOpGt:
-		if len(values) == 0 || len(expr.Values) == 0 {
-			return false
-		}
-		// Try to convert to integers for numeric comparison
-		nodeVal, nodeErr := strconv.Atoi(values[0])
-		requiredVal, reqErr := strconv.Atoi(expr.Values[0])
-		if nodeErr == nil && reqErr == nil {
-			// If both values can be parsed as integers, do numeric comparison
-			return nodeVal > requiredVal
-		}
-		// Fall back to string comparison if not numeric
-		return values[0] > expr.Values[0]
-	case v1.NodeSelectorOpLt:
-		if len(values) == 0 || len(expr.Values) == 0 {
-			return false
-		}
-		// Try to convert to integers for numeric comparison
-		nodeVal, nodeErr := strconv.Atoi(values[0])
-		requiredVal, reqErr := strconv.Atoi(expr.Values[0])
-		if nodeErr == nil && reqErr == nil {
-			// If both values can be parsed as integers, do numeric comparison
-			return nodeVal < requiredVal
-		}
-		// Fall back to string comparison if not numeric
-		return values[0] < expr.Values[0]
-	}
-
-	return false
+	return utils.NodeMatchesModelRequirement(w.nodeInfo, expr)
 }
 
 func downloadPolicyOrDefault(storage *v1beta1.StorageSpec) v1beta1.DownloadPolicy {
