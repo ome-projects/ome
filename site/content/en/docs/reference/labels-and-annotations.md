@@ -66,18 +66,21 @@ These annotations control model encryption and decryption:
 | `rdma.ome.io/container-name` | Specifies the container name for RDMA configuration |
 
 The profiles are `oci-roce` (the default), `cks-gb-sglang` and `cks-gb-rdma`.
-`oci-roce` injects NCCL/UCX environment variables. `cks-gb-sglang` injects NCCL
-environment variables. Both profiles inject a `/dev/shm` emptyDir, a
-`/dev/infiniband` hostPath mount and the `IPC_LOCK` capability; `cks-gb-rdma`
-adds Multus network attachments only. None of them run the container
-privileged: a privileged container bypasses the device cgroup and sees every
-GPU on the node rather than the ones allocated to it.
+`oci-roce` and `cks-gb-sglang` inject NCCL environment variables, a `/dev/shm`
+emptyDir, a `/dev/infiniband` hostPath mount and the `IPC_LOCK` capability;
+`cks-gb-rdma` adds Multus network attachments only. None of them run the
+container privileged: a privileged container bypasses the device cgroup and
+sees every GPU on the node rather than the ones allocated to it.
 
 A profile does not by itself grant access to the HCA device nodes. Request
 your cluster's RDMA device-plugin resource in the runtime's container
 resources (for example `rdma/hca_shared_devices_a: 1`), or set
 `privileged: true` on the container explicitly. Values already set on the
 container win over the profile.
+
+No profile sets `UCX_TLS` or `UCX_NET_DEVICES`, so UCX-based KV transfer
+such as NIXL picks its own transports and can use RDMA. To restrict UCX, set
+these variables on the container.
 
 
 ### Runtime Revision and Pinning Annotations

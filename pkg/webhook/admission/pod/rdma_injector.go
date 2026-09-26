@@ -29,6 +29,10 @@ const (
 // RDMAProfiles is a map of profile names to RDMA configurations
 var RDMAProfiles = map[string]RDMAProfile{
 	"oci-roce": {
+		// UCX_TLS and UCX_NET_DEVICES are deliberately absent. No NCCL
+		// path reads them, but UCX-based KV transfer (NIXL) does, and
+		// pinning them to tcp/eth0 quietly moved it off RDMA (#837).
+		// Runtimes that want a UCX restriction set it on the container.
 		EnvVars: map[string]string{
 			"NCCL_NET_PLUGIN":            "none",
 			"NCCL_DEBUG":                 "INFO",
@@ -44,8 +48,6 @@ var RDMAProfiles = map[string]RDMAProfile{
 			"NCCL_IB_TIMEOUT":            "22",
 			"HCOLL_ENABLE_MCAST_ALL":     "0",
 			"coll_hcoll_enable":          "0",
-			"UCX_TLS":                    "tcp",
-			"UCX_NET_DEVICES":            "eth0",
 			"RX_QUEUE_LEN":               "8192",
 			"IB_RX_QUEUE_LEN":            "8192",
 			"NCCL_SOCKET_IFNAME":         "eth0",

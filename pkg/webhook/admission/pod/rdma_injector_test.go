@@ -972,3 +972,18 @@ func TestRDMAProfiles_AreNotPrivileged(t *testing.T) {
 		}
 	}
 }
+
+// UCX_TLS and UCX_NET_DEVICES decide which transports and devices UCX may
+// use. NCCL's built-in IB transport never reads them, so a profile gains
+// nothing by pinning them, while UCX-based KV transfer such as NIXL quietly
+// falls back to whatever they allow: TCP over eth0 under the old oci-roce
+// values (#837). Runtimes that want a restriction set it on the container.
+func TestRDMAProfiles_DoNotPinUCXTransports(t *testing.T) {
+	for name, profile := range RDMAProfiles {
+		for _, key := range []string{"UCX_TLS", "UCX_NET_DEVICES"} {
+			_, has := profile.EnvVars[key]
+			assert.False(t, has,
+				"profile %q sets %s, which overrides UCX transport selection for every UCX user in the pod", name, key)
+		}
+	}
+}
