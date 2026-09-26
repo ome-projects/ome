@@ -133,6 +133,8 @@ for the full commentary):
 | `quotaManager.resyncInterval` | `10m` | Re-runs the tree checks on an otherwise-idle cluster. |
 | `quotaManager.crd.install` | `false` | Install the CRD from this chart. Only for clusters without `ome-crd`. |
 | `quotaManager.webhook.enabled` | `true` | Serve the validating webhook. Disable only to debug a wedged cluster whose webhook certs or Service are broken. |
+| `quotaManager.metricsPort` | `8080` | Port the controller-runtime `/metrics` endpoint binds. The default scrape annotations track it — see [Metrics](#metrics). |
+| `quotaManager.metrics.serviceMonitor.enabled` | `false` | Collect metrics through a prometheus-operator `ServiceMonitor` instead of the default `prometheus.io/*` pod annotations — see [Metrics](#metrics). |
 
 **Cover resources are a ceiling, not a budget.** Kueue refuses to admit a
 workload requesting a resource its queue does not cover, and every serving pod
@@ -373,6 +375,125 @@ snapshots of the CRs: they do not prove admission, enforcement, or Kueue
 integration, and collection is bounded (at most 1000 objects within a
 10-second deadline). The `get`/`list` rules on `ome.io` resources in the
 plugin's baseline reader role already cover them.
+
+## Metrics
+
+The manager always serves the standard controller-runtime metrics endpoint at
+`/metrics` on `quotaManager.metricsPort` (default `8080`); the values under
+[Scraping](#scraping) below only decide who collects it. On top of the usual
+controller-runtime series it registers three `ome_quota_*` families, published
+from the same reconcile passes that write the statuses above, so the series and
+the CRs cannot disagree.
+
+### Capacity
+
+A whole-fleet snapshot of the last capacity pass, per `(resource, flavor)`
+pair. Every gauge is reset and repopulated each pass, so a fixed problem — a
+flavor added, a node uncordoned — actually reads as fixed instead of a stale
+series reporting forever.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `ome_quota_capacity_allocatable` | `resource`, `flavor` | Allocatable accelerators on nodes that could accept work. |
+| `ome_quota_capacity_unavailable` | `resource`, `flavor` | Accelerators on nodes that matched the flavor but were cordoned or not `Ready`. Budgets are sized against allocatable; this is the parked remainder. |
+| `ome_quota_capacity_nodes` | `resource`, `flavor`, `state` | Nodes behind those totals; `state` is `schedulable` or `unavailable`. This is what separates a one-machine shortfall from a rack. |
+| `ome_quota_capacity_unattributed` | `resource`, `reason` | Allocatable accelerators no `ResourceFlavor` claims, contributing zero to every budget. `reason` is `NoMatchingFlavor` (no flavor's node labels matched) or `AmbiguousFlavor` (two flavors matched equally specifically). |
+| `ome_quota_capacity_unattributed_nodes` | `reason` | Distinct nodes behind the unattributed figure. A node advertising two unclaimed resources counts once. |
+
+Two things will not line up with other sources, by design. The gauges report
+the **raw observation** of the pass, before the high-water-mark merge — budget
+checks compare against the mark in the root's `status.capacity`, so the gauge
+can dip during a drain while the mark holds. And the figure is kubelet
+*allocatable*, not node capacity, so it will not reconcile against
+`kube_node_status_capacity`.
+
+`ome_quota_capacity_unattributed > 0` is worth alerting on: it means a missing
+or ambiguous flavor is silently zeroing capacity, not that the fleet shrank —
+and the unattributed slice and the node counts appear only in these metrics,
+not in any CR status.
+
+### Budgets
+
+The same four figures as `status.budgets`, per node that carries a budget, as
+gauges in accelerator units. All four share the labels `plane`, `quota` (the
+`AcceleratorQuota` object name — *quota*, not *node*, because
+`ome_quota_capacity_nodes` already means machines), `role` (`Cohort` or
+`ClusterQueue`), `resource` and `flavor`.
+
+| Metric | Meaning |
+| --- | --- |
+| `ome_quota_budget_nominal` | Accelerators allowed for this node and flavor. |
+| `ome_quota_budget_admitted` | Currently admitted against the materialized queues, including anything borrowed. |
+| `ome_quota_budget_reserved` | Held by workloads carrying a quota reservation, admitted or not. Never below admitted; the gap is work that owns chips but has not started. |
+| `ome_quota_budget_borrowed` | Admitted above this node's own nominal, taken from idle siblings. |
+
+On the single-cluster path this page covers, `plane` is always `workload`. The
+label exists because a management plane publishes the same series names meaning
+different things — the authored fleet total rather than one cluster's share —
+and a query must never sum the two.
+
+Cohort series report the roll-up of the leaves beneath them, so an unqualified
+`sum()` counts each admitted chip once per budgeted ancestor. Filter by role
+when aggregating across tenants:
+
+```
+# Per-tenant utilization, without double counting through cohort roll-ups.
+sum by (quota) (ome_quota_budget_admitted{role="ClusterQueue"})
+  / sum by (quota) (ome_quota_budget_nominal{role="ClusterQueue"})
+```
+
+There is deliberately no `lent` metric: the model has no lent figure (a loan
+between two siblings is internal to the subtree that contains them), and it is
+derivable in PromQL over a subtree. Budget series are published every pass
+rather than on change, so they reappear within one pass of a manager restart;
+on a pass where usage could not be read from Kueue, both the status and the
+gauges keep their previous figures rather than blanking. Deleting a node
+removes its series — through its finalizer, or through a whole-tree sweep that
+catches nodes deleted while the manager was down. Nodes without budgets (the
+reserved root, a Cohort with no guardrail) publish nothing.
+
+### Materialization backend
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `ome_quota_backend_applied_total` | — | Kueue objects written by the materializer. Writes are server-side applies issued unconditionally, so this tracks pass frequency times render size, **not** how often the tree changed. |
+| `ome_quota_backend_swept_total` | `trigger` | Kueue objects reaped as orphans: `trigger="materialize"` is a pass finding objects the tree no longer names, `trigger="finalize"` is a deleted node's own objects. Sweeps that find nothing do not move the counter. |
+
+### Scraping
+
+Two collection paths exist, and the chart keeps them mutually exclusive:
+
+- **Pod annotations (the default).** The Deployment stamps
+  `prometheus.io/scrape: "true"`, `prometheus.io/path: /metrics` and
+  `prometheus.io/port` (tracking `metricsPort`) on its pod. This is all the
+  [bundled Prometheus](/ome/docs/administration/metrics/) consults — but its
+  `ome-control-plane` job keeps annotated pods only in its own release
+  namespace, so install `ome-quota-manager` into the same namespace as
+  `ome-resources` if you rely on it.
+- **ServiceMonitor.** For prometheus-operator stacks, set
+  `quotaManager.metrics.serviceMonitor.enabled=true`. The chart renders a
+  `ServiceMonitor`, adds a named `metrics` port to the component's Service
+  (which the webhook already fronts), and **suppresses the pod annotations**:
+  a cluster running both collectors scrapes the pod twice, and every
+  unqualified `sum()` over the result is doubled. If you genuinely want both,
+  restate the annotations under `quotaManager.podAnnotations`.
+
+The ServiceMonitor carries no selector labels by default, deliberately:
+kube-prometheus-stack selects monitors labelled `release: <its release name>`,
+other collectors key on their own label, and a guessed default would yield an
+object that exists and is never scraped — indistinguishable from a broken
+scrape. Set whatever yours selects on:
+
+```yaml
+quotaManager:
+  metrics:
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack   # whatever your collector selects on
+      # interval, scrapeTimeout, honorLabels, relabelings and
+      # metricRelabelings pass through; unset means the collector's defaults.
+```
 
 ## RBAC
 
