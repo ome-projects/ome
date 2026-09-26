@@ -13,6 +13,9 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
+	if err := input.prepareDeletionPhase(ctx); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), nil
+	}
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
@@ -114,6 +117,7 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 	parent HfArtifactEntry,
 	modelStoreRoot string,
 	wasReady bool,
+	parentReferenced func(context.Context, string) (bool, error),
 ) (hfArtifactTaskResult, error) {
 	if parent.Status != HfArtifactStatusUpdating || parent.LockID == "" || len(parent.Children) != 0 {
 		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("shared artifact %s is not locked for deletion", parent.Key)), nil
@@ -121,6 +125,12 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 	hasChildren, err := h.files.HasChildren(parent.LocalPath, modelStoreRoot)
 	if err != nil {
 		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("scan child symlinks for shared Hugging Face parent %s: %w", parent.Key, err)), nil
+	}
+	if !hasChildren && parentReferenced != nil {
+		hasChildren, err = parentReferenced(ctx, parent.LocalPath)
+		if err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
 	}
 	if hasChildren {
 		// Preserve files for an unrecorded child and end deletion ownership.

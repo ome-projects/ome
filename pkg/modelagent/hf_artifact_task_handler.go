@@ -58,6 +58,27 @@ type hfArtifactTaskInput struct {
 	PreserveChildPath bool
 	// Downloads and attachments recheck live child intent under both file locks.
 	validateDownload func(context.Context) error
+	// Cleanup revalidates intent and ownership without mutating readiness.
+	validateDeletion func(context.Context) error
+	// Prepare readiness/status once per locked cleanup phase, not per check.
+	prepareDeletion func(context.Context) error
+	// Finish a specialized cleanup while still holding both operation locks.
+	// The callback must clear only this exact receipt with its terminal state.
+	finishDeletion func(context.Context, HfArtifactPendingDeletion) error
+	// Local references protect child links as well as parent directories.
+	pathReferenced func(context.Context, string) (bool, error)
+}
+
+func (input hfArtifactTaskInput) prepareDeletionPhase(ctx context.Context) error {
+	if input.validateDeletion != nil {
+		if err := input.validateDeletion(ctx); err != nil {
+			return err
+		}
+	}
+	if input.prepareDeletion != nil {
+		return input.prepareDeletion(ctx)
+	}
+	return nil
 }
 
 func (input hfArtifactTaskInput) modelStoreRoot() (string, error) {

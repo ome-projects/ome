@@ -622,6 +622,9 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 			return newHfArtifactRetryResult(input.Parent.Key, nil), nil
 		}
 		defer unlock()
+		if err := input.prepareDeletionPhase(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
 		if err := handler.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}

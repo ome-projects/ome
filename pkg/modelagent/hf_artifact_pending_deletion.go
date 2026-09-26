@@ -264,6 +264,11 @@ func (r *HfArtifactRepository) finishPendingDeletion(ctx context.Context, key st
 }
 
 func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input hfArtifactTaskInput, pending *HfArtifactPendingDeletion) (hfArtifactTaskResult, error) {
+	if input.validateDeletion != nil {
+		if err := input.validateDeletion(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
 	parent := pending.parentForChild(input.ChildModelKey)
 	if pending.ChildPath != input.ChildModelPath {
 		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("pending shared deletion child path changed")), nil
@@ -298,13 +303,25 @@ func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input
 	if err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
-	if !referenced && h.hasOtherPathUsers != nil {
+	if !referenced && input.pathReferenced == nil && h.hasOtherPathUsers != nil {
 		referenced, err = h.hasOtherPathUsers(input)
 		if err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}
 	}
+	if input.pathReferenced != nil {
+		used, err := input.pathReferenced(ctx, input.ChildModelPath)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+		referenced = referenced || used
+	}
 	referenced = referenced || input.PreserveChildPath
+	if input.validateDeletion != nil {
+		if err := input.validateDeletion(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
 	if !referenced {
 		if err := h.files.RemoveChildSymlink(input.ChildModelPath, pending.ParentPath); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
@@ -316,13 +333,17 @@ func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input
 				return newHfArtifactRetryResult(parent.Key, err), nil
 			}
 		} else {
-			result, err := h.deleteLockedParent(ctx, parent, input.ModelStoreRoot, pending.ParentWasReady)
+			result, err := h.deleteLockedParent(ctx, parent, input.ModelStoreRoot, pending.ParentWasReady, input.pathReferenced)
 			if err != nil || result.Outcome != hfArtifactTaskDone {
 				return result, err
 			}
 		}
 	}
-	if !input.RetainDeletionReceipt {
+	if input.finishDeletion != nil {
+		if err := input.finishDeletion(ctx, *pending); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	} else if !input.RetainDeletionReceipt {
 		if err := h.repository.finishPendingDeletion(ctx, input.ChildModelKey, *pending); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}
@@ -358,6 +379,9 @@ func (h *hfArtifactTaskHandler) resumeDeletionBeforeDownload(ctx context.Context
 	}
 	if pending == nil {
 		return hfArtifactTaskResult{}, false
+	}
+	if err := input.prepareDeletionPhase(ctx); err != nil {
+		return newHfArtifactRetryResult(input.Parent.Key, err), true
 	}
 	result, err := h.resumePendingDeletion(ctx, input, pending)
 	if err != nil || result.Outcome == hfArtifactTaskDone {
