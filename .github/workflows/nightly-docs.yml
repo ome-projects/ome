@@ -4,6 +4,23 @@ on:
   schedule:
     - cron: '23 9 * * *' # 09:23 UTC daily
   workflow_dispatch:
+    inputs:
+      maintenance_pr:
+        description: Repair an existing docs PR instead of discovering new ones
+        type: string
+        default: ''
+      maintenance_apply:
+        description: Publish the maintenance repair (false is a dry run)
+        type: boolean
+        default: false
+      maintenance_force:
+        description: Resume a maintenance PR after three unsuccessful rounds
+        type: boolean
+        default: false
+      maintenance_feedback:
+        description: Additional source-backed feedback for the maintenance PR
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -19,8 +36,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  maintain:
+    if: github.event_name == 'workflow_dispatch' && inputs.maintenance_pr != ''
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    uses: ./.github/workflows/docs-pr-maintenance.yml
+    with:
+      pr_number: ${{ inputs.maintenance_pr }}
+      apply: ${{ inputs.maintenance_apply }}
+      force: ${{ inputs.maintenance_force }}
+      feedback: ${{ inputs.maintenance_feedback }}
+    secrets: inherit
+
   prepare:
-    if: github.repository == 'ome-projects/ome' && (github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    if: github.repository == 'ome-projects/ome' && inputs.maintenance_pr == '' && (github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ome-runner-cpu
     timeout-minutes: 45
     outputs:

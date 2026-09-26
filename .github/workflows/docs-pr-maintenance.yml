@@ -1,0 +1,117 @@
+name: Documentation PR Maintenance
+
+on:
+  schedule:
+    - cron: '11,41 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Existing nightly docs PR (empty scans all eligible PRs)
+        type: string
+        default: ''
+      apply:
+        description: Publish repairs and update maintenance status
+        type: boolean
+        default: false
+      force:
+        description: Explicitly resume a PR that exhausted its failed-round budget
+        type: boolean
+        default: false
+      feedback:
+        description: Additional source-backed feedback for this PR
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      apply:
+        type: boolean
+        default: false
+      force:
+        type: boolean
+        default: false
+      feedback:
+        type: string
+        default: ''
+  # Submitted reviews and inline replies are picked up by the sweep. PR review
+  # events use the PR merge ref; privileged workers must use trusted workflows.
+  issue_comment:
+    types: [created, edited]
+  workflow_run:
+    workflows: [Nightly Documentation Updates, PR Validation, Claude Code Review]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+# A sweep always reconciles the complete eligible set, so coalesced events do
+# not strand PRs. Per-PR locks also cover explicit dispatches from the nightly.
+concurrency:
+  group: docs-pr-maintenance-controller
+  cancel-in-progress: false
+
+jobs:
+  select:
+    if: >-
+      github.repository == 'ome-projects/ome'
+      && vars.DOCS_MAINTENANCE_ENABLED != 'false'
+      && (github.event_name != 'issue_comment' || github.event.issue.pull_request)
+      && (github.event_name != 'issue_comment' || !startsWith(github.event.comment.body, '<!-- docs-maintenance-state:'))
+    runs-on: ome-runner-cpu
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      count: ${{ steps.select.outputs.count }}
+      apply: ${{ steps.mode.outputs.apply }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      EXTRA_FEEDBACK: ${{ inputs.feedback }}
+      FORCE: ${{ inputs.force }}
+      ALLOW_MERGE: ${{ vars.DOCS_MAINTENANCE_MERGE == 'true' }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ github.sha }}
+      - name: Select mode
+        id: mode
+        env:
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' || inputs.pr_number != '' }}
+          REQUESTED_APPLY: ${{ inputs.apply }}
+        run: |
+          if [ "$MANUAL" = true ]; then
+            echo "apply=$REQUESTED_APPLY" >> "$GITHUB_OUTPUT"
+          else
+            echo 'apply=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Reconcile eligible PRs and skip unchanged work
+        id: select
+        run: python3 hack/nightly-docs/maintenance.py select
+
+  maintain:
+    needs: select
+    if: needs.select.outputs.count != '0' && needs.select.outputs.count != ''
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    uses: ./.github/workflows/docs-pr-worker.yml
+    with:
+      number: ${{ matrix.number }}
+      apply: ${{ needs.select.outputs.apply == 'true' }}
+      force: ${{ inputs.force || false }}
+      feedback: ${{ inputs.feedback || '' }}
+    secrets: inherit
