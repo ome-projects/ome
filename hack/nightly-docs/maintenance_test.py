@@ -310,3 +310,53 @@ class PublicationTests(unittest.TestCase):
             with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'ome-projects/ome'}), \
                     patch.object(m.docs, 'mutate_git'), self.assertRaises(ValueError):
                 m.context(pr)
+
+    def refresh_context(self, base):
+        pr = pull()
+        pr['body'] = f"<!-- nightly-docs:{self.item['key']} -->"
+        pr['head'].update(sha=self.head, ref=self.item['branch'])
+        pr['base']['sha'] = base
+        details = {'threads': [], 'comments': [], 'failed_checks': []}
+        previous = {**pr, 'base': {**pr['base'], 'sha': self.base}}
+        self.ctx.update(extra_feedback='', feedback=details, signature=m.signature(previous, details))
+        return pr, details
+
+    def test_refresh_allows_only_unrelated_new_pages_and_preserves_patch(self):
+        added = self.path.parent / 'unrelated.md'
+        added.write_text('Another concern\n')
+        self.git('add', str(added))
+        self.git('commit', '-qm', 'merge unrelated new doc')
+        base = self.git('rev-parse', 'HEAD')
+        self.git('push', '-q', 'origin', 'HEAD:refs/heads/main')
+        self.git('checkout', '--detach', self.base)
+        self.path.write_text('Reviewed repair\n')
+        directory = self.root / 'evidence'
+        directory.mkdir()
+        pr, details = self.refresh_context(base)
+        with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'ome-projects/ome'}), \
+                patch.object(m, 'get_pr', return_value=pr), \
+                patch.object(m, 'feedback', return_value=(details, {}, None)):
+            m.refresh_base(self.ctx, directory)
+        self.assertEqual(self.ctx['review_base'], self.base)
+        self.assertEqual(self.ctx['base'], base)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), base)
+        self.assertEqual(self.path.read_text(), 'Reviewed repair\n')
+        self.assertEqual(added.read_text(), 'Another concern\n')
+        self.assertEqual(self.git('diff', '--cached', '--name-only', base), str(self.path))
+
+    def test_refresh_rejects_source_or_existing_page_changes(self):
+        for path in [Path('source.go'), self.path]:
+            self.git('reset', '--hard', self.base)
+            path.write_text('Changed on main\n')
+            self.git('add', str(path))
+            self.git('commit', '-qm', 'main changed existing content')
+            base = self.git('rev-parse', 'HEAD')
+            self.git('push', '-q', 'origin', 'HEAD:refs/heads/' + ('source' if path.suffix == '.go' else 'docs'))
+            self.git('checkout', '--detach', self.base)
+            self.path.write_text('Reviewed repair\n')
+            pr, details = self.refresh_context(base)
+            with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'ome-projects/ome'}), \
+                    patch.object(m, 'get_pr', return_value=pr), \
+                    patch.object(m, 'feedback', return_value=(details, {}, None)), \
+                    self.assertRaisesRegex(ValueError, 'fresh review'):
+                m.refresh_base(self.ctx, self.root)

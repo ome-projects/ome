@@ -170,6 +170,9 @@ jobs:
         with:
           go-version: '1.26'
           cache-dependency-path: hack/internal/tools/go.sum
+      - name: Refresh only unrelated new documentation on main
+        if: steps.review.outcome == 'success'
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" refresh
       - uses: actions/setup-node@v6
         if: steps.review.outcome == 'success'
         with:

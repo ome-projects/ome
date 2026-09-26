@@ -299,6 +299,42 @@ def live_match(ctx):
     return pr
 
 
+def refresh_base(ctx, directory):
+    """Carry a reviewed patch across unrelated new pages, never source edits."""
+    pr = get_pr(ctx['number'])
+    eligible(pr)
+    details, _, _ = feedback(pr)
+    previous = {**pr, 'base': {**pr['base'], 'sha': ctx['base']}}
+    if (pr['head']['sha'] != ctx['head']
+            or signature(previous, details, ctx['extra_feedback']) != ctx['signature']):
+        raise ValueError('PR head or feedback changed during review; discard this stale attempt')
+    base = pr['base']['sha']
+    if base == ctx['base']:
+        return
+    docs.mutate_git('fetch', '--no-tags', 'origin', base)
+    docs.git('merge-base', '--is-ancestor', ctx['base'], base)
+    for line in docs.git('diff', '--name-status', ctx['base'], base).splitlines():
+        status, path = line.split('\t', 1)
+        if (status != 'A' or not docs.doc_path(path) or path in ctx['item']['doc_paths']
+                or docs.git('ls-tree', base, '--', path).split()[0] != '100644'):
+            raise ValueError('Main changed source, existing docs, or overlapping paths; a fresh review is required')
+    # Executable source, schemas, templates and every existing page are byte-for-
+    # byte unchanged. Reuse the semantic verdict, then rebuild and recheck links
+    # against the new site. Publication still rejects any subsequent base move.
+    docs.export_bundle(ctx['item'], ctx['base'], directory / 'bundle.json')
+    payload = json.loads((directory / 'bundle.json').read_text())
+    docs.mutate_git('reset', '--hard', ctx['base'])
+    ctx['review_base'] = ctx['base']
+    ctx['base'] = base
+    ctx['signature'] = signature(pr, details, ctx['extra_feedback'])
+    payload['base_sha'] = base
+    restore(ctx, json.dumps(payload))
+    (directory / 'bundle.json').write_text(json.dumps(payload))
+    (directory / 'context.json').write_text(json.dumps(ctx, indent=2))
+    (directory / 'full-pr.patch').write_text(docs.git('diff', '--cached', base))
+    print(f"Refreshed {ctx['review_base']} -> {base}: only unrelated new documentation pages")
+
+
 def publish_repair(ctx):
     """Append a normal commit, carrying current main, with no force push."""
     live_match(ctx)
@@ -402,7 +438,8 @@ def finish(ctx, directory, apply):
                  "extra_feedback": ctx["extra_feedback"], "run_url": ctx["run_url"]}
         save_state(ctx, state)
     result = {"number": ctx["number"], "applied": apply, "accepted": accepted, "head": head,
-              "base": ctx["base"], "reason": reason, "resolved_bot_threads": threads if accepted else []}
+              "base": ctx["base"], "review_base": ctx.get("review_base", ctx["base"]),
+              "reason": reason, "resolved_bot_threads": threads if accepted else []}
     (directory / "result.json").write_text(json.dumps(result, indent=2))
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
         summary.write(f"PR #{ctx['number']}: {'validated' if accepted else 'needs repair'}; "
@@ -513,6 +550,8 @@ def main():
                                        Path(os.environ["PUBLIC_DIR"]) if os.getenv("PUBLIC_DIR") else None)
         if findings:
             raise ValueError("\n".join(findings))
+    elif command == "refresh":
+        refresh_base(ctx, directory)
     elif command == "finish":
         finish(ctx, directory, apply)
     elif command == "failure":

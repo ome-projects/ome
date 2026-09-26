@@ -165,6 +165,12 @@ Each activation does one repair round:
    from the rendered pages. Fenced YAML is data: shell heredocs, CEL rules and
    admission webhooks are not executed. These checks do not prove every example
    can run against a live Kubernetes cluster.
+   Before building, a main advance may be carried forward only if it adds
+   unrelated regular handwritten Markdown pages. Source, schemas, templates and
+   every existing page must remain byte-for-byte identical. The semantic review
+   can then be reused while build/link validation uses the refreshed base; both
+   revisions are recorded in the evidence. Any other main change requires a
+   fresh review, and a subsequent base move still blocks publication.
 5. Append a signed-off repair commit to the **same branch**, including current
    main when necessary, using a normal push. The committed tree must exactly
    match the validated tree. Concurrent changes invalidate publication; no
