@@ -298,6 +298,7 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 // runHfArtifactDownload keeps expensive validation and writes on normal workers.
 // A Failed parent with children is repaired in place, never reset as a new copy.
 func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (result hfArtifactTaskResult, err error) {
+	s.guardSharedArtifactCleanup(task, &input)
 	input.validateDownload = func(ctx context.Context) error {
 		return s.validateArtifactDownload(ctx, task)
 	}
@@ -366,8 +367,10 @@ func (s *Gopher) hfArtifactInputForChild(task *GopherTask, parent HfArtifactEntr
 	if err != nil {
 		return hfArtifactTaskInput{}, err
 	}
-	return hfArtifactTaskInput{Parent: parent, ChildModelKey: key, ChildModelUID: types.UID(getModelUID(task)),
-		ChildModelPath: parent.Children[key], ModelStoreRoot: root}, nil
+	input := hfArtifactTaskInput{Parent: parent, ChildModelKey: key, ChildModelUID: types.UID(getModelUID(task)),
+		ChildModelPath: parent.Children[key], ModelStoreRoot: root}
+	s.guardSharedArtifactCleanup(task, &input)
+	return input, nil
 }
 
 // detachHfArtifactForDefaultDownload releases persisted shared ownership before
