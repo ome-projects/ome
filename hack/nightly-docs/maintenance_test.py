@@ -108,6 +108,20 @@ class PolicyTests(unittest.TestCase):
         runs[0]["external_id"] = "stale-base"
         self.assertTrue(m.merge_blockers(pr, state, "digest", info, runs))
 
+    def test_disabled_merge_never_calls_mutation_even_when_ready(self):
+        pr = pull()
+        info = {"reviewDecision": "APPROVED", "mergeStateStatus": "CLEAN", "statusCheckRollup": []}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")}), \
+                patch.object(m, "api", return_value=pr) as api, \
+                patch.object(m, "feedback", return_value=({"threads": []}, {}, None)), \
+                patch.object(m.docs, "run", return_value=json.dumps(info)), \
+                patch.object(m, "check_runs", return_value=[]), \
+                patch.object(m, "merge_blockers", return_value=[]):
+            m.merge(7, False)
+            self.assertEqual(api.call_count, 1)
+            self.assertEqual(api.call_args.args, ('repos/ome-projects/ome/pulls/7',))
+
 
 class ExampleTests(unittest.TestCase):
     def test_manifest_schema_and_prefix(self):
@@ -202,3 +216,18 @@ class PublicationTests(unittest.TestCase):
         m.docs.validate_diff(self.item, self.base)
         with patch.object(m, 'live_match'), self.assertRaises(subprocess.CalledProcessError):
             m.publish_repair(self.ctx)
+
+    def test_incoming_code_and_executable_docs_are_rejected(self):
+        for path, mode in [('code.py', 0o644), (str(self.path), 0o755)]:
+            self.git('checkout', '--detach', self.head)
+            Path(path).write_text('Untrusted content\n')
+            Path(path).chmod(mode)
+            self.git('add', path)
+            self.git('commit', '-qm', 'invalid PR edit')
+            pr = pull()
+            pr['body'] = f"<!-- nightly-docs:{self.item['key']} -->"
+            pr['head'].update(sha=self.git('rev-parse', 'HEAD'), ref=self.item['branch'])
+            pr['base']['sha'] = self.base
+            with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'ome-projects/ome'}), \
+                    patch.object(m.docs, 'mutate_git'), self.assertRaises(ValueError):
+                m.context(pr)

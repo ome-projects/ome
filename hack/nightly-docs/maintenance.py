@@ -255,6 +255,7 @@ def prepare(number, directory, apply, force):
         if apply:
             save_state(ctx, {"phase": "working", "attempts": attempts, "head": ctx["head"],
                              "base": ctx["base"], "run_url": ctx["run_url"],
+                             "extra_feedback": ctx["extra_feedback"],
                              "reason": "Repair/validation in progress; no merge authorization implied."})
     (directory / "context.json").write_text(json.dumps(ctx, indent=2))
     output(work=str(action == "work").lower(), cached=str(action == "cached").lower(), base=ctx["base"])
