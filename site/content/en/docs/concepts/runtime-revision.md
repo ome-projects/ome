@@ -118,7 +118,41 @@ spec:
 
 An explicit `revision` overrides drift handling. If the named revision does not exist, the controller sets `RuntimeDrifted` with reason `RevisionMissing` rather than silently falling back to the live runtime.
 
-> **Note:** A `revision` can only point at a snapshot that already exists. Snapshots for a *new* runtime version come into existence when an InferenceService rolls forward (via `ome.io/runtime-sync`) or is first pinned. To find available revisions: `kubectl -n ome get controllerrevisions -l ome.io/runtime-of=<runtime-name>`.
+> **Note:** A `revision` can only point at a snapshot that already exists. Snapshots for a *new* runtime version come into existence when an InferenceService rolls forward (via `ome.io/runtime-sync`) or is first pinned. To see which snapshots exist, use `kubectl ome runtime history` (below), or query the labels directly: `kubectl -n ome get controllerrevisions -l ome.io/runtime-of=<runtime-name>`.
+
+### Listing snapshots: `kubectl ome runtime history` (alpha)
+
+The [kubectl-ome](/ome/docs/tasks/kubectl-ome) plugin lists the snapshots available to a service without a hand-written label query. It takes the **InferenceService**, not the runtime: the command resolves the service's runtime itself, then lists that runtime's `ControllerRevision` snapshots from the OME control-plane namespace (`--ome-namespace`, default `ome`):
+
+```bash
+kubectl ome runtime history my-service -n team-a
+```
+
+```
+WINDOW    REVISION         CREATED           ROLES   CHECK   LIVE    ISSUES
+C/B/1/1   cr...#91d02f4a   26-09-24T09:15Z   H       OK      MATCH   R0/G0
+C/B/1/1   cr...#2130c7ba   26-09-20T14:02Z   AQRH    OK      DIFF    R0/G0
+```
+
+One row per snapshot, newest first. The default table is compact (every line fits an 80-column terminal), so the cells are coded:
+
+| Column | Meaning |
+|--------|---------|
+| `WINDOW` | The observation window, repeated on every row: observation state, completeness, pages seen, pages asked. `C/B` = the listing completed, so the window is complete up to GC retention (see below); `P/I` = truncated — older snapshots exist that are not shown; `U/I` = the listing failed; `N/N` = history was not requested. |
+| `REVISION` | Snapshot name. Names longer than 14 columns display as `PREFIX#DIGEST`, where the digest is an eight-hex display-only digest of the full name — not a Kubernetes identity and not the runtime content hash. |
+| `CREATED` | Creation time, UTC, `YY-MM-DDTHH:MMZ`. |
+| `ROLES` | Why the row is in the report: `A` = active (the snapshot currently driving the pods), `Q` = requested (`spec.runtime.revision`), `R` = reported (`status.pinnedRevisionName`), `H` = history (found by the label listing). |
+| `CHECK` | Internal consistency of the snapshot: `OK`, `BAD`, or `?`. |
+| `LIVE` | Content-hash relation to the current live runtime: `MATCH`, `DIFF`, `AMB` (short-hash collision), or `?`. On a drifted pin the active row shows `DIFF`. |
+| `ISSUES` | `R<n>/G<n>` — issue counts for this revision and for the report as a whole. The issue codes themselves appear only in `-o wide`. |
+
+The compact `REVISION` cell is display-only — a truncated `PREFIX#DIGEST` cannot be pasted into `spec.runtime.revision`. Use `-o wide` for full revision names, timestamps, content hashes, sources, and exact issue codes, or `-o json|yaml` for machine-readable output:
+
+```bash
+kubectl ome runtime history my-service -n team-a -o wide
+```
+
+The listing is bounded: at most two 500-item pages (1,000 revisions), with the `WINDOW` column reporting whether that window is complete or truncated. The pinned (`R`) and requested (`Q`) revisions are read directly by name, so they appear even when they have aged out of the listed window. The command is read-only and never prints raw runtime specs, ControllerRevision data, status messages, resource versions, or synchronization tokens.
 
 ## Garbage collection
 
