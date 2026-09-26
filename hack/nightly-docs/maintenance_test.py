@@ -27,6 +27,9 @@ class PolicyTests(unittest.TestCase):
         env = patch.dict(os.environ, {"GITHUB_REPOSITORY": "ome-projects/ome"})
         env.start()
         self.addCleanup(env.stop)
+        base = patch.object(m, 'current_base', return_value='a' * 40)
+        base.start()
+        self.addCleanup(base.stop)
 
     def test_identity_is_checked_independently_of_label(self):
         self.assertEqual(m.eligible(pull())[0], "a" * 40)
@@ -83,6 +86,17 @@ class PolicyTests(unittest.TestCase):
             m.decode_state([comment, comment])
         comment["user"]["login"] = "untrusted"
         self.assertEqual(m.decode_state([comment]), ({}, None))
+
+    def test_bot_skip_notice_is_not_a_repair_request(self):
+        comment = {'user': {'login': 'coderabbitai[bot]'},
+                   'body': '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n'
+                           '<!-- This is an auto-generated comment: skip review by coderabbit.ai -->\nReview skipped'}
+        self.assertFalse(m.substantive_comment(comment))
+        comment['user']['login'] = 'maintainer'
+        self.assertTrue(m.substantive_comment(comment))
+        comment['user']['login'] = 'coderabbitai[bot]'
+        comment['body'] = 'Fix this incorrect example'
+        self.assertTrue(m.substantive_comment(comment))
 
     def test_human_threads_are_never_resolved(self):
         bot = {"author": {"login": "claude[bot]"}, "body": "fix link"}
@@ -174,6 +188,18 @@ class PolicyTests(unittest.TestCase):
             m.merge(7, True)
         self.assertEqual(api.call_args.args, ('repos/ome-projects/ome/pulls/7/merge', 'PUT',
                                              {'sha': pr['head']['sha'], 'merge_method': 'squash'}))
+
+
+class FreshnessTests(unittest.TestCase):
+    def test_stale_pr_base_cannot_hide_a_main_update(self):
+        pr = pull()
+        ctx = {"number": 7, "head": pr['head']['sha'], "base": pr['base']['sha'],
+               "signature": m.signature(pr, {}), "extra_feedback": ""}
+        with patch.object(m, 'repo', return_value='ome-projects/ome'), \
+                patch.object(m, 'api', side_effect=[pr, {'object': {'sha': 'c' * 40}}]), \
+                patch.object(m, 'feedback', return_value=({}, {}, None)):
+            with self.assertRaisesRegex(ValueError, 'stale'):
+                m.live_match(ctx)
 
 
 class ExampleTests(unittest.TestCase):

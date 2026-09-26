@@ -37,6 +37,18 @@ def repo():
     return value
 
 
+def current_base():
+    """PR base.sha can lag branch updates; read the live main ref explicitly."""
+    return api(f"repos/{repo()}/git/ref/heads/main")["object"]["sha"]
+
+
+def get_pr(number):
+    """Keep PR identity metadata, but pin source freshness to the actual branch."""
+    pr = api(f"repos/{repo()}/pulls/{number}")
+    pr["base"]["sha"] = current_base()
+    return pr
+
+
 def eligible(pr):
     """Authenticate the original publisher, repository, branch and concern marker."""
     body = pr.get("body") or ""
@@ -69,6 +81,18 @@ def decode_state(comments):
     if type(state.get("attempts")) is not int or not 0 <= state["attempts"] <= MAX_ATTEMPTS:
         raise ValueError("Invalid maintenance attempt counter")
     return state, comment["id"]
+
+
+def substantive_comment(comment):
+    """Bookkeeping and bot skip notices are not new review feedback."""
+    author, body = comment["user"]["login"], comment["body"]
+    if author == "github-actions[bot]" and body.startswith(STATE):
+        return False
+    if (author == "coderabbitai[bot]"
+            and body.startswith("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
+                                "<!-- This is an auto-generated comment: skip review by coderabbit.ai -->")):
+        return False
+    return True
 
 
 def feedback(pr):
@@ -105,8 +129,7 @@ def feedback(pr):
                      if c["name"] != CHECK and c["conclusion"] in
                      {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}]
     details = {"comments": [{"id": c["id"], "author": c["user"]["login"], "body": c["body"]}
-                            for c in comments if not (c["user"]["login"] == "github-actions[bot]"
-                                                      and c["body"].startswith(STATE))],
+                            for c in comments if substantive_comment(c)],
                "reviews": [{"id": r["id"], "author": r["user"]["login"], "body": r["body"],
                             "state": r["state"], "commit": r["commit_id"]}
                            for r in reviews if r["body"] or r["state"] == "CHANGES_REQUESTED"],
@@ -171,8 +194,11 @@ def output(**values):
 
 def select(number, force, merge):
     """Reconcile all eligible PRs on each wake so replaced queued events are safe."""
-    prs = ([api(f"repos/{repo()}/pulls/{int(number)}")] if number else
+    prs = ([get_pr(int(number))] if number else
            docs.pages(f"repos/{repo()}/pulls?state=open&per_page=100"))
+    base = current_base()
+    for pr in prs:
+        pr["base"]["sha"] = base
     prs = list({pr["number"]: pr for pr in prs}.values())
 
     def candidate(pr):
@@ -244,7 +270,7 @@ def restore(ctx, bundle=None):
 def prepare(number, directory, apply, force):
     """Reserve one bounded attempt under the workflow's per-PR concurrency lock."""
     import maintenance_checks as checks
-    ctx = context(api(f"repos/{repo()}/pulls/{number}"))
+    ctx = context(get_pr(number))
     action = decision(ctx["state"], ctx["signature"], force)
     directory.mkdir(parents=True, exist_ok=True)
     ctx["action"] = action
@@ -264,7 +290,7 @@ def prepare(number, directory, apply, force):
 
 def live_match(ctx):
     """Reject stale writers rather than overwrite a new commit or ignore feedback."""
-    pr = api(f"repos/{repo()}/pulls/{ctx['number']}")
+    pr = get_pr(ctx['number'])
     eligible(pr)
     details, _, _ = feedback(pr)
     if (pr["head"]["sha"] != ctx["head"] or pr["base"]["sha"] != ctx["base"]
@@ -353,7 +379,7 @@ def finish(ctx, directory, apply):
         if head != ctx["head"]:
             expected_details["failed_checks"] = []
         if accepted:
-            current = api(f"repos/{repo()}/pulls/{ctx['number']}")
+            current = get_pr(ctx['number'])
             fresh, _, _ = feedback(current)
             original_threads = {t["id"]: t for t in ctx["feedback"]["threads"]}
             fresh_threads = {t["id"]: t for t in fresh["threads"]}
@@ -365,7 +391,7 @@ def finish(ctx, directory, apply):
                 expected_details["threads"] = [t for t in expected_details["threads"] if t["id"] != thread]
             for index, thread in enumerate(expected_details["threads"], 1):
                 thread["number"] = index
-        current = api(f"repos/{repo()}/pulls/{ctx['number']}")
+        current = get_pr(ctx['number'])
         details, _, _ = feedback(current)
         if current["head"]["sha"] != head or current["base"]["sha"] != ctx["base"]:
             raise ValueError("PR changed after publication; a fresh review is required")
@@ -386,7 +412,7 @@ def finish(ctx, directory, apply):
 
 def failure(ctx):
     """An interrupted model/build still consumes the reserved failed-round budget."""
-    current = api(f"repos/{repo()}/pulls/{ctx['number']}")
+    current = get_pr(ctx['number'])
     if current["state"] != "open":
         return
     state = {"phase": "needs-human" if ctx["attempts"] >= MAX_ATTEMPTS else "needs-repair",
@@ -427,7 +453,7 @@ def merge_blockers(pr, state, digest, info, checks):
 
 def merge(number, enabled):
     """Opt-in squash merge; no admin bypass, auto-approval, or policy mutations."""
-    pr = api(f"repos/{repo()}/pulls/{number}")
+    pr = get_pr(number)
     eligible(pr)
     details, state, _ = feedback(pr)
     digest = signature(pr, details, state.get("extra_feedback", ""))
@@ -442,7 +468,7 @@ def merge(number, enabled):
     if blockers:
         message = "Not merged: " + "; ".join(blockers)
     else:
-        latest = api(f"repos/{repo()}/pulls/{number}")
+        latest = get_pr(number)
         if latest["head"]["sha"] != pr["head"]["sha"] or latest["base"]["sha"] != pr["base"]["sha"]:
             raise ValueError("PR or main moved before merge")
         result = api(f"repos/{repo()}/pulls/{number}/merge", "PUT", {

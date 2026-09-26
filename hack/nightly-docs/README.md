@@ -149,6 +149,8 @@ Each activation does one repair round:
 
 1. Pin the PR head, current main and review feedback. Read unresolved threads,
    review/issue comments, failed CI check summaries and previous repair findings.
+   Read main's live Git ref because the PR API's `base.sha` can lag updates.
+   Ignore maintenance bookkeeping and CodeRabbit's informational skip notices.
    Overlay only the PR's Markdown on trusted main; changes to the same pages on
    main require human conflict resolution.
 2. A fresh **claude-fable-5**, `xhigh`, 120-turn worker fixes the original concern
