@@ -31,7 +31,8 @@ func newArtifactWithdrawalTest(t *testing.T, kind string) (*Gopher, *GopherTask,
 		var input hfArtifactTaskInput
 		g, task, input = newSharedEvictionTestModel(t)
 		path = input.ChildModelPath
-		withdraw = func() error { return g.prepareSharedEviction(ctx, task, input) }
+		g.guardSharedEvictionCleanup(task, &input)
+		withdraw = func() error { return input.prepareDeletionPhase(ctx) }
 	} else {
 		g, task, path = newEvictionTestModel(t)
 		withdraw = func() error { return g.evictDirectArtifact(ctx, task) }

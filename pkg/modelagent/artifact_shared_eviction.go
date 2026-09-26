@@ -149,11 +149,9 @@ func (s *Gopher) validateSharedEvictionCleanup(ctx context.Context, task *Gopher
 	return nil
 }
 
-// Called once per phase while both operation locks are held, including retries.
+// Called after phase-entry validation while both operation locks are held,
+// once per phase including retries.
 func (s *Gopher) prepareSharedEviction(ctx context.Context, task *GopherTask, input hfArtifactTaskInput) error {
-	if err := s.validateSharedEvictionCleanup(ctx, task, input); err != nil {
-		return err
-	}
 	key, uid := input.ChildModelKey, input.ChildModelUID
 	err := s.configMapReconciler.mutateConfigMapWithModelUID(ctx, key, uid, func(cm *corev1.ConfigMap) (bool, error) {
 		if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {

@@ -6,7 +6,31 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 )
+
+func TestSharedEvictionPhaseValidatesInitialReferencesOnce(t *testing.T) {
+	g, task, input := newSharedEvictionTestModel(t)
+	g.guardSharedEvictionCleanup(task, &input)
+	unlock, acquired, err := g.sharedHfArtifactHandler().tryArtifactOperation(input)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer unlock()
+	client := g.modelClient.(*omefake.Clientset)
+	client.ClearActions()
+
+	require.NoError(t, input.prepareDeletionPhase(context.Background()))
+
+	lists := map[string]int{}
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "list" {
+			lists[action.GetResource().Resource]++
+		}
+	}
+	require.Equal(t, map[string]int{"basemodels": 1, "clusterbasemodels": 1}, lists,
+		"phase entry validates references before readiness preparation")
+	require.Equal(t, ModelStatusEvicting, directArtifactEntry(t, g, task).Status)
+}
 
 func TestSharedCleanupPreparesOncePerLockedPhase(t *testing.T) {
 	for _, operation := range []string{"delete", "download", "repair"} {
