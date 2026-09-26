@@ -38,6 +38,7 @@ const (
 	Download         GopherTaskType = "Download"
 	DownloadOverride GopherTaskType = "DownloadOverride"
 	Delete           GopherTaskType = "Delete"
+	Evict            GopherTaskType = "Evict"
 )
 
 type GopherTask struct {

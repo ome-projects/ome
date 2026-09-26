@@ -20,6 +20,8 @@ const (
 	ModelStatusFailed ModelStatus = "Failed"
 	// ModelStatusDeleted indicates the model was deleted
 	ModelStatusDeleted ModelStatus = "Deleted"
+	// ModelStatusEvicted reports local cleanup complete; the Model CR remains.
+	ModelStatusEvicted ModelStatus = "Evicted"
 )
 
 // ConfigParsingAnnotation is the annotation key to skip config parsing
