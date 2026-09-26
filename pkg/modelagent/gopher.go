@@ -493,6 +493,10 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 		}
 	}
 	if task.TaskType == Evict {
+		if handled, waiting, err := s.processSharedArtifactEviction(ctx, task); handled {
+			keepDeleteBarrier = waiting
+			return err
+		}
 		if err := s.evictDirectArtifact(ctx, task); err != nil {
 			return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
 		}
