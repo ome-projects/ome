@@ -1,13 +1,195 @@
 package modelagent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/utils/storage"
-	"strings"
 )
+
+type directArtifactDownloadKey struct{}
+
+// A lock belongs to one execution attempt, never to a task copied into a queue.
+type directArtifactDownloadOperation struct {
+	path            string
+	release         func()
+	sharedCompleted bool
+	readOnly        bool
+	sharedReader    *hfArtifactTaskInput
+}
+
+func withDirectArtifactDownloadOperation(ctx context.Context) (context.Context, func()) {
+	op := &directArtifactDownloadOperation{}
+	return context.WithValue(ctx, directArtifactDownloadKey{}, op), func() {
+		if op.release != nil {
+			op.release()
+			op.release = nil
+		}
+	}
+}
+
+func directArtifactDownloadOperationFromContext(ctx context.Context) *directArtifactDownloadOperation {
+	op, _ := ctx.Value(directArtifactDownloadKey{}).(*directArtifactDownloadOperation)
+	return op
+}
+
+func (s *Gopher) hasSharedArtifactPublication(ctx context.Context, task *GopherTask) bool {
+	if op := directArtifactDownloadOperationFromContext(ctx); op != nil && op.sharedCompleted {
+		return true
+	}
+	if taskModelMeta(task) == nil {
+		return false
+	}
+	spec := taskModelSpec(task)
+	return spec.Storage != nil && spec.Storage.Path != nil && isSharedHfArtifactSymlink(*spec.Storage.Path)
+}
+
+func (s *Gopher) handoffOrdinaryArtifactOwner(ctx context.Context, task *GopherTask) error {
+	if s.configMapReconciler == nil {
+		return fmt.Errorf("artifact ownership requires a ConfigMap reconciler")
+	}
+	return s.configMapReconciler.handoffOrdinaryModelOwner(ctx,
+		getModelID(task.BaseModel, task.ClusterBaseModel), taskModelMeta(task).UID, func() error {
+			return s.validateArtifactDownload(ctx, task)
+		})
+}
+
+// Coordinate bounded ordinary writers through their final Ready publication.
+func (s *Gopher) acquireDirectArtifactDownload(ctx context.Context, task *GopherTask) (func(), bool, error) {
+	return s.acquireDirectArtifactOperation(ctx, task, false)
+}
+
+func (s *Gopher) acquireDirectArtifactOperation(ctx context.Context, task *GopherTask, readOnly bool) (func(), bool, error) {
+	noop := func() {}
+	if taskModelMeta(task) == nil {
+		return nil, false, fmt.Errorf("artifact operation requires a model")
+	}
+	// Legacy destinations still need a verified persisted-UID handoff, even
+	// though their files are outside canonical path ownership.
+	legacy := func() (func(), bool, error) {
+		if taskModelMeta(task).UID != "" && s.configMapReconciler != nil {
+			if err := s.handoffOrdinaryArtifactOwner(ctx, task); err != nil {
+				return nil, false, err
+			}
+		}
+		return noop, true, nil
+	}
+	path, err := s.directArtifactOperationPath(task, readOnly)
+	if err != nil {
+		return nil, false, err
+	}
+	if path == "" {
+		return legacy()
+	}
+	unlock, acquired, err := s.acquireDirectArtifactPathLock(path)
+	if err != nil || !acquired {
+		return nil, false, err
+	}
+	if !readOnly {
+		if err := s.validateDirectArtifactWritePath(task, path); err != nil {
+			unlock()
+			return nil, false, err
+		}
+	}
+	if err := s.validateArtifactDownload(ctx, task); err != nil {
+		unlock()
+		return nil, false, err
+	}
+	if err := s.handoffOrdinaryArtifactOwner(ctx, task); err != nil {
+		unlock()
+		return nil, false, err
+	}
+	if err := s.validateArtifactDownload(ctx, task); err != nil {
+		unlock()
+		return nil, false, err
+	}
+	if _, err := s.directArtifactPath(task); err != nil && !readOnly {
+		// An external ancestor alias can become dangling after a prior eviction.
+		// Create its validated managed destination while holding the family lock,
+		// so the ordinary source can subsequently write through the same alias.
+		// Existing leaf links are left for HF's guarded unlink/replacement.
+		_, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			err = os.MkdirAll(path, 0o755)
+		}
+		if err != nil {
+			unlock()
+			return nil, false, err
+		}
+	}
+	if op := directArtifactDownloadOperationFromContext(ctx); op != nil {
+		op.path, op.release, op.readOnly = path, unlock, readOnly
+		return noop, true, nil
+	}
+	return unlock, true, nil
+}
+
+func (s *Gopher) validateDirectArtifactPublication(ctx context.Context, task *GopherTask, path string) error {
+	if err := s.validateArtifactDownload(ctx, task); err != nil {
+		return err
+	}
+	held := directArtifactDownloadOperationFromContext(ctx)
+	current, err := s.directArtifactOperationPath(task, held != nil && held.readOnly)
+	if err != nil || current != path {
+		return fmt.Errorf("direct artifact path changed before Ready: %s (%v)", path, err)
+	}
+	if info, err := os.Lstat(path); err != nil || !info.IsDir() {
+		return fmt.Errorf("direct artifact is absent before Ready publication: %s (%v)", path, err)
+	}
+	cm, err := s.configMapReconciler.getConfigMap(ctx)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	key := getModelID(task.BaseModel, task.ClusterBaseModel)
+	if cm.Data[key] == "" {
+		return nil
+	}
+	entry, err := existingModelEntry(cm.Data, key)
+	if err != nil {
+		return err
+	}
+	if entry.ModelUID != "" && entry.ModelUID != taskModelMeta(task).UID {
+		return fmt.Errorf("direct artifact owner changed before Ready publication")
+	}
+	if entry.HfArtifactPendingDeletion != nil || entry.HfArtifactKey != "" || entry.DirectArtifactPendingEviction != nil || entry.Status == ModelStatusEvicted {
+		return fmt.Errorf("direct artifact cleanup interrupted Ready publication")
+	}
+	return nil
+}
+
+// Persist proof from a completed writer while its child lock is still held.
+// Metadata parsing is optional, so it cannot supply mandatory cleanup ownership.
+func (s *Gopher) persistDirectArtifactPath(ctx context.Context, task *GopherTask, path string) error {
+	key, uid := getModelID(task.BaseModel, task.ClusterBaseModel), taskModelMeta(task).UID
+	return s.configMapReconciler.mutateModelEntryWithRetry(ctx, key, uid, false, func(data map[string]string) (bool, error) {
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return false, err
+		}
+		entry := ModelEntry{Name: taskModelMeta(task).Name, ModelUID: uid}
+		if data[key] != "" {
+			var err error
+			entry, err = existingModelEntry(data, key)
+			if err != nil {
+				return false, err
+			}
+		}
+		if entry.HfArtifactKey != "" || entry.HfArtifactPendingDeletion != nil {
+			return false, fmt.Errorf("direct artifact acquired shared ownership before publication")
+		}
+		entry.ModelUID = uid
+		entry.DirectArtifactPath = path
+		return writeModelEntry(data, key, entry)
+	})
+}
 
 func (s *Gopher) directArtifactPath(task *GopherTask) (string, error) {
 	if task == nil || taskModelMeta(task) == nil || taskModelMeta(task).UID == "" {

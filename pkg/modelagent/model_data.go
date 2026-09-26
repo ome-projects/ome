@@ -92,6 +92,8 @@ type ModelEntry struct {
 	Config        *ModelConfig      `json:"config,omitempty"`        // Model configuration, may be nil if just tracking status
 	Progress      *DownloadProgress `json:"progress,omitempty"`      // Download progress, nil when not downloading
 	HfArtifactKey string            `json:"hfArtifactKey,omitempty"` // ConfigMap key of the shared HF artifact used by this model
+	// DirectArtifactPath is the canonical path published by a completed direct writer.
+	DirectArtifactPath string `json:"directArtifactPath,omitempty"`
 	// Pending cleanup survives reference removal until local and parent cleanup finish.
 	HfArtifactPendingDeletion     *HfArtifactPendingDeletion     `json:"hfArtifactPendingDeletion,omitempty"`
 	DirectArtifactPendingEviction *DirectArtifactPendingEviction `json:"directArtifactPendingEviction,omitempty"`

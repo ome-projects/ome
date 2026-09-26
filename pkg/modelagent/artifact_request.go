@@ -57,6 +57,31 @@ func artifactRestorationRequested(task *GopherTask) bool {
 	return meta != nil && meta.Annotations[constants.ModelArtifactRehydrationIDAnnotation] != ""
 }
 
+// Validate actual artifact work, not only the strict spelling that grants
+// deletion ownership. Live legacy Models also need empty-to-request fencing.
+func (s *Gopher) requiresArtifactRequestValidation(ctx context.Context, task *GopherTask) bool {
+	if artifactRestorationRequested(task) || s.hasSharedArtifactPublication(ctx, task) {
+		return true
+	}
+	meta := taskModelMeta(task)
+	if meta == nil || meta.UID == "" {
+		return false
+	}
+	spec := taskModelSpec(task)
+	if spec.Storage == nil || spec.Storage.StorageUri == nil {
+		return false
+	}
+	source, err := storage.GetStorageType(*spec.Storage.StorageUri)
+	if err != nil || source != storage.StorageTypeHuggingFace && source != storage.StorageTypeOCI && source != storage.StorageTypeLocal {
+		return false
+	}
+	if s.modelClient != nil {
+		return true
+	}
+	path, err := s.directArtifactOperationPath(task, source == storage.StorageTypeLocal)
+	return err != nil || path != ""
+}
+
 func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -86,6 +111,23 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 		}
 	}
 	return ctx.Err()
+}
+
+// Limit writer coordination to supported sources and owned paths.
+func (s *Gopher) isBoundedDirectArtifactTask(task *GopherTask) bool {
+	if task == nil || taskModelMeta(task) == nil {
+		return false
+	}
+	spec := taskModelSpec(task)
+	if spec.Storage == nil || spec.Storage.StorageUri == nil {
+		return false
+	}
+	source, err := storage.GetStorageType(*spec.Storage.StorageUri)
+	if err != nil || (source != storage.StorageTypeOCI && source != storage.StorageTypeHuggingFace) {
+		return false
+	}
+	_, err = s.directArtifactPath(task)
+	return err == nil
 }
 
 // Read live ownership and download inputs before writing or publishing.
