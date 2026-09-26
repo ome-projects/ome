@@ -9,7 +9,6 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -165,66 +164,6 @@ func (s *Gopher) hfArtifactIsCurrentChildUID(input hfArtifactTaskInput) (bool, e
 		return false, err
 	}
 	return model.UID == input.ChildModelUID, nil
-}
-
-func (s *Gopher) hfArtifactHasOtherPathUsers(input hfArtifactTaskInput) (bool, error) {
-	namespace, name, cluster, valid := constants.ParseModelInfoFromConfigMapKey(input.ChildModelKey)
-	if !valid {
-		return false, fmt.Errorf("invalid shared artifact child key %q", input.ChildModelKey)
-	}
-	root, err := canonicalHfArtifactStoreRoot(input.ModelStoreRoot)
-	if err != nil {
-		return false, err
-	}
-	childPath, err := hfArtifactPathInRoot(input.ChildModelPath, input.ModelStoreRoot, root)
-	if err != nil {
-		return false, err
-	}
-	// CR paths need not use the canonical spelling stored in the parent index.
-	// Compare under the same root without following the child symlink itself.
-	matches := func(storage *v1beta1.StorageSpec) bool {
-		if storage == nil || storage.Path == nil || *storage.Path == "" {
-			return false
-		}
-		path, err := hfArtifactPathInRoot(filepath.Clean(*storage.Path), input.ModelStoreRoot, root)
-		return err == nil && path == childPath
-	}
-	if s.baseModelLister == nil || s.clusterBaseModelLister == nil {
-		return false, fmt.Errorf("model listers are unavailable for shared artifact cleanup")
-	}
-	models, err := s.baseModelLister.List(labels.Everything())
-	if err != nil {
-		return false, err
-	}
-	for _, model := range models {
-		if !cluster && model.Namespace == namespace && model.Name == name {
-			continue
-		}
-		// Deleting CRs are not future consumers. Persisted child references
-		// still protect their paths until cleanup removes those references.
-		if model.DeletionTimestamp != nil && !strings.EqualFold(model.Labels[constants.ReserveModelArtifact], "true") {
-			continue
-		}
-		if matches(model.Spec.Storage) {
-			return true, nil
-		}
-	}
-	clusterModels, err := s.clusterBaseModelLister.List(labels.Everything())
-	if err != nil {
-		return false, err
-	}
-	for _, model := range clusterModels {
-		if cluster && model.Name == name {
-			continue
-		}
-		if model.DeletionTimestamp != nil && !strings.EqualFold(model.Labels[constants.ReserveModelArtifact], "true") {
-			continue
-		}
-		if matches(model.Spec.Storage) {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // lockHfChildStatus prevents ordinary task progress from publishing Ready or
