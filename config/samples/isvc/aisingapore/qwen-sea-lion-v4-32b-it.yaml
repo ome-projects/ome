@@ -1,0 +1,16 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen-sea-lion-v4-32b-it
+  namespace: qwen-sea-lion-v4-32b-it
+spec:
+  model:
+    name: qwen-sea-lion-v4-32b-it
+  runtime:
+    name: vllm-qwen-sea-lion-v4-32b-it
+  engine:
+    minReplicas: 1
+    maxReplicas: 1
+  router:
+    minReplicas: 1
+    maxReplicas: 1
