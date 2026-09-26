@@ -66,6 +66,8 @@ and may increase model cost; the 100-PR ceiling is not a daily output target.
 Publisher overlap checks batch open-PR file lists with GraphQL and fall back to
 fully paginated REST for PRs changing more than 100 files.
 
+Models select numbered entries from a trusted per-scan commit index; the
+workflow resolves them to full source SHAs, avoiding hash transcription errors.
 Each scan reports inspected source commits and remaining work. These are model
 self-reports, not a tool-level audit; inspecting a commit subject does not count.
 The `nightly-docs-discovery-report` artifact (14-day retention) contains every

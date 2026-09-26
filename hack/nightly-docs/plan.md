@@ -23,9 +23,12 @@ while other promising candidates remain unexamined. Aim for broad coverage,
 not a quota of PRs; never invent gaps or lower accuracy to fill the cap.
 Finish evidence gathering within 80 turns and reserve the remaining budget for
 the structured plan. Return an empty concerns list when no supported gaps remain.
-Also return inspected_commits: distinct full SHAs whose source diff AND current
+Every code_history line begins with an integer commit ID, then its full SHA.
+Use the integer ID for source_commit and inspected_commits; the workflow owns
+resolving IDs to exact hashes. Never retype a SHA in a structured source field.
+Also return inspected_commits: distinct commit IDs whose source diff AND current
 implementation/docs you actually examined (reading a commit subject is not an
-inspection). Every concern's source_sha must be in that list. Return remaining_work
+inspection). Every concern's source_commit must be in that list. Return remaining_work
 as a concise description of unexamined candidates and why you stopped, or state
 that the supplied candidates have been exhausted. This is a self-reported
 coverage measure, not proof of an exhaustive audit.
@@ -38,7 +41,7 @@ ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
 - Bad: "Update InferenceService docs for rollout, routing, and autoscaling."
 - area is a stable subsystem slug; concern is a stable, narrowly descriptive
   slug for the behavior, without a date. Preserve existing slugs for the same gap.
-- source_sha must be a full SHA from the supplied code-change history. Confirm
+- source_commit must be an integer ID from the supplied code-change history. Confirm
   that the behavior still exists on the current default branch.
 - title must be a nonempty printable single line, at most 120 characters
   including the `[Docs] ` prefix. Include that prefix in every title.

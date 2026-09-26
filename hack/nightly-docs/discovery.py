@@ -44,6 +44,28 @@ def partition(context):
             for slug, _, _ in SHARDS}
 
 
+def resolve_scan(raw, history):
+    """Resolve small model-selected IDs through the trusted source index."""
+    result = json.loads(raw)
+    commits = [line.split()[0] for line in history]
+
+    def resolve(number):
+        if type(number) is not int or number < 1 or number > len(commits):
+            raise ValueError("Source commit ID is outside this scan's index")
+        return commits[number - 1]
+
+    concerns = []
+    for proposal in result["concerns"]:
+        item = dict(proposal)
+        if "source_sha" in item:
+            raise ValueError("The model must select a commit ID, not supply a hash")
+        item["source_sha"] = resolve(item.pop("source_commit"))
+        concerns.append(item)
+    return json.dumps({"concerns": concerns,
+                       "inspected_commits": [resolve(number) for number in result["inspected_commits"]],
+                       "remaining_work": result["remaining_work"]})
+
+
 def validate_scan(raw, context, slug, history):
     result = json.loads(raw)
     inspected = result["inspected_commits"]
@@ -120,13 +142,15 @@ def main():
         slug = os.environ["SHARD"]
         assignments = json.loads((root / "assignments.json").read_text())
         focus = next(focus for name, focus, _ in SHARDS if name == slug)
-        context.update(code_history=assignments[slug], shard=slug, focus=focus,
+        context.update(code_history=[f"{i}: {line}" for i, line in enumerate(assignments[slug], 1)],
+                       shard=slug, focus=focus,
                        scan_responsibilities={name: focus for name, focus, _ in SHARDS})
         Path(os.environ["NIGHTLY_CONTEXT"]).write_text(json.dumps(context, indent=2))
     elif command == "scan":
         slug = os.environ["SHARD"]
         assignments = json.loads((root / "assignments.json").read_text())
-        scan = validate_scan(os.environ["PLAN_JSON"], context, slug, assignments[slug])
+        raw = resolve_scan(os.environ["PLAN_JSON"], assignments[slug])
+        scan = validate_scan(raw, context, slug, assignments[slug])
         Path(os.environ["SCAN_OUTPUT"]).write_text(json.dumps(scan))
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
             summary.write(f"{slug}: {len(assignments[slug])} eligible commits; "

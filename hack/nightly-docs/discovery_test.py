@@ -20,6 +20,25 @@ class DiscoveryTests(unittest.TestCase):
         with patch.object(discovery, 'partition', return_value=self.assignments):
             return discovery.combine(self.scans, self.context)
 
+    def test_model_commit_ids_resolve_to_exact_trusted_hashes(self):
+        item = proposal()
+        del item['source_sha']
+        item['source_commit'] = 2
+        raw = json.dumps({'concerns': [item], 'inspected_commits': [2], 'remaining_work': 'Done'})
+        resolved = json.loads(discovery.resolve_scan(raw, self.history))
+        self.assertEqual(resolved['concerns'][0]['source_sha'], 'b' * 40)
+        self.assertEqual(resolved['inspected_commits'], ['b' * 40])
+        self.assertNotIn('source_commit', resolved['concerns'][0])
+
+    def test_invalid_commit_ids_and_model_supplied_hashes_fail_closed(self):
+        for number in [0, -1, 3, '1', True, 1.0]:
+            with self.subTest(number=number), self.assertRaises(ValueError):
+                discovery.resolve_scan(json.dumps({'concerns': [], 'inspected_commits': [number],
+                                                   'remaining_work': 'Done'}), self.history)
+        with self.assertRaisesRegex(ValueError, 'not supply a hash'):
+            discovery.resolve_scan(json.dumps({'concerns': [proposal(source_commit=1)],
+                                               'inspected_commits': [1], 'remaining_work': 'Done'}), self.history)
+
     def test_partition_keeps_unmatched_history_and_order(self):
         with patch.object(docs, 'git', side_effect=['a' * 40] + [''] * 7):
             result = discovery.partition(self.context)

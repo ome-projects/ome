@@ -121,7 +121,7 @@ jobs:
             --max-turns 100
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_sha":{"type":"string"},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["area","concern","source_sha","title","question","evidence","doc_paths"]}},"inspected_commits":{"type":"array","items":{"type":"string"}},"remaining_work":{"type":"string"}},"required":["concerns","inspected_commits","remaining_work"]}'
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_commit":{"type":"integer","minimum":1},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["area","concern","source_commit","title","question","evidence","doc_paths"]}},"inspected_commits":{"type":"array","items":{"type":"integer","minimum":1}},"remaining_work":{"type":"string"}},"required":["concerns","inspected_commits","remaining_work"]}'
       - name: Validate and record scan coverage
         env:
           PLAN_JSON: ${{ steps.discover.outputs.structured_output }}
