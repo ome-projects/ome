@@ -12,6 +12,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 	"go.uber.org/zap"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/logging"
@@ -63,6 +65,8 @@ type Gopher struct {
 	modelVerificationLimiter *verificationLimiter
 	modelRootDir             string
 	xetConfig                *xet.Config
+	nodeUID                  types.UID // Pinned at startup; never adopt a replacement Node.
+	modelClient              omeclient.Interface
 	kubeClient               kubernetes.Interface
 	gopherChan               chan *GopherTask
 	nodeLabelReconciler      *NodeLabelReconciler
@@ -121,6 +125,7 @@ func NewGopher(
 	logger *zap.SugaredLogger,
 	baseModelLister omev1beta1lister.BaseModelLister,
 	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister,
+	modelClient omeclient.Interface,
 	options ...GopherOption) (*Gopher, error) {
 
 	if xetConfig == nil {
@@ -128,6 +133,21 @@ func NewGopher(
 	}
 	if samePathWaitTimeout <= 0 {
 		samePathWaitTimeout = defaultSamePathWaitTimeout
+	}
+	node, err := kubeClient.CoreV1().Nodes().Get(context.Background(), configMapReconciler.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("pin model-agent node identity: %w", err)
+	}
+	if node.UID == "" {
+		return nil, fmt.Errorf("model-agent node identity is empty")
+	}
+	// Bind all label operations, including eviction and repair withdrawals,
+	// before any workers start. Never refresh this pin from a later Node GET.
+	if nodeLabelReconciler != nil {
+		if nodeLabelReconciler.nodeUID != "" && nodeLabelReconciler.nodeUID != node.UID {
+			return nil, fmt.Errorf("node label reconciler is bound to another node identity")
+		}
+		nodeLabelReconciler.nodeUID = node.UID
 	}
 
 	gopher := &Gopher{
@@ -139,6 +159,8 @@ func NewGopher(
 		modelVerificationLimiter: newVerificationLimiter(1),
 		modelRootDir:             modelRootDir,
 		xetConfig:                xetConfig,
+		nodeUID:                  node.UID,
+		modelClient:              modelClient,
 		kubeClient:               kubeClient,
 		gopherChan:               gopherChan,
 		nodeLabelReconciler:      nodeLabelReconciler,

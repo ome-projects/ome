@@ -284,6 +284,7 @@ func initializeComponents(
 		logger,
 		baseModelInformer.Lister(),
 		clusterBaseModelInformer.Lister(),
+		omeClient,
 		modelagent.WithModelVerificationConcurrency(cfg.effectiveVerificationConcurrency()),
 	)
 	if err != nil {
