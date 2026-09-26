@@ -129,7 +129,7 @@ func sharedEvictionEntry(data map[string]string, task *GopherTask, input hfArtif
 }
 
 func (s *Gopher) validateSharedEvictionCleanup(ctx context.Context, task *GopherTask, input hfArtifactTaskInput) error {
-	if err := s.validateDirectEvictionRequest(ctx, task); err != nil {
+	if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 		return err
 	}
 	cm, err := s.configMapReconciler.getConfigMap(ctx)
@@ -156,7 +156,7 @@ func (s *Gopher) prepareSharedEviction(ctx context.Context, task *GopherTask, in
 	}
 	key, uid := input.ChildModelKey, input.ChildModelUID
 	err := s.configMapReconciler.mutateConfigMapWithModelUID(ctx, key, uid, func(cm *corev1.ConfigMap) (bool, error) {
-		if err := s.validateDirectEvictionRequest(ctx, task); err != nil {
+		if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 			return false, err
 		}
 		entry, err := sharedEvictionEntry(cm.Data, task, input)
@@ -173,7 +173,7 @@ func (s *Gopher) prepareSharedEviction(ctx context.Context, task *GopherTask, in
 		return fmt.Errorf("eviction requires node readiness reconciliation")
 	}
 	op := &NodeLabelOp{ModelStateOnNode: Deleted, BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel}
-	op.validateCurrent = func() error { return s.validateDirectEvictionRequest(ctx, task) }
+	op.validateCurrent = func() error { return s.validateArtifactCleanupRequest(ctx, task) }
 	return s.nodeLabelReconciler.WithdrawReadiness(ctx, op)
 }
 
@@ -184,7 +184,7 @@ func (s *Gopher) guardSharedEvictionCleanup(task *GopherTask, input *hfArtifactT
 		return s.finishSharedEviction(ctx, task, *input, pending)
 	}
 	input.pathReferenced = func(ctx context.Context, path string) (bool, error) {
-		if err := s.validateDirectEvictionRequest(ctx, task); err != nil {
+		if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 			return false, err
 		}
 		cm, err := s.configMapReconciler.getConfigMap(ctx)

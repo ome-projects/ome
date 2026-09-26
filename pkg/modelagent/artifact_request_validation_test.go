@@ -2,11 +2,14 @@ package modelagent
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
@@ -75,6 +78,42 @@ func TestArtifactRequestRequiresCurrentNodeAndValidMarker(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestArtifactCleanupDeleteRequiresOriginalModelUID(t *testing.T) {
+	for _, state := range []string{"absent", "same UID", "replacement UID", "API error"} {
+		t.Run(state, func(t *testing.T) {
+			g, task, input := newSharedEvictionTestModel(t)
+			task.TaskType = Delete
+			apiErr := errors.New("model lookup unavailable")
+			switch state {
+			case "absent":
+				g.modelClient = omefake.NewSimpleClientset()
+			case "replacement UID":
+				latest := task.BaseModel.DeepCopy()
+				latest.UID = "replacement"
+				g.modelClient = omefake.NewSimpleClientset(latest)
+			case "API error":
+				g.modelClient.(*omefake.Clientset).PrependReactor("get", "basemodels", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apiErr
+				})
+			}
+			for _, validate := range []func() error{
+				func() error { return g.validateArtifactCleanupRequest(context.Background(), task) },
+				func() error { return g.validateSharedCleanupOwnership(context.Background(), task, input) },
+			} {
+				err := validate()
+				switch state {
+				case "absent", "same UID":
+					require.NoError(t, err)
+				case "replacement UID":
+					require.Error(t, err)
+				case "API error":
+					require.ErrorIs(t, err, apiErr)
+				}
 			}
 		})
 	}

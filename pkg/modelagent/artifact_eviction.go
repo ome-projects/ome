@@ -69,7 +69,7 @@ func (s *Gopher) cleanupDirectArtifact(ctx context.Context, task *GopherTask, pa
 	// Status publication uses the same in-process lock as ordinary writers.
 	s.configMapMutex.Lock()
 	defer s.configMapMutex.Unlock()
-	validate := func() error { return s.validateDirectEvictionRequest(ctx, task) }
+	validate := func() error { return s.validateArtifactCleanupRequest(ctx, task) }
 	state := Deleted
 	if restoration != nil {
 		validate = func() error { return s.validateArtifactDownload(ctx, task) }
@@ -205,7 +205,7 @@ func (s *Gopher) removeCompletedDirectEviction(ctx context.Context, task *Gopher
 	c.configMapMutationMutex.Lock()
 	defer c.configMapMutationMutex.Unlock()
 	err := c.mutateConfigMapWithModelUIDLocked(ctx, key, uid, func(cm *corev1.ConfigMap) (bool, error) {
-		if err := s.validateDirectEvictionRequest(ctx, task); err != nil {
+		if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 			return false, err
 		}
 		if cm.Data[key] == "" {
@@ -237,7 +237,7 @@ func (s *Gopher) removeCompletedDirectEviction(ctx context.Context, task *Gopher
 	return nil
 }
 
-func (s *Gopher) validateDirectEvictionRequest(ctx context.Context, task *GopherTask) error {
+func (s *Gopher) validateArtifactCleanupRequest(ctx context.Context, task *GopherTask) error {
 	if task.TaskType != Delete {
 		return s.validateArtifactDownload(ctx, task)
 	}
@@ -245,7 +245,7 @@ func (s *Gopher) validateDirectEvictionRequest(ctx context.Context, task *Gopher
 		return err
 	}
 	if s.modelClient == nil {
-		return fmt.Errorf("eviction cleanup requires a live model client")
+		return fmt.Errorf("artifact cleanup requires a live model client")
 	}
 	var latest metav1.Object
 	var err error
@@ -262,13 +262,13 @@ func (s *Gopher) validateDirectEvictionRequest(ctx context.Context, task *Gopher
 	}
 	// Placement loss also queues Delete while the same Model remains live.
 	if latest.GetUID() != taskModelMeta(task).UID {
-		return fmt.Errorf("eviction cleanup requires the matching Model UID")
+		return fmt.Errorf("artifact cleanup requires the matching Model UID")
 	}
 	return nil
 }
 
 func (s *Gopher) validateDirectEviction(ctx context.Context, task *GopherTask, path string) error {
-	if err := s.validateDirectEvictionRequest(ctx, task); err != nil {
+	if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 		return err
 	}
 	if task.TaskType != Delete {
@@ -406,7 +406,7 @@ func directEvictionEntry(data map[string]string, task *GopherTask, path string) 
 func (s *Gopher) persistDirectEviction(ctx context.Context, task *GopherTask, path string, complete bool) error {
 	key, uid := getModelID(task.BaseModel, task.ClusterBaseModel), taskModelMeta(task).UID
 	return s.configMapReconciler.mutateConfigMapWithModelUID(ctx, key, uid, func(cm *corev1.ConfigMap) (bool, error) {
-		if err := s.validateDirectEvictionRequest(ctx, task); err != nil {
+		if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 			return false, err
 		}
 		entry, err := directEvictionEntry(cm.Data, task, path)

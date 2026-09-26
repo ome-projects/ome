@@ -3,9 +3,6 @@ package modelagent
 import (
 	"context"
 	"fmt"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Receipts retain file ownership independently of task kind or transient model
@@ -54,23 +51,7 @@ func (s *Gopher) validateSharedCleanupOwnership(ctx context.Context, task *Gophe
 	if taskModelMeta(task) == nil || taskModelMeta(task).UID == "" || s.modelClient == nil {
 		return fmt.Errorf("shared cleanup requires a live model UID")
 	}
-	if task.TaskType == Delete {
-		// Ordinary Delete retains its existing semantics: an absent Model or
-		// the same live UID may release its recorded files, never a replacement.
-		var latest metav1.Object
-		var err error
-		if task.BaseModel != nil {
-			latest, err = s.modelClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Get(ctx, task.BaseModel.Name, metav1.GetOptions{})
-		} else {
-			latest, err = s.modelClient.OmeV1beta1().ClusterBaseModels().Get(ctx, task.ClusterBaseModel.Name, metav1.GetOptions{})
-		}
-		if err != nil && !apierrors.IsNotFound(err) {
-			return err
-		}
-		if err == nil && latest.GetUID() != taskModelMeta(task).UID {
-			return fmt.Errorf("shared cleanup Model UID changed")
-		}
-	} else if err := s.validateArtifactDownload(ctx, task); err != nil {
+	if err := s.validateArtifactCleanupRequest(ctx, task); err != nil {
 		return err
 	}
 	cm, err := s.configMapReconciler.getConfigMap(ctx)
