@@ -69,7 +69,10 @@ The command refuses to patch unless the service is an eligible pin right now:
 - `spec.runtime.autoSync` is `false` and `status.pinnedRevisionName` resolves to a consistent snapshot;
 - drift is actually reported: `RuntimeDrifted` is `True` with reason `RevisionMismatch` (a missing source runtime or missing revision is not eligible);
 - `spec.runtime.revision` is not set — an explicit rollback pin is never advanced;
+- the runtime's **merged** spec is enabled, and none of the snapshots the command reads — the pinned revision, the retained history, and the predicted target — stores a disabled spec;
 - no earlier sync token is still pending, and there is no in-flight rollout/canary-rollback, held-revision, or pending replica work.
+
+Disabled *ancestors* do not make the pin ineligible. Because eligibility is checked on the merged spec, a runtime that [inherits](/ome/docs/concepts/runtime_inheritance) from a disabled profile — the `ome.io/runtime-profile` pattern requires `spec.disabled: true` on the profile — can still roll forward; the disabled profiles are captured, identity and content, into the safety snapshot rather than refused. The leaf runtime must set `spec.disabled: false` explicitly: `disabled` merges like any other scalar, so a leaf that leaves it unset inherits `true` and the sync refuses a disabled effective runtime.
 
 It prints a preview on stderr (pinned and live runtime hashes, the predicted new revision name, sources) and asks for confirmation; pass `--yes` to skip the prompt. `--dry-run=client` runs every check locally and sends nothing; `--dry-run=server` submits the patch with `dryRun=All` so the API server validates it without persisting. Snapshot history is read from the OME control-plane namespace (`--ome-namespace`, default `ome`).
 
