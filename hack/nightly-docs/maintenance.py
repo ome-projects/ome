@@ -202,6 +202,9 @@ def select(number, force, merge):
     prs = list({pr["number"]: pr for pr in prs}.values())
 
     def candidate(pr):
+        if pr['state'] != 'open':
+            print(f"Skipping closed PR #{pr['number']}")
+            return None
         try:
             eligible(pr)
         except ValueError:

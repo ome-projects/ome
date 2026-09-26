@@ -69,6 +69,14 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(len(selected), 100)
         self.assertEqual(selected[0], {'number': 101})
 
+    def test_closed_pr_dispatch_is_a_noop(self):
+        pr = {**pull(), 'state': 'closed'}
+        with patch.object(m, 'get_pr', return_value=pr), \
+                patch.object(m, 'feedback') as feedback, patch.object(m, 'output') as output:
+            m.select(7, False, False)
+        feedback.assert_not_called()
+        self.assertEqual(output.call_args.kwargs, {'matrix': {'include': []}, 'count': '0'})
+
     def test_cache_pins_head_base_and_feedback(self):
         pr = pull()
         original = m.signature(pr, {"threads": []})
