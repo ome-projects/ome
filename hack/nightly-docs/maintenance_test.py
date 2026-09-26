@@ -51,6 +51,21 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(m.decision(state, "old"), "cached")
         self.assertEqual(m.decision(state, "new-feedback"), "work")
 
+    def test_waiting_approvals_cannot_starve_repairs(self):
+        prs = [{**pull(), "number": number} for number in range(1, 102)]
+
+        def feedback(pr):
+            state = {"phase": "ready", "signature": "same", "attempts": 0} if pr['number'] <= 100 else {}
+            return {}, state, None
+
+        with patch.object(m.docs, 'pages', return_value=prs), \
+                patch.object(m, 'feedback', side_effect=feedback), \
+                patch.object(m, 'signature', return_value='same'), patch.object(m, 'output') as output:
+            m.select(0, False, True)
+        selected = output.call_args.kwargs['matrix']['include']
+        self.assertEqual(len(selected), 100)
+        self.assertEqual(selected[0], {'number': 101})
+
     def test_cache_pins_head_base_and_feedback(self):
         pr = pull()
         original = m.signature(pr, {"threads": []})
@@ -121,6 +136,26 @@ class PolicyTests(unittest.TestCase):
             m.merge(7, False)
             self.assertEqual(api.call_count, 1)
             self.assertEqual(api.call_args.args, ('repos/ome-projects/ome/pulls/7',))
+
+    def test_feedback_arriving_during_publication_is_not_marked_reviewed(self):
+        original = {"threads": [], "comments": [], "failed_checks": []}
+        fresh = {**original, "comments": [{"body": "New concern after publication"}]}
+        pr = pull()
+        ctx = {"number": 7, "head": "old", "base": pr['base']['sha'], "feedback": original,
+               "attempts": 1, "extra_feedback": "", "run_url": "https://example.test/run"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'checks.json').write_text('[]')
+            with patch.dict(os.environ, {"BUILD_OK": "true", "CHECKS_OK": "true",
+                    "REVIEW_JSON": json.dumps({"accurate": True, "single_concern": True, "reason": "Verified"}),
+                    "GITHUB_STEP_SUMMARY": str(root / 'summary')}), \
+                    patch.object(m, 'live_match'), patch.object(m, 'publish_repair', return_value=pr['head']['sha']), \
+                    patch.object(m, 'record_check'), patch.object(m, 'api', return_value=pr), \
+                    patch.object(m, 'feedback', return_value=(fresh, {}, None)), \
+                    patch.object(m, 'save_state') as save:
+                m.finish(ctx, root, True)
+            state = save.call_args.args[1]
+            self.assertEqual(m.decision(state, m.signature(pr, fresh)), 'work')
 
 
 class ExampleTests(unittest.TestCase):

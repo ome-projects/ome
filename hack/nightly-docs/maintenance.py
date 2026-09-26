@@ -187,13 +187,14 @@ def select(number, force, merge):
         action = decision(state, signature(pr, details, extra), force)
         if action == "needs-human" or (action == "cached" and not merge):
             return None
-        return {"number": pr["number"]}
+        return {"number": pr["number"], "priority": 0 if action == "work" else 1}
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         selected = [item for item in pool.map(candidate, prs) if item is not None]
-    # Oldest PRs first; 100 is the existing creation cap, not a file limit.
-    selected.sort(key=lambda item: item["number"])
-    selected = selected[:100]
+    # Repairs precede cached merge checks so older PRs waiting for approval do
+    # not indefinitely occupy all 100 slots. Oldest first within each class.
+    selected.sort(key=lambda item: (item["priority"], item["number"]))
+    selected = [{"number": item["number"]} for item in selected[:100]]
     output(matrix={"include": selected}, count=str(len(selected)))
 
 
