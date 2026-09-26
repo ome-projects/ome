@@ -1,0 +1,325 @@
+name: Maintain One Documentation PR
+
+on:
+  workflow_call:
+    inputs:
+      number:
+        type: number
+        required: true
+      apply:
+        type: boolean
+        default: false
+      force:
+        type: boolean
+        default: false
+      feedback:
+        type: string
+        default: ''
+
+concurrency:
+  group: docs-pr-maintenance-${{ inputs.number }}
+  cancel-in-progress: false
+
+env:
+  PR_NUMBER: ${{ inputs.number }}
+  APPLY: ${{ inputs.apply }}
+  FORCE: ${{ inputs.force }}
+  EXTRA_FEEDBACK: ${{ inputs.feedback }}
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  prepare:
+    runs-on: ome-runner-cpu
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    outputs:
+      work: ${{ steps.prepare.outputs.work }}
+      cached: ${{ steps.prepare.outputs.cached }}
+      base: ${{ steps.prepare.outputs.base }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          export-api-key: 'false'
+          source-sha: ${{ github.sha }}
+      - name: Install pinned validation dependencies
+        run: python3 -m pip install -r "$RUNNER_TEMP/nightly-docs-tools/maintenance-requirements.txt"
+      - name: Pin PR, main, feedback and retry budget
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" prepare
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-maintenance-context-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance/context.json
+          retention-days: 14
+          if-no-files-found: error
+
+  repair:
+    needs: prepare
+    if: needs.prepare.outputs.work == 'true'
+    runs-on: ome-runner-cpu
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ needs.prepare.outputs.base }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: docs-maintenance-context-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+      - name: Overlay PR documentation onto trusted current main
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" restore
+      - name: Repair this concern from feedback and current implementation
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: >-
+            Read and follow ${{ runner.temp }}/nightly-docs-tools/maintenance-write.md.
+            The maintenance context is ${{ runner.temp }}/docs-maintenance/context.json.
+          claude_args: >-
+            --model claude-fable-5
+            --effort xhigh
+            --max-turns 120
+            --tools "Read,Glob,Grep,Edit,Write"
+            --allowedTools "Read,Glob,Grep,Edit,Write"
+      - name: Export documentation data only
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" export
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-maintenance-draft-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance/bundle.json
+          retention-days: 14
+          if-no-files-found: error
+
+  review:
+    needs: [prepare, repair]
+    if: needs.prepare.outputs.work == 'true'
+    runs-on: ome-runner-cpu
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          source-sha: ${{ needs.prepare.outputs.base }}
+      - name: Install pinned validation dependencies
+        run: python3 -m pip install -r "$RUNNER_TEMP/nightly-docs-tools/maintenance-requirements.txt"
+      - uses: actions/download-artifact@v5
+        with:
+          name: docs-maintenance-context-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+      - uses: actions/download-artifact@v5
+        with:
+          name: docs-maintenance-draft-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+      - name: Import with pristine scope and total-PR size guards
+        id: scope
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" import
+      - name: Validate complete OME examples and link prefixes
+        id: examples
+        continue-on-error: true
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" check
+      - name: Independently verify the complete concern and feedback fixes
+        id: review
+        if: steps.examples.outcome == 'success' && steps.scope.outputs.changed == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: >-
+            Read and follow ${{ runner.temp }}/nightly-docs-tools/maintenance-review.md.
+            The context is ${{ runner.temp }}/docs-maintenance/context.json.
+            Review ${{ runner.temp }}/docs-maintenance/full-pr.patch and checks.json in that directory.
+          claude_args: >-
+            --model claude-fable-5
+            --effort xhigh
+            --max-turns 120
+            --tools "Read,Glob,Grep"
+            --allowedTools "Read,Glob,Grep"
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"},"addressed_threads":{"type":"array","uniqueItems":true,"items":{"type":"integer","minimum":1}}},"required":["single_concern","accurate","reason","addressed_threads"]}'
+      - name: Validate and save the independent verdict
+        env:
+          REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" review-export
+      - name: Check artifact data for credentials
+        id: scan
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" scan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-maintenance-review-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+          retention-days: 14
+          if-no-files-found: error
+
+  validate-publish:
+    needs: [prepare, review]
+    if: needs.prepare.outputs.work == 'true'
+    runs-on: ome-runner-cpu
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          export-api-key: 'false'
+          source-sha: ${{ needs.prepare.outputs.base }}
+      - name: Install pinned validation dependencies
+        run: python3 -m pip install -r "$RUNNER_TEMP/nightly-docs-tools/maintenance-requirements.txt"
+      - uses: actions/download-artifact@v5
+        with:
+          name: docs-maintenance-review-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+      - name: Revalidate the reviewed documentation bundle
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" import
+      - name: Require the independent accuracy and scope verdict
+        id: verdict
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" review-gate
+      - name: Revalidate complete examples before publication
+        id: examples
+        continue-on-error: true
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" check
+      - uses: actions/setup-go@v6
+        if: steps.verdict.outputs.accepted == 'true' && steps.examples.outcome == 'success'
+        with:
+          go-version: '1.26'
+          cache-dependency-path: hack/internal/tools/go.sum
+      - name: Refresh only unrelated new documentation on main
+        if: steps.verdict.outputs.accepted == 'true' && steps.examples.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" refresh
+      - uses: actions/setup-node@v6
+        if: steps.verdict.outputs.accepted == 'true' && steps.examples.outcome == 'success'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Build production documentation from the trusted base
+        id: build
+        if: steps.verdict.outputs.accepted == 'true' && steps.examples.outcome == 'success'
+        continue-on-error: true
+        env:
+          HUGO_ENVIRONMENT: production
+          HUGO_BASEURL: https://ome-projects.github.io/ome/
+        run: |
+          python3 "$RUNNER_TEMP/nightly-docs-tools/install_hugo.py" "$RUNNER_TEMP/nightly-docs-bin"
+          python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" site "$RUNNER_TEMP/maintenance-site" "$RUNNER_TEMP/nightly-docs-bin/hugo"
+      - name: Verify rendered internal links and anchors
+        id: links
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        env:
+          PUBLIC_DIR: ${{ runner.temp }}/maintenance-site/public
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" check
+      - name: Publish guarded repair and record the actual PR-head check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_OK: ${{ steps.build.outcome == 'success' }}
+          CHECKS_OK: ${{ steps.examples.outcome == 'success' && steps.links.outcome == 'success' }}
+        run: |
+          gh auth setup-git
+          python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" finish
+      - name: Check evidence for credentials
+        id: evidence
+        if: always()
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/maintenance.py" scan
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.evidence.outcome == 'success'
+        with:
+          name: docs-maintenance-evidence-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+          retention-days: 14
+          if-no-files-found: error
+
+  record-failure:
+    needs: [prepare, repair, review, validate-publish]
+    if: >-
+      always() && inputs.apply && needs.prepare.outputs.work == 'true'
+      && (needs.repair.result != 'success' || needs.review.result != 'success' || needs.validate-publish.result != 'success')
+    runs-on: ome-runner-cpu
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v5
+        with:
+          name: docs-maintenance-context-${{ inputs.number }}
+          path: ${{ runner.temp }}/docs-maintenance
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          export-api-key: 'false'
+          source-sha: ${{ github.sha }}
+      - run: python3 hack/nightly-docs/maintenance.py failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  merge:
+    needs: [prepare, repair, review, validate-publish]
+    if: >-
+      always() && inputs.apply && needs.prepare.result == 'success'
+      && (needs.prepare.outputs.cached == 'true' || needs.validate-publish.result == 'success')
+    concurrency:
+      group: docs-pr-maintenance-merge-main
+      cancel-in-progress: false
+    runs-on: ome-runner-cpu
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+    env:
+      ALLOW_MERGE: ${{ vars.DOCS_MAINTENANCE_MERGE == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/nightly-docs-setup
+        with:
+          export-api-key: 'false'
+          source-sha: ${{ github.sha }}
+      - run: python3 hack/nightly-docs/maintenance.py merge
+        env:
+          GH_TOKEN: ${{ github.token }}

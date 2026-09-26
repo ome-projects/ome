@@ -100,9 +100,11 @@ reopen/rework it; the nightly does not silently recreate it.
   repository's Actions settings (organization policy must allow it).
 - Publication uses the scoped `GITHUB_TOKEN` (`contents: write` and
   `pull-requests: write`); no additional PAT or GitHub App is required.
-  GitHub does not trigger normal push/PR workflows for this token's events,
-  so the nightly performs its own scope, review, and Hugo checks before opening
-  the PR. Maintainers can trigger any further desired CI manually.
+  Token-generated events do not reliably run follow-up CI without approval.
+  The nightly therefore performs its own scope, review and Hugo checks. The
+  maintenance worker below validates its actual PR head independently; it does
+  not bypass any other pending or required CI. An installation token can be
+  added separately if normal event-driven CI without approval is desired.
 - Schedules become active only after the workflow is on the default branch.
   Maintainers can manually dispatch from a trusted workflow branch to validate
   fixes before opening a PR. These runs perform the full review/build/publication
@@ -113,6 +115,7 @@ reopen/rework it; the nightly does not silently recreate it.
 ## Local validation
 
 ```bash
+python3 -m pip install -r hack/nightly-docs/maintenance-requirements.txt
 python3 -m unittest discover -s hack/nightly-docs -p '*_test.py'
 actionlint .github/workflows/nightly-docs.yml
 ```
@@ -120,4 +123,120 @@ actionlint .github/workflows/nightly-docs.yml
 Register `ome-runner-cpu` as a self-hosted label in your local actionlint config.
 Tests use temporary Git repositories and mocks; they never call a model or
 publish a branch/PR. Prompt files are separate so policy can be reviewed without
-reading workflow syntax. The Python helper uses only the standard library.
+reading workflow syntax. Publication uses the standard library; example validation uses the pinned
+PyYAML and jsonschema dependencies. The pre-commit hook installs these in its
+own Python environment.
+
+
+## Maintenance of existing documentation PRs
+
+`docs-pr-maintenance.yml` reconciles up to 100 eligible open PRs on each sweep,
+with four concurrent workers on `ome-runner-cpu`. Sweeps run every two hours,
+at minute 11 of even-numbered UTC hours. Issue comments and completion of the
+nightly, PR validation or code review workflow also wake it. Submitted reviews and inline replies are
+picked up by the sweep, avoiding privileged execution from a PR merge ref.
+Schedules/events use default-branch workflow code. Manual dispatch can use a
+trusted implementation branch. No PR-controlled scripts or Git metadata are
+executed. Runner pods must be ephemeral and isolated between jobs.
+
+Eligibility requires the original `github-actions[bot]` author, a same-repository
+branch matching the original concern marker, an open non-draft PR targeting
+main, and only added/modified handwritten documentation. Labels alone do not
+confer eligibility. A replacement publisher identity needs an explicit update
+to this guard. The source commit must belong to current main's history.
+
+Each activation does one repair round:
+
+1. Pin the PR head, current main and review feedback. Read unresolved threads,
+   review/issue comments, failed CI check summaries and previous repair findings.
+   Only OWNER, MEMBER and COLLABORATOR feedback and authenticated Claude/CodeRabbit
+   bot feedback can invalidate the model cache. Outsider comments cannot start
+   model rounds; all unresolved threads still block merging, and a human reply
+   of any association protects a thread from automatic resolution.
+   Read main's live Git ref because the PR API's `base.sha` can lag updates.
+   Ignore maintenance bookkeeping and CodeRabbit's informational skip notices.
+   Overlay only the PR's Markdown on trusted main; changes to the same pages on
+   main require human conflict resolution.
+2. A fresh **claude-fable-5**, `xhigh`, 120-turn worker fixes the original concern
+   using read/edit tools and a read-only GitHub token. It cannot push or merge.
+3. A separate job imports only documentation text, repeats the full-PR scope,
+   whitespace and **999 changed-line maximum** checks, validates YAML examples
+   against current OME CRD schemas, and catches incorrect `/docs/` prefixes.
+   There is no file-count limit; repairs stay within the original PR's paths.
+4. A second, independent **claude-fable-5** review in a read-only job checks the whole PR, behavior
+   claims, feedback and semantic correctness against implementation and tests.
+   A separate publisher revalidates the data and requires both accuracy and scope
+   approval. Its write token is scoped to API/publication steps, with no model
+   running in that job. Known live credentials and recognizable token literals
+   are rejected before artifact upload and public reporting. Non-model setup
+   does not copy the runner API key into the GitHub environment file.
+   Build the production Hugo site, then check internal docs links and anchors
+   from the rendered pages. Fenced YAML is data: shell heredocs, CEL rules and
+   admission webhooks are not executed. These checks do not prove every example
+   can run against a live Kubernetes cluster.
+   Before building, a main advance may be carried forward only if it adds
+   unrelated regular handwritten Markdown pages. Source, schemas, templates and
+   every existing page must remain byte-for-byte identical. The semantic review
+   can then be reused while build/link validation uses the refreshed base; both
+   revisions are recorded in the evidence. Any other main change requires a
+   fresh review, and a subsequent base move still blocks publication.
+5. Append a signed-off repair commit to the **same branch**, including current
+   main when necessary, using a normal push. The committed tree must exactly
+   match the validated tree. Concurrent changes invalidate publication; no
+   force-push is used. Rejected accuracy, rejected scope, failed deterministic
+   checks or malformed verdicts cannot publish a repair. Their findings remain
+   in bounded retry state and artifacts for the next round. The publisher waits
+   briefly for its new head to propagate, rejecting any competing head or base.
+6. Record `Docs maintenance` on the actual PR head and update one bot status
+   comment. Verified bot-only threads may be resolved; human discussions never
+   are. New head/base/feedback invalidates a cached successful result. The same
+   source/feedback does not repeatedly consume model turns after validation.
+
+Three unsuccessful rounds exhaust the durable per-PR budget, including worker
+failures and cancellation after reservation. Successful validation resets the
+counter. A `needs-human` status remains visible until a maintainer dispatches
+`force=true`; a new automatic commit does not reset failed attempts. One PR's
+failure does not cancel other matrix workers. Artifacts retain context, final
+patch, validation findings and verdict for 14 days. A successful workflow can
+still report a rejected repair; inspect its verdict and the PR-head check.
+
+### Merge policy and controls
+
+- Set `DOCS_MAINTENANCE_ENABLED=false` to stop new maintenance work.
+- **Merging is off by default.** Opt in separately with repository variable
+  `DOCS_MAINTENANCE_MERGE=true`. No repository/organization setting is changed by
+  the workflow. Dry runs never write a branch, check, comment, thread or merge.
+- Even when enabled, normal squash merge requires a fresh successful maintenance
+  check for the current head/main, all reported checks successful/neutral/skipped,
+  no unresolved threads, GitHub's `APPROVED` review decision and `CLEAN` merge
+  state. Repository approval/CODEOWNER rules still apply. The worker neither
+  approves itself nor invokes an administrative bypass. Approval-required CI
+  must be released by a maintainer; the bot will wait.
+- Merge operations are serialized and conditional on the PR head SHA. GitHub's
+  merge API does not atomically pin main's SHA; strict required checks or a merge
+  queue are needed for an atomic base-freshness guarantee under external merges.
+  This workflow rechecks main immediately before the merge request.
+- The workflow can drive a PR to a validated, mergeable state, but cannot promise
+  a merge when approval, CI, conflicts or unresolved human feedback block it.
+
+### Test on a branch before submitting changes
+
+The existing nightly dispatcher has a maintenance-only route, allowing the new
+reusable workflows to run before their first merge to main:
+
+```bash
+gh workflow run nightly-docs.yml --repo ome-projects/ome --ref BRANCH \
+  -f maintenance_pr=1047 -f maintenance_apply=false
+```
+
+Inspect `docs-maintenance-evidence-1047/result.json` and the final diff, then test
+publication with `maintenance_apply=true`. Keep the merge variable unset during
+pilots. `maintenance_feedback` supplies specific additional feedback;
+`maintenance_force=true` explicitly resumes an exhausted PR. After installation,
+`docs-pr-maintenance.yml` also supports direct dispatch with `pr_number`, `apply`,
+`feedback` and `force`. A dispatch without a PR number scans all eligible PRs;
+manual dispatch defaults to dry-run mode. `feedback` (at most 2,000 characters)
+and `force` require an explicit PR number; they cannot fan out across a sweep.
+A PR with malformed feedback is skipped with a diagnostic during a sweep, while
+an explicit dispatch fails loudly. Scope/conflict rejections during preparation
+are marked `needs-human` rather than repeatedly launching workers.

@@ -39,8 +39,9 @@ repos:
       - id: nightly-docs-contract
         name: nightly documentation scope and publication contract
         entry: python3 -m unittest discover -s hack/nightly-docs -p '*_test.py'
-        language: system
-        files: ^(hack/nightly-docs/|\.github/workflows/nightly-docs\.yml|\.github/actions/nightly-docs-setup/)
+        language: python
+        additional_dependencies: [PyYAML==6.0.2, jsonschema==4.25.1]
+        files: ^(hack/nightly-docs/|\.github/workflows/(nightly-docs|docs-pr-maintenance|docs-pr-worker)\.yml|\.github/actions/nightly-docs-setup/)
         pass_filenames: false
 
       - id: dev-images-contract
