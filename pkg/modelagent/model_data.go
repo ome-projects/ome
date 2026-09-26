@@ -4,6 +4,8 @@ package modelagent
 import (
 	"encoding/json"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"sigs.k8s.io/ome/pkg/modelparser"
 )
 
@@ -83,13 +85,22 @@ func (p *DownloadProgress) Percentage() float64 {
 // ModelEntry represents an entry in the node model ConfigMap
 // This is the top-level structure stored for each model in the ConfigMap
 type ModelEntry struct {
+	// ModelUID binds persisted state to the CR instance, not its reusable name.
+	ModelUID      types.UID         `json:"modelUID,omitempty"`
 	Name          string            `json:"name"`                    // Name of the model
 	Status        ModelStatus       `json:"status"`                  // Current status of the model on this node
 	Config        *ModelConfig      `json:"config,omitempty"`        // Model configuration, may be nil if just tracking status
 	Progress      *DownloadProgress `json:"progress,omitempty"`      // Download progress, nil when not downloading
 	HfArtifactKey string            `json:"hfArtifactKey,omitempty"` // ConfigMap key of the shared HF artifact used by this model
 	// Pending cleanup survives reference removal until local and parent cleanup finish.
-	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
+	HfArtifactPendingDeletion     *HfArtifactPendingDeletion     `json:"hfArtifactPendingDeletion,omitempty"`
+	DirectArtifactPendingEviction *DirectArtifactPendingEviction `json:"directArtifactPendingEviction,omitempty"`
+}
+
+// DirectArtifactPendingEviction binds restartable cleanup to one owner and path.
+type DirectArtifactPendingEviction struct {
+	ModelUID types.UID `json:"modelUID"`
+	Path     string    `json:"path"`
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig
