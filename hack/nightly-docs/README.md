@@ -48,6 +48,11 @@ the existing release-driven Pages workflow publishes the website separately.
    `fail-fast: false` lets other concerns finish when one fails. The publisher
    skips concerns whose writer failed to produce an artifact.
 
+Writers and independent reviewers each have a 120-turn ceiling, with a prompt
+target of 60 turns for investigation/editing or evidence gathering. This leaves
+headroom for tool batches and the final result; exceeding the ceiling still
+fails the job rather than bypassing review.
+
 The writer has a read-only GitHub token and cannot publish. The planner and
 publisher's reviewer have only Read, Glob, and Grep tools (no shell, editing, or
 agent tools); source diffs are prepared by the workflow. The publisher does not

@@ -218,7 +218,7 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 60
+            --max-turns 120
             --tools "Read,Glob,Grep,Edit,Write"
             --allowedTools "Read,Glob,Grep,Edit,Write"
       - name: Export untrusted documentation data
@@ -303,7 +303,7 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 60
+            --max-turns 120
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
             --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"}},"required":["single_concern","accurate","reason"]}'
