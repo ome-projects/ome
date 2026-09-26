@@ -249,6 +249,13 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if task == nil {
 		return
 	}
+	if task.TaskType == Evict {
+		// Refresh persisted opt-out/receipt ownership before reserving the
+		// barrier. beginTask retries a failed lookup before any cleanup.
+		if err := s.loadArtifactRouting(context.Background(), true); err != nil {
+			s.logger.Warnf("Cannot refresh eviction routing: %v", err)
+		}
+	}
 	s.artifactRouting.mutex.Lock()
 	s.routeArtifactTaskLocked(task)
 	s.artifactRouting.mutex.Unlock()
@@ -256,13 +263,13 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue()
 	}
-	if task.TaskType == Delete && task.SharedArtifact {
+	if (task.TaskType == Delete || task.TaskType == Evict) && task.SharedArtifact {
 		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
 		if result == gopherTaskStale {
 			return
 		}
 		s.taskTracker.finishDelete(attempt, true)
-	} else if task.TaskType == Delete {
+	} else if task.TaskType == Delete || task.TaskType == Evict {
 		s.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
 	} else {
 		s.classifyStartupRevalidation(task)
@@ -474,6 +481,26 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	keepDeleteBarrier := false
 	defer func() { finish(keepDeleteBarrier) }()
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
+	if task.TaskType == Delete {
+		handled, err := s.resumeDirectEvictionOnDelete(ctx, task)
+		if err != nil {
+			retryErr := s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+			keepDeleteBarrier = retryErr == nil
+			return retryErr
+		}
+		if handled {
+			return nil
+		}
+	}
+	if task.TaskType == Evict {
+		if err := s.evictDirectArtifact(ctx, task); err != nil {
+			return s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		}
+		return nil
+	}
+	if (task.TaskType == Download || task.TaskType == DownloadOverride) && artifactEvictionRequested(task) {
+		return nil
+	}
 	// Get model type, namespace, and name for metrics
 	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
 

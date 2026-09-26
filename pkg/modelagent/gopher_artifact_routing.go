@@ -67,11 +67,11 @@ func (s *Gopher) cleanupDeletingModel(current, cleanup *GopherTask) error {
 	return s.processTask(cleanup)
 }
 
-func (s *Gopher) loadArtifactRouting(ctx context.Context) error {
+func (s *Gopher) loadArtifactRouting(ctx context.Context, refresh bool) error {
 	s.artifactRouting.mutex.Lock()
 	known := s.artifactRouting.known
 	s.artifactRouting.mutex.Unlock()
-	if known || s.configMapReconciler == nil {
+	if known && !refresh || s.configMapReconciler == nil {
 		return nil
 	}
 	cm, err := s.configMapReconciler.getConfigMap(ctx)
@@ -123,15 +123,23 @@ func (s *Gopher) isOrdinaryArtifactTask(task *GopherTask) bool {
 func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool, error) {
 	ctx := context.Background()
 	task.Sequence = s.taskTracker.ensureSequence(task.Sequence)
-	if err := s.loadArtifactRouting(ctx); err != nil {
-		return ctx, func(bool) {}, false, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+	if err := s.loadArtifactRouting(ctx, task.TaskType == Evict); err != nil {
+		retryErr := s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), err))
+		if task.TaskType == Evict && retryErr != nil {
+			// enqueueTask may already have reserved this eviction's barrier.
+			// Claim only this sequence's idle attempt before releasing it; an
+			// older failed lookup must never finalize a newer or active owner.
+			attempt, _ := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
+			s.taskTracker.finishDelete(attempt, false)
+		}
+		return ctx, func(bool) {}, false, retryErr
 	}
 	s.artifactRouting.mutex.Lock()
 	s.routeArtifactTaskLocked(task)
 	defer s.artifactRouting.mutex.Unlock()
 	key := gopherTaskModelKey(task)
 	if !task.SharedArtifact {
-		if task.TaskType == Delete {
+		if task.TaskType == Delete || task.TaskType == Evict {
 			s.taskTracker.cancelLegacyDownload(key)
 			attempt := s.taskTracker.beginLegacyTask(key, nil)
 			return ctx, func(bool) { s.taskTracker.finishLegacyTask(attempt) }, true, nil
@@ -143,7 +151,7 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 	if s.isTaskModelReplaced(task) {
 		return ctx, func(bool) {}, false, nil
 	}
-	if task.TaskType == Delete {
+	if task.TaskType == Delete || task.TaskType == Evict {
 		attempt, outcome := s.taskTracker.beginDelete(key, task.Sequence)
 		if outcome != gopherTaskProceed {
 			err := s.waitForActiveTask(task, outcome)

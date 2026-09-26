@@ -257,6 +257,9 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		return
 	}
 
+	if w.enqueueArtifactEviction(&GopherTask{BaseModel: baseModel}) {
+		return
+	}
 	if w.shouldDownloadModel(baseModel.Spec.Storage) {
 		// Refresh the node info
 		var err error
@@ -308,6 +311,9 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		return
 	}
 
+	if w.enqueueArtifactEviction(&GopherTask{ClusterBaseModel: clusterBaseModel}) {
+		return
+	}
 	if w.shouldDownloadModel(clusterBaseModel.Spec.Storage) {
 		// Refresh the node info
 		var err error
@@ -357,6 +363,9 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	if !newBaseModel.ObjectMeta.DeletionTimestamp.IsZero() {
 		w.logger.Infof("Resource has deletion timestamp: BaseModel '%s', processing delete", newBaseModel.Name)
 		w.deleteBaseModel(newBaseModel)
+		return
+	}
+	if w.enqueueArtifactEviction(&GopherTask{BaseModel: newBaseModel}) {
 		return
 	}
 
@@ -414,6 +423,9 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	if !newClusterBaseModel.ObjectMeta.DeletionTimestamp.IsZero() {
 		w.logger.Infof("Resource has deletion timestamp: ClusterBaseModel '%s', processing delete", newClusterBaseModel.Name)
 		w.deleteClusterBaseModel(newClusterBaseModel)
+		return
+	}
+	if w.enqueueArtifactEviction(&GopherTask{ClusterBaseModel: newClusterBaseModel}) {
 		return
 	}
 
