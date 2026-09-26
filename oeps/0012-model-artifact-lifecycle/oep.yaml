@@ -1,0 +1,12 @@
+title: Model Artifact Eviction and Rehydration
+oep-number: "0012"
+authors:
+  - "@op109lvb"
+status: provisional
+creation-date: 2026-09-24
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+stage: alpha
