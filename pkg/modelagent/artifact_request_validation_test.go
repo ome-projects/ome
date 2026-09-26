@@ -54,7 +54,7 @@ func TestArtifactRequestUsesLiveIdentityAndInputs(t *testing.T) {
 			live := task.BaseModel.DeepCopy()
 			tc.change(live)
 			g.modelClient = omefake.NewSimpleClientset(live)
-			skip, _, err := g.shouldSkipArtifactTask(context.Background(), task)
+			skip, err := g.shouldSkipArtifactTask(context.Background(), task)
 			require.NoError(t, err)
 			require.Equal(t, tc.skip, skip)
 		})

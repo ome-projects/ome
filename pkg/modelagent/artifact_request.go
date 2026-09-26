@@ -95,7 +95,7 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	skip, _, err := s.shouldSkipArtifactTask(ctx, task)
+	skip, err := s.shouldSkipArtifactTask(ctx, task)
 	if err != nil {
 		return err
 	}
@@ -140,12 +140,12 @@ func (s *Gopher) isBoundedDirectArtifactTask(task *GopherTask) bool {
 }
 
 // Read live ownership and download inputs before writing or publishing.
-func (s *Gopher) shouldSkipArtifactTask(ctx context.Context, task *GopherTask) (bool, bool, error) {
+func (s *Gopher) shouldSkipArtifactTask(ctx context.Context, task *GopherTask) (bool, error) {
 	if taskModelMeta(task) == nil || taskModelMeta(task).UID == "" {
-		return false, false, fmt.Errorf("artifact operation requires a model UID")
+		return false, fmt.Errorf("artifact operation requires a model UID")
 	}
 	if s.modelClient == nil {
-		return false, false, fmt.Errorf("artifact operation requires a live model client")
+		return false, fmt.Errorf("artifact operation requires a live model client")
 	}
 	latest := *task
 	var err error
@@ -155,49 +155,49 @@ func (s *Gopher) shouldSkipArtifactTask(ctx context.Context, task *GopherTask) (
 		latest.ClusterBaseModel, err = s.modelClient.OmeV1beta1().ClusterBaseModels().Get(ctx, task.ClusterBaseModel.Name, metav1.GetOptions{})
 	}
 	if apierrors.IsNotFound(err) {
-		return true, false, nil
+		return true, nil
 	}
 	if err != nil {
-		return false, false, err
+		return false, err
 	}
 	meta := taskModelMeta(&latest)
 	if meta.UID != taskModelMeta(task).UID ||
 		!reflect.DeepEqual(artifactDownloadInputs(taskModelSpec(task)), artifactDownloadInputs(taskModelSpec(&latest))) ||
 		!reflect.DeepEqual(downloadAnnotations(meta.Annotations), downloadAnnotations(taskModelMeta(task).Annotations)) {
-		return true, false, nil
+		return true, nil
 	}
 	if !meta.DeletionTimestamp.IsZero() {
-		return true, true, nil
+		return true, nil
 	}
 	if artifactRestorationRequested(task) &&
 		downloadPolicyOrDefault(taskModelSpec(task).Storage) != downloadPolicyOrDefault(taskModelSpec(&latest).Storage) {
-		return true, false, nil
+		return true, nil
 	}
 	if task.TaskType == Evict {
 		// Local cleanup applies even after this node loses placement eligibility.
 		// Unlike an ordinary OCI refresh, eviction must not outlive a changed
 		// shared-reuse policy while retaining an old cleanup snapshot.
 		if downloadPolicyOrDefault(taskModelSpec(task).Storage) != downloadPolicyOrDefault(taskModelSpec(&latest).Storage) {
-			return true, false, nil
+			return true, nil
 		}
-		return !artifactEvictionRequested(&latest), false, nil
+		return !artifactEvictionRequested(&latest), nil
 	}
 	if artifactEvictionRequested(&latest) {
-		return true, false, nil
+		return true, nil
 	}
 	spec := taskModelSpec(&latest)
 	if spec.Storage == nil || len(spec.Storage.NodeSelector) == 0 && spec.Storage.NodeAffinity == nil {
-		return false, false, nil
+		return false, nil
 	}
 	if s.kubeClient == nil || s.configMapReconciler == nil || s.configMapReconciler.nodeName == "" {
-		return false, false, fmt.Errorf("artifact operation requires current node eligibility")
+		return false, fmt.Errorf("artifact operation requires current node eligibility")
 	}
 	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
 	if err != nil {
-		return false, false, err
+		return false, err
 	}
 	scout := Scout{nodeInfo: node, logger: s.logger}
-	return !scout.shouldDownloadModel(spec.Storage), false, nil
+	return !scout.shouldDownloadModel(spec.Storage), nil
 }
 
 // Scout handles placement separately and only refreshes HF downloads for

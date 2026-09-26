@@ -30,7 +30,7 @@ func (s *Gopher) evictDirectArtifact(ctx context.Context, task *GopherTask) erro
 		return fmt.Errorf("eviction requires a directly owned HF or OCI artifact")
 	}
 	if task.TaskType != Delete {
-		skip, _, err := s.shouldSkipArtifactTask(ctx, task)
+		skip, err := s.shouldSkipArtifactTask(ctx, task)
 		if err != nil || skip {
 			return err
 		}

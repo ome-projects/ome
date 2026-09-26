@@ -21,7 +21,7 @@ func (s *Gopher) processSharedArtifactEviction(ctx context.Context, task *Gopher
 		}
 		// A withdrawn or superseded request must release the delete barrier.
 		// Its durable receipt remains available to the next operation.
-		if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err == nil && skip {
+		if skip, err := s.shouldSkipArtifactTask(ctx, task); err == nil && skip {
 			return true, false, nil
 		}
 		err := s.requeueHfArtifactTask(task, newHfArtifactRetryResult(gopherTaskModelKey(task), cause))
@@ -52,7 +52,7 @@ func (s *Gopher) processSharedArtifactEviction(ctx context.Context, task *Gopher
 	if !found {
 		return false, false, nil
 	}
-	if skip, _, err := s.shouldSkipArtifactTask(ctx, task); err != nil || skip {
+	if skip, err := s.shouldSkipArtifactTask(ctx, task); err != nil || skip {
 		if err != nil {
 			return retry(err)
 		}
