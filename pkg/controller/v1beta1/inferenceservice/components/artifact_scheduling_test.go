@@ -1,6 +1,7 @@
 package components
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -15,6 +16,8 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/deployment"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	lwsreconciler "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/lws"
 )
 
 func TestSinglePodArtifactSelectorsOverrideAllLayers(t *testing.T) {
@@ -22,6 +25,59 @@ func TestSinglePodArtifactSelectorsOverrideAllLayers(t *testing.T) {
 		for _, mode := range []constants.DeploymentModeType{constants.RawDeployment, constants.OMENative} {
 			t.Run(component+"/"+string(mode), func(t *testing.T) {
 				testArtifactSelectorLayers(t, component, mode, false)
+			})
+		}
+	}
+}
+
+func TestMultiPodRenderedTemplatesCarryCurrentArtifactRequest(t *testing.T) {
+	for _, component := range []string{"engine", "decoder"} {
+		for _, mode := range []constants.DeploymentModeType{constants.MultiNode, constants.OMENative} {
+			t.Run(component+"/"+string(mode), func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				require.NoError(t, corev1.AddToScheme(scheme))
+				require.NoError(t, v1beta1.AddToScheme(scheme))
+				c := ctrlfake.NewClientBuilder().WithScheme(scheme).Build()
+				model := &metav1.ObjectMeta{Name: "model", UID: "model-uid", Annotations: map[string]string{}}
+				isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "models", UID: "service-uid"}}
+				componentMeta := metav1.ObjectMeta{Name: "service-" + component, Namespace: "models", Labels: map[string]string{constants.OMEComponentLabel: component}}
+				input := ComponentInputs{BaseModel: &v1beta1.BaseModelSpec{}, BaseModelMeta: model, DeploymentMode: mode}
+				pod := v1beta1.PodSpec{Containers: []corev1.Container{{Name: "server", Image: "test"}}}
+				for _, request := range []string{"", "restore-001", "restore-002"} {
+					model.Annotations[constants.ModelArtifactRehydrationIDAnnotation] = request
+					leader := artifactSchedulingPod(t, component, input, pod, isvc, true, false)
+					worker := artifactSchedulingPod(t, component+"-worker", input, pod, isvc, true, false)
+					var rendered []corev1.PodSpec
+					if mode == constants.MultiNode {
+						lws := lwsreconciler.NewLWSReconciler(c, scheme, leader, worker, 2, &v1beta1.ComponentExtensionSpec{}, componentMeta).LWS
+						rendered = []corev1.PodSpec{lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec, lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec}
+					} else {
+						ir, err := irprojector.EnsureInferenceReplica(context.Background(), irprojector.Params{ISVC: isvc, Component: v1beta1.ComponentType(component), ComponentExt: &v1beta1.ComponentExtensionSpec{}, ObjectMeta: componentMeta, PodSpec: leader, WorkerPodSpec: worker, WorkerSize: 2, MultiPod: true, Client: c})
+						require.NoError(t, err)
+						require.Len(t, ir.Spec.Runners, 2)
+						for _, runner := range ir.Spec.Runners {
+							rendered = append(rendered, runner.Template.Spec)
+						}
+					}
+					for _, actual := range rendered {
+						require.Equal(t, "Ready", actual.NodeSelector[constants.GetClusterBaseModelLabel(model.Name)])
+						require.Equal(t, request, actual.NodeSelector[constants.GetModelArtifactRequestLabel(model.UID)])
+						if request == "" {
+							require.NotContains(t, actual.NodeSelector, constants.GetModelArtifactRequestLabel(model.UID))
+						}
+					}
+				}
+				require.Nil(t, isvc.Annotations)
+			})
+		}
+	}
+}
+
+func TestMultiPodArtifactSelectorsOverrideAllLayers(t *testing.T) {
+	for _, component := range []string{"engine", "decoder", "engine-worker", "decoder-worker"} {
+		for _, mode := range []constants.DeploymentModeType{constants.MultiNode, constants.OMENative} {
+			t.Run(component+"/"+string(mode), func(t *testing.T) {
+				testArtifactSelectorLayers(t, component, mode, true)
 			})
 		}
 	}
@@ -73,8 +129,11 @@ func testArtifactSelectorLayers(t *testing.T, component string, mode constants.D
 }
 
 func TestArtifactSelectorExclusions(t *testing.T) {
-	for _, mode := range []constants.DeploymentModeType{constants.RawDeployment, constants.OMENative} {
-		for _, component := range []string{"engine", "decoder"} {
+	for _, mode := range []constants.DeploymentModeType{constants.RawDeployment, constants.MultiNode, constants.OMENative} {
+		for _, component := range []string{"engine", "decoder", "engine-worker", "decoder-worker"} {
+			if mode == constants.RawDeployment && strings.HasSuffix(component, "-worker") {
+				continue
+			}
 			for _, exclusion := range []string{"absent", "pvc", "sharded", "merged", "none"} {
 				t.Run(string(mode)+"/"+component+"/"+exclusion, func(t *testing.T) {
 					meta := &metav1.ObjectMeta{Name: "model", UID: "uid", Annotations: map[string]string{constants.ModelArtifactRehydrationIDAnnotation: "restore-001"}}
@@ -91,7 +150,7 @@ func TestArtifactSelectorExclusions(t *testing.T) {
 					}
 					pod := v1beta1.PodSpec{Containers: []corev1.Container{{Name: "server", Image: "test"}}, NodeSelector: map[string]string{"unrelated": "retained"}}
 					isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "models"}}
-					actual := artifactSchedulingPod(t, component, input, pod, isvc, false, exclusion == "merged")
+					actual := artifactSchedulingPod(t, component, input, pod, isvc, mode != constants.RawDeployment, exclusion == "merged")
 					if exclusion == "none" {
 						require.Equal(t, "Ready", actual.NodeSelector[constants.GetClusterBaseModelLabel(meta.Name)])
 						require.Equal(t, "restore-001", actual.NodeSelector[constants.GetModelArtifactRequestLabel(meta.UID)])
