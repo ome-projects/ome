@@ -139,11 +139,12 @@ def feedback(pr):
             if thread["comments"]["pageInfo"]["hasNextPage"]:
                 raise ValueError("A review thread exceeds 100 comments; human triage required")
             comments_in_thread = thread['comments']['nodes']
-            trusted = [c for c in comments_in_thread if trusted_feedback(c.get('author'), c.get('authorAssociation'))]
-            if len(trusted) != len(comments_in_thread):
+            accepted_comments = [c for c in comments_in_thread
+                                 if trusted_feedback(c.get('author'), c.get('authorAssociation'))]
+            if len(accepted_comments) != len(comments_in_thread):
                 protected.append(thread['id'])
-            if trusted:
-                threads.append({**thread, "comments": trusted, "number": len(threads) + 1})
+            if accepted_comments:
+                threads.append({**thread, "comments": accepted_comments, "number": len(threads) + 1})
         if not connection["pageInfo"]["hasNextPage"]:
             break
         cursor = connection["pageInfo"]["endCursor"]
