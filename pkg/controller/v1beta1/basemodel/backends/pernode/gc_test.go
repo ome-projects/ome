@@ -23,7 +23,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
 )
 
 func orphanConfigMap() *corev1.ConfigMap {
@@ -200,12 +199,11 @@ func TestOrphanCleanupErrorsPreserveFinalizerAndStatus(t *testing.T) {
 			g.Expect(live.Get(ctx, client.ObjectKeyFromObject(model), model)).To(gomega.Succeed())
 			g.Expect(controllerutil.ContainsFinalizer(model, constants.BaseModelFinalizer)).To(gomega.BeTrue())
 			g.Expect(live.Get(ctx, client.ObjectKeyFromObject(cm), &corev1.ConfigMap{})).To(gomega.Succeed())
-			updated := false
-			err = processModelStatus(ctx, c, reader, logr.Discard(), "default", "model", false,
-				func(context.Context, *shared.ModelConfig) error { updated = true; return nil },
-				func(context.Context, []string, []string) error { updated = true; return nil })
+			before := model.Status.DeepCopy()
+			err = ReconcileStatusFromConfigMaps(ctx, c, reader, logr.Discard(), model, false, "BaseModel")
 			g.Expect(err).To(gomega.HaveOccurred())
-			g.Expect(updated).To(gomega.BeFalse())
+			g.Expect(live.Get(ctx, client.ObjectKeyFromObject(model), model)).To(gomega.Succeed())
+			g.Expect(&model.Status).To(gomega.Equal(before))
 		})
 	}
 }

@@ -420,7 +420,7 @@ type ObjectReference struct {
 }
 
 // LifeCycleState enum
-// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed
+// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed;Evicted
 type LifeCycleState string
 
 const (
@@ -430,6 +430,7 @@ const (
 	LifeCycleStateInTraining LifeCycleState = "In_Training"
 	LifeCycleStateReady      LifeCycleState = "Ready"
 	LifeCycleStateFailed     LifeCycleState = "Failed"
+	LifeCycleStateEvicted    LifeCycleState = "Evicted"
 )
 
 const (
@@ -510,6 +511,13 @@ type ModelCacheStatus struct {
 	SourceUri string `json:"sourceUri,omitempty"`
 }
 
+// ModelRehydrationStatus records the last restoration request acknowledged by
+// at least one currently eligible Ready node. Completion is history, not proof
+// of present readiness; the current request is in the Model annotation.
+type ModelRehydrationStatus struct {
+	CompletedRequestID string `json:"completedRequestID,omitempty"`
+}
+
 // ModelStatusSpec defines the observed state of Model weight
 type ModelStatusSpec struct {
 	// LifeCycle is an enum of Deprecated, Experiment, Public, Internal
@@ -537,6 +545,14 @@ type ModelStatusSpec struct {
 
 	// +listType=atomic
 	NodesFailed []string `json:"nodesFailed,omitempty"`
+
+	// Nodes that have reported completed local artifact eviction.
+	// +listType=atomic
+	NodesEvicted []string `json:"nodesEvicted,omitempty"`
+
+	// Rehydration records observed restoration progress for per-node models.
+	// +optional
+	Rehydration *ModelRehydrationStatus `json:"rehydration,omitempty"`
 
 	// Conditions describe cluster-wide model readiness and cache state.
 	// Sharded models report SourceReachable, MetadataExtracted, and Ready;

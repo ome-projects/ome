@@ -139,6 +139,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelFrameworkSpec":               schema_pkg_apis_ome_v1beta1_ModelFrameworkSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelOverlayRef":                  schema_pkg_apis_ome_v1beta1_ModelOverlayRef(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef":                         schema_pkg_apis_ome_v1beta1_ModelRef(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus":           schema_pkg_apis_ome_v1beta1_ModelRehydrationStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRevisionStates":              schema_pkg_apis_ome_v1beta1_ModelRevisionStates(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelSizeRangeSpec":               schema_pkg_apis_ome_v1beta1_ModelSizeRangeSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelStatus":                      schema_pkg_apis_ome_v1beta1_ModelStatus(ref),
@@ -9221,6 +9222,25 @@ func schema_pkg_apis_ome_v1beta1_ModelRef(ref common.ReferenceCallback) common.O
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_ModelRehydrationStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ModelRehydrationStatus records the last restoration request acknowledged by at least one currently eligible Ready node. Completion is history, not proof of present readiness; the current request is in the Model annotation.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"completedRequestID": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_ModelRevisionStates(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -9387,6 +9407,32 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 							},
 						},
 					},
+					"nodesEvicted": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Nodes that have reported completed local artifact eviction.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"rehydration": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Rehydration records observed restoration progress for per-node models.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus"),
+						},
+					},
 					"conditions": {
 						VendorExtensible: spec.VendorExtensible{
 							Extensions: spec.Extensions{
@@ -9420,7 +9466,7 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRehydrationStatus"},
 	}
 }
 

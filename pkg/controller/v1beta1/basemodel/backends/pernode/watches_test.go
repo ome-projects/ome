@@ -5,21 +5,80 @@ import (
 	"testing"
 
 	"github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
+
+func TestNodePlacementFanoutWithoutConfigMaps(t *testing.T) {
+	ctx := context.Background()
+	base, cluster := restorationModel(false), restorationModel(true)
+	c := restorationClient(t, base, cluster)
+	node := restorationNode("node-a")
+	p := CreateNodePlacementPredicate()
+	require.True(t, p.Create(event.CreateEvent{Object: node}))
+	require.True(t, p.Delete(event.DeleteEvent{Object: node}))
+	changed := node.DeepCopy()
+	changed.Labels["pool"] = "other"
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: node, ObjectNew: changed}))
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: node, ObjectNew: node.DeepCopy()}))
+	changed = node.DeepCopy()
+	changed.Spec.Unschedulable = true
+	changed.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: node, ObjectNew: changed}))
+	for _, namespaced := range []bool{false, true} {
+		requests := MapNodeToRestorationRequests(ctx, c, ctrl.Log, node, namespaced)
+		require.Len(t, requests, 1)
+		expected := cluster
+		if namespaced {
+			expected = base
+		}
+		require.Equal(t, client.ObjectKeyFromObject(expected), requests[0].NamespacedName)
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: node.Name, Namespace: constants.OMENamespace}}
+	require.NoError(t, c.Create(ctx, cm))
+	require.Len(t, MapNodeToRestorationRequests(ctx, c, ctrl.Log, node, true), 1)
+	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(cm), &corev1.ConfigMap{}), "placement fanout must not delete reports")
+	require.False(t, CreateNodeDeletionPredicate().Create(event.CreateEvent{Object: node}))
+	require.False(t, CreateNodeDeletionPredicate().Update(event.UpdateEvent{ObjectOld: node, ObjectNew: changed}))
+}
+
+func TestConfigMapUpdateEnqueuesOldAndMalformedNewKeys(t *testing.T) {
+	old := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: constants.OMENamespace, Labels: map[string]string{constants.ModelStatusConfigMapLabel: "true"}}, Data: map[string]string{"ns.basemodel.old": `{"status":"Ready"}`}}
+	current := old.DeepCopy()
+	current.Labels = nil
+	current.Data = map[string]string{"ns.basemodel.new": "{"}
+	e := event.UpdateEvent{ObjectOld: old, ObjectNew: current}
+	require.True(t, CreateModelStatusConfigMapPredicate().Update(e))
+	h := handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+		return MapConfigMapToModelRequests(obj, ctrl.Log, true)
+	})
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	defer queue.ShutDown()
+	h.Update(context.Background(), e, queue)
+	require.Equal(t, 2, queue.Len())
+	var names []string
+	for queue.Len() > 0 {
+		req, _ := queue.Get()
+		names = append(names, req.Name)
+		queue.Done(req)
+	}
+	require.ElementsMatch(t, []string{"old", "new"}, names)
+}
 
 func TestMapConfigMapToModelRequests(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
@@ -79,11 +138,7 @@ func TestMapConfigMapToModelRequests(t *testing.T) {
 				},
 			},
 			isNamespaced:  true,
-			expectedCount: 1, // Only valid entry should be processed
-			expectedFirst: &types.NamespacedName{
-				Namespace: "default",
-				Name:      "valid-model",
-			},
+			expectedCount: 2, // A malformed report must also invalidate old status.
 		},
 		{
 			name:          "Non-ConfigMap object",

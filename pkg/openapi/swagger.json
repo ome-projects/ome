@@ -5170,6 +5170,15 @@
         }
       }
     },
+    "v1beta1.ModelRehydrationStatus": {
+      "description": "ModelRehydrationStatus records the last restoration request acknowledged by at least one currently eligible Ready node. Completion is history, not proof of present readiness; the current request is in the Model annotation.",
+      "type": "object",
+      "properties": {
+        "completedRequestID": {
+          "type": "string"
+        }
+      }
+    },
     "v1beta1.ModelRevisionStates": {
       "type": "object",
       "required": [
@@ -5252,6 +5261,15 @@
           "description": "LifeCycle is an enum of Deprecated, Experiment, Public, Internal",
           "type": "string"
         },
+        "nodesEvicted": {
+          "description": "Nodes that have reported completed local artifact eviction.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
         "nodesFailed": {
           "type": "array",
           "items": {
@@ -5272,6 +5290,10 @@
           "description": "ObservedGeneration is the .metadata.generation the controller last reconciled against. If this lags behind .metadata.generation, the controller has not yet observed the latest spec edit.",
           "type": "integer",
           "format": "int64"
+        },
+        "rehydration": {
+          "description": "Rehydration records observed restoration progress for per-node models.",
+          "$ref": "#/definitions/v1beta1.ModelRehydrationStatus"
         },
         "state": {
           "description": "Status of the model weight",

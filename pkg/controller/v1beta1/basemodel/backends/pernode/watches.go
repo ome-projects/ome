@@ -2,7 +2,7 @@ package pernode
 
 import (
 	"context"
-	"encoding/json"
+	"maps"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -13,8 +13,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
 )
 
 func CreateNodeDeletionPredicate() predicate.Predicate {
@@ -73,7 +73,7 @@ func CreateModelStatusConfigMapPredicate() predicate.Predicate {
 			return IsModelStatusConfigMap(e.Object)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return IsModelStatusConfigMap(e.ObjectNew)
+			return IsModelStatusConfigMap(e.ObjectOld) || IsModelStatusConfigMap(e.ObjectNew)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return IsModelStatusConfigMap(e.Object)
@@ -82,7 +82,7 @@ func CreateModelStatusConfigMapPredicate() predicate.Predicate {
 }
 
 func IsModelStatusConfigMap(obj client.Object) bool {
-	if obj.GetNamespace() != constants.OMENamespace {
+	if obj == nil || obj.GetNamespace() != constants.OMENamespace {
 		return false
 	}
 	labels := obj.GetLabels()
@@ -103,18 +103,12 @@ func MapConfigMapToModelRequests(obj client.Object, log logr.Logger, isNamespace
 		return requests
 	}
 
-	for key, data := range configMap.Data {
+	for key := range configMap.Data {
 		namespace, modelName, isClusterBaseModel, success := constants.ParseModelInfoFromConfigMapKey(key)
 		if !success {
 			continue
 		}
 		if (isNamespaced && isClusterBaseModel) || (!isNamespaced && !isClusterBaseModel) {
-			continue
-		}
-
-		var modelEntry shared.ModelEntry
-		if err := json.Unmarshal([]byte(data), &modelEntry); err != nil {
-			log.V(1).Info("Failed to parse model entry in ConfigMap", "configMap", configMap.Name, "key", key, "error", err)
 			continue
 		}
 
@@ -125,5 +119,54 @@ func MapConfigMapToModelRequests(obj client.Object, log logr.Logger, isNamespace
 		requests = append(requests, req)
 	}
 
+	return requests
+}
+
+// CreateNodePlacementPredicate is separate from orphan cleanup: membership
+// changes must reconcile models even when no agent has created a ConfigMap.
+func CreateNodePlacementPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { _, ok := e.Object.(*corev1.Node); return ok },
+		DeleteFunc: func(e event.DeleteEvent) bool { _, ok := e.Object.(*corev1.Node); return ok },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			old, oldOK := e.ObjectOld.(*corev1.Node)
+			current, currentOK := e.ObjectNew.(*corev1.Node)
+			return oldOK && currentOK && (old.UID != current.UID || !maps.Equal(old.Labels, current.Labels))
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+// MapNodeToRestorationRequests only enqueues work; it never deletes reports.
+func MapNodeToRestorationRequests(ctx context.Context, c client.Client, log logr.Logger, obj client.Object, isNamespaced bool) []reconcile.Request {
+	if _, ok := obj.(*corev1.Node); !ok {
+		return nil
+	}
+	var objects []client.Object
+	if isNamespaced {
+		list := &v1beta1.BaseModelList{}
+		if err := c.List(ctx, list); err != nil {
+			log.Error(err, "List BaseModels for Node placement change")
+			return nil
+		}
+		for i := range list.Items {
+			objects = append(objects, &list.Items[i])
+		}
+	} else {
+		list := &v1beta1.ClusterBaseModelList{}
+		if err := c.List(ctx, list); err != nil {
+			log.Error(err, "List ClusterBaseModels for Node placement change")
+			return nil
+		}
+		for i := range list.Items {
+			objects = append(objects, &list.Items[i])
+		}
+	}
+	var requests []reconcile.Request
+	for _, model := range objects {
+		if model.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation] != "" {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+		}
+	}
 	return requests
 }

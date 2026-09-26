@@ -13,165 +13,121 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
+	"sigs.k8s.io/ome/pkg/utils"
 )
 
-// processModelStatus walks the per-node model-status ConfigMaps for
-// this model and folds them into nodesReady/nodesFailed via the
-// caller-supplied statusUpdateFunc. Per-node spec updates from the
-// agent flow through specUpdateFunc (filtered to entries that carry a
-// non-nil Config).
-func processModelStatus(ctx context.Context, kubeClient client.Client, nodeReader client.Reader, log logr.Logger, namespace, name string, isClusterScope bool,
-	specUpdateFunc func(context.Context, *shared.ModelConfig) error,
-	statusUpdateFunc func(context.Context, []string, []string) error) error {
+type modelStatusSnapshot struct {
+	ready, failed, evicted []string
+	configs                []*shared.ModelConfig
+	evicting               bool
+}
 
-	modelInfo := name
-	if !isClusterScope {
-		modelInfo = namespace + "/" + name
+// collectModelStatus validates reports against current placement participants.
+// A report's R is its last successful acknowledgement, not an
+// attempt ID: non-Ready observations cannot acknowledge the current request.
+func collectModelStatus(ctx context.Context, c client.Client, nodeReader client.Reader, log logr.Logger, obj client.Object, isClusterScoped bool) (modelStatusSnapshot, error) {
+	var snapshot modelStatusSnapshot
+	spec, _, err := shared.ModelSpecAndStatus(obj)
+	if err != nil {
+		return snapshot, err
 	}
-	log = log.WithValues("model", modelInfo)
-
+	request := obj.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation]
+	nodes := map[string]corev1.Node{}
+	if request != "" {
+		if nodeReader == nil {
+			return snapshot, fmt.Errorf("restoration status requires a current Node reader")
+		}
+		list := &corev1.NodeList{}
+		if err := nodeReader.List(ctx, list); err != nil {
+			return snapshot, fmt.Errorf("list restoration Nodes: %w", err)
+		}
+		for _, node := range list.Items {
+			if utils.ModelMatchesNodePlacement(spec.Storage, &node) {
+				nodes[node.Name] = node
+			}
+		}
+	}
 	configMaps := &corev1.ConfigMapList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(constants.OMENamespace),
-		client.MatchingLabels{constants.ModelStatusConfigMapLabel: "true"},
+	if err := c.List(ctx, configMaps, client.InNamespace(constants.OMENamespace), client.MatchingLabels{constants.ModelStatusConfigMapLabel: "true"}); err != nil {
+		return snapshot, fmt.Errorf("list model ConfigMaps: %w", err)
 	}
-	if err := kubeClient.List(ctx, configMaps, listOpts...); err != nil {
-		log.Error(err, "Failed to list ConfigMaps")
-		return fmt.Errorf("failed to list ConfigMaps: %w", err)
-	}
-
-	log.Info("Processing model status from ConfigMaps", "configMapsTotal", len(configMaps.Items))
-
-	var processedNodes, validNodes, readyNodes, failedNodes int
-	var nodesReady []string
-	var nodesFailed []string
-	var specUpdateErrors []string
-	modelKey := constants.GetModelConfigMapKey(namespace, name, isClusterScope)
-
-	for _, configMap := range configMaps.Items {
-		processedNodes++
-		data, exists := configMap.Data[modelKey]
+	modelKey := constants.GetModelConfigMapKey(obj.GetNamespace(), obj.GetName(), isClusterScoped)
+	for _, cm := range configMaps.Items {
+		data, exists := cm.Data[modelKey]
 		if !exists {
 			continue
 		}
-
-		orphaned, err := cleanupOrphanedNodeConfigMap(ctx, kubeClient, nodeReader, &configMap)
+		orphaned, err := cleanupOrphanedNodeConfigMap(ctx, c, nodeReader, &cm)
 		if err != nil {
-			return err
+			return snapshot, err
 		}
 		if orphaned {
 			continue
 		}
-		validNodes++
-
-		var modelEntry shared.ModelEntry
-		if err := json.Unmarshal([]byte(data), &modelEntry); err != nil {
-			log.Error(err, "Failed to parse model entry", "node", configMap.Name, "key", modelKey)
+		var entry shared.ModelEntry
+		if err := json.Unmarshal([]byte(data), &entry); err != nil {
+			log.Error(err, "Ignoring malformed model report", "node", cm.Name, "key", modelKey)
 			continue
 		}
-
-		log.V(1).Info("Processing model entry", "node", configMap.Name, "status", modelEntry.Status, "hasConfig", modelEntry.Config != nil, "hasProgress", modelEntry.Progress != nil)
-
-		if modelEntry.Config != nil {
-			if err := specUpdateFunc(ctx, modelEntry.Config); err != nil {
-				log.Error(err, "Failed to update model spec", "node", configMap.Name)
-				specUpdateErrors = append(specUpdateErrors, configMap.Name)
+		if entry.ModelUID != "" && entry.ModelUID != obj.GetUID() {
+			continue
+		}
+		currentAcknowledgement := true
+		if request != "" {
+			node, eligible := nodes[cm.Name]
+			if !eligible || obj.GetUID() == "" || node.UID == "" || entry.ModelUID != obj.GetUID() || entry.NodeUID != node.UID {
+				continue
 			}
+			currentAcknowledgement = entry.Status == shared.ModelStatusReady && entry.ArtifactRehydrationID == request
 		}
-
-		switch modelEntry.Status {
+		if currentAcknowledgement && entry.Config != nil {
+			snapshot.configs = append(snapshot.configs, entry.Config)
+		}
+		switch entry.Status {
 		case shared.ModelStatusReady:
-			nodesReady = addToSlice(nodesReady, configMap.Name)
-			readyNodes++
+			if currentAcknowledgement {
+				snapshot.ready = addToSlice(snapshot.ready, cm.Name)
+			}
 		case shared.ModelStatusFailed:
-			nodesFailed = addToSlice(nodesFailed, configMap.Name)
-			failedNodes++
-		case shared.ModelStatusUpdating, shared.ModelStatusDeleted:
-		default:
-			log.V(1).Info("Unknown model status", "node", configMap.Name, "status", modelEntry.Status)
+			snapshot.failed = addToSlice(snapshot.failed, cm.Name)
+		case shared.ModelStatusEvicted:
+			snapshot.evicted = addToSlice(snapshot.evicted, cm.Name)
+		case shared.ModelStatusEvicting:
+			snapshot.evicting = true
 		}
 	}
-
-	slices.Sort(nodesReady)
-	slices.Sort(nodesFailed)
-
-	log.Info("Model status summary",
-		"readyNodes", readyNodes,
-		"failedNodes", failedNodes,
-		"totalProcessed", processedNodes,
-		"validNodes", validNodes)
-
-	if len(specUpdateErrors) > 0 {
-		log.Info("Some nodes failed spec updates", "failedNodes", specUpdateErrors)
-	}
-
-	return statusUpdateFunc(ctx, nodesReady, nodesFailed)
+	slices.Sort(snapshot.ready)
+	slices.Sort(snapshot.failed)
+	slices.Sort(snapshot.evicted)
+	return snapshot, nil
 }
 
-func updateModelSpecWithConfig(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, spec *v1beta1.BaseModelSpec, config *shared.ModelConfig, modelType string) error {
-	if updated := shared.UpdateSpecWithConfig(spec, config); updated {
-		if err := kubeClient.Update(ctx, obj); err != nil {
-			return fmt.Errorf("failed to update %s spec: %w", modelType, err)
-		}
-		log.Info(fmt.Sprintf("Updated %s spec with configuration data", modelType),
-			"name", obj.GetName(), "namespace", obj.GetNamespace())
+func (s modelStatusSnapshot) lifecycleState() v1beta1.LifeCycleState {
+	if len(s.ready) > 0 {
+		return v1beta1.LifeCycleStateReady
 	}
-	return nil
-}
-
-func addToSlice(s []string, item string) []string {
-	for _, existing := range s {
-		if existing == item {
-			return s
-		}
+	if s.evicting {
+		return v1beta1.LifeCycleStateInTransit
 	}
-	return append(s, item)
+	if len(s.evicted) > 0 {
+		return v1beta1.LifeCycleStateEvicted
+	}
+	return CalculateLifecycleState(s.ready, s.failed)
 }
 
 func CalculateLifecycleState(nodesReady, nodesFailed []string) v1beta1.LifeCycleState {
 	if len(nodesReady) > 0 {
 		return v1beta1.LifeCycleStateReady
-	} else if len(nodesFailed) > 0 {
+	}
+	if len(nodesFailed) > 0 {
 		return v1beta1.LifeCycleStateFailed
 	}
 	return v1beta1.LifeCycleStateInTransit
 }
 
-func updateModelStatusWithRetry(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, nodesReady, nodesFailed []string, modelType string) error {
-	updateFunc := func(ctx context.Context, client client.Client, obj client.Object) error {
-		_, status, err := shared.ModelSpecAndStatus(obj)
-		if err != nil {
-			return err
-		}
-
-		newState := CalculateLifecycleState(nodesReady, nodesFailed)
-		if slices.Equal(status.NodesReady, nodesReady) &&
-			slices.Equal(status.NodesFailed, nodesFailed) &&
-			status.State == newState {
-			return nil
-		}
-
-		status.NodesReady = nodesReady
-		status.NodesFailed = nodesFailed
-		status.State = newState
-		shared.StampObservedReconcile(obj, status)
-
-		if err := client.Status().Update(ctx, obj); err != nil {
-			return err
-		}
-		log.Info(fmt.Sprintf("Updated %s status", modelType),
-			"nodesReady", len(nodesReady),
-			"nodesFailed", len(nodesFailed),
-			"state", newState)
-		return nil
+func addToSlice(s []string, item string) []string {
+	if !slices.Contains(s, item) {
+		return append(s, item)
 	}
-
-	return shared.RetryUpdate(ctx, kubeClient, log, obj, "status", updateFunc)
-}
-
-func retrySpecUpdate(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, config *shared.ModelConfig, updateFunc func(context.Context, client.Client, client.Object, *shared.ModelConfig) error) error {
-	wrappedUpdateFunc := func(ctx context.Context, client client.Client, obj client.Object) error {
-		return updateFunc(ctx, client, obj, config)
-	}
-	return shared.RetryUpdate(ctx, kubeClient, log, obj, "spec", wrappedUpdateFunc)
+	return s
 }

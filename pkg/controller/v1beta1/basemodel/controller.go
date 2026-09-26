@@ -169,6 +169,13 @@ func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(pernode.CreateNodeDeletionPredicate()),
 		).
 		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return pernode.MapNodeToRestorationRequests(ctx, r.Client, r.Log, obj, true)
+			}),
+			builder.WithPredicates(pernode.CreateNodePlacementPredicate()),
+		).
+		Watches(
 			&corev1.PersistentVolumeClaim{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 				return pvc.MapToBaseModels(ctx, r.Client, r.Log, obj)
@@ -198,6 +205,13 @@ func (r *ClusterBaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return pernode.HandleNodeDeletion(ctx, r.Client, r.Log, obj)
 			}),
 			builder.WithPredicates(pernode.CreateNodeDeletionPredicate()),
+		).
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return pernode.MapNodeToRestorationRequests(ctx, r.Client, r.Log, obj, false)
+			}),
+			builder.WithPredicates(pernode.CreateNodePlacementPredicate()),
 		).
 		Watches(
 			&corev1.PersistentVolumeClaim{},
