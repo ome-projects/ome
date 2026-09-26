@@ -42,6 +42,107 @@ func TestHfArtifactStartupCorruptChildDoesNotBlockOtherParents(t *testing.T) {
 	assert.Equal(t, HfArtifactStatusUpdating, stored.Status, "preserve corrupt relationship for reconstruction")
 }
 
+func TestGopherHfArtifactRecoveryPreservesNestedActiveOwner(t *testing.T) {
+	for _, recovery := range []string{"startup", "path retry"} {
+		for _, layout := range []string{"configured", "external legacy"} {
+			t.Run(recovery+"/"+layout, func(t *testing.T) {
+				ctx := context.Background()
+				repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+				input := testHfArtifactTaskInput(t, t.TempDir(), "family/child")
+				configuredRoot := input.ModelStoreRoot
+				if layout == "external legacy" {
+					configuredRoot = t.TempDir()
+					// Legacy external tasks derive their store from the parent.
+					input.ModelStoreRoot = hfArtifactParentStoreRoot(input.Parent)
+				}
+				require.NoError(t, os.MkdirAll(input.Parent.LocalPath, 0700))
+				active := &Gopher{configMapReconciler: repository.configMaps, modelRootDir: configuredRoot}
+				unlock, acquired, err := active.sharedHfArtifactHandler().tryArtifactOperation(input)
+				require.NoError(t, err)
+				require.True(t, acquired)
+				held := true
+				defer func() {
+					if held {
+						unlock()
+					}
+				}()
+				parent, acquired, err := repository.TryAcquireLock(ctx, input.Parent)
+				require.NoError(t, err)
+				require.True(t, acquired)
+				maps := repository.configMaps
+				restarted := &Gopher{
+					configMapReconciler: NewConfigMapReconciler(maps.nodeName, maps.namespace, maps.kubeClient, maps.logger),
+					modelRootDir:        configuredRoot,
+				}
+				restarted.sharedHfArtifactHandler()
+				startup := restarted.hfArtifactStartup
+				if recovery == "startup" {
+					require.NoError(t, startup.recover(ctx))
+				} else {
+					require.ErrorContains(t, startup.recoverParentAtPath(ctx, parent.Key, parent.LocalPath), "active owner")
+				}
+				actual, found, err := repository.Get(ctx, parent.Identity)
+				require.NoError(t, err)
+				require.True(t, found)
+				require.Equal(t, HfArtifactStatusUpdating, actual.Status)
+				require.Equal(t, parent.LockID, actual.LockID)
+				unlock()
+				held = false
+				require.NoError(t, startup.recoverParentAtPath(ctx, parent.Key, parent.LocalPath))
+				actual, _, err = repository.Get(ctx, parent.Identity)
+				require.NoError(t, err)
+				require.Equal(t, HfArtifactStatusFailed, actual.Status, "an abandoned unmarked owner can be recovered")
+			})
+		}
+	}
+}
+
+func TestAliasedRootRecoveryPreservesActiveWriter(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		t.Run(fmt.Sprint(persisted), func(t *testing.T) {
+			ctx := context.Background()
+			repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+			realBase, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			realRoot := filepath.Join(realBase, "store")
+			require.NoError(t, os.MkdirAll(realRoot, 0o700))
+			aliasBase := filepath.Join(t.TempDir(), "base-alias")
+			require.NoError(t, os.Symlink(realBase, aliasBase))
+			aliasRoot := filepath.Join(aliasBase, "store")
+			task := newOCIInputTestTask()
+			*task.BaseModel.Spec.Storage.Path = filepath.Join(realRoot, "family", "child")
+			input, eligible, err := newHfArtifactTaskInputForOCI(task, task.BaseModel.Spec.Storage, aliasRoot)
+			require.NoError(t, err)
+			require.True(t, eligible)
+			active := &Gopher{configMapReconciler: repository.configMaps, modelRootDir: aliasRoot}
+			if persisted {
+				parent := input.Parent
+				parent.Children = map[string]string{input.ChildModelKey: input.ChildModelPath}
+				input, err = active.hfArtifactInputForChild(task, parent)
+				require.NoError(t, err)
+			}
+			require.NoError(t, os.MkdirAll(input.Parent.LocalPath, 0o700))
+			unlock, acquired, err := active.sharedHfArtifactHandler().tryArtifactOperation(input)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			defer unlock()
+			parent, acquired, err := repository.TryAcquireLock(ctx, input.Parent)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			maps := repository.configMaps
+			restarted := &Gopher{modelRootDir: aliasRoot,
+				configMapReconciler: NewConfigMapReconciler(maps.nodeName, maps.namespace, maps.kubeClient, maps.logger)}
+			restarted.sharedHfArtifactHandler()
+			require.NoError(t, restarted.hfArtifactStartup.recover(ctx))
+			actual, found, err := repository.Get(ctx, parent.Identity)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, HfArtifactStatusUpdating, actual.Status, "startup must not recover an active writer through another root spelling")
+			require.Equal(t, parent.LockID, actual.LockID)
+		})
+	}
+}
+
 func TestHfArtifactStartupValidatesAfterMarkerOnlyCompletion(t *testing.T) {
 	h, first, second := newTestHfArtifactRepair(t)
 	ctx := context.Background()

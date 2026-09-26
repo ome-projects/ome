@@ -53,7 +53,10 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 			s.demoteToNormalPriority(task)
 			return true, true, nil
 		}
-		oldInput := s.hfArtifactInputForChild(task, stored)
+		oldInput, inputErr := s.hfArtifactInputForChild(task, stored)
+		if inputErr != nil {
+			return true, false, inputErr
+		}
 		preserve, lookupErr := s.hfArtifactHasOtherPathUsers(oldInput)
 		if lookupErr != nil {
 			return true, false, lookupErr
@@ -127,6 +130,7 @@ func (s *Gopher) sharedHfArtifactHandler() *hfArtifactTaskHandler {
 		s.hfArtifactHandler.hasOtherPathUsers = s.hfArtifactHasOtherPathUsers
 		s.hfArtifactHandler.isCurrentChildUID = s.hfArtifactIsCurrentChildUID
 		s.hfArtifactStartup = newHfArtifactStartup(s.hfArtifactHandler)
+		s.hfArtifactStartup.modelStoreRoot = s.modelRootDir
 	})
 	return s.hfArtifactHandler
 }
@@ -247,7 +251,10 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 	if err != nil || !found {
 		return noop, err
 	}
-	input := s.hfArtifactInputForChild(task, parent)
+	input, err := s.hfArtifactInputForChild(task, parent)
+	if err != nil {
+		return noop, err
+	}
 	unlock, acquired, err := handler.tryParentFileOperation(parent, input.ModelStoreRoot)
 	if err != nil {
 		return noop, err
@@ -340,7 +347,11 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 	}
 	if found {
 		input.Parent = parent
-		if !hfArtifactInputPathWithin(input.ModelStoreRoot, parent.LocalPath) {
+		root, err := canonicalHfArtifactStoreRoot(input.ModelStoreRoot)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+		if _, err := hfArtifactPathInRoot(parent.LocalPath, input.ModelStoreRoot, root); err != nil {
 			// One identity has one recorded parent. Do not attach
 			// a child whose scan root cannot protect that parent's other links.
 			return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
@@ -369,20 +380,16 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 	return handler.handleDownload(ctx, input, download)
 }
 
-func (s *Gopher) hfArtifactInputForChild(task *GopherTask, parent HfArtifactEntry) hfArtifactTaskInput {
+func (s *Gopher) hfArtifactInputForChild(task *GopherTask, parent HfArtifactEntry) (hfArtifactTaskInput, error) {
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
 	// Derive the scan boundary from the recorded parent, including custom
 	// BaseModel roots outside the agent's default model directory.
-	root := parent.LocalPath
-	for i := 0; i < len(strings.Split(parent.Identity.ModelID, "/"))+2; i++ {
-		root = filepath.Dir(root)
-	}
-	if s.modelRootDir != "" && hfArtifactInputPathWithin(s.modelRootDir, parent.LocalPath) &&
-		hfArtifactInputPathWithin(s.modelRootDir, parent.Children[key]) {
-		root = s.modelRootDir
+	root, err := hfArtifactStoreRootForPaths(s.modelRootDir, hfArtifactParentStoreRoot(parent), parent.LocalPath, parent.Children[key])
+	if err != nil {
+		return hfArtifactTaskInput{}, err
 	}
 	return hfArtifactTaskInput{Parent: parent, ChildModelKey: key, ChildModelUID: types.UID(getModelUID(task)),
-		ChildModelPath: parent.Children[key], ModelStoreRoot: root}
+		ChildModelPath: parent.Children[key], ModelStoreRoot: root}, nil
 }
 
 // detachHfArtifactForDefaultDownload releases persisted shared ownership before
@@ -416,7 +423,10 @@ func (s *Gopher) detachHfArtifactForDefaultDownload(ctx context.Context, task *G
 		s.demoteToNormalPriority(task)
 		return true, nil
 	}
-	input := s.hfArtifactInputForChild(task, parent)
+	input, err := s.hfArtifactInputForChild(task, parent)
+	if err != nil {
+		return false, err
+	}
 	preserve, err := s.hfArtifactHasOtherPathUsers(input)
 	if err != nil {
 		return false, err
@@ -476,7 +486,10 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 		}
 		return false, false, nil
 	}
-	input := s.hfArtifactInputForChild(task, parent)
+	input, err := s.hfArtifactInputForChild(task, parent)
+	if err != nil {
+		return true, false, err
+	}
 	preserve, err := s.hfArtifactHasOtherPathUsers(input)
 	if err != nil {
 		return true, false, err
@@ -523,7 +536,10 @@ func (s *Gopher) resumeHfArtifactChildDeletion(ctx context.Context, task *Gopher
 		s.demoteToNormalPriority(task)
 		return true, true, nil
 	}
-	input := s.hfArtifactInputForChild(task, pending.parentForChild(key))
+	input, err := s.hfArtifactInputForChild(task, pending.parentForChild(key))
+	if err != nil {
+		return true, false, err
+	}
 	input.RetainDeletionReceipt = task.TaskType == Delete
 	input.PreserveChildPath = task.TaskType == Delete && s.isReservingModelArtifact(task)
 	err = s.hfArtifactStartup.recover(ctx)

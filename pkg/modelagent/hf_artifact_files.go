@@ -34,18 +34,143 @@ func canonicalHfArtifactStoreRoot(root string) (string, error) {
 	}
 	// Resolve OS aliases above the store (e.g. /var -> /private/var), including
 	// when the store has not been created yet. Links below it are not allowed.
-	base := root
-	for {
-		resolved, err := filepath.EvalSymlinks(base)
-		if err == nil {
-			relative, _ := filepath.Rel(base, root)
-			return filepath.Join(resolved, relative), nil
-		}
-		if !os.IsNotExist(err) || filepath.Dir(base) == base {
+	return resolveArtifactPath(root)
+}
+
+// resolveArtifactPath follows existing aliases and preserves a missing suffix.
+// A dangling link is not a missing directory: its unresolved target is unsafe
+// for proving that a persisted reference is unrelated to an eviction.
+func resolveArtifactPath(path string) (string, error) {
+	return resolveArtifactPathWithMissingLinks(path, false)
+}
+
+func resolveArtifactPathWithMissingLinks(path string, allowMissingLinks bool) (string, error) {
+	if path == "" || strings.ContainsRune(path, '\x00') {
+		return "", fmt.Errorf("invalid artifact path %q", path)
+	}
+	if !filepath.IsAbs(path) {
+		cwd, err := os.Getwd()
+		if err != nil {
 			return "", err
 		}
-		base = filepath.Dir(base)
+		path = cwd + string(filepath.Separator) + path
 	}
+	base := path
+	var suffix []string
+	links := 0
+	for {
+		base = strings.TrimRight(base, string(filepath.Separator))
+		if base == "" {
+			base = string(filepath.Separator)
+		}
+		resolved, err := filepath.EvalSymlinks(base)
+		if err == nil {
+			return filepath.Join(append([]string{resolved}, suffix...)...), nil
+		}
+		if !os.IsNotExist(err) || base == string(filepath.Separator) {
+			return "", err
+		}
+		if info, statErr := os.Lstat(base); statErr == nil {
+			if allowMissingLinks && info.Mode()&os.ModeSymlink != 0 && links < 40 {
+				target, err := os.Readlink(base)
+				if err != nil {
+					return "", err
+				}
+				if !filepath.IsAbs(target) {
+					target = base[:strings.LastIndex(base, string(filepath.Separator))+1] + target
+				}
+				base = target + string(filepath.Separator) + strings.Join(suffix, string(filepath.Separator))
+				suffix = nil
+				links++
+				continue
+			}
+			return "", fmt.Errorf("cannot resolve existing artifact path %s: %w", base, err)
+		} else if !os.IsNotExist(statErr) {
+			return "", statErr
+		}
+		// Keep the raw prefix until the filesystem resolves it: cleaning
+		// symlink/../child first can select a different physical directory.
+		separator := strings.LastIndex(base, string(filepath.Separator))
+		part := base[separator+1:]
+		if part == ".." {
+			return "", fmt.Errorf("cannot resolve artifact parent traversal %s: %w", base, err)
+		}
+		suffix = append([]string{part}, suffix...)
+		base = base[:separator]
+	}
+}
+
+// Walk actual filesystem entries, including intermediate aliases that are lost
+// when resolving only the final destination. Preserve symlink/.. semantics and
+// the caller's existing policy for dangling links and missing suffixes.
+func walkArtifactPath(path string, allowMissingLinks bool, visitEntry func(string, bool) error) (string, error) {
+	resolved, err := resolveArtifactPathWithMissingLinks(path, allowMissingLinks)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(path) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		path = cwd + string(filepath.Separator) + path
+	}
+	parts, current, links := strings.Split(path, string(filepath.Separator)), string(filepath.Separator), 0
+	for len(parts) > 0 {
+		part := parts[0]
+		parts = parts[1:]
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			current = filepath.Dir(current)
+			continue
+		}
+		next := filepath.Join(current, part)
+		info, err := os.Lstat(next)
+		if err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		link := err == nil && info.Mode()&os.ModeSymlink != 0
+		if err := visitEntry(next, link); err != nil {
+			return "", err
+		}
+		if link {
+			links++
+			if links > 40 {
+				return "", fmt.Errorf("too many artifact path links")
+			}
+			target, err := os.Readlink(next)
+			if err != nil {
+				return "", err
+			}
+			if filepath.IsAbs(target) {
+				current = string(filepath.Separator)
+			}
+			parts = append(strings.Split(target, string(filepath.Separator)), parts...)
+		} else {
+			current = next
+		}
+	}
+	if current != resolved {
+		return "", fmt.Errorf("artifact path changed during resolution: %s", path)
+	}
+	return current, nil
+}
+
+// Intermediate entries must survive too, but merely traversing a common
+// ancestor (such as the store root) does not reference all its descendants.
+func artifactReferenceUsesPath(reference, target string) (bool, error) {
+	used := false
+	resolved, err := walkArtifactPath(reference, false, func(entry string, _ bool) error {
+		used = used || hfArtifactInputPathWithin(target, entry)
+		return nil
+	})
+	return err == nil && (used || artifactPathsOverlap(target, resolved)), err
+}
+
+func artifactPathsOverlap(a, b string) bool {
+	return hfArtifactInputPathWithin(a, b) || hfArtifactInputPathWithin(b, a)
 }
 
 func validateHfArtifactCleanPath(path string) error {
@@ -104,6 +229,25 @@ func hfArtifactParentStoreRoot(parent HfArtifactEntry) string {
 		root = filepath.Dir(root)
 	}
 	return root
+}
+
+// Use the configured lock/scan boundary for physically contained paths, even
+// when the configuration and persisted paths spell an ancestor alias differently.
+// External legacy parents retain their existing derived boundary.
+func hfArtifactStoreRootForPaths(configuredRoot, derivedRoot string, paths ...string) (string, error) {
+	if configuredRoot == "" {
+		return derivedRoot, nil
+	}
+	root, err := canonicalHfArtifactStoreRoot(configuredRoot)
+	if err != nil {
+		return "", err
+	}
+	for _, path := range paths {
+		if _, err := hfArtifactPathInRoot(path, configuredRoot, root); err != nil {
+			return derivedRoot, nil
+		}
+	}
+	return configuredRoot, nil
 }
 
 func validateHfArtifactParentPath(parent HfArtifactEntry, modelStoreRoot string) (string, string, error) {

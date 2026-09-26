@@ -12,15 +12,24 @@ import (
 // ownership. A parent's Ready state survives a restart; this validation cache
 // deliberately does not.
 type hfArtifactStartup struct {
-	mu        sync.Mutex
-	recovered bool
-	pending   map[string]bool            // true while a worker validates this startup parent
-	deferred  map[string]HfArtifactEntry // Updating parents awaiting ownership recovery.
-	handler   *hfArtifactTaskHandler
+	mu             sync.Mutex
+	recovered      bool
+	pending        map[string]bool            // true while a worker validates this startup parent
+	deferred       map[string]HfArtifactEntry // Updating parents awaiting ownership recovery.
+	handler        *hfArtifactTaskHandler
+	modelStoreRoot string
 }
 
 func newHfArtifactStartup(handler *hfArtifactTaskHandler) *hfArtifactStartup {
 	return &hfArtifactStartup{handler: handler, pending: make(map[string]bool), deferred: make(map[string]HfArtifactEntry)}
+}
+
+func (s *hfArtifactStartup) tryParentFileOperation(parent HfArtifactEntry) (func(), bool, error) {
+	storeRoot, err := hfArtifactStoreRootForPaths(s.modelStoreRoot, hfArtifactParentStoreRoot(parent), parent.LocalPath)
+	if err != nil {
+		return nil, false, err
+	}
+	return s.handler.tryParentFileOperation(parent, storeRoot)
 }
 
 // recover must run before any shared-artifact task can acquire a parent. Keeping
@@ -65,7 +74,7 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 			continue
 		}
 		if parent.Status == HfArtifactStatusUpdating {
-			unlock, acquired, err := s.handler.tryParentFileOperation(parent, hfArtifactParentStoreRoot(parent))
+			unlock, acquired, err := s.tryParentFileOperation(parent)
 			if err != nil {
 				s.deferred[key] = parent
 				s.pending[key] = false
@@ -149,7 +158,7 @@ func (s *hfArtifactStartup) recoverParentAtPath(ctx context.Context, key, path s
 		}
 		s.deferred[key] = expected
 	}
-	unlock, acquired, err := s.handler.tryParentFileOperation(expected, hfArtifactParentStoreRoot(expected))
+	unlock, acquired, err := s.tryParentFileOperation(expected)
 	if err != nil {
 		return err
 	}

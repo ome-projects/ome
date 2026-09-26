@@ -220,3 +220,58 @@ func TestHfArtifactFileLocksContendAcrossRootAliases(t *testing.T) {
 		})
 	}
 }
+
+func TestHfArtifactChildLocksSerializePathFamilies(t *testing.T) {
+	for _, pair := range [][2]string{{"a", "a/nested"}, {"a/nested", "a"}, {"a/first", "a/second"}, {"a", "b"}} {
+		t.Run(pair[0]+"-"+pair[1], func(t *testing.T) {
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			first := hfArtifactTaskInput{ModelStoreRoot: root, ChildModelPath: filepath.Join(root, pair[0])}
+			second := hfArtifactTaskInput{ModelStoreRoot: root, ChildModelPath: filepath.Join(root, pair[1])}
+			lock, acquired, err := tryHfArtifactChildFileLock(first)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			defer lock.Close()
+			require.Equal(t, filepath.Join(root, hfArtifactLockDirectory), filepath.Dir(lock.Path()), "stable locks must be outside removable model directories")
+			next, acquired, err := tryHfArtifactChildFileLock(second)
+			require.NoError(t, err)
+			if pair[1] == "b" {
+				require.True(t, acquired, "disjoint top-level families remain concurrent")
+				require.NoError(t, next.Close())
+			} else {
+				require.False(t, acquired, "ancestor, descendant, and sibling writers share one family lock")
+			}
+			require.NoError(t, lock.Close())
+			require.FileExists(t, lock.Path())
+			next, acquired, err = tryHfArtifactChildFileLock(second)
+			require.NoError(t, err)
+			require.True(t, acquired)
+			require.NoError(t, next.Close())
+		})
+	}
+}
+
+func TestHfArtifactNestedParentSharesChildPathFamily(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	input := testHfArtifactTaskInput(t, root, "family/child")
+	parent, acquired, err := tryHfArtifactParentFileLock(input.Parent, root)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer parent.Close()
+	require.Equal(t, filepath.Join(root, hfArtifactLockDirectory), filepath.Dir(parent.Path()))
+	// Parent-only startup recovery must exclude ordinary ancestor writers too.
+	_, acquired, err = tryHfArtifactChildFileLock(hfArtifactTaskInput{ModelStoreRoot: root, ChildModelPath: filepath.Join(root, "family")})
+	require.NoError(t, err)
+	require.False(t, acquired)
+	require.NoError(t, parent.Close())
+	repository, _ := newTestHfArtifactRepository(t, map[string]string{})
+	handler := newHfArtifactTaskHandler(repository)
+	unlock, acquired, err := handler.tryArtifactOperation(input)
+	require.NoError(t, err)
+	require.True(t, acquired, "shared parent and child in one family must not self-contend")
+	defer unlock()
+	_, acquired, err = tryHfArtifactChildFileLock(hfArtifactTaskInput{ModelStoreRoot: root, ChildModelPath: filepath.Join(root, "family", "sibling")})
+	require.NoError(t, err)
+	require.False(t, acquired)
+}

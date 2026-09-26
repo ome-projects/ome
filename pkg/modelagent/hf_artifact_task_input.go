@@ -25,7 +25,7 @@ func isHfArtifactShapeFiltered(task *GopherTask) bool {
 	return filter != nil && filter.IsTensorrtLLMModel && filter.ModelType == string(constants.ServingBaseModel)
 }
 
-// newHfArtifactTaskInputForOCI plans a complete HF-origin OCI copy without I/O.
+// newHfArtifactTaskInputForOCI plans a complete HF-origin OCI copy without source I/O.
 // Ineligible sources use the legacy path (false, nil). Eligible sources with
 // unsafe local paths return an error instead of falling back to a download.
 func newHfArtifactTaskInputForOCI(task *GopherTask, storageSpec *v1beta1.StorageSpec, modelRootDir string) (hfArtifactTaskInput, bool, error) {
@@ -93,9 +93,12 @@ func newHfArtifactTaskInput(task *GopherTask, storageSpec *v1beta1.StorageSpec, 
 		if hfArtifactInputPathWithin(childPath, configuredRoot) {
 			return hfArtifactTaskInput{}, false, fmt.Errorf("child path %s contains model root %s", childPath, configuredRoot)
 		}
-		if hfArtifactInputPathWithin(configuredRoot, childPath) {
-			root = configuredRoot
-		} else if task.ClusterBaseModel != nil {
+		var err error
+		root, err = hfArtifactStoreRootForPaths(configuredRoot, root, childPath)
+		if err != nil {
+			return hfArtifactTaskInput{}, false, err
+		}
+		if root != configuredRoot && task.ClusterBaseModel != nil {
 			return hfArtifactTaskInput{}, false, fmt.Errorf("child path %s is outside cluster model root %s", childPath, configuredRoot)
 		}
 	}
@@ -103,7 +106,13 @@ func newHfArtifactTaskInput(task *GopherTask, storageSpec *v1beta1.StorageSpec, 
 	if task.ClusterBaseModel != nil {
 		parentPath = filepath.Join(root, constants.ModelArtifactsDirectory, filepath.FromSlash(identity.ModelID), identity.CommitSHA)
 	}
-	if !hfArtifactInputPathWithin(root, parentPath) ||
+	physicalRoot, err := canonicalHfArtifactStoreRoot(root)
+	if err != nil {
+		return hfArtifactTaskInput{}, false, err
+	}
+	physicalChild, childErr := hfArtifactPathInRoot(childPath, root, physicalRoot)
+	_, parentErr := hfArtifactPathInRoot(parentPath, root, physicalRoot)
+	if childErr != nil || parentErr != nil || physicalChild == physicalRoot ||
 		hfArtifactInputPathWithin(childPath, parentPath) || hfArtifactInputPathWithin(parentPath, childPath) {
 		return hfArtifactTaskInput{}, false, fmt.Errorf("shared Hugging Face parent %s conflicts with child path %s or model root %s", parentPath, childPath, root)
 	}
