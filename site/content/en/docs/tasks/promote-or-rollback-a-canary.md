@@ -21,9 +21,9 @@ target rejected?* — and are distinct from `kubectl ome rollout pause` and
 
 ## Before you begin
 
-- Install the [kubectl-ome plugin](/docs/tasks/kubectl-ome/). Both commands
+- Install the [kubectl-ome plugin](/ome/docs/tasks/kubectl-ome/). Both commands
   patch the InferenceService, so you also need the action RBAC rule from
-  [Required RBAC](/docs/tasks/kubectl-ome/#required-rbac) in addition to read
+  [Required RBAC](/ome/docs/tasks/kubectl-ome/#required-rbac) in addition to read
   access on `inferenceservices` and `inferencereplicas`.
 - The target must be an OMENative-managed InferenceService with an active
   pinned rollout run whose plan contains exactly one canary group.
