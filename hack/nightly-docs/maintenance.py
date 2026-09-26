@@ -400,6 +400,7 @@ def finish(ctx, directory, apply):
     findings = json.loads(findings_path.read_text()) if findings_path.exists() else ["Checks did not complete."]
     technical = os.getenv("BUILD_OK") == "true" and os.getenv("CHECKS_OK") == "true" and not findings
     accepted = technical and verdict["single_concern"] and verdict["accurate"]
+    resolved = []
     reason = "\n".join(findings + [verdict["reason"]])
     if not technical:
         reason += "\nProduction build or deterministic validation did not pass."
@@ -426,6 +427,7 @@ def finish(ctx, directory, apply):
                     continue
                 api("graphql", "POST", {"query": "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}",
                                         "variables": {"id": thread}})
+                resolved.append(thread)
                 expected_details["threads"] = [t for t in expected_details["threads"] if t["id"] != thread]
             for index, thread in enumerate(expected_details["threads"], 1):
                 thread["number"] = index
@@ -441,7 +443,7 @@ def finish(ctx, directory, apply):
         save_state(ctx, state)
     result = {"number": ctx["number"], "applied": apply, "accepted": accepted, "head": head,
               "base": ctx["base"], "review_base": ctx.get("review_base", ctx["base"]),
-              "reason": reason, "resolved_bot_threads": threads if accepted else []}
+              "reason": reason, "resolved_bot_threads": resolved}
     (directory / "result.json").write_text(json.dumps(result, indent=2))
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
         summary.write(f"PR #{ctx['number']}: {'validated' if accepted else 'needs repair'}; "

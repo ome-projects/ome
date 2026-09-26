@@ -152,8 +152,11 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(api.call_args.args, ('repos/ome-projects/ome/pulls/7',))
 
     def test_feedback_arriving_during_publication_is_not_marked_reviewed(self):
-        original = {"threads": [], "comments": [], "failed_checks": []}
-        fresh = {**original, "comments": [{"body": "New concern after publication"}]}
+        thread = {"id": "T", "number": 1, "comments": [{"author": {"__typename": "Bot", "login": "claude"}}]}
+        original = {"threads": [thread], "comments": [], "failed_checks": []}
+        fresh = copy.deepcopy(original)
+        fresh['threads'][0]['comments'].append({'author': {'__typename': 'User', 'login': 'reviewer'},
+                                                'body': 'New concern after publication'})
         pr = pull()
         ctx = {"number": 7, "head": "old", "base": pr['base']['sha'], "feedback": original,
                "attempts": 1, "extra_feedback": "", "run_url": "https://example.test/run"}
@@ -161,7 +164,8 @@ class PolicyTests(unittest.TestCase):
             root = Path(directory)
             (root / 'checks.json').write_text('[]')
             with patch.dict(os.environ, {"BUILD_OK": "true", "CHECKS_OK": "true",
-                    "REVIEW_JSON": json.dumps({"accurate": True, "single_concern": True, "reason": "Verified"}),
+                    "REVIEW_JSON": json.dumps({"accurate": True, "single_concern": True, "reason": "Verified",
+                                                "addressed_threads": [1]}),
                     "GITHUB_STEP_SUMMARY": str(root / 'summary')}), \
                     patch.object(m, 'live_match'), patch.object(m, 'publish_repair', return_value=pr['head']['sha']), \
                     patch.object(m, 'record_check'), patch.object(m, 'api', return_value=pr), \
@@ -170,6 +174,7 @@ class PolicyTests(unittest.TestCase):
                 m.finish(ctx, root, True)
             state = save.call_args.args[1]
             self.assertEqual(m.decision(state, m.signature(pr, fresh)), 'work')
+            self.assertEqual(json.loads((root / 'result.json').read_text())['resolved_bot_threads'], [])
 
     def test_enabled_merge_uses_normal_squash_and_expected_head(self):
         pr = pull()
