@@ -169,7 +169,7 @@ func TestGetNodeLabelPatchPayloadBytes(t *testing.T) {
 		ModelStateOnNode: Ready,
 	}
 
-	payload, err := getNodeLabelPatchPayloadBytes(op)
+	payload, err := getNodeLabelPatchPayloadBytes(op, "")
 	assert.NoError(t, err)
 
 	// Verify JSON patch structure
@@ -193,7 +193,7 @@ func TestGetNodeLabelPatchPayloadBytes(t *testing.T) {
 		ModelStateOnNode: Updating,
 	}
 
-	payload, err = getNodeLabelPatchPayloadBytes(op)
+	payload, err = getNodeLabelPatchPayloadBytes(op, "")
 	assert.NoError(t, err)
 
 	err = json.Unmarshal(payload, &patches)
@@ -209,7 +209,7 @@ func TestGetNodeLabelPatchPayloadBytes(t *testing.T) {
 
 	// Test with Failed state
 	op.ModelStateOnNode = Failed
-	payload, err = getNodeLabelPatchPayloadBytes(op)
+	payload, err = getNodeLabelPatchPayloadBytes(op, "")
 	assert.NoError(t, err)
 
 	err = json.Unmarshal(payload, &patches)
@@ -221,7 +221,7 @@ func TestGetNodeLabelPatchPayloadBytes(t *testing.T) {
 
 	// Test with Deleted state (should be "remove" operation)
 	op.ModelStateOnNode = Deleted
-	payload, err = getNodeLabelPatchPayloadBytes(op)
+	payload, err = getNodeLabelPatchPayloadBytes(op, "")
 	assert.NoError(t, err)
 
 	// For a remove operation, let's verify the raw JSON doesn't contain a value field
@@ -241,7 +241,7 @@ func TestGetNodeLabelPatchPayloadBytes(t *testing.T) {
 		ModelStateOnNode: Ready,
 	}
 
-	_, err = getNodeLabelPatchPayloadBytes(op)
+	_, err = getNodeLabelPatchPayloadBytes(op, "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "empty op without any models")
 }

@@ -21,9 +21,14 @@ import (
 // NodeLabelOp represents an operation on node labels
 // This is used to pass model references to the NodeLabelReconciler
 type NodeLabelOp struct {
-	ModelStateOnNode ModelStateOnNode
-	BaseModel        *v1beta1.BaseModel
-	ClusterBaseModel *v1beta1.ClusterBaseModel
+	validateCurrent       func() error
+	artifactRehydrationID string // Only a committed Ready report supplies this.
+	nodeUID               types.UID
+	requestLabelOnly      bool
+	deleteLabelKeys       []string // Present keys in the node snapshot, rebuilt on retry.
+	ModelStateOnNode      ModelStateOnNode
+	BaseModel             *v1beta1.BaseModel
+	ClusterBaseModel      *v1beta1.ClusterBaseModel
 }
 
 // NodeLabelReconciler handles updating node labels œwith model status information
@@ -32,6 +37,7 @@ type NodeLabelReconciler struct {
 	opRetry    int                  // Number of retries for operations
 	kubeClient kubernetes.Interface // Kubernetes client for node operations
 	nodeName   string               // The name of the node
+	nodeUID    types.UID            // Bound once by NewGopher before starting workers.
 	logger     *zap.SugaredLogger   // Logger for recording operations
 }
 
@@ -75,8 +81,48 @@ func (n *NodeLabelReconciler) ReconcileNodeLabels(op *NodeLabelOp) error {
 	})
 }
 
+// WithdrawReadiness verifies the resulting node state as part of each attempt.
+// Eviction removes the normal label; restoration requires it to be non-Ready.
+func (n *NodeLabelReconciler) WithdrawReadiness(ctx context.Context, op *NodeLabelOp) error {
+	if op == nil || op.validateCurrent == nil {
+		return fmt.Errorf("readiness withdrawal requires current Model validation")
+	}
+	if op.requestLabelOnly || op.ModelStateOnNode != Deleted && op.ModelStateOnNode != Updating {
+		return fmt.Errorf("readiness withdrawal requires Deleted or Updating state")
+	}
+	// Keep the first observed node UID across retries without mutating the caller.
+	attempt := *op
+	var lastErr error
+	// Keep the underlying error: the legacy Retry helper formats away its type.
+	_ = utils.Retry(n.opRetry, 100*time.Millisecond, func() error {
+		lastErr = n.applyNodeLabelOperationWithContext(ctx, &attempt, true)
+		return lastErr
+	})
+	return lastErr
+}
+
 // applyNodeLabelOperation applies model state changes to the node labels
 func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
+	return n.applyNodeLabelOperationWithContext(context.TODO(), op, false)
+}
+
+func (n *NodeLabelReconciler) applyNodeLabelOperationWithContext(ctx context.Context, op *NodeLabelOp, strict bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !strict {
+		copy := *op
+		op = &copy
+	}
+	if n.nodeUID != "" {
+		op.nodeUID = n.nodeUID
+	}
+	finish := func() error {
+		if strict {
+			return n.verifyReadinessWithdrawn(ctx, op)
+		}
+		return nil
+	}
 	modelInfo := getNodeLabelModelInfo(op)
 	n.logger.Infof("Processing node label %s operation for %s in state: %s", op.ModelStateOnNode, modelInfo, op.ModelStateOnNode)
 
@@ -84,12 +130,18 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	labelKey, err := getModelLabelKey(op)
 	if err != nil {
 		n.logger.Errorf("Failed to get label key for %s: %v", modelInfo, err)
+		if strict {
+			return err
+		}
 		return nil // Don't retry for invalid model references
 	}
 
 	// First get the node to check existing labels
-	node, err := n.kubeClient.CoreV1().Nodes().Get(context.TODO(), n.nodeName, metav1.GetOptions{})
+	node, err := n.kubeClient.CoreV1().Nodes().Get(ctx, n.nodeName, metav1.GetOptions{})
 	if err != nil {
+		if strict {
+			return err
+		}
 		if errors.IsNotFound(err) {
 			// Node doesn't exist, log warning and return nil to avoid retries
 			n.logger.Warnf("Node %s not found, skipping node labeling for %s: %v", n.nodeName, modelInfo, err)
@@ -101,29 +153,60 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	}
 
 	// Check current labels - make idempotent based on operation type
+	if op.validateCurrent != nil {
+		if err := op.validateCurrent(); err != nil {
+			return err
+		}
+	}
+	if op.nodeUID != "" && node.UID != op.nodeUID {
+		return fmt.Errorf("node identity changed before model label publication")
+	}
+	if strict && op.nodeUID == "" {
+		op.nodeUID = node.UID
+	}
 	currentValue, labelExists := node.Labels[labelKey]
 
 	// Handle operation based on desired state and current state
 	switch op.ModelStateOnNode {
 	case Deleted:
-		// For delete operations, if the label doesn't exist, the operation is already complete
-		if !labelExists {
+		op.deleteLabelKeys = make([]string, 0, 2)
+		if labelExists && !op.requestLabelOnly {
+			op.deleteLabelKeys = append(op.deleteLabelKeys, labelKey)
+		}
+		if uid := getModelResourceUID(op.BaseModel, op.ClusterBaseModel); uid != "" {
+			requestKey := constants.GetModelArtifactRequestLabel(uid)
+			if _, exists := node.Labels[requestKey]; exists {
+				op.deleteLabelKeys = append(op.deleteLabelKeys, requestKey)
+			}
+		}
+		if len(op.deleteLabelKeys) == 0 {
 			n.logger.Infof("Label %s already removed from node %s for %s - operation is idempotent", labelKey, n.nodeName, modelInfo)
-			return nil
+			return finish()
 		}
 	case Ready, Updating, Failed:
 		// For add/update operations, if the label already has the desired value, skip
-		if labelExists && currentValue == string(op.ModelStateOnNode) {
+		pairedReady := op.ModelStateOnNode != Ready || op.artifactRehydrationID == "" ||
+			node.Labels[constants.GetModelArtifactRequestLabel(getModelResourceUID(op.BaseModel, op.ClusterBaseModel))] == op.artifactRehydrationID
+		if labelExists && currentValue == string(op.ModelStateOnNode) && pairedReady {
 			n.logger.Infof("Label %s already set to %s on node %s for %s - operation is idempotent",
 				labelKey, string(op.ModelStateOnNode), n.nodeName, modelInfo)
-			return nil
+			return finish()
 		}
 	}
 
 	// Generate patch payload
-	payloadBytes, err := getNodeLabelPatchPayloadBytes(op)
+	resourceVersion := ""
+	if strict || op.validateCurrent != nil || op.nodeUID != "" {
+		// Bind the validated request to the node snapshot. A newer Ready
+		// publication must conflict, then retry with fresh request validation.
+		resourceVersion = node.ResourceVersion
+	}
+	payloadBytes, err := getNodeLabelPatchPayloadBytes(op, resourceVersion)
 	if err != nil {
 		n.logger.Errorf("Failed to get node label patch payload for %s: %v", modelInfo, err)
+		if strict {
+			return err
+		}
 		return nil // Don't retry for payload generation issues
 	}
 	n.logger.Debugf("Generated node label patch payload for %s: %s", modelInfo, string(payloadBytes))
@@ -131,18 +214,21 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	// Skip empty patch operations
 	if len(payloadBytes) <= 2 { // Just "[]" for empty patch
 		n.logger.Infof("Empty patch payload for %s, skipping operation", modelInfo)
-		return nil
+		return finish()
 	}
 
 	// Apply the patch
 	_, err = n.kubeClient.CoreV1().Nodes().Patch(
-		context.TODO(),
+		ctx,
 		n.nodeName,
 		types.JSONPatchType,
 		payloadBytes,
 		metav1.PatchOptions{},
 	)
 	if err != nil {
+		if strict {
+			return err
+		}
 		// Check for specific error types and handle them gracefully
 		if errors.IsNotFound(err) {
 			// Node disappeared after our initial check
@@ -153,6 +239,9 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 			n.logger.Warnf("Conflict during patch operation for node %s and model %s, will retry: %v", n.nodeName, modelInfo, err)
 			return err // Return error to trigger retry
 		} else if errors.IsInvalid(err) || errors.IsBadRequest(err) {
+			if op.validateCurrent != nil || op.nodeUID != "" {
+				return err // Includes a failed resourceVersion JSON test.
+			}
 			// For delete operations that fail with "not found" patch path errors, consider it already done
 			if op.ModelStateOnNode == Deleted && strings.Contains(err.Error(), "not found") {
 				n.logger.Infof("Label %s already removed from node %s for %s - considering delete operation successful",
@@ -171,7 +260,32 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	}
 	n.logger.Infof("Successfully patched node %s with %s state for %s", n.nodeName, op.ModelStateOnNode, modelInfo)
 
-	return nil
+	return finish()
+}
+
+func (n *NodeLabelReconciler) verifyReadinessWithdrawn(ctx context.Context, op *NodeLabelOp) error {
+	node, err := n.kubeClient.CoreV1().Nodes().Get(ctx, n.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if err := op.validateCurrent(); err != nil {
+		return err
+	}
+	if op.nodeUID != "" && node.UID != op.nodeUID {
+		return fmt.Errorf("node identity changed during readiness withdrawal")
+	}
+	label, err := getModelLabelKey(op)
+	if err != nil {
+		return err
+	}
+	value, present := node.Labels[label]
+	if op.ModelStateOnNode == Deleted && present {
+		return fmt.Errorf("model readiness label has not been removed")
+	}
+	if op.ModelStateOnNode == Updating && value == string(Ready) {
+		return fmt.Errorf("model readiness has not been withdrawn")
+	}
+	return ctx.Err()
 }
 
 // getNodeLabelModelInfo returns a string identifying a model for logging
@@ -206,7 +320,7 @@ func getModelLabelKey(op *NodeLabelOp) (string, error) {
 }
 
 // getNodeLabelPatchPayloadBytes generates the JSON patch for node labels
-func getNodeLabelPatchPayloadBytes(op *NodeLabelOp) ([]byte, error) {
+func getNodeLabelPatchPayloadBytes(op *NodeLabelOp, resourceVersion string) ([]byte, error) {
 	labelKey, err := getModelLabelKey(op)
 	if err != nil {
 		return []byte{}, err
@@ -233,12 +347,25 @@ func getNodeLabelPatchPayloadBytes(op *NodeLabelOp) ([]byte, error) {
 			Value: string(Failed),
 		}}
 	case Deleted:
-		payload = []patchStringValue{{
-			Op:   "remove",
-			Path: fmt.Sprintf("/metadata/labels/%s", strings.ReplaceAll(labelKey, "/", "~1")),
-		}}
+		keys := op.deleteLabelKeys
+		if keys == nil {
+			keys = []string{labelKey}
+		}
+		for _, key := range keys {
+			payload = append(payload, patchStringValue{Op: "remove", Path: "/metadata/labels/" + strings.ReplaceAll(key, "/", "~1")})
+		}
 	default:
 		break
+	}
+	if len(payload) != 0 && resourceVersion != "" {
+		payload = append([]patchStringValue{{Op: "test", Path: "/metadata/resourceVersion", Value: resourceVersion}}, payload...)
+	}
+	if op.ModelStateOnNode == Ready && op.artifactRehydrationID != "" {
+		key := constants.GetModelArtifactRequestLabel(getModelResourceUID(op.BaseModel, op.ClusterBaseModel))
+		payload = append(payload, patchStringValue{Op: "add", Path: "/metadata/labels/" + strings.ReplaceAll(key, "/", "~1"), Value: op.artifactRehydrationID})
+	}
+	if len(payload) != 0 && op.nodeUID != "" {
+		payload = append([]patchStringValue{{Op: "test", Path: "/metadata/uid", Value: string(op.nodeUID)}}, payload...)
 	}
 
 	payloadBytes, err := json.Marshal(payload)
