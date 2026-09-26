@@ -335,6 +335,9 @@ func (d *Decoder) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *m
 
 	UpdatePodSpecVolumes(&d.BaseComponentFields, isvc, podSpec, objectMeta)
 	UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, podSpec, v1beta1.DecoderComponent)
+	if d.DeploymentMode != constants.MultiNode && d.decoderSpec.Leader == nil && d.decoderSpec.Worker == nil {
+		requireModelArtifactNodeSelectors(&d.BaseComponentFields, podSpec)
+	}
 	UpdateDecoderAffinity(&d.BaseComponentFields, isvc, podSpec)
 
 	d.Log.V(1).Info("Decoder PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)

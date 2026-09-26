@@ -1579,6 +1579,14 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1beta1.ClusterServingRuntime{},
 			handler.EnqueueRequestsFromMapFunc(r.isvcsReferencingRuntime))
 
+	// Steady Raw deployments need not periodically reconcile. Model requests
+	// must therefore fan out even when the InferenceService itself is unchanged.
+	ctrlBuilder = ctrlBuilder.
+		Watches(&v1beta1.BaseModel{}, handler.EnqueueRequestsFromMapFunc(r.isvcsReferencingModel),
+			builder.WithPredicates(modelArtifactChangePredicate())).
+		Watches(&v1beta1.ClusterBaseModel{}, handler.EnqueueRequestsFromMapFunc(r.isvcsReferencingModel),
+			builder.WithPredicates(modelArtifactChangePredicate()))
+
 	// AcceleratorClass events fan out to every ISVC with an accelerator
 	// preference. Policy-based selection (BestFit/Cheapest/...) can resolve
 	// to ANY class, so the mapping is preference-bearing ISVCs, not ISVCs

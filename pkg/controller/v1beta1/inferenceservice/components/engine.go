@@ -345,6 +345,9 @@ func (e *Engine) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *me
 	}
 	UpdatePodSpecVolumes(&e.BaseComponentFields, isvc, podSpec, objectMeta)
 	UpdatePodSpecNodeSelector(&e.BaseComponentFields, isvc, podSpec, v1beta1.EngineComponent)
+	if e.DeploymentMode != constants.MultiNode && e.engineSpec.Leader == nil && e.engineSpec.Worker == nil {
+		requireModelArtifactNodeSelectors(&e.BaseComponentFields, podSpec)
+	}
 	UpdateEngineAffinity(&e.BaseComponentFields, isvc, podSpec)
 
 	e.Log.V(1).Info("Engine PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)

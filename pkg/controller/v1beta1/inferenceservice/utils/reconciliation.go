@@ -26,21 +26,49 @@ func GetBaseModel(cl client.Client, name string, namespace string) (*v1beta1.Bas
 // GetBaseModelWithStatus retrieves a BaseModel or ClusterBaseModel by name and
 // returns its spec, metadata, and status.
 func GetBaseModelWithStatus(cl client.Client, name string, namespace string) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, *v1beta1.ModelStatusSpec, error) {
-	baseModel := &v1beta1.BaseModel{}
-	err := cl.Get(context.TODO(), client.ObjectKey{Name: name, Namespace: namespace}, baseModel)
-	if err == nil {
-		return &baseModel.Spec, &baseModel.ObjectMeta, &baseModel.Status, nil
-	} else if !errors.IsNotFound(err) {
+	return getModelReferenceWithStatus(cl, &v1beta1.ModelRef{Name: name}, namespace)
+}
+
+// ModelReferenceKind validates the primary Model reference. Empty kind retains
+// legacy namespaced-first lookup; explicit kinds never fall back across scopes.
+func ModelReferenceKind(ref *v1beta1.ModelRef) (string, error) {
+	if ref == nil {
+		return "", nil
+	}
+	if ref.APIGroup != nil && *ref.APIGroup != "" && *ref.APIGroup != v1beta1.SchemeGroupVersion.Group {
+		return "", fmt.Errorf("unsupported Model API group %q", *ref.APIGroup)
+	}
+	if ref.Kind == nil || *ref.Kind == "" {
+		return "", nil
+	}
+	if *ref.Kind != "BaseModel" && *ref.Kind != "ClusterBaseModel" {
+		return "", fmt.Errorf("unsupported Model kind %q", *ref.Kind)
+	}
+	return *ref.Kind, nil
+}
+
+func getModelReferenceWithStatus(cl client.Client, ref *v1beta1.ModelRef, namespace string) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, *v1beta1.ModelStatusSpec, error) {
+	kind, err := ModelReferenceKind(ref)
+	if err != nil {
 		return nil, nil, nil, err
 	}
+	if kind != "ClusterBaseModel" {
+		baseModel := &v1beta1.BaseModel{}
+		err := cl.Get(context.TODO(), client.ObjectKey{Name: ref.Name, Namespace: namespace}, baseModel)
+		if err == nil {
+			return &baseModel.Spec, &baseModel.ObjectMeta, &baseModel.Status, nil
+		} else if kind == "BaseModel" || !errors.IsNotFound(err) {
+			return nil, nil, nil, err
+		}
+	}
 	clusterBaseModel := &v1beta1.ClusterBaseModel{}
-	err = cl.Get(context.TODO(), client.ObjectKey{Name: name}, clusterBaseModel)
+	err = cl.Get(context.TODO(), client.ObjectKey{Name: ref.Name}, clusterBaseModel)
 	if err == nil {
 		return &clusterBaseModel.Spec, &clusterBaseModel.ObjectMeta, &clusterBaseModel.Status, nil
 	} else if !errors.IsNotFound(err) {
 		return nil, nil, nil, err
 	}
-	return nil, nil, nil, goerrors.New("No BaseModel or ClusterBaseModel with the name: " + name)
+	return nil, nil, nil, goerrors.New("No BaseModel or ClusterBaseModel with the name: " + ref.Name)
 }
 
 // GetFineTunedWeight Get the fine-tuned weight from the given fine-tuned weight name.
@@ -71,7 +99,7 @@ func ReconcileBaseModelWithStatus(cl client.Client, isvc *v1beta1.InferenceServi
 		return nil, nil, nil, nil
 	}
 
-	baseModel, baseModelMeta, baseModelStatus, err := GetBaseModelWithStatus(cl, isvc.Spec.Model.Name, isvc.Namespace)
+	baseModel, baseModelMeta, baseModelStatus, err := getModelReferenceWithStatus(cl, isvc.Spec.Model, isvc.Namespace)
 	if err != nil {
 		return nil, nil, nil, err
 	}

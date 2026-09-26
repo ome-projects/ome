@@ -482,6 +482,26 @@ func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceSe
 	}
 }
 
+// requireModelArtifactNodeSelectors runs after all placement overlays. These
+// selectors are artifact requirements, not user-overridable placement defaults.
+func requireModelArtifactNodeSelectors(b *BaseComponentFields, podSpec *corev1.PodSpec) {
+	if b.BaseModel == nil || b.BaseModelMeta == nil || b.FineTunedServingWithMergedWeights || isPVCBaseModel(b) || isShardedModel(b.BaseModel) {
+		return
+	}
+	if podSpec.NodeSelector == nil {
+		podSpec.NodeSelector = make(map[string]string)
+	}
+	meta := b.BaseModelMeta
+	key := constants.GetClusterBaseModelLabel(meta.Name)
+	if meta.Namespace != "" {
+		key = constants.GetBaseModelLabel(meta.Namespace, meta.Name)
+	}
+	podSpec.NodeSelector[key] = "Ready"
+	if request := meta.Annotations[constants.ModelArtifactRehydrationIDAnnotation]; request != "" {
+		podSpec.NodeSelector[constants.GetModelArtifactRequestLabel(meta.UID)] = request
+	}
+}
+
 func applyMergedNodeSelector(runtime *v1beta1.ServingRuntimeSpec, acceleratorClass *v1beta1.AcceleratorClassSpec, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) {
 	mergedNodeSelector := isvcutils.MergeNodeSelector(runtime, acceleratorClass, isvc, componentType)
 	if len(mergedNodeSelector) > 0 {
