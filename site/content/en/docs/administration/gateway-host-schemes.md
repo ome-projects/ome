@@ -110,6 +110,63 @@ Two operational consequences to plan for:
   the service by its host; the top-level route's backend (router if present,
   otherwise engine) is the entry point.
 
+## Hostname truncation for names longer than 63 characters
+
+DNS limits each dot-separated label of a hostname to 63 characters, but
+Kubernetes allows an InferenceService name of up to 253 characters. Rendering
+a longer name verbatim into `domainTemplate` would produce an invalid
+hostname, so OME truncates the `{{ .Name }}` value **before** rendering the
+template:
+
+- A name of **63 characters or fewer** is used unchanged — most services
+  never see this behavior.
+- A **longer** name is replaced by an exactly-63-character label of the form
+  `<hash>-<suffix>`, where `<hash>` is the first 8 hex characters of the
+  SHA-256 of the full original name (a leading digit is swapped for the
+  letter `a`, so the label always starts with a letter) and `<suffix>` is
+  the **last 54 characters** of the original name.
+
+For example, this 65-character InferenceService name in namespace `prod`:
+
+```
+very-long-service-name-that-exceeds-normal-limits-and-keeps-going
+```
+
+renders, with the chart-default template, as a host of the shape:
+
+```
+a1b2c3d4-ervice-name-that-exceeds-normal-limits-and-keeps-going.prod.example.com
+```
+
+where `a1b2c3d4` stands in for the real 8-character hash (deterministic for
+your name; the value here is illustrative) and everything after the first
+`-` is the last 54 characters of the original name — note the leading
+`very-long-s` is gone.
+
+What this means in practice:
+
+- **Deterministic and stable.** The same name always yields the same hash,
+  so the hostname never changes across reconciles — and two long names that
+  differ only in the truncated-away head still get distinct hostnames,
+  because the hash covers the full original name.
+- **Where you see it.** In the per-ISVC subdomain scheme the truncated form
+  appears in the HTTPRoute `spec.hostnames` and in the `status.url` host —
+  both come from the same renderer, so they always agree. You will **never**
+  see it in the shared-host scheme's hostname: the shared host does not
+  contain the service name, and the `/<namespace>/<service>/` path prefix
+  keeps the full name (URL paths have no 63-character label limit). The same
+  rule also applies to the per-component hostnames generated when Gateway
+  API is disabled (see [Ingress
+  Administration](/ome/docs/administration/ingress/)).
+- **Only `{{ .Name }}` is truncated.** The other template values render
+  as-is, and the rendered hostname is still validated as a fully qualified
+  domain name (253 characters overall) — a template whose total output is
+  too long even after truncation fails reconciliation with
+  `invalid domain name ...`.
+- **Wildcard DNS and TLS still match.** The truncated form is a single
+  label in the same template position, so a wildcard like
+  `*.prod.example.com` covers it exactly as it covers short names.
+
 ## Switching schemes cluster-wide
 
 Both fields live in the `ingress` key of the `inferenceservice-config`
