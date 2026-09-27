@@ -22,12 +22,14 @@ spec:
       restartPolicy: RecreateInstanceOnPodRestart
     leader:
       runner:
+        name: ome-container
         resources:
           limits:
             nvidia.com/gpu: "8"
     worker:
       size: 1
       runner:
+        name: ome-container
         resources:
           limits:
             nvidia.com/gpu: "8"
