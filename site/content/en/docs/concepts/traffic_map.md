@@ -29,6 +29,30 @@ chat   Split   True        True       False      Routable   4d
 
 `MODE` mirrors the service's placement mode (`Single`, `All`, or `Split`); the other columns surface the conditions described below, with `REASON` taken from `Routable`.
 
+## Listing with the OME CLI
+
+The [OME CLI](/ome/docs/tasks/kubectl-ome) supports the same resource — `kubectl ome get trafficmaps` (aliases `trafficmap`, `tm`, `tmap`) lists a namespace's maps (`-A` for all namespaces, `-l` for label selectors):
+
+```bash
+$ kubectl ome get trafficmaps -n prod
+NAME   MODE    TARGETS   ROUTABLE   PUBLISHED   AGE
+chat   Split   2         True       True        4d
+```
+
+`MODE` is `spec.mode`, `TARGETS` counts **all** of `spec.entries` — zero-weight ones included — and `ROUTABLE` and `PUBLISHED` show those conditions' status. `-o wide` adds the operational evidence:
+
+| Wide column | What it shows |
+|-------------|---------------|
+| `SERVICE` | `spec.service` — the routed InferenceService. |
+| `ACTIVE` | How many entries have `weight` above zero. |
+| `HEALTHY` | How many entries report `healthy: true`. `HEALTHY` exceeding `ACTIVE` means healthy clusters are drawing no traffic — see [Why is this cluster's weight zero?](#why-is-this-clusters-weight-zero). |
+| `OVERRIDE`, `OVERRIDE-REASON` | The `OverrideActive` condition's status and reason — `True` / `OverridesApplied` while a manual drain holds arms at zero. |
+| `REASON` | The `Routable` condition's reason, such as `NoRoutableCapacity`. |
+| `GATEWAY` | `status.gatewayRef` as `group/kind:namespace/name`. |
+| `PUBLISHER-FRESHNESS` | `Current`, `Stale`, or `Unobserved` — `status.observedTrafficMapGeneration` against `metadata.generation`, the publisher-lag check from [Staleness checks](#staleness-checks). |
+
+Unlike the raw `kubectl get` columns above, every condition-backed column here is **current-generation guarded**: when a condition's `observedGeneration` lags `metadata.generation`, status columns print `Unknown` and reason columns print `-` rather than passing off a stale routing decision as live. For the two-cluster map in [Reading the routing table](#reading-the-routing-table) below, `-o wide` shows `ACTIVE 1`, `HEALTHY 2`: `worker-b` is healthy yet carries weight `0`.
+
 ## Reading the routing table
 
 `spec.entries` holds one entry per serving cluster. This example shows a healthy two-cluster map where one cluster nevertheless gets no traffic:
