@@ -147,6 +147,8 @@ The controller manages a finalizer (`acceleratorclasses.ome.io/finalizer`) on ev
 
 Deleting a class does not touch running pods, but it affects the next reconcile of InferenceServices that reference it: a service that pins the class by name fails with an `AcceleratorClassError` warning event, while policy-based selection silently skips the missing name in the runtime's candidate list.
 
+Runtimes feel the deletion at admission time instead. A validating webhook denies create and update of any **enabled** ServingRuntime or ClusterServingRuntime whose `spec.acceleratorRequirements.acceleratorClasses` names a class that does not exist, with `unknown accelerator classes referenced in AcceleratorRequirements: [<names>]`. Nothing blocks the delete itself, and runtimes already admitted keep working — but each enabled runtime that lists the deleted class can no longer pass an update (a `kubectl apply`, a Helm upgrade, a GitOps sync) until the class is recreated, the reference is removed, or the runtime is disabled (`spec.disabled: true` skips the check). The same rule read forward is an ordering requirement: create AcceleratorClass resources before the enabled runtimes that reference them. See [admission-time validation of the runtime list](/ome/docs/reference/runtime-accelerator-class-matching/#admission-time-validation-of-the-runtime-list) for the full behavior.
+
 ## Next steps
 
 - [Select Accelerators for an InferenceService](/ome/docs/tasks/run-workloads/select-accelerators/) — the selection policies, constraints, and how a selected class shapes the generated pods
