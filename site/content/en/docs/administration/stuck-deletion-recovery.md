@@ -18,8 +18,12 @@ the API when the kubelet on its node acknowledges the termination. If the node
 is dead — powered off, partitioned, or removed entirely — no kubelet is left
 to acknowledge anything, the pod stays **Terminating forever**, and everything
 gated on its disappearance waits with it. A scale-down never completes; a
-deleting InferenceReplica holds its finalizer, which in turn holds the
-deleting InferenceService.
+deleting InferenceReplica holds its finalizer indefinitely, and anything that
+waits for the InferenceReplica object to disappear — a foreground cascading
+delete, a terminating namespace — waits with it. (The parent InferenceService
+is not among them: its controller releases its own finalizer immediately, so
+under the default background cascade the InferenceService is already gone
+before teardown of its InferenceReplicas even starts.)
 
 This page covers the two operator-level controls for that situation, both in
 the `lifecycle` block of the `inferenceservice-config` ConfigMap:
@@ -38,8 +42,9 @@ This is one specific concern: **recovery of wedged deletion**. Deadlines for
 Instances that never become Ready (`instanceReadyTimeout`,
 `stuckPodGracePeriod`, `unschedulableGracePeriod`) and recovery of running
 pods that fail are separate mechanisms with their own configuration. Both
-controls here apply only to OMENative-mode components — Deployment and
-LeaderWorkerSet modes delegate pod lifecycle to those controllers.
+controls here apply only to OMENative-mode components — `RawDeployment` and
+`MultiNode` components delegate pod lifecycle to the Deployment and
+LeaderWorkerSet controllers.
 
 ## Where the configuration lives
 
@@ -73,7 +78,9 @@ ome:
         deadline: 30m
 ```
 
-The rendered ConfigMap entry:
+The rendered ConfigMap entry (the chart merges every configured `lifecycle`
+field — batch sizes, `instanceReadyTimeout`, and so on — into this same JSON
+document; only the two blocks of this page are shown):
 
 ```yaml
 apiVersion: v1
@@ -162,6 +169,9 @@ pod deletions:
 - **scale-down** delete batches (fewer Instances desired),
 - **rollout replacement**, where a new pod cannot take its stable name until
   the old one is gone,
+- **migration**, where a source pod wedged Terminating on a dead node — often
+  the very reason the migration was requested — would otherwise keep the
+  migration from ever reaching a terminal phase,
 - **teardown** of a deleting InferenceReplica (see below), which without the
   escalation waits forever on a dead node.
 
@@ -200,8 +210,8 @@ duration string and is **required** when the block is present:
   still collects everything a live kubelet can collect.
 
 The two controls are complementary, and the distinction matters: releasing the
-finalizer unblocks the InferenceReplica (and the InferenceService deletion
-waiting on it), but background GC deletes pods gracefully too — a pod stuck
+finalizer unblocks the InferenceReplica (and whatever is waiting for it to
+disappear), but background GC deletes pods gracefully too — a pod stuck
 Terminating on a dead node **stays stuck** after the finalizer lifts. Only the
 force-delete escalation (or a manual force delete) actually removes it. A
 teardown deadline without `lifecycle.forceDelete` is therefore an escape
@@ -211,7 +221,7 @@ hatch for the API objects, not a cleanup of the wedged pods.
 
 | Event reason | On | Meaning |
 |--------------|----|---------|
-| `DrainOverdue` | InferenceService (or the InferenceReplica when the parent is gone) | A deleting Instance's pods are past their drain deadline. Diagnostic only — force-deleting stays gated on the configured policy. This is the signal you see when pods are wedged and `forceDelete` is unconfigured or not yet actionable. |
+| `DrainOverdue` | InferenceService (or the InferenceReplica when the parent is gone) | A deleting Instance's pods are past their drain deadline. Once per overdue episode, and diagnostic only — force-deleting stays gated on the configured policy. This is the signal you see when pods are wedged and `forceDelete` is unconfigured or not yet actionable. |
 | `PodForceDeleted` | InferenceService (or InferenceReplica) | The escalation force-deleted a stuck pod; names the pod, node, evidence branch, and overdue duration. |
 | `PodDeleteBlockedByFinalizer` | InferenceService (or InferenceReplica) | An overdue Terminating pod is pinned by another controller's finalizers; OME will not strip them. Once per pod UID. |
 | `TeardownBlocked` | InferenceReplica | Teardown pods survive and no (valid) deadline is configured; the finalizer holds. Aggregated. |
