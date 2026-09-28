@@ -1,11 +1,13 @@
 """Partition discovery and fairly combine independently validated scan results."""
 
+from datetime import datetime, timedelta, timezone
 from itertools import zip_longest
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+from urllib.parse import urlencode
 
 import nightly_docs as docs
 
@@ -165,9 +167,11 @@ def pending_from_report(report, context):
 
 def previous_pending(repo, branch, context):
     """Read the latest retained main-branch plan, never another branch's pilot."""
-    runs = json.loads(docs.run('gh', 'api',
-        f'repos/{repo}/actions/workflows/nightly-docs.yml/runs?branch={branch}&per_page=10'))['workflow_runs']
-    for run in runs:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).date().isoformat()
+    query = urlencode({'branch': branch, 'per_page': 100, 'created': '>=' + cutoff})
+    run_pages = json.loads(docs.run('gh', 'api',
+        f'repos/{repo}/actions/workflows/nightly-docs.yml/runs?{query}', '--paginate', '--slurp'))
+    for run in (run for page in run_pages for run in page['workflow_runs']):
         if (run['status'] != 'completed' or run['head_branch'] != branch
                 or run['head_repository']['full_name'] != repo):
             continue

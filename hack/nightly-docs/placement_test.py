@@ -96,8 +96,8 @@ class PlacementTests(unittest.TestCase):
             if 'artifacts?' in args[2]:
                 return json.dumps([{'artifacts': []}, {'artifacts': [
                     {'name': 'nightly-docs-discovery-report', 'expired': False}]}])
-            return json.dumps({'workflow_runs': [{'id': 5, 'status': 'completed',
-                'head_branch': 'main', 'head_repository': {'full_name': 'o/r'}}]})
+            return json.dumps([{'workflow_runs': [{'id': 5, 'status': 'completed',
+                'head_branch': 'main', 'head_repository': {'full_name': 'o/r'}}]}])
         with patch.object(docs, 'run', side_effect=run):
             result = discovery.previous_pending('o/r', 'main', {'code_history': ['a' * 40 + ' old']})
         self.assertEqual(result, [self.item])
@@ -108,7 +108,7 @@ class PlacementTests(unittest.TestCase):
         full = {'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
                 'scans': [{'shard': name} for name, _, _ in discovery.SHARDS]}
         reports = [{**full, 'scans': full['scans'][:1]}, {**full, 'max_prs': 2},
-                   {**full, 'dry_run': True}, {'queued_concerns': []}, full]
+                   {**full, 'dry_run': True}, {'queued_concerns': []}] + [{**full, 'dry_run': True}] * 8 + [full]
         downloaded = []
         def run(*args):
             if args[:3] == ('gh', 'run', 'download'):
@@ -118,18 +118,21 @@ class PlacementTests(unittest.TestCase):
                 return ''
             if 'artifacts?' in args[2]:
                 return json.dumps([{'artifacts': [{'name': 'nightly-docs-discovery-report', 'expired': False}]}])
-            return json.dumps({'workflow_runs': [{'id': number, 'status': 'completed',
-                'head_branch': 'main', 'head_repository': {'full_name': 'o/r'}} for number in range(1, 6)]})
+            self.assertIn('--paginate', args)
+            self.assertIn('--slurp', args)
+            runs = [{'id': number, 'status': 'completed', 'head_branch': 'main',
+                     'head_repository': {'full_name': 'o/r'}} for number in range(1, len(reports) + 1)]
+            return json.dumps([{'workflow_runs': runs[:10]}, {'workflow_runs': runs[10:]}])
         with patch.object(docs, 'run', side_effect=run):
             queue = discovery.previous_pending('o/r', 'main', {'code_history': ['a' * 40 + ' old']})
-        self.assertEqual(downloaded, [1, 2, 3, 4, 5])
+        self.assertEqual(downloaded, list(range(1, len(reports) + 1)))
         self.assertEqual(queue, [self.item])
 
     def test_queue_never_reads_branch_pilot_artifacts(self):
         runs = {'workflow_runs': [
             {'id': 1, 'status': 'completed', 'head_branch': 'codex/pilot', 'head_repository': {'full_name': 'o/r'}},
             {'id': 2, 'status': 'in_progress', 'head_branch': 'main', 'head_repository': {'full_name': 'o/r'}}]}
-        with patch.object(docs, 'run', return_value=json.dumps(runs)), patch.object(docs, 'pages') as pages:
+        with patch.object(docs, 'run', return_value=json.dumps([runs])), patch.object(docs, 'pages') as pages:
             self.assertEqual(discovery.previous_pending('o/r', 'main', {}), [])
             pages.assert_not_called()
 

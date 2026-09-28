@@ -93,8 +93,8 @@ self-reports, not a tool-level audit; inspecting a commit subject does not count
 The `nightly-docs-discovery-report` artifact (14-day retention) contains every
 scan, the selected plan, and reasons for deferring proposals. Concerns deferred
 for a shared canonical page or the PR cap are saved as `queued_concerns`. The
-next run reads the newest retained plan from the ten latest default-branch runs
-and supplies that queue for fresh evaluation. Only reports covering all eight
+next run paginates default-branch runs from the last 14 days to find the newest
+eligible retained plan and supplies that queue for fresh evaluation. Only reports covering all eight
 scans with the default 100-concern cap and dry-run disabled may seed the queue;
 branch pilots and limited/dry runs on main cannot replace it. Deferred records
 use the full source/area/concern key, so equal slugs in different areas do not

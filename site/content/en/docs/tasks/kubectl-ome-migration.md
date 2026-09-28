@@ -140,7 +140,7 @@ typed partial evidence instead of failing the command:
   controller has processed a migration request for the service.
 - Audit ConfigMap forbidden → `AuditUnavailable`. Right name but not
   controller-owned by this exact service → `AuditIdentityInvalid`.
-  Unparsable payload or one over 1 MiB → `AuditMalformed` /
+  A payload that cannot be parsed or one over 1 MiB → `AuditMalformed` /
   `AuditPayloadTooLarge`.
 
 The report deliberately redacts raw ConfigMap payloads, annotations, caller
