@@ -19,6 +19,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	codec "sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
@@ -82,6 +83,54 @@ const (
 	testISVCUID = types.UID("isvc-uid")
 	testIRUID   = types.UID("ir-uid")
 )
+
+func TestSourceRequestsHonorPlacementPause(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		policy    *v1beta1.PlacementExecutionPolicy
+		ownerOnly bool
+		wantErr   bool
+	}{
+		{name: "ordinary local service"},
+		{name: "released", policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 2, SourceUID: "source", ClusterUID: "cluster"}},
+		{name: "paused", policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 1, SourceUID: "source", ClusterUID: "cluster", PauseSurge: true}, wantErr: true},
+		{name: "owner paused before projection", ownerOnly: true, policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 1, SourceUID: "source", ClusterUID: "cluster", PauseSurge: true}, wantErr: true},
+		{name: "malformed", policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects, source := validSingleSourceObjects()
+			sourceIR(objects).Spec.PlacementExecution = tc.policy
+			if tc.ownerOnly {
+				sourceIR(objects).Spec.PlacementExecution = nil
+			}
+			for _, object := range objects {
+				if owner, ok := object.(*v1beta1.InferenceService); ok && tc.policy != nil {
+					raw, err := json.Marshal(tc.policy)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if owner.Annotations == nil {
+						owner.Annotations = map[string]string{}
+					}
+					owner.Annotations[constants.PlacementOriginUID] = "source"
+					owner.Annotations[constants.PlacementExecution] = string(raw)
+				}
+				if node, ok := object.(*corev1.Node); ok {
+					node.Labels[corev1.LabelHostname] = node.Name
+				}
+			}
+			snap := captureSourceFixture(t, objects)
+			_, err := BuildRequest(snap, source, testProfiles(false), "pause-prediction", captureTime.Add(time.Second), time.Minute)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("prediction error = %v, want error %t", err, tc.wantErr)
+			}
+			_, err = BuildExecutionRequest(snap, source, testProfiles(false), "pause-execution", []string{"target-a"}, captureTime.Add(time.Second), time.Minute)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("execution error = %v, want error %t", err, tc.wantErr)
+			}
+		})
+	}
+}
 
 func TestBuildRequestPreservesSnapshotTimeAcrossJSON(t *testing.T) {
 	for _, execution := range []bool{false, true} {

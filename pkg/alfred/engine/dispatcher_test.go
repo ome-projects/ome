@@ -487,6 +487,109 @@ func TestDispatcherRetryKeepsExactUUIDAndPayload(t *testing.T) {
 	}
 }
 
+func setPlacementPause(t *testing.T, cl client.Client, ownerOnly bool) {
+	t.Helper()
+	if ownerOnly {
+		var owner v1beta1.InferenceService
+		if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "a"}, &owner); err != nil {
+			t.Fatal(err)
+		}
+		if owner.Annotations == nil {
+			owner.Annotations = map[string]string{}
+		}
+		owner.Annotations[constants.PlacementOriginUID] = "source"
+		owner.Annotations[constants.PlacementExecution] = `{"planID":"plan","revision":1,"sourceUID":"source","clusterUID":"cluster","pauseSurge":true}`
+		if err := cl.Update(context.Background(), &owner); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	var ir v1beta1.InferenceReplica
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "a-engine"}, &ir); err != nil {
+		t.Fatal(err)
+	}
+	ir.Spec.PlacementExecution = &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 1, SourceUID: "source", ClusterUID: "cluster", PauseSurge: true}
+	if err := cl.Update(context.Background(), &ir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDispatcherWithholdsPlacementPausedRequests(t *testing.T) {
+	for _, ownerOnly := range []bool{false, true} {
+		for _, when := range []string{"before-preflight", "during-simulation", "prepared-retry"} {
+			t.Run(fmt.Sprintf("ownerOnly=%t/%s", ownerOnly, when), func(t *testing.T) {
+				d, cl, snap, c, cfg, a := dispatchFixture(t, false)
+				wantEntries, wantPatches := 0, 0
+				simulations := 0
+				d.Simulator = simulationFunc(func(_ context.Context, r scheduling.Request) (scheduling.Result, error) {
+					simulations++
+					if when == "during-simulation" {
+						setPlacementPause(t, cl.Client, ownerOnly)
+					}
+					return feasiblePrediction(r), nil
+				})
+				if when == "prepared-retry" {
+					cl.failBeforeApply = true
+					d.Execute(context.Background(), snap, []policy.Candidate{c}, cfg, a)
+					cl.failBeforeApply = false
+					wantEntries, wantPatches = 1, 1
+				}
+				if when != "during-simulation" {
+					setPlacementPause(t, cl.Client, ownerOnly)
+				}
+				_, decisions := d.Execute(context.Background(), snap, []policy.Candidate{c}, cfg, a)
+				got := decisionFor(t, decisions, "prod/a")
+				if got.DispatchStatus == "submitted" || cl.patches != wantPatches {
+					t.Fatalf("paused request submitted: %+v patches=%d", got, cl.patches)
+				}
+				_, j, err := loadDispatchJournal(context.Background(), cl.Client, "ome")
+				if err != nil || len(j.Entries) != wantEntries {
+					t.Fatalf("unexpected journal: %+v, %v", j, err)
+				}
+				if when == "during-simulation" && simulations != 1 {
+					t.Fatalf("simulations = %d, want 1", simulations)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatcherReconcilesSubmittedMigrationDuringPlacementPause(t *testing.T) {
+	d, cl, snap, c, cfg, a := dispatchFixture(t, false)
+	d.Execute(context.Background(), snap, []policy.Candidate{c}, cfg, a)
+	_, j, err := loadDispatchJournal(context.Background(), cl.Client, "ome")
+	if err != nil || len(j.Entries) != 1 {
+		t.Fatalf("missing submitted request: %+v %v", j, err)
+	}
+	id := j.Entries[0].UUID
+	setPlacementPause(t, cl.Client, true)
+	setPlacementPause(t, cl.Client, false)
+	for _, phase := range []v1beta1.MigrationPhase{v1beta1.MigrationPhaseAccepted, v1beta1.MigrationPhaseCompleted} {
+		var ir v1beta1.InferenceReplica
+		if err := cl.Client.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "a-engine"}, &ir); err != nil {
+			t.Fatal(err)
+		}
+		ir.Status.Migrations = []v1beta1.MigrationStatus{{RequestUUID: id, Trigger: v1beta1.MigrationTriggerManual, SourceInstance: 0, FromNode: "source", Phase: phase, StartedAt: metav1.NewTime(testNow), Deadline: metav1.NewTime(testNow.Add(time.Hour))}}
+		want := "acknowledged"
+		if phase.Terminal() {
+			done, success := metav1.NewTime(testNow.Add(time.Minute)), true
+			d.Now = func() time.Time { return testNow.Add(time.Minute) }
+			ir.Status.Migrations[0].CompletedAt, ir.Status.Migrations[0].Succeeded = &done, &success
+			want = "completed"
+		}
+		if err := cl.Client.Update(context.Background(), &ir); err != nil {
+			t.Fatal(err)
+		}
+		_, decisions := d.Execute(context.Background(), snap, nil, cfg, a)
+		if got := decisionFor(t, decisions, "prod/a"); got.DispatchStatus != want || got.RequestUUID != id {
+			t.Fatalf("paused reconciliation: %+v, want %s with same UUID", got, want)
+		}
+	}
+	if cl.patches != 1 {
+		t.Fatalf("submitted a duplicate request: patches=%d", cl.patches)
+	}
+}
+
 func TestDispatcherAcknowledgementHonorsAPITimestampPrecision(t *testing.T) {
 	d, cl, snap, c, cfg, a := dispatchFixture(t, false)
 	now := testNow.Add(100 * time.Millisecond)

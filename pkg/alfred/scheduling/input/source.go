@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
+	"sigs.k8s.io/ome/pkg/alfred/placement"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -215,8 +216,8 @@ func resolveSource(s *Snapshot, source Source) (*sourceState, error) {
 	if !controllerOwnerMatches(state.ir.OwnerReferences, v1beta1.SchemeGroupVersion.String(), "InferenceService", state.isvc.Name, state.isvc.UID) {
 		return nil, fmt.Errorf("source InferenceReplica owner does not match InferenceService UID")
 	}
-	if state.ir.Spec.Paused {
-		return nil, fmt.Errorf("source InferenceReplica is paused")
+	if err := placement.CheckNewSurge(state.isvc, state.ir); err != nil {
+		return nil, err
 	}
 	if state.ir.Status.ObservedGeneration != state.ir.Generation {
 		return nil, fmt.Errorf("InferenceReplica observation is stale")

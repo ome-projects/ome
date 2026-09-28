@@ -28,7 +28,7 @@ if [[ ! -f "${kubeconfig}" ]]; then
   echo "kubeconfig not found: ${kubeconfig}" >&2
   exit 2
 fi
-if [[ "${scenario}" != "maintenance-single" && "${scenario}" != "maintenance-columnar" && "${scenario}" != "unhealthy-single" && "${scenario}" != "restart-single" && "${scenario}" != "hint-exhaustion-single" && "${scenario}" != "target-health-race-single" ]]; then
+if [[ "${scenario}" != "maintenance-single" && "${scenario}" != "maintenance-columnar" && "${scenario}" != "unhealthy-single" && "${scenario}" != "restart-single" && "${scenario}" != "hint-exhaustion-single" && "${scenario}" != "target-health-race-single" && "${scenario}" != "placement-pause-single" ]]; then
   echo "unsupported scenario: ${scenario}" >&2
   exit 2
 fi
@@ -52,6 +52,11 @@ ir_status="${state_dir}/ir-status"
 initial_count=1
 workload_manifest="${script_dir}/manifests/workload-single.yaml"
 columnar_json=null
+placement_json=null
+if [[ "${scenario}" == "placement-pause-single" ]]; then
+  workload_manifest="${script_dir}/manifests/workload-placement-pause.yaml"
+  source "${script_dir}/placement-pause.sh"
+fi
 if [[ "${scenario}" == "maintenance-columnar" ]]; then
   initial_count=4
   workload_manifest="${script_dir}/manifests/workload-columnar.yaml"
@@ -396,6 +401,8 @@ else
   "${kube[@]}" label node "${source_node}" "${maintenance_key}=${maintenance_value}" --overwrite >/dev/null
 fi
 
+if [[ "${scenario}" == "placement-pause-single" ]]; then placement_pause_observe_and_release; fi
+
 request_json=""
 recommendation_json=""
 request_deadline=$((SECONDS + deadline_seconds))
@@ -491,6 +498,7 @@ while (( SECONDS < request_deadline )); do
          else .maintenance.requested == true and .maintenanceDrainedAt == null end) and
         .omeGpuOccupantsPresent == true' <<<"${node_record}" >/dev/null; then
         echo "Holding replacement $(jq -r '.name' <<<"${replacement_json}") not-ready for ${surge_hold_seconds}s"
+        if [[ "${scenario}" == "placement-pause-single" ]]; then placement_pause_allocated; fi
         hold_deadline=$((SECONDS + surge_hold_seconds))
         while (( SECONDS < hold_deadline )); do
           assert_annotation_watch_alive "${request_watch_pid}" "${request_watch_stderr}"
@@ -754,6 +762,11 @@ if [[ "${scenario}" == "restart-single" ]]; then
       workloadDispatchCount:$dispatchCount,uniqueRequestCount:$requestCount}' <<<"${restart_json}")"
 fi
 
+if [[ "${scenario}" == "placement-pause-single" ]]; then
+  placement_pause_complete
+  placement_json="$(jq -c . "${artifact_dir}/placement-evidence.json")"
+fi
+
 evidence="${artifact_dir}/evidence.json"
 assert_annotation_watch_alive "${request_watch_pid}" "${request_watch_stderr}"
 if [[ "${scenario}" == "maintenance-columnar" ]]; then
@@ -775,15 +788,21 @@ jq -n --arg scenario "${scenario}" --argjson source "${source_json}" \
   --argjson alfred "${alfred_json}" \
   --argjson health "${health_json}" --argjson restart "${restart_json}" \
   --argjson columnar "${columnar_json}" \
+  --argjson placement "${placement_json}" \
   --slurpfile handoff "${artifact_dir}/handoff-samples.jsonl" \
   '{scenario:$scenario, source:$source, preTrigger:$preTrigger, request:$request,
-    surge:$surge, handoff:$handoff, completed:$completed, alfred:$alfred,health:$health,restart:$restart,columnar:$columnar}' >"${evidence}"
+    surge:$surge, handoff:$handoff, completed:$completed, alfred:$alfred,health:$health,restart:$restart,columnar:$columnar,placement:$placement}' >"${evidence}"
 
 # Delayed variants retain the same complete maintenance handoff invariant;
 # their separate evidence additionally characterizes the mailbox race.
-if ! jq 'if .scenario == "hint-exhaustion-single" or .scenario == "target-health-race-single" then .scenario="maintenance-single" else . end' "${evidence}" | jq -e -f "${script_dir}/verify-evidence.jq" >/dev/null; then
+if ! jq 'if .scenario == "hint-exhaustion-single" or .scenario == "target-health-race-single" or .scenario == "placement-pause-single" then .scenario="maintenance-single" else . end' "${evidence}" | jq -e -f "${script_dir}/verify-evidence.jq" >/dev/null; then
   echo "captured evidence failed the acceptance verifier" >&2
   exit 1
+fi
+if [[ "${scenario}" == "placement-pause-single" ]]; then
+  jq -e -L "${script_dir}" -f "${script_dir}/verify-placement-pause.jq" "${evidence}" >/dev/null || {
+    echo 'placement pause evidence failed its acceptance verifier' >&2; exit 1;
+  }
 fi
 assert_annotation_watch_alive "${request_watch_pid}" "${request_watch_stderr}"
 

@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
+	"sigs.k8s.io/ome/pkg/alfred/placement"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -64,7 +65,7 @@ func OMENativeEligibility(snap *snapshot.ClusterSnapshot, w *snapshot.Workload,
 		return AdvisoryOMENativeObservationInvalid
 	}
 	ir := comp.IR
-	if ir.Spec.Paused {
+	if err := placement.CheckNewSurge(w.ISVC, ir); err != nil {
 		return AdvisoryOMENativeStateIneligible
 	}
 	if ir.Spec.Lifecycle != nil && ir.Spec.Lifecycle.MigrationPolicy != nil &&

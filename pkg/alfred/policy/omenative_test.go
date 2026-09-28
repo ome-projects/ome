@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
@@ -27,6 +28,49 @@ func TestOMENativeEligibilityDoesNotApplyCooldown(t *testing.T) {
 
 	if got := OMENativeEligibility(snap, w, comp, comp.Instances[0]); got != "" {
 		t.Fatalf("cooldown leaked into shared eligibility: got %q, want eligible", got)
+	}
+}
+
+func TestOMENativeEligibilityHonorsPlacementPause(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		policy    *v1beta1.PlacementExecutionPolicy
+		ownerOnly bool
+		want      string
+	}{
+		{name: "ordinary local service"},
+		{name: "released", policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 2, SourceUID: "source", ClusterUID: "cluster"}},
+		{name: "paused", policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 1, SourceUID: "source", ClusterUID: "cluster", PauseSurge: true}, want: AdvisoryOMENativeStateIneligible},
+		{name: "owner paused before projection", ownerOnly: true, policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan", Revision: 1, SourceUID: "source", ClusterUID: "cluster", PauseSurge: true}, want: AdvisoryOMENativeStateIneligible},
+		{name: "malformed", policy: &v1beta1.PlacementExecutionPolicy{PlanID: "plan"}, want: AdvisoryOMENativeStateIneligible},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := testutil.NewSnapshot().WithNode("source", "h100", 8).WithNode("target", "h100", 8).
+				WithInstance("prod/model", v1beta1.EngineComponent, constants.OMENative, "source", 1).Build()
+			w := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "model"}]
+			comp := w.Components[v1beta1.EngineComponent]
+			comp.IR.Spec.PlacementExecution = tc.policy
+			if tc.policy != nil {
+				if w.ISVC == nil {
+					w.ISVC = &v1beta1.InferenceService{}
+				}
+				raw, err := json.Marshal(tc.policy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if w.ISVC.Annotations == nil {
+					w.ISVC.Annotations = map[string]string{}
+				}
+				w.ISVC.Annotations[constants.PlacementOriginUID] = "source"
+				w.ISVC.Annotations[constants.PlacementExecution] = string(raw)
+			}
+			if tc.ownerOnly {
+				comp.IR.Spec.PlacementExecution = nil
+			}
+			if got := OMENativeEligibility(snap, w, comp, comp.Instances[0]); got != tc.want {
+				t.Fatalf("eligibility = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

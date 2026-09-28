@@ -49,6 +49,7 @@ bash hack/alfred-kind-e2e/kwok.sh
 bash hack/alfred-kind-e2e/deploy.sh
 bash hack/alfred-kind-e2e/scenario.sh maintenance-single
 bash hack/alfred-kind-e2e/scenario.sh maintenance-columnar
+bash hack/alfred-kind-e2e/scenario.sh placement-pause-single
 bash hack/alfred-kind-e2e/scenario.sh restart-single
 bash hack/alfred-kind-e2e/scenario.sh unhealthy-single
 ```
@@ -97,6 +98,19 @@ platform. It uses Alfred's bounded status decoder and stops on decode errors.
 representations; separate `.decoded.json` files hold logical rows and the raw
 encoding marker. The evidence verifier requires actual ColumnarV2 at both
 snapshots, even when the manager's configured target permits dense fallback.
+
+`placement-pause-single` starts an origin-marked service with a valid public
+placement pause envelope. After maintenance is triggered, three distinct Alfred
+decision cycles must report an advisory with no request, journal intent,
+migration or replacement for that fresh owner/replica. Source readiness and real
+routing must remain intact. The harness releases the pause at revision 2 through
+ISVC metadata and waits for real IR projection. Once the resulting migration has
+allocated a held replacement, it publishes pause revision 3. That same request
+must finish through the normal source-preserving handoff and Alfred journal
+reconciliation, with no duplicate across three further decision cycles. Raw API
+samples and the annotation watch are retained beside the combined evidence.
+This tests the public envelope on a local member, not end-to-end multi-cluster
+placement, real GPU execution, or retry recovery across a generation change.
 
 The gang fixture has a leader and worker, each requesting eight GPUs, scheduled
 by the real OME scheduler into one zone. Migration must replace both members in

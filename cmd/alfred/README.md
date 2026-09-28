@@ -37,12 +37,25 @@ journal. The OME controller also needs valid `lifecycle.audit` configuration;
 Alfred's compatibility flag does not discover consumer readiness. See the
 [migration API guide](../../site/content/en/docs/tasks/request-an-instance-migration.md).
 
+New migrations respect both the replica's pause flag and the public placement
+execution policy. A paused or invalid authority envelope on the replica or its
+origin-marked owner prevents submission, including while owner policy projection
+is pending. A valid release must clear both observed pauses before new work proceeds.
+Already submitted migrations remain tracked; a pause does not cancel them or
+stop reconciliation of allocated work. Alfred only reads this placement protocol;
+it does not implement placement-controller or migration-controller behavior.
+
 Current execution supports eligible OMENative instances only. RawDeployment,
 LWS and other workloads have no eviction adapter. Simulation reserves no
 capacity; target hints are preferences, not scheduling-time health guarantees.
 One unresolved request blocks new dispatches. Do not erase the journal to
 unblock it. These limits and the recorded qualification results are not a
 production-readiness guarantee.
+
+A prepared request can remain blocked after a pause/release changes its source
+generation: retry fingerprint recovery is a separate hardening item. The
+pre-dispatch checks also do not provide an atomic transaction across owner and
+replica objects or reserve a future destination.
 
 ## Build and verify
 
