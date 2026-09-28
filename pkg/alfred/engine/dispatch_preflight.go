@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,7 +99,17 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	}
 	owner := fresh.Workloads[current.Workload].ISVC
 	ir := fresh.Workloads[current.Workload].Components[current.Component].IR
-	fingerprint, err := dispatchSourceFingerprint(owner, ir, request.SourcePods, current.Instance)
+	// Select once so the pre/post-simulation comparison and any durable retry
+	// use the same algorithm. Never upgrade an existing intent's source fence.
+	fingerprintVersion := dispatchFingerprintSemantic
+	if existing != nil && !strings.HasPrefix(existing.SourceFingerprint, semanticFingerprintPrefix) {
+		legacy, err := hex.DecodeString(existing.SourceFingerprint)
+		if err != nil || len(legacy) != sha256.Size {
+			return empty, "SourceChanged"
+		}
+		fingerprintVersion = dispatchFingerprintLegacy
+	}
+	fingerprint, err := dispatchSourceFingerprint(owner, ir, request.SourcePods, current.Instance, fingerprintVersion)
 	if err != nil {
 		return empty, "SourceChanged"
 	}
@@ -136,7 +147,12 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	}
 	finalOwner := final.Workloads[current.Workload].ISVC
 	finalIR := final.Workloads[current.Workload].Components[current.Component].IR
-	finalFingerprint, err := dispatchSourceFingerprint(finalOwner, finalIR, finalRequest.SourcePods, current.Instance)
+	// A durable retry may cross a fully observed pause/release, but a single
+	// simulation attempt still requires stable owner/replica generations.
+	if finalOwner.Generation != owner.Generation || finalIR.Generation != ir.Generation {
+		return empty, "SourceChanged"
+	}
+	finalFingerprint, err := dispatchSourceFingerprint(finalOwner, finalIR, finalRequest.SourcePods, current.Instance, fingerprintVersion)
 	if err != nil || finalFingerprint != fingerprint {
 		return empty, "SourceChanged"
 	}
@@ -187,9 +203,13 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 		historyWindow: historyWindow}, ""
 }
 
-// Retain scheduling identity/spec and semantic incarnation, but not resource
-// versions or changing readiness timestamps, in the durable retry fence.
-func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.InferenceReplica, pods []corev1.Pod, instance int32) (string, error) {
+// Normalize independent logical source copies at the existing audited boundary.
+// Both versions exclude the same non-persisted Pod observations. The legacy
+// branch retains its exact byte-level format for pre-upgrade prepared intents.
+func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.InferenceReplica, pods []corev1.Pod, instance int32, version dispatchFingerprintVersion) (string, error) {
+	if owner == nil || ir == nil {
+		return "", fmt.Errorf("source owner or replica is missing")
+	}
 	normalized := make([]corev1.Pod, len(pods))
 	for i := range pods {
 		normalized[i] = *pods[i].DeepCopy()
@@ -216,6 +236,12 @@ func dispatchSourceFingerprint(owner *v1beta1.InferenceService, ir *v1beta1.Infe
 	row.ReadyPodCount = 0
 	row.ScheduledPodCount = 0
 	row.NodesOccupied = nil
+	if version == dispatchFingerprintSemantic {
+		return dispatchSemanticSourceFingerprint(owner, ir, row, normalized)
+	}
+	if version != dispatchFingerprintLegacy {
+		return "", fmt.Errorf("unsupported source fingerprint version")
+	}
 	raw, err := json.Marshal(struct {
 		OwnerUID        string
 		OwnerGeneration int64

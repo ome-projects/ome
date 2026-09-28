@@ -54,10 +54,22 @@ One unresolved request blocks new dispatches. Do not erase the journal to
 unblock it. These limits and the recorded qualification results are not a
 production-readiness guarantee.
 
-A prepared request can remain blocked after a pause/release changes its source
-generation: retry fingerprint recovery is a separate hardening item. The
-pre-dispatch checks also do not provide an atomic transaction across owner and
-replica objects or reserve a future destination.
+New prepared requests use a versioned semantic source fingerprint. Retries keep
+the exact UUID and payload across diagnostic status updates or a valid, fully
+observed placement pause/release. They still require unchanged source identities,
+specs, gang members, lifecycle state and authority identity, plus fresh policy,
+budgets, simulation and submission checks. Generations must remain stable during
+each simulation attempt. Condition states and lifecycle timestamps remain fenced;
+event stamps, previous-failure diagnostics and condition messages do not.
+
+Pre-upgrade prepared requests retain their original strict fingerprint: Alfred
+never rewrites their fence to authorize a retry. Unknown fingerprint versions
+cannot be retried, but already published requests still reconcile. A pause that
+outlasts the acknowledgement deadline can leave a request stalled; this change
+does not resume stalled requests. The pre-dispatch checks do not provide an atomic
+transaction across owner and replica objects, fence future consumer acceptance,
+or reserve a destination. Typed source fingerprints cover fields known to the
+running Alfred binary, not unknown fields from a newer API version.
 
 ## Build and verify
 

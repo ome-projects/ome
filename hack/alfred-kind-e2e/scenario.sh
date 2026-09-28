@@ -28,7 +28,7 @@ if [[ ! -f "${kubeconfig}" ]]; then
   echo "kubeconfig not found: ${kubeconfig}" >&2
   exit 2
 fi
-if [[ "${scenario}" != "maintenance-single" && "${scenario}" != "maintenance-columnar" && "${scenario}" != "unhealthy-single" && "${scenario}" != "restart-single" && "${scenario}" != "hint-exhaustion-single" && "${scenario}" != "target-health-race-single" && "${scenario}" != "placement-pause-single" ]]; then
+if [[ "${scenario}" != "maintenance-single" && "${scenario}" != "maintenance-columnar" && "${scenario}" != "unhealthy-single" && "${scenario}" != "restart-single" && "${scenario}" != "hint-exhaustion-single" && "${scenario}" != "target-health-race-single" && "${scenario}" != "placement-pause-single" && "${scenario}" != "semantic-retry-single" ]]; then
   echo "unsupported scenario: ${scenario}" >&2
   exit 2
 fi
@@ -53,6 +53,12 @@ initial_count=1
 workload_manifest="${script_dir}/manifests/workload-single.yaml"
 columnar_json=null
 placement_json=null
+semantic_retry_json=null
+if [[ "${scenario}" == "semantic-retry-single" ]]; then
+  workload_manifest="${script_dir}/manifests/workload-placement-pause.yaml"
+  source "${script_dir}/placement-pause.sh"
+  source "${script_dir}/semantic-retry.sh"
+fi
 if [[ "${scenario}" == "placement-pause-single" ]]; then
   workload_manifest="${script_dir}/manifests/workload-placement-pause.yaml"
   source "${script_dir}/placement-pause.sh"
@@ -119,6 +125,11 @@ cleanup() {
     fi
   fi
   if [[ "${delayed}" == true ]]; then delayed_request_cleanup || rc=1; fi
+  if [[ "${scenario}" == semantic-retry-single ]] && ! sr_cleanup; then
+    echo "semantic retry admission cleanup failed; inspect ${artifact_dir}" >&2
+    dump_diagnostics
+    rc=1
+  fi
   exit "${rc}"
 }
 trap cleanup EXIT
@@ -195,8 +206,11 @@ if "${kube[@]}" get namespace "${namespace}" >/dev/null 2>&1; then
       --timeout=90s >/dev/null
   fi
 fi
-"${kube[@]}" apply -f "${workload_manifest}" \
-  >"${artifact_dir}/apply.txt"
+if [[ "${scenario}" == semantic-retry-single ]]; then
+  sr_apply_fixture >"${artifact_dir}/apply.txt"
+else
+  "${kube[@]}" apply -f "${workload_manifest}" >"${artifact_dir}/apply.txt"
+fi
 
 echo "Waiting for the controller-created source Instance to be healthy"
 ready_deadline=$((SECONDS + 180))
@@ -341,6 +355,8 @@ request_watch_pid=$!
 sleep 1
 assert_annotation_watch_alive "${request_watch_pid}" "${request_watch_stderr}"
 
+if [[ "${scenario}" == semantic-retry-single ]]; then sr_prepare; fi
+
 triggered_node="${source_node}"
 if [[ "${scenario}" == "unhealthy-single" ]]; then
   echo "Observing the one-minute False recovery quarantine without evacuation"
@@ -402,6 +418,7 @@ else
 fi
 
 if [[ "${scenario}" == "placement-pause-single" ]]; then placement_pause_observe_and_release; fi
+if [[ "${scenario}" == semantic-retry-single ]]; then sr_after_trigger; fi
 
 request_json=""
 recommendation_json=""
@@ -767,6 +784,11 @@ if [[ "${scenario}" == "placement-pause-single" ]]; then
   placement_json="$(jq -c . "${artifact_dir}/placement-evidence.json")"
 fi
 
+if [[ "${scenario}" == semantic-retry-single ]]; then
+  sr_complete
+  semantic_retry_json="$(jq -c . "${artifact_dir}/semantic-retry-evidence.json")"
+fi
+
 evidence="${artifact_dir}/evidence.json"
 assert_annotation_watch_alive "${request_watch_pid}" "${request_watch_stderr}"
 if [[ "${scenario}" == "maintenance-columnar" ]]; then
@@ -789,19 +811,25 @@ jq -n --arg scenario "${scenario}" --argjson source "${source_json}" \
   --argjson health "${health_json}" --argjson restart "${restart_json}" \
   --argjson columnar "${columnar_json}" \
   --argjson placement "${placement_json}" \
+  --argjson semanticRetry "${semantic_retry_json}" \
   --slurpfile handoff "${artifact_dir}/handoff-samples.jsonl" \
   '{scenario:$scenario, source:$source, preTrigger:$preTrigger, request:$request,
-    surge:$surge, handoff:$handoff, completed:$completed, alfred:$alfred,health:$health,restart:$restart,columnar:$columnar,placement:$placement}' >"${evidence}"
+    surge:$surge, handoff:$handoff, completed:$completed, alfred:$alfred,health:$health,restart:$restart,columnar:$columnar,placement:$placement,semanticRetry:$semanticRetry}' >"${evidence}"
 
 # Delayed variants retain the same complete maintenance handoff invariant;
 # their separate evidence additionally characterizes the mailbox race.
-if ! jq 'if .scenario == "hint-exhaustion-single" or .scenario == "target-health-race-single" or .scenario == "placement-pause-single" then .scenario="maintenance-single" else . end' "${evidence}" | jq -e -f "${script_dir}/verify-evidence.jq" >/dev/null; then
+if ! jq 'if .scenario == "hint-exhaustion-single" or .scenario == "target-health-race-single" or .scenario == "placement-pause-single" or .scenario == "semantic-retry-single" then .scenario="maintenance-single" else . end' "${evidence}" | jq -e -f "${script_dir}/verify-evidence.jq" >/dev/null; then
   echo "captured evidence failed the acceptance verifier" >&2
   exit 1
 fi
 if [[ "${scenario}" == "placement-pause-single" ]]; then
   jq -e -L "${script_dir}" -f "${script_dir}/verify-placement-pause.jq" "${evidence}" >/dev/null || {
     echo 'placement pause evidence failed its acceptance verifier' >&2; exit 1;
+  }
+fi
+if [[ "${scenario}" == semantic-retry-single ]]; then
+  jq -e -L "${script_dir}" -f "${script_dir}/verify-semantic-retry.jq" "${evidence}" >/dev/null || {
+    echo 'semantic retry evidence failed its acceptance verifier' >&2; exit 1;
   }
 fi
 assert_annotation_watch_alive "${request_watch_pid}" "${request_watch_stderr}"

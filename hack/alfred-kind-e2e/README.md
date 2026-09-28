@@ -50,6 +50,7 @@ bash hack/alfred-kind-e2e/deploy.sh
 bash hack/alfred-kind-e2e/scenario.sh maintenance-single
 bash hack/alfred-kind-e2e/scenario.sh maintenance-columnar
 bash hack/alfred-kind-e2e/scenario.sh placement-pause-single
+bash hack/alfred-kind-e2e/scenario.sh semantic-retry-single
 bash hack/alfred-kind-e2e/scenario.sh restart-single
 bash hack/alfred-kind-e2e/scenario.sh unhealthy-single
 ```
@@ -111,6 +112,35 @@ reconciliation, with no duplicate across three further decision cycles. Raw API
 samples and the annotation watch are retained beside the combined evidence.
 This tests the public envelope on a local member, not end-to-end multi-cluster
 placement, real GPU execution, or retry recovery across a generation change.
+
+`semantic-retry-single` tests the prepared-intent retry path across a real IR
+generation change. A temporary admission policy targets only Alfred's additions
+of migration request annotations to the fresh fixture UID. After maintenance,
+Alfred must persist one prepared UUID/payload, attempt publication, and receive
+an API rejection. The witness includes an increase in the API server's counter
+for this unique policy, measured after all dry-run rejection probes; a prepared
+journal entry alone is insufficient. The canonical Alfred guard stays intact.
+
+The harness publishes placement pause revision 2, removes the temporary binding
+while paused, and confirms the exact prepared payload passes server dry-run.
+Three paused decision cycles must preserve the source and prepared intent with
+no request or replacement. Released revision 3 must then let that same UUID and
+byte-identical payload migrate through the usual held-surge/routing checks, with
+no duplicate across three completed cycles. ISVC metadata changes its resource
+version; the real OME projection advances IR generation while the source Pod and
+revision remain unchanged. The old generation-based retry fence instead produces
+a bounded three-cycle `SourceChanged` failure witness before acknowledgement
+timeout.
+
+This case requires the harness's `ome` Alfred namespace, three-minute migration
+acknowledgement timeout, API-server metrics access, and administrator permission
+to create/delete the narrowly scoped admission resources and impersonate Alfred
+for server dry-run only. It does not change Alfred RBAC. Raw policy objects,
+probe responses, metrics, API snapshots and watches remain in the run artifacts.
+Cleanup uses recorded admission-object UIDs; if it cannot confirm a safe pause
+after a failure, it reports the retained narrow deny policy instead of silently
+unblocking a live pending intent. The offline shell/verifier tests run under the
+existing `hack/alfred-kind-e2e/*_test.sh` CI loop; no live cluster is used in CI.
 
 The gang fixture has a leader and worker, each requesting eight GPUs, scheduled
 by the real OME scheduler into one zone. Migration must replace both members in

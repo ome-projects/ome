@@ -32,7 +32,7 @@ func TestDispatchFingerprintUsesLogicalSourceAcrossEncodings(t *testing.T) {
 		CurrentRevision: "rev", InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 7, Phase: v1beta1.OMENativeInstanceReady,
 			Incarnation: 2, RunningRevision: "rev", PodCount: 1, ServingPodCount: 1, AvailablePodCount: 1, Admitted: true}},
 	}}
-	dense, err := dispatchSourceFingerprint(owner, ir, nil, 7)
+	dense, err := dispatchSourceFingerprint(owner, ir, nil, 7, dispatchFingerprintSemantic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestDispatchFingerprintUsesLogicalSourceAcrossEncodings(t *testing.T) {
 	ir.Status.InstanceStatuses = nil
 	ir.Status.InstanceStatusEncoding = &marker
 	ir.Status.InstanceStatusColumns = columns
-	compact, err := dispatchSourceFingerprint(owner, ir, nil, 7)
+	compact, err := dispatchSourceFingerprint(owner, ir, nil, 7, dispatchFingerprintSemantic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestDispatchFingerprintUsesLogicalSourceAcrossEncodings(t *testing.T) {
 		t.Fatalf("equivalent logical source changed fingerprint: dense=%s compact=%s", dense, compact)
 	}
 	ir.Status.InstanceStatusColumns.RunningRevisions = nil
-	changed, err := dispatchSourceFingerprint(owner, ir, nil, 7)
+	changed, err := dispatchSourceFingerprint(owner, ir, nil, 7, dispatchFingerprintSemantic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestDispatchFingerprintUsesLogicalSourceAcrossEncodings(t *testing.T) {
 	}
 	unknown := v1beta1.InstanceStatusEncoding("Future")
 	ir.Status.InstanceStatusEncoding = &unknown
-	if fingerprint, err := dispatchSourceFingerprint(owner, ir, nil, 7); err == nil || fingerprint != "" {
+	if fingerprint, err := dispatchSourceFingerprint(owner, ir, nil, 7, dispatchFingerprintSemantic); err == nil || fingerprint != "" {
 		t.Fatalf("undecodable source fingerprint = %q, %v; want error", fingerprint, err)
 	}
 }
