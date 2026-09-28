@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1811,5 +1813,40 @@ func TestPairingProtocol_CollisionSaltStillDistinguishes(t *testing.T) {
 	}
 	if bytes.Equal(rawA, rawB) {
 		t.Error("payloads with distinct protocols are byte-identical; collision detection cannot separate them")
+	}
+}
+
+func TestPlacementPolicyDoesNotChangePodRevision(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		meta *metav1.ObjectMeta
+	}{
+		{name: "no user metadata"},
+		{name: "user metadata", meta: &metav1.ObjectMeta{Labels: map[string]string{"app": "example-model"}, Annotations: map[string]string{"example.com/setting": "value"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := basicPodSpecForRevision()
+			want, _, err := Hash(pod, tt.meta, nil, "owner-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := tt.meta.DeepCopy()
+			if meta == nil {
+				meta = &metav1.ObjectMeta{}
+			}
+			if meta.Annotations == nil {
+				meta.Annotations = map[string]string{}
+			}
+			for _, policy := range []string{`{"planID":"plan-a","pauseSurge":true}`, `{"planID":"plan-b","pauseSurge":false}`} {
+				meta.Annotations[constants.PlacementExecution] = policy
+				got, _, err := Hash(pod, meta, nil, "owner-a")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diff := cmp.Diff(want, got); diff != "" {
+					t.Errorf("pod revision (-want +got):\n%s", diff)
+				}
+			}
+		})
 	}
 }

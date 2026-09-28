@@ -9,9 +9,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
@@ -842,62 +844,72 @@ func TestProberRejectsAmbiguousIdentity(t *testing.T) {
 }
 
 func TestProberTimeoutStartsAfterExecutorDequeues(t *testing.T) {
-	executor, _, _ := startTestObserverExecutor(t, 1, 1)
-	firstStarted := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	first, err := executor.Submit(context.Background(), observerTestTimeout, func(ctx context.Context) error {
-		close(firstStarted)
-		select {
-		case <-releaseFirst:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	})
-	if err != nil {
-		t.Fatalf("Submit(first) error = %v", err)
-	}
-	<-firstStarted
+	for _, tt := range []struct {
+		name          string
+		queueTimeouts int
+	}{
+		{name: "immediate release"},
+		{name: "queue wait exceeds request timeout", queueTimeouts: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				executor, _, _ := startTestObserverExecutor(t, 1, 1)
+				firstStarted := make(chan struct{})
+				releaseFirst := make(chan struct{})
+				first, err := executor.Submit(context.Background(), observerTestTimeout, func(ctx context.Context) error {
+					close(firstStarted)
+					select {
+					case <-releaseFirst:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				})
+				if err != nil {
+					t.Fatalf("Submit(first) error = %v", err)
+				}
+				<-firstStarted
 
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requests.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-	config := testProbeConfig()
-	config.Timeout = 30 * time.Millisecond
-	clk := clocktesting.NewFakeClock(testProbeNow)
-	prober, err := NewProber(executor, NewObserverClient(), clk, testProbeResponseBytes, logr.Discard())
-	if err != nil {
-		t.Fatalf("NewProber() error = %v", err)
-	}
-	policy := testProbePolicy(t, config)
-	target := testProbeTarget(server.URL, policy.PolicyDigest)
-
-	done := make(chan error, 1)
-	go func() {
-		_, reconcileErr := prober.Reconcile(context.Background(), testProbeRequest(policy, target))
-		done <- reconcileErr
-	}()
-	time.Sleep(3 * config.Timeout)
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("probe began while queued; requests = %d", got)
-	}
-	close(releaseFirst)
-	if err := waitFuture(t, first); err != nil {
-		t.Fatalf("first future error = %v", err)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Reconcile() error = %v", err)
-		}
-	case <-time.After(observerTestTimeout):
-		t.Fatal("Reconcile() did not finish")
-	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("requests after worker release = %d, want 1", got)
+				config := testProbeConfig()
+				var requests atomic.Int32
+				client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+					requests.Add(1)
+					deadline, ok := request.Context().Deadline()
+					if !ok {
+						t.Error("probe request has no deadline")
+					} else if diff := cmp.Diff(config.Timeout, time.Until(deadline)); diff != "" {
+						t.Errorf("execution budget (-want +got):\n%s", diff)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+				})}
+				prober, err := NewProber(executor, client, clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes, logr.Discard())
+				if err != nil {
+					t.Fatalf("NewProber() error = %v", err)
+				}
+				policy := testProbePolicy(t, config)
+				target := testProbeTarget("https://service.example.com", policy.PolicyDigest)
+				done := make(chan error, 1)
+				go func() {
+					_, reconcileErr := prober.Reconcile(context.Background(), testProbeRequest(policy, target))
+					done <- reconcileErr
+				}()
+				synctest.Wait()
+				time.Sleep(time.Duration(tt.queueTimeouts) * config.Timeout)
+				if diff := cmp.Diff(int32(0), requests.Load()); diff != "" {
+					t.Fatalf("requests while queued (-want +got):\n%s", diff)
+				}
+				close(releaseFirst)
+				if err := waitFuture(t, first); err != nil {
+					t.Fatalf("first future error = %v", err)
+				}
+				if err := <-done; err != nil {
+					t.Fatalf("Reconcile() error = %v", err)
+				}
+				if diff := cmp.Diff(int32(1), requests.Load()); diff != "" {
+					t.Fatalf("requests after worker release (-want +got):\n%s", diff)
+				}
+			})
+		})
 	}
 }
 

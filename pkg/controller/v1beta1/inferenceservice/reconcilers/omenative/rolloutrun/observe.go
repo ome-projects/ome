@@ -285,6 +285,11 @@ func canaryMidFlight(isvc *v1beta1.InferenceService) bool {
 // derivedProvenance parses the derive-time plan-source annotation
 // ("<idx>=<name>@<digest>;..."), which carries per-group policy identity on a
 // derived ISVC whose refs the control plane inflated into inline groups.
+//
+// The annotation carries no progression, so every returned PolicyRef has
+// Progression deliberately unset. That zero value is NOT writable to the
+// status subresource (the field is a required CRD enum): a caller that puts
+// one on status must fill Progression from the composed group body first.
 func derivedProvenance(isvc *v1beta1.InferenceService) map[int]v1beta1.RolloutRunProvenance {
 	raw := isvc.Annotations[constants.RolloutPlanSourceAnnotation]
 	if raw == "" {

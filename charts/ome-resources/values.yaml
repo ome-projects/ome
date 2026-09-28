@@ -97,8 +97,8 @@ ome:
         requeueInterval: ""         # status-refresh poll cadence
         gcInterval: ""              # orphan-sweep cadence
         maxConcurrentReconciles: 0  # parallel placement reconciles (0 => single worker)
-        fanoutTimeout: ""           # per-cluster fan-out apply deadline
-        winnerLostGrace: ""         # grace before re-placing when the sticky winner's derived is missing
+        fanoutTimeout: ""           # per-cluster placement read/apply/delete deadline
+        winnerLostGrace: ""         # grace for transient absence, membership removal, or admission loss of the sticky winner
         statusBatchPeriod: ""       # debounce for a burst of cross-cluster status events
         statusSafetyRequeue: ""     # steady-state re-read backstop when the funnel is on
         dispatcherMode: ""          # "AllAtOnce" (default) or "Incremental"

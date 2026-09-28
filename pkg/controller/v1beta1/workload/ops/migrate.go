@@ -130,6 +130,9 @@ func Migrate(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 		// handled (no fall-through needed).
 		return true, true, nil
 	}
+	if input.PauseNewSurge && !entry.SurgeAllocated() {
+		return false, false, nil
+	}
 
 	ledger, err := audit.LoadLedgerForOwner(ctx, deps.Reader(), ledgerOwnerObject(input))
 	if err != nil {

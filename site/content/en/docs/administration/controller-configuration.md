@@ -69,6 +69,14 @@ The three timing flags have no in-binary default and must be supplied together o
 
 None of the four has an in-binary default. The `ome-resources` chart supplies the operative values (`4`/`4`/`100`/`200`); zero or unset falls back to controller-runtime's defaults — one worker per controller and `20` QPS / `30` burst. See [Tuning reconcile throughput](#tuning-reconcile-throughput).
 
+### Operator config cache
+
+| Flag                 | Type     | Default | Description                                                                                                                                   |
+|----------------------|----------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--config-cache-ttl` | duration | `30s`   | TTL for the in-memory cache of the `inferenceservice-config` ConfigMap on the reconcile path. `0` disables caching, so every config load reads the apiserver. |
+
+Unlike the throughput flags, this one has an in-binary default; the chart supplies the same `30s`. The TTL is the answer to "do I need to restart the controller after editing `inferenceservice-config`?" — you do not; see [Tuning the config cache](#tuning-the-config-cache).
+
 ### Runtime-revision garbage collection
 
 These control cleanup of the OME-managed `ControllerRevision` snapshots created for [runtime pinning](/ome/docs/concepts/runtime-revision).
@@ -140,6 +148,34 @@ The manager logs the effective limits at startup, so you can confirm a change la
 ```bash
 kubectl -n ome logs deploy/<ome-controller-manager> | grep 'Configured API client rate limits'
 ```
+
+## Tuning the config cache
+
+Much of OME's operational tuning does not live in these flags at all — it lives in the `inferenceservice-config` ConfigMap in the OME namespace (the `deploy`, `ingress`, `canaryAnalysis`, `rollout`, `coordination`, and `lifecycle` blocks, among others). Unlike the flags on this page, editing that ConfigMap requires **no controller restart**: the controllers reload it on the reconcile path through an in-memory cache whose lifetime is `--config-cache-ttl`. Once the cached entry expires, the next config load fetches the ConfigMap again, so an edit reaches the controllers within one TTL window — at the default `30s`, at most 30 seconds after the edit.
+
+Two caveats on that guarantee:
+
+- **It covers the reconcile-path blocks.** A few blocks are loaded once at manager startup — `multicluster` and `omeAgent`, for example — and changes to those still need a pod restart.
+- **Fresh config is applied at the next reconcile.** The manager does not watch the ConfigMap, so an edit alone does not enqueue existing InferenceServices. Each object picks up the new values the next time something reconciles it: a spec change, an event on an owned resource, or one of the periodic re-checks below.
+
+The cache exists to keep that freshness affordable next to the [reconcile-throughput settings](#tuning-reconcile-throughput). A single reconcile pass loads several config blocks, and each uncached load is a direct apiserver GET that draws from the same `--kube-api-qps` budget as everything else the manager does. The cache collapses those onto one GET per TTL window, and concurrent expiries share a single in-flight fetch — so raising the worker counts does not multiply config reads. The InferenceService and InferenceReplica controllers and the AutoscalerPolicy/RolloutPolicy status controllers each hold their own cache instance with the same TTL.
+
+Setting the flag to `0` disables caching. Every config load then reads the apiserver live, which changes two things:
+
+- **Load.** Each reconcile pass again issues one GET per config block, all competing for the client-side rate limit (see [Recognizing client-side throttling](#recognizing-client-side-throttling)).
+- **Periodic re-checks stop.** The TTL doubles as the requeue interval for config-driven state that no watch event covers: an InferenceService held on an unbound autoscaler provider, and the AutoscalerPolicy/RolloutPolicy status controllers' re-check of provider bindings, are re-evaluated once per TTL because a ConfigMap edit emits no event on those objects. At `0` that periodic pass is skipped — reads are live, but nothing schedules a reconcile after a ConfigMap edit alone.
+
+So lower the TTL if a 30-second delay on config edits is too slow for your workflow, and raise it if the config GETs matter in your apiserver traffic — but prefer a small positive value over `0`.
+
+The chart value, under `ome.controller`:
+
+```yaml
+ome:
+  controller:
+    configCacheTTL: "30s"
+```
+
+The chart renders the flag only when the value is non-empty, and here the binary has its own `30s` default, so omitting the value changes nothing. To disable caching from the chart, the value must be the quoted string `"0"` — an unquoted `0` is falsy in the template, which omits the flag and silently keeps the `30s` default instead of disabling the cache.
 
 ## Tuning runtime-revision garbage collection
 

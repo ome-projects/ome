@@ -32,7 +32,7 @@ func scheme(t *testing.T) *runtime.Scheme {
 
 func wcWithSecret(name string) *v1beta1.WorkloadCluster {
 	return &v1beta1.WorkloadCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid")},
 		Spec: v1beta1.WorkloadClusterSpec{ClusterSource: v1beta1.ClusterConnectionSource{
 			KubeConfig: &v1beta1.KubeConfigSource{SecretRef: corev1.SecretReference{Name: "kc", Namespace: "ome-system"}, Key: "kubeconfig"},
 		}},

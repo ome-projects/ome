@@ -51,6 +51,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
 
 // IsIRManagedComponent returns true when the given Component should be
@@ -81,6 +82,9 @@ var isvcGVK = v1beta1.SchemeGroupVersion.WithKind("InferenceService")
 // it hands the IR controller the exact same per-pod template the
 // dispatch site computed.
 type Params struct {
+	placementExecution    *v1beta1.PlacementExecutionPolicy
+	placementReplicaLimit *int32
+
 	// ISVC is the parent InferenceService. The projector reads
 	// ISVC.Name / Namespace / UID for IR naming + owner-ref, and
 	// passes Spec.<component>.Lifecycle into the IR Spec.
@@ -194,11 +198,9 @@ type Params struct {
 //
 // Idempotent: the second invocation with the same Params produces the
 // same Spec and no-ops (projectionUnchanged skips the write). On a real
-// change it issues a merge patch of only the diffed fields — with no
-// ResourceVersion precondition, so a concurrent IR status write from the
-// IR controller can't turn it into an optimistic-lock conflict. The
-// retry.RetryOnConflict wrapper remains for the racing-create path, which
-// synthesizes a Conflict.
+// change it patches only the diffed fields. Placement-managed projections
+// use an optimistic lock so concurrent writes cannot regress plan authority.
+// Ordinary local projections do not contend with IR status writes.
 //
 // Errors are wrapped with the offending IR namespace/name for grep-
 // ability in operator logs — except apierrors.IsConflict, which callers
@@ -206,6 +208,14 @@ type Params struct {
 func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceReplica, error) {
 	if err := validateParams(p); err != nil {
 		return nil, err
+	}
+	policy, err := protocol.FromDerived(p.ISVC)
+	if err != nil {
+		return nil, err
+	}
+	p.placementExecution = policy
+	if policy != nil && policy.PauseSurge && (p.ComponentExt == nil || p.ComponentExt.MinReplicas == nil || *p.ComponentExt.MinReplicas <= 0 || int64(*p.ComponentExt.MinReplicas) > math.MaxInt32) {
+		return nil, fmt.Errorf("placement pause requires a resolved positive component floor")
 	}
 	p = applyQuotaGovernance(p)
 
@@ -222,11 +232,12 @@ func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceRe
 	if p.Reader != nil {
 		reads = p.Reader
 	}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		ir := &v1beta1.InferenceReplica{}
 		getErr := reads.Get(ctx, key, ir)
 		switch {
 		case apierrors.IsNotFound(getErr):
+			p.placementReplicaLimit = placementReplicaLimit(ir, p)
 			ir = newInferenceReplica(p, name)
 			if err := p.Client.Create(ctx, ir); err != nil {
 				if apierrors.IsAlreadyExists(err) {
@@ -251,12 +262,16 @@ func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceRe
 		case getErr != nil:
 			return fmt.Errorf("get IR %s/%s: %w", p.ISVC.Namespace, name, getErr)
 		}
+		if err := protocol.Authorize(ir.Spec.PlacementExecution, policy); err != nil {
+			return fmt.Errorf("project IR %s/%s: %w", p.ISVC.Namespace, name, err)
+		}
 
 		// IR exists - apply the desired spec on top of the live object. The
 		// pacing partition is projected; the rest of the pacing block (the
 		// canary executor's rollback target) is preserved. Paused is projected
 		// from the parent ISVC's operator-facing rollout-paused annotation below.
 		original := ir.DeepCopy()
+		p.placementReplicaLimit = placementReplicaLimit(ir, p)
 		applyDesiredSpec(ir, p, name)
 
 		// No-op guard: skip the write entirely when nothing the projector
@@ -270,12 +285,10 @@ func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceRe
 			return nil
 		}
 
-		// Merge patch (no ResourceVersion precondition) so a concurrent
-		// IR status write from the IR controller doesn't turn this into an
-		// optimistic-lock conflict — the projector only owns spec/metadata
-		// fields, never status. RetryOnConflict still wraps the Get→patch
-		// for the racing-create path below, which synthesizes a Conflict.
 		patch := client.MergeFrom(original)
+		if policy != nil {
+			patch = client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
+		}
 
 		// Every write bumps the IR's generation, and a write on every pass
 		// starves each fresh-snapshot consumer downstream — ObservedGeneration
@@ -429,6 +442,8 @@ func applyDesiredSpec(ir *v1beta1.InferenceReplica, p Params, name string) {
 	ir.Spec.ParentRef = v1beta1.ParentReference{
 		Name: p.ISVC.Name,
 	}
+	ir.Spec.PlacementExecution = p.placementExecution.DeepCopy()
+	ir.Spec.PlacementReplicaLimit = p.placementReplicaLimit
 	ir.Spec.Component = p.Component
 	ir.Spec.Replicas = desiredReplicas(ir, p)
 	ir.Spec.Runners = runnersFromParams(p)
@@ -581,6 +596,21 @@ func desiredReplicas(ir *v1beta1.InferenceReplica, p Params) *int32 {
 		return ir.Spec.Replicas
 	}
 	return replicasFromComponentExt(p.ComponentExt)
+}
+
+// placementReplicaLimit captures committed demand before the pause is
+// acknowledged. Subsequent autoscaler increases cannot expand that reservation.
+func placementReplicaLimit(ir *v1beta1.InferenceReplica, p Params) *int32 {
+	if p.placementExecution == nil || !p.placementExecution.PauseSurge {
+		return nil
+	}
+	floor := int32(*p.ComponentExt.MinReplicas)
+	requested := *desiredReplicas(ir, p)
+	limit := max(floor, requested)
+	if ir.Spec.PlacementExecution != nil && ir.Spec.PlacementExecution.PauseSurge && ir.Spec.PlacementReplicaLimit != nil {
+		limit = max(floor, min(*ir.Spec.PlacementReplicaLimit, requested))
+	}
+	return &limit
 }
 
 // isAutoscalerManaged reports whether the resolved Component autoscaler

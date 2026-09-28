@@ -150,6 +150,7 @@ func TestGatewayAPIStrategy_Reconcile(t *testing.T) {
 
 			// Set component statuses to ready
 			setComponentStatusReadyGateway(tt.isvc)
+			makeHTTPRouteSpecsCurrent(t, tt.isvc, tt.ingressConfig, tt.existingHTTPRoutes)
 
 			objs := []client.Object{tt.isvc}
 			objs = append(objs, tt.existingHTTPRoutes...)
@@ -179,6 +180,72 @@ func TestGatewayAPIStrategy_Reconcile(t *testing.T) {
 				assert.NoError(t, err)
 				assert.Equal(t, tt.expectedIngressReady, tt.isvc.Status.GetCondition(v1beta1.IngressReady).Status)
 			}
+		})
+	}
+}
+
+func TestGatewayAPIStrategy_Reconcile_AcceptedRoutesDuringScaleUp(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		readyReplicas int32
+		serving       int32
+		want          corev1.ConditionStatus
+	}{
+		{name: "serving capacity remains", readyReplicas: 4, serving: 4, want: corev1.ConditionTrue},
+		{name: "ready replicas are out of rotation", readyReplicas: 4, serving: 0, want: corev1.ConditionFalse},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, v1beta1.AddToScheme(scheme))
+			require.NoError(t, gatewayapiv1.Install(scheme))
+			require.NoError(t, corev1.AddToScheme(scheme))
+
+			isvc := createTestInferenceServiceWithRouterGateway("test-isvc", "default")
+			isvc.Generation = 2
+			setComponentStatusReadyGateway(isvc)
+			existingHTTPRoutes := []client.Object{
+				createReadyHTTPRoute("test-isvc-engine", "default"),
+				createReadyHTTPRoute("test-isvc-router", "default"),
+				createReadyHTTPRoute("test-isvc", "default"),
+			}
+			makeHTTPRouteSpecsCurrent(t, isvc, gatewayTestIngressConfig(), existingHTTPRoutes)
+			isvc.Status.SetCondition(v1beta1.EngineReady, &apis.Condition{
+				Type:    v1beta1.EngineReady,
+				Status:  corev1.ConditionFalse,
+				Reason:  "InsufficientAvailable",
+				Message: "component is converging to its desired replica count",
+			})
+			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
+				Type:   v1beta1.IngressReady,
+				Status: corev1.ConditionTrue,
+			})
+			isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+				v1beta1.EngineComponent: {
+					ScaleTargetRef: &v1beta1.ScaleTargetRef{
+						APIVersion: v1beta1.SchemeGroupVersion.String(),
+						Kind:       "InferenceReplica",
+						Name:       "test-isvc-engine",
+					},
+					Lifecycle: &v1beta1.LifecycleStatus{
+						ObservedGeneration: 1,
+						Replicas:           10,
+						ReadyReplicas:      tt.readyReplicas,
+						ServingReplicas:    tt.serving,
+					},
+				},
+			}
+
+			fakeClient := fakeclient.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(append([]client.Object{isvc}, existingHTTPRoutes...)...).
+				WithStatusSubresource(&gatewayapiv1.HTTPRoute{}).
+				Build()
+			strategy := createGatewayAPIStrategyWithClient(t, fakeClient)
+
+			require.NoError(t, strategy.Reconcile(context.Background(), isvc))
+			condition := isvc.Status.GetCondition(v1beta1.IngressReady)
+			require.NotNil(t, condition)
+			assert.Equal(t, tt.want, condition.Status)
 		})
 	}
 }
@@ -358,8 +425,13 @@ func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute(t *testing.T) {
 					cond := tt.isvc.Status.GetCondition(v1beta1.IngressReady)
 					require.NotNil(t, cond)
 					assert.Equal(t, corev1.ConditionFalse, cond.Status)
+				} else if tt.expectedUpdate {
+					assert.False(t, ready, "an updated route must await status for its new generation")
+					cond := tt.isvc.Status.GetCondition(v1beta1.IngressReady)
+					require.NotNil(t, cond)
+					assert.Equal(t, corev1.ConditionFalse, cond.Status)
 				} else {
-					assert.True(t, ready, "an existing route defers readiness to the status check")
+					assert.True(t, ready)
 				}
 			}
 		})
@@ -790,15 +862,65 @@ func TestGatewayAPIStrategy_GetRawServiceHost(t *testing.T) {
 
 func TestGatewayAPIStrategy_IsHTTPRouteReady(t *testing.T) {
 	tests := []struct {
-		name            string
-		status          gatewayapiv1.HTTPRouteStatus
-		expectedReady   bool
-		expectedReason  *string
-		expectedMessage *string
+		name          string
+		mutate        func(*gatewayapiv1.HTTPRoute)
+		expectedReady bool
 	}{
+		{name: "current generation accepted", expectedReady: true},
 		{
-			name:          "empty status",
-			status:        gatewayapiv1.HTTPRouteStatus{},
+			name: "empty status",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Status.Parents = nil
+			},
+			expectedReady: false,
+		},
+		{
+			name: "accepted condition missing",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Status.Parents[0].Conditions = nil
+			},
+			expectedReady: false,
+		},
+		{
+			name: "accepted condition unknown",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Status.Parents[0].Conditions[0].Status = metav1.ConditionUnknown
+			},
+			expectedReady: false,
+		},
+		{
+			name: "accepted condition is stale",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Status.Parents[0].Conditions[0].ObservedGeneration--
+			},
+			expectedReady: false,
+		},
+		{
+			name: "configured parent has no matching status",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Status.Parents[0].ParentRef.Name = "another-gateway"
+			},
+			expectedReady: false,
+		},
+		{
+			name: "second configured parent has no status",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Spec.ParentRefs = append(route.Spec.ParentRefs, gatewayapiv1.ParentReference{
+					Name: "second-gateway",
+				})
+			},
+			expectedReady: false,
+		},
+		{
+			name: "current generation condition is false",
+			mutate: func(route *gatewayapiv1.HTTPRoute) {
+				route.Status.Parents[0].Conditions = append(route.Status.Parents[0].Conditions, metav1.Condition{
+					Type:               string(gatewayapiv1.RouteConditionResolvedRefs),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: route.Generation,
+					Reason:             string(gatewayapiv1.RouteReasonInvalidKind),
+				})
+			},
 			expectedReady: false,
 		},
 	}
@@ -806,7 +928,11 @@ func TestGatewayAPIStrategy_IsHTTPRouteReady(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			strategy := createGatewayAPIStrategy(t)
-			ready, _, _ := strategy.(*GatewayAPIStrategy).isHTTPRouteReady(tt.status)
+			route := createReadyHTTPRoute("test-isvc", "default")
+			if tt.mutate != nil {
+				tt.mutate(route)
+			}
+			ready, _, _ := strategy.(*GatewayAPIStrategy).isHTTPRouteReady(route)
 			assert.Equal(t, tt.expectedReady, ready)
 		})
 	}
@@ -890,19 +1016,61 @@ func createGatewayAPIStrategyWithClient(t *testing.T, client client.Client) inte
 	require.NoError(t, corev1.AddToScheme(scheme))
 
 	opts := interfaces.ReconcilerOptions{
-		Client: client,
-		Scheme: scheme,
-		IngressConfig: &controllerconfig.IngressConfig{
-			EnableGatewayAPI:  true,
-			IngressDomain:     "example.com",
-			OmeIngressGateway: "istio-system/gateway",
-			DomainTemplate:    "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
-			UrlScheme:         "https",
-		},
-		IsvcConfig: &controllerconfig.InferenceServicesConfig{},
+		Client:        client,
+		Scheme:        scheme,
+		IngressConfig: gatewayTestIngressConfig(),
+		IsvcConfig:    &controllerconfig.InferenceServicesConfig{},
 	}
 
 	return NewGatewayAPIStrategy(opts, services.NewDomainService(), services.NewPathService())
+}
+
+func gatewayTestIngressConfig() *controllerconfig.IngressConfig {
+	return &controllerconfig.IngressConfig{
+		EnableGatewayAPI:  true,
+		IngressDomain:     "example.com",
+		OmeIngressGateway: "istio-system/gateway",
+		DomainTemplate:    "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
+		UrlScheme:         "https",
+	}
+}
+
+func makeHTTPRouteSpecsCurrent(
+	t *testing.T,
+	isvc *v1beta1.InferenceService,
+	ingressConfig *controllerconfig.IngressConfig,
+	routes []client.Object,
+) {
+	t.Helper()
+	builder := builders.NewHTTPRouteBuilder(
+		nil,
+		ingressConfig,
+		&controllerconfig.InferenceServicesConfig{},
+		services.NewDomainService(),
+		services.NewPathService(),
+	)
+	for _, obj := range routes {
+		route, ok := obj.(*gatewayapiv1.HTTPRoute)
+		require.True(t, ok)
+		var component string
+		switch route.Name {
+		case constants.EngineServiceName(isvc.Name):
+			component = builders.EngineComponent
+		case constants.RouterServiceName(isvc.Name):
+			component = builders.RouterComponent
+		case constants.DecoderServiceName(isvc.Name):
+			component = builders.DecoderComponent
+		case isvc.Name:
+			component = builders.TopLevelComponent
+		default:
+			t.Fatalf("unknown HTTPRoute %q", route.Name)
+		}
+		desired, err := builder.BuildHTTPRoute(context.Background(), isvc, component)
+		require.NoError(t, err)
+		require.NotNil(t, desired)
+		route.Spec = desired.(*gatewayapiv1.HTTPRoute).Spec
+		markHTTPRouteAccepted(route)
+	}
 }
 
 func createTestInferenceServiceGateway(name, namespace string) *v1beta1.InferenceService {
@@ -964,50 +1132,47 @@ func setComponentStatusReadyGateway(isvc *v1beta1.InferenceService) {
 }
 
 func createReadyHTTPRoute(name, namespace string) *gatewayapiv1.HTTPRoute {
-	return &gatewayapiv1.HTTPRoute{
+	parentRef := gatewayapiv1.ParentReference{Name: "gateway"}
+	route := &gatewayapiv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:       name,
+			Namespace:  namespace,
+			Generation: 1,
 		},
-		Status: gatewayapiv1.HTTPRouteStatus{
-			RouteStatus: gatewayapiv1.RouteStatus{
-				Parents: []gatewayapiv1.RouteParentStatus{{
-					ParentRef:      gatewayapiv1.ParentReference{Name: "gateway"},
-					ControllerName: "test.controller/gateway",
-					Conditions: []metav1.Condition{{
-						Type:               string(gatewayapiv1.RouteConditionAccepted),
-						Status:             metav1.ConditionTrue,
-						Reason:             string(gatewayapiv1.RouteReasonAccepted),
-						LastTransitionTime: metav1.Now(),
-					}},
-				}},
+		Spec: gatewayapiv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayapiv1.CommonRouteSpec{
+				ParentRefs: []gatewayapiv1.ParentReference{parentRef},
 			},
 		},
 	}
+	markHTTPRouteAccepted(route)
+	return route
+}
+
+func markHTTPRouteAccepted(route *gatewayapiv1.HTTPRoute) {
+	parents := make([]gatewayapiv1.RouteParentStatus, 0, len(route.Spec.ParentRefs))
+	for _, parentRef := range route.Spec.ParentRefs {
+		parents = append(parents, gatewayapiv1.RouteParentStatus{
+			ParentRef:      parentRef,
+			ControllerName: "test.controller/gateway",
+			Conditions: []metav1.Condition{{
+				Type:               string(gatewayapiv1.RouteConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: route.Generation,
+				Reason:             string(gatewayapiv1.RouteReasonAccepted),
+				LastTransitionTime: metav1.Now(),
+			}},
+		})
+	}
+	route.Status.Parents = parents
 }
 
 func createNotReadyHTTPRoute(name, namespace string) *gatewayapiv1.HTTPRoute {
-	return &gatewayapiv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Status: gatewayapiv1.HTTPRouteStatus{
-			RouteStatus: gatewayapiv1.RouteStatus{
-				Parents: []gatewayapiv1.RouteParentStatus{{
-					ParentRef:      gatewayapiv1.ParentReference{Name: "gateway"},
-					ControllerName: "test.controller/gateway",
-					Conditions: []metav1.Condition{{
-						Type:               string(gatewayapiv1.RouteConditionAccepted),
-						Status:             metav1.ConditionFalse,
-						Reason:             string(gatewayapiv1.RouteReasonNotAllowedByListeners),
-						Message:            "route not accepted",
-						LastTransitionTime: metav1.Now(),
-					}},
-				}},
-			},
-		},
-	}
+	route := createReadyHTTPRoute(name, namespace)
+	route.Status.Parents[0].Conditions[0].Status = metav1.ConditionFalse
+	route.Status.Parents[0].Conditions[0].Reason = string(gatewayapiv1.RouteReasonNotAllowedByListeners)
+	route.Status.Parents[0].Conditions[0].Message = "route not accepted"
+	return route
 }
 
 func TestGatewayAPIStrategy_ReconcileBackendTrafficPolicy(t *testing.T) {

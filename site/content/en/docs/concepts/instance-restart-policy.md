@@ -79,7 +79,7 @@ Under `None`, all of these triggers are off. Two behaviors are policy-independen
 
 ## The crash-loop repair (every policy)
 
-A `Ready`, operation-free Instance holding a pod wedged in a terminal kubelet waiting state (`CrashLoopBackOff`, `ImagePullBackOff`, `CreateContainerError`) on the component's current revision — for longer than the operator's stuck-pod grace — is repaired through the same whole-Instance restart, under **every** restart policy: the pod cannot recover on its own and no other machinery owns that shape. `None` keeps its meaning for mere container restarts — a container that died and came back is not a wedge.
+A `Ready`, operation-free Instance holding a pod wedged in a terminal kubelet waiting state — `CrashLoopBackOff`, an image-pull failure (`ImagePullBackOff`, `ErrImagePull`, `InvalidImageName`), or a container create/run error (`CreateContainerError`, `CreateContainerConfigError`, `RunContainerError`) — on the component's current revision for longer than the operator's stuck-pod grace is repaired through the same whole-Instance restart, under **every** restart policy: the pod cannot recover on its own and no other machinery owns that shape. `None` keeps its meaning for mere container restarts — a container that died and came back is not a wedge.
 
 The grace window is `lifecycle.stuckPodGracePeriod` in the `inferenceservice-config` ConfigMap (the `ome-resources` chart ships `60s`); removing it disables this repair. Because this repair takes a still-serving Instance offline, it is admitted the way any capacity-taking attempt is — the per-component unavailability budget and the cross-component coordination gate must both admit it, and the retry budget recorded against the revision denies it once automatic attempts are spent. A component wedged on a bad revision therefore repairs at the configured pace, and a revision that keeps crash-looping is held rather than recycled forever. The pod-loss triggers above are different: they repair an outage rather than cause one, so they start without consuming any budget.
 
@@ -102,23 +102,19 @@ Pausing a rollout does not suspend recovery — a paused component keeps repairi
 
 - **Template changes.** Rolling an Instance to a new revision is [update strategies](/ome/docs/concepts/omenative-update-strategies); a restart rebuilds the Instance on the revision it was already running.
 - **A new Instance that never becomes Ready.** That is the `instanceReadyTimeout` readiness deadline, which parks the failed attempt rather than restarting anything.
-- **Instances parked at `Failed`.** Automatic recovery acts on running Instances; rebuilding a parked one is the manual `ome.io/reset-instances` annotation on the InferenceReplica (`all`, or a comma-separated list of Instance indices).
+- **Instances parked at `Failed`.** Automatic recovery acts on running Instances; rebuilding a parked one is the manual [`ome.io/reset-instances` annotation](/ome/docs/tasks/reset-failed-instances) on the InferenceReplica (`all`, or a comma-separated list of Instance indices).
 
 ## Observing a restart
 
-Per-Instance detail lives on the owning InferenceReplica:
+Per-Instance detail lives on the owning InferenceReplica; the [kubectl-ome plugin](/ome/docs/tasks/kubectl-ome-instance-list) reads it for you:
 
 ```bash
-kubectl get inferencereplica deepseek-r1-native-engine -o jsonpath='{.status}' | jq
+kubectl ome instance list deepseek-r1-native -n <namespace>
 ```
 
-A row that was just repaired shows the bumped incarnation and the preserved failure:
+A row that was just repaired shows the bumped incarnation in its `IDX/INC` cell, and the `F` flag in the `AOF` column marks the preserved failure record. To read the record's contents — plus the Instance's conditions and any in-flight operation — switch to the single-instance deep dive, `kubectl ome instance status deepseek-r1-native 0 --component engine`. The record is the Instance's `lastFailure`:
 
 ```yaml
-index: 0
-phase: Ready
-incarnation: 2
-readySince: "2026-09-26T11:52:07Z"
 lastFailure:
   podName: deepseek-r1-native-engine-0-worker-0
   containerName: ome-container
@@ -126,6 +122,8 @@ lastFailure:
   exitCode: 137
   time: "2026-09-26T11:47:31Z"
 ```
+
+On the InferenceReplica object itself, the per-Instance rows are stored either as the dense `status.instanceStatuses` list or grouped into `status.instanceStatusColumns`, depending on the manager's configured [status encoding](/ome/docs/administration/omenative-status-encoding); both decode to the same rows.
 
 The events on the InferenceReplica tell the same story: `RestartTriggered` (Warning, with the cause and new incarnation) followed by `RestartCompleted` (Normal).
 

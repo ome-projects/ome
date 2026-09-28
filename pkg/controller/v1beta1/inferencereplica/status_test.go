@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -2741,6 +2742,61 @@ func TestAggregateAndWriteStatus_ObservedGenerationFollowsGeneration(t *testing.
 
 	g.Expect(ir.Status.ObservedGeneration).To(gomega.Equal(int64(4)),
 		"the caller's in-memory IR must mirror the committed ObservedGeneration")
+}
+
+func TestPlacementGuardAcknowledgement(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		participant, paused bool
+		generationChanged   bool
+		wantAcknowledgement int64
+	}{
+		{name: "local clears placement acknowledgement"},
+		{name: "paused member acknowledges guarded generation", participant: true, paused: true, wantAcknowledgement: 4},
+		{name: "released member acknowledges generation", participant: true, wantAcknowledgement: 4},
+		{name: "concurrent generation cannot be acknowledged", participant: true, paused: true, generationChanged: true, wantAcknowledgement: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ir := baselineIR("service-engine", "team-a", 1)
+			ir.Generation, ir.Status.PlacementObservedGeneration = 4, 3
+			if tt.participant {
+				ir.Spec.PlacementExecution = &v1beta1.PlacementExecutionPolicy{PlanID: "plan-a", Revision: 1, SourceUID: "source-a", ClusterUID: "cluster-a", PauseSurge: tt.paused}
+				ir.Spec.PlacementReplicaLimit = ptr.To[int32](1)
+			}
+			live := ir.DeepCopy()
+			if tt.generationChanged {
+				live.Generation++
+			}
+			r, c := newReconciler(t, live)
+			plan := workloadtypes.ComponentPlan{
+				Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component), Replicas: 1,
+				Instances: []workloadtypes.InstancePlan{{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}}},
+			}
+			err := writeStatus(r, ir, plan, nil, false, nil)
+			if tt.generationChanged {
+				if !errors.Is(err, workloadtypes.ErrStatusMutationPrecondition) {
+					t.Fatalf("generation conflict: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			got := &v1beta1.InferenceReplica{}
+			if err := c.Get(t.Context(), client.ObjectKeyFromObject(ir), got); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tt.wantAcknowledgement, got.Status.PlacementObservedGeneration); diff != "" {
+				t.Errorf("persisted acknowledgement (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(got.Status.PlacementObservedGeneration, ir.Status.PlacementObservedGeneration); diff != "" {
+				t.Errorf("mirrored acknowledgement (-want +got):\n%s", diff)
+			}
+			if tt.generationChanged {
+				if diff := cmp.Diff(live.Status, got.Status); diff != "" {
+					t.Errorf("unobserved generation mutated status:\n%s", diff)
+				}
+			}
+		})
+	}
 }
 
 // TestPublicationCounters_DeriveFromPodsNotPhases pins the Component

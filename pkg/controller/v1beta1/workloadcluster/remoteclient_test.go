@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,6 +19,52 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
+
+func TestDirectClientBypassesInformerReads(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		wrap func(client.WithWatch, client.Reader) SelectivelyCachingClient
+		want bool
+	}{
+		{name: "uncached transport", wrap: func(c client.WithWatch, _ client.Reader) SelectivelyCachingClient { return NewNeverCachingClient(c) }, want: true},
+		{name: "selectively cached transport", wrap: func(c client.WithWatch, cached client.Reader) SelectivelyCachingClient {
+			return &selectivelyCachingClient{WithWatch: c, cachedReader: cached}
+		}, want: true},
+		{name: "nil transport", wrap: func(client.WithWatch, client.Reader) SelectivelyCachingClient { return NewNeverCachingClient(nil) }},
+		{name: "unsupported wrapper", wrap: func(c client.WithWatch, _ client.Reader) SelectivelyCachingClient {
+			return struct{ SelectivelyCachingClient }{NewNeverCachingClient(c)}
+		}},
+		{name: "nil client", wrap: func(client.WithWatch, client.Reader) SelectivelyCachingClient { return nil }},
+		{name: "nil direct wrapper", wrap: func(client.WithWatch, client.Reader) SelectivelyCachingClient { return (*neverCachingClient)(nil) }},
+		{name: "nil cached wrapper", wrap: func(client.WithWatch, client.Reader) SelectivelyCachingClient {
+			return (*selectivelyCachingClient)(nil)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			direct := &recordingClient{}
+			cached := &recordingReader{}
+			got, ok := DirectClient(tt.wrap(direct, cached))
+			if diff := cmp.Diff(tt.want, ok); diff != "" {
+				t.Fatalf("available (-want +got):\n%s", diff)
+			}
+			if !ok {
+				if got != nil {
+					t.Fatal("unverified transport returned a client")
+				}
+				return
+			}
+			if err := got.Get(t.Context(), client.ObjectKey{Name: "service-a"}, &v1beta1.InferenceService{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := got.List(t.Context(), &corev1.PodList{}); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff([4]int{1, 1, 0, 0}, [4]int{direct.getCalls, direct.listCalls, cached.getCalls, cached.listCalls}); diff != "" {
+				t.Errorf("direct and cached read counts (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
 
 type recordingClient struct {
 	client.WithWatch

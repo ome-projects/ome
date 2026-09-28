@@ -7,10 +7,26 @@ import (
 	"knative.dev/pkg/apis"
 )
 
-// TrafficMapPublished is the condition type reporting whether the active
-// publisher has realized this TrafficMap onto a concrete data plane (e.g. a
-// Gateway API HTTPRoute).
-const TrafficMapPublished = "Published"
+const (
+	// TrafficMapPublished is the condition type reporting whether the active
+	// publisher has realized this TrafficMap onto a concrete data plane (e.g. a
+	// Gateway API HTTPRoute).
+	TrafficMapPublished = "Published"
+
+	// TrafficMapPublicationFallback is the abnormal-true condition type reporting
+	// whether the publisher has applied a retained positive plan instead of the
+	// current TrafficMap plan.
+	TrafficMapPublicationFallback = "PublicationFallback"
+)
+
+// Reasons used by the publisher-owned publication conditions while entering,
+// serving, or finalizing retained-plan fallback.
+const (
+	TrafficMapReasonLastPositiveRetained     = "LastPositiveRetained"
+	TrafficMapReasonPublicationFallback      = "PublicationFallback"
+	TrafficMapReasonPublicationTransitioning = "Transitioning"
+	TrafficMapReasonPublicationFinalizing    = "Finalizing"
+)
 
 // TrafficMapRoutable is the condition type reporting whether this map carries a
 // target a gateway can send traffic to. It is owned by the routing controller,
@@ -121,8 +137,9 @@ const (
 // is garbage-collected with the ISVC), for as long as that ISVC is routed --
 // including while no home is routable, when the table is empty or all-zero and
 // the Routable condition says why. The routing controller owns spec, SourceUID,
-// and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the
-// rest of status.
+// and the Routable, CapacityFallback, and OverrideActive conditions; the
+// publisher owns the rest of status, including Published and
+// PublicationFallback.
 // +genclient
 // +k8s:openapi-gen=true
 // +kubebuilder:object:root=true
@@ -155,6 +172,11 @@ type TrafficMapList struct {
 // consumes it as desired state. A validating webhook may reject writes from
 // non-controller users.
 type TrafficMapSpec struct {
+	// PlacementPlanID identifies the accepted allocation behind this routing
+	// table. Publication must acknowledge this plan before a placement drains.
+	// +optional
+	PlacementPlanID string `json:"placementPlanID,omitempty"`
+
 	// Service is the routed logical service — the InferenceService name. Equal to
 	// metadata.name in v1; a distinct field leaves room for a future
 	// many-ISVC-to-one-service map.
@@ -322,10 +344,10 @@ type TrafficMapCapacity struct {
 // TrafficMapStatus reports whether the active publisher has realized this map
 // onto a concrete data plane, and whether the map has anything to realize.
 // Two writers share it: the publisher owns Published, GatewayRef,
-// ObservedTrafficMapGeneration, Publisher, and the Published condition; the
-// routing controller owns SourceUID plus the Routable and CapacityFallback
-// conditions. Conditions is keyed on type, so each writer must patch only its
-// own fields and conditions.
+// ObservedTrafficMapGeneration, Publisher, and the Published and
+// PublicationFallback conditions; the routing controller owns SourceUID plus
+// the Routable, CapacityFallback, and OverrideActive conditions. Conditions is
+// keyed on type, so each writer must patch only its own fields and conditions.
 type TrafficMapStatus struct {
 	// SourceUID is the UID of the InferenceService that generated this map. The
 	// routing controller writes it through its own status field manager before a
@@ -349,13 +371,14 @@ type TrafficMapStatus struct {
 	// +optional
 	ObservedTrafficMapGeneration int64 `json:"observedTrafficMapGeneration,omitempty"`
 
-	// Publisher records the durable target claims needed to recover or reverse
-	// data-plane mutations made while realizing this map.
+	// Publisher records the durable target claims and optional replay state needed
+	// to recover or reverse data-plane mutations made while realizing this map.
 	// +optional
 	Publisher *TrafficMapPublisherStatus `json:"publisher,omitempty"`
 
-	// Conditions carry the routing controller's Routable and CapacityFallback
-	// conditions and the publisher's Published condition.
+	// Conditions carry the routing controller's Routable, CapacityFallback, and
+	// OverrideActive conditions and the publisher's Published and
+	// PublicationFallback conditions.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -364,9 +387,9 @@ type TrafficMapStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
-// TrafficMapPublisherStatus is the durable cleanup journal for one publisher.
-// Claims are persisted before external mutation and retained until their
-// targets have been cleaned up.
+// TrafficMapPublisherStatus is the durable cleanup and replay journal for one
+// publisher. Claims are persisted before external mutation and retained until
+// their targets have been cleaned up.
 type TrafficMapPublisherStatus struct {
 	// PublisherName identifies the publisher implementation whose cleanup
 	// semantics apply. An implementation upgraded under the same name must remain
@@ -394,6 +417,57 @@ type TrafficMapPublisherStatus struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	ObservedOptionsDigest string `json:"observedOptionsDigest,omitempty"`
+
+	// LastPositive is the latest complete positive publisher plan that was fully
+	// applied. It is absent when no compatible plan is available for replay.
+	// +optional
+	LastPositive *TrafficMapPublisherLastPositive `json:"lastPositive,omitempty"`
+}
+
+// TrafficMapPublisherLastPositive is a complete post-transform publisher plan
+// retained for restart-safe replay.
+type TrafficMapPublisherLastPositive struct {
+	// TrafficMapGeneration is the generation whose positive plan was applied.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	TrafficMapGeneration int64 `json:"trafficMapGeneration"`
+
+	// ObservedISVCGeneration is the source generation that produced the plan.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	ObservedISVCGeneration int64 `json:"observedISVCGeneration"`
+
+	// PlanCompatibilityDigest identifies the effective publisher options that
+	// affect target identity or weights.
+	// +required
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PlanCompatibilityDigest string `json:"planCompatibilityDigest"`
+
+	// Targets is the complete canonical target-to-weight plan. Every claimed
+	// target appears exactly once, including inactive targets at weight zero.
+	// +required
+	// +listType=map
+	// +listMapKey=target
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=128
+	Targets []TrafficMapPublisherTarget `json:"targets"`
+}
+
+// TrafficMapPublisherTarget is one canonical target and its exact applied
+// integer weight in a retained publisher plan.
+type TrafficMapPublisherTarget struct {
+	// Target is a publisher-defined canonical identifier already covered by the
+	// enclosing publisher claim journal.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	Target string `json:"target"`
+
+	// Weight is the exact non-negative integer applied by the publisher.
+	// Publisher-specific bounds are validated before replay.
+	// +required
+	// +kubebuilder:validation:Minimum=0
+	Weight int64 `json:"weight"`
 }
 
 // TrafficMapGatewayRef points at the data plane object a publisher created to

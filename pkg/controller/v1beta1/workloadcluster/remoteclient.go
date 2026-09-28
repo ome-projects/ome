@@ -77,6 +77,22 @@ func NewNeverCachingClient(fakeClient client.WithWatch) SelectivelyCachingClient
 	}
 }
 
+// DirectClient exposes the transport without informer reads. Callers that use
+// observations to release shared capacity must verify physical absence live.
+func DirectClient(c SelectivelyCachingClient) (client.WithWatch, bool) {
+	switch c := c.(type) {
+	case *neverCachingClient:
+		if c != nil {
+			return c.WithWatch, c.WithWatch != nil
+		}
+	case *selectivelyCachingClient:
+		if c != nil {
+			return c.WithWatch, c.WithWatch != nil
+		}
+	}
+	return nil, false
+}
+
 type selectivelyCachingClient struct {
 	client.WithWatch
 	cachedReader client.Reader

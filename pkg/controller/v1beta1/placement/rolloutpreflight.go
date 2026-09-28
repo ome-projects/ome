@@ -112,6 +112,12 @@ func (p *rolloutPreflight) homeFor(uid types.UID, cluster string) *v1beta1.Candi
 	return p.homes[uid][cluster]
 }
 
+func (p *rolloutPreflight) forgetHome(uid types.UID, cluster string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.homes[uid], cluster)
+}
+
 // warnOnce reports whether msg is new content for this source (and records
 // it); an unchanged message returns false so the caller skips the re-emit.
 func (p *rolloutPreflight) warnOnce(uid types.UID, msg string) bool {
@@ -274,8 +280,7 @@ func (r *Reconciler) preflightRolloutPolicies(ctx context.Context, isvc *v1beta1
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: name}, pol); err != nil {
 			if !apierrors.IsNotFound(err) && sourcePlaced(isvc) {
 				// A transient control-plane read error is no verdict on the
-				// policy: writing Pending here would wipe a Placed source's
-				// status and URL. Hold the existing result and re-read soon.
+				// policy. Hold actuation and re-read soon.
 				r.Log.Error(err, "rollout preflight: policy read failed; holding existing placement",
 					"policy", isvc.Namespace+"/"+name, "isvc", isvc.Namespace+"/"+isvc.Name)
 				return &policyPreflightOutcome{holdAsIs: true, transient: true}
@@ -344,10 +349,14 @@ func (r *Reconciler) preflightRolloutPolicies(ctx context.Context, isvc *v1beta1
 			continue
 		}
 		if c == winner {
-			// The standing winner never loses its home to a preflight verdict:
-			// hold everything as-is; ineligibility gates only NEW fan-out.
-			r.Log.Info("rollout preflight: standing winner lacks the capability label; holding placement as-is",
+			// Capability ineligibility gates new fan-out without freezing the
+			// standing winner's observed health.
+			r.Log.Info("rollout preflight: standing winner lacks the capability label; holding actuation",
 				"cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
+			rp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
+				v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
+				fmt.Sprintf("rollout policy: standing winner %s lacks %s=%s; holding placement",
+					c, constants.WorkloadClusterRolloutPolicyLabel, WorkloadClusterRolloutPolicyCapability)))
 			return &policyPreflightOutcome{holdAsIs: true}
 		}
 		skips = append(skips, candidateSkip{

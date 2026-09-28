@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -3100,4 +3101,46 @@ func TestRevisionHashCacheInvalidatesWhenExcludedAnnotationsChange(t *testing.T)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(initialHash).NotTo(gomega.Equal(expectedHash))
 	g.Expect(updatedHash).To(gomega.Equal(expectedHash))
+}
+
+func TestReconcileUnresolvedPlacementLimitCannotAcknowledge(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		limit *int32
+	}{
+		{name: "pruned limit"},
+		{name: "zero limit", limit: ptr.To[int32](0)},
+		{name: "negative limit", limit: ptr.To[int32](-1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ir := baselineIR("engine", "team-a", 3)
+			ir.Generation = 2
+			ir.Status.ObservedGeneration = 1
+			ir.Status.PlacementObservedGeneration = 1
+			ir.Spec.PlacementExecution = &v1beta1.PlacementExecutionPolicy{PlanID: "plan-a", Revision: 1, SourceUID: "source-a", ClusterUID: "cluster-a", PauseSurge: true}
+			ir.Spec.PlacementReplicaLimit = tt.limit
+			r, c := newReconciler(t, ir)
+			before := &v1beta1.InferenceReplica{}
+			if err := c.Get(t.Context(), client.ObjectKeyFromObject(ir), before); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err == nil {
+				t.Fatal("unresolved limit executed")
+			}
+			after := &v1beta1.InferenceReplica{}
+			if err := c.Get(t.Context(), client.ObjectKeyFromObject(ir), after); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(before, after); diff != "" {
+				t.Errorf("unresolved limit mutated authority (-want +got):\n%s", diff)
+			}
+			pods := &corev1.PodList{}
+			if err := c.List(t.Context(), pods); err != nil {
+				t.Fatal(err)
+			}
+			if len(pods.Items) != 0 {
+				t.Fatal("unresolved limit created pods")
+			}
+		})
+	}
 }

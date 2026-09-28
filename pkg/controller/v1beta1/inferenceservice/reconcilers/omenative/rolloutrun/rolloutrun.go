@@ -295,7 +295,14 @@ func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedP
 			// A derived ISVC's inline group inflated from a policy at derive
 			// time: report the policy identity a locally-resolved ref would.
 			source = v1beta1.RolloutPlanSourcePolicy
-			provRef = p.PolicyRef
+			if p.PolicyRef != nil {
+				// The provenance annotation encodes only name@digest, so the
+				// parsed ref's Progression is zero — which the status
+				// subresource's enum rejects, failing every status write for
+				// the life of the run. The composed body is authoritative.
+				provRef = p.PolicyRef.DeepCopy()
+				provRef.Progression = composed.DeclaredProgression()
+			}
 		}
 		plan.groups = append(plan.groups, v1beta1.RolloutRunGroup{
 			Source:           source,

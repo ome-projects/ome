@@ -133,6 +133,8 @@ spec:
               observedISVCGeneration:
                 format: int64
                 type: integer
+              placementPlanID:
+                type: string
               service:
                 type: string
             required:
@@ -209,6 +211,46 @@ spec:
                     minItems: 1
                     type: array
                     x-kubernetes-list-type: set
+                  lastPositive:
+                    properties:
+                      observedISVCGeneration:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      planCompatibilityDigest:
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      targets:
+                        items:
+                          properties:
+                            target:
+                              maxLength: 512
+                              minLength: 1
+                              type: string
+                            weight:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - target
+                          - weight
+                          type: object
+                        maxItems: 128
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - target
+                        x-kubernetes-list-type: map
+                      trafficMapGeneration:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    required:
+                    - observedISVCGeneration
+                    - planCompatibilityDigest
+                    - targets
+                    - trafficMapGeneration
+                    type: object
                   observedOptionsDigest:
                     pattern: ^sha256:[0-9a-f]{64}$
                     type: string

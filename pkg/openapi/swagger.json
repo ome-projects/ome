@@ -143,6 +143,40 @@
         }
       }
     },
+    "v1beta1.AcceleratorCapacityAttribution": {
+      "description": "AcceleratorCapacityAttribution describes how nodes were assigned to a flavor.",
+      "type": "object",
+      "required": [
+        "flavorUID",
+        "flavorSetHash",
+        "complete"
+      ],
+      "properties": {
+        "complete": {
+          "description": "Complete means every observed node advertising this resource was unambiguously attributed and every flavor had a verifiable identity.",
+          "type": "boolean",
+          "default": false
+        },
+        "flavorSetHash": {
+          "description": "FlavorSetHash identifies all flavor definitions and configured resource names used by the attribution rule, including more specific selectors.",
+          "type": "string",
+          "default": ""
+        },
+        "flavorUID": {
+          "description": "FlavorUID identifies the observed ResourceFlavor object.",
+          "type": "string",
+          "default": ""
+        },
+        "nodeLabels": {
+          "description": "NodeLabels is the flavor's node selector at observation time.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    },
     "v1beta1.AcceleratorCapacityStatus": {
       "description": "AcceleratorCapacityStatus is the observed physical capacity of one flavor, the denominator an admin reads a budget against. It is derived, never authored.",
       "type": "object",
@@ -154,6 +188,10 @@
         "allocatable": {
           "description": "Allocatable is the currently schedulable quantity: the flavor's resource summed over Ready, uncordoned nodes matching the flavor's node labels. Nodes that are NotReady or cordoned remain physical inventory but contribute no schedulable capacity.",
           "$ref": "#/definitions/resource.Quantity"
+        },
+        "attribution": {
+          "description": "Attribution identifies the hardware mapping used for this observation. Omission cannot establish whether an observed zero is a complete sample.",
+          "$ref": "#/definitions/v1beta1.AcceleratorCapacityAttribution"
         },
         "highWaterMark": {
           "description": "HighWaterMark is the greatest Allocatable observed for this flavor. Budget checks compare against it rather than the instantaneous value, so capacity that shrinks — a drain, a cordon, a device-plugin restart — never marks a node Degraded. It is lowered only once the observed value stays below it by more than the configured hysteresis band.",
@@ -377,10 +415,18 @@
           "description": "Allocatable is that cluster's schedulable quantity of the flavor.",
           "$ref": "#/definitions/resource.Quantity"
         },
+        "attribution": {
+          "description": "Attribution is the member's hardware mapping at observation time.",
+          "$ref": "#/definitions/v1beta1.AcceleratorCapacityAttribution"
+        },
         "cluster": {
           "description": "Cluster is the WorkloadCluster's name.",
           "type": "string",
           "default": ""
+        },
+        "clusterUID": {
+          "description": "ClusterUID identifies the registration through which the report was read. Omission cannot establish that a same-name cluster owns this sample.",
+          "type": "string"
         },
         "highWaterMark": {
           "description": "HighWaterMark is the greatest Allocatable observed on this cluster.",
@@ -389,6 +435,18 @@
         "observedAt": {
           "description": "ObservedAt is when this cluster's value was last sampled. A stale stamp distinguishes \"capacity dropped\" from \"the cluster stopped reporting\".",
           "$ref": "#/definitions/v1.Time"
+        },
+        "reportAvailable": {
+          "description": "ReportAvailable means the most recent collection verified the source object and registration. It does not imply that ObservedAt is fresh.",
+          "type": "boolean"
+        },
+        "reportResourceVersion": {
+          "description": "ReportResourceVersion identifies the source object read for this sample.",
+          "type": "string"
+        },
+        "reportUID": {
+          "description": "ReportUID identifies the member's root AcceleratorQuota.",
+          "type": "string"
         }
       }
     },
@@ -1661,6 +1719,60 @@
         }
       }
     },
+    "v1beta1.CandidateAllocationStatus": {
+      "description": "CandidateAllocationStatus separates original, currently authorized, and desired floors. A zero current floor does not authorize deletion before traffic drains.",
+      "type": "object",
+      "required": [
+        "clusterUID",
+        "originalReplicas",
+        "currentReplicas",
+        "desiredReplicas"
+      ],
+      "properties": {
+        "capacity": {
+          "description": "Capacity is the accepted hardware sample, when capacity determines weight.",
+          "$ref": "#/definitions/v1beta1.PlacementCapacitySample"
+        },
+        "clusterUID": {
+          "type": "string",
+          "default": ""
+        },
+        "currentReplicas": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "desiredReplicas": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "drainRequested": {
+          "description": "DrainRequested withdraws this home from routing before physical removal.",
+          "type": "boolean"
+        },
+        "matchingTerms": {
+          "description": "MatchingTerms contains zero-based indexes into the source's affinity terms.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0
+          },
+          "x-kubernetes-list-type": "set"
+        },
+        "originalReplicas": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "weight": {
+          "description": "Weight is the effective static allocation weight, when applicable.",
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
     "v1beta1.CandidateAutoscalingStatus": {
       "description": "CandidateAutoscalingStatus is the per-home AutoscalerPolicy digest state the watch-funnel lifts off a derived InferenceService.",
       "type": "object",
@@ -1715,6 +1827,14 @@
           "type": "integer",
           "format": "int32"
         },
+        "allocation": {
+          "description": "Allocation is the persisted floor and identity of this member.",
+          "$ref": "#/definitions/v1beta1.CandidateAllocationStatus"
+        },
+        "appliedPlanID": {
+          "description": "AppliedPlanID identifies the allocation acknowledged by this member.",
+          "type": "string"
+        },
         "autoscaling": {
           "description": "Autoscaling mirrors this home's AutoscalerPolicy state so digest skew between homes is visible from the source InferenceService. Set only when the source references at least one policy.",
           "$ref": "#/definitions/v1beta1.CandidateAutoscalingStatus"
@@ -1727,6 +1847,10 @@
         "endpoint": {
           "description": "Endpoint is this candidate's own externally-addressable URL, mirrored from its derived InferenceService's status.url once admitted AND addressable. In Single mode only the winner carries one and the top-level PlacementStatus.Endpoint is authoritative; in All/Split mode every serving home carries its own, and this list is the source of truth an external LB/DNS consumes to route across homes. Empty until the home is addressable.",
           "$ref": "#/definitions/knative.URL"
+        },
+        "observationKnown": {
+          "description": "ObservationKnown distinguishes a current observation from retained evidence.",
+          "type": "boolean"
         },
         "phase": {
           "description": "Phase is the candidate's state.",
@@ -1819,6 +1943,35 @@
         }
       }
     },
+    "v1beta1.ClusterAffinityTerm": {
+      "description": "ClusterAffinityTerm selects WorkloadClusters by ANDing its requirements. Multiple terms form a union; a weight assigns replica shares to each match.",
+      "type": "object",
+      "properties": {
+        "matchExpressions": {
+          "description": "MatchExpressions selects the WorkloadCluster's actual labels.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.ClusterSelectorRequirement"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "matchFields": {
+          "description": "MatchFields selects the real metadata.name using In or NotIn. Multiple names are allowed; a label named metadata.name does not affect this match.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.ClusterSelectorRequirement"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "weight": {
+          "description": "Weight is permitted only for static Split. If any term has an explicit weight, matching term weights add and omitted weights contribute one. Omission must be preserved to distinguish unweighted overlapping terms.",
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
     "v1beta1.ClusterBaseModel": {
       "description": "ClusterBaseModel is the Schema for the basemodels API",
       "type": "object",
@@ -1892,6 +2045,35 @@
         "name": {
           "type": "string",
           "default": ""
+        }
+      }
+    },
+    "v1beta1.ClusterSelectorRequirement": {
+      "description": "ClusterSelectorRequirement tests one label or supported object field.",
+      "type": "object",
+      "required": [
+        "key",
+        "operator"
+      ],
+      "properties": {
+        "key": {
+          "description": "Key is a label key, or metadata.name for a field requirement.",
+          "type": "string",
+          "default": ""
+        },
+        "operator": {
+          "description": "Operator follows Kubernetes node-selector semantics for labels.",
+          "type": "string",
+          "default": ""
+        },
+        "values": {
+          "description": "Values is nonempty for In/NotIn, empty for Exists/DoesNotExist, and a single integer for Gt/Lt.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "default": ""
+          },
+          "x-kubernetes-list-type": "atomic"
         }
       }
     },
@@ -3486,6 +3668,15 @@
           "description": "Paused, when true, stops the InferenceReplica controller from initiating fleet changes: Update, Create, and Migration operations are neither started nor advanced. The component's RestartPolicy keeps repairing existing Instances at their current revision unless PauseMode is Freeze. In-flight operations resume on unpause.",
           "type": "boolean"
         },
+        "placementExecution": {
+          "description": "PlacementExecution is allocation authority projected from a derived service. Its generation must be observed before the control plane uses member evidence.",
+          "$ref": "#/definitions/v1beta1.PlacementExecutionPolicy"
+        },
+        "placementReplicaLimit": {
+          "description": "PlacementReplicaLimit reserves the largest replica count this component may request while placement pauses growth. Only a raised placement floor can increase this limit; autoscaler requests remain in Replicas.",
+          "type": "integer",
+          "format": "int32"
+        },
         "replicas": {
           "description": "Replicas is the desired Instance count. The HPA / KEDA scale subresource writes this field. Defaults to 1 when omitted.",
           "type": "integer",
@@ -3596,6 +3787,11 @@
         },
         "observedGeneration": {
           "description": "ObservedGeneration is the InferenceReplica.metadata.generation the most recent status flush reflects.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "placementObservedGeneration": {
+          "description": "PlacementObservedGeneration identifies the generation reconciled with placement rollout and replica-growth guards. The control plane requires this acknowledgement before sharing surge allowance with the member.",
           "type": "integer",
           "format": "int64"
         },
@@ -5442,6 +5638,191 @@
         }
       }
     },
+    "v1beta1.PlacementCapacityPool": {
+      "description": "PlacementCapacityPool is the evidence for one resource/flavor ratio.",
+      "type": "object",
+      "required": [
+        "resourceName",
+        "resourceFlavor",
+        "demand",
+        "allocatable",
+        "observedAt",
+        "reportUID",
+        "reportResourceVersion",
+        "attribution"
+      ],
+      "properties": {
+        "allocatable": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "attribution": {
+          "default": {},
+          "$ref": "#/definitions/v1beta1.AcceleratorCapacityAttribution"
+        },
+        "demand": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "observedAt": {
+          "$ref": "#/definitions/v1.Time"
+        },
+        "reportResourceVersion": {
+          "type": "string",
+          "default": ""
+        },
+        "reportUID": {
+          "type": "string",
+          "default": ""
+        },
+        "resourceFlavor": {
+          "type": "string",
+          "default": ""
+        },
+        "resourceName": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "v1beta1.PlacementCapacitySample": {
+      "description": "PlacementCapacitySample records the identified hardware and resolved demand used to normalize one member into nominal whole-replica capacity.",
+      "type": "object",
+      "required": [
+        "demandFingerprint",
+        "replicas",
+        "pools"
+      ],
+      "properties": {
+        "demandFingerprint": {
+          "type": "string",
+          "default": ""
+        },
+        "pools": {
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.PlacementCapacityPool"
+          },
+          "x-kubernetes-list-map-keys": [
+            "resourceName",
+            "resourceFlavor"
+          ],
+          "x-kubernetes-list-type": "map"
+        },
+        "replicas": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        }
+      }
+    },
+    "v1beta1.PlacementExecutionPolicy": {
+      "description": "PlacementExecutionPolicy carries source allocation authority to a member's component reconciler. It is absent for locally managed services.",
+      "type": "object",
+      "required": [
+        "planID",
+        "revision",
+        "sourceUID",
+        "clusterUID",
+        "pauseSurge"
+      ],
+      "properties": {
+        "clusterUID": {
+          "type": "string",
+          "default": ""
+        },
+        "pauseSurge": {
+          "description": "PauseSurge prevents new surplus-producing operations while existing operations retain their reservations and may finish cleanup.",
+          "type": "boolean",
+          "default": false
+        },
+        "planID": {
+          "type": "string",
+          "default": ""
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "sourceUID": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "v1beta1.PlacementPlanStatus": {
+      "description": "PlacementPlanStatus identifies the allocation persisted before member writes. Original assignments remain fixed throughout a transition, including retargets.",
+      "type": "object",
+      "required": [
+        "id",
+        "revision",
+        "sourceUID",
+        "observedGeneration",
+        "inputDigest",
+        "pauseSurge",
+        "requestedReplicas",
+        "assignedReplicas",
+        "unassignedReplicas",
+        "originalUnassignedReplicas"
+      ],
+      "properties": {
+        "assignedReplicas": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "id": {
+          "type": "string",
+          "default": ""
+        },
+        "inputDigest": {
+          "description": "InputDigest identifies resolved source intent and accepted allocation inputs. Heartbeat timestamps and report resource versions do not change this digest.",
+          "type": "string",
+          "default": ""
+        },
+        "observedGeneration": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "originalUnassignedReplicas": {
+          "description": "OriginalUnassignedReplicas retains the unassigned part of the original floor.",
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "pauseSurge": {
+          "description": "PauseSurge keeps new member rollout reservations stopped while placement owns the shared transition allowance. Releasing it creates a new revision.",
+          "type": "boolean",
+          "default": false
+        },
+        "requestedReplicas": {
+          "description": "RequestedReplicas includes the assigned and unassigned desired floor.",
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "revision": {
+          "description": "Revision increases for every accepted allocation or drain instruction.",
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "sourceUID": {
+          "type": "string",
+          "default": ""
+        },
+        "unassignedReplicas": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        }
+      }
+    },
     "v1beta1.PlacementSpec": {
       "description": "PlacementSpec declares how the control plane selects the workload clusters an InferenceService is placed onto, and how many of them serve it. It subsumes the legacy ome.io/accelerator-requirements and ome.io/cluster-selector annotations in a typed, schema-validated form; when this field is nil the control plane still honors those annotations for backward compatibility.",
       "type": "object",
@@ -5498,6 +5879,10 @@
         "phase": {
           "description": "Phase is a coarse placement state.",
           "type": "string"
+        },
+        "plan": {
+          "description": "Plan is the durable authority for member allocation writes.",
+          "$ref": "#/definitions/v1beta1.PlacementPlanStatus"
         }
       }
     },
@@ -8018,7 +8403,7 @@
       }
     },
     "v1beta1.TrafficMap": {
-      "description": "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status.",
+      "description": "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status, including Published and PublicationFallback.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -8208,8 +8593,49 @@
         }
       }
     },
+    "v1beta1.TrafficMapPublisherLastPositive": {
+      "description": "TrafficMapPublisherLastPositive is a complete post-transform publisher plan retained for restart-safe replay.",
+      "type": "object",
+      "required": [
+        "trafficMapGeneration",
+        "observedISVCGeneration",
+        "planCompatibilityDigest",
+        "targets"
+      ],
+      "properties": {
+        "observedISVCGeneration": {
+          "description": "ObservedISVCGeneration is the source generation that produced the plan.",
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "planCompatibilityDigest": {
+          "description": "PlanCompatibilityDigest identifies the effective publisher options that affect target identity or weights.",
+          "type": "string",
+          "default": ""
+        },
+        "targets": {
+          "description": "Targets is the complete canonical target-to-weight plan. Every claimed target appears exactly once, including inactive targets at weight zero.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/v1beta1.TrafficMapPublisherTarget"
+          },
+          "x-kubernetes-list-map-keys": [
+            "target"
+          ],
+          "x-kubernetes-list-type": "map"
+        },
+        "trafficMapGeneration": {
+          "description": "TrafficMapGeneration is the generation whose positive plan was applied.",
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        }
+      }
+    },
     "v1beta1.TrafficMapPublisherStatus": {
-      "description": "TrafficMapPublisherStatus is the durable cleanup journal for one publisher. Claims are persisted before external mutation and retained until their targets have been cleaned up.",
+      "description": "TrafficMapPublisherStatus is the durable cleanup and replay journal for one publisher. Claims are persisted before external mutation and retained until their targets have been cleaned up.",
       "type": "object",
       "required": [
         "publisherName"
@@ -8224,6 +8650,10 @@
           },
           "x-kubernetes-list-type": "set"
         },
+        "lastPositive": {
+          "description": "LastPositive is the latest complete positive publisher plan that was fully applied. It is absent when no compatible plan is available for replay.",
+          "$ref": "#/definitions/v1beta1.TrafficMapPublisherLastPositive"
+        },
         "observedOptionsDigest": {
           "description": "ObservedOptionsDigest is the SHA-256 digest of the effective safe publisher options used by the most recent successful reconciliation. It is absent before the first successful reconciliation and does not determine target ownership.",
           "type": "string"
@@ -8232,6 +8662,27 @@
           "description": "PublisherName identifies the publisher implementation whose cleanup semantics apply. An implementation upgraded under the same name must remain able to clean target identifiers written by its prior versions.",
           "type": "string",
           "default": ""
+        }
+      }
+    },
+    "v1beta1.TrafficMapPublisherTarget": {
+      "description": "TrafficMapPublisherTarget is one canonical target and its exact applied integer weight in a retained publisher plan.",
+      "type": "object",
+      "required": [
+        "target",
+        "weight"
+      ],
+      "properties": {
+        "target": {
+          "description": "Target is a publisher-defined canonical identifier already covered by the enclosing publisher claim journal.",
+          "type": "string",
+          "default": ""
+        },
+        "weight": {
+          "description": "Weight is the exact non-negative integer applied by the publisher. Publisher-specific bounds are validated before replay.",
+          "type": "integer",
+          "format": "int64",
+          "default": 0
         }
       }
     },
@@ -8263,6 +8714,10 @@
           "type": "integer",
           "format": "int64"
         },
+        "placementPlanID": {
+          "description": "PlacementPlanID identifies the accepted allocation behind this routing table. Publication must acknowledge this plan before a placement drains.",
+          "type": "string"
+        },
         "service": {
           "description": "Service is the routed logical service — the InferenceService name. Equal to metadata.name in v1; a distinct field leaves room for a future many-ISVC-to-one-service map.",
           "type": "string",
@@ -8271,11 +8726,11 @@
       }
     },
     "v1beta1.TrafficMapStatus": {
-      "description": "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Published, GatewayRef, ObservedTrafficMapGeneration, Publisher, and the Published condition; the routing controller owns SourceUID plus the Routable and CapacityFallback conditions. Conditions is keyed on type, so each writer must patch only its own fields and conditions.",
+      "description": "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Published, GatewayRef, ObservedTrafficMapGeneration, Publisher, and the Published and PublicationFallback conditions; the routing controller owns SourceUID plus the Routable, CapacityFallback, and OverrideActive conditions. Conditions is keyed on type, so each writer must patch only its own fields and conditions.",
       "type": "object",
       "properties": {
         "conditions": {
-          "description": "Conditions carry the routing controller's Routable and CapacityFallback conditions and the publisher's Published condition.",
+          "description": "Conditions carry the routing controller's Routable, CapacityFallback, and OverrideActive conditions and the publisher's Published and PublicationFallback conditions.",
           "type": "array",
           "items": {
             "default": {},
@@ -8302,7 +8757,7 @@
           "type": "boolean"
         },
         "publisher": {
-          "description": "Publisher records the durable target claims needed to recover or reverse data-plane mutations made while realizing this map.",
+          "description": "Publisher records the durable target claims and optional replay state needed to recover or reverse data-plane mutations made while realizing this map.",
           "$ref": "#/definitions/v1beta1.TrafficMapPublisherStatus"
         },
         "sourceUID": {

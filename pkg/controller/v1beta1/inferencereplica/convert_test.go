@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -2498,5 +2500,109 @@ func TestRetryBlocksFromIR_RoundTrip(t *testing.T) {
 	// Round-trip identity.
 	for i := range observed.RetryBlocks {
 		g.Expect(retryBlockFromWorkload(observed.RetryBlocks[i])).To(gomega.Equal(in[i]))
+	}
+}
+
+func TestPlacementSurgeGate(t *testing.T) {
+	policy := &v1beta1.PlacementExecutionPolicy{PlanID: "plan-a", Revision: 1, SourceUID: "source-a", ClusterUID: "cluster-a", PauseSurge: true}
+	released := policy.DeepCopy()
+	released.PauseSurge = false
+	for _, tt := range []struct {
+		name       string
+		policy     *v1beta1.PlacementExecutionPolicy
+		strategy   workloadtypes.UpdateStrategyType
+		sequential bool
+		wantNil    bool
+		wantPause  bool
+		wantAllow  bool
+		wantGate   workloadtypes.RolloutHoldGate
+	}{
+		{name: "local preserves nil gate", wantNil: true},
+		{name: "placement holds surge", policy: policy, strategy: workloadtypes.UpdateStrategySurgeThenDrain, wantPause: true, wantGate: workloadtypes.RolloutHoldGateBudget},
+		{name: "placement allows recreate", policy: policy, strategy: workloadtypes.UpdateStrategyRecreatePod, wantPause: true, wantAllow: true},
+		{name: "placement release permits surge", policy: released, strategy: workloadtypes.UpdateStrategySurgeThenDrain, wantAllow: true},
+		{name: "malformed policy holds surge", policy: &v1beta1.PlacementExecutionPolicy{}, strategy: workloadtypes.UpdateStrategySurgeThenDrain, wantPause: true, wantGate: workloadtypes.RolloutHoldGateBudget},
+		{name: "release preserves sequential gate", policy: released, strategy: workloadtypes.UpdateStrategySurgeThenDrain, sequential: true, wantGate: workloadtypes.RolloutHoldGateSequential},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			engine := mkIR(v1beta1.EngineComponent, 1)
+			decoder := mkIR(v1beta1.DecoderComponent, 1)
+			for _, ir := range []*v1beta1.InferenceReplica{engine, decoder} {
+				ir.Generation, ir.Status.ObservedGeneration = 1, 1
+				setParentGenStamp(ir, 1)
+			}
+			engine.Spec.PlacementExecution = tt.policy.DeepCopy()
+			r, _ := newReconciler(t, engine, decoder)
+			var parent *v1beta1.InferenceService
+			if tt.sequential {
+				parent = mkSequentialParent()
+			}
+			before := engine.DeepCopy()
+			input := r.buildReconcileInput(context.Background(), engine, parent, nil, nil, lifecycleSettings{}, 0, coordination.GroupDefaults{})
+			if diff := cmp.Diff(tt.wantPause, input.PauseNewSurge); diff != "" {
+				t.Errorf("migration pause (-want +got):\n%s", diff)
+			}
+			if (input.UpdateGate == nil) != tt.wantNil {
+				t.Fatalf("nil gate = %t, want %t", input.UpdateGate == nil, tt.wantNil)
+			}
+			if input.UpdateGate != nil {
+				allowed, gate, reason := input.UpdateGate(tt.strategy, 0, 0)
+				if diff := cmp.Diff(tt.wantAllow, allowed); diff != "" {
+					t.Errorf("allowed (-want +got):\n%s; reason: %s", diff, reason)
+				}
+				if diff := cmp.Diff(tt.wantGate, gate); diff != "" {
+					t.Errorf("gate (-want +got):\n%s", diff)
+				}
+			}
+			if diff := cmp.Diff(before, engine); diff != "" {
+				t.Errorf("IR mutated (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPlacementReplicaLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		limit        *int32
+		pause, local bool
+		invalid      bool
+		want         int32
+		wantErr      bool
+	}{
+		{name: "paused autoscaler growth is deferred", limit: ptr.To[int32](2), pause: true, want: 2},
+		{name: "released autoscaler request takes effect", limit: ptr.To[int32](2), want: 5},
+		{name: "ordinary local ignores limit", limit: ptr.To[int32](2), local: true, want: 5},
+		{name: "unused limit does not force growth", limit: ptr.To[int32](8), pause: true, want: 5},
+		{name: "missing limit cannot acknowledge pause", pause: true, wantErr: true},
+		{name: "zero limit cannot use replica fallback", limit: ptr.To[int32](0), pause: true, wantErr: true},
+		{name: "negative limit cannot execute", limit: ptr.To[int32](-1), pause: true, wantErr: true},
+		{name: "invalid authority cannot acknowledge pause", limit: ptr.To[int32](2), pause: true, invalid: true, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ir := &v1beta1.InferenceReplica{Spec: v1beta1.InferenceReplicaSpec{
+				Replicas: ptr.To[int32](5), PlacementReplicaLimit: tt.limit,
+				PlacementExecution: &v1beta1.PlacementExecutionPolicy{PlanID: "plan-a", Revision: 1, SourceUID: "source-a", ClusterUID: "cluster-a", PauseSurge: tt.pause},
+			}}
+			if tt.local {
+				ir.Spec.PlacementExecution = nil
+			}
+			if tt.invalid {
+				ir.Spec.PlacementExecution.PlanID = ""
+			}
+			before := ir.DeepCopy()
+			err := validatePlacementReplicaLimit(ir)
+			if diff := cmp.Diff(tt.wantErr, err != nil); diff != "" {
+				t.Fatalf("%s: %v", diff, err)
+			}
+			if !tt.wantErr {
+				if diff := cmp.Diff(tt.want, desiredFromIR(ir).Replicas); diff != "" {
+					t.Error(diff)
+				}
+			}
+			if diff := cmp.Diff(before, ir); diff != "" {
+				t.Errorf("scale request mutated:\n%s", diff)
+			}
+		})
 	}
 }

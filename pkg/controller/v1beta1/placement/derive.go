@@ -20,7 +20,7 @@ import (
 //   - Control-plane identity stamped (PlacementControlPlaneLabel) when controlPlaneID
 //     is non-empty, so the GC sweep only reaps deriveds THIS control plane created.
 //   - Kueue gating stamped on component pod metadata (the queue-name label).
-//   - Control-plane-only directives removed (routing, placement selectors, and
+//   - Control-plane-only directives removed (routing, placement, and
 //     rollout verbs) so the worker reconciler does not (re)act on the control
 //     plane's decisions.
 //
@@ -40,9 +40,7 @@ func DeriveISVC(src *v1beta1.InferenceService, controlPlaneID, localQueue string
 	d.ManagedFields = nil
 	d.Status = v1beta1.InferenceServiceStatus{}
 	d.Spec.Routing = nil
-	if d.Spec.Placement != nil {
-		d.Spec.Placement.CapacityFactors = nil //nolint:staticcheck // Derived objects must omit the supported legacy alias.
-	}
+	d.Spec.Placement = nil
 
 	// Resolve queue name: per-ISVC annotation, then the operator-configured queue.
 	queue := src.Annotations[LocalQueueAnnotation]

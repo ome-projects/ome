@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
 
 // irGVK is the GroupVersionKind every IR-driven workload reconcile
@@ -226,6 +227,22 @@ func (r *Reconciler) buildReconcileInput(ctx context.Context, ir *v1beta1.Infere
 			return allowed, workloadtypes.RolloutHoldGate(gate), reason
 		}
 	}
+	if policy := ir.Spec.PlacementExecution; policy != nil {
+		input.PauseNewSurge = policy.PauseSurge || protocol.Validate(policy) != nil
+		coordinationGate := input.UpdateGate
+		input.UpdateGate = func(strategy workloadtypes.UpdateStrategyType, surge, unavailable int32) (bool, workloadtypes.RolloutHoldGate, string) {
+			if err := protocol.Validate(policy); err != nil {
+				return false, workloadtypes.RolloutHoldGateBudget, err.Error()
+			}
+			if policy.PauseSurge && strategy == workloadtypes.UpdateStrategySurgeThenDrain {
+				return false, workloadtypes.RolloutHoldGateBudget, "placement transition holds new member surge"
+			}
+			if coordinationGate != nil {
+				return coordinationGate(strategy, surge, unavailable)
+			}
+			return true, "", ""
+		}
+	}
 	// The migration audit ledger (history) lives on the user-facing
 	// parent ISVC when resolvable; Migrate drives the IR's own pods and
 	// resumes from IR.Status.Migrations. Nil parent (brief foreground-GC
@@ -334,6 +351,9 @@ func desiredFromIR(ir *v1beta1.InferenceReplica) workloadtypes.WorkloadDesiredSp
 	if ir.Spec.Replicas != nil && *ir.Spec.Replicas > 0 {
 		replicas = *ir.Spec.Replicas
 	}
+	if policy := ir.Spec.PlacementExecution; policy != nil && policy.PauseSurge && ir.Spec.PlacementReplicaLimit != nil {
+		replicas = min(replicas, *ir.Spec.PlacementReplicaLimit)
+	}
 	// Pacing.Partition is the rollout-control partition the engine's
 	// update hold reads ahead of the user's Lifecycle partition;
 	// Pacing.MaxUnavailable is copied but has no producer and no reader
@@ -391,6 +411,22 @@ func desiredFromIR(ir *v1beta1.InferenceReplica) workloadtypes.WorkloadDesiredSp
 		}
 	}
 	return desired
+}
+
+// validatePlacementReplicaLimit runs before workload actions and generation
+// acknowledgement. A pruned or unresolved limit cannot grant member growth.
+func validatePlacementReplicaLimit(ir *v1beta1.InferenceReplica) error {
+	policy := ir.Spec.PlacementExecution
+	if policy == nil || !policy.PauseSurge {
+		return nil
+	}
+	if err := protocol.Validate(policy); err != nil {
+		return err
+	}
+	if ir.Spec.PlacementReplicaLimit == nil || *ir.Spec.PlacementReplicaLimit <= 0 {
+		return fmt.Errorf("placement pause requires a persisted positive replica limit")
+	}
+	return nil
 }
 
 // runnersFromIR converts the IR Runner list to the workload.Runner

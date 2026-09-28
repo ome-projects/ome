@@ -26,7 +26,7 @@ import (
 const tpuFlavor = "tpu7x"
 
 var derive = CapacityOptions{
-	Resources:         []string{"google.com/tpu", "nvidia.com/gpu"},
+	Resources:         []string{"google.com/tpu"},
 	HysteresisPercent: 10,
 }
 
@@ -160,10 +160,10 @@ func TestReconcileCapacity(t *testing.T) {
 			want:  []observed{},
 		},
 		{
-			name:    "a cluster with no accelerator nodes records nothing",
+			name:    "a cluster with no accelerator nodes records zero",
 			nodes:   []client.Object{workerNode("cpu-only", withAllocatable(map[string]string{"cpu": "64"}))},
 			flavors: flavors,
-			want:    []observed{},
+			want:    []observed{{Resource: "google.com/tpu", Flavor: tpuFlavor, Allocatable: "0", HighWater: "0"}},
 		},
 		{
 			name: "capacity is keyed by (resource, flavor)",
@@ -174,9 +174,12 @@ func TestReconcileCapacity(t *testing.T) {
 			},
 			flavors: append([]client.Object{}, flavors[0],
 				resourceFlavor("gb300", map[string]string{"accelerator": "gb300"})),
+			opts: &CapacityOptions{Resources: []string{"google.com/tpu", "nvidia.com/gpu"}, HysteresisPercent: 10},
 			want: []observed{
+				{Resource: "google.com/tpu", Flavor: "gb300", Allocatable: "0", HighWater: "0"},
 				{Resource: "google.com/tpu", Flavor: tpuFlavor, Allocatable: "4", HighWater: "4"},
 				{Resource: "nvidia.com/gpu", Flavor: "gb300", Allocatable: "8", HighWater: "8"},
+				{Resource: "nvidia.com/gpu", Flavor: tpuFlavor, Allocatable: "0", HighWater: "0"},
 			},
 		},
 	}
@@ -543,8 +546,9 @@ func TestNodeCapacityChanged(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			old, updated := base(), base()
 			tc.mutate(updated)
-			if got := nodeCapacityChanged(old, updated, derive.Resources); got != tc.want {
-				t.Errorf("nodeCapacityChanged() = %v, want %v", got, tc.want)
+			got := nodeCapacityChanged(old, updated, []string{"google.com/tpu", "nvidia.com/gpu"})
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("nodeCapacityChanged (-want +got):\n%s", diff)
 			}
 		})
 	}

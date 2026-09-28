@@ -270,6 +270,17 @@ func (g *GatewayAPIStrategy) reconcileComponentHTTPRoute(ctx context.Context, is
 			if err := g.client.Update(ctx, httpRoute); err != nil {
 				return false, fmt.Errorf("failed to update %s HttpRoute %s: %w", componentType, httpRoute.Name, err)
 			}
+			// The existing parent status describes the previous route
+			// generation. Do not treat it as proof that the updated route has
+			// been accepted; the HTTPRoute watch will re-enqueue the ISVC after
+			// the gateway reports status for the new generation.
+			isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{
+				Type:    v1beta1.IngressReady,
+				Status:  corev1.ConditionFalse,
+				Reason:  HTTPRouteParentStatusNotAvailable,
+				Message: fmt.Sprintf("%s HTTPRoute awaiting gateway reprogramming", componentType),
+			})
+			return false, nil
 		}
 	}
 	return true, nil
@@ -342,7 +353,7 @@ func (g *GatewayAPIStrategy) checkHTTPRouteStatuses(ctx context.Context, isvc *v
 			return false, err
 		}
 
-		if ready, reason, message := g.isHTTPRouteReady(httpRoute.Status); !ready {
+		if ready, reason, message := g.isHTTPRouteReady(httpRoute); !ready {
 			componentType := g.getComponentType(comp.name, isvc)
 			isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{
 				Type:    v1beta1.IngressReady,
@@ -410,16 +421,34 @@ func (g *GatewayAPIStrategy) semanticHttpRouteEquals(desired, existing *gatewaya
 	return equality.Semantic.DeepEqual(desired.Spec, existing.Spec)
 }
 
-// isHTTPRouteReady checks if the HTTPRoute is ready. If not, returns the reason and message.
-func (g *GatewayAPIStrategy) isHTTPRouteReady(httpRouteStatus gatewayapiv1.HTTPRouteStatus) (bool, *string, *string) {
-	if len(httpRouteStatus.Parents) == 0 {
+// isHTTPRouteReady checks that every configured parent has accepted the
+// current HTTPRoute generation and has no current False condition.
+func (g *GatewayAPIStrategy) isHTTPRouteReady(httpRoute *gatewayapiv1.HTTPRoute) (bool, *string, *string) {
+	if httpRoute == nil || len(httpRoute.Spec.ParentRefs) == 0 || len(httpRoute.Status.Parents) == 0 {
 		return false, ptr.To(HTTPRouteParentStatusNotAvailable), ptr.To(HTTPRouteNotReady)
 	}
-	for _, parent := range httpRouteStatus.Parents {
-		for _, condition := range parent.Conditions {
-			if condition.Status == metav1.ConditionFalse {
-				return false, &condition.Reason, &condition.Message
+	for _, parentRef := range httpRoute.Spec.ParentRefs {
+		accepted := false
+		for _, parentStatus := range httpRoute.Status.Parents {
+			if !equality.Semantic.DeepEqual(parentRef, parentStatus.ParentRef) {
+				continue
 			}
+			for i := range parentStatus.Conditions {
+				condition := &parentStatus.Conditions[i]
+				if condition.ObservedGeneration != httpRoute.Generation {
+					continue
+				}
+				if condition.Status == metav1.ConditionFalse {
+					return false, &condition.Reason, &condition.Message
+				}
+				if condition.Type == string(gatewayapiv1.RouteConditionAccepted) &&
+					condition.Status == metav1.ConditionTrue {
+					accepted = true
+				}
+			}
+		}
+		if !accepted {
+			return false, ptr.To(HTTPRouteParentStatusNotAvailable), ptr.To(HTTPRouteNotReady)
 		}
 	}
 	return true, nil, nil

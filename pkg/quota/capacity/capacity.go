@@ -18,6 +18,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // Options is config-driven with no in-code defaults: an unset field disables
@@ -43,6 +44,7 @@ type Options struct {
 // not own node labelling.
 type Flavor struct {
 	Name string
+	UID  types.UID
 	// NodeLabels must all match for a node to belong to this flavor. An empty
 	// map matches every node, which is how a catch-all flavor is expressed.
 	NodeLabels map[string]string
