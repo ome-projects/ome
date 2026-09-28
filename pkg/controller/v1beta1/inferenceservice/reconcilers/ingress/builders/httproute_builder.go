@@ -316,7 +316,7 @@ func (b *HTTPRouteBuilder) createHTTPRouteRule(routeMatches []gatewayapiv1.HTTPR
 }
 
 func (b *HTTPRouteBuilder) buildEngineHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
-	if !isvc.Status.IsConditionReady(v1beta1.EngineReady) {
+	if !componentCanBackRoute(isvc, v1beta1.EngineComponent, v1beta1.EngineReady) {
 		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 			Type:   v1beta1.IngressReady,
 			Status: corev1.ConditionFalse,
@@ -352,7 +352,7 @@ func (b *HTTPRouteBuilder) buildEngineHTTPRoute(ctx context.Context, isvc *v1bet
 }
 
 func (b *HTTPRouteBuilder) buildRouterHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
-	if !isvc.Status.IsConditionReady(v1beta1.RouterReady) {
+	if !componentCanBackRoute(isvc, v1beta1.RouterComponent, v1beta1.RouterReady) {
 		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 			Type:   v1beta1.IngressReady,
 			Status: corev1.ConditionFalse,
@@ -380,7 +380,7 @@ func (b *HTTPRouteBuilder) buildRouterHTTPRoute(ctx context.Context, isvc *v1bet
 }
 
 func (b *HTTPRouteBuilder) buildDecoderHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
-	if !isvc.Status.IsConditionReady(v1beta1.DecoderReady) {
+	if !componentCanBackRoute(isvc, v1beta1.DecoderComponent, v1beta1.DecoderReady) {
 		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 			Type:   v1beta1.IngressReady,
 			Status: corev1.ConditionFalse,
@@ -422,7 +422,7 @@ func (b *HTTPRouteBuilder) buildTopLevelHTTPRoute(ctx context.Context, isvc *v1b
 			timeout = toGatewayAPIDuration(*isvc.Spec.Router.TimeoutSeconds)
 		}
 	} else {
-		if !isvc.Status.IsConditionReady(v1beta1.EngineReady) {
+		if !componentCanBackRoute(isvc, v1beta1.EngineComponent, v1beta1.EngineReady) {
 			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 				Type:   v1beta1.IngressReady,
 				Status: corev1.ConditionFalse,

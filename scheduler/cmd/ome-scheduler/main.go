@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"k8s.io/component-base/cli"
+	_ "k8s.io/component-base/metrics/prometheus/clientgo"
 	"k8s.io/kubernetes/cmd/kube-scheduler/app"
 
 	"sigs.k8s.io/ome/scheduler/pkg/plugins/gangpack"

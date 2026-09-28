@@ -280,6 +280,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return r.reconcileTeardown(ctx, log, ir)
 	}
 
+	if err := validatePlacementReplicaLimit(ir); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Ensure the teardown finalizer before any other work so a later
 	// delete routes through the reconciled teardown path. The IR
 	// validating webhook admits finalizer-only updates, so this write

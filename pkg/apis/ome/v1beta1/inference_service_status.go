@@ -534,6 +534,10 @@ const (
 // PlacementStatus is the multi-cluster placement status: its coarse phase and
 // the candidate clusters participating in placement.
 type PlacementStatus struct {
+	// Plan is the durable authority for member allocation writes.
+	// +optional
+	Plan *PlacementPlanStatus `json:"plan,omitempty"`
+
 	// Cluster is the winning WorkloadCluster in Single mode. It is empty before
 	// admission and in All/Split modes, where Candidates is authoritative.
 	// +optional
@@ -560,6 +564,18 @@ type PlacementStatus struct {
 
 // CandidatePlacement is the per-cluster state of a fan-out candidate.
 type CandidatePlacement struct {
+	// Allocation is the persisted floor and identity of this member.
+	// +optional
+	Allocation *CandidateAllocationStatus `json:"allocation,omitempty"`
+
+	// AppliedPlanID identifies the allocation acknowledged by this member.
+	// +optional
+	AppliedPlanID string `json:"appliedPlanID,omitempty"`
+
+	// ObservationKnown distinguishes a current observation from retained evidence.
+	// +optional
+	ObservationKnown bool `json:"observationKnown,omitempty"`
+
 	// Cluster is the WorkloadCluster name.
 	Cluster string `json:"cluster"`
 	// Phase is the candidate's state.

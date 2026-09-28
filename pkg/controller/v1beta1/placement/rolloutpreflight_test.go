@@ -52,6 +52,24 @@ func srcISVCWithRolloutRef(selector string) *v1beta1.InferenceService {
 	return isvc
 }
 
+func placedSrcISVCWithRolloutRef(selector string) *v1beta1.InferenceService {
+	isvc := srcISVCWithRolloutRef(selector)
+	url := &apis.URL{Scheme: "https", Host: "svc.example.com"}
+	isvc.Status.Placement = &v1beta1.PlacementStatus{
+		Cluster: "a", Phase: v1beta1.PlacementPhasePlaced, Endpoint: url,
+		Candidates: []v1beta1.CandidatePlacement{{
+			Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted,
+			Endpoint: url, AdmittedReplicas: 1, ReadyReplicas: 1,
+			Rollout: &v1beta1.CandidateRolloutStatus{ActiveRunID: "stale-run"},
+		}},
+	}
+	isvc.Status.URL = url
+	isvc.Status.SetConditions([]apis.Condition{{
+		Type: apis.ConditionReady, Status: corev1.ConditionTrue, Reason: placementReadyReasonReady,
+	}})
+	return isvc
+}
+
 // rolloutCapabilityLabels satisfies both the match selector and the
 // rollout-policy capability gate.
 func rolloutCapabilityLabels() map[string]string {
@@ -213,6 +231,51 @@ func TestReconcile_RolloutRefMissingHoldsPlacement(t *testing.T) {
 	assert.Contains(t, pre.Message, "cp-east", "message must name the control plane")
 }
 
+func TestReconcile_RolloutHoldRefreshesStandingHomeAndProvenance(t *testing.T) {
+	s := testScheme(t)
+	worker := workerWithReplicaCounts(t, s, "fresh.example.com", 2, 1)
+	src := placedSrcISVCWithRolloutRef("gpu=gb300")
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
+		"a": workloadcluster.NewNeverCachingClient(worker),
+	}}, src, readyWC("a", rolloutCapabilityLabels()))
+	ensurePlacedStatus(t, cp, src)
+
+	res, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+	assert.Equal(t, r.requeue(), res.RequeueAfter)
+
+	derived := &v1beta1.InferenceService{}
+	require.NoError(t, worker.Get(context.Background(), req().NamespacedName, derived))
+	assert.Nil(t, derived.Spec.Rollout, "the unresolved source policy must not be applied")
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	require.Len(t, p.Candidates, 1)
+	assert.Equal(t, int32(2), p.Candidates[0].AdmittedReplicas)
+	assert.Equal(t, int32(1), p.Candidates[0].ReadyReplicas)
+	assert.Equal(t, "fresh.example.com", p.Candidates[0].Endpoint.Host)
+	assert.Nil(t, p.Candidates[0].Rollout, "fresh member status clears stale provenance")
+}
+
+func TestReconcile_RolloutHoldRefreshesProvenanceWhenIRIsUnknown(t *testing.T) {
+	s := testScheme(t)
+	worker := irGetFailClient{WithWatch: workerWithReplicaCounts(t, s, "fresh.example.com", 2, 1)}
+	src := placedSrcISVCWithRolloutRef("gpu=gb300")
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
+		"a": workloadcluster.NewNeverCachingClient(worker),
+	}}, src, readyWC("a", rolloutCapabilityLabels()))
+	ensurePlacedStatus(t, cp, src)
+
+	_, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	require.Len(t, p.Candidates, 1)
+	assert.Zero(t, p.Candidates[0].ReadyReplicas)
+	assert.Equal(t, "fresh.example.com", p.Candidates[0].Endpoint.Host)
+	assert.Nil(t, p.Candidates[0].Rollout, "readable derived status is authoritative")
+}
+
 func TestPreflightRollout_ProgressionMismatchHolds(t *testing.T) {
 	s := testScheme(t)
 	pol := &v1beta1.RolloutPolicy{
@@ -335,8 +398,8 @@ func TestPreflightRollout_NoRolloutIsNil(t *testing.T) {
 	assert.Nil(t, r.preflightRolloutPolicies(context.Background(), srcISVC("gpu=gb300"), []string{"a"}, nil))
 }
 
-// The standing winner never loses its home to a capability verdict: hold
-// as-is, never Pending, never a re-race off a serving cluster.
+// A capability verdict cannot evict the standing winner: it holds actuation
+// while the controller continues observing that home.
 func TestPreflightRollout_WinnerSurvivesCapabilityLoss(t *testing.T) {
 	s := testScheme(t)
 	isvc := srcISVCWithRolloutRef("gpu=gb300")
@@ -349,6 +412,10 @@ func TestPreflightRollout_WinnerSurvivesCapabilityLoss(t *testing.T) {
 	require.NotNil(t, out)
 	assert.True(t, out.holdAsIs)
 	assert.False(t, out.hold)
+	pre, staged := r.rolloutState().preflightFor(isvc.UID)
+	require.True(t, staged)
+	assert.Equal(t, corev1.ConditionFalse, pre.cond.Status)
+	assert.Equal(t, v1beta1.PlacementPolicyPreflightReasonCapabilityMissing, pre.cond.Reason)
 }
 
 // A bare manual Pause in a placed plan is a dead end (the promote verb is

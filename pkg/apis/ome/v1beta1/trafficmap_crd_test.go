@@ -47,7 +47,8 @@ func TestTrafficMapCRD_PublisherStatusJournal(t *testing.T) {
 	}
 	publisher := requireSchemaProperty(t, status, "publisher")
 	requireTrafficMapRequiredProperties(t, "status.publisher", publisher, "publisherName")
-	requireTrafficMapOptionalProperties(t, "status.publisher", publisher, "claimedTargets", "observedOptionsDigest")
+	requireTrafficMapOptionalProperties(t, "status.publisher", publisher,
+		"claimedTargets", "observedOptionsDigest", "lastPositive")
 
 	name := requireSchemaProperty(t, publisher, "publisherName")
 	requireTrafficMapLengthBounds(t, "status.publisher.publisherName", name, 1, MaxTrafficMapPublisherNameLength)
@@ -59,9 +60,61 @@ func TestTrafficMapCRD_PublisherStatusJournal(t *testing.T) {
 	if got, want := optionsDigest.Pattern, `^sha256:[0-9a-f]{64}$`; got != want {
 		t.Errorf("status.publisher.observedOptionsDigest pattern = %q, want %q", got, want)
 	}
+	lastPositive := requireSchemaProperty(t, publisher, "lastPositive")
+	requireTrafficMapRequiredProperties(t, "status.publisher.lastPositive", lastPositive,
+		"trafficMapGeneration", "observedISVCGeneration", "planCompatibilityDigest", "targets")
+
+	trafficMapGeneration := requireSchemaProperty(t, lastPositive, "trafficMapGeneration")
+	requireTrafficMapPositiveInt64(t, "status.publisher.lastPositive.trafficMapGeneration", trafficMapGeneration)
+	observedISVCGeneration := requireSchemaProperty(t, lastPositive, "observedISVCGeneration")
+	requireTrafficMapPositiveInt64(t, "status.publisher.lastPositive.observedISVCGeneration", observedISVCGeneration)
+
+	compatibilityDigest := requireSchemaProperty(t, lastPositive, "planCompatibilityDigest")
+	if got, want := compatibilityDigest.Pattern, `^sha256:[0-9a-f]{64}$`; got != want {
+		t.Errorf("status.publisher.lastPositive.planCompatibilityDigest pattern = %q, want %q", got, want)
+	}
+
+	targets := requireSchemaProperty(t, lastPositive, "targets")
+	if targets.XListType == nil || *targets.XListType != "map" {
+		t.Errorf("status.publisher.lastPositive.targets list type = %v, want map", targets.XListType)
+	}
+	if !slices.Equal(targets.XListMapKeys, []string{"target"}) {
+		t.Errorf("status.publisher.lastPositive.targets list-map keys = %v, want [target]", targets.XListMapKeys)
+	}
+	if targets.MinItems == nil || *targets.MinItems != 1 {
+		t.Errorf("status.publisher.lastPositive.targets minItems = %v, want 1", targets.MinItems)
+	}
+	if targets.MaxItems == nil || *targets.MaxItems != int64(MaxTrafficMapPublisherTargets) {
+		t.Errorf("status.publisher.lastPositive.targets maxItems = %v, want %d",
+			targets.MaxItems, MaxTrafficMapPublisherTargets)
+	}
+	if targets.Items == nil || targets.Items.Schema == nil {
+		t.Fatal("status.publisher.lastPositive.targets has no item schema")
+	}
+	targetItem := *targets.Items.Schema
+	requireTrafficMapRequiredProperties(t, "status.publisher.lastPositive.targets[]", targetItem, "target", "weight")
+	requireTrafficMapLengthBounds(t, "status.publisher.lastPositive.targets[].target",
+		requireSchemaProperty(t, targetItem, "target"), 1, MaxTrafficMapPublisherTargetLength)
+	weight := requireSchemaProperty(t, targetItem, "weight")
+	if weight.Type != "integer" || weight.Format != "int64" || weight.Minimum == nil || *weight.Minimum != 0 {
+		t.Errorf("status.publisher.lastPositive.targets[].weight = type %q format %q minimum %v, want integer/int64/0",
+			weight.Type, weight.Format, weight.Minimum)
+	}
+	if weight.Maximum != nil {
+		t.Errorf("status.publisher.lastPositive.targets[].weight maximum = %v, want publisher-specific runtime validation",
+			*weight.Maximum)
+	}
 
 	if publisher.Default != nil {
 		t.Errorf("status.publisher default = %s, want none", publisher.Default.Raw)
+	}
+}
+
+func requireTrafficMapPositiveInt64(t *testing.T, path string, schema apiextensionsv1.JSONSchemaProps) {
+	t.Helper()
+	if schema.Type != "integer" || schema.Format != "int64" || schema.Minimum == nil || *schema.Minimum != 1 {
+		t.Errorf("%s = type %q format %q minimum %v, want integer/int64/1",
+			path, schema.Type, schema.Format, schema.Minimum)
 	}
 }
 

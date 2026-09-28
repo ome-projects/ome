@@ -15,6 +15,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorBudget":                schema_pkg_apis_ome_v1beta1_AcceleratorBudget(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorBudgetStatus":          schema_pkg_apis_ome_v1beta1_AcceleratorBudgetStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapabilities":          schema_pkg_apis_ome_v1beta1_AcceleratorCapabilities(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution":   schema_pkg_apis_ome_v1beta1_AcceleratorCapacityAttribution(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityStatus":        schema_pkg_apis_ome_v1beta1_AcceleratorCapacityStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorClass":                 schema_pkg_apis_ome_v1beta1_AcceleratorClass(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorClassList":             schema_pkg_apis_ome_v1beta1_AcceleratorClassList(ref),
@@ -60,6 +61,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobSpec":                 schema_pkg_apis_ome_v1beta1_BenchmarkJobSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobStatus":               schema_pkg_apis_ome_v1beta1_BenchmarkJobStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryStatus":                     schema_pkg_apis_ome_v1beta1_CanaryStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus":        schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus":       schema_pkg_apis_ome_v1beta1_CandidateAutoscalingStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateComponentAutoscaling":    schema_pkg_apis_ome_v1beta1_CandidateComponentAutoscaling(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidatePlacement":               schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref),
@@ -67,10 +69,12 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutGroup":            schema_pkg_apis_ome_v1beta1_CandidateRolloutGroup(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutLastRun":          schema_pkg_apis_ome_v1beta1_CandidateRolloutLastRun(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutStatus":           schema_pkg_apis_ome_v1beta1_CandidateRolloutStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterAffinityTerm":              schema_pkg_apis_ome_v1beta1_ClusterAffinityTerm(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterBaseModel":                 schema_pkg_apis_ome_v1beta1_ClusterBaseModel(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterBaseModelList":             schema_pkg_apis_ome_v1beta1_ClusterBaseModelList(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterConnectionSource":          schema_pkg_apis_ome_v1beta1_ClusterConnectionSource(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterProfileRef":                schema_pkg_apis_ome_v1beta1_ClusterProfileRef(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterSelectorRequirement":       schema_pkg_apis_ome_v1beta1_ClusterSelectorRequirement(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterServingRuntime":            schema_pkg_apis_ome_v1beta1_ClusterServingRuntime(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterServingRuntimeList":        schema_pkg_apis_ome_v1beta1_ClusterServingRuntimeList(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler":              schema_pkg_apis_ome_v1beta1_ComponentAutoscaler(ref),
@@ -147,6 +151,10 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.OMENativeInstanceStatus":          schema_pkg_apis_ome_v1beta1_OMENativeInstanceStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ObjectReference":                  schema_pkg_apis_ome_v1beta1_ObjectReference(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference":                  schema_pkg_apis_ome_v1beta1_ParentReference(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacityPool":            schema_pkg_apis_ome_v1beta1_PlacementCapacityPool(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacitySample":          schema_pkg_apis_ome_v1beta1_PlacementCapacitySample(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy":         schema_pkg_apis_ome_v1beta1_PlacementExecutionPolicy(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementPlanStatus":              schema_pkg_apis_ome_v1beta1_PlacementPlanStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec":                    schema_pkg_apis_ome_v1beta1_PlacementSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementStatus":                  schema_pkg_apis_ome_v1beta1_PlacementStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PodOverride":                      schema_pkg_apis_ome_v1beta1_PodOverride(ref),
@@ -209,7 +217,9 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapGatewayRef":             schema_pkg_apis_ome_v1beta1_TrafficMapGatewayRef(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapList":                   schema_pkg_apis_ome_v1beta1_TrafficMapList(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapProbe":                  schema_pkg_apis_ome_v1beta1_TrafficMapProbe(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherLastPositive":  schema_pkg_apis_ome_v1beta1_TrafficMapPublisherLastPositive(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherStatus":        schema_pkg_apis_ome_v1beta1_TrafficMapPublisherStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherTarget":        schema_pkg_apis_ome_v1beta1_TrafficMapPublisherTarget(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapSpec":                   schema_pkg_apis_ome_v1beta1_TrafficMapSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapStatus":                 schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec":                      schema_pkg_apis_ome_v1beta1_TrafficSpec(ref),
@@ -453,6 +463,60 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorCapabilities(ref common.ReferenceCal
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_AcceleratorCapacityAttribution(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "AcceleratorCapacityAttribution describes how nodes were assigned to a flavor.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"flavorUID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "FlavorUID identifies the observed ResourceFlavor object.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"nodeLabels": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeLabels is the flavor's node selector at observation time.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"flavorSetHash": {
+						SchemaProps: spec.SchemaProps{
+							Description: "FlavorSetHash identifies all flavor definitions and configured resource names used by the attribution rule, including more specific selectors.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"complete": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Complete means every observed node advertising this resource was unambiguously attributed and every flavor had a verifiable identity.",
+							Default:     false,
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"flavorUID", "flavorSetHash", "complete"},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_AcceleratorCapacityStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -516,12 +580,18 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorCapacityStatus(ref common.ReferenceC
 							},
 						},
 					},
+					"attribution": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Attribution identifies the hardware mapping used for this observation. Omission cannot establish whether an observed zero is a complete sample.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution"),
+						},
+					},
 				},
 				Required: []string{"resourceName", "resourceFlavor"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorClusterCapacityStatus"},
+			"k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorClusterCapacityStatus"},
 	}
 }
 
@@ -850,6 +920,34 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorClusterCapacityStatus(ref common.Ref
 							Format:      "",
 						},
 					},
+					"clusterUID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ClusterUID identifies the registration through which the report was read. Omission cannot establish that a same-name cluster owns this sample.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"reportUID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReportUID identifies the member's root AcceleratorQuota.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"reportResourceVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReportResourceVersion identifies the source object read for this sample.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"reportAvailable": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReportAvailable means the most recent collection verified the source object and registration. It does not imply that ObservedAt is fresh.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 					"allocatable": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Allocatable is that cluster's schedulable quantity of the flavor.",
@@ -868,12 +966,18 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorClusterCapacityStatus(ref common.Ref
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
 						},
 					},
+					"attribution": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Attribution is the member's hardware mapping at observation time.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution"),
+						},
+					},
 				},
 				Required: []string{"cluster"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+			"k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution"},
 	}
 }
 
@@ -3126,6 +3230,90 @@ func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) comm
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "CandidateAllocationStatus separates original, currently authorized, and desired floors. A zero current floor does not authorize deletion before traffic drains.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"clusterUID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"matchingTerms": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "MatchingTerms contains zero-based indexes into the source's affinity terms.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: 0,
+										Type:    []string{"integer"},
+										Format:  "int32",
+									},
+								},
+							},
+						},
+					},
+					"weight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Weight is the effective static allocation weight, when applicable.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"capacity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Capacity is the accepted hardware sample, when capacity determines weight.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacitySample"),
+						},
+					},
+					"originalReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+					"currentReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+					"desiredReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+					"drainRequested": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DrainRequested withdraws this home from routing before physical removal.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"clusterUID", "originalReplicas", "currentReplicas", "desiredReplicas"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacitySample"},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_CandidateAutoscalingStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -3217,6 +3405,26 @@ func schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref common.ReferenceCallback
 				Description: "CandidatePlacement is the per-cluster state of a fan-out candidate.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"allocation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Allocation is the persisted floor and identity of this member.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus"),
+						},
+					},
+					"appliedPlanID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AppliedPlanID identifies the allocation acknowledged by this member.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"observationKnown": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservationKnown distinguishes a current observation from retained evidence.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 					"cluster": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Cluster is the WorkloadCluster name.",
@@ -3269,7 +3477,7 @@ func schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref common.ReferenceCallback
 			},
 		},
 		Dependencies: []string{
-			"knative.dev/pkg/apis.URL", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutStatus"},
+			"knative.dev/pkg/apis.URL", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutStatus"},
 	}
 }
 
@@ -3411,6 +3619,66 @@ func schema_pkg_apis_ome_v1beta1_CandidateRolloutStatus(ref common.ReferenceCall
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_ClusterAffinityTerm(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ClusterAffinityTerm selects WorkloadClusters by ANDing its requirements. Multiple terms form a union; a weight assigns replica shares to each match.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"weight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Weight is permitted only for static Split. If any term has an explicit weight, matching term weights add and omitted weights contribute one. Omission must be preserved to distinguish unweighted overlapping terms.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"matchExpressions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "MatchExpressions selects the WorkloadCluster's actual labels.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterSelectorRequirement"),
+									},
+								},
+							},
+						},
+					},
+					"matchFields": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "MatchFields selects the real metadata.name using In or NotIn. Multiple names are allowed; a label named metadata.name does not affect this match.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterSelectorRequirement"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterSelectorRequirement"},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_ClusterBaseModel(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -3547,6 +3815,56 @@ func schema_pkg_apis_ome_v1beta1_ClusterProfileRef(ref common.ReferenceCallback)
 						},
 					},
 				},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_ClusterSelectorRequirement(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ClusterSelectorRequirement tests one label or supported object field.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"key": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Key is a label key, or metadata.name for a field requirement.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"operator": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Operator follows Kubernetes node-selector semantics for labels.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"values": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Values is nonempty for In/NotIn, empty for Exists/DoesNotExist, and a single integer for Gt/Lt.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"key", "operator"},
 			},
 		},
 	}
@@ -6257,6 +6575,19 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 				Description: "InferenceReplicaSpec is the desired state of one (ISVC, Component) workload. The InferenceService controller is the sole writer; the admission webhook rejects writes from other actors that lack the ome.io/controller-write annotation.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"placementExecution": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PlacementExecution is allocation authority projected from a derived service. Its generation must be observed before the control plane uses member evidence.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy"),
+						},
+					},
+					"placementReplicaLimit": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PlacementReplicaLimit reserves the largest replica count this component may request while placement pauses growth. Only a raised placement floor can increase this limit; autoscaler requests remain in Replicas.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
 					"parentRef": {
 						SchemaProps: spec.SchemaProps{
 							Description: "ParentRef names the InferenceService that owns this replica. Set by the ISVC controller at create time; immutable thereafter.",
@@ -6380,7 +6711,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceReplicaPacing", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.Runner"},
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceReplicaPacing", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.Runner"},
 	}
 }
 
@@ -6394,6 +6725,13 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaStatus(ref common.ReferenceCall
 					"observedGeneration": {
 						SchemaProps: spec.SchemaProps{
 							Description: "ObservedGeneration is the InferenceReplica.metadata.generation the most recent status flush reflects.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"placementObservedGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PlacementObservedGeneration identifies the generation reconciled with placement rollout and replica-growth guards. The control plane requires this acknowledgement before sharing surge allowance with the member.",
 							Type:        []string{"integer"},
 							Format:      "int64",
 						},
@@ -9696,6 +10034,266 @@ func schema_pkg_apis_ome_v1beta1_ParentReference(ref common.ReferenceCallback) c
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_PlacementCapacityPool(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementCapacityPool is the evidence for one resource/flavor ratio.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"resourceName": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"resourceFlavor": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"demand": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"allocatable": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"observedAt": {
+						SchemaProps: spec.SchemaProps{
+							Ref: ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"reportUID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"reportResourceVersion": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"attribution": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution"),
+						},
+					},
+				},
+				Required: []string{"resourceName", "resourceFlavor", "demand", "allocatable", "observedAt", "reportUID", "reportResourceVersion", "attribution"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorCapacityAttribution"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementCapacitySample(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementCapacitySample records the identified hardware and resolved demand used to normalize one member into nominal whole-replica capacity.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"demandFingerprint": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"replicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"pools": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"resourceName",
+									"resourceFlavor",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacityPool"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"demandFingerprint", "replicas", "pools"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacityPool"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementExecutionPolicy(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementExecutionPolicy carries source allocation authority to a member's component reconciler. It is absent for locally managed services.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"planID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"revision": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"sourceUID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"clusterUID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"pauseSurge": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PauseSurge prevents new surplus-producing operations while existing operations retain their reservations and may finish cleanup.",
+							Default:     false,
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"planID", "revision", "sourceUID", "clusterUID", "pauseSurge"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementPlanStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementPlanStatus identifies the allocation persisted before member writes. Original assignments remain fixed throughout a transition, including retargets.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"id": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"revision": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Revision increases for every accepted allocation or drain instruction.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"sourceUID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"observedGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"inputDigest": {
+						SchemaProps: spec.SchemaProps{
+							Description: "InputDigest identifies resolved source intent and accepted allocation inputs. Heartbeat timestamps and report resource versions do not change this digest.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"pauseSurge": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PauseSurge keeps new member rollout reservations stopped while placement owns the shared transition allowance. Releasing it creates a new revision.",
+							Default:     false,
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"requestedReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RequestedReplicas includes the assigned and unassigned desired floor.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"assignedReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int64",
+						},
+					},
+					"unassignedReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+					"originalUnassignedReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "OriginalUnassignedReplicas retains the unassigned part of the original floor.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+				Required: []string{"id", "revision", "sourceUID", "observedGeneration", "inputDigest", "pauseSurge", "requestedReplicas", "assignedReplicas", "unassignedReplicas", "originalUnassignedReplicas"},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -9759,6 +10357,12 @@ func schema_pkg_apis_ome_v1beta1_PlacementStatus(ref common.ReferenceCallback) c
 				Description: "PlacementStatus is the multi-cluster placement status: its coarse phase and the candidate clusters participating in placement.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"plan": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Plan is the durable authority for member allocation writes.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementPlanStatus"),
+						},
+					},
 					"cluster": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Cluster is the winning WorkloadCluster in Single mode. It is empty before admission and in All/Split modes, where Candidates is authoritative.",
@@ -9805,7 +10409,7 @@ func schema_pkg_apis_ome_v1beta1_PlacementStatus(ref common.ReferenceCallback) c
 			},
 		},
 		Dependencies: []string{
-			"knative.dev/pkg/apis.URL", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidatePlacement"},
+			"knative.dev/pkg/apis.URL", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidatePlacement", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementPlanStatus"},
 	}
 }
 
@@ -14293,7 +14897,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMap(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status.",
+				Description: "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status, including Published and PublicationFallback.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -14618,11 +15222,73 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapProbe(ref common.ReferenceCallback) c
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_TrafficMapPublisherLastPositive(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "TrafficMapPublisherLastPositive is a complete post-transform publisher plan retained for restart-safe replay.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"trafficMapGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TrafficMapGeneration is the generation whose positive plan was applied.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"observedISVCGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservedISVCGeneration is the source generation that produced the plan.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"planCompatibilityDigest": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PlanCompatibilityDigest identifies the effective publisher options that affect target identity or weights.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"targets": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"target",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Targets is the complete canonical target-to-weight plan. Every claimed target appears exactly once, including inactive targets at weight zero.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherTarget"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"trafficMapGeneration", "observedISVCGeneration", "planCompatibilityDigest", "targets"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherTarget"},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_TrafficMapPublisherStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "TrafficMapPublisherStatus is the durable cleanup journal for one publisher. Claims are persisted before external mutation and retained until their targets have been cleaned up.",
+				Description: "TrafficMapPublisherStatus is the durable cleanup and replay journal for one publisher. Claims are persisted before external mutation and retained until their targets have been cleaned up.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"publisherName": {
@@ -14660,8 +15326,46 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapPublisherStatus(ref common.ReferenceC
 							Format:      "",
 						},
 					},
+					"lastPositive": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LastPositive is the latest complete positive publisher plan that was fully applied. It is absent when no compatible plan is available for replay.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherLastPositive"),
+						},
+					},
 				},
 				Required: []string{"publisherName"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherLastPositive"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_TrafficMapPublisherTarget(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "TrafficMapPublisherTarget is one canonical target and its exact applied integer weight in a retained publisher plan.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"target": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Target is a publisher-defined canonical identifier already covered by the enclosing publisher claim journal.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"weight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Weight is the exact non-negative integer applied by the publisher. Publisher-specific bounds are validated before replay.",
+							Default:     0,
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+				},
+				Required: []string{"target", "weight"},
 			},
 		},
 	}
@@ -14674,6 +15378,13 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapSpec(ref common.ReferenceCallback) co
 				Description: "TrafficMapSpec is the computed routing table. It is a machine-written declarative artifact — the routing controller recomputes it whenever status.placement or the home's quota allocation changes; the publisher consumes it as desired state. A validating webhook may reject writes from non-controller users.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
+					"placementPlanID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PlacementPlanID identifies the accepted allocation behind this routing table. Publication must acknowledge this plan before a placement drains.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"service": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Service is the routed logical service — the InferenceService name. Equal to metadata.name in v1; a distinct field leaves room for a future many-ISVC-to-one-service map.",
@@ -14731,7 +15442,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Published, GatewayRef, ObservedTrafficMapGeneration, Publisher, and the Published condition; the routing controller owns SourceUID plus the Routable and CapacityFallback conditions. Conditions is keyed on type, so each writer must patch only its own fields and conditions.",
+				Description: "TrafficMapStatus reports whether the active publisher has realized this map onto a concrete data plane, and whether the map has anything to realize. Two writers share it: the publisher owns Published, GatewayRef, ObservedTrafficMapGeneration, Publisher, and the Published and PublicationFallback conditions; the routing controller owns SourceUID plus the Routable, CapacityFallback, and OverrideActive conditions. Conditions is keyed on type, so each writer must patch only its own fields and conditions.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"sourceUID": {
@@ -14763,7 +15474,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 					},
 					"publisher": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Publisher records the durable target claims needed to recover or reverse data-plane mutations made while realizing this map.",
+							Description: "Publisher records the durable target claims and optional replay state needed to recover or reverse data-plane mutations made while realizing this map.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficMapPublisherStatus"),
 						},
 					},
@@ -14779,7 +15490,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Conditions carry the routing controller's Routable and CapacityFallback conditions and the publisher's Published condition.",
+							Description: "Conditions carry the routing controller's Routable, CapacityFallback, and OverrideActive conditions and the publisher's Published and PublicationFallback conditions.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{

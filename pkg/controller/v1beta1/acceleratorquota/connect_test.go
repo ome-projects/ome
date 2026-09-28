@@ -28,23 +28,26 @@ type fakeRegistry struct {
 	connected  map[string]string
 	disconnect []string
 	connectErr error
+	identities map[string]types.UID
 }
 
 func newFakeRegistry() *fakeRegistry {
-	return &fakeRegistry{connected: map[string]string{}}
+	return &fakeRegistry{connected: map[string]string{}, identities: map[string]types.UID{}}
 }
 
-func (f *fakeRegistry) Connect(_ context.Context, name string, kubeconfig []byte) error {
+func (f *fakeRegistry) ConnectFor(_ context.Context, name string, uid types.UID, kubeconfig []byte) error {
 	if f.connectErr != nil {
 		return f.connectErr
 	}
 	f.connected[name] = string(kubeconfig)
+	f.identities[name] = uid
 	return nil
 }
 
 func (f *fakeRegistry) Disconnect(name string) {
 	f.disconnect = append(f.disconnect, name)
 	delete(f.connected, name)
+	delete(f.identities, name)
 }
 
 // Connected is what the Connector compares across a pass to decide whether the
@@ -72,7 +75,7 @@ func connectScheme(t *testing.T) *runtime.Scheme {
 
 func workloadCluster(name string, ready bool, secretName, key string) *v1beta1.WorkloadCluster {
 	wc := &v1beta1.WorkloadCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid")},
 		Spec: v1beta1.WorkloadClusterSpec{
 			ClusterSource: v1beta1.ClusterConnectionSource{
 				KubeConfig: &v1beta1.KubeConfigSource{
@@ -178,6 +181,18 @@ func TestConnectorMirrorsTheRegistry(t *testing.T) {
 			}
 			if diff := cmp.Diff(want, reg.connected); diff != "" {
 				t.Errorf("connections mismatch (-want +got):\n%s", diff)
+			}
+			for name := range want {
+				var wc v1beta1.WorkloadCluster
+				if err := c.Get(context.Background(), types.NamespacedName{Name: name}, &wc); err != nil {
+					t.Fatal(err)
+				}
+				if wc.UID == "" {
+					t.Fatal("registry must have a UID")
+				}
+				if diff := cmp.Diff(wc.UID, reg.identities[name]); diff != "" {
+					t.Errorf("connection UID (-want +got):\n%s", diff)
+				}
 			}
 			if diff := cmp.Diff(tc.wantDisconnect, reg.disconnect); diff != "" {
 				t.Errorf("disconnections mismatch (-want +got):\n%s", diff)

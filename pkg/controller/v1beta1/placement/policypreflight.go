@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"knative.dev/pkg/apis"
@@ -218,6 +219,13 @@ func (p *policyPreflight) homeFor(uid types.UID, cluster string) (policyHomeObse
 	return obs, ok
 }
 
+func (p *policyPreflight) forgetHome(uid types.UID, cluster string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.homes[uid], cluster)
+	delete(p.prunes[uid], cluster)
+}
+
 // recordEligibility stores a candidate's terminally-determined preflight
 // verdict (member verified, or member NotFound/digest-skewed). Transient
 // read errors never write here; they read the last verdict instead.
@@ -380,12 +388,10 @@ func (r *Reconciler) controlPlaneName() string {
 // or no eligible candidate at all).
 type policyPreflightOutcome struct {
 	eligible []string
-	hold     bool
-	// holdAsIs keeps the existing placement result untouched this pass — no
-	// status write, no fan-out, just a requeue. Set when the standing winner
-	// fails preflight or the anchor read fails transiently on a Placed
-	// source: writing Pending or re-racing on either signal would tear down
-	// a healthy, serving home.
+	// hold gates fan-out while the caller continues observing standing homes.
+	hold bool
+	// holdAsIs gates fan-out and Single re-racing while the caller continues
+	// observing and publishing standing-home health.
 	holdAsIs bool
 	// transient marks a pass whose verdict rests on a transient read error,
 	// so the caller re-checks at the poll cadence instead of the long
@@ -472,8 +478,7 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: name}, pol); err != nil {
 			if !apierrors.IsNotFound(err) && sourcePlaced(isvc) {
 				// A transient control-plane read error is no verdict on the
-				// anchor: writing Pending here would wipe a Placed source's
-				// status and URL. Hold the existing result and re-read soon.
+				// anchor. Hold actuation and re-read soon.
 				r.Log.Error(err, "policy preflight: anchor read failed; holding existing placement",
 					"policy", isvc.Namespace+"/"+name, "isvc", isvc.Namespace+"/"+isvc.Name)
 				return &policyPreflightOutcome{holdAsIs: true, transient: true}
@@ -574,13 +579,14 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 			pp.recordEligibility(isvc.UID, c, false)
 		}
 		if c == winner {
-			// The standing winner never loses its home to a preflight
-			// verdict: filtering it would skip the sticky-winner path and
-			// immediately re-race a serving placement (dual-active during
-			// the window, then teardown of a healthy home). Hold everything
-			// as-is; preflight ineligibility gates only NEW fan-out.
-			r.Log.Info("policy preflight: standing winner ineligible; holding placement as-is",
+			// Preflight ineligibility gates new fan-out without freezing the
+			// standing winner's observed health.
+			r.Log.Info("policy preflight: standing winner ineligible; holding actuation",
 				"cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name, "reason", skip.reason, "detail", skip.detail)
+			if !skip.transient {
+				pp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse, skip.reason,
+					"standing winner is ineligible; skipped: "+describeSkips([]candidateSkip{*skip})))
+			}
 			return &policyPreflightOutcome{holdAsIs: true, transient: skip.transient}
 		}
 		skips = append(skips, *skip)
@@ -696,22 +702,29 @@ func liftCandidateAutoscaling(refs []componentPolicyRef, derived *v1beta1.Infere
 	observedDigest := make(map[string]string, len(refs))
 	ready, reported, failedClosed := true, true, false
 	for _, ref := range refs {
+		entry := v1beta1.CandidateComponentAutoscaling{}
+		appliedRef := autoscaler.ComponentPolicyRef(derived, ref.component)
+		if appliedRef == nil || appliedRef.Name != ref.policy {
+			out.Components[ref.component] = entry
+			ready = false
+			reported = false
+			continue
+		}
 		var as *v1beta1.ComponentAutoscalerStatus
 		if cs, ok := derived.Status.Components[ref.component]; ok {
 			as = cs.Autoscaler
 		}
-		entry := v1beta1.CandidateComponentAutoscaling{}
 		compReported := false
 		if as != nil {
 			switch {
-			case as.SpecSource == string(autoscaler.SpecSourcePolicy) && as.Policy != nil:
+			case as.SpecSource == string(autoscaler.SpecSourcePolicy) && as.Policy != nil && as.Policy.Name == ref.policy:
 				entry.ResolvedDigest = as.Policy.ResolvedDigest
 				entry.Ready = entry.ResolvedDigest != ""
 				compReported = entry.Ready
 				if observedDigest[ref.policy] == "" {
 					observedDigest[ref.policy] = as.Policy.PortableDigest
 				}
-			case as.ShadowedPolicyRef != nil:
+			case as.ShadowedPolicyRef != nil && as.ShadowedPolicyRef.Name == ref.policy:
 				// Inline outranks the ref: not policy-ready, but the shadow
 				// preview proves the member resolved the policy, so the skew
 				// detector must not count this home as unresponsive.
@@ -720,7 +733,9 @@ func liftCandidateAutoscaling(refs []componentPolicyRef, derived *v1beta1.Infere
 					observedDigest[ref.policy] = as.ShadowedPolicyRef.PortableDigest
 				}
 			}
-			if apimeta.IsStatusConditionFalse(as.Conditions, v1beta1.AutoscalerResolvedCondition) {
+			resolved := apimeta.FindStatusCondition(as.Conditions, v1beta1.AutoscalerResolvedCondition)
+			if resolved != nil && resolved.Status == metav1.ConditionFalse && derived.Generation > 0 &&
+				resolved.ObservedGeneration == derived.Generation {
 				failedClosed = true
 			}
 		}

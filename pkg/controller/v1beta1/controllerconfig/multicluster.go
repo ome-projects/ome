@@ -92,12 +92,12 @@ type PlacementConfig struct {
 	// MaxConcurrentReconciles caps placement reconciles in parallel (distinct
 	// ISVCs). Zero falls back to controller-runtime's single worker.
 	MaxConcurrentReconciles int `json:"maxConcurrentReconciles,omitempty"`
-	// FanoutTimeout is the per-cluster deadline bounding a single fan-out apply, so
-	// one slow remote cannot block placement to healthy peers.
+	// FanoutTimeout is the per-cluster deadline bounding a single placement read,
+	// apply, or delete, so one slow remote cannot block work on healthy peers.
 	FanoutTimeout string `json:"fanoutTimeout,omitempty"`
-	// WinnerLostGrace is the grace window held before re-placing when the sticky
-	// winner's derived is absent on a still-connected winner. Empty re-places
-	// immediately.
+	// WinnerLostGrace is the grace window for transient loss of a sticky winner,
+	// including derived absence, membership removal, or admission loss. Empty
+	// uses the controller default.
 	WinnerLostGrace string `json:"winnerLostGrace,omitempty"`
 	// StatusBatchPeriod debounces a burst of cross-cluster derived-status events for
 	// one ISVC into a single placement reconcile.

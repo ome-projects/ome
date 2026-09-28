@@ -157,10 +157,7 @@ func TestDeriveISVC_StripsRoutingDirectives(t *testing.T) {
 	d := DeriveISVC(src, "cp-east", "")
 
 	assert.Nil(t, d.Spec.Routing, "routing is reconciled only by the control plane")
-	require.NotNil(t, d.Spec.Placement)
-	assert.Equal(t, v1beta1.PlacementModeAll, d.Spec.Placement.Mode)
-	assert.Nil(t, d.Spec.Placement.CapacityFactors, //nolint:staticcheck // Verify the supported legacy alias is removed.
-		"the legacy routing capacity alias is reconciled only by the control plane")
+	assert.Nil(t, d.Spec.Placement, "placement is reconciled only by the control plane")
 	assert.Equal(t, wantSource, src, "derivation must not mutate the source ISVC")
 }
 

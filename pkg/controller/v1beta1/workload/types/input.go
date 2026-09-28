@@ -196,6 +196,11 @@ type ReconcileInput struct {
 	// Nil is treated as always-allowed.
 	UpdateGate func(strategy UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (allowed bool, gate RolloutHoldGate, denyReason string)
 
+	// PauseNewSurge holds fresh migration reservations while an external
+	// placement plan owns the shared allowance. Allocated migrations continue.
+	// Fresh update surge is held by UpdateGate; ordinary floor creation is free.
+	PauseNewSurge bool
+
 	// RecordRolloutHold, when non-nil, is called at most once per Update
 	// pass with the pass's verdict: non-nil when a StartingFresh Instance
 	// was denied by the per-Component budget or UpdateGate and nothing

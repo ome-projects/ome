@@ -1,12 +1,15 @@
 package acceleratorquota
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,6 +61,10 @@ type CapacityOptions struct {
 	// damping, so the mark tracks every dip — including the ones caused by a
 	// drain or a reboot.
 	HysteresisPercent int32
+
+	// ReportInterval bounds how long unchanged hardware observations can remain
+	// unpublished. Zero disables periodic timestamp refreshes.
+	ReportInterval time.Duration
 }
 
 // Enabled reports whether capacity derivation is configured.
@@ -162,11 +169,38 @@ func (r *Reconciler) reconcileCapacity(ctx context.Context, root *v1beta1.Accele
 	// unattributed slice and the raw node counts have no other reader.
 	recordCapacity(observed)
 
+	now := metav1.Now()
 	updated := root.DeepCopy()
+	samples, attribution := attributeCapacity(observed, flavors, r.Capacity.Resources)
 	updated.Status.Capacity = mergeCapacity(
-		root.Status.Capacity, observed.Capacities, r.Capacity.HysteresisPercent, metav1.Now())
+		root.Status.Capacity, observed.Capacities, r.Capacity.HysteresisPercent, now)
+	recorded := map[string]bool{}
+	for i := range updated.Status.Capacity {
+		sample := &updated.Status.Capacity[i]
+		key := budgetKey(sample.ResourceName, sample.ResourceFlavor)
+		recorded[key] = true
+		sample.Attribution = attribution[key]
+	}
+	// Add first observations of empty pools after high-water tracking; a pool
+	// without nodes must retain the quota tracker's established historical mark.
+	for _, sample := range samples {
+		key := budgetKey(sample.ResourceName, sample.ResourceFlavor)
+		if !recorded[key] {
+			updated.Status.Capacity = append(updated.Status.Capacity, v1beta1.AcceleratorCapacityStatus{
+				ResourceName: sample.ResourceName, ResourceFlavor: sample.ResourceFlavor,
+				ObservedAt: now.DeepCopy(), Attribution: attribution[key],
+			})
+		}
+	}
+	slices.SortFunc(updated.Status.Capacity, func(a, b v1beta1.AcceleratorCapacityStatus) int {
+		if order := cmp.Compare(a.ResourceName, b.ResourceName); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.ResourceFlavor, b.ResourceFlavor)
+	})
 
-	if equalCapacity(root.Status.Capacity, updated.Status.Capacity) {
+	if equalCapacity(root.Status.Capacity, updated.Status.Capacity) &&
+		!capacityReportDue(root.Status.Capacity, now.Time, r.Capacity.ReportInterval) {
 		return nil
 	}
 	if err := r.Status().Patch(ctx, updated, client.MergeFrom(root)); err != nil {
@@ -177,6 +211,28 @@ func (r *Reconciler) reconcileCapacity(ctx context.Context, root *v1beta1.Accele
 		return fmt.Errorf("writing root capacity: %w", err)
 	}
 	return nil
+}
+
+// capacityReportDue refreshes only completed samples. A failed read cannot
+// extend their freshness, and an absent report cannot claim observed hardware.
+func capacityReportDue(reports []v1beta1.AcceleratorCapacityStatus, now time.Time, interval time.Duration) bool {
+	if interval <= 0 {
+		return false
+	}
+	for _, report := range reports {
+		if report.ObservedAt == nil || report.ObservedAt.After(now) || now.Sub(report.ObservedAt.Time) >= interval {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Reconciler) nextResync() time.Duration {
+	interval := r.ResyncInterval
+	if report := r.Capacity.ReportInterval; r.Capacity.Enabled() && report > 0 && (interval <= 0 || report < interval) {
+		interval = report
+	}
+	return interval
 }
 
 // flavors reads the Kueue ResourceFlavors capacity is attributed to.
@@ -201,7 +257,7 @@ func (r *Reconciler) flavors(ctx context.Context) ([]capacity.Flavor, error) {
 	out := make([]capacity.Flavor, 0, len(list.Items))
 	for i := range list.Items {
 		f := &list.Items[i]
-		out = append(out, capacity.Flavor{Name: f.Name, NodeLabels: f.Spec.NodeLabels})
+		out = append(out, capacity.Flavor{Name: f.Name, UID: f.UID, NodeLabels: f.Spec.NodeLabels})
 	}
 	return out, nil
 }
@@ -251,7 +307,8 @@ func equalCapacity(a, b []v1beta1.AcceleratorCapacityStatus) bool {
 		if a[i].ResourceName != b[i].ResourceName ||
 			a[i].ResourceFlavor != b[i].ResourceFlavor ||
 			a[i].Allocatable.Cmp(b[i].Allocatable) != 0 ||
-			a[i].HighWaterMark.Cmp(b[i].HighWaterMark) != 0 {
+			a[i].HighWaterMark.Cmp(b[i].HighWaterMark) != 0 ||
+			!apiequality.Semantic.DeepEqual(a[i].Attribution, b[i].Attribution) {
 			return false
 		}
 	}

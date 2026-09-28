@@ -32277,6 +32277,109 @@ spec:
                           admittedReplicas:
                             format: int32
                             type: integer
+                          allocation:
+                            properties:
+                              capacity:
+                                properties:
+                                  demandFingerprint:
+                                    type: string
+                                  pools:
+                                    items:
+                                      properties:
+                                        allocatable:
+                                          format: int64
+                                          minimum: 0
+                                          type: integer
+                                        attribution:
+                                          properties:
+                                            complete:
+                                              type: boolean
+                                            flavorSetHash:
+                                              type: string
+                                            flavorUID:
+                                              type: string
+                                            nodeLabels:
+                                              additionalProperties:
+                                                type: string
+                                              type: object
+                                          required:
+                                            - complete
+                                            - flavorSetHash
+                                            - flavorUID
+                                          type: object
+                                        demand:
+                                          format: int64
+                                          minimum: 1
+                                          type: integer
+                                        observedAt:
+                                          format: date-time
+                                          type: string
+                                        reportResourceVersion:
+                                          type: string
+                                        reportUID:
+                                          type: string
+                                        resourceFlavor:
+                                          type: string
+                                        resourceName:
+                                          type: string
+                                      required:
+                                        - allocatable
+                                        - attribution
+                                        - demand
+                                        - observedAt
+                                        - reportResourceVersion
+                                        - reportUID
+                                        - resourceFlavor
+                                        - resourceName
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                      - resourceName
+                                      - resourceFlavor
+                                    x-kubernetes-list-type: map
+                                  replicas:
+                                    format: int64
+                                    minimum: 0
+                                    type: integer
+                                required:
+                                  - demandFingerprint
+                                  - pools
+                                  - replicas
+                                type: object
+                              clusterUID:
+                                type: string
+                              currentReplicas:
+                                format: int32
+                                minimum: 0
+                                type: integer
+                              desiredReplicas:
+                                format: int32
+                                minimum: 0
+                                type: integer
+                              drainRequested:
+                                type: boolean
+                              matchingTerms:
+                                items:
+                                  format: int32
+                                  type: integer
+                                type: array
+                                x-kubernetes-list-type: set
+                              originalReplicas:
+                                format: int32
+                                minimum: 0
+                                type: integer
+                              weight:
+                                format: int64
+                                minimum: 0
+                                type: integer
+                            required:
+                              - clusterUID
+                              - currentReplicas
+                              - desiredReplicas
+                              - originalReplicas
+                            type: object
+                          appliedPlanID:
+                            type: string
                           autoscaling:
                             properties:
                               components:
@@ -32309,6 +32412,8 @@ spec:
                             type: string
                           endpoint:
                             type: string
+                          observationKnown:
+                            type: boolean
                           phase:
                             enum:
                               - Admitting
@@ -32372,6 +32477,52 @@ spec:
                         - Placed
                         - Failed
                       type: string
+                    plan:
+                      properties:
+                        assignedReplicas:
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        id:
+                          type: string
+                        inputDigest:
+                          type: string
+                        observedGeneration:
+                          format: int64
+                          minimum: 1
+                          type: integer
+                        originalUnassignedReplicas:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                        pauseSurge:
+                          type: boolean
+                        requestedReplicas:
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        revision:
+                          format: int64
+                          minimum: 1
+                          type: integer
+                        sourceUID:
+                          type: string
+                        unassignedReplicas:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                      required:
+                        - assignedReplicas
+                        - id
+                        - inputDigest
+                        - observedGeneration
+                        - originalUnassignedReplicas
+                        - pauseSurge
+                        - requestedReplicas
+                        - revision
+                        - sourceUID
+                        - unassignedReplicas
+                      type: object
                   type: object
                 rollout:
                   properties:

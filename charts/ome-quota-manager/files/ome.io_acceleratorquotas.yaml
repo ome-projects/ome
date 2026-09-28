@@ -266,6 +266,23 @@ spec:
                       - type: string
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
+                    attribution:
+                      properties:
+                        complete:
+                          type: boolean
+                        flavorSetHash:
+                          type: string
+                        flavorUID:
+                          type: string
+                        nodeLabels:
+                          additionalProperties:
+                            type: string
+                          type: object
+                      required:
+                      - complete
+                      - flavorSetHash
+                      - flavorUID
+                      type: object
                     highWaterMark:
                       anyOf:
                       - type: integer
@@ -284,7 +301,26 @@ spec:
                             - type: string
                             pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                             x-kubernetes-int-or-string: true
+                          attribution:
+                            properties:
+                              complete:
+                                type: boolean
+                              flavorSetHash:
+                                type: string
+                              flavorUID:
+                                type: string
+                              nodeLabels:
+                                additionalProperties:
+                                  type: string
+                                type: object
+                            required:
+                            - complete
+                            - flavorSetHash
+                            - flavorUID
+                            type: object
                           cluster:
+                            type: string
+                          clusterUID:
                             type: string
                           highWaterMark:
                             anyOf:
@@ -294,6 +330,12 @@ spec:
                             x-kubernetes-int-or-string: true
                           observedAt:
                             format: date-time
+                            type: string
+                          reportAvailable:
+                            type: boolean
+                          reportResourceVersion:
+                            type: string
+                          reportUID:
                             type: string
                         required:
                         - cluster

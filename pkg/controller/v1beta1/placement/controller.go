@@ -34,6 +34,8 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/placement/plan"
+	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
 
 const (
@@ -42,10 +44,10 @@ const (
 	// manager flag / chart; this is the graceful-degradation default.
 	DefaultPlacementRequeue = 30 * time.Second
 
-	// DefaultPlaceTimeout is the fallback per-cluster fan-out apply deadline used
+	// DefaultPlaceTimeout is the fallback per-cluster operation deadline used
 	// when Reconciler.PlaceTimeout is unset. The operative value is supplied by
 	// the manager flag / chart; this is the graceful-degradation default that
-	// keeps one wedged remote from stalling the apply to its healthy peers.
+	// keeps one wedged remote from stalling progress on its healthy peers.
 	DefaultPlaceTimeout = 10 * time.Second
 
 	// DefaultWinnerLostGrace is the fallback grace window used when
@@ -54,13 +56,19 @@ const (
 	// lets a transient winner-derived gap heal before re-racing.
 	DefaultWinnerLostGrace = 1 * time.Minute
 
-	placementReadyReasonPending    = "PlacementPending"
+	placementReadyReasonPending = "PlacementPending"
+	// PlacementReadyReasonLost identifies an authoritative loss of every current
+	// home without treating an unreadable member as absent.
+	PlacementReadyReasonLost = "PlacementLost"
+	// PlacementReadyReasonUnknown identifies an incomplete placement observation
+	// that cannot prove either serving readiness or authoritative placement loss.
+	PlacementReadyReasonUnknown    = "PlacementUnknown"
 	placementReadyReasonAdmitting  = "PlacementAdmitting"
 	placementReadyReasonReady      = "PlacementReady"
 	placementReadyReasonNotReady   = "PlacementNotReady"
 	placementReadyReasonFailed     = "PlacementFailed"
-	placementReadyReasonUnknown    = "PlacementUnknown"
 	placementReadyMessagePending   = "Waiting for an eligible workload cluster"
+	placementReadyMessageLost      = "All recorded placement homes are confirmed absent"
 	placementReadyMessageAdmitting = "Waiting for a workload cluster to admit the InferenceService"
 	placementReadyMessageReady     = "At least one admitted placement has a ready ingress and ready replicas"
 	placementReadyMessageNotReady  = "Placement is admitted but no candidate has a ready ingress, endpoint, and replicas"
@@ -78,6 +86,7 @@ type placementResult struct {
 	url              *apis.URL // published endpoint; mirrored to BOTH status.placement.endpoint and status.url
 	ready            bool      // at least one observed admitted home has ready replicas and a ready ingress
 	readinessUnknown bool      // one or more candidates lacked a current serving-readiness observation
+	placementLost    bool      // every relevant standing home was conclusively absent
 }
 
 // ClusterClients is the subset of *workloadcluster.Manager the placer needs.
@@ -132,18 +141,17 @@ type Reconciler struct {
 	// concurrently. Sourced from a flag/chart value; no in-code default. Zero
 	// (unset) preserves controller-runtime's single-worker default.
 	MaxConcurrentReconciles int
-	// PlaceTimeout bounds a single per-cluster placeOn during fan-out so one
-	// stuck/slow remote cannot block the apply to the healthy candidates. The
+	// PlaceTimeout bounds a single per-cluster observation, apply, or delete so one
+	// stuck/slow remote cannot block progress on the healthy candidates. The
 	// operative value is supplied by the manager flag / chart; zero (unset) falls
 	// back to DefaultPlaceTimeout (graceful degradation, no magic literal in the
 	// hot path).
 	PlaceTimeout time.Duration
-	// WinnerLostGracePeriod is how long the controller waits, after the sticky
-	// winner's derived first appears ABSENT on a connected winner cluster, before
-	// giving up on it and re-racing. It rides out a transient gap (the worker
-	// recreating the derived, a brief apiserver hiccup) so a momentary blip does
-	// not tear down a healthy placement and re-fan-out the whole candidate set.
-	// A genuinely-deleted derived re-races once the window elapses. Config-driven
+	// WinnerLostGracePeriod is how long the controller waits after the sticky
+	// winner is confirmed absent or loses admission before giving up and re-racing.
+	// This covers derived-workload recreation and WorkloadCluster removal without
+	// treating an unreadable member as evidence of loss. The controller re-races
+	// once the window elapses. Config-driven
 	// (manager flag / chart); zero (unset) falls back to DefaultWinnerLostGrace.
 	WinnerLostGracePeriod time.Duration
 
@@ -173,7 +181,7 @@ type Reconciler struct {
 	dispatcherOnce sync.Once
 
 	// winnerLostSince tracks, per source-ISVC UID, the first time this controller
-	// observed the sticky winner's derived ABSENT on a connected winner cluster.
+	// observed the sticky winner as absent or as having lost admission.
 	// It is the in-memory backing for WinnerLostGracePeriod: the PlacementStatus
 	// API carries no such timestamp and this package may not extend it, so the
 	// grace clock lives here. A control-plane restart loses the marker and the
@@ -250,6 +258,11 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if !isvc.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, isvc)
 	}
+	// The primary watch and queued status events can include local services.
+	// Only placement sources may acquire placement state or remote allocations.
+	if !IsPlacementEligible(isvc) {
+		return ctrl.Result{}, nil
+	}
 
 	if controllerutil.AddFinalizer(isvc, PlacementFinalizer) {
 		if err := r.Update(ctx, isvc); err != nil {
@@ -261,6 +274,10 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if err := r.List(ctx, clusters); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Member observation is independent from placement eligibility. Status homes
+	// are read before any readiness or policy gate so those gates can stop
+	// actuation without freezing the source's view of serving health.
+	observations := r.observeStandingHomes(ctx, isvc, clusters.Items)
 	candidates, reason, err := MatchCandidates(isvc, clusters.Items)
 	if err != nil || len(candidates) == 0 {
 		// Surface WHY there are no candidates (malformed selector / no
@@ -268,15 +285,11 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		// set is diagnosable instead of an indistinguishable Pending.
 		r.Log.Info("no placement candidates", "isvc", isvc.Namespace+"/"+isvc.Name,
 			"reason", reason, "error", err)
-		if err == nil && reason == MatchReasonNoReadyClusters && isvc.Status.Placement != nil &&
-			placementTargetExists(isvc.Status.Placement, clusters.Items) {
-			// Fleet readiness is sampled and can disappear for one health interval.
-			// Preserve the last-known placement (including its endpoint and homes)
-			// rather than publishing Pending and derouting still-serving traffic.
-			// Retention keys on the target still EXISTING, not on it being ready,
-			// so a decommissioned fleet falls through to Pending instead of
-			// pinning the InferenceService to a cluster that is gone.
-			return ctrl.Result{RequeueAfter: r.requeue()}, nil
+		if isvc.Status.Placement != nil && len(observations.standing) > 0 {
+			// WorkloadCluster readiness is sampled independently from the derived
+			// workload. Keep reconciling standing status while the current fleet
+			// view blocks new placement.
+			return r.writeObservedPlacement(ctx, isvc, observations)
 		}
 		return r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
 	}
@@ -288,11 +301,7 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	// common no-ref ISVC.
 	pf := r.preflightPolicies(ctx, isvc, candidates, clusters.Items)
 	if pf != nil && pf.holdAsIs {
-		// The standing winner failed preflight, or a Placed source's anchor
-		// read failed transiently: keep the last-written placement untouched
-		// (no Pending write, no re-race) and re-check at the poll cadence,
-		// mirroring the winner-disconnected handling.
-		return ctrl.Result{RequeueAfter: r.requeue()}, nil
+		return r.writeObservedPlacement(ctx, isvc, observations)
 	}
 	if pf != nil && !pf.hold {
 		candidates = pf.eligible
@@ -308,7 +317,7 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if pf == nil || !pf.hold {
 		rf = r.preflightRolloutPolicies(ctx, isvc, candidates, clusters.Items)
 		if rf != nil && rf.holdAsIs {
-			return ctrl.Result{RequeueAfter: r.requeue()}, nil
+			return r.writeObservedPlacement(ctx, isvc, observations)
 		}
 		if rf != nil && !rf.hold {
 			candidates = rf.eligible
@@ -317,19 +326,18 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 
 	var res ctrl.Result
 	if (pf != nil && pf.hold) || (rf != nil && rf.hold) {
-		res, err = r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
+		res, err = r.writeObservedPlacement(ctx, isvc, observations)
 	} else {
 		// Branch on placement mode. Each mode owns its own reconcile: Single keeps one
-		// winner (sticky race + loser sweep); All keeps every home that admits. Split
-		// is not yet implemented — hold Pending rather than silently run it as Single,
-		// so an operator never mistakes an un-split placement for a split one.
+		// winner, All keeps every home that admits, and Split apportions the requested
+		// replicas across its candidate set.
 		switch mode := placementMode(isvc); mode {
 		case v1beta1.PlacementModeSingle:
-			res, err = r.reconcileSingle(ctx, isvc, candidates)
+			res, err = r.reconcileSingle(ctx, isvc, candidates, observations)
 		case v1beta1.PlacementModeAll:
-			res, err = r.reconcileAll(ctx, isvc, candidates)
+			res, err = r.reconcileAll(ctx, isvc, candidates, observations)
 		case v1beta1.PlacementModeSplit:
-			res, err = r.reconcileSplit(ctx, isvc, candidates)
+			res, err = r.reconcileSplit(ctx, isvc, candidates, observations)
 		default:
 			r.Log.Info("placement mode not supported by this build; holding Pending",
 				"mode", mode, "isvc", isvc.Namespace+"/"+isvc.Name)
@@ -351,104 +359,78 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 // sweep the losers, and hold that winner sticky across polls — re-racing only if
 // it is lost (derived deleted, or admission lost past the grace window). This is
 // the default mode.
-func (r *Reconciler) reconcileSingle(ctx context.Context, isvc *v1beta1.InferenceService, candidates []string) (ctrl.Result, error) {
-	// Sticky winner: keep the current winner while its derived ISVC still
-	// exists and it remains a candidate. Otherwise fall through to re-race.
-	if winner := winnerCluster(isvc); winner != "" && slices.Contains(candidates, winner) {
-		state, derived, err := r.getWinnerDerived(ctx, winner, isvc)
-		if err != nil {
-			// A transient remote GET error must NOT abort the reconcile or be
-			// misread as "derived gone" (which would prematurely re-race and
-			// sweep losers). Hold the existing placement and retry next poll.
-			r.Log.Error(err, "sticky winner: remote get failed; holding placement", "cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
-			return ctrl.Result{RequeueAfter: r.requeue()}, nil
+func (r *Reconciler) reconcileSingle(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	candidates []string,
+	observations *placementObservations,
+) (ctrl.Result, error) {
+	// A standing winner remains sticky while it can be observed or while its
+	// absence is inside the grace window. Observation updates health even when
+	// actuation and re-racing are held.
+	if winner := winnerCluster(isvc); winner != "" &&
+		(observations.projects(winner) || !observations.known[winner]) {
+		home, ok := observations.get(winner)
+		if !ok {
+			home = observations.refresh(ctx, r, isvc, winner)
 		}
-		switch state {
-		case winnerDisconnected:
-			// The winner cluster is not reachable this pass. This is NOT evidence
-			// the derived was deleted — re-racing now would tear down a healthy
-			// placement on a transport flap. Hold the placement and retry; the
-			// grace clock is deliberately NOT armed (it tracks absence on a
-			// CONNECTED winner, not a disconnected transport).
-			r.Log.Info("sticky winner: cluster disconnected; holding placement", "cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
-			return ctrl.Result{RequeueAfter: r.requeue()}, nil
-
-		case winnerDerivedPresent:
-			cl, ok := r.Clusters.ClientFor(winner)
-			if !ok {
-				// Winner disconnected between the derived GET and now; hold
-				// rather than judge its state on partial data (consistent with
-				// the winnerDisconnected handling above).
-				r.Log.Info("sticky winner: cluster client unavailable; holding placement", "cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
-				return ctrl.Result{RequeueAfter: r.requeue()}, nil
+		if home.err != nil {
+			r.Log.Error(home.err, "sticky winner: member read failed; holding placement",
+				"cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
+		}
+		switch home.state {
+		case homeUnknown:
+			res, err := r.writePlacement(ctx, isvc, observedSingleResult(isvc, winner, home))
+			if err == nil {
+				res.RequeueAfter = r.requeue()
 			}
-			// Read the authoritative per-component IR status from the winner
-			// cluster (source of truth; the derived ISVC does not mirror it).
-			statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
-			if err != nil {
-				// A transient IR read error must not be misread as terminal
-				// failure; hold and retry next poll.
-				r.Log.Error(err, "sticky winner: reading IR statuses failed; holding placement", "cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
-				return ctrl.Result{RequeueAfter: r.requeue()}, nil
+			return res, err
+		case homeAbsent:
+			if remaining := r.graceRemaining(isvc.UID, time.Now()); remaining > 0 {
+				return r.writeSingleAbsentGrace(ctx, isvc, winner)
 			}
-			if IsTerminallyFailed(derived, statuses) {
-				// The placement itself failed; surface it and stop. Do NOT
-				// re-place into a hot fail-loop — needs human/spec action.
-				u := endpointFor(derived)
-				if u == nil {
-					u = isvc.Status.URL
-				}
+			r.clearGrace(isvc.UID)
+		case homePresent:
+			if home.terminal {
+				r.clearGrace(isvc.UID)
 				return r.writePlacement(ctx, isvc, placementResult{
 					winner: winner, phase: v1beta1.PlacementPhaseFailed,
-					candidates: []v1beta1.CandidatePlacement{{Cluster: winner, Phase: v1beta1.CandidatePhaseAdmitted}},
-					url:        u,
+					candidates: []v1beta1.CandidatePlacement{home.candidate},
 				})
 			}
-			// The winner must still hold its Kueue admission. If it lost it (e.g.
-			// preemption evicted every instance of a component), the placement is no
-			// longer live even though the derived object exists. Ride out a transient
-			// dip (rollout, brief re-gate) with the same grace window a vanished
-			// derived uses, then re-race off the healthy candidates. Without this a
-			// preempted winner is reported Placed forever while serving nothing.
-			if !AllComponentsAdmitted(derived, statuses) {
+			if home.candidate.Phase != v1beta1.CandidatePhaseAdmitted {
 				if remaining := r.graceRemaining(isvc.UID, time.Now()); remaining > 0 {
-					r.Log.Info("sticky winner: lost admission; within grace window, holding placement",
-						"cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name, "graceRemaining", remaining)
-					return ctrl.Result{RequeueAfter: min(remaining, r.requeue())}, nil
+					return r.writeSingleAdmissionGrace(ctx, isvc, winner)
 				}
 				r.clearGrace(isvc.UID)
-				r.Log.Info("sticky winner: lost admission past grace window; re-racing",
-					"cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
-				break // exit the switch; fall through to the re-race path below
+				break
 			}
-			// Admitted and present: healthy. Drop any pending grace marker, re-apply
-			// on the winner, and sweep any stray derived on the other candidates
-			// (origin-guarded, so a same-named user ISVC is safe).
 			r.clearGrace(isvc.UID)
+			if !slices.Contains(candidates, winner) {
+				res, err := r.writePlacement(ctx, isvc, observedCandidateResult(home))
+				if err == nil {
+					res.RequeueAfter = r.requeue()
+				}
+				return res, err
+			}
+			cl, ok := r.Clusters.ClientFor(winner)
+			if !ok {
+				unknown := retainedUnknownCandidate(isvc, home.candidate)
+				res, err := r.writePlacement(ctx, isvc, placementResult{
+					winner: winner, phase: v1beta1.PlacementPhasePlaced,
+					candidates: []v1beta1.CandidatePlacement{unknown},
+					url:        unknown.Endpoint, readinessUnknown: true,
+				})
+				if err == nil {
+					res.RequeueAfter = r.requeue()
+				}
+				return res, err
+			}
 			if err := r.placeOnBounded(ctx, winner, cl, isvc); err != nil {
-				return ctrl.Result{}, err
+				return r.observedStatusThenError(ctx, isvc, observations, err)
 			}
 			r.deleteLosers(ctx, isvc, candidates, winner)
-			return r.writePlacement(ctx, isvc, placedResult(winner, derived, isvc, statuses))
-
-		case winnerDerivedAbsent:
-			// The winner is connected but its derived is gone. Distinguish a
-			// transient gap (worker recreating it, brief apiserver blip) from a
-			// genuine deletion by holding the placement until the grace window
-			// elapses; only then re-race. Without this, a momentary disappearance
-			// would re-fan-out the whole candidate set and churn the placement.
-			if remaining := r.graceRemaining(isvc.UID, time.Now()); remaining > 0 {
-				r.Log.Info("sticky winner: derived absent; within grace window, holding placement",
-					"cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name, "graceRemaining", remaining)
-				// Requeue when the grace window is due to expire (or at the poll
-				// cadence, whichever is sooner) so re-placement is not deferred a
-				// full poll past the deadline.
-				return ctrl.Result{RequeueAfter: min(remaining, r.requeue())}, nil
-			}
-			// Grace elapsed: the winner is genuinely lost. Clear the marker and
-			// fall through to re-race.
-			r.clearGrace(isvc.UID)
-			r.Log.Info("sticky winner: derived absent past grace window; re-racing", "cluster", winner, "isvc", isvc.Namespace+"/"+isvc.Name)
+			return r.writePlacement(ctx, isvc, observedCandidateResult(home))
 		}
 	}
 
@@ -464,24 +446,49 @@ func (r *Reconciler) reconcileSingle(ctx context.Context, isvc *v1beta1.Inferenc
 	// Fan out to the connected nominated candidates.
 	placed, err := r.fanOut(ctx, isvc, nominated)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.observedStatusThenError(ctx, isvc, observations, err)
 	}
-	if len(placed) == 0 {
-		return r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
+	placedNow := make(map[string]bool, len(placed))
+	for _, cluster := range placed {
+		placedNow[cluster] = true
 	}
 
-	// Race: the first placed candidate whose derived ISVC reports an admitted
-	// instance wins.
-	winner, winnerDerived, winnerStatuses, err := r.findWinner(ctx, isvc, placed)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if winner == "" {
-		cands := make([]v1beta1.CandidatePlacement, 0, len(placed))
-		for _, c := range placed {
-			cands = append(cands, v1beta1.CandidatePlacement{Cluster: c, Phase: v1beta1.CandidatePhaseAdmitting})
+	// Race only on fully observed admission. Unknown homes remain represented
+	// with zero ready capacity but cannot win or trigger teardown elsewhere.
+	cands := make([]v1beta1.CandidatePlacement, 0, len(nominated))
+	unknown := false
+	for _, cluster := range nominated {
+		if !placedNow[cluster] && !observations.had(cluster) {
+			continue
 		}
-		res, err := r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhaseAdmitting, candidates: cands})
+		home := observations.refresh(ctx, r, isvc, cluster)
+		if home.err != nil {
+			r.Log.Error(home.err, "race: member read failed; keeping unknown candidate",
+				"cluster", cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
+		}
+		if home.state == homeAbsent {
+			if placedNow[cluster] {
+				cands = append(cands, identityCandidate(cluster))
+			}
+			continue
+		}
+		unknown = unknown || home.state == homeUnknown
+		cands = append(cands, home.candidate)
+		if home.state != homePresent || home.terminal || home.candidate.Phase != v1beta1.CandidatePhaseAdmitted {
+			continue
+		}
+		r.clearGrace(isvc.UID)
+		r.deleteLosers(ctx, isvc, candidates, cluster)
+		return r.writePlacement(ctx, isvc, observedCandidateResult(home))
+	}
+	if len(cands) == 0 {
+		return r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
+	}
+	{
+		res, err := r.writePlacement(ctx, isvc, placementResult{
+			phase: v1beta1.PlacementPhaseAdmitting, candidates: cands,
+			readinessUnknown: unknown,
+		})
 		if err == nil {
 			// Admitting is an active wait for Kueue admission, so re-poll at the fast
 			// cadence to observe the winner promptly. writePlacement otherwise
@@ -498,11 +505,6 @@ func (r *Reconciler) reconcileSingle(ctx context.Context, isvc *v1beta1.Inferenc
 		}
 		return res, err
 	}
-
-	// Winner: sweep the losers (every candidate cluster except the winner;
-	// each delete is origin-guarded so only our derived copies are removed).
-	r.deleteLosers(ctx, isvc, candidates, winner)
-	return r.writePlacement(ctx, isvc, placedResult(winner, winnerDerived, isvc, winnerStatuses))
 }
 
 // placementMode returns the ISVC's placement cardinality, defaulting to Single
@@ -524,120 +526,55 @@ func placementMode(isvc *v1beta1.InferenceService) v1beta1.PlacementMode {
 //
 // There is deliberately no sticky-winner / re-race path here: those protect the
 // single-home invariant, which All does not have. Each home is independent.
-// placementTargetExists reports whether the placement still names at least one
-// WorkloadCluster that is present in the fleet, in any readiness state.
-func placementTargetExists(pl *v1beta1.PlacementStatus, clusters []v1beta1.WorkloadCluster) bool {
-	present := make(map[string]struct{}, len(clusters))
-	for i := range clusters {
-		present[clusters[i].Name] = struct{}{}
-	}
-	if pl.Cluster != "" {
-		if _, ok := present[pl.Cluster]; ok {
-			return true
-		}
-	}
-	for _, c := range pl.Candidates {
-		if _, ok := present[c.Cluster]; ok {
-			return true
-		}
-	}
-	return false
-}
 
-func (r *Reconciler) reconcileAll(ctx context.Context, isvc *v1beta1.InferenceService, candidates []string) (ctrl.Result, error) {
-	scaleComps := placementScaleComponents(isvc)
-	trustedReady := hasPlacementReadyProvenance(isvc)
-	serving := false
-
-	// A candidate that cannot be observed this pass keeps its last-published
-	// state. The WorkloadCluster API can remain Ready while a newly elected
-	// process is still rebuilding its local remote-client registry.
-	prev := make(map[string]v1beta1.CandidatePlacement, len(candidates))
-	if isvc.Status.Placement != nil {
-		for _, c := range isvc.Status.Placement.Candidates {
-			prev[c.Cluster] = c
-		}
-	}
-
+func (r *Reconciler) reconcileAll(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	candidates []string,
+	observations *placementObservations,
+) (ctrl.Result, error) {
 	placed, err := r.fanOut(ctx, isvc, candidates)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.observedStatusThenError(ctx, isvc, observations, err)
 	}
 	placedNow := make(map[string]bool, len(placed))
 	for _, c := range placed {
 		placedNow[c] = true
 	}
 
-	cands := make([]v1beta1.CandidatePlacement, 0, len(candidates))
+	projected := observations.projectedClusters(candidates)
+	cands := make([]v1beta1.CandidatePlacement, 0, len(projected))
 	admitted := 0
-	carryForward := func(c string) {
-		if p, ok := prev[c]; ok {
-			p = normalizeCandidatePhase(p)
-			// A carried ReadyReplicas count is trusted as serving provenance only
-			// once this controller has published its own ingress-gated Ready verdict.
-			if !trustedReady {
-				p.ReadyReplicas = 0
-			}
-			cands = append(cands, p)
-			if p.Phase == v1beta1.CandidatePhaseAdmitted {
-				admitted++
-				serving = serving || candidateHasServingData(p)
-			}
-		}
-	}
+	serving := false
 	unobserved := false
-	for _, c := range candidates {
-		if !placedNow[c] {
-			unobserved = true
-			if _, had := prev[c]; had {
-				r.Log.Info("all: candidate unavailable; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
+	for _, cluster := range projected {
+		actuatable := slices.Contains(candidates, cluster)
+		if actuatable && placedNow[cluster] {
+			observations.refresh(ctx, r, isvc, cluster)
+		}
+		home, observed := observations.get(cluster)
+		if !observed {
+			home = observations.refresh(ctx, r, isvc, cluster)
+		}
+		if actuatable && !placedNow[cluster] && !observations.had(cluster) {
+			continue
+		}
+		if home.err != nil {
+			r.Log.Error(home.err, "all: member read failed; keeping unknown home",
+				"cluster", cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
+		}
+		if home.state == homeAbsent {
+			if actuatable && placedNow[cluster] {
+				cands = append(cands, identityCandidate(cluster))
 			}
-			carryForward(c)
 			continue
 		}
-		derived, ok, err := r.getDerived(ctx, c, isvc)
-		if err != nil {
-			r.Log.Error(err, "all: reading derived failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			unobserved = true
-			carryForward(c)
-			continue
-		}
-		if !ok {
-			unobserved = true
-			carryForward(c)
-			continue
-		}
-		cl, ok := r.Clusters.ClientFor(c)
-		if !ok {
-			unobserved = true
-			carryForward(c)
-			continue
-		}
-		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
-		if err != nil {
-			r.Log.Error(err, "all: reading IR statuses failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			unobserved = true
-			carryForward(c)
-			continue
-		}
-		if AllComponentsAdmitted(derived, statuses) {
+		unobserved = unobserved || home.state == homeUnknown
+		cands = append(cands, home.candidate)
+		if home.candidate.Phase == v1beta1.CandidatePhaseAdmitted {
 			admitted++
-			readyReplicas := placementReadyReplicas(scaleComps, statuses)
-			if !derived.Status.IsConditionReady(v1beta1.IngressReady) {
-				readyReplicas = 0
-			}
-			candidate := v1beta1.CandidatePlacement{
-				Cluster:          c,
-				Phase:            v1beta1.CandidatePhaseAdmitted,
-				Endpoint:         endpointFor(derived),
-				AdmittedReplicas: placementAdmittedReplicas(scaleComps, statuses),
-				ReadyReplicas:    readyReplicas,
-			}
-			cands = append(cands, candidate)
-			serving = serving || placementCandidateServing(derived, candidate)
-			continue
+			serving = serving || home.serving
 		}
-		cands = append(cands, v1beta1.CandidatePlacement{Cluster: c, Phase: v1beta1.CandidatePhaseAdmitting})
 	}
 	if len(placed) == 0 && len(cands) == 0 {
 		res, err := r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
@@ -677,11 +614,15 @@ func (r *Reconciler) reconcileAll(ctx context.Context, isvc *v1beta1.InferenceSe
 // Balanced (spec.placement.split.spread) apportions an even share across all
 // candidates. The endpoint weight follows each home's ready replicas.
 //
-// Distribution is a single ordered pass with no over-admission trim and no
-// deficit re-apportionment beyond that pass — it converges to >= floor
-// admitted, Packed, and accepts transient overshoot. Like All, there is no
-// sticky winner or re-race: each home is independent.
-func (r *Reconciler) reconcileSplit(ctx context.Context, isvc *v1beta1.InferenceService, candidates []string) (ctrl.Result, error) {
+// Distribution is a single ordered pass. It trims observed over-admission but
+// does not re-apportion a deficit beyond that pass. Like All, there is no sticky
+// winner or re-race: each home is independent.
+func (r *Reconciler) reconcileSplit(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	candidates []string,
+	observations *placementObservations,
+) (ctrl.Result, error) {
 	desired := splitDesiredReplicas(isvc)
 	if desired <= 0 {
 		// No floor declared — nothing to distribute.
@@ -694,149 +635,155 @@ func (r *Reconciler) reconcileSplit(ctx context.Context, isvc *v1beta1.Inference
 	if sp := isvc.Spec.Placement.Split; sp != nil {
 		maxPer, minPer, spread = sp.MaxReplicasPerCluster, sp.MinReplicasPerCluster, sp.Spread
 	}
-	scaleComps := placementScaleComponents(isvc)
 
-	// Phase 1 — observe each candidate's current derived: admitted + ready replica
-	// counts and the home endpoint. Observing BEFORE (re)apportioning is what lets
-	// the loop both fill a deficit and trim over-admission in the same pass. A
-	// disconnected candidate is not observable this pass; a sub-minPer sliver is
-	// counted as zero (dropped below).
-	type homeObs struct {
-		admitted, ready int32
-		endpoint        *apis.URL
-		present, sliver bool
-		ingressReady    bool
-		// unreadable marks a home whose state could not be read this pass, as
-		// distinct from one observed to hold nothing. Apportionment credits it
-		// with its last published count so a transient read error cannot look
-		// like freed capacity and provision a duplicate elsewhere, and the
-		// apply phase leaves it alone.
-		unreadable bool
+	// Phase 1 — observe before apportioning. Unknown homes retain their last
+	// admitted share for allocation safety but publish zero ready capacity.
+	// Standing homes that are not actuatable this pass reserve their share, so
+	// a readiness or preflight gate cannot make their capacity look free.
+	projected := observations.projectedClusters(candidates)
+	selected := make(map[string]bool, len(candidates))
+	for _, cluster := range candidates {
+		selected[cluster] = true
 	}
-	// Last published per-home counts, used to keep an unreadable home's share
-	// stable across the pass.
-	lastAdmitted := make(map[string]int32, len(candidates))
-	lastCand := make(map[string]v1beta1.CandidatePlacement, len(candidates))
-	if isvc.Status.Placement != nil {
-		for _, c := range isvc.Status.Placement.Candidates {
-			lastAdmitted[c.Cluster] = c.AdmittedReplicas
-			lastCand[c.Cluster] = c
+	homes := make(map[string]homeObservation, len(projected))
+	for _, cluster := range projected {
+		home, ok := observations.get(cluster)
+		if !ok {
+			home = observations.refresh(ctx, r, isvc, cluster)
+		}
+		homes[cluster] = home
+		if home.err != nil {
+			r.Log.Error(home.err, "split: member read failed; keeping allocation share",
+				"cluster", cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
 		}
 	}
-	obs := make(map[string]*homeObs, len(candidates))
+	actuatable := make(map[string]bool, len(candidates))
+	actionCandidates := make([]string, 0, len(candidates))
 	admitted := make(map[string]int32, len(candidates))
-	markUnreadable := func(c string, o *homeObs) {
-		o.unreadable = true
-		o.present = false
-		admitted[c] = lastAdmitted[c]
-	}
-	for _, c := range candidates {
-		o := &homeObs{}
-		obs[c] = o
-		cl, ok := r.Clusters.ClientFor(c)
-		if !ok {
-			markUnreadable(c, o)
-			continue // disconnected; retry next poll
+	var reserved int32
+	for _, cluster := range projected {
+		home := homes[cluster]
+		count := home.candidate.AdmittedReplicas
+		if home.state == homeAbsent || home.terminal ||
+			(minPer > 0 && count > 0 && count < minPer) {
+			count = 0
 		}
-		derived, ok, err := r.getDerived(ctx, c, isvc)
-		if err != nil {
-			r.Log.Error(err, "split: reading derived failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			markUnreadable(c, o)
-			continue
-		}
-		if !ok {
-			continue // no derived yet
-		}
-		o.present = true
-		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
-		if err != nil {
-			r.Log.Error(err, "split: reading IR statuses failed; keeping last-known home state", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			markUnreadable(c, o)
-			continue
-		}
-		o.admitted = placementAdmittedReplicas(scaleComps, statuses)
-		o.endpoint = endpointFor(derived)
-		o.ingressReady = derived.Status.IsConditionReady(v1beta1.IngressReady)
-		if o.ingressReady {
-			o.ready = placementReadyReplicas(scaleComps, statuses)
-		}
-		admitted[c] = o.admitted
-		if minPer > 0 && o.admitted > 0 && o.admitted < minPer {
-			// Sub-floor sliver: do not count it toward the floor; it is swept below.
-			o.sliver = true
-			admitted[c] = 0
+		if selected[cluster] && !home.terminal {
+			actuatable[cluster] = true
+			actionCandidates = append(actionCandidates, cluster)
+			admitted[cluster] = count
+		} else if !selected[cluster] {
+			reserved += count
 		}
 	}
 
 	// Phase 2 — apportion the desired count into a per-cluster target request.
-	targets := splitApportion(candidates, admitted, desired, maxPer, spread)
+	remainingDesired := desired - reserved
+	if remainingDesired < 0 {
+		remainingDesired = 0
+	}
+	targets := splitApportion(actionCandidates, admitted, remainingDesired, maxPer, spread)
 
 	// Phase 3 — apply: request the target on kept clusters, sweep the rest, and
 	// record per-home status from the observed counts.
 	var admittedTotal int32
 	cands := make([]v1beta1.CandidatePlacement, 0, len(candidates))
-	trustedReady := hasPlacementReadyProvenance(isvc)
 	serving := false
 	unobserved := false
-	for _, c := range candidates {
-		o := obs[c]
-		if o.unreadable {
+	retrySoon := false
+	for _, cluster := range projected {
+		home := homes[cluster]
+		sliver := home.candidate.AdmittedReplicas > 0 && minPer > 0 &&
+			home.candidate.AdmittedReplicas < minPer
+		if home.terminal {
+			cands = append(cands, home.candidate)
+			continue
+		}
+		if !actuatable[cluster] {
+			if home.state == homeAbsent {
+				continue
+			}
+			candidate := home.candidate
+			if sliver {
+				candidate = identityCandidate(cluster)
+			}
+			cands = append(cands, candidate)
+			unobserved = unobserved || home.state == homeUnknown
+			if candidate.Phase == v1beta1.CandidatePhaseAdmitted {
+				admittedTotal += candidate.AdmittedReplicas
+				serving = serving || home.serving
+			}
+			continue
+		}
+		if home.state == homeUnknown {
 			unobserved = true
-			if p, had := lastCand[c]; had {
-				p = normalizeCandidatePhase(p)
-				if !trustedReady {
-					p.ReadyReplicas = 0
-				}
-				cands = append(cands, p)
-				if p.Phase == v1beta1.CandidatePhaseAdmitted {
-					counted := p.AdmittedReplicas
-					if t := targets[c]; counted > t {
-						counted = t
-					}
-					admittedTotal += counted
-					serving = serving || candidateHasServingData(p)
+			if observations.had(cluster) {
+				cands = append(cands, home.candidate)
+				if home.candidate.Phase == v1beta1.CandidatePhaseAdmitted {
+					admittedTotal += min32(home.candidate.AdmittedReplicas, targets[cluster])
 				}
 			}
 			continue
 		}
-		if o.sliver || targets[c] <= 0 {
+		if sliver || targets[cluster] <= 0 {
 			// Sliver, or not needed (Packed floor met / trimmed away): sweep any derived.
-			if o.present {
-				if err := r.deleteDerivedOn(ctx, c, isvc); err != nil {
-					r.Log.Error(err, "split: sweep cluster failed", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
+			if home.state == homePresent {
+				if err := r.deleteDerivedOnBounded(ctx, cluster, isvc); err != nil {
+					r.Log.Error(err, "split: sweep cluster failed", "cluster", cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
+					cands = append(cands, home.candidate)
+					if home.candidate.Phase == v1beta1.CandidatePhaseAdmitted {
+						admittedTotal += home.candidate.AdmittedReplicas
+						serving = serving || home.serving
+					}
+					retrySoon = true
 				}
 			}
 			continue
 		}
-		cl, ok := r.Clusters.ClientFor(c)
+		cl, ok := r.Clusters.ClientFor(cluster)
 		if !ok {
-			continue // disconnected; retry next poll
+			if home.state == homePresent {
+				cands = append(cands, home.candidate)
+			}
+			if home.state == homePresent && home.candidate.Phase == v1beta1.CandidatePhaseAdmitted {
+				admittedTotal += min32(home.candidate.AdmittedReplicas, targets[cluster])
+				serving = serving || home.serving
+			}
+			retrySoon = true
+			continue
 		}
-		if err := r.placeOnReplicasBounded(ctx, c, cl, isvc, targets[c], maxPer); err != nil {
-			r.Log.Error(err, "split: place failed on cluster", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			continue // per-cluster tolerated, like fanOut
+		if err := r.placeOnReplicasBounded(ctx, cluster, cl, isvc, targets[cluster], maxPer); err != nil {
+			if apierrors.IsConflict(err) {
+				// The derived copy moved under the apply; the next pass re-reads
+				// it, so a stale-version write is a retry, not a failure.
+				r.Log.V(1).Info("split: place conflicted on cluster; retrying", "cluster", cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
+			} else {
+				r.Log.Error(err, "split: place failed on cluster", "cluster", cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
+			}
+			if home.state == homePresent {
+				cands = append(cands, home.candidate)
+			}
+			if home.state == homePresent && home.candidate.Phase == v1beta1.CandidatePhaseAdmitted {
+				admittedTotal += min32(home.candidate.AdmittedReplicas, targets[cluster])
+				serving = serving || home.serving
+			}
+			retrySoon = true
+			continue
 		}
-		if o.admitted == 0 {
+		if home.candidate.AdmittedReplicas == 0 {
 			// Gated so far: keep trying and record an admitting candidate.
-			cands = append(cands, v1beta1.CandidatePlacement{Cluster: c, Phase: v1beta1.CandidatePhaseAdmitting})
+			cands = append(cands, identityCandidate(cluster))
 			continue
 		}
 		// Count admitted toward the floor, capped by the target — a trimmed home is
 		// on its way down to target, so do not credit the excess it still shows.
-		counted := o.admitted
-		if counted > targets[c] {
-			counted = targets[c]
+		counted := home.candidate.AdmittedReplicas
+		if counted > targets[cluster] {
+			counted = targets[cluster]
 		}
 		admittedTotal += counted
-		candidate := v1beta1.CandidatePlacement{
-			Cluster:          c,
-			Phase:            v1beta1.CandidatePhaseAdmitted,
-			Endpoint:         o.endpoint,
-			AdmittedReplicas: o.admitted,
-			ReadyReplicas:    o.ready,
-		}
-		cands = append(cands, candidate)
-		serving = serving || (o.ingressReady && candidateHasServingData(candidate))
+		cands = append(cands, home.candidate)
+		serving = serving || home.serving
 	}
 
 	phase := v1beta1.PlacementPhaseAdmitting
@@ -847,7 +794,7 @@ func (r *Reconciler) reconcileSplit(ctx context.Context, isvc *v1beta1.Inference
 		phase: phase, candidates: cands, ready: serving,
 		readinessUnknown: unobserved && !serving,
 	})
-	if err == nil && admittedTotal < desired {
+	if err == nil && (admittedTotal < desired || unobserved || retrySoon) {
 		// Floor not yet met (homes still gated / capacity filling in): re-poll at
 		// the normal cadence rather than the long steady-state backstop.
 		res.RequeueAfter = r.requeue()
@@ -872,6 +819,9 @@ func (r *Reconciler) reconcileSplit(ctx context.Context, isvc *v1beta1.Inference
 //   - Balanced (spread): request an even ceil(desired/n) share on every candidate.
 func splitApportion(candidates []string, admitted map[string]int32, desired, maxPer int32, spread bool) map[string]int32 {
 	targets := make(map[string]int32, len(candidates))
+	if len(candidates) == 0 {
+		return targets
+	}
 	capTo := func(v int32) int32 {
 		if maxPer > 0 && v > maxPer {
 			return maxPer
@@ -1055,6 +1005,12 @@ func (r *Reconciler) placeOnReplicasBounded(ctx context.Context, cluster string,
 	return r.placeOnReplicas(cctx, cluster, cl, isvc, replicas, maxPer)
 }
 
+func (r *Reconciler) deleteDerivedOnBounded(ctx context.Context, cluster string, isvc *v1beta1.InferenceService) error {
+	cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
+	defer cancel()
+	return r.deleteDerivedOn(cctx, cluster, isvc)
+}
+
 // connectedSet snapshots the currently-connected cluster names as a set for O(1)
 // membership checks during a single fan-out pass.
 func connectedSet(clusters ClusterClients) map[string]bool {
@@ -1064,47 +1020,6 @@ func connectedSet(clusters ClusterClients) map[string]bool {
 		set[n] = true
 	}
 	return set
-}
-
-// findWinner returns the winning cluster: the first placed candidate, in sorted
-// candidate order, whose derived ISVC reports EVERY declared component admitted,
-// or "" if none is fully admitted yet. Requiring all components (not just one
-// instance) prevents a PD service from being declared placed while only the
-// engine has cleared Kueue and the decoder is still gated. When several clusters
-// fully admit near-simultaneously the lowest-named candidate wins — a
-// deterministic tie-break, not literally "first in wall-clock time". A candidate
-// whose derived or IR status cannot be read this pass is skipped, so one
-// unreachable cluster cannot deny the race to its healthy peers.
-func (r *Reconciler) findWinner(
-	ctx context.Context,
-	isvc *v1beta1.InferenceService,
-	placed []string,
-) (string, *v1beta1.InferenceService, map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, error) {
-	for _, c := range placed {
-		derived, ok, err := r.getDerived(ctx, c, isvc)
-		if err != nil {
-			r.Log.Error(err, "race: reading derived failed; skipping candidate", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			continue
-		}
-		if !ok {
-			continue
-		}
-		cl, ok := r.Clusters.ClientFor(c)
-		if !ok {
-			continue
-		}
-		// Read the authoritative per-component IR status from candidate cluster
-		// c (source of truth; the derived ISVC does not mirror it).
-		statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
-		if err != nil {
-			r.Log.Error(err, "race: reading IR statuses failed; skipping candidate", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
-			continue
-		}
-		if AllComponentsAdmitted(derived, statuses) {
-			return c, derived, statuses, nil
-		}
-	}
-	return "", nil, nil, nil
 }
 
 // deleteLosers best-effort deletes THIS ISVC's derived copy on each cluster in
@@ -1122,7 +1037,7 @@ func (r *Reconciler) deleteLosers(ctx context.Context, isvc *v1beta1.InferenceSe
 		if c == keep {
 			continue
 		}
-		if err := r.deleteDerivedOn(ctx, c, isvc); err != nil {
+		if err := r.deleteDerivedOnBounded(ctx, c, isvc); err != nil {
 			r.Log.Error(err, "loser cleanup failed on cluster (will retry next poll)", "cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
 		}
 	}
@@ -1145,47 +1060,6 @@ func (r *Reconciler) getDerived(ctx context.Context, cluster string, isvc *v1bet
 	r.observeDerivedPolicyStatus(isvc, cluster, derived)
 	r.observeDerivedRolloutStatus(isvc, cluster, derived)
 	return derived, true, nil
-}
-
-// winnerDerivedState is the outcome of inspecting the sticky winner's derived
-// ISVC, with the disconnected case kept DISTINCT from the genuinely-absent case
-// (which getDerived collapses into ok=false). The winner-lost grace logic must
-// treat a disconnected winner as transient (hold, no grace clock) and only run
-// the grace clock when the derived is absent on a CONNECTED winner.
-type winnerDerivedState int
-
-const (
-	// winnerDisconnected: the winner cluster has no live client this pass
-	// (transport flap / not yet (re)connected). Transient — not evidence the
-	// derived was deleted.
-	winnerDisconnected winnerDerivedState = iota
-	// winnerDerivedPresent: the winner is connected and its derived exists.
-	winnerDerivedPresent
-	// winnerDerivedAbsent: the winner is connected but its derived is NotFound.
-	// This is the only state that arms the winner-lost grace clock.
-	winnerDerivedAbsent
-)
-
-// getWinnerDerived inspects the sticky winner's derived ISVC, distinguishing a
-// disconnected winner from a connected-but-absent derived so the caller can
-// apply the grace window only to a genuine disappearance. A transient GET error
-// is returned as an error (caller holds placement and requeues) rather than
-// misread as absence.
-func (r *Reconciler) getWinnerDerived(ctx context.Context, cluster string, isvc *v1beta1.InferenceService) (winnerDerivedState, *v1beta1.InferenceService, error) {
-	cl, ok := r.Clusters.ClientFor(cluster)
-	if !ok {
-		return winnerDisconnected, nil, nil
-	}
-	derived := &v1beta1.InferenceService{}
-	if err := cl.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}, derived); err != nil {
-		if apierrors.IsNotFound(err) {
-			return winnerDerivedAbsent, nil, nil
-		}
-		return winnerDisconnected, nil, err
-	}
-	r.observeDerivedPolicyStatus(isvc, cluster, derived)
-	r.observeDerivedRolloutStatus(isvc, cluster, derived)
-	return winnerDerivedPresent, derived, nil
 }
 
 // placeOn creates-or-updates the derived ISVC on the target cluster. The control
@@ -1231,8 +1105,12 @@ func (r *Reconciler) derivedFor(src *v1beta1.InferenceService) (*v1beta1.Inferen
 // applyDerived create-or-updates the derived ISVC `desired` on the target
 // cluster.
 func (r *Reconciler) applyDerived(ctx context.Context, cluster string, cl client.Client, src, desired *v1beta1.InferenceService) error {
+	policy, err := protocol.FromDerived(desired)
+	if err != nil {
+		return err
+	}
 	target := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, cl, target, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, cl, target, func() error {
 		// Origin-guard the apply, mirroring the origin guard on the delete path
 		// (deleteDerivedOn): a target that already exists (CreateOrUpdate's Get
 		// populated it, so ResourceVersion is set) and is NOT a derived of THIS
@@ -1246,6 +1124,18 @@ func (r *Reconciler) applyDerived(ctx context.Context, cluster string, cl client
 		if target.ResourceVersion != "" && !isOurDerived(target, src) {
 			return fmt.Errorf("refusing to overwrite non-derived InferenceService %s/%s on candidate cluster: not a placement derived of control plane %q",
 				target.Namespace, target.Name, r.ControlPlaneID)
+		}
+		current, err := protocol.FromDerived(target)
+		if err != nil {
+			return err
+		}
+		if err := protocol.Authorize(current, policy); err != nil {
+			return err
+		}
+		if policy != nil {
+			if err := r.checkPlanCurrent(ctx, src); err != nil {
+				return err
+			}
 		}
 		// Before the wholesale re-stamp below overwrites it, the live remote
 		// spec is the evidence for the FieldPruned detector: a member apiserver
@@ -1444,13 +1334,16 @@ func (r *Reconciler) writePlacement(ctx context.Context, isvc *v1beta1.Inference
 		if err := r.APIReader.Get(ctx, key, cur); err != nil {
 			return err
 		}
+		if !plan.SameSnapshot(isvc, cur) {
+			return plan.ErrStaleSnapshot
+		}
 		readyBefore := cur.Status.GetCondition(apis.ConditionReady)
 		if cur.Status.Placement == nil {
 			cur.Status.Placement = &v1beta1.PlacementStatus{}
 		}
 		cur.Status.Placement.Cluster = res.winner
 		cur.Status.Placement.Phase = res.phase
-		cur.Status.Placement.Candidates = res.candidates
+		cur.Status.Placement.Candidates = mergeCandidateObservations(cur.Status.Placement.Candidates, res.candidates)
 		cur.Status.Placement.Endpoint = res.url
 		cur.Status.URL = res.url
 		applyPolicyConditions(&cur.Status, policyConds)
@@ -1464,6 +1357,9 @@ func (r *Reconciler) writePlacement(ctx context.Context, isvc *v1beta1.Inference
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
+		}
+		if errors.Is(err, plan.ErrStaleSnapshot) {
+			return ctrl.Result{RequeueAfter: r.requeue()}, nil
 		}
 		return ctrl.Result{}, err
 	}
@@ -1481,21 +1377,27 @@ func setSourcePlacementReady(status *v1beta1.InferenceServiceStatus, res placeme
 	manager := sourcePlacementConditionSet.Manage(status)
 	switch res.phase {
 	case v1beta1.PlacementPhasePending:
-		manager.MarkUnknown(apis.ConditionReady, placementReadyReasonPending, placementReadyMessagePending)
+		if res.placementLost {
+			manager.MarkUnknown(apis.ConditionReady, PlacementReadyReasonLost, placementReadyMessageLost)
+		} else if res.readinessUnknown {
+			manager.MarkUnknown(apis.ConditionReady, PlacementReadyReasonUnknown, placementReadyMessageUnknown)
+		} else {
+			manager.MarkUnknown(apis.ConditionReady, placementReadyReasonPending, placementReadyMessagePending)
+		}
 	case v1beta1.PlacementPhaseAdmitting:
 		manager.MarkUnknown(apis.ConditionReady, placementReadyReasonAdmitting, placementReadyMessageAdmitting)
 	case v1beta1.PlacementPhasePlaced:
 		if res.ready {
 			manager.MarkTrueWithReason(apis.ConditionReady, placementReadyReasonReady, placementReadyMessageReady)
 		} else if res.readinessUnknown {
-			manager.MarkUnknown(apis.ConditionReady, placementReadyReasonUnknown, placementReadyMessageUnknown)
+			manager.MarkUnknown(apis.ConditionReady, PlacementReadyReasonUnknown, placementReadyMessageUnknown)
 		} else {
 			manager.MarkFalse(apis.ConditionReady, placementReadyReasonNotReady, placementReadyMessageNotReady)
 		}
 	case v1beta1.PlacementPhaseFailed:
 		manager.MarkFalse(apis.ConditionReady, placementReadyReasonFailed, placementReadyMessageFailed)
 	default:
-		manager.MarkUnknown(apis.ConditionReady, placementReadyReasonUnknown, placementReadyMessageUnknown)
+		manager.MarkUnknown(apis.ConditionReady, PlacementReadyReasonUnknown, placementReadyMessageUnknown)
 	}
 
 	// Other condition writers can temporarily recompute Ready while adding their
@@ -1525,14 +1427,6 @@ func normalizeCandidatePhase(candidate v1beta1.CandidatePlacement) v1beta1.Candi
 	return candidate
 }
 
-// hasPlacementReadyProvenance distinguishes status written by this controller,
-// which gates every candidate's ReadyReplicas on its own ingress readiness, from
-// legacy status whose aggregate Ready condition cannot be attributed to a home.
-func hasPlacementReadyProvenance(isvc *v1beta1.InferenceService) bool {
-	ready := isvc.Status.GetCondition(apis.ConditionReady)
-	return ready != nil && ready.IsTrue() && ready.Reason == placementReadyReasonReady
-}
-
 func placementCandidateServing(derived *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) bool {
 	return derived != nil && derived.Status.IsConditionReady(v1beta1.IngressReady) &&
 		candidateHasServingData(candidate)
@@ -1551,39 +1445,6 @@ func endpointFor(derived *v1beta1.InferenceService) *apis.URL {
 		return nil
 	}
 	return derived.Status.URL
-}
-
-// placedResult builds the Placed status for winner. The endpoint is sticky: if
-// the winner's derived has no URL this pass (transient worker-status gap), the
-// last-published URL (from the in-memory isvc) is kept rather than cleared, so
-// an external LB watching status.url does not see a spurious deroute.
-func placedResult(
-	winner string,
-	derived, isvc *v1beta1.InferenceService,
-	statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus,
-) placementResult {
-	u := endpointFor(derived)
-	if u == nil {
-		u = isvc.Status.URL // keep last-known endpoint
-	}
-	components := placementScaleComponents(isvc)
-	readyReplicas := placementReadyReplicas(components, statuses)
-	if derived == nil || !derived.Status.IsConditionReady(v1beta1.IngressReady) {
-		readyReplicas = 0
-	}
-	candidate := v1beta1.CandidatePlacement{
-		Cluster:          winner,
-		Phase:            v1beta1.CandidatePhaseAdmitted,
-		Endpoint:         u,
-		AdmittedReplicas: placementAdmittedReplicas(components, statuses),
-		ReadyReplicas:    readyReplicas,
-	}
-	return placementResult{
-		winner: winner, phase: v1beta1.PlacementPhasePlaced,
-		candidates: []v1beta1.CandidatePlacement{candidate},
-		url:        u,
-		ready:      placementCandidateServing(derived, candidate),
-	}
 }
 
 func winnerCluster(isvc *v1beta1.InferenceService) string {
@@ -1625,10 +1486,10 @@ func (r *Reconciler) nominate() Dispatcher {
 	return r.dispatcher
 }
 
-// graceRemaining records (on first observation) and reports how long is LEFT in
-// the winner-lost grace window for this source ISVC. The clock starts the first
-// time the winner's derived is seen absent on a connected winner; subsequent
-// observations reuse that start. A non-positive return means the window has
+// graceRemaining records (on first observation) and reports how long is left in
+// the winner-lost grace window for this source ISVC. The clock starts when the
+// winner is first confirmed absent or has lost admission; subsequent observations
+// reuse that start. A non-positive return means the window has
 // elapsed (caller should re-race). now is injected so tests can drive the clock
 // without sleeping.
 func (r *Reconciler) graceRemaining(uid types.UID, now time.Time) time.Duration {
@@ -1781,7 +1642,7 @@ func placementEligibleIndexExtractor(obj client.Object) []string {
 	if !ok {
 		return nil
 	}
-	if !declaresPlacementRequirement(isvc) {
+	if !IsPlacementEligible(isvc) {
 		return nil
 	}
 	return []string{placementEligibleIndexValue}
@@ -1802,6 +1663,9 @@ func declaresPlacementRequirement(isvc *v1beta1.InferenceService) bool {
 // predicate so ordinary, single-cluster InferenceServices do not accidentally
 // acquire multi-cluster artifacts.
 func IsPlacementEligible(isvc *v1beta1.InferenceService) bool {
+	if isvc == nil || isvc.Labels[PlacementOriginLabel] != "" || isvc.Annotations[PlacementOriginUIDAnnotation] != "" {
+		return false
+	}
 	return declaresPlacementRequirement(isvc)
 }
 

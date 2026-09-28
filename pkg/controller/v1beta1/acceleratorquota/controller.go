@@ -248,6 +248,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// this manager was down -- loses its series here rather than reporting a
 	// deleted tenant's accelerators forever.
 	sweepBudgets(inTree)
+	if r.Project.Enabled() && built.Root != nil {
+		if err := r.reconcileFleetCapacity(ctx, built.Root.Quota.UID); err != nil {
+			errs = append(errs, fmt.Errorf("collecting fleet capacity: %w", err))
+		}
+	}
 	if len(errs) > 0 {
 		// One node's failure must not skip the rest, so they are collected and
 		// the whole pass retried. Each carries the stage it came from: claiming,
@@ -291,13 +296,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// straight back, but in the idle case above there is no such event
 			// and dropping the interval would disable the only thing that would
 			// notice the tree being repaired.
-			return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+			return ctrl.Result{RequeueAfter: r.nextResync()}, nil
 		}
 		if err := r.reconcileCapacity(ctx, built.Root.Quota); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
-	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+	return ctrl.Result{RequeueAfter: r.nextResync()}, nil
 }
 
 // reconcileStatus writes one node's observed position and condition. It patches
@@ -686,6 +691,9 @@ type options struct {
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts ...Option) error {
+	if r.Capacity.ReportInterval < 0 {
+		return fmt.Errorf("capacity report interval must be nonnegative")
+	}
 	var cfg options
 	for _, o := range opts {
 		o(&cfg)

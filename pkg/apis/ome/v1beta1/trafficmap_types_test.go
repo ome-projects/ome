@@ -8,20 +8,43 @@ import (
 )
 
 const testTrafficMapPublisherObservedOptionsDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const testTrafficMapPublisherPlanCompatibilityDigest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
 func TestTrafficMapPublisherStatusJSONRoundTrip(t *testing.T) {
 	status := TrafficMapStatus{
 		Published: true,
 		Publisher: &TrafficMapPublisherStatus{
 			PublisherName:         "example-publisher",
-			ClaimedTargets:        []string{"example-system/model-service"},
+			ClaimedTargets:        []string{"example-system/model-service", "example-system/retired-service"},
 			ObservedOptionsDigest: testTrafficMapPublisherObservedOptionsDigest,
+			LastPositive: &TrafficMapPublisherLastPositive{
+				TrafficMapGeneration:    12,
+				ObservedISVCGeneration:  42,
+				PlanCompatibilityDigest: testTrafficMapPublisherPlanCompatibilityDigest,
+				Targets: []TrafficMapPublisherTarget{
+					{Target: "example-system/model-service", Weight: 60},
+					{Target: "example-system/retired-service", Weight: 0},
+				},
+			},
 		},
 	}
 
 	raw, err := json.Marshal(status)
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	for _, field := range []string{
+		`"lastPositive"`,
+		`"trafficMapGeneration"`,
+		`"observedISVCGeneration"`,
+		`"planCompatibilityDigest"`,
+		`"targets"`,
+		`"target"`,
+		`"weight"`,
+	} {
+		if !strings.Contains(string(raw), field) {
+			t.Errorf("serialized publisher snapshot is missing %s: %s", field, raw)
+		}
 	}
 	var roundTripped TrafficMapStatus
 	if err := json.Unmarshal(raw, &roundTripped); err != nil {
@@ -40,17 +63,37 @@ func TestTrafficMapPublisherStatusDeepCopyIsIndependent(t *testing.T) {
 		Status: TrafficMapStatus{
 			Publisher: &TrafficMapPublisherStatus{
 				PublisherName:         "example-publisher",
-				ClaimedTargets:        []string{"example-system/model-service"},
+				ClaimedTargets:        []string{"example-system/model-service", "example-system/retired-service"},
 				ObservedOptionsDigest: testTrafficMapPublisherObservedOptionsDigest,
+				LastPositive: &TrafficMapPublisherLastPositive{
+					TrafficMapGeneration:    12,
+					ObservedISVCGeneration:  42,
+					PlanCompatibilityDigest: testTrafficMapPublisherPlanCompatibilityDigest,
+					Targets: []TrafficMapPublisherTarget{
+						{Target: "example-system/model-service", Weight: 60},
+						{Target: "example-system/retired-service", Weight: 0},
+					},
+				},
 			},
 		},
 	}
 
 	cloned := original.DeepCopy()
 	cloned.Status.Publisher.ClaimedTargets[0] = "example-system/other-service"
+	cloned.Status.Publisher.LastPositive.TrafficMapGeneration = 13
+	cloned.Status.Publisher.LastPositive.Targets[0].Target = "example-system/other-service"
+	cloned.Status.Publisher.LastPositive.Targets[0].Weight = 100
 
 	if got := original.Status.Publisher.ClaimedTargets[0]; got != "example-system/model-service" {
 		t.Errorf("original claimed target = %q after clone mutation", got)
+	}
+	if got := original.Status.Publisher.LastPositive.TrafficMapGeneration; got != 12 {
+		t.Errorf("original snapshot TrafficMap generation = %d after clone mutation", got)
+	}
+	if got := original.Status.Publisher.LastPositive.Targets[0]; got != (TrafficMapPublisherTarget{
+		Target: "example-system/model-service", Weight: 60,
+	}) {
+		t.Errorf("original snapshot target = %#v after clone mutation", got)
 	}
 }
 
@@ -64,6 +107,9 @@ func TestTrafficMapPublisherStatusOmitsDigestBeforeFirstSuccess(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"observedOptionsDigest"`) {
 		t.Fatalf("pre-mutation publisher status unexpectedly contains observedOptionsDigest: %s", raw)
+	}
+	if strings.Contains(string(raw), `"lastPositive"`) {
+		t.Fatalf("publisher status without a snapshot unexpectedly contains lastPositive: %s", raw)
 	}
 }
 
