@@ -42,4 +42,28 @@ expect_rejected unsupported-scenario \
   "unsupported scenario" \
   env STATE_DIR="${tmp_dir}" "${scenario}" something-else
 
+# Exercise the actual EXIT cleanup without a cluster. Bash 3.2 may pass status
+# zero after a fatal nounset expansion; an unsealed scenario must still fail.
+cleanup_probe='
+  set -euo pipefail
+  scenario=maintenance-single
+  artifact_dir=offline-diagnostics
+  request_watch_pid=""
+  triggered_node=""
+  delayed=false
+  passed="$2"
+  dump_diagnostics() { :; }
+  eval "$(sed -n "/^cleanup() {/,/^trap cleanup EXIT/p" "$1")"
+  if [[ "$3" == nounset ]]; then
+    (( ${missing_deadline:-0} > 0 && missing_deadline < 1 ))
+  fi
+  exit 0
+'
+for failure in zero nounset; do
+  expect_rejected "unsealed-${failure}" \
+    'maintenance-single failed; diagnostics: offline-diagnostics' \
+    bash -c "${cleanup_probe}" -- "${scenario}" false "${failure}"
+done
+bash -c "${cleanup_probe}" -- "${scenario}" true zero
+
 echo "scenario preflight tests passed"

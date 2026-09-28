@@ -115,6 +115,7 @@ cleanup() {
     wait "${request_watch_pid}" >/dev/null 2>&1 || true
   fi
   if [[ "${passed}" != "true" ]]; then
+    if ((rc == 0)); then rc=1; fi
     dump_diagnostics
     echo "${scenario} failed; diagnostics: ${artifact_dir}" >&2
   fi
