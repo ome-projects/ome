@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 import nightly_docs as docs
 
@@ -89,7 +90,7 @@ def validate_scan(raw, context, slug, history):
 
 
 def combine(scans, context):
-    expected = [slug for slug, _, _ in SHARDS]
+    expected = context.get("selected_shards", [slug for slug, _, _ in SHARDS])
     by_slug = {scan["shard"]: scan for scan in scans}
     if len(by_slug) != len(scans) or set(by_slug) != set(expected):
         raise ValueError("Missing or duplicate discovery scans")
@@ -115,8 +116,8 @@ def combine(scans, context):
                 reason = "duplicate concern"
             elif occupied.intersection(item["doc_paths"]):
                 reason = "overlapping documentation files"
-            elif len(selected) >= docs.MAX_PRS:
-                reason = "100-PR cap"
+            elif len(selected) >= context.get("max_prs", docs.MAX_PRS):
+                reason = "PR cap"
             else:
                 selected.append(item)
                 keys.add(item["key"])
@@ -128,16 +129,74 @@ def combine(scans, context):
     return selected, deferred
 
 
+def deferred_queue(scans, deferred, prs):
+    """Queue file-blocked concerns without reviving merged or declined work."""
+    queued = {concern for concern, reason in deferred
+              if reason in {'overlapping documentation files', 'PR cap', 'existing PR'}}
+    queued_concerns = []
+    for scan in scans:
+        for proposal in scan['concerns']:
+            if proposal['concern'] not in queued:
+                continue
+            title = proposal['title']
+            item = docs.validate_item({**proposal, 'title': title if title.startswith('[Docs] ') else '[Docs] ' + title})
+            # Keep file-blocked work, but never queue an already-open,
+            # merged, or deliberately declined instance of this concern.
+            if any(f"{docs.MARKER}{item['key']} -->" in pr['body'] or item['branch'] == pr['branch']
+                   for pr in prs):
+                continue
+            queued_concerns.append(item)
+    return queued_concerns
+
+
+def pending_from_report(report, context):
+    """Carry deferred concerns as evidence; revalidate against current docs/history."""
+    history = {line.split()[0] for line in context['code_history']}
+    result, seen = [], set()
+    for proposal in report.get('queued_concerns', []):
+        item = docs.validate_item(proposal)
+        identity = (item['area'], item['concern'])
+        if item['source_sha'] in history and identity not in seen:
+            seen.add(identity)
+            result.append(item)
+    return result[:docs.MAX_PRS]
+
+
+def previous_pending(repo, branch, context):
+    """Read the latest retained main-branch plan, never another branch's pilot."""
+    runs = json.loads(docs.run('gh', 'api',
+        f'repos/{repo}/actions/workflows/nightly-docs.yml/runs?branch={branch}&per_page=10'))['workflow_runs']
+    for run in runs:
+        if (run['status'] != 'completed' or run['head_branch'] != branch
+                or run['head_repository']['full_name'] != repo):
+            continue
+        artifacts = docs.pages(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
+        if not any(a['name'] == 'nightly-docs-discovery-report' and not a['expired'] for a in artifacts):
+            continue
+        with tempfile.TemporaryDirectory() as directory:
+            docs.run('gh', 'run', 'download', str(run['id']), '--repo', repo,
+                     '--name', 'nightly-docs-discovery-report', '--dir', directory)
+            report = json.loads(Path(directory, 'nightly-docs-discovery-report.json').read_text())
+        return pending_from_report(report, context)
+    return []
+
+
 def main():
     command = sys.argv[1]
     root = Path(os.environ["RUNNER_TEMP"]) / "nightly-docs-context"
     context = json.loads((root / "context.json").read_text())
     context["source_diffs"] = str(root / "nightly-docs-sources")
     if command == "partition":
+        selected_shard = os.getenv('DISCOVERY_SHARD', '')
+        names = [slug for slug, _, _ in SHARDS]
+        if selected_shard and selected_shard not in names:
+            raise ValueError('Unknown discovery shard')
+        context['selected_shards'] = [selected_shard] if selected_shard else names
+        (root / 'context.json').write_text(json.dumps(context, indent=2))
         assignments = partition(context)
         (root / "assignments.json").write_text(json.dumps(assignments))
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-            output.write("matrix=" + json.dumps({"include": [{"shard": slug} for slug, _, _ in SHARDS]}) + "\n")
+            output.write("matrix=" + json.dumps({"include": [{"shard": slug} for slug in context["selected_shards"]]}) + "\n")
     elif command == "context":
         slug = os.environ["SHARD"]
         assignments = json.loads((root / "assignments.json").read_text())
@@ -159,7 +218,9 @@ def main():
     elif command == "combine":
         scans = [json.loads(path.read_text()) for path in Path(os.environ["SCAN_DIR"]).glob("*.json")]
         selected, deferred = combine(scans, context)
-        report = {"base_sha": context["base_sha"], "scans": scans, "selected": selected,
+        queued_concerns = deferred_queue(scans, deferred, context['existing_prs'])
+        report = {"queued_concerns": queued_concerns, "doc_inventory": context["doc_inventory"],
+                  "base_sha": context["base_sha"], "scans": scans, "selected": selected,
                   "deferred": deferred}
         Path(os.environ["REPORT_OUTPUT"]).write_text(json.dumps(report, indent=2))
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:

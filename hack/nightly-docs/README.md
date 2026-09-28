@@ -18,6 +18,10 @@ the existing release-driven Pages workflow publishes the website separately.
    There is no date cutoff or persisted success cursor: older gaps and failed or
    deferred work remain eligible. Discovery is model-guided, not an exhaustive
    guarantee that every gap will be found in a single run.
+   Supply an inventory of authored page titles/headings. Planners must read
+   existing candidate pages, identify canonical pages needing correction, and
+   justify each new page. A new page cannot substitute for fixing an existing
+   false claim, including claims left behind by a merged related documentation PR.
 2. Combine the eight validated results in round-robin order and select
    **at most 100 independent concerns per run**, not 100 per scan. Each concern answers
    one concrete user question or corrects one stale claim and cites a source
@@ -27,9 +31,13 @@ the existing release-driven Pages workflow publishes the website separately.
    (999 maximum)**, with **no file-count limit**. Generated API
    reference files, code, configuration, file deletion, and symlinks are blocked.
 4. Defer duplicate concern keys, area/concern identities, identical normalized
-   questions, and overlapping files across scans; defer files touched by any
-   open PR. Conflicts do not discard other useful proposals from a scan.
-   Examine human PRs too. Stable source/area/concern markers and branch names
+   questions, and overlapping files across scans. Open nightly documentation
+   PRs reserve their files; human PR file lists do not. Review their actual
+   documentation diffs on the proposed paths instead: unrelated edits or changes
+   already integrated into main need not block a canonical-page fix. A genuinely
+   duplicate, competing, or ambiguous human change is rejected by review. Age,
+   draft status, and PR size alone never decide whether a human change matters.
+   Conflicts do not discard other useful proposals from a scan. Stable source/area/concern markers and branch names
    deduplicate retries and remember closed-unmerged proposals as declined.
    Semantic duplicate detection across different source commits/slugs also
    relies on the planners reading existing PRs and honoring their separate
@@ -39,10 +47,14 @@ the existing release-driven Pages workflow publishes the website separately.
    writing allowed documentation paths. No writer scripts, Git metadata, hooks,
    configuration, or review verdicts cross this boundary.
 6. Independently review each diff with read-only Fable tools for accuracy and a
-   single concern, build the production Hugo site, recheck live PRs, sign off
+   single concern, appropriate page placement, consistency of related docs, and
+   absence of competing human PR work. Capture human PR head SHAs and doc-only
+   diffs using each branch's merge base with pinned main; never execute PR code.
+   Build the production Hugo site, recheck live PRs, sign off
    one commit, and open one PR. Git commands disable hooks, including pre-push.
    Nothing is merged automatically. Empty or failed edits publish no PR.
-   An explicit accuracy/scope rejection is recorded in the job summary and skips
+   Any new/changed overlapping human PR invalidates the review before publication.
+   An explicit accuracy/scope/placement/overlap rejection is recorded in the job summary and skips
    publication; it is an expected filter outcome. Malformed review output, model
    failures, scope violations, and build/publication errors still fail the run.
    `fail-fast: false` lets other concerns finish when one fails. The publisher
@@ -76,7 +88,12 @@ workflow resolves them to full source SHAs, avoiding hash transcription errors.
 Each scan reports inspected source commits and remaining work. These are model
 self-reports, not a tool-level audit; inspecting a commit subject does not count.
 The `nightly-docs-discovery-report` artifact (14-day retention) contains every
-scan, the selected plan, and reasons for deferring proposals. Job summaries show
+scan, the selected plan, and reasons for deferring proposals. Concerns deferred
+for a shared canonical page or the PR cap are saved as `queued_concerns`. The
+next run reads the newest retained plan from the ten latest default-branch runs
+and supplies that queue for fresh evaluation. Branch pilots cannot seed it.
+This is a best-effort queue within artifact retention; full-history discovery
+still covers older work when evidence expires. Job summaries show
 eligible commits, reported inspected commits and candidate counts by scan.
 A missing/invalid scan fails planning rather than silently treating it as an
 empty result. This makes incomplete discovery visible and retryable.
@@ -85,6 +102,29 @@ pushed a branch but failed to open its PR, an exact retry can reuse that tree;
 otherwise the job fails for maintainer inspection instead of overwriting it.
 To reconsider a deliberately declined concern, a maintainer must explicitly
 reopen/rework it; the nightly does not silently recreate it.
+
+## Branch validation without opening documentation PRs
+
+A targeted manual run can exercise discovery, writing, independent placement and
+human-overlap review, and the production site build without pushing branches:
+
+```bash
+gh workflow run nightly-docs.yml --repo ome-projects/ome \
+  --ref codex/your-fix-branch -f dry_run=true \
+  -f discovery_shard=runtime-accelerators -f max_prs=2
+```
+
+`discovery_shard` accepts one of the eight scan names above (CLI observation is
+`cli-observe`, CLI actions `cli-actions`, model storage `model-storage`, runtimes
+`runtime-accelerators`, workloads `workload-rollouts`, networking
+`networking-traffic`, autoscaling `autoscaling-quota`, or `operations`). Empty
+runs all scans. `max_prs` is 1–100; scheduled runs retain the 100-PR ceiling.
+`dry_run` defaults to false. It runs all publication guards but skips branch
+creation, commits, pushes and PR creation. Inspect `nightly-docs-validation-*`
+artifacts for the item, full diff, pinned human overlap evidence, and explicit
+review verdict. A successful run with a rejected verdict is not a successful
+repair: require an accepted verdict, a useful existing-page diff, and a passing
+build when evaluating a pilot.
 
 ## Setup
 

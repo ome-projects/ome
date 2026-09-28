@@ -1,6 +1,12 @@
 Read AGENTS.md and the single concern JSON in NIGHTLY_ITEM.
 Read the supplied source-commit patch, current implementation, tests, and docs.
 Update ONLY the listed doc_paths to address exactly this one concern.
+Follow the placement decision: correct/extend canonical sections first and
+reconcile related claims on all listed pages. A separate new page must have the
+planner's justification; do not use one as a substitute for fixing old text.
+Search related docs for contradictory claims. If a necessary correction lies
+outside doc_paths, leave the tree unchanged and explain that the plan needs
+additional paths; do not publish a knowingly incomplete fix.
 Finish investigation and editing within 60 turns, leaving the rest of the
 120-turn budget for completing edits and concluding. Batch related source reads;
 do not spend the entire budget investigating adjacent implementation details.

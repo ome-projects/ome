@@ -5,6 +5,18 @@ on:
     - cron: '23 9 * * *' # 09:23 UTC daily
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: Validate discovery and documentation edits without creating PRs
+        type: boolean
+        default: false
+      discovery_shard:
+        description: Optional subsystem scan for a targeted validation run
+        type: string
+        default: ''
+      max_prs:
+        description: Maximum independent concerns to write (1-100)
+        type: number
+        default: 100
       maintenance_pr:
         description: Repair an existing docs PR instead of discovering new ones
         type: string
@@ -23,6 +35,7 @@ on:
         default: ''
 
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 
@@ -59,6 +72,9 @@ jobs:
       base_sha: ${{ steps.baseline.outputs.sha }}
     env:
       GH_TOKEN: ${{ github.token }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      MAX_PR_COUNT: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_prs) || '100' }}
+      DISCOVERY_SHARD: ${{ inputs.discovery_shard }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -152,7 +168,7 @@ jobs:
             --max-turns 100
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_commit":{"type":"integer","minimum":1},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["area","concern","source_commit","title","question","evidence","doc_paths"]}},"inspected_commits":{"type":"array","items":{"type":"integer","minimum":1}},"remaining_work":{"type":"string"}},"required":["concerns","inspected_commits","remaining_work"]}'
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_commit":{"type":"integer","minimum":1},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}},"placement":{"type":"object","additionalProperties":false,"properties":{"examined_pages":{"type":"array","minItems":1,"items":{"type":"string"}},"canonical_pages":{"type":"array","items":{"type":"string"}},"new_page_reason":{"type":"string"}},"required":["examined_pages","canonical_pages","new_page_reason"]}},"required":["area","concern","source_commit","title","question","evidence","doc_paths","placement"]}},"inspected_commits":{"type":"array","items":{"type":"integer","minimum":1}},"remaining_work":{"type":"string"}},"required":["concerns","inspected_commits","remaining_work"]}'
       - name: Validate and record scan coverage
         env:
           PLAN_JSON: ${{ steps.discover.outputs.structured_output }}
@@ -284,6 +300,7 @@ jobs:
       BASE_SHA: ${{ needs.plan.outputs.base_sha }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
       ITEM_JSON: ${{ toJSON(matrix) }}
+      DRY_RUN: ${{ inputs.dry_run == true }}
     steps:
       # Only data crosses the job boundary. No writer scripts, Git metadata,
       # hooks, config, or review verdicts are reused in this privileged job.
@@ -295,6 +312,10 @@ jobs:
       - uses: ./.github/actions/nightly-docs-setup
         with:
           source-sha: ${{ needs.plan.outputs.base_sha }}
+      - name: Set validation evidence paths
+        run: |
+          echo "OVERLAP_PATH=$RUNNER_TEMP/nightly-docs-validation/overlaps.json" >> "$GITHUB_ENV"
+          echo "VALIDATION_DIR=$RUNNER_TEMP/nightly-docs-validation" >> "$GITHUB_ENV"
       - name: Find this concern's artifact
         id: artifact
         env:
@@ -323,6 +344,12 @@ jobs:
           python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" evidence
           python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" import
           git -c core.hooksPath=/dev/null diff --cached --no-ext-diff --no-textconv > "$RUNNER_TEMP/nightly-docs-review.patch"
+          mkdir -p "$VALIDATION_DIR"
+          cp "$NIGHTLY_ITEM" "$VALIDATION_DIR/item.json"
+          cp "$RUNNER_TEMP/nightly-docs-review.patch" "$VALIDATION_DIR/documentation.patch"
+      - name: Capture actual overlapping human PR documentation changes
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" overlaps
       - name: Independently review accuracy and scope
         if: steps.scope.outputs.changed == 'true'
         id: review
@@ -330,14 +357,14 @@ jobs:
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/review.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json. Read ${{ runner.temp }}/nightly-docs-review.patch and ${{ runner.temp }}/nightly-docs-source.patch.
+          prompt: Read and follow ${{ runner.temp }}/nightly-docs-tools/review.md. NIGHTLY_ITEM is ${{ runner.temp }}/nightly-docs-item.json. Read ${{ runner.temp }}/nightly-docs-review.patch, ${{ runner.temp }}/nightly-docs-source.patch, and ${{ env.OVERLAP_PATH }}.
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
             --max-turns 120
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
-            --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"}},"required":["single_concern","accurate","reason"]}'
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"single_concern":{"type":"boolean"},"accurate":{"type":"boolean"},"reason":{"type":"string"},"placement_appropriate":{"type":"boolean"},"related_docs_consistent":{"type":"boolean"},"no_competing_pr":{"type":"boolean"}},"required":["single_concern","accurate","reason","placement_appropriate","related_docs_consistent","no_competing_pr"]}'
       - name: Record the review decision
         if: steps.scope.outputs.changed == 'true'
         id: verdict
@@ -364,7 +391,7 @@ jobs:
         run: |
           python3 "$RUNNER_TEMP/nightly-docs-tools/install_hugo.py" "$RUNNER_TEMP/nightly-docs-bin"
           python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" site "$RUNNER_TEMP/nightly-docs-site" "$RUNNER_TEMP/nightly-docs-bin/hugo"
-      - name: Publish one documentation PR
+      - name: Publish one documentation PR or validate a dry run
         if: steps.verdict.outputs.accepted == 'true'
         env:
           REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
@@ -374,3 +401,10 @@ jobs:
       - name: No-op summary
         if: steps.scope.outputs.changed == 'false'
         run: echo "No supported documentation change remained for this concern; no PR created." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scope.outputs.changed == 'true'
+        with:
+          name: nightly-docs-validation-${{ strategy.job-index }}
+          path: ${{ env.VALIDATION_DIR }}
+          retention-days: 14
+          if-no-files-found: error

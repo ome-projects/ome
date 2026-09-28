@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import nightly_docs as docs
+import discovery
 
 
 def proposal(**changes):
@@ -51,7 +52,8 @@ class PlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output, summary = Path(directory) / "output", Path(directory) / "summary"
             raw = json.dumps({"single_concern": True, "accurate": False,
-                              "reason": "Incorrect <verb> claim"})
+                              "reason": "Incorrect <verb> claim", "placement_appropriate": True,
+                              "related_docs_consistent": True, "no_competing_pr": True})
             with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output),
                                          "GITHUB_STEP_SUMMARY": str(summary)}):
                 docs.record_review(raw)
@@ -99,10 +101,10 @@ class PlanningTests(unittest.TestCase):
             with self.subTest(state=state, merged=merged):
                 self.assertEqual(self.plan([proposal()], self.context([pr(item, state, merged=merged)])), [])
 
-    def test_open_human_pr_reserves_paths_without_marker(self):
+    def test_human_pr_overlap_is_reviewed_instead_of_reserving_whole_file(self):
         item = docs.validate_item(proposal())
         human = pr(item, body="Manual docs fix", branch="human/fix")
-        self.assertEqual(self.plan([proposal()], self.context([human])), [])
+        self.assertEqual(len(self.plan([proposal()], self.context([human]))), 1)
         human["state"] = "closed"
         self.assertEqual(len(self.plan([proposal()], self.context([human]))), 1)
 
@@ -127,7 +129,7 @@ class PlanningTests(unittest.TestCase):
                       {"single_concern": "true", "accurate": True}]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 docs.review_passes(json.dumps(value))
-        docs.review_passes('{"single_concern":true,"accurate":true,"reason":"verified"}')
+        docs.review_passes('{"single_concern":true,"accurate":true,"placement_appropriate":true,"related_docs_consistent":true,"no_competing_pr":true,"reason":"verified"}')
 
 
 class GitGuardTests(unittest.TestCase):
@@ -250,7 +252,9 @@ class GitGuardTests(unittest.TestCase):
         self.git("commit", "-qm", "Add example")
         source = self.git("rev-parse", "HEAD")
         with tempfile.TemporaryDirectory() as directory, \
-                patch.object(docs, "existing_prs", return_value=[]):
+                patch.object(docs, "existing_prs", return_value=[]), \
+                patch.object(discovery, "previous_pending", return_value=[]), \
+                patch.dict(os.environ, {"DEFAULT_BRANCH": "main"}):
             output = Path(directory) / "context.json"
             docs.prepare("test/repo", output)
             context = json.loads(output.read_text())

@@ -101,17 +101,18 @@ def existing_prs(repo):
             continue
         result.append({"number": pr["number"], "title": pr["title"],
                        "body": body, "state": pr["state"],
-                       "merged": bool(pr["merged_at"]),
+                       "merged": bool(pr["merged_at"]), "head_sha": pr["head"]["sha"],
                        "branch": pr["head"]["ref"], "files": files_by_pr.get(pr["number"], [])})
     return result
 
 
 def covered(item, prs):
+    import placement
     marker = f'{MARKER}{item["key"]} -->'
     for pr in prs:
         if marker in pr["body"] or pr["branch"] == item["branch"]:
             return True
-        if pr["state"] == "open" and set(item["doc_paths"]) & set(pr["files"]):
+        if pr["state"] == "open" and placement.automated(pr) and set(item["doc_paths"]) & set(pr["files"]):
             return True
     return False
 
@@ -128,9 +129,16 @@ def prepare(repo, output):
             subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "show",
                             "--first-parent", "--no-ext-diff", "--no-textconv",
                             sha, "--", *CODE_PATHS], stdout=patch, check=True)
-    context = {"base_sha": git("rev-parse", "HEAD"), "max_prs": MAX_PRS,
+    import placement
+    limit = int(os.getenv("MAX_PR_COUNT") or MAX_PRS)
+    if not 1 <= limit <= MAX_PRS:
+        raise ValueError("max_prs must be between 1 and 100")
+    context = {"base_sha": git("rev-parse", "HEAD"), "max_prs": limit,
+               "doc_inventory": placement.inventory("HEAD"),
                "code_history": history.splitlines(), "source_diffs": str(sources),
                "existing_prs": existing_prs(repo)}
+    import discovery
+    context['pending_concerns'] = discovery.previous_pending(repo, os.environ['DEFAULT_BRANCH'], context)
     Path(output).write_text(json.dumps(context, indent=2) + "\n")
 
 
@@ -146,6 +154,9 @@ def plan(raw, context):
         if not proposal["title"].startswith("[Docs] "):
             proposal = {**proposal, "title": "[Docs] " + proposal["title"]}
         item = validate_item(proposal)
+        if "doc_inventory" in context:
+            import placement
+            placement.validate(item, context["doc_inventory"])
         if item["source_sha"] not in candidates:
             raise ValueError("Source commit is not in the supplied default-branch history")
         if item["key"] in keys or occupied.intersection(item["doc_paths"]):
@@ -167,6 +178,9 @@ def validate_diff(item, base):
         return False
     if not changed <= set(item["doc_paths"]):
         raise ValueError("Changes exceed the planned documentation file allowlist")
+    canonical = set(item.get('placement', {}).get('canonical_pages', []))
+    if not canonical <= changed:
+        raise ValueError('The patch leaves a planned canonical-page correction unchanged')
     for path in changed:
         p = Path(path)
         if not p.is_file() or any(parent.is_symlink() for parent in (p, *p.parents)):
@@ -219,7 +233,7 @@ def import_bundle(item, base, raw):
     return validate_diff(item, base)
 
 
-def review_verdict(raw):
+def review_verdict(raw, require_placement=False):
     verdict = json.loads(raw)
     if (not isinstance(verdict, dict)
             or type(verdict.get("single_concern")) is not bool
@@ -227,14 +241,21 @@ def review_verdict(raw):
             or not isinstance(verdict.get("reason"), str)
             or not verdict["reason"].strip() or len(verdict["reason"]) > 10000):
         raise ValueError("Malformed documentation review")
+    if require_placement:
+        for key in ['placement_appropriate', 'related_docs_consistent', 'no_competing_pr']:
+            if type(verdict.get(key)) is not bool:
+                raise ValueError('Missing independent placement/overlap review')
     return verdict
 
 
 def record_review(raw):
-    verdict = review_verdict(raw)
-    accepted = verdict["single_concern"] and verdict["accurate"]
+    verdict = review_verdict(raw, require_placement=True)
+    accepted = all(verdict[k] for k in ["single_concern", "accurate", "placement_appropriate",
+                                       "related_docs_consistent", "no_competing_pr"])
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"accepted={str(accepted).lower()}\n")
+    if os.getenv('VALIDATION_DIR'):
+        Path(os.environ['VALIDATION_DIR'], 'verdict.json').write_text(json.dumps(verdict, indent=2))
     if not accepted:
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
             summary.write("Documentation proposal rejected; no PR created.\n\n<pre>"
@@ -242,19 +263,31 @@ def record_review(raw):
 
 
 def review_passes(raw):
-    verdict = review_verdict(raw)
-    if verdict.get("single_concern") is not True or verdict.get("accurate") is not True:
+    verdict = review_verdict(raw, require_placement=True)
+    if not all(verdict[k] for k in ["single_concern", "accurate", "placement_appropriate",
+                                    "related_docs_consistent", "no_competing_pr"]):
         raise ValueError("Documentation review rejected the change: " + str(verdict.get("reason")))
 
 
 def publish(item, repo, base, base_branch):
     # Refresh against live PRs immediately before publishing to cover human PRs
     # opened while the model/build ran and retries after partial publication.
-    if covered(item, existing_prs(repo)):
+    live_prs = existing_prs(repo)
+    if covered(item, live_prs):
         print("Concern already covered or files reserved by another PR; skipping.")
         return
     if not validate_diff(item, base):
         print("No documentation gap to publish.")
+        return
+    if 'placement' in item:
+        import placement
+        placement.validate(item, placement.inventory(base))
+        placement.verify_snapshot(item, live_prs, os.environ['OVERLAP_PATH'])
+    if os.getenv('DRY_RUN') == 'true':
+        print('Dry run: validation passed; no branch or PR created.')
+        if os.getenv('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                summary.write(f"Validated dry run: {item['title']}; no branch or PR created.\n")
         return
     # Never overwrite an existing branch, even after a prior push/PR API failure.
     # In that case reuse it only if its exact tree and parent match this run.
@@ -311,7 +344,7 @@ Scope: **{item["area"]} / {item["concern"]}**. Other concerns are deferred.
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["context", "plan", "evidence", "check", "export", "import", "review", "publish"])
+    parser.add_argument("command", choices=["context", "plan", "evidence", "check", "export", "import", "review", "overlaps", "publish"])
     args = parser.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
     if args.command == "context":
@@ -332,6 +365,9 @@ def main():
             path.write_text(json.dumps(item) + "\n")
             patch = git("show", "--first-parent", "--no-ext-diff", "--no-textconv", item["source_sha"])
             path.with_name("nightly-docs-source.patch").write_text(patch + "\n")
+        elif args.command == 'overlaps':
+            import placement
+            placement.capture(item, repo, base, os.environ['OVERLAP_PATH'])
         elif args.command in ("check", "import"):
             if args.command == "import":
                 changed = import_bundle(item, base, Path(os.environ["BUNDLE_PATH"]).read_text())

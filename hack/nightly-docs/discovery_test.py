@@ -55,7 +55,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(selected), 100)
         self.assertEqual(len(deferred), 60)
         self.assertEqual([item['concern'] for item in selected[:8]], [f'concern-{n}-0' for n in range(8)])
-        self.assertTrue(all(reason == '100-PR cap' for _, reason in deferred))
+        self.assertTrue(all(reason == 'PR cap' for _, reason in deferred))
 
     def test_overlap_and_semantic_identity_are_deferred_not_failed(self):
         for scan in self.scans[:3]:
