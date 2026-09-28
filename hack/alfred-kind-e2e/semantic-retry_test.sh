@@ -118,6 +118,23 @@ if sr_probe denied "${sr_entry}" 2>/dev/null; then fail 'RBAC denial mistaken fo
 probe_mode=allowed
 sr_probe allowed "${sr_entry}" || fail 'accepted dry-run payload was not recognized'
 if sr_probe denied "${sr_entry}"; then fail 'unenforced policy accepted'; else [[ "$?" == 2 ]] || fail 'policy-cache delay not identified'; fi
+# Preparation probes run before sr_after_trigger sets the shared retry deadline.
+# Exercise the real wait/probe path under nounset with no optional deadline.
+(
+  unset sr_deadline
+  probe_mode=denied
+  sr_wait_probe denied "${sr_entry}"
+  echo 'initial admission wait completed'
+) >"${test_dir}/initial-wait.stdout" 2>"${test_dir}/initial-wait.stderr" || fail 'initial admission wait rejected an unset optional deadline'
+grep -q '^initial admission wait completed$' "${test_dir}/initial-wait.stdout" || fail 'initial admission wait did not finish'
+(
+  sr_deadline=$((SECONDS - 1))
+  ((sr_deadline > 0)) || sr_deadline=1
+  SECONDS=$((sr_deadline + 1))
+  sr_probe() { touch "${test_dir}/probe-after-deadline"; }
+  if sr_wait_probe denied "${sr_entry}" 2>/dev/null; then fail 'expired shared deadline accepted'; fi
+  [[ ! -f "${test_dir}/probe-after-deadline" ]] || fail 'expired shared deadline was ignored'
+)
 for mode in errexit no-errexit; do
   for stage in prepared paused released completed; do
     for failure in unreadable unsafe; do

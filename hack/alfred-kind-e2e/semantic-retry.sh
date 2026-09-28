@@ -152,8 +152,8 @@ sr_probe() {
 }
 
 sr_wait_probe() {
-  local expected="$1" entry="$2" deadline=$((SECONDS + 20)) code
-  if (( ${sr_deadline:-0} > 0 && sr_deadline < deadline )); then deadline="${sr_deadline}"; fi
+  local expected="$1" entry="$2" deadline=$((SECONDS + 20)) code retry_deadline="${sr_deadline:-0}"
+  if (( retry_deadline > 0 && retry_deadline < deadline )); then deadline="${retry_deadline}"; fi
   while ((SECONDS < deadline)); do
     if sr_probe "${expected}" "${entry}"; then return 0; else code=$?; fi
     [[ "${code}" == 2 ]] || return 1
