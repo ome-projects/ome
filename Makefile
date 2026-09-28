@@ -710,22 +710,7 @@ test-no-xet: fmt vet manifests envtest ## 🧪 Run tests excluding ome-agent
 coverage: cover-check ## Show coverage summary and enforce threshold
 
 cover-check: ## Enforce the minimum average coverage (COVER_MIN, currently 50)
-	@echo "\n---------- Coverage Summary ----------"
-	@for part in cmd pkg internal; do \
-		echo "\n$$part Coverage:"; \
-		go tool cover -func=coverage-$$part.out | grep -v "100.0%"; \
-	done
-	@echo "\nTotal Coverage:"
-	@cmd_cov=$$(go tool cover -func=coverage-cmd.out | grep total | awk '{sub(/%/,"",$$3); print $$3}'); \
-	pkg_cov=$$(go tool cover -func=coverage-pkg.out | grep total | awk '{sub(/%/,"",$$3); print $$3}'); \
-	int_cov=$$(go tool cover -func=coverage-internal.out | grep total | awk '{sub(/%/,"",$$3); print $$3}'); \
-	echo "CMD: $$cmd_cov%"; echo "PKG: $$pkg_cov%"; echo "Internal: $$int_cov%"; \
-	avg_cov=$$(awk "BEGIN {printf \"%.2f\", ($$cmd_cov + $$pkg_cov + $$int_cov) / 3}"); \
-	echo "\nAverage Coverage: $$avg_cov%"; \
-	if awk "BEGIN {exit !($$avg_cov < $(COVER_MIN))}"; then \
-		echo "❌ Average coverage $$avg_cov% is below threshold of $(COVER_MIN)%"; \
-		exit 1; \
-	fi
+	@bash hack/check-coverage.sh "$(COVER_MIN)"
 DEP_CRDS_DIR := tests/integration/dep-crds
 
 # Each <bundle>-crds target copies CRD YAMLs from the corresponding

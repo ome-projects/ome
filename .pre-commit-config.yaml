@@ -53,6 +53,14 @@ repos:
         files: ^(\.github/workflows/(dev-images\.yaml|pr-validation\.yml)|hack/(dev-images_test|prepare-dev-charts(_test)?)\.sh)$
         pass_filenames: false
 
+      - id: coverage-gate-contract
+        name: coverage gate contract
+        description: Verify make coverage reads only the total rows and fails closed.
+        entry: bash hack/check-coverage_test.sh
+        language: system
+        files: ^hack/check-coverage(_test)?\.sh$
+        pass_filenames: false
+
       - id: go-fmt
         name: go fmt
         description: Format Go code with gofmt
