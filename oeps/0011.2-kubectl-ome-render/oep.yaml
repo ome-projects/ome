@@ -1,0 +1,17 @@
+title: Render the Effective InferenceService in kubectl-ome
+oep-number: "0011.2"
+authors:
+  - "@shaodianwang"
+status: provisional
+creation-date: 2026-09-28
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+see-also:
+  - "/oeps/0011-kubectl-ome-plugin"
+  - "/oeps/0011.1-kubectl-ome-operations"
+
+# The target maturity stage in the current dev cycle for this OEP.
+stage: alpha

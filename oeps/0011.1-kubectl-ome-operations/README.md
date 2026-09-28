@@ -451,6 +451,9 @@ proof that an optional controller is installed.
 - **Effective configuration may itself contain literal secrets.** Runtime and
   revision views use an allowlisted, redacted field set and never emit complete
   pod templates, environment values, headers, or arbitrary extension payloads.
+  [OEP-0011.2](../0011.2-kubectl-ome-render/README.md) scopes this rule to
+  diagnostic reports and adds `runtime render` as the one separately
+  documented command that prints effective component specs unredacted.
 
 ## Design Details
 
