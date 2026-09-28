@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Sourced only by scenario.sh placement-pause-single. Fixture authority is
-# written through the public ISVC metadata contract with the harness identity.
-# All IR spec/status, requests, journal entries and pods come from controllers.
+# Helpers for scenario.sh placement-pause-single and offline tests. Callers
+# provide scenario globals; tests supply fixtures and replace API boundaries.
+# Live fixture authority uses the public ISVC metadata contract with the harness
+# identity. Live IR spec/status, requests, journal entries and pods come from
+# controllers.
 
 placement_snapshot() {
   local service replica current_pods current_endpoints recommendations dispatch requests
