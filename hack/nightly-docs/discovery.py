@@ -107,7 +107,8 @@ def combine(scans, context):
                 continue
             item = docs.plan(json.dumps({"concerns": [proposal]}), context)
             if not item:
-                deferred.append((proposal["concern"], "existing PR"))
+                key = f'{proposal["source_sha"]}:{proposal["area"]}:{proposal["concern"]}'
+                deferred.append((key, "existing PR"))
                 continue
             item = item[0]
             identity = (item["area"], item["concern"])
@@ -125,21 +126,21 @@ def combine(scans, context):
                 questions.add(question)
                 occupied.update(item["doc_paths"])
                 continue
-            deferred.append((item["concern"], reason))
+            deferred.append((item["key"], reason))
     return selected, deferred
 
 
 def deferred_queue(scans, deferred, prs):
     """Queue file-blocked concerns without reviving merged or declined work."""
-    queued = {concern for concern, reason in deferred
+    queued = {key for key, reason in deferred
               if reason in {'overlapping documentation files', 'PR cap', 'existing PR'}}
     queued_concerns = []
     for scan in scans:
         for proposal in scan['concerns']:
-            if proposal['concern'] not in queued:
-                continue
             title = proposal['title']
             item = docs.validate_item({**proposal, 'title': title if title.startswith('[Docs] ') else '[Docs] ' + title})
+            if item['key'] not in queued:
+                continue
             # Keep file-blocked work, but never queue an already-open,
             # merged, or deliberately declined instance of this concern.
             if any(f"{docs.MARKER}{item['key']} -->" in pr['body'] or item['branch'] == pr['branch']
@@ -179,6 +180,11 @@ def previous_pending(repo, branch, context):
             docs.run('gh', 'run', 'download', str(run['id']), '--repo', repo,
                      '--name', 'nightly-docs-discovery-report', '--dir', directory)
             report = json.loads(Path(directory, 'nightly-docs-discovery-report.json').read_text())
+        # Only full, publishing runs may replace the retained queue. A pilot
+        # dispatched on main is still a pilot, regardless of its branch.
+        if (report.get('dry_run') is not False or report.get('max_prs') != docs.MAX_PRS
+                or {scan['shard'] for scan in report.get('scans', [])} != {name for name, _, _ in SHARDS}):
+            continue
         return pending_from_report(report, context)
     return []
 
@@ -223,7 +229,7 @@ def main():
         queued_concerns = deferred_queue(scans, deferred, context['existing_prs'])
         report = {"queued_concerns": queued_concerns, "doc_inventory": context["doc_inventory"],
                   "base_sha": context["base_sha"], "scans": scans, "selected": selected,
-                  "deferred": deferred}
+                  "deferred": deferred, "dry_run": context["dry_run"], "max_prs": context["max_prs"]}
         Path(os.environ["REPORT_OUTPUT"]).write_text(json.dumps(report, indent=2))
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write("matrix=" + json.dumps({"include": selected}) + "\n")

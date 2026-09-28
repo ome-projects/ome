@@ -58,7 +58,7 @@ class PlacementTests(unittest.TestCase):
         with patch.object(discovery, 'partition', return_value={shard: context['code_history']}):
             selected, deferred = discovery.combine(scans, context)
         self.assertEqual(len(selected), 1)
-        self.assertEqual(deferred, [('another-claim', 'overlapping documentation files')])
+        self.assertEqual(deferred, [(docs.validate_item(second)['key'], 'overlapping documentation files')])
         self.assertEqual(selected[0]['doc_paths'], [self.path])
 
     def test_every_editorial_and_conflict_verdict_is_required(self):
@@ -75,7 +75,7 @@ class PlacementTests(unittest.TestCase):
     def test_file_blocked_queue_survives_but_declined_concerns_do_not(self):
         other = pr(self.item, body=docs.MARKER + 'another-concern -->', branch='codex/nightly-docs-another')
         scans = [{'concerns': [self.item]}]
-        deferred = [(self.item['concern'], 'existing PR')]
+        deferred = [(self.item['key'], 'existing PR')]
         self.assertEqual(discovery.deferred_queue(scans, deferred, [other]), [self.item])
         self.assertEqual(discovery.deferred_queue(scans, deferred, [pr(self.item, state='closed')]), [])
 
@@ -90,7 +90,8 @@ class PlacementTests(unittest.TestCase):
             calls.append(args)
             if args[:3] == ('gh', 'run', 'download'):
                 Path(args[-1], 'nightly-docs-discovery-report.json').write_text(
-                    json.dumps({'queued_concerns': [self.item]}))
+                    json.dumps({'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
+                                'scans': [{'shard': name} for name, _, _ in discovery.SHARDS]}))
                 return ''
             if 'artifacts?' in args[2]:
                 return json.dumps([{'artifacts': []}, {'artifacts': [
@@ -101,6 +102,28 @@ class PlacementTests(unittest.TestCase):
             result = discovery.previous_pending('o/r', 'main', {'code_history': ['a' * 40 + ' old']})
         self.assertEqual(result, [self.item])
         self.assertEqual(calls[-1][:4], ('gh', 'run', 'download', '5'))
+
+    def test_main_branch_pilots_do_not_replace_the_full_queue(self):
+        """Skip filtered, capped, dry-run, and legacy reports before a full run."""
+        full = {'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
+                'scans': [{'shard': name} for name, _, _ in discovery.SHARDS]}
+        reports = [{**full, 'scans': full['scans'][:1]}, {**full, 'max_prs': 2},
+                   {**full, 'dry_run': True}, {'queued_concerns': []}, full]
+        downloaded = []
+        def run(*args):
+            if args[:3] == ('gh', 'run', 'download'):
+                number = int(args[3])
+                downloaded.append(number)
+                Path(args[-1], 'nightly-docs-discovery-report.json').write_text(json.dumps(reports[number-1]))
+                return ''
+            if 'artifacts?' in args[2]:
+                return json.dumps([{'artifacts': [{'name': 'nightly-docs-discovery-report', 'expired': False}]}])
+            return json.dumps({'workflow_runs': [{'id': number, 'status': 'completed',
+                'head_branch': 'main', 'head_repository': {'full_name': 'o/r'}} for number in range(1, 6)]})
+        with patch.object(docs, 'run', side_effect=run):
+            queue = discovery.previous_pending('o/r', 'main', {'code_history': ['a' * 40 + ' old']})
+        self.assertEqual(downloaded, [1, 2, 3, 4, 5])
+        self.assertEqual(queue, [self.item])
 
     def test_queue_never_reads_branch_pilot_artifacts(self):
         runs = {'workflow_runs': [
@@ -126,6 +149,7 @@ class PlacementGitTests(unittest.TestCase):
     setUp = fixtures.GitGuardTests.setUp
     cleanup = fixtures.GitGuardTests.cleanup
     git = fixtures.GitGuardTests.git
+    origin = fixtures.GitGuardTests.origin
 
     def test_writer_cannot_add_a_page_and_skip_the_planned_canonical_fix(self):
         new = self.path.parent / 'new-reference.md'
@@ -161,6 +185,7 @@ class PlacementGitTests(unittest.TestCase):
             self.assertNotIn('source.go', content)
 
     def test_dry_run_validates_but_does_not_push_or_open_pr(self):
+        self.origin()
         self.path.write_text('Corrected canonical documentation.\n')
         with patch.dict(os.environ, {'DRY_RUN': 'true'}), patch.object(docs, 'existing_prs', return_value=[]), \
                 patch.object(docs, 'mutate_git', wraps=docs.mutate_git) as mutate, patch.object(docs, 'run', wraps=docs.run) as run:
@@ -168,3 +193,31 @@ class PlacementGitTests(unittest.TestCase):
         self.assertFalse(any(call.args[0] in {"push", "commit", "switch"} for call in mutate.call_args_list))
         self.assertFalse(any(call.args[:3] == ('gh', 'pr', 'create') for call in run.call_args_list))
         self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
+
+    def test_dry_run_checks_existing_branch_tree_and_parent_without_publishing(self):
+        """Accept an exact retry; reject a different tree or parent before success."""
+        self.origin()
+        self.path.write_text('Corrected canonical documentation.\n')
+        self.git('add', '.')
+        tree = self.git('write-tree')
+        matching = self.git('commit-tree', tree, '-p', self.base, '-m', 'existing docs')
+        changed_tree = self.git('rev-parse', self.base + '^{tree}')
+        wrong_tree = self.git('commit-tree', changed_tree, '-p', self.base, '-m', 'other docs')
+        wrong_parent = self.git('commit-tree', tree, '-p', matching, '-m', 'other parent')
+        ref = f"refs/heads/{self.item['branch']}"
+        for head, accepted in [(matching, True), (wrong_tree, False), (wrong_parent, False)]:
+            with self.subTest(head=head):
+                self.git('push', '--force', 'origin', f'{head}:{ref}')
+                with patch.dict(os.environ, {'DRY_RUN': 'true'}), \
+                        patch.object(docs, 'existing_prs', return_value=[]), \
+                        patch.object(docs, 'mutate_git', wraps=docs.mutate_git) as mutate, \
+                        patch.object(docs, 'run', wraps=docs.run) as run:
+                    if accepted:
+                        docs.publish(self.item, 'owner/repo', self.base, 'main')
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'differs'):
+                            docs.publish(self.item, 'owner/repo', self.base, 'main')
+                self.assertFalse(any(c.args[0] in {'push', 'commit', 'switch'} for c in mutate.call_args_list))
+                self.assertFalse(any(c.args[:3] == ('gh', 'pr', 'create') for c in run.call_args_list))
+                self.assertEqual(self.git('ls-remote', 'origin', ref).split()[0], head)
+                self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)

@@ -134,7 +134,7 @@ def prepare(repo, output):
     if not 1 <= limit <= MAX_PRS:
         raise ValueError("max_prs must be between 1 and 100")
     context = {"base_sha": git("rev-parse", "HEAD"), "max_prs": limit,
-               "doc_inventory": placement.inventory("HEAD"),
+               "doc_inventory": placement.inventory("HEAD"), "dry_run": os.getenv("DRY_RUN") == "true",
                "code_history": history.splitlines(), "source_diffs": str(sources),
                "existing_prs": existing_prs(repo)}
     import discovery
@@ -283,12 +283,6 @@ def publish(item, repo, base, base_branch):
         import placement
         placement.validate(item, placement.inventory(base))
         placement.verify_snapshot(item, live_prs, os.environ['OVERLAP_PATH'])
-    if os.getenv('DRY_RUN') == 'true':
-        print('Dry run: validation passed; no branch or PR created.')
-        if os.getenv('GITHUB_STEP_SUMMARY'):
-            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-                summary.write(f"Validated dry run: {item['title']}; no branch or PR created.\n")
-        return
     # Never overwrite an existing branch, even after a prior push/PR API failure.
     # In that case reuse it only if its exact tree and parent match this run.
     branch = item["branch"]
@@ -298,7 +292,13 @@ def publish(item, repo, base, base_branch):
         mutate_git("fetch", "origin", f"refs/heads/{branch}")
         if git("rev-parse", "FETCH_HEAD^{tree}") != tree or git("rev-parse", "FETCH_HEAD^") != base:
             raise ValueError(f"Existing branch {branch} differs; inspect it before retrying")
-    else:
+    if os.getenv('DRY_RUN') == 'true':
+        print('Dry run: validation passed; no branch or PR created.')
+        if os.getenv('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                summary.write(f"Validated dry run: {item['title']}; no branch or PR created.\n")
+        return
+    if not remote:
         mutate_git("switch", "-c", branch)
         # The publisher, rather than the model, owns commit metadata and DCO.
         git("config", "user.name", "github-actions[bot]")

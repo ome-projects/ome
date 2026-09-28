@@ -53,7 +53,10 @@ the existing release-driven Pages workflow publishes the website separately.
    Build the production Hugo site, recheck live PRs, sign off
    one commit, and open one PR. Git commands disable hooks, including pre-push.
    Nothing is merged automatically. Empty or failed edits publish no PR.
-   Any new/changed overlapping human PR invalidates the review before publication.
+   Any new/changed overlapping human PR observed by the final recheck invalidates
+   the review before publication. This check cannot be atomic with other
+   contributors opening or updating PRs; normal PR review and merge checks remain
+   necessary after publication.
    An explicit accuracy/scope/placement/overlap rejection is recorded in the job summary and skips
    publication; it is an expected filter outcome. Malformed review output, model
    failures, scope violations, and build/publication errors still fail the run.
@@ -91,7 +94,11 @@ The `nightly-docs-discovery-report` artifact (14-day retention) contains every
 scan, the selected plan, and reasons for deferring proposals. Concerns deferred
 for a shared canonical page or the PR cap are saved as `queued_concerns`. The
 next run reads the newest retained plan from the ten latest default-branch runs
-and supplies that queue for fresh evaluation. Branch pilots cannot seed it.
+and supplies that queue for fresh evaluation. Only reports covering all eight
+scans with the default 100-concern cap and dry-run disabled may seed the queue;
+branch pilots and limited/dry runs on main cannot replace it. Deferred records
+use the full source/area/concern key, so equal slugs in different areas do not
+queue selected work by accident.
 This is a best-effort queue within artifact retention; full-history discovery
 still covers older work when evidence expires. Job summaries show
 eligible commits, reported inspected commits and candidate counts by scan.
@@ -120,7 +127,8 @@ gh workflow run nightly-docs.yml --repo ome-projects/ome \
 `networking-traffic`, autoscaling `autoscaling-quota`, or `operations`). Empty
 runs all scans. `max_prs` is 1–100; scheduled runs retain the 100-PR ceiling.
 `dry_run` defaults to false. It runs all publication guards but skips branch
-creation, commits, pushes and PR creation. Inspect `nightly-docs-validation-*`
+creation, commits, pushes and PR creation. It still fetches an existing concern
+branch to verify that its tree and parent match the proposed retry. Inspect `nightly-docs-validation-*`
 artifacts for the item, full diff, pinned human overlap evidence, and explicit
 review verdict. A successful run with a rejected verdict is not a successful
 repair: require an accepted verdict, a useful existing-page diff, and a passing
