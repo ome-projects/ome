@@ -6,13 +6,18 @@ on:
     types: [ opened, synchronize, reopened ]
     paths:
       - '.github/workflows/alfred-simulator.yml'
-      - 'pkg/alfred/scheduling/**'
-      - 'pkg/alfred/config/**'
-      - 'pkg/alfred/engine/**'
-      - 'pkg/alfred/snapshot/**'
-      - 'pkg/alfred/policy/**'
+      - 'pkg/alfred/**'
       - 'cmd/alfred/**'
-      - 'pkg/alfred/simulator/**'
+      - 'pkg/apis/ome/**'
+      - 'pkg/controller/**'
+      - 'pkg/constants/**'
+      - 'pkg/utils/**'
+      - 'config/crd/**'
+      - 'config/alfred/**'
+      - 'charts/ome-alfred/**'
+      - 'charts/ome-resources/**'
+      - 'hack/alfred-kind-e2e/**'
+      - 'dockerfiles/alfred.Dockerfile'
       - 'scheduler/**'
       - 'go.mod'
       - 'go.sum'
@@ -20,13 +25,18 @@ on:
     branches: [ main, release-* ]
     paths:
       - '.github/workflows/alfred-simulator.yml'
-      - 'pkg/alfred/scheduling/**'
-      - 'pkg/alfred/config/**'
-      - 'pkg/alfred/engine/**'
-      - 'pkg/alfred/snapshot/**'
-      - 'pkg/alfred/policy/**'
+      - 'pkg/alfred/**'
       - 'cmd/alfred/**'
-      - 'pkg/alfred/simulator/**'
+      - 'pkg/apis/ome/**'
+      - 'pkg/controller/**'
+      - 'pkg/constants/**'
+      - 'pkg/utils/**'
+      - 'config/crd/**'
+      - 'config/alfred/**'
+      - 'charts/ome-alfred/**'
+      - 'charts/ome-resources/**'
+      - 'hack/alfred-kind-e2e/**'
+      - 'dockerfiles/alfred.Dockerfile'
       - 'scheduler/**'
       - 'go.mod'
       - 'go.sum'
@@ -59,9 +69,26 @@ jobs:
             pkg/alfred/simulator/go.sum
             scheduler/go.sum
 
+      - name: Setup Helm for deployment artifact tests
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v4.2.0'
+
+      - name: Prepare API server and deployment test tools
+        run: |
+          command -v helm
+          command -v kubectl
+          command -v jq
+          make envtest
+          assets="$(./bin/setup-envtest use 1.30 -p path)"
+          test -n "$assets"
+          test -x "$assets/kube-apiserver"
+          test -x "$assets/etcd"
+          echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
+
       - name: Test nested module with race detector
         working-directory: pkg/alfred/simulator
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
       - name: Vet nested module
         working-directory: pkg/alfred/simulator
@@ -71,10 +98,16 @@ jobs:
         working-directory: pkg/alfred/simulator
         run: go build ./cmd/alfred-simulator
 
-      - name: Test root wire compatibility
-        run: go test ./pkg/alfred/scheduling/...
-
-      - name: Test predictive inputs and recommendation loop against simulator
+      - name: Test Alfred boundaries, guards, and compiled-worker integration
         env:
           ALFRED_SIMULATOR_BINARY: ${{ github.workspace }}/pkg/alfred/simulator/alfred-simulator
-        run: go test -race ./pkg/alfred/scheduling/input ./pkg/alfred/engine
+          KUBECONFIG: /dev/null
+          USE_EXISTING_CLUSTER: 'false'
+        run: go test -race -count=1 ./cmd/alfred/... ./pkg/alfred/...
+
+      - name: Test offline acceptance harness
+        run: |
+          for test in hack/alfred-kind-e2e/*_test.sh; do
+            bash "$test"
+          done
+          go test -race -count=1 ./hack/alfred-kind-e2e/ir-status ./hack/alfred-kind-e2e/worker-result

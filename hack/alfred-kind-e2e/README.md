@@ -184,3 +184,28 @@ Run offline harness checks with:
 for test in hack/alfred-kind-e2e/*_test.sh; do bash "$test" || exit; done
 go test ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/ir-status
 ```
+
+## Alfred-only change boundary
+
+For a PR intentionally limited to Alfred, check its committed diff against the
+intended base. Run this in Bash with `pipefail` so a failed Git command cannot
+be mistaken for an empty, allowed diff:
+
+```bash
+set -o pipefail
+git diff --name-only -z --no-renames origin/main...HEAD |
+  bash hack/alfred-kind-e2e/check-change-scope.sh
+```
+
+The checker permits only Alfred code, deployment/build assets, this harness,
+its dedicated CI workflow and OEP 8. Shared APIs, controllers (including the
+read-only status codec), scheduler implementation and root dependency files
+require separate approval. Disabling rename detection checks both ends of a
+move. This path check complements the resolved dependency test in `cmd/alfred`;
+it does not prove semantic independence or cover uncommitted files.
+
+The dedicated CI workflow runs offline harness and compiled-worker checks, not
+live kind qualification. Before presenting a revision as locally qualified,
+run the applicable live scenarios from that exact checkout and retain its SHA,
+image identities, scheduler profiles and evidence. A later relevant change or
+rebase requires fresh evidence. A skipped or unavailable test is not a pass.
