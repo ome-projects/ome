@@ -84,6 +84,24 @@ class PlacementTests(unittest.TestCase):
         context = {'code_history': ['a' * 40 + ' old change']}
         self.assertEqual(discovery.pending_from_report(report, context), [self.item])
 
+    def test_queue_reads_paginated_artifact_objects_and_validates_saved_items(self):
+        calls = []
+        def run(*args):
+            calls.append(args)
+            if args[:3] == ('gh', 'run', 'download'):
+                Path(args[-1], 'nightly-docs-discovery-report.json').write_text(
+                    json.dumps({'queued_concerns': [self.item]}))
+                return ''
+            if 'artifacts?' in args[2]:
+                return json.dumps([{'artifacts': []}, {'artifacts': [
+                    {'name': 'nightly-docs-discovery-report', 'expired': False}]}])
+            return json.dumps({'workflow_runs': [{'id': 5, 'status': 'completed',
+                'head_branch': 'main', 'head_repository': {'full_name': 'o/r'}}]})
+        with patch.object(docs, 'run', side_effect=run):
+            result = discovery.previous_pending('o/r', 'main', {'code_history': ['a' * 40 + ' old']})
+        self.assertEqual(result, [self.item])
+        self.assertEqual(calls[-1][:4], ('gh', 'run', 'download', '5'))
+
     def test_queue_never_reads_branch_pilot_artifacts(self):
         runs = {'workflow_runs': [
             {'id': 1, 'status': 'completed', 'head_branch': 'codex/pilot', 'head_repository': {'full_name': 'o/r'}},

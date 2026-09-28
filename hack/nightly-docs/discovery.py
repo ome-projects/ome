@@ -170,7 +170,9 @@ def previous_pending(repo, branch, context):
         if (run['status'] != 'completed' or run['head_branch'] != branch
                 or run['head_repository']['full_name'] != repo):
             continue
-        artifacts = docs.pages(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100")
+        pages = json.loads(docs.run('gh', 'api',
+            f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100", '--paginate', '--slurp'))
+        artifacts = [artifact for page in pages for artifact in page['artifacts']]
         if not any(a['name'] == 'nightly-docs-discovery-report' and not a['expired'] for a in artifacts):
             continue
         with tempfile.TemporaryDirectory() as directory:
