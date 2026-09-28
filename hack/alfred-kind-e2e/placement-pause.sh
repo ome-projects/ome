@@ -44,16 +44,16 @@ placement_wait_projection() {
   local phase="$1" revision="$2" paused="$3" sample deadline
   deadline=$((SECONDS + 60))
   while (( SECONDS < deadline )); do
-    sample="$(placement_snapshot)"
+    sample="$(placement_snapshot)" || { echo "placement ${phase}: snapshot read failed" >&2; return 1; }
     printf '%s\n' "${sample}" >>"${artifact_dir}/placement-${phase}-projection.jsonl"
     # The source must stay safe through projection; writes may be observed at
     # different resource versions, so allow the expected projection to settle.
-    placement_check source-safe "${sample}" || return 1
+    placement_check source-safe "${sample}" || { echo "placement ${phase}: source safety check failed" >&2; return 1; }
     if jq -e --argjson revision "${revision}" --argjson paused "${paused}" '
       .ir.spec.placementExecution.revision == $revision and
       .ir.spec.placementExecution.pauseSurge == $paused and
       .ir.status.placementObservedGeneration == .ir.metadata.generation' <<<"${sample}" >/dev/null; then
-      placement_check "${phase}" "${sample}" || return 1
+      placement_check "${phase}" "${sample}" || { echo "placement ${phase}: projection check failed" >&2; return 1; }
       printf '%s\n' "${sample}" >"${artifact_dir}/placement-${phase}.json"
       return 0
     fi
@@ -67,21 +67,23 @@ placement_pause_observe_and_release() {
   local sample deadline cycles=0 previous='' timestamp
   placement_isvc_uid="$(jq -r '.metadata.uid' <<<"${isvc}")"
   placement_ir_uid="$(jq -r '.metadata.uid' <<<"${ir}")"
-  [[ -n "${placement_isvc_uid}" && "${placement_isvc_uid}" != null && -n "${placement_ir_uid}" && "${placement_ir_uid}" != null ]] || return 1
+  [[ -n "${placement_isvc_uid}" && "${placement_isvc_uid}" != null && -n "${placement_ir_uid}" && "${placement_ir_uid}" != null ]] ||
+    { echo 'placement pause: missing ISVC or IR UID' >&2; return 1; }
   # The existing baseline saved the real fresh IR before maintenance. Require
   # pause to have existed there, not merely after a later annotation patch.
   jq -e --arg uid "${placement_ir_uid}" '
     .metadata.uid == $uid and .spec.placementReplicaLimit == 1 and
     .spec.placementExecution == {planID:"alfred-e2e-pause",revision:1,
       sourceUID:"alfred-e2e-source",clusterUID:"alfred-e2e-member",pauseSurge:true}' \
-    "${artifact_dir}/ir-before-trigger.raw.json" >/dev/null
+    "${artifact_dir}/ir-before-trigger.raw.json" >/dev/null ||
+    { echo 'placement pause: baseline policy check failed' >&2; return 1; }
   echo 'Observing placement pause across three distinct Alfred decision cycles'
   deadline=$((SECONDS + 60))
   while (( SECONDS < deadline && cycles < 3 )); do
-    sample="$(placement_snapshot)"
+    sample="$(placement_snapshot)" || { echo 'placement pause: snapshot read failed' >&2; return 1; }
     printf '%s\n' "${sample}" >>"${artifact_dir}/placement-paused-api-samples.jsonl"
     # Check absence of effects on every sample, even before the first advisory.
-    placement_check paused-safe "${sample}" || return 1
+    placement_check paused-safe "${sample}" || { echo 'placement pause: paused safety check failed' >&2; return 1; }
     timestamp="$(jq -r '.recommendations.data["last-cycle.json"] | fromjson | .timestamp' <<<"${sample}")"
     if [[ "${timestamp}" != "${previous}" ]] && placement_check paused "${sample}"; then
       printf '%s\n' "${sample}" >>"${artifact_dir}/placement-paused-cycles.jsonl"
@@ -103,9 +105,9 @@ placement_pause_allocated() {
   # Pod binding can race the journal/status and KWOK condition observations.
   # Retain every sample and wait for a complete witness with the source safe.
   while (( SECONDS < deadline )); do
-    sample="$(placement_snapshot)"
+    sample="$(placement_snapshot)" || { echo 'placement allocation: snapshot read failed' >&2; return 1; }
     printf '%s\n' "${sample}" >>"${artifact_dir}/placement-allocation-api-samples.jsonl"
-    placement_check source-safe "${sample}" || return 1
+    placement_check source-safe "${sample}" || { echo 'placement allocation: source safety check failed' >&2; return 1; }
     if placement_check allocated "${sample}"; then break; fi
     sleep 0.2
   done
@@ -117,14 +119,14 @@ placement_pause_allocated() {
 
 placement_pause_complete() {
   local sample deadline cycles=0 previous timestamp
-  sample="$(placement_snapshot)"
-  placement_check completed "${sample}" || return 1
+  sample="$(placement_snapshot)" || { echo 'placement completion: snapshot read failed' >&2; return 1; }
+  placement_check completed "${sample}" || { echo 'placement completion: completed safety check failed' >&2; return 1; }
   previous="$(jq -r '.recommendations.data["last-cycle.json"] | fromjson | .timestamp' <<<"${sample}")"
   deadline=$((SECONDS + 60))
   while (( SECONDS < deadline && cycles < 3 )); do
-    sample="$(placement_snapshot)"
+    sample="$(placement_snapshot)" || { echo 'placement completion: snapshot read failed' >&2; return 1; }
     printf '%s\n' "${sample}" >>"${artifact_dir}/placement-completed-api-samples.jsonl"
-    placement_check completed "${sample}" || return 1
+    placement_check completed "${sample}" || { echo 'placement completion: completed safety check failed' >&2; return 1; }
     timestamp="$(jq -r '.recommendations.data["last-cycle.json"] | fromjson | .timestamp' <<<"${sample}")"
     if [[ "${timestamp}" != "${previous}" ]]; then
       printf '%s\n' "${sample}" >>"${artifact_dir}/placement-completed-cycles.jsonl"

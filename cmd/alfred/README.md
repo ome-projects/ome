@@ -44,6 +44,8 @@ is pending. A valid release must clear both observed pauses before new work proc
 Already submitted migrations remain tracked; a pause does not cancel them or
 stop reconciliation of allocated work. Alfred only reads this placement protocol;
 it does not implement placement-controller or migration-controller behavior.
+Pause-related recommendations and dispatch diagnostics can currently report
+generic ineligibility or source-change reasons rather than identifying the pause.
 
 Current execution supports eligible OMENative instances only. RawDeployment,
 LWS and other workloads have no eviction adapter. Simulation reserves no
