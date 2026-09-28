@@ -36,7 +36,7 @@ Details of the comparison:
 - **The classes are pooled, not matched per component.** An engine override and a decoder override naming different classes both land in the same required set, and each is checked against the runtime's single `acceleratorClasses` list. A runtime cannot declare "H100 for the engine, A100 for the decoder" — list both.
 - **A silent runtime is filtered, unlike deployment-mode matching.** A runtime with no `acceleratorRequirements` (or an empty `acceleratorClasses` list) is rejected the moment the service names any class. To keep a runtime eligible for services that pin hardware, list every class it can run on.
 - **It is a hard filter, not a preference.** A matching class does not raise a runtime's score, and a runtime listing the exact class is not ranked above one that merely includes it among many.
-- **Matching is an exact, case-sensitive string comparison.** The matcher does not read AcceleratorClass resources at this stage, so the named class does not need to exist in the cluster for a runtime to match — existence is checked later, when the class is resolved for pod generation.
+- **Matching is an exact, case-sensitive string comparison.** The matcher does not read AcceleratorClass resources at this stage, so the class the *service* names does not need to exist in the cluster for a runtime to match — existence is checked later, when the class is resolved for pod generation. The names on the *runtime's* side, by contrast, were already checked against existing AcceleratorClass resources when the runtime was admitted (see [Admission-time validation of the runtime list](#admission-time-validation-of-the-runtime-list)).
 - **Only `acceleratorClasses` participates.** The other `acceleratorRequirements` fields (`minMemory`, `minComputePerformanceTFLOPS`, `minArchitectureVersion`, `requiredFeatures`, `preferredPrecisions`) do not filter runtime selection.
 
 ## Declaring the two sides
@@ -76,6 +76,23 @@ spec:
 ```
 
 This service auto-selects only among runtimes whose `acceleratorClasses` include `nvidia-h100`; the runtime above qualifies.
+
+## Admission-time validation of the runtime list
+
+The two sides are checked at different times. The class a service names is never checked for existence during matching (see above), but the classes a **runtime** lists are checked when the runtime itself is created or updated: a validating webhook reads the cluster's AcceleratorClass resources and denies any **enabled** ServingRuntime or ClusterServingRuntime whose `spec.acceleratorRequirements.acceleratorClasses` contains a name with no matching AcceleratorClass. All missing names are collected and reported together:
+
+```
+admission webhook "clusterservingruntime.ome-webhook-server.validator" denied the request: unknown accelerator classes referenced in AcceleratorRequirements: [nvidia-b200 nvidia-h100nvl]
+```
+
+For a namespaced ServingRuntime the webhook name is `servingruntime.ome-webhook-server.validator`; AcceleratorClass is cluster-scoped, so both kinds validate against the same catalog.
+
+What this check implies:
+
+- **Create AcceleratorClasses before the enabled runtimes that reference them.** A runtime naming a class that does not exist yet is denied outright, so in manifests applied together (Helm, GitOps) the classes must be admitted first. The classes only need to exist — a class reporting zero nodes passes.
+- **A runtime with `spec.disabled: true` skips the check.** The webhook admits a disabled runtime before looking at its accelerator classes, so a disabled runtime can hold references to classes that do not exist yet. Re-enabling it is an update to an enabled runtime, and the check applies then.
+- **Deleting an AcceleratorClass is never blocked**, even while enabled runtimes list it. Those runtimes keep serving and keep matching — the webhook only intercepts create and update — but every subsequent write to such a runtime (a `kubectl apply`, a Helm upgrade, a GitOps sync) is denied until the class is recreated, the reference is removed, or the runtime is disabled. See [Deleting a class](/ome/docs/concepts/accelerator_class/#deleting-a-class).
+- **An absent `acceleratorRequirements` block, or an empty `acceleratorClasses` list, always passes** — the check runs only over the names actually listed.
 
 ## Where a rejection surfaces
 
