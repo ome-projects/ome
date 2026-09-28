@@ -15,7 +15,7 @@ sr_parse_metrics() {
     [$lines[] | select(startswith("apiserver_validating_admission_policy_check_total{")) |
       capture("^apiserver_validating_admission_policy_check_total\\{(?<labels>[^}]*)\\} (?<value>[^ ]+)$") |
       select(.labels | contains("policy=\""+$name+"\"") and contains("policy_binding=\""+$name+"\"") and
-        contains("error_type=\"no_error\"") and contains("enforcement_action=\"deny\"")) |
+        contains("error_type=\"invalid_error\"") and contains("enforcement_action=\"deny\"")) |
       .value | tonumber] as $counts |
     [$lines[] | select(startswith("process_start_time_seconds ")) | split(" ")[1] | tonumber] as $starts |
     if ($counts|length) != 1 or ($starts|length) != 1 or

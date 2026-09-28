@@ -37,12 +37,14 @@ if [[ "${1:-}" == --case ]]; then
   exit "$?"
 fi
 sr_name=alfred-e2e-retry-test
+# Kubernetes labels a successfully evaluated false validation invalid_error,
+# not no_error. Mirror the actual API-server metric, including label order.
 metrics='process_start_time_seconds 1234
-apiserver_validating_admission_policy_check_total{policy="alfred-e2e-retry-test",policy_binding="alfred-e2e-retry-test",error_type="no_error",enforcement_action="deny"} 2
-apiserver_validating_admission_policy_check_total{policy="unrelated",policy_binding="unrelated",error_type="no_error",enforcement_action="deny"} 99'
+apiserver_validating_admission_policy_check_total{enforcement_action="deny",error_type="invalid_error",policy="alfred-e2e-retry-test",policy_binding="alfred-e2e-retry-test"} 2
+apiserver_validating_admission_policy_check_total{enforcement_action="deny",error_type="invalid_error",policy="unrelated",policy_binding="unrelated"} 99'
 parsed="$(sr_parse_metrics <<<"${metrics}")"
 [[ "${parsed}" == '{"denyCount":2,"processStart":1234}' ]] || fail 'metric parser did not isolate fixture denials'
-for bad in '' "${metrics/2/NaN}" "${metrics/no_error/compile_error}" "${metrics}"$'\n'"${metrics}"; do
+for bad in '' "${metrics/2/NaN}" "${metrics/invalid_error/compile_error}" "${metrics/invalid_error/no_error}" "${metrics/invalid_error/out_of_budget}" "${metrics}"$'\n'"${metrics}"; do
   if sr_parse_metrics <<<"${bad}" >/dev/null 2>&1; then fail 'metric parser accepted missing, invalid, or ambiguous evidence'; fi
 done
 # The request body is a JSON patch that preserves owner UID/RV and adds only
