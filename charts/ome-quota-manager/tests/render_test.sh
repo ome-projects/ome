@@ -101,11 +101,20 @@ grep -Fq -- '--accelerator-resources=google.com/tpu,nvidia.com/gpu' <<<"${defaul
   fail "the accelerator suffixes were not passed"
 grep -Fq -- '--capacity-hysteresis-percent=10' <<<"${default}" ||
   fail "the hysteresis band was not passed"
+grep -Fq -- '--capacity-report-interval=1m' <<<"${default}" ||
+  fail "the capacity report interval was not passed"
+custom_report="$(render --set quotaManager.mode=workload --set quotaManager.capacity.reportInterval=2m)"
+grep -Fq -- '--capacity-report-interval=2m' <<<"${custom_report}" ||
+  fail "the configured capacity report interval was not passed"
+no_report="$(render --set quotaManager.mode=workload --set quotaManager.capacity.reportInterval=)"
+if grep -Fq -- '--capacity-report-interval' <<<"${no_report}"; then
+  fail "an unset capacity report interval was defaulted"
+fi
 
 # A management-mode install holds the authored fleet tree and has no local
 # silicon, so a cluster-wide Node read there would be unused privilege.
 management="$(render --set quotaManager.mode=management)"
-for unwanted in 'resources: ["nodes"]' 'resources: ["resourceflavors"]' '--accelerator-resources'; do
+for unwanted in 'resources: ["nodes"]' 'resources: ["resourceflavors"]' '--accelerator-resources' '--capacity-report-interval'; do
   if grep -Fq -- "${unwanted}" <<<"${management}"; then
     fail "management mode rendered ${unwanted}"
   fi
@@ -122,7 +131,7 @@ for off in \
   ; do
   nocapacity="$(render --set quotaManager.mode=workload --set "${off}")" ||
     fail "--set ${off} failed to render at all"
-  for unwanted in 'resources: ["nodes"]' 'resources: ["resourceflavors"]' '--accelerator-resources'; do
+  for unwanted in 'resources: ["nodes"]' 'resources: ["resourceflavors"]' '--accelerator-resources' '--capacity-report-interval'; do
     if grep -Fq -- "${unwanted}" <<<"${nocapacity}"; then
       fail "--set ${off} still rendered ${unwanted}"
     fi

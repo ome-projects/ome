@@ -90,6 +90,10 @@ quotaManager:
   # management-mode install holds the authored fleet tree and has no local
   # nodes to measure.
   capacity:
+    # Refresh unchanged observations so consumers can distinguish stable hardware
+    # from a reporter that stopped. Empty or 0s disables periodic refresh.
+    reportInterval: 1m
+
     # resources are the extended resource names that count as accelerators,
     # written in full. Exact names rather than a pattern, because this list
     # decides what every budget is measured against and a pattern would quietly

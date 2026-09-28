@@ -96,6 +96,9 @@ spec:
         {{- with (include "ome-quota-manager.acceleratorResources" .) }}
         - "--accelerator-resources={{ . }}"
         - "--capacity-hysteresis-percent={{ ($.Values.quotaManager.capacity | default dict).hysteresisPercent | default 0 }}"
+        {{- with ($.Values.quotaManager.capacity | default dict).reportInterval }}
+        - "--capacity-report-interval={{ . }}"
+        {{- end }}
         {{- end }}
         {{- $cover := include "ome-quota-manager.coverResources" . }}
         {{- $enrolled := include "ome-quota-manager.enrolledNamespaces" . }}
