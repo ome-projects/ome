@@ -33,15 +33,19 @@ var engineDirectModes = map[v1beta1.ComponentType]constants.DeploymentModeType{
 }
 
 // liveIR returns an IR fixture with realistic Status fields the
-// aggregator should mirror onto the ISVC.
+// aggregator should mirror onto the ISVC. The fixture has reconciled its
+// current spec (status.observedGeneration == generation) and carries the
+// projector's parent-generation stamp for baselineISVC's generation.
 func liveIR(parentName, namespace string, replicas int32) *v1beta1.InferenceReplica {
 	cc := int32(0)
 	return &v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      parentName + "-engine",
-			Namespace: namespace,
+			Name:       parentName + "-engine",
+			Namespace:  namespace,
+			Generation: 1,
 			Annotations: map[string]string{
-				constants.InferenceReplicaControllerWriteAnnotationKey: constants.InferenceReplicaControllerWriteAnnotationVal,
+				constants.InferenceReplicaControllerWriteAnnotationKey:  constants.InferenceReplicaControllerWriteAnnotationVal,
+				constants.InferenceReplicaParentGenerationAnnotationKey: "1",
 			},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
@@ -124,7 +128,12 @@ func TestAggregateIRStatus_OMENative_NoIR_NoErr(t *testing.T) {
 func TestAggregateIRStatus_OMENative_CopiesStatusFromIR(t *testing.T) {
 	g := gomega.NewWithT(t)
 	isvc := baselineISVC("llama", "prod")
+	// The ISVC generation is set apart from the IR's generation and
+	// status.observedGeneration (both 1) so the ObservedGeneration
+	// assertion below can only pass via the parent-generation stamp.
+	isvc.Generation = 5
 	ir := liveIR("llama", "prod", 3)
+	ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "5"
 	c := fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
 		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
@@ -143,6 +152,8 @@ func TestAggregateIRStatus_OMENative_CopiesStatusFromIR(t *testing.T) {
 	om := got.Status.Components[v1beta1.EngineComponent].Lifecycle
 	g.Expect(om).NotTo(gomega.BeNil(),
 		"OMENative subtree must be populated for IR-managed Component")
+	g.Expect(om.ObservedGeneration).To(gomega.Equal(isvc.Generation),
+		"ObservedGeneration must report the parent ISVC generation the reconciled IR was projected from")
 	g.Expect(om.Replicas).To(gomega.Equal(int32(3)),
 		"Replicas counter must mirror IR.Status.Replicas")
 	g.Expect(om.ReadyReplicas).To(gomega.Equal(int32(3)))
@@ -608,6 +619,99 @@ func TestAggregateIRStatus_NoWriteWhenUnchanged(t *testing.T) {
 		"a no-op AggregateIRStatus pass must perform ZERO writes (ResourceVersion unchanged)")
 }
 
+// TestAggregateIRStatus_ObservedGenerationTracksParentStamp drives
+// lifecycleObservedGeneration through the aggregator's write path across
+// IR-only spec changes; every expected value differs from the IR
+// generation at that step.
+func TestAggregateIRStatus_ObservedGenerationTracksParentStamp(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	isvc := baselineISVC("llama", "prod")
+	isvc.Generation = 7
+	ir := liveIR("llama", "prod", 1)
+	ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "7"
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
+		WithObjects(isvc, ir).
+		Build()
+	isvcKey := client.ObjectKeyFromObject(isvc)
+	irKey := client.ObjectKeyFromObject(ir)
+
+	liveObservedGeneration := func() int64 {
+		got := &v1beta1.InferenceService{}
+		g.Expect(c.Get(ctx, isvcKey, got)).To(gomega.Succeed())
+		lc := got.Status.Components[v1beta1.EngineComponent].Lifecycle
+		g.Expect(lc).NotTo(gomega.BeNil())
+		return lc.ObservedGeneration
+	}
+	setIRMeta := func(mutate func(*v1beta1.InferenceReplica)) {
+		cur := &v1beta1.InferenceReplica{}
+		g.Expect(c.Get(ctx, irKey, cur)).To(gomega.Succeed())
+		mutate(cur)
+		g.Expect(c.Update(ctx, cur)).To(gomega.Succeed())
+	}
+	setIRObserved := func(observed int64) {
+		cur := &v1beta1.InferenceReplica{}
+		g.Expect(c.Get(ctx, irKey, cur)).To(gomega.Succeed())
+		cur.Status.ObservedGeneration = observed
+		g.Expect(c.Status().Update(ctx, cur)).To(gomega.Succeed())
+	}
+
+	// Reconciled IR (generation 1 == observed 1) with stamp 7 → 7.
+	g.Expect(AggregateIRStatus(ctx, c, c, isvc, engineOMENativeModes)).To(gomega.Succeed())
+	g.Expect(liveObservedGeneration()).To(gomega.Equal(int64(7)),
+		"a reconciled IR must surface the parent-generation stamp")
+	g.Expect(isvc.Status.Components[v1beta1.EngineComponent].Lifecycle.ObservedGeneration).To(gomega.Equal(int64(7)),
+		"the in-memory mirror must carry the same value as the write")
+
+	// IR-only spec change (generation 2, observed still 1): the IR has not
+	// reconciled its new spec, so the live value is carried. The in-memory
+	// ISVC handed in has no Lifecycle block at all, which pins that the
+	// carry base is the LIVE ISVC, not the caller's snapshot.
+	setIRMeta(func(cur *v1beta1.InferenceReplica) { cur.Generation = 2 })
+	stale := baselineISVC("llama", "prod")
+	stale.Generation = 7
+	g.Expect(AggregateIRStatus(ctx, c, c, stale, engineOMENativeModes)).To(gomega.Succeed())
+	g.Expect(liveObservedGeneration()).To(gomega.Equal(int64(7)),
+		"an IR that has not reconciled its current spec must carry the live value, never its own generation")
+	g.Expect(stale.Status.Components[v1beta1.EngineComponent].Lifecycle.ObservedGeneration).To(gomega.Equal(int64(7)),
+		"the in-memory mirror must carry the live value even when the caller's snapshot had none")
+
+	// IR status catches up (observed 2 == generation 2): stamp 7 again.
+	setIRObserved(2)
+	g.Expect(AggregateIRStatus(ctx, c, c, isvc, engineOMENativeModes)).To(gomega.Succeed())
+	g.Expect(liveObservedGeneration()).To(gomega.Equal(int64(7)))
+
+	// Annotation-only re-projection (stamp 8, IR generation unchanged at 2):
+	// a metadata-only patch does not bump the IR generation, so the IR is
+	// still reconciled and the new stamp surfaces immediately.
+	setIRMeta(func(cur *v1beta1.InferenceReplica) {
+		cur.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "8"
+	})
+	isvc.Generation = 8
+	g.Expect(AggregateIRStatus(ctx, c, c, isvc, engineOMENativeModes)).To(gomega.Succeed())
+	g.Expect(liveObservedGeneration()).To(gomega.Equal(int64(8)),
+		"an annotation-only stamp bump must surface without an IR generation change")
+	g.Expect(isvc.Status.Components[v1beta1.EngineComponent].Lifecycle.ObservedGeneration).To(gomega.Equal(int64(8)))
+
+	// Steady state: a repeat pass over the unchanged IR and ISVC must not
+	// write (ResourceVersion stable).
+	before := &v1beta1.InferenceService{}
+	g.Expect(c.Get(ctx, isvcKey, before)).To(gomega.Succeed())
+	g.Expect(AggregateIRStatus(ctx, c, c, before.DeepCopy(), engineOMENativeModes)).To(gomega.Succeed())
+	after := &v1beta1.InferenceService{}
+	g.Expect(c.Get(ctx, isvcKey, after)).To(gomega.Succeed())
+	g.Expect(after.ResourceVersion).To(gomega.Equal(before.ResourceVersion),
+		"an unchanged generation rollup must perform ZERO writes")
+
+	// Sanity: the IR generation itself never appears on the ISVC.
+	cur := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(ctx, irKey, cur)).To(gomega.Succeed())
+	g.Expect(cur.Generation).To(gomega.Equal(int64(2)))
+	g.Expect(liveObservedGeneration()).NotTo(gomega.Equal(cur.Generation))
+}
+
 // TestIrStatusToComponentStatus_DeepCopiesCollisionCount pins the
 // aliasing guard for the fields the projector still copies. The
 // CollisionCount pointer must be a fresh allocation so downstream
@@ -624,7 +728,7 @@ func TestIrStatusToComponentStatus_DeepCopiesCollisionCount(t *testing.T) {
 			CollisionCount: ptr.To(int32(5)),
 		},
 	}
-	out := IRStatusToComponentStatus(ir)
+	out := IRStatusToComponentStatus(ir, nil)
 	g.Expect(out).NotTo(gomega.BeNil())
 
 	// CollisionCount pointer must NOT be aliased.

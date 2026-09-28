@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
+	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,6 +33,7 @@ import (
 	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	placementcontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/placement"
 )
 
@@ -44,20 +48,33 @@ const (
 )
 
 const (
-	trafficMapPublisherReasonPublished        = "Published"
-	trafficMapPublisherReasonWithdrawn        = "Withdrawn"
-	trafficMapPublisherReasonInvalidOwner     = "InvalidOwner"
-	trafficMapPublisherReasonInvalidOptions   = "InvalidOptions"
-	trafficMapPublisherReasonInvalidPlan      = "InvalidPlan"
-	trafficMapPublisherReasonLegacyActive     = "LegacyLifecycleActive"
-	trafficMapPublisherReasonClaimRejected    = "ClaimRejected"
-	trafficMapPublisherReasonDrainFailed      = "DrainFailed"
-	trafficMapPublisherReasonApplyFailed      = "ApplyFailed"
-	trafficMapPublisherReasonUnpublishFailed  = "UnpublishFailed"
-	trafficMapPublisherReasonPublisherChanged = "PublisherChanged"
-	trafficMapPublisherReasonUnpublished      = "Unpublished"
-	trafficMapPublisherOptionsDigestVersion   = "v1"
-	trafficMapPublisherStatusFieldOwner       = "ome-trafficmap-publisher"
+	trafficMapPublisherReasonPublished          = "Published"
+	trafficMapPublisherReasonWithdrawn          = "Withdrawn"
+	trafficMapPublisherReasonInvalidOwner       = "InvalidOwner"
+	trafficMapPublisherReasonInvalidOptions     = "InvalidOptions"
+	trafficMapPublisherReasonInvalidPlan        = "InvalidPlan"
+	trafficMapPublisherReasonLegacyActive       = "LegacyLifecycleActive"
+	trafficMapPublisherReasonClaimRejected      = "ClaimRejected"
+	trafficMapPublisherReasonDrainFailed        = "DrainFailed"
+	trafficMapPublisherReasonApplyFailed        = "ApplyFailed"
+	trafficMapPublisherReasonUnpublishFailed    = "UnpublishFailed"
+	trafficMapPublisherReasonPublisherChanged   = "PublisherChanged"
+	trafficMapPublisherReasonUnpublished        = "Unpublished"
+	trafficMapPublisherReasonCurrentPlan        = "CurrentPlanApplied"
+	trafficMapPublisherReasonApplyCurrent       = "ApplyCurrent"
+	trafficMapPublisherReasonUnsupported        = "Unsupported"
+	trafficMapPublisherReasonEligibilityUnknown = "EligibilityUnknown"
+	trafficMapPublisherOptionsDigestVersion     = "v1"
+	trafficMapPublisherStatusFieldOwner         = "ome-trafficmap-publisher"
+)
+
+// TrafficMapNoPositivePlanPolicy is the publisher-resolved action for a valid
+// current plan that contains no positive target weight.
+type TrafficMapNoPositivePlanPolicy string
+
+const (
+	TrafficMapNoPositivePlanPolicyApplyCurrent       TrafficMapNoPositivePlanPolicy = "ApplyCurrent"
+	TrafficMapNoPositivePlanPolicyRetainLastPositive TrafficMapNoPositivePlanPolicy = "RetainLastPositive"
 )
 
 // TrafficMapPublishPlan is an immutable, publisher-specific publication plan.
@@ -65,6 +82,38 @@ const (
 // controller persists that set before passing the plan back to Apply.
 type TrafficMapPublishPlan interface {
 	Claims() []string
+}
+
+// TrafficMapPublishPlanCapture is the publisher-neutral, post-transform view of
+// an opaque publication plan. Withdrawn is explicit because an empty withdrawal
+// and an empty, authoritative plan have different fallback semantics.
+type TrafficMapPublishPlanCapture struct {
+	Targets                 []v1beta1.TrafficMapPublisherTarget
+	PlanCompatibilityDigest string
+	NoPositivePlanPolicy    TrafficMapNoPositivePlanPolicy
+	// AllowAllHomesUnreadyFallback opts this publisher plan into replaying a
+	// compatible retained positive plan for a definitive AllHomesUnready
+	// routing verdict. This permits an earlier source generation and a current
+	// claim subset whose omitted retained targets all have zero weight. The
+	// shared default remains fail closed because the verdict can be a real outage.
+	AllowAllHomesUnreadyFallback bool
+	Withdrawn                    bool
+}
+
+// TrafficMapPublisherFallback is an optional capability for publishers whose
+// complete replay state is a bounded canonical target-to-weight set. Both
+// methods must be pure; the shared controller owns validation, persistence,
+// claim arbitration, ordering, and the call to Apply.
+type TrafficMapPublisherFallback interface {
+	Capture(TrafficMapPublishPlan) (TrafficMapPublishPlanCapture, error)
+	Replay(v1beta1.TrafficMapPublisherLastPositive) (TrafficMapPublishPlan, error)
+}
+
+type trafficMapPublicationPreparation struct {
+	previousClaims []string
+	expectedClaims []string
+	useFallback    bool
+	lastPositive   *v1beta1.TrafficMapPublisherLastPositive
 }
 
 // TrafficMapPublishResult reports the outcome of a successfully applied plan.
@@ -147,11 +196,20 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err := validatePublisherName(r.Publisher.Name()); err != nil {
 		return ctrl.Result{}, err
 	}
+	if _, capable := r.Publisher.(TrafficMapPublisherFallback); capable && !r.Publisher.Stateful() {
+		return ctrl.Result{}, fmt.Errorf(
+			"TrafficMap publisher %q exposes retained-plan fallback but is stateless", r.Publisher.Name(),
+		)
+	}
 
 	trafficMap := &v1beta1.TrafficMap{}
 	if err := r.Get(ctx, req.NamespacedName, trafficMap); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			deleteTrafficMapPublicationFallbackMetric(req.Namespace, req.Name, r.Publisher.Name())
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	recordTrafficMapPublicationFallbackMetric(trafficMap, r.Publisher.Name())
 	if !trafficMap.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, trafficMap)
 	}
@@ -180,6 +238,15 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 		return r.reject(ctx, trafficMap, trafficMapPublisherReasonInvalidOwner, err)
 	}
 	if !publisherOwnerActive(owner) {
+		if _, err := normalizedPublisherJournal(trafficMap.Status.Publisher, r.Publisher.Name()); err != nil {
+			return r.reject(ctx, trafficMap, trafficMapPublisherReasonPublisherChanged, err)
+		}
+		if err := r.markInactive(ctx, trafficMap); err != nil {
+			if errors.Is(err, errTrafficMapPublisherJournalChanged) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
 		return r.successResult(), nil
 	}
 	if r.Publisher.Stateful() && (trafficMap.Status.Publisher == nil ||
@@ -218,6 +285,18 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err != nil {
 		return r.reject(ctx, trafficMap, trafficMapPublisherReasonInvalidPlan, err)
 	}
+	var capture *TrafficMapPublishPlanCapture
+	if fallback, ok := r.Publisher.(TrafficMapPublisherFallback); ok {
+		captured, err := fallback.Capture(plan)
+		if err != nil {
+			return r.reject(ctx, trafficMap, trafficMapPublisherReasonInvalidPlan,
+				fmt.Errorf("capture TrafficMap publication plan: %w", err))
+		}
+		if err := validateTrafficMapPlanCapture(&captured, desiredClaims); err != nil {
+			return r.reject(ctx, trafficMap, trafficMapPublisherReasonInvalidPlan, err)
+		}
+		capture = &captured
+	}
 
 	if !r.Publisher.Stateful() {
 		if len(desiredClaims) != 0 {
@@ -244,12 +323,15 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 			}
 			return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonClaimRejected, err)
 		}
+		if err := r.markTransitioning(ctx, trafficMap, nil, false); err != nil {
+			return ctrl.Result{}, err
+		}
 		result, err := r.Publisher.Apply(ctx, plan)
 		if err != nil {
 			return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonApplyFailed, err)
 		}
-		if err := r.markPublished(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
-			trafficMap.Generation, nil, effectiveOptions, result); err != nil {
+		if err := r.markPublicationApplied(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
+			trafficMap.Generation, nil, effectiveOptions, result, nil, nil, false); err != nil {
 			if errors.Is(err, errTrafficMapPublisherJournalChanged) {
 				return ctrl.Result{Requeue: true}, nil
 			}
@@ -266,10 +348,13 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	previousClaims, err := r.preclaim(ctx, trafficMap, owner, desiredClaims)
+	preparation, err := r.preclaim(ctx, trafficMap, owner, desiredClaims, capture)
 	if err != nil {
 		if errors.Is(err, errTrafficMapPublisherPlanStale) {
 			return ctrl.Result{Requeue: true}, nil
+		}
+		if errors.Is(err, errTrafficMapPublisherEligibilityUnknown) {
+			return r.successResult(), nil
 		}
 		if errors.Is(err, errTrafficMapPublisherOwnerRead) {
 			return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonInvalidOwner, err)
@@ -286,8 +371,37 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 		}
 		return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonClaimRejected, err)
 	}
+	applyPlan := plan
+	if preparation.useFallback {
+		fallback := r.Publisher.(TrafficMapPublisherFallback)
+		replayed, replayErr := fallback.Replay(*copyTrafficMapLastPositive(preparation.lastPositive))
+		if replayErr == nil && replayed == nil {
+			replayErr = fmt.Errorf("publisher returned a nil replay plan")
+		}
+		if replayErr == nil {
+			replayedClaims, claimsErr := normalizePublisherClaims(replayed.Claims())
+			if claimsErr != nil {
+				replayErr = claimsErr
+			} else if !slices.Equal(replayedClaims, preparation.expectedClaims) {
+				replayErr = fmt.Errorf("replay claims %v do not exactly match durable claims %v",
+					replayedClaims, preparation.expectedClaims)
+			}
+		}
+		if replayErr != nil {
+			if err := r.invalidateLastPositive(ctx, trafficMap, preparation.expectedClaims); err != nil {
+				if errors.Is(err, errTrafficMapPublisherJournalChanged) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
+			preparation.useFallback = false
+			preparation.lastPositive = nil
+		} else {
+			applyPlan = replayed
+		}
+	}
 	if preflighter, ok := r.Publisher.(trafficMapPublisherPreflighter); ok {
-		if err := preflighter.Preflight(ctx, plan); err != nil {
+		if err := preflighter.Preflight(ctx, applyPlan); err != nil {
 			var terminal *terminalPublisherError
 			if errors.As(err, &terminal) {
 				return r.reject(ctx, trafficMap, trafficMapPublisherReasonClaimRejected, terminal.err)
@@ -295,19 +409,44 @@ func (r *TrafficMapPublisherReconciler) Reconcile(ctx context.Context, req ctrl.
 			return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonClaimRejected, err)
 		}
 	}
-	expectedClaims := publisherClaimUnion(previousClaims, desiredClaims)
-	staleClaims := publisherClaimDifference(previousClaims, desiredClaims)
+	staleClaims := []string(nil)
+	if !preparation.useFallback {
+		staleClaims = publisherClaimDifference(preparation.previousClaims, desiredClaims)
+	}
 	if len(staleClaims) != 0 {
 		if err := r.Publisher.Drain(ctx, client.ObjectKeyFromObject(trafficMap), slices.Clone(staleClaims)); err != nil {
 			return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonDrainFailed, err)
 		}
 	}
-	result, err := r.Publisher.Apply(ctx, plan)
+	result, err := r.Publisher.Apply(ctx, applyPlan)
 	if err != nil {
 		return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonApplyFailed, err)
 	}
-	if err := r.markPublished(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
-		trafficMap.Generation, expectedClaims, effectiveOptions, result); err != nil {
+	if preparation.useFallback && result.Withdrawn {
+		return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonApplyFailed,
+			fmt.Errorf("publisher reported withdrawal while replaying a retained positive plan"))
+	}
+	if !preparation.useFallback && capture != nil && result.Withdrawn != capture.Withdrawn {
+		if err := r.invalidateLastPositive(ctx, trafficMap, preparation.expectedClaims); err != nil {
+			if errors.Is(err, errTrafficMapPublisherJournalChanged) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		return r.retryFailure(ctx, trafficMap, trafficMapPublisherReasonApplyFailed, fmt.Errorf(
+			"publisher Apply withdrawal result %t does not match captured plan withdrawal %t",
+			result.Withdrawn, capture.Withdrawn,
+		))
+	}
+	var committed *v1beta1.TrafficMapPublisherLastPositive
+	if !preparation.useFallback && capture != nil && trafficMapPlanCapturePositive(capture) && !capture.Withdrawn {
+		committed = trafficMapLastPositiveFromCapture(
+			trafficMap.Generation, owner.Generation, preparation.expectedClaims, capture,
+		)
+	}
+	if err := r.markPublicationApplied(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
+		trafficMap.Generation, preparation.expectedClaims, effectiveOptions, result,
+		preparation.lastPositive, committed, preparation.useFallback); err != nil {
 		if errors.Is(err, errTrafficMapPublisherJournalChanged) {
 			return ctrl.Result{Requeue: true}, nil
 		}
@@ -382,16 +521,16 @@ func (r *TrafficMapPublisherReconciler) validateLivePublisherOwner(
 	ctx context.Context,
 	trafficMap *v1beta1.TrafficMap,
 	expected *v1beta1.InferenceService,
-) error {
+) (*v1beta1.InferenceService, error) {
 	owner, err := r.readTrafficMapOwner(ctx, trafficMap)
 	if err != nil {
 		if errors.Is(err, errTrafficMapPublisherOwnerRead) {
-			return err
+			return nil, err
 		}
-		return fmt.Errorf("%w: %v", errTrafficMapPublisherSourceChanged, err)
+		return nil, fmt.Errorf("%w: %v", errTrafficMapPublisherSourceChanged, err)
 	}
 	if owner.UID != expected.UID || owner.Generation != expected.Generation {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"%w: InferenceService %s identity changed from UID %q generation %d to UID %q generation %d",
 			errTrafficMapPublisherSourceChanged, client.ObjectKeyFromObject(owner),
 			expected.UID, expected.Generation, owner.UID, owner.Generation,
@@ -399,15 +538,21 @@ func (r *TrafficMapPublisherReconciler) validateLivePublisherOwner(
 	}
 	if !equality.Semantic.DeepEqual(owner.Labels, expected.Labels) ||
 		!equality.Semantic.DeepEqual(owner.Annotations, expected.Annotations) ||
-		!equality.Semantic.DeepEqual(owner.Finalizers, expected.Finalizers) {
-		return fmt.Errorf("%w: InferenceService %s publication metadata changed while planning",
+		!equality.Semantic.DeepEqual(owner.Finalizers, expected.Finalizers) ||
+		owner.Status.ObservedGeneration != expected.Status.ObservedGeneration ||
+		!equality.Semantic.DeepEqual(owner.Status.Placement, expected.Status.Placement) ||
+		!equality.Semantic.DeepEqual(
+			owner.Status.GetCondition(apis.ConditionReady),
+			expected.Status.GetCondition(apis.ConditionReady),
+		) {
+		return nil, fmt.Errorf("%w: InferenceService %s publication inputs changed while planning",
 			errTrafficMapPublisherSourceChanged, client.ObjectKeyFromObject(owner))
 	}
 	if !publisherOwnerActive(owner) {
-		return fmt.Errorf("%w: InferenceService %s is deleting, opted out, or not placement eligible",
+		return nil, fmt.Errorf("%w: InferenceService %s is deleting, opted out, or not placement eligible",
 			errTrafficMapPublisherSourceChanged, client.ObjectKeyFromObject(owner))
 	}
-	return nil
+	return owner, nil
 }
 
 func (r *TrafficMapPublisherReconciler) ensureFinalizer(
@@ -449,9 +594,10 @@ func (r *TrafficMapPublisherReconciler) preclaim(
 	trafficMap *v1beta1.TrafficMap,
 	owner *v1beta1.InferenceService,
 	desiredClaims []string,
-) ([]string, error) {
+	capture *TrafficMapPublishPlanCapture,
+) (*trafficMapPublicationPreparation, error) {
 	key := client.ObjectKeyFromObject(trafficMap)
-	var previousClaims []string
+	var preparation *trafficMapPublicationPreparation
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		live := &v1beta1.TrafficMap{}
 		if err := r.APIReader.Get(ctx, key, live); err != nil {
@@ -465,17 +611,74 @@ func (r *TrafficMapPublisherReconciler) preclaim(
 		if live.Generation != trafficMap.Generation || !live.DeletionTimestamp.IsZero() {
 			return errTrafficMapPublisherPlanStale
 		}
-		if err := r.validateLivePublisherOwner(ctx, live, owner); err != nil {
+		liveOwner, err := r.validateLivePublisherOwner(ctx, live, owner)
+		if err != nil {
 			return err
 		}
 		if !controllerutil.ContainsFinalizer(live, TrafficMapPublisherFinalizer) {
 			return errTrafficMapPublisherPlanStale
 		}
 
-		existing, digest, err := publisherJournalForName(live.Status.Publisher, r.Publisher.Name())
+		journal, err := normalizedPublisherJournal(live.Status.Publisher, r.Publisher.Name())
 		if err != nil {
 			return &terminalPublisherError{err: err}
 		}
+		existing := journal.ClaimedTargets
+
+		if capture != nil && !capture.Withdrawn &&
+			!trafficMapPlanCapturePositive(capture) &&
+			capture.NoPositivePlanPolicy == TrafficMapNoPositivePlanPolicyRetainLastPositive {
+			eligible, known := trafficMapFallbackEligibilityWithAllHomesUnready(
+				live, liveOwner, capture.AllowAllHomesUnreadyFallback,
+			)
+			if !known {
+				if err := r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
+					setTrafficMapPublicationConditions(
+						status, live.Generation, metav1.ConditionUnknown,
+						trafficMapPublisherReasonEligibilityUnknown,
+						"TrafficMap fallback eligibility cannot be determined from fresh status",
+					)
+					return nil
+				}); err != nil {
+					return err
+				}
+				return errTrafficMapPublisherEligibilityUnknown
+			}
+			allHomesUnready := eligible && capture.AllowAllHomesUnreadyFallback &&
+				trafficMapRoutableReason(live) == v1beta1.TrafficMapReasonAllHomesUnready
+			claimsCompatible := publisherClaimsReplayCompatible(desiredClaims, existing)
+			validateLastPositive := validateTrafficMapLastPositive
+			if allHomesUnready {
+				claimsCompatible = publisherClaimsReplayCompatibleForAllHomesUnready(
+					desiredClaims, existing, journal.LastPositive,
+				)
+				validateLastPositive = validateTrafficMapLastPositiveFromEarlierGeneration
+			}
+			if eligible && claimsCompatible && validateLastPositive(
+				journal.LastPositive, existing, liveOwner.Generation,
+				capture.PlanCompatibilityDigest, live.Generation,
+			) == nil {
+				if err := r.rejectClaimCollisions(ctx, live, existing); err != nil {
+					return err
+				}
+				preparation = &trafficMapPublicationPreparation{
+					previousClaims: slices.Clone(existing),
+					expectedClaims: slices.Clone(existing),
+					useFallback:    true,
+					lastPositive:   copyTrafficMapLastPositive(journal.LastPositive),
+				}
+				return r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
+					status.Publisher = copyTrafficMapPublisherJournal(journal)
+					setTrafficMapPublicationConditions(
+						status, live.Generation, metav1.ConditionUnknown,
+						v1beta1.TrafficMapReasonPublicationTransitioning,
+						"TrafficMap publisher is transitioning to a retained positive plan",
+					)
+					return nil
+				})
+			}
+		}
+
 		union := publisherClaimUnion(existing, desiredClaims)
 		if len(union) > v1beta1.MaxTrafficMapPublisherTargets {
 			return &terminalPublisherError{err: fmt.Errorf(
@@ -485,20 +688,575 @@ func (r *TrafficMapPublisherReconciler) preclaim(
 		if err := r.rejectClaimCollisions(ctx, live, union); err != nil {
 			return err
 		}
-		previousClaims = slices.Clone(existing)
+
+		keepLastPositive := false
+		if capture != nil && !capture.Withdrawn && trafficMapPlanCapturePositive(capture) {
+			keepLastPositive = slices.Equal(existing, desiredClaims) && validateTrafficMapLastPositive(
+				journal.LastPositive, union, liveOwner.Generation,
+				capture.PlanCompatibilityDigest, live.Generation,
+			) == nil
+			if !keepLastPositive && capture.AllowAllHomesUnreadyFallback {
+				keepLastPositive = publisherClaimsReplayCompatibleForAllHomesUnready(
+					desiredClaims, existing, journal.LastPositive,
+				) && validateTrafficMapLastPositiveFromEarlierGeneration(
+					journal.LastPositive, existing, liveOwner.Generation,
+					capture.PlanCompatibilityDigest, live.Generation,
+				) == nil
+			}
+		}
+		lastPositive := journal.LastPositive
+		if !keepLastPositive {
+			lastPositive = nil
+		}
+		preparation = &trafficMapPublicationPreparation{
+			previousClaims: slices.Clone(existing),
+			expectedClaims: slices.Clone(union),
+			lastPositive:   copyTrafficMapLastPositive(lastPositive),
+		}
 		return r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
 			status.Publisher = &v1beta1.TrafficMapPublisherStatus{
 				PublisherName:         r.Publisher.Name(),
 				ClaimedTargets:        slices.Clone(union),
-				ObservedOptionsDigest: digest,
+				ObservedOptionsDigest: journal.ObservedOptionsDigest,
+				LastPositive:          copyTrafficMapLastPositive(lastPositive),
 			}
+			setTrafficMapPublicationConditions(
+				status, live.Generation, metav1.ConditionUnknown,
+				v1beta1.TrafficMapReasonPublicationTransitioning,
+				"TrafficMap publisher is applying the current plan",
+			)
 			return nil
 		})
 	})
 	if errors.Is(err, errTrafficMapPublisherPlanStale) {
 		return nil, errTrafficMapPublisherPlanStale
 	}
-	return previousClaims, err
+	return preparation, err
+}
+
+func (r *TrafficMapPublisherReconciler) markTransitioning(
+	ctx context.Context,
+	trafficMap *v1beta1.TrafficMap,
+	expectedClaims []string,
+	keepLastPositive bool,
+) error {
+	return r.patchStatusByKey(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
+		func(status *v1beta1.TrafficMapStatus) error {
+			claims, _, err := publisherJournalForName(status.Publisher, r.Publisher.Name())
+			if err != nil {
+				return fmt.Errorf("%w: %v", errTrafficMapPublisherJournalChanged, err)
+			}
+			if !slices.Equal(claims, expectedClaims) {
+				return fmt.Errorf("%w: claimed targets changed from %v to %v",
+					errTrafficMapPublisherJournalChanged, expectedClaims, claims)
+			}
+			if status.Publisher != nil && !keepLastPositive {
+				status.Publisher.LastPositive = nil
+			}
+			setTrafficMapPublicationConditions(
+				status, trafficMap.Generation, metav1.ConditionUnknown,
+				v1beta1.TrafficMapReasonPublicationTransitioning,
+				"TrafficMap publisher is applying the current plan",
+			)
+			return nil
+		})
+}
+
+func (r *TrafficMapPublisherReconciler) invalidateLastPositive(
+	ctx context.Context,
+	trafficMap *v1beta1.TrafficMap,
+	expectedClaims []string,
+) error {
+	return r.patchStatusByKey(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
+		func(status *v1beta1.TrafficMapStatus) error {
+			claims, _, err := publisherJournalForName(status.Publisher, r.Publisher.Name())
+			if err != nil || status.Publisher == nil || !slices.Equal(claims, expectedClaims) {
+				return fmt.Errorf("%w: retained plan journal changed", errTrafficMapPublisherJournalChanged)
+			}
+			status.Publisher.LastPositive = nil
+			setTrafficMapPublicationConditions(
+				status, trafficMap.Generation, metav1.ConditionUnknown,
+				v1beta1.TrafficMapReasonPublicationTransitioning,
+				"TrafficMap retained plan is invalid; applying the current plan",
+			)
+			return nil
+		})
+}
+
+func (r *TrafficMapPublisherReconciler) markInactive(
+	ctx context.Context,
+	trafficMap *v1beta1.TrafficMap,
+) error {
+	return r.patchStatusByKey(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
+		func(status *v1beta1.TrafficMapStatus) error {
+			if _, err := normalizedPublisherJournal(status.Publisher, r.Publisher.Name()); err != nil {
+				return fmt.Errorf("%w: %v", errTrafficMapPublisherJournalChanged, err)
+			}
+			status.Published = false
+			if status.Publisher != nil {
+				status.Publisher.LastPositive = nil
+			}
+			apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type:               v1beta1.TrafficMapPublished,
+				Status:             metav1.ConditionFalse,
+				Reason:             trafficMapPublisherReasonUnpublished,
+				Message:            "TrafficMap source is deleting or has opted out of publication",
+				ObservedGeneration: trafficMap.Generation,
+			})
+			apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type:               v1beta1.TrafficMapPublicationFallback,
+				Status:             metav1.ConditionFalse,
+				Reason:             trafficMapPublisherReasonUnpublished,
+				Message:            "TrafficMap publication fallback is inactive",
+				ObservedGeneration: trafficMap.Generation,
+			})
+			return nil
+		})
+}
+
+func setTrafficMapPublicationConditions(
+	status *v1beta1.TrafficMapStatus,
+	generation int64,
+	fallbackStatus metav1.ConditionStatus,
+	reason string,
+	message string,
+) {
+	status.Published = false
+	apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               v1beta1.TrafficMapPublished,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: generation,
+	})
+	apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               v1beta1.TrafficMapPublicationFallback,
+		Status:             fallbackStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: generation,
+	})
+}
+
+func normalizedPublisherJournal(
+	journal *v1beta1.TrafficMapPublisherStatus,
+	name string,
+) (*v1beta1.TrafficMapPublisherStatus, error) {
+	claims, digest, err := publisherJournalForName(journal, name)
+	if err != nil {
+		return nil, err
+	}
+	normalized := &v1beta1.TrafficMapPublisherStatus{
+		PublisherName:         name,
+		ClaimedTargets:        claims,
+		ObservedOptionsDigest: digest,
+	}
+	if journal != nil && journal.PublisherName == name {
+		normalized.LastPositive = copyTrafficMapLastPositive(journal.LastPositive)
+	}
+	return normalized, nil
+}
+
+func copyTrafficMapPublisherJournal(
+	journal *v1beta1.TrafficMapPublisherStatus,
+) *v1beta1.TrafficMapPublisherStatus {
+	if journal == nil {
+		return nil
+	}
+	return &v1beta1.TrafficMapPublisherStatus{
+		PublisherName:         journal.PublisherName,
+		ClaimedTargets:        slices.Clone(journal.ClaimedTargets),
+		ObservedOptionsDigest: journal.ObservedOptionsDigest,
+		LastPositive:          copyTrafficMapLastPositive(journal.LastPositive),
+	}
+}
+
+func copyTrafficMapLastPositive(
+	lastPositive *v1beta1.TrafficMapPublisherLastPositive,
+) *v1beta1.TrafficMapPublisherLastPositive {
+	if lastPositive == nil {
+		return nil
+	}
+	return &v1beta1.TrafficMapPublisherLastPositive{
+		TrafficMapGeneration:    lastPositive.TrafficMapGeneration,
+		ObservedISVCGeneration:  lastPositive.ObservedISVCGeneration,
+		PlanCompatibilityDigest: lastPositive.PlanCompatibilityDigest,
+		Targets:                 slices.Clone(lastPositive.Targets),
+	}
+}
+
+func validateTrafficMapPlanCapture(
+	capture *TrafficMapPublishPlanCapture,
+	desiredClaims []string,
+) error {
+	if capture == nil {
+		return fmt.Errorf("TrafficMap publisher returned a nil plan capture")
+	}
+	if capture.NoPositivePlanPolicy != TrafficMapNoPositivePlanPolicyApplyCurrent &&
+		capture.NoPositivePlanPolicy != TrafficMapNoPositivePlanPolicyRetainLastPositive {
+		return fmt.Errorf("publisher returned unknown no-positive plan policy %q",
+			capture.NoPositivePlanPolicy)
+	}
+	if capture.AllowAllHomesUnreadyFallback &&
+		capture.NoPositivePlanPolicy != TrafficMapNoPositivePlanPolicyRetainLastPositive {
+		return fmt.Errorf("AllHomesUnready fallback requires no-positive plan policy %q",
+			TrafficMapNoPositivePlanPolicyRetainLastPositive)
+	}
+	if capture.AllowAllHomesUnreadyFallback && capture.Withdrawn {
+		return fmt.Errorf("withdrawn publisher plan cannot enable AllHomesUnready fallback")
+	}
+	if err := validatePublisherDigest(capture.PlanCompatibilityDigest); err != nil {
+		return fmt.Errorf("invalid plan compatibility digest: %w", err)
+	}
+	targets, claims, _, err := normalizeTrafficMapPublisherTargets(capture.Targets, false)
+	if err != nil {
+		return fmt.Errorf("invalid captured publisher targets: %w", err)
+	}
+	if !slices.Equal(claims, desiredClaims) {
+		return fmt.Errorf("captured target set %v does not exactly match plan claims %v", claims, desiredClaims)
+	}
+	if capture.Withdrawn && trafficMapTargetsPositive(targets) {
+		return fmt.Errorf("withdrawn publisher plan contains a positive target weight")
+	}
+	capture.Targets = targets
+	return nil
+}
+
+func validateTrafficMapLastPositive(
+	lastPositive *v1beta1.TrafficMapPublisherLastPositive,
+	claims []string,
+	ownerGeneration int64,
+	compatibilityDigest string,
+	currentTrafficMapGeneration int64,
+) error {
+	return validateTrafficMapLastPositiveGeneration(
+		lastPositive, claims, ownerGeneration, compatibilityDigest,
+		currentTrafficMapGeneration, false,
+	)
+}
+
+func validateTrafficMapLastPositiveFromEarlierGeneration(
+	lastPositive *v1beta1.TrafficMapPublisherLastPositive,
+	claims []string,
+	ownerGeneration int64,
+	compatibilityDigest string,
+	currentTrafficMapGeneration int64,
+) error {
+	return validateTrafficMapLastPositiveGeneration(
+		lastPositive, claims, ownerGeneration, compatibilityDigest,
+		currentTrafficMapGeneration, true,
+	)
+}
+
+func validateTrafficMapLastPositiveGeneration(
+	lastPositive *v1beta1.TrafficMapPublisherLastPositive,
+	claims []string,
+	ownerGeneration int64,
+	compatibilityDigest string,
+	currentTrafficMapGeneration int64,
+	allowPreviousOwnerGeneration bool,
+) error {
+	if lastPositive == nil {
+		return fmt.Errorf("retained positive plan is absent")
+	}
+	if lastPositive.TrafficMapGeneration < 1 ||
+		lastPositive.TrafficMapGeneration > currentTrafficMapGeneration {
+		return fmt.Errorf("retained TrafficMap generation %d is outside [1,%d]",
+			lastPositive.TrafficMapGeneration, currentTrafficMapGeneration)
+	}
+	if lastPositive.ObservedISVCGeneration < 1 ||
+		lastPositive.ObservedISVCGeneration > ownerGeneration ||
+		(!allowPreviousOwnerGeneration && lastPositive.ObservedISVCGeneration != ownerGeneration) {
+		return fmt.Errorf("retained source generation %d does not match current generation %d",
+			lastPositive.ObservedISVCGeneration, ownerGeneration)
+	}
+	if err := validatePublisherDigest(lastPositive.PlanCompatibilityDigest); err != nil {
+		return fmt.Errorf("invalid retained plan compatibility digest: %w", err)
+	}
+	if lastPositive.PlanCompatibilityDigest != compatibilityDigest {
+		return fmt.Errorf("retained plan compatibility digest does not match current options")
+	}
+	_, targetClaims, positive, err := normalizeTrafficMapPublisherTargets(lastPositive.Targets, true)
+	if err != nil {
+		return fmt.Errorf("invalid retained publisher targets: %w", err)
+	}
+	if !positive {
+		return fmt.Errorf("retained publisher plan has no positive target")
+	}
+	if !slices.Equal(targetClaims, claims) {
+		return fmt.Errorf("retained target set %v does not exactly match durable claims %v",
+			targetClaims, claims)
+	}
+	return nil
+}
+
+func normalizeTrafficMapPublisherTargets(
+	targets []v1beta1.TrafficMapPublisherTarget,
+	requireNonEmpty bool,
+) ([]v1beta1.TrafficMapPublisherTarget, []string, bool, error) {
+	if requireNonEmpty && len(targets) == 0 {
+		return nil, nil, false, fmt.Errorf("publisher target list must not be empty")
+	}
+	if len(targets) > v1beta1.MaxTrafficMapPublisherTargets {
+		return nil, nil, false, fmt.Errorf("publisher plan has %d targets, maximum is %d",
+			len(targets), v1beta1.MaxTrafficMapPublisherTargets)
+	}
+	normalized := slices.Clone(targets)
+	slices.SortFunc(normalized, func(left, right v1beta1.TrafficMapPublisherTarget) int {
+		return strings.Compare(left.Target, right.Target)
+	})
+	claims := make([]string, len(normalized))
+	positive := false
+	for i := range normalized {
+		target := normalized[i]
+		if target.Target == "" {
+			return nil, nil, false, fmt.Errorf("publisher target must not be empty")
+		}
+		if len(target.Target) > v1beta1.MaxTrafficMapPublisherTargetLength {
+			return nil, nil, false, fmt.Errorf("publisher target %q has %d bytes, maximum is %d",
+				target.Target, len(target.Target), v1beta1.MaxTrafficMapPublisherTargetLength)
+		}
+		if target.Weight < 0 {
+			return nil, nil, false, fmt.Errorf("publisher target %q has negative weight %d",
+				target.Target, target.Weight)
+		}
+		if i > 0 && target.Target == normalized[i-1].Target {
+			return nil, nil, false, fmt.Errorf("publisher plan contains duplicate target %q", target.Target)
+		}
+		claims[i] = target.Target
+		positive = positive || target.Weight > 0
+	}
+	return normalized, claims, positive, nil
+}
+
+func validatePublisherDigest(digest string) error {
+	if len(digest) != len("sha256:")+sha256.Size*2 || digest[:len("sha256:")] != "sha256:" {
+		return fmt.Errorf("must match sha256:<64 lowercase hex characters>")
+	}
+	hexDigest := digest[len("sha256:"):]
+	if hexDigest != strings.ToLower(hexDigest) {
+		return fmt.Errorf("must use lowercase hexadecimal")
+	}
+	if _, err := hex.DecodeString(hexDigest); err != nil {
+		return fmt.Errorf("must use hexadecimal: %w", err)
+	}
+	return nil
+}
+
+func trafficMapPlanCapturePositive(capture *TrafficMapPublishPlanCapture) bool {
+	return capture != nil && trafficMapTargetsPositive(capture.Targets)
+}
+
+func trafficMapTargetsPositive(targets []v1beta1.TrafficMapPublisherTarget) bool {
+	return slices.ContainsFunc(targets, func(target v1beta1.TrafficMapPublisherTarget) bool {
+		return target.Weight > 0
+	})
+}
+
+func trafficMapLastPositiveFromCapture(
+	trafficMapGeneration int64,
+	ownerGeneration int64,
+	claims []string,
+	capture *TrafficMapPublishPlanCapture,
+) *v1beta1.TrafficMapPublisherLastPositive {
+	weights := make(map[string]int64, len(capture.Targets))
+	for _, target := range capture.Targets {
+		weights[target.Target] = target.Weight
+	}
+	targets := make([]v1beta1.TrafficMapPublisherTarget, 0, len(claims))
+	for _, claim := range claims {
+		targets = append(targets, v1beta1.TrafficMapPublisherTarget{
+			Target: claim,
+			Weight: weights[claim],
+		})
+	}
+	return &v1beta1.TrafficMapPublisherLastPositive{
+		TrafficMapGeneration:    trafficMapGeneration,
+		ObservedISVCGeneration:  ownerGeneration,
+		PlanCompatibilityDigest: capture.PlanCompatibilityDigest,
+		Targets:                 targets,
+	}
+}
+
+func trafficMapFallbackEligibility(
+	trafficMap *v1beta1.TrafficMap,
+	owner *v1beta1.InferenceService,
+) (eligible bool, known bool) {
+	return trafficMapFallbackEligibilityWithAllHomesUnready(trafficMap, owner, false)
+}
+
+func trafficMapFallbackEligibilityWithAllHomesUnready(
+	trafficMap *v1beta1.TrafficMap,
+	owner *v1beta1.InferenceService,
+	allowAllHomesUnready bool,
+) (eligible bool, known bool) {
+	if trafficMap == nil || owner == nil {
+		return false, false
+	}
+	if _, found := owner.Annotations[constants.TrafficDrainAnnotation]; found {
+		return false, true
+	}
+	if owner.Status.ObservedGeneration != owner.Generation {
+		return false, false
+	}
+	routable := apimeta.FindStatusCondition(trafficMap.Status.Conditions, v1beta1.TrafficMapRoutable)
+	override := apimeta.FindStatusCondition(trafficMap.Status.Conditions, v1beta1.TrafficMapOverrideActive)
+	if routable == nil || override == nil ||
+		routable.ObservedGeneration != trafficMap.Generation ||
+		override.ObservedGeneration != trafficMap.Generation {
+		return false, false
+	}
+	if routable.Status != metav1.ConditionFalse {
+		return false, false
+	}
+	if trafficMapPlacementMode(trafficMap.Spec.Mode) != trafficMapOwnerPlacementMode(owner) {
+		return false, false
+	}
+	if override.Status != metav1.ConditionFalse || override.Reason != v1beta1.TrafficMapReasonNoOverrides {
+		return false, false
+	}
+	placement := owner.Status.Placement
+	if placement == nil {
+		return false, true
+	}
+	ready := owner.Status.GetCondition(apis.ConditionReady)
+	placementUnknown := ready != nil && ready.Status == corev1.ConditionUnknown &&
+		ready.Reason == placementcontroller.PlacementReadyReasonUnknown
+	switch routable.Reason {
+	case v1beta1.TrafficMapReasonNotPlaced:
+		if len(trafficMap.Spec.Entries) != 0 {
+			return false, false
+		}
+		if placement.Phase == v1beta1.PlacementPhasePlaced {
+			// Both eligible routing states have an empty plan, so a status-only
+			// source transition (including address recovery) can reach us before
+			// Routable changes reason or the routing spec becomes positive.
+			return false, false
+		}
+		if trafficMapPlacementMode(trafficMap.Spec.Mode) != v1beta1.PlacementModeSingle ||
+			placement.Phase == v1beta1.PlacementPhaseAdmitting ||
+			placement.Phase == v1beta1.PlacementPhaseRacing || //nolint:staticcheck // Treat legacy status as definitive during rolling upgrades.
+			placement.Phase == v1beta1.PlacementPhaseFailed {
+			return false, true
+		}
+		if placement.Phase != v1beta1.PlacementPhasePending {
+			return false, false
+		}
+		if placement.Cluster == "" {
+			return false, true
+		}
+		if placement.Endpoint != nil || len(placement.Candidates) != 0 {
+			return false, false
+		}
+		if placementUnknown {
+			return false, false
+		}
+		if ready == nil {
+			return false, false
+		}
+		return trafficMapSinglePlacementLost(trafficMap.Spec.Mode, placement, ready), true
+	case v1beta1.TrafficMapReasonNoAddressableHome:
+		if len(trafficMap.Spec.Entries) != 0 {
+			return false, false
+		}
+		if placement.Phase == v1beta1.PlacementPhasePending {
+			// The source has reached the other eligible empty-plan state while
+			// the routing condition still names the previous one.
+			return false, false
+		}
+		if placement.Phase == v1beta1.PlacementPhaseAdmitting ||
+			placement.Phase == v1beta1.PlacementPhaseRacing || //nolint:staticcheck // Treat legacy status as definitive during rolling upgrades.
+			placement.Phase == v1beta1.PlacementPhaseFailed {
+			return false, true
+		}
+		if placement.Phase != v1beta1.PlacementPhasePlaced {
+			return false, false
+		}
+		if placementUnknown {
+			return false, false
+		}
+		if ready == nil {
+			return false, false
+		}
+		if placement.Endpoint != nil && placement.Endpoint.Host != "" {
+			return false, false
+		}
+		hasReadyWithoutAddress := false
+		for _, candidate := range placement.Candidates {
+			if candidate.Endpoint != nil && candidate.Endpoint.Host != "" {
+				return false, false
+			}
+			hasReadyWithoutAddress = hasReadyWithoutAddress || candidate.ReadyReplicas > 0
+		}
+		return hasReadyWithoutAddress, true
+	case v1beta1.TrafficMapReasonAllHomesUnready:
+		if placement.Phase != v1beta1.PlacementPhaseAdmitting &&
+			placement.Phase != v1beta1.PlacementPhaseFailed && placementUnknown {
+			return false, false
+		}
+		if !allowAllHomesUnready {
+			return false, true
+		}
+		if placement.Phase == v1beta1.PlacementPhaseAdmitting ||
+			placement.Phase == v1beta1.PlacementPhaseFailed {
+			return false, true
+		}
+		if placement.Phase != v1beta1.PlacementPhasePlaced || ready == nil ||
+			ready.Status != corev1.ConditionFalse || len(trafficMap.Spec.Entries) == 0 {
+			return false, false
+		}
+		for _, entry := range trafficMap.Spec.Entries {
+			if entry.Endpoint == nil || entry.Endpoint.Host == "" || entry.Weight != 0 || entry.Healthy {
+				return false, false
+			}
+			if len(entry.DrainRefs) != 0 || entry.Probe != nil && entry.Probe.Gated {
+				return false, true
+			}
+			if entry.Capacity == nil {
+				return false, false
+			}
+			if entry.Capacity.Allocated <= 0 {
+				return false, true
+			}
+			if entry.Capacity.Ready != 0 {
+				return false, false
+			}
+		}
+		return true, true
+	case v1beta1.TrafficMapReasonNoRoutableCapacity,
+		v1beta1.TrafficMapReasonAllHomesProbeFailed,
+		v1beta1.TrafficMapReasonTrafficDrain:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func trafficMapSinglePlacementLost(
+	mode v1beta1.PlacementMode,
+	placement *v1beta1.PlacementStatus,
+	ready *apis.Condition,
+) bool {
+	return placement != nil && ready != nil &&
+		trafficMapPlacementMode(mode) == v1beta1.PlacementModeSingle &&
+		placement.Phase == v1beta1.PlacementPhasePending &&
+		placement.Cluster != "" && placement.Endpoint == nil && len(placement.Candidates) == 0 &&
+		ready.Status == corev1.ConditionUnknown &&
+		ready.Reason == placementcontroller.PlacementReadyReasonLost
+}
+
+func trafficMapPlacementMode(mode v1beta1.PlacementMode) v1beta1.PlacementMode {
+	if mode == "" {
+		return v1beta1.PlacementModeSingle
+	}
+	return mode
+}
+
+func trafficMapOwnerPlacementMode(owner *v1beta1.InferenceService) v1beta1.PlacementMode {
+	if owner == nil || owner.Spec.Placement == nil {
+		return v1beta1.PlacementModeSingle
+	}
+	return trafficMapPlacementMode(owner.Spec.Placement.Mode)
 }
 
 func (r *TrafficMapPublisherReconciler) preflightStateless(
@@ -519,7 +1277,7 @@ func (r *TrafficMapPublisherReconciler) preflightStateless(
 	if live.Generation != trafficMap.Generation || !live.DeletionTimestamp.IsZero() {
 		return errTrafficMapPublisherPlanStale
 	}
-	if err := r.validateLivePublisherOwner(ctx, live, owner); err != nil {
+	if _, err := r.validateLivePublisherOwner(ctx, live, owner); err != nil {
 		return err
 	}
 	existingClaims, _, err := publisherJournalForName(live.Status.Publisher, r.Publisher.Name())
@@ -605,11 +1363,35 @@ func (r *TrafficMapPublisherReconciler) finalize(
 		return ctrl.Result{}, fmt.Errorf("TrafficMap %s was replaced while finalizing publisher state", key)
 	}
 	if !controllerutil.ContainsFinalizer(live, TrafficMapPublisherFinalizer) {
+		deleteTrafficMapPublicationFallbackMetric(key.Namespace, key.Name, r.Publisher.Name())
 		return ctrl.Result{}, nil
+	}
+	if _, err := normalizedPublisherJournal(live.Status.Publisher, r.Publisher.Name()); err != nil {
+		return r.reject(ctx, live, trafficMapPublisherReasonPublisherChanged, err)
+	}
+	if err := r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
+		if status.Publisher != nil {
+			status.Publisher.LastPositive = nil
+		}
+		setTrafficMapPublicationConditions(
+			status, live.Generation, metav1.ConditionFalse,
+			v1beta1.TrafficMapReasonPublicationFinalizing,
+			"TrafficMap publisher is removing external state",
+		)
+		return nil
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	live = &v1beta1.TrafficMap{}
+	if err := r.APIReader.Get(ctx, key, live); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if live.UID != trafficMap.UID {
+		return ctrl.Result{}, fmt.Errorf("TrafficMap %s was replaced while finalizing publisher state", key)
 	}
 	journal := v1beta1.TrafficMapPublisherStatus{PublisherName: r.Publisher.Name()}
 	if live.Status.Publisher != nil {
-		journal = *live.Status.Publisher.DeepCopy()
+		journal = *copyTrafficMapPublisherJournal(live.Status.Publisher)
 	}
 	claims, digest, err := publisherJournalForName(&journal, r.Publisher.Name())
 	if err != nil {
@@ -619,7 +1401,8 @@ func (r *TrafficMapPublisherReconciler) finalize(
 	journal.ClaimedTargets = claims
 	journal.ObservedOptionsDigest = digest
 	if err := r.Publisher.Unpublish(ctx, key, *journal.DeepCopy()); err != nil {
-		return r.retryFailure(ctx, live, trafficMapPublisherReasonUnpublishFailed, err)
+		r.Log.Error(err, "TrafficMap publisher finalization failed", "trafficMap", key)
+		return ctrl.Result{}, err
 	}
 	if err := r.clearPublisherJournal(ctx, key, live.UID, journal); err != nil {
 		if errors.Is(err, errTrafficMapPublisherJournalChanged) {
@@ -630,6 +1413,7 @@ func (r *TrafficMapPublisherReconciler) finalize(
 	if err := r.removeFinalizer(ctx, key, live.UID); err != nil {
 		return ctrl.Result{}, err
 	}
+	deleteTrafficMapPublicationFallbackMetric(key.Namespace, key.Name, r.Publisher.Name())
 	return ctrl.Result{}, nil
 }
 
@@ -687,6 +1471,13 @@ func (r *TrafficMapPublisherReconciler) clearPublisherJournal(
 				ObservedGeneration: cleared.Generation,
 			}
 			apimeta.SetStatusCondition(&status.Conditions, condition)
+			apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type:               v1beta1.TrafficMapPublicationFallback,
+				Status:             metav1.ConditionFalse,
+				Reason:             v1beta1.TrafficMapReasonPublicationFinalizing,
+				Message:            "TrafficMap publication fallback is finalized",
+				ObservedGeneration: cleared.Generation,
+			})
 			return nil
 		})
 	})
@@ -736,7 +1527,7 @@ func (r *TrafficMapPublisherReconciler) removeFinalizer(
 	})
 }
 
-func (r *TrafficMapPublisherReconciler) markPublished(
+func (r *TrafficMapPublisherReconciler) markPublicationApplied(
 	ctx context.Context,
 	key types.NamespacedName,
 	uid types.UID,
@@ -744,6 +1535,9 @@ func (r *TrafficMapPublisherReconciler) markPublished(
 	expectedClaims []string,
 	effectiveOptions map[string]string,
 	result TrafficMapPublishResult,
+	expectedLastPositive *v1beta1.TrafficMapPublisherLastPositive,
+	committedLastPositive *v1beta1.TrafficMapPublisherLastPositive,
+	usingFallback bool,
 ) error {
 	digest, err := publisherOptionsDigest(r.Publisher.Name(), effectiveOptions)
 	if err != nil {
@@ -764,23 +1558,50 @@ func (r *TrafficMapPublisherReconciler) markPublished(
 					errTrafficMapPublisherJournalChanged, expectedClaims, liveClaims,
 				)
 			}
+			if !equality.Semantic.DeepEqual(status.Publisher.LastPositive, expectedLastPositive) {
+				return fmt.Errorf("%w: retained positive plan changed after external apply",
+					errTrafficMapPublisherJournalChanged)
+			}
 		} else if len(liveClaims) != 0 {
 			return fmt.Errorf(
 				"%w: stateless publisher found %d claimed targets",
 				errTrafficMapPublisherJournalChanged, len(liveClaims),
 			)
 		}
-		status.Published = !result.Withdrawn
-		status.ObservedTrafficMapGeneration = generation
-		if result.Withdrawn {
-			status.GatewayRef = nil
-		} else {
-			status.GatewayRef = copyTrafficMapGatewayRef(result.GatewayRef)
-		}
 		if status.Publisher == nil || status.Publisher.PublisherName != r.Publisher.Name() {
 			status.Publisher = &v1beta1.TrafficMapPublisherStatus{PublisherName: r.Publisher.Name()}
 		}
 		status.Publisher.ObservedOptionsDigest = digest
+		status.GatewayRef = copyTrafficMapGatewayRef(result.GatewayRef)
+		if result.Withdrawn {
+			status.GatewayRef = nil
+		}
+		if usingFallback {
+			if expectedLastPositive == nil {
+				return fmt.Errorf("%w: retained positive plan is missing", errTrafficMapPublisherJournalChanged)
+			}
+			status.Published = false
+			status.ObservedTrafficMapGeneration = expectedLastPositive.TrafficMapGeneration
+			apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type:               v1beta1.TrafficMapPublished,
+				Status:             metav1.ConditionFalse,
+				Reason:             v1beta1.TrafficMapReasonPublicationFallback,
+				Message:            fmt.Sprintf("TrafficMap publisher %q retained the last positive plan", r.Publisher.Name()),
+				ObservedGeneration: generation,
+			})
+			apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type:               v1beta1.TrafficMapPublicationFallback,
+				Status:             metav1.ConditionTrue,
+				Reason:             v1beta1.TrafficMapReasonLastPositiveRetained,
+				Message:            "The last fully applied positive publication plan is retained",
+				ObservedGeneration: generation,
+			})
+			return nil
+		}
+
+		status.Published = !result.Withdrawn
+		status.ObservedTrafficMapGeneration = generation
+		status.Publisher.LastPositive = copyTrafficMapLastPositive(committedLastPositive)
 		condition := metav1.Condition{
 			Type:               v1beta1.TrafficMapPublished,
 			Status:             metav1.ConditionTrue,
@@ -794,6 +1615,25 @@ func (r *TrafficMapPublisherReconciler) markPublished(
 			condition.Message = fmt.Sprintf("TrafficMap publication is withdrawn by publisher %q", r.Publisher.Name())
 		}
 		apimeta.SetStatusCondition(&status.Conditions, condition)
+		fallbackReason := trafficMapPublisherReasonCurrentPlan
+		fallbackMessage := "The current TrafficMap publication plan is applied"
+		if result.Withdrawn {
+			fallbackReason = trafficMapPublisherReasonWithdrawn
+			fallbackMessage = "TrafficMap publication is withdrawn"
+		} else if _, capable := r.Publisher.(TrafficMapPublisherFallback); !capable {
+			fallbackReason = trafficMapPublisherReasonUnsupported
+			fallbackMessage = "The selected publisher does not retain publication plans"
+		} else if committedLastPositive == nil {
+			fallbackReason = trafficMapPublisherReasonApplyCurrent
+			fallbackMessage = "The current no-positive TrafficMap plan is applied"
+		}
+		apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type:               v1beta1.TrafficMapPublicationFallback,
+			Status:             metav1.ConditionFalse,
+			Reason:             fallbackReason,
+			Message:            fallbackMessage,
+			ObservedGeneration: generation,
+		})
 		return nil
 	})
 }
@@ -834,15 +1674,10 @@ func (r *TrafficMapPublisherReconciler) markFailed(
 		"trafficMap", client.ObjectKeyFromObject(trafficMap), "reason", reason)
 	return r.patchStatusByKey(ctx, client.ObjectKeyFromObject(trafficMap), trafficMap.UID,
 		func(status *v1beta1.TrafficMapStatus) error {
-			status.Published = false
-			condition := metav1.Condition{
-				Type:               v1beta1.TrafficMapPublished,
-				Status:             metav1.ConditionFalse,
-				Reason:             reason,
-				Message:            trafficMapPublisherFailureMessage(reason),
-				ObservedGeneration: trafficMap.Generation,
-			}
-			apimeta.SetStatusCondition(&status.Conditions, condition)
+			setTrafficMapPublicationConditions(
+				status, trafficMap.Generation, metav1.ConditionUnknown,
+				reason, trafficMapPublisherFailureMessage(reason),
+			)
 			return nil
 		})
 }
@@ -878,11 +1713,16 @@ func (r *TrafficMapPublisherReconciler) patchPublisherStatus(
 	// server-side-apply ownership. Explicitly patch zero-value transitions before
 	// applying the sparse status projection so withdrawal cannot leave stale
 	// publication state or a stale GatewayRef behind.
+	clearsLastPositive := live.Status.Publisher != nil && live.Status.Publisher.LastPositive != nil &&
+		(desired.Status.Publisher == nil || desired.Status.Publisher.LastPositive == nil)
 	if (live.Status.Published && !desired.Status.Published) ||
-		(live.Status.GatewayRef != nil && desired.Status.GatewayRef == nil) {
+		(live.Status.GatewayRef != nil && desired.Status.GatewayRef == nil) || clearsLastPositive {
 		narrowed := live.DeepCopy()
 		narrowed.Status.Published = desired.Status.Published
 		narrowed.Status.GatewayRef = copyTrafficMapGatewayRef(desired.Status.GatewayRef)
+		if clearsLastPositive && narrowed.Status.Publisher != nil {
+			narrowed.Status.Publisher.LastPositive = nil
+		}
 		if err := r.Status().Patch(ctx, narrowed,
 			client.MergeFromWithOptions(live, client.MergeFromWithOptimisticLock{})); err != nil {
 			return err
@@ -891,7 +1731,11 @@ func (r *TrafficMapPublisherReconciler) patchPublisherStatus(
 	}
 	// Apply even when the typed values are unchanged so this controller remains
 	// the declared owner of its sparse status projection after a restart.
-	return r.applyPublisherStatus(ctx, desired)
+	if err := r.applyPublisherStatus(ctx, desired); err != nil {
+		return err
+	}
+	recordTrafficMapPublicationFallbackMetric(desired, r.Publisher.Name())
+	return nil
 }
 
 func (r *TrafficMapPublisherReconciler) applyPublisherStatus(
@@ -921,6 +1765,22 @@ func trafficMapPublisherStatusApply(trafficMap *v1beta1.TrafficMap) runtime.Appl
 		if trafficMap.Status.Publisher.ObservedOptionsDigest != "" {
 			publisher["observedOptionsDigest"] = trafficMap.Status.Publisher.ObservedOptionsDigest
 		}
+		if trafficMap.Status.Publisher.LastPositive != nil {
+			lastPositive := trafficMap.Status.Publisher.LastPositive
+			targets := make([]any, len(lastPositive.Targets))
+			for i, target := range lastPositive.Targets {
+				targets[i] = map[string]any{
+					"target": target.Target,
+					"weight": target.Weight,
+				}
+			}
+			publisher["lastPositive"] = map[string]any{
+				"trafficMapGeneration":    lastPositive.TrafficMapGeneration,
+				"observedISVCGeneration":  lastPositive.ObservedISVCGeneration,
+				"planCompatibilityDigest": lastPositive.PlanCompatibilityDigest,
+				"targets":                 targets,
+			}
+		}
 		status["publisher"] = publisher
 	}
 	if trafficMap.Status.GatewayRef != nil {
@@ -936,11 +1796,14 @@ func trafficMapPublisherStatusApply(trafficMap *v1beta1.TrafficMap) runtime.Appl
 		}
 		status["gatewayRef"] = gatewayRef
 	}
-	conditions := make([]any, 0, 1)
-	if published := apimeta.FindStatusCondition(
-		trafficMap.Status.Conditions, v1beta1.TrafficMapPublished,
-	); published != nil {
-		conditions = append(conditions, trafficMapConditionApply(*published))
+	conditions := make([]any, 0, 2)
+	for _, conditionType := range []string{
+		v1beta1.TrafficMapPublished,
+		v1beta1.TrafficMapPublicationFallback,
+	} {
+		if condition := apimeta.FindStatusCondition(trafficMap.Status.Conditions, conditionType); condition != nil {
+			conditions = append(conditions, trafficMapConditionApply(*condition))
+		}
 	}
 	if len(conditions) != 0 {
 		status["conditions"] = conditions
@@ -1006,6 +1869,9 @@ func (r *TrafficMapPublisherReconciler) validateSetup() error {
 	if r.Publisher.Stateful() && !r.LeaderElectionEnabled {
 		return fmt.Errorf("stateful TrafficMap publisher %q requires leader election", r.Publisher.Name())
 	}
+	if _, capable := r.Publisher.(TrafficMapPublisherFallback); capable && !r.Publisher.Stateful() {
+		return fmt.Errorf("TrafficMap publisher %q exposes retained-plan fallback but is stateless", r.Publisher.Name())
+	}
 	if r.Active && r.Publisher.Stateful() && r.RequeueAfter <= 0 {
 		return fmt.Errorf("stateful TrafficMap publisher %q requires a positive resync period", r.Publisher.Name())
 	}
@@ -1039,17 +1905,24 @@ var trafficMapPublisherOwnerChange = predicate.Funcs{
 			oldOwner.DeletionTimestamp.IsZero() != newOwner.DeletionTimestamp.IsZero() ||
 			!slices.Equal(oldOwner.Finalizers, newOwner.Finalizers) ||
 			!equality.Semantic.DeepEqual(oldOwner.Labels, newOwner.Labels) ||
-			!equality.Semantic.DeepEqual(oldOwner.Annotations, newOwner.Annotations)
+			!equality.Semantic.DeepEqual(oldOwner.Annotations, newOwner.Annotations) ||
+			oldOwner.Status.ObservedGeneration != newOwner.Status.ObservedGeneration ||
+			!equality.Semantic.DeepEqual(oldOwner.Status.Placement, newOwner.Status.Placement) ||
+			!equality.Semantic.DeepEqual(
+				oldOwner.Status.GetCondition(apis.ConditionReady),
+				newOwner.Status.GetCondition(apis.ConditionReady),
+			)
 	},
 }
 
 var (
-	errTrafficMapPublisherPlanStale      = errors.New("TrafficMap changed while claiming publisher targets")
-	errTrafficMapPublisherJournalChanged = errors.New("TrafficMap publisher journal changed during reconciliation")
-	errTrafficMapPublisherChanged        = errors.New("TrafficMap publisher changed while claims remain")
-	errTrafficMapPublisherSourceChanged  = errors.New("TrafficMap source provenance changed during reconciliation")
-	errTrafficMapPublisherOwnerInvalid   = errors.New("TrafficMap owner binding is invalid")
-	errTrafficMapPublisherOwnerRead      = errors.New("TrafficMap owner state read failed")
+	errTrafficMapPublisherPlanStale          = errors.New("TrafficMap changed while claiming publisher targets")
+	errTrafficMapPublisherJournalChanged     = errors.New("TrafficMap publisher journal changed during reconciliation")
+	errTrafficMapPublisherChanged            = errors.New("TrafficMap publisher changed while claims remain")
+	errTrafficMapPublisherSourceChanged      = errors.New("TrafficMap source provenance changed during reconciliation")
+	errTrafficMapPublisherOwnerInvalid       = errors.New("TrafficMap owner binding is invalid")
+	errTrafficMapPublisherOwnerRead          = errors.New("TrafficMap owner state read failed")
+	errTrafficMapPublisherEligibilityUnknown = errors.New("TrafficMap fallback eligibility is unknown")
 )
 
 func validatePublisherSourceUID(trafficMap *v1beta1.TrafficMap, ownerUID types.UID) error {
@@ -1116,7 +1989,7 @@ func publisherJournalForName(
 	if err != nil {
 		return nil, "", fmt.Errorf("invalid publisher journal: %w", err)
 	}
-	if len(claims) != 0 && journal.PublisherName != name {
+	if journal.PublisherName != name && (len(claims) != 0 || journal.LastPositive != nil) {
 		return nil, "", fmt.Errorf("%w: from %q to %q",
 			errTrafficMapPublisherChanged, journal.PublisherName, name)
 	}
@@ -1132,7 +2005,8 @@ func publisherJournalHasClaims(journal *v1beta1.TrafficMapPublisherStatus) bool 
 }
 
 func publisherStatusNeedsFinalizer(status v1beta1.TrafficMapStatus, stateful bool) bool {
-	if publisherJournalHasClaims(status.Publisher) {
+	if publisherJournalHasClaims(status.Publisher) ||
+		(status.Publisher != nil && status.Publisher.LastPositive != nil) {
 		return true
 	}
 	return stateful && (status.Publisher != nil || status.Published || status.GatewayRef != nil ||
@@ -1184,6 +2058,51 @@ func publisherClaimDifference(left, right []string) []string {
 	}
 	slices.Sort(difference)
 	return difference
+}
+
+func publisherClaimsReplayCompatible(current, durable []string) bool {
+	return len(current) == 0 || slices.Equal(current, durable)
+}
+
+func publisherClaimsReplayCompatibleForAllHomesUnready(
+	current, durable []string,
+	lastPositive *v1beta1.TrafficMapPublisherLastPositive,
+) bool {
+	if len(current) == 0 || lastPositive == nil {
+		return false
+	}
+	currentSet := make(map[string]struct{}, len(current))
+	durableSet := make(map[string]struct{}, len(durable))
+	for _, claim := range current {
+		currentSet[claim] = struct{}{}
+	}
+	for _, claim := range durable {
+		durableSet[claim] = struct{}{}
+	}
+	for _, claim := range current {
+		if _, found := durableSet[claim]; !found {
+			return false
+		}
+	}
+	for _, target := range lastPositive.Targets {
+		if _, found := currentSet[target.Target]; !found && target.Weight > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func trafficMapRoutableReason(trafficMap *v1beta1.TrafficMap) string {
+	if trafficMap == nil {
+		return ""
+	}
+	condition := apimeta.FindStatusCondition(
+		trafficMap.Status.Conditions, v1beta1.TrafficMapRoutable,
+	)
+	if condition == nil {
+		return ""
+	}
+	return condition.Reason
 }
 
 func routingPublisherOptions(owner *v1beta1.InferenceService) map[string]string {

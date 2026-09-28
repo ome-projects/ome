@@ -27,7 +27,7 @@ const defaultKubeConfigKey = "kubeconfig"
 // workloadcluster.Manager it needs, declared locally so the quota plane depends
 // on the behaviour rather than on the type.
 type clusterRegistry interface {
-	Connect(ctx context.Context, name string, kubeconfig []byte) error
+	ConnectFor(ctx context.Context, name string, uid types.UID, kubeconfig []byte) error
 	Disconnect(name string)
 	Connected() []string
 }
@@ -149,9 +149,8 @@ func (c *Connector) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 		return ctrl.Result{}, nil
 	}
 
-	// Content-keyed, so an unchanged kubeconfig is a no-op and a rotated one
-	// rebuilds the client. Every pass calls it; only a change costs anything.
-	if err := c.Clusters.Connect(ctx, wc.Name, kubeconfig); err != nil {
+	// Registry identity and credential content both identify the connection.
+	if err := c.Clusters.ConnectFor(ctx, wc.Name, wc.UID, kubeconfig); err != nil {
 		return ctrl.Result{}, fmt.Errorf("connecting to %s: %w", wc.Name, err)
 	}
 	return ctrl.Result{}, nil

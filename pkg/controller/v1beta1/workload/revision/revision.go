@@ -376,7 +376,7 @@ func isSchedulingAnnotation(key string) bool {
 // isDerivedAnnotation reports whether an annotation is controller-owned rather
 // than authored intent, and so must not feed the pod-template revision hash.
 func isDerivedAnnotation(key string) bool {
-	return isLifecycleAnnotation(key) || isSchedulingAnnotation(key)
+	return key == constants.PlacementExecution || isLifecycleAnnotation(key) || isSchedulingAnnotation(key)
 }
 
 // hasDerivedAnnotation reports whether any key is controller-owned. Fast path

@@ -250,6 +250,10 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		irstatus.ClearPodDerivedObservations(fresh.Status.InstanceStatuses)
 
 		fresh.Status.ObservedGeneration = fresh.Generation
+		fresh.Status.PlacementObservedGeneration = 0
+		if ir.Spec.PlacementExecution != nil {
+			fresh.Status.PlacementObservedGeneration = ownerGeneration
+		}
 		fresh.Status.LabelSelector = irLabelSelectorString(fresh.Spec.ParentRef.Name, fresh.Spec.Component)
 
 		// Top-level Ready condition. Two-axis rule:
@@ -343,6 +347,7 @@ func mirrorBack(ir, fresh *v1beta1.InferenceReplica, publication []workloadtypes
 	ir.Status.UpdateRevision = fresh.Status.UpdateRevision
 	ir.Status.CurrentRevision = fresh.Status.CurrentRevision
 	ir.Status.ObservedGeneration = fresh.Status.ObservedGeneration
+	ir.Status.PlacementObservedGeneration = fresh.Status.PlacementObservedGeneration
 	ir.Status.LabelSelector = fresh.Status.LabelSelector
 	ir.Status.RolloutHold = fresh.Status.RolloutHold.DeepCopy()
 	// The transient publication view is the source for same-pass derived fields.

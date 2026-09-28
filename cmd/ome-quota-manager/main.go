@@ -96,6 +96,7 @@ type options struct {
 	// capacityHysteresisPercent damps the derived high-water mark. Zero means no
 	// damping rather than a default band.
 	capacityHysteresisPercent int
+	capacityReportInterval    time.Duration
 	coverResources            string
 	// enrolledNamespaces are the namespaces this cluster serves budgeted
 	// workloads from. Deploy config rather than a field on the CR: it describes
@@ -175,6 +176,8 @@ func main() {
 			"reasons unrelated to entitlement — a drain, a reboot, a device plugin restarting — and "+
 			"following those down would mark budgets Degraded every time a rack was patched. Growth is "+
 			"always believed immediately. 0 disables damping.")
+	flag.DurationVar(&opts.capacityReportInterval, "capacity-report-interval", opts.capacityReportInterval,
+		"Refresh unchanged hardware observation timestamps at this interval. 0 disables periodic refresh.")
 	flag.StringVar(&opts.coverResources, "cover-resources", opts.coverResources,
 		"Comma-separated resource=quantity pairs every rendered ClusterQueue funds alongside its "+
 			"accelerator budget, e.g. \"cpu=1k,memory=1Ti\". Kueue refuses to admit a workload "+
@@ -360,6 +363,7 @@ func main() {
 		r.Capacity = acceleratorquota.CapacityOptions{
 			Resources:         splitAndTrim(opts.acceleratorResources),
 			HysteresisPercent: int32(opts.capacityHysteresisPercent),
+			ReportInterval:    opts.capacityReportInterval,
 		}
 		if r.Capacity.Enabled() {
 			setupLog.Info("Deriving cluster capacity onto the reserved root",

@@ -729,6 +729,7 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/reconciler.go", "buildComponentObservation", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "admittedReplicaCount", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "componentHasAdmittedInstance", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/member_resources.go", "countMemberResources", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/failed.go", "IsTerminallyFailed", read(1), decodedObjectRows, rows)
 
 	// The kubectl-ome CLI still reads stored dense rows directly. Alfred has
@@ -808,6 +809,10 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/observe.go", "observeGroupTargets", "Get", 1, passThroughTopLevelStatus+" (revision pointers and replica counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/pdb/cutover.go", "OMENativeCutoverReady", "Get", 1, passThroughTopLevelStatus+" (ready and available counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler/dispatch.go", "controlledByVerifiedModeBridge", "Get", 1, passThroughSpecMetadata+" (ownership: UID, labels, parentRef)")
+
+	// Placement discovers identities before fetching bounded decoded rows.
+	approve("pkg/controller/v1beta1/placement/planned_observation.go", "Reconciler.observePlannedHome", "List", 1, passThroughSpecMetadata+" (inventory identities; each object is fetched through GetDecoded before resource accounting)")
+	approve("pkg/controller/v1beta1/placement/planned_observation.go", "Reconciler.observePlannedHome", "Get", 1, passThroughSpecMetadata+" (resource-version fence after Pod observation)")
 
 	// Generated client-go informer: a raw list/watch cache that consumes no
 	// rows; row-consuming code reads through the decoded accessor, never

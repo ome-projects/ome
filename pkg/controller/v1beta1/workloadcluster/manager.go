@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -82,6 +83,7 @@ type remoteConn struct {
 	cancel     context.CancelFunc
 	configHash string
 	generation uint64
+	clusterUID types.UID
 }
 
 // NewManager returns an empty Manager whose default builder constructs a
@@ -172,6 +174,18 @@ func (m *Manager) ClientFor(name string) (SelectivelyCachingClient, bool) {
 	return cl, ok
 }
 
+// ClientForUID returns a client only when it belongs to the requested registry
+// object. An unknown UID cannot establish cluster identity.
+func (m *Manager) ClientForUID(name string, uid types.UID) (SelectivelyCachingClient, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c, ok := m.conns[name]
+	if !ok || uid == "" || c.clusterUID != uid {
+		return nil, false
+	}
+	return c.client, true
+}
+
 // clientForGeneration returns the current client together with an identity
 // that changes whenever Connect replaces it. The funnel uses the generation to
 // attach one informer handler to each remote cache instance.
@@ -189,10 +203,23 @@ func (m *Manager) clientForGeneration(name string) (SelectivelyCachingClient, ui
 // no-op when the kubeconfig is unchanged; on change it builds a fresh client
 // and disposes the old one (cancels its watch context).
 func (m *Manager) Connect(ctx context.Context, name string, raw []byte) error {
+	return m.connect(ctx, name, "", raw)
+}
+
+// ConnectFor binds a remote client to a WorkloadCluster UID. A recreated
+// registration gets a fresh client and cache even when its credential is equal.
+func (m *Manager) ConnectFor(ctx context.Context, name string, uid types.UID, raw []byte) error {
+	if uid == "" {
+		return fmt.Errorf("workloadcluster %q: connection requires a registry UID", name)
+	}
+	return m.connect(ctx, name, uid, raw)
+}
+
+func (m *Manager) connect(ctx context.Context, name string, uid types.UID, raw []byte) error {
 	hash := hashBytes(raw)
 
 	m.mu.RLock()
-	if cur, ok := m.conns[name]; ok && cur.configHash == hash {
+	if cur, ok := m.conns[name]; ok && cur.configHash == hash && cur.clusterUID == uid {
 		m.mu.RUnlock()
 		return nil
 	}
@@ -200,10 +227,8 @@ func (m *Manager) Connect(ctx context.Context, name string, raw []byte) error {
 
 	cl, cancel, err := m.newClient(ctx, raw, m.scheme)
 	if err != nil {
-		// Build failed for a CHANGED kubeconfig: the cached client (if any) is
-		// for the stale config and must not be left serving requests against
-		// credentials/endpoints the user has rotated away. Evict it so callers
-		// see (nil, false) rather than a silently-stale connection.
+		// A failed rebuild cannot retain a client for a different credential or
+		// registry identity. Its requests and cached objects belong elsewhere.
 		m.Disconnect(name)
 		return fmt.Errorf("workloadcluster %q: build remote client: %w", name, err)
 	}
@@ -213,7 +238,7 @@ func (m *Manager) Connect(ctx context.Context, name string, raw []byte) error {
 		old.cancel()
 	}
 	m.nextGeneration++
-	m.conns[name] = &remoteConn{client: cl, cancel: cancel, configHash: hash, generation: m.nextGeneration}
+	m.conns[name] = &remoteConn{client: cl, cancel: cancel, configHash: hash, generation: m.nextGeneration, clusterUID: uid}
 	m.mu.Unlock()
 	return nil
 }

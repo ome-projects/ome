@@ -959,3 +959,139 @@ func TestRolledBackRunStillClosesForTheGroupThatFailed(t *testing.T) {
 		t.Errorf("lastRun outcome: got %+v want RolledBack", last)
 	}
 }
+
+// A hub-derived ISVC carries its policy identity only in the derive-time
+// annotation, which has no progression field, and the hub drops the spec ref
+// in favour of the inlined body. The pinned ref must still name a
+// progression: status.rollout.activeRun's policyRef.progression is a required
+// CRD enum, so a zero value fails every status write for the life of the run
+// and the canary machinery never sees an ActiveRun.
+func TestDerivedGroupPinsProgressionFromComposedBody(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		group v1beta1.RolloutGroup
+		want  v1beta1.RolloutProgressionKind
+	}{
+		{
+			name: "canary",
+			group: v1beta1.RolloutGroup{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				Canary:     canaryBody(10, 100),
+			},
+			want: v1beta1.RolloutProgressionCanary,
+		},
+		{
+			name: "blueGreen",
+			group: v1beta1.RolloutGroup{
+				Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+				BlueGreen:  &v1beta1.GroupBlueGreen{},
+			},
+			want: v1beta1.RolloutProgressionBlueGreen,
+		},
+		{
+			name: "rollingUpdate",
+			group: v1beta1.RolloutGroup{
+				Components:    []v1beta1.ComponentType{v1beta1.EngineComponent},
+				RollingUpdate: &v1beta1.GroupRollingUpdate{},
+			},
+			want: v1beta1.RolloutProgressionRollingUpdate,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := isvcFixture(tc.group)
+			isvc.Annotations = map[string]string{
+				constants.RolloutPlanSourceAnnotation: "0=vllm-engine-standard@rp1:8b734048103c",
+			}
+			in := testInputs(t, isvc, irFixture(oldRev, newRev))
+
+			out, err := Reconcile(context.Background(), in)
+			if err != nil || out.Parked {
+				t.Fatalf("unexpected: %v %+v", err, out)
+			}
+			active := isvc.Status.Rollout.ActiveRun
+			if active == nil || len(active.Plan.Groups) != 1 {
+				t.Fatalf("run not pinned: %+v", isvc.Status.Rollout)
+			}
+			g := active.Plan.Groups[0]
+			if g.Source != v1beta1.RolloutPlanSourcePolicy {
+				t.Fatalf("source = %q, want the derived group to report policy provenance", g.Source)
+			}
+			if g.PolicyRef == nil || g.PolicyRef.Name != "vllm-engine-standard" {
+				t.Fatalf("policyRef = %+v", g.PolicyRef)
+			}
+			if g.PolicyRef.Progression != tc.want {
+				t.Fatalf("policyRef.progression = %q, want %q; an empty value is rejected by the status subresource enum",
+					g.PolicyRef.Progression, tc.want)
+			}
+			if g.PortableDigest == "" || g.Group.PolicyRef != nil {
+				t.Fatalf("pinned group must carry the resolved body and a digest, no ref: %+v", g)
+			}
+		})
+	}
+}
+
+// The provenance the plan pins must survive into the closed-run record, which
+// is the other status surface that serialises a RolloutPolicyRef.
+func TestDerivedGroupProgressionSurvivesIntoRunRecord(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Canary:     canaryBody(10, 100),
+	})
+	isvc.Annotations = map[string]string{
+		constants.RolloutPlanSourceAnnotation: "0=vllm-engine-standard@rp1:8b734048103c",
+	}
+	in := testInputs(t, isvc, irFixture(oldRev, newRev))
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	active := isvc.Status.Rollout.ActiveRun
+	if active == nil {
+		t.Fatal("run not pinned")
+	}
+	closeRun(isvc, active, v1beta1.RolloutRunCompleted, metav1.NewTime(time.Unix(2000, 0)))
+
+	last := isvc.Status.Rollout.LastRun
+	if last == nil || len(last.Groups) != 1 {
+		t.Fatalf("record = %+v", last)
+	}
+	ref := last.Groups[0].PolicyRef
+	if ref == nil || ref.Progression != v1beta1.RolloutProgressionCanary {
+		t.Fatalf("lastRun.groups[0].policyRef = %+v, want progression %q", ref, v1beta1.RolloutProgressionCanary)
+	}
+}
+
+// derivedProvenance's annotation format is "<idx>=<name>@<digest>" — it has no
+// progression field, so the refs it returns deliberately leave Progression
+// unset. This pins that contract: a caller putting one of these on status must
+// fill Progression itself.
+func TestDerivedProvenanceLeavesProgressionUnset(t *testing.T) {
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+		Name: "llm-a", Namespace: "ns",
+		Annotations: map[string]string{
+			constants.RolloutPlanSourceAnnotation: "0=example-router-standard@rp1:aaf48b2c4d29;1=vllm-engine-standard@rp1:8b734048103c",
+		},
+	}}
+
+	got := derivedProvenance(isvc)
+	if len(got) != 2 {
+		t.Fatalf("parsed %d entries, want 2: %+v", len(got), got)
+	}
+	for idx, p := range got {
+		if p.Source != v1beta1.RolloutPlanSourcePolicy {
+			t.Errorf("groups[%d].source = %q", idx, p.Source)
+		}
+		if p.PolicyRef == nil {
+			t.Fatalf("groups[%d]: nil policyRef", idx)
+		}
+		if p.PolicyRef.Progression != "" {
+			t.Errorf("groups[%d].policyRef.progression = %q, want unset; the annotation carries no progression",
+				idx, p.PolicyRef.Progression)
+		}
+	}
+	if got[0].PolicyRef.Name != "example-router-standard" || got[0].PortableDigest != "rp1:aaf48b2c4d29" {
+		t.Errorf("groups[0] = %+v", got[0])
+	}
+	if got[1].PolicyRef.Name != "vllm-engine-standard" || got[1].PortableDigest != "rp1:8b734048103c" {
+		t.Errorf("groups[1] = %+v", got[1])
+	}
+}

@@ -119,6 +119,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return ctrl.Result{}, err
 	}
+	if r.Manager != nil {
+		if _, connected := r.Manager.ClientFor(wc.Name); connected {
+			if _, matches := r.Manager.ClientForUID(wc.Name, wc.UID); !matches {
+				r.Manager.Disconnect(wc.Name)
+				r.clearFailure(wc.Name)
+				r.clearRetry(wc.Name)
+			}
+		}
+	}
 
 	status, reason, msg, raw := r.assess(ctx, wc)
 
@@ -164,7 +173,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	connFailed := status != metav1.ConditionTrue && reason == "ConnectionFailed"
 	if r.Manager != nil {
 		if status == metav1.ConditionTrue {
-			if err := r.Manager.Connect(r.connectCtx(), wc.Name, raw); err != nil {
+			if err := r.Manager.ConnectFor(r.connectCtx(), wc.Name, wc.UID, raw); err != nil {
 				r.recordFailure(wc.Name)
 				connFailed = true
 				apimeta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{

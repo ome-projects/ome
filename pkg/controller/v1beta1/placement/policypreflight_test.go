@@ -108,11 +108,19 @@ func (f flakyAnchorReader) Get(ctx context.Context, key client.ObjectKey, obj cl
 // published URL — the standing-winner shape the preflight must never evict.
 func placedSrcISVCWithRef(selector string) *v1beta1.InferenceService {
 	isvc := srcISVCWithRef(selector)
+	url := &apis.URL{Scheme: "https", Host: "svc.example.com"}
 	isvc.Status.Placement = &v1beta1.PlacementStatus{
 		Cluster: "a", Phase: v1beta1.PlacementPhasePlaced,
-		Candidates: []v1beta1.CandidatePlacement{{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted}},
+		Endpoint: url,
+		Candidates: []v1beta1.CandidatePlacement{{
+			Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted,
+			Endpoint: url, AdmittedReplicas: 1, ReadyReplicas: 1,
+		}},
 	}
-	isvc.Status.URL = &apis.URL{Scheme: "https", Host: "svc.example.com"}
+	isvc.Status.URL = url
+	isvc.Status.SetConditions([]apis.Condition{{
+		Type: apis.ConditionReady, Status: corev1.ConditionTrue, Reason: placementReadyReasonReady,
+	}})
 	return isvc
 }
 
@@ -337,11 +345,19 @@ func TestLiftCandidateAutoscaling(t *testing.T) {
 	refs := []componentPolicyRef{{component: v1beta1.EngineComponent, policy: testPolicyName}}
 
 	derivedWith := func(as *v1beta1.ComponentAutoscalerStatus) *v1beta1.InferenceService {
-		return &v1beta1.InferenceService{Status: v1beta1.InferenceServiceStatus{
-			Components: map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
-				v1beta1.EngineComponent: {Autoscaler: as},
+		return &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Generation: 7},
+			Spec: v1beta1.InferenceServiceSpec{
+				Engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
+					AutoscalerPolicyRef: &v1beta1.AutoscalerPolicyRef{Name: testPolicyName},
+				}},
 			},
-		}}
+			Status: v1beta1.InferenceServiceStatus{
+				Components: map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+					v1beta1.EngineComponent: {Autoscaler: as},
+				},
+			},
+		}
 	}
 
 	t.Run("policy rendered and ready", func(t *testing.T) {
@@ -386,10 +402,78 @@ func TestLiftCandidateAutoscaling(t *testing.T) {
 			SpecSource: "policy",
 			Conditions: []metav1.Condition{{
 				Type: v1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionFalse,
-				Reason: v1beta1.AutoscalerResolvedReasonPolicyNotFound,
+				ObservedGeneration: 7,
+				Reason:             v1beta1.AutoscalerResolvedReasonPolicyNotFound,
 			}},
 		}))
 		assert.True(t, failedClosed)
+	})
+
+	t.Run("derived spec with an old policy ref is not attributed to the current ref", func(t *testing.T) {
+		derived := derivedWith(&v1beta1.ComponentAutoscalerStatus{
+			SpecSource: "policy",
+			Policy: &v1beta1.AutoscalerPolicyProvenance{
+				Name: "old-policy", PortableDigest: "pv1:old", ResolvedDigest: "rv1:old",
+			},
+		})
+		derived.Spec.Engine.AutoscalerPolicyRef.Name = "old-policy"
+		got, reported, failedClosed := liftCandidateAutoscaling(refs, derived)
+		assert.False(t, got.Ready)
+		assert.False(t, reported)
+		assert.False(t, failedClosed)
+		assert.Empty(t, got.Components[v1beta1.EngineComponent].ResolvedDigest)
+		require.Len(t, got.Policies, 1)
+		assert.Equal(t, testPolicyName, got.Policies[0].Name)
+		assert.Empty(t, got.Policies[0].PortableDigest)
+	})
+
+	t.Run("stale rendered status is not attributed to the current ref", func(t *testing.T) {
+		got, reported, failedClosed := liftCandidateAutoscaling(refs, derivedWith(&v1beta1.ComponentAutoscalerStatus{
+			SpecSource: "policy",
+			Policy: &v1beta1.AutoscalerPolicyProvenance{
+				Name: "old-policy", PortableDigest: "pv1:old", ResolvedDigest: "rv1:old",
+			},
+			Conditions: []metav1.Condition{{
+				Type: v1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionTrue,
+				ObservedGeneration: 6,
+			}},
+		}))
+		assert.False(t, got.Ready)
+		assert.False(t, reported)
+		assert.False(t, failedClosed)
+		assert.Empty(t, got.Components[v1beta1.EngineComponent].ResolvedDigest)
+		assert.Empty(t, got.Policies[0].PortableDigest)
+	})
+
+	t.Run("current failure is surfaced while old live provenance is retained", func(t *testing.T) {
+		got, reported, failedClosed := liftCandidateAutoscaling(refs, derivedWith(&v1beta1.ComponentAutoscalerStatus{
+			SpecSource: "policy",
+			Policy: &v1beta1.AutoscalerPolicyProvenance{
+				Name: "old-policy", PortableDigest: "pv1:old", ResolvedDigest: "rv1:old",
+			},
+			Conditions: []metav1.Condition{{
+				Type: v1beta1.AutoscalerResolvedCondition, Status: metav1.ConditionFalse,
+				ObservedGeneration: 7, Reason: v1beta1.AutoscalerResolvedReasonPolicyNotFound,
+			}},
+		}))
+		assert.False(t, got.Ready)
+		assert.False(t, reported)
+		assert.True(t, failedClosed)
+		assert.Empty(t, got.Components[v1beta1.EngineComponent].ResolvedDigest)
+		assert.Empty(t, got.Policies[0].PortableDigest)
+	})
+
+	t.Run("stale shadow status is not attributed to the current ref", func(t *testing.T) {
+		got, reported, failedClosed := liftCandidateAutoscaling(refs, derivedWith(&v1beta1.ComponentAutoscalerStatus{
+			SpecSource: "isvc",
+			ShadowedPolicyRef: &v1beta1.ShadowedAutoscalerPolicy{
+				Name: "old-policy", PortableDigest: "pv1:old", WouldRenderDigest: "rv1:old",
+			},
+		}))
+		assert.False(t, got.Ready)
+		assert.False(t, reported)
+		assert.False(t, failedClosed)
+		assert.Empty(t, got.Policies[0].PortableDigest)
 	})
 }
 
@@ -634,12 +718,12 @@ func mismatchedPolicy(name string) *v1beta1.AutoscalerPolicy {
 }
 
 // The standing winner must survive the digest window an in-place policy edit
-// opens (anchor updated, member not yet synced): no re-race, no Pending write,
-// placement held as-is at the poll cadence.
+// opens (anchor updated, member not yet synced): actuation stays held while its
+// current placement status is observed at the poll cadence.
 func TestReconcile_WinnerSurvivesDigestMismatchWindow(t *testing.T) {
 	s := testScheme(t)
-	w := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(mismatchedPolicy(testPolicyName)).Build()
+	w := workerWithReplicaCounts(t, s, "fresh.example.com", 2, 1)
+	require.NoError(t, w.Create(context.Background(), mismatchedPolicy(testPolicyName)))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
@@ -655,17 +739,23 @@ func TestReconcile_WinnerSurvivesDigestMismatchWindow(t *testing.T) {
 	require.NotNil(t, p)
 	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase, "digest window must not evict the standing winner")
 	assert.Equal(t, "a", p.Cluster)
-	assert.NotNil(t, cpStatusURL(t, cp), "published URL survives the hold")
+	require.Len(t, p.Candidates, 1)
+	assert.Equal(t, int32(2), p.Candidates[0].AdmittedReplicas)
+	assert.Equal(t, int32(1), p.Candidates[0].ReadyReplicas)
+	assert.Equal(t, "fresh.example.com", p.Candidates[0].Endpoint.Host)
+	assert.Equal(t, "fresh.example.com", cpStatusURL(t, cp).Host)
 }
 
 // A transient member GET error on the standing winner's cluster (no prior
 // terminal verdict in memory, e.g. right after a control-plane restart) holds
-// the placement as-is instead of re-racing.
+// actuation instead of re-racing while status observation continues.
 func TestReconcile_WinnerSurvivesTransientMemberGetError(t *testing.T) {
 	s := testScheme(t)
 	fail := true
+	w := workerWithReplicaCounts(t, s, "fresh.example.com", 2, 1)
+	require.NoError(t, w.Create(context.Background(), hpaPolicy(testPolicyName)))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": flakyPolicyGetter{memberWith(s, hpaPolicy(testPolicyName)), &fail},
+		"a": flakyPolicyGetter{workloadcluster.NewNeverCachingClient(w), &fail},
 	}}
 	src := placedSrcISVCWithRef("gpu=gb300")
 	r, cp := newPlacer(s, clusters, src, hpaPolicy(testPolicyName), readyWC("a", capabilityLabels()))
@@ -679,7 +769,7 @@ func TestReconcile_WinnerSurvivesTransientMemberGetError(t *testing.T) {
 	require.NotNil(t, p)
 	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase, "transient read error must not evict the standing winner")
 	assert.Equal(t, "a", p.Cluster)
-	assert.NotNil(t, cpStatusURL(t, cp))
+	assert.Equal(t, "fresh.example.com", cpStatusURL(t, cp).Host)
 }
 
 // A candidate the preflight terminally verified stays eligible across a
@@ -742,13 +832,14 @@ func TestPreflightPolicies_TransientErrorUnverifiedStaysSkipped(t *testing.T) {
 	assert.Equal(t, v1beta1.PlacementPolicyPreflightReasonMemberGetTimeout, cond.Reason)
 }
 
-// A transient control-plane blip on the anchor GET must hold a Placed
-// source's existing status untouched — never write Pending over a serving
-// URL.
+// A transient control-plane blip on the anchor GET holds actuation while the
+// standing home still refreshes from member state.
 func TestReconcile_AnchorBlipDoesNotWipePlacedStatus(t *testing.T) {
 	s := testScheme(t)
+	w := workerWithReplicaCounts(t, s, "fresh.example.com", 2, 1)
+	require.NoError(t, w.Create(context.Background(), hpaPolicy(testPolicyName)))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": memberWith(s, hpaPolicy(testPolicyName)),
+		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
 	src := placedSrcISVCWithRef("gpu=gb300")
 	r, cp := newPlacer(s, clusters, src, hpaPolicy(testPolicyName), readyWC("a", capabilityLabels()))
@@ -764,9 +855,63 @@ func TestReconcile_AnchorBlipDoesNotWipePlacedStatus(t *testing.T) {
 	require.NotNil(t, p)
 	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase, "anchor blip must not write Pending over a Placed source")
 	assert.Equal(t, "a", p.Cluster)
-	assert.NotNil(t, cpStatusURL(t, cp))
+	assert.Equal(t, "fresh.example.com", cpStatusURL(t, cp).Host)
 	_, staged := r.policyState().preflightFor(src.UID)
 	assert.False(t, staged, "no condition staged on a transient anchor blip")
+}
+
+func TestReconcile_PolicyHoldKeepsPresentDeadmittedHomeObservableAfterGrace(t *testing.T) {
+	s := testScheme(t)
+	worker := workerWithGatedDerived(t, s)
+	src := placedSrcISVCWithRef("gpu=gb300")
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
+		"a": workloadcluster.NewNeverCachingClient(worker),
+	}}, src, readyWC("a", capabilityLabels()))
+	r.winnerLostSince.Store(src.UID, time.Now().Add(-2*r.winnerLostGrace()))
+	ensurePlacedStatus(t, cp, src)
+
+	_, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	assert.Empty(t, p.Cluster, "expired grace releases winner ownership")
+	assert.Equal(t, v1beta1.PlacementPhaseAdmitting, p.Phase)
+	require.Len(t, p.Candidates, 1, "the present home must remain observable")
+	assert.Equal(t, "a", p.Candidates[0].Cluster)
+	assert.Equal(t, v1beta1.CandidatePhaseAdmitting, p.Candidates[0].Phase)
+	assert.Nil(t, p.Candidates[0].Endpoint)
+	assert.Zero(t, p.Candidates[0].ReadyReplicas)
+
+	derived := &v1beta1.InferenceService{}
+	require.NoError(t, worker.Get(context.Background(), req().NamespacedName, derived))
+	assert.Nil(t, derived.Spec.Engine.AutoscalerPolicyRef,
+		"policy hold must not apply the blocked source spec")
+}
+
+func TestReconcile_PolicyHoldElectsObservedAdmittedCandidate(t *testing.T) {
+	s := testScheme(t)
+	worker := workerWithReplicaCounts(t, s, "fresh.example.com", 2, 1)
+	src := srcISVCWithRef("gpu=gb300")
+	src.Status.Placement = &v1beta1.PlacementStatus{
+		Phase:      v1beta1.PlacementPhaseAdmitting,
+		Candidates: []v1beta1.CandidatePlacement{{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitting}},
+	}
+	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
+		"a": workloadcluster.NewNeverCachingClient(worker),
+	}}, src, readyWC("a", capabilityLabels()))
+	r.winnerLostSince.Store(src.UID, time.Now().Add(-2*r.winnerLostGrace()))
+
+	_, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err)
+
+	p := cpPlacement(t, cp)
+	require.NotNil(t, p)
+	assert.Equal(t, "a", p.Cluster)
+	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
+	assert.Equal(t, "fresh.example.com", p.Endpoint.Host)
+	_, armed := r.winnerLostSince.Load(src.UID)
+	assert.False(t, armed, "a newly observed winner starts with a fresh grace clock")
 }
 
 // A reserved ref kind passes no preflight: every member webhook would deny

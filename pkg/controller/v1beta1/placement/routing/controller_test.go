@@ -612,6 +612,52 @@ func TestReconcile_DeletingISVCReapsTrafficMapAndPreservesJournal(t *testing.T) 
 	}
 }
 
+func TestReconcile_DeletingISVCReapConflictRequeuesWithoutError(t *testing.T) {
+	isvc := splitISVC([]string{"a"}, []int32{3}, []int32{3})
+	now := metav1.Now()
+	isvc.DeletionTimestamp = &now
+	isvc.Finalizers = []string{"example.com/hold-source"}
+	tm := &v1beta1.TrafficMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            testName,
+			Namespace:       testNS,
+			UID:             "traffic-map-uid",
+			ResourceVersion: "1",
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(isvc, v1beta1.SchemeGroupVersion.WithKind("InferenceService")),
+			},
+		},
+		Status: v1beta1.TrafficMapStatus{SourceUID: isvc.UID},
+	}
+	deleteCalls := 0
+	c := fakeclient.NewClientBuilder().WithScheme(routingScheme(t)).
+		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.TrafficMap{}).
+		WithObjects(isvc, tm).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.DeleteOption) error {
+				deleteCalls++
+				return apierrors.NewConflict(
+					schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "trafficmaps"},
+					object.GetName(),
+					apierrors.NewBadRequest("delete preconditions no longer match"),
+				)
+			},
+		}).
+		Build()
+	r := &Reconciler{Client: c, APIReader: c, Log: log.Log, Config: controllerTestConfig()}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testName, Namespace: testNS},
+	})
+
+	require.NoError(t, err, "a fenced delete that lost a race is retried, not reported")
+	assert.True(t, result.Requeue)
+	assert.Equal(t, 1, deleteCalls)
+	current, exists := getTrafficMap(t, c)
+	require.True(t, exists)
+	assert.True(t, current.DeletionTimestamp.IsZero())
+}
+
 func TestReconcile_DeletingISVCReapsOrphanedProvenancedTrafficMap(t *testing.T) {
 	isvc := splitISVC([]string{"a"}, []int32{3}, []int32{3})
 	now := metav1.Now()
@@ -1168,10 +1214,10 @@ func TestReconcile_SourceAbsentTrafficMapDeleteFencesReplacement(t *testing.T) {
 		Build()
 	r := &Reconciler{Client: c, APIReader: c, Log: log.Log, Config: controllerTestConfig()}
 
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
 
-	require.Error(t, err)
-	assert.True(t, apierrors.IsConflict(err))
+	require.NoError(t, err, "a fenced delete that lost a race is retried, not reported")
+	assert.True(t, result.Requeue)
 	assert.Equal(t, 1, deleteCalls)
 	replacement := &v1beta1.TrafficMap{}
 	require.NoError(t, c.Get(context.Background(), key, replacement))

@@ -77,13 +77,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		r.Prober.Forget(req.NamespacedName)
 		r.Capacity.Forget(req.NamespacedName)
 		deleteCapacityFallbackMetric(req.Namespace, req.Name)
-		return ctrl.Result{}, r.reapSourceAbsentTrafficMap(ctx, req.NamespacedName)
+		return reapResult(r.reapSourceAbsentTrafficMap(ctx, req.NamespacedName))
 	}
 	if !isvc.DeletionTimestamp.IsZero() {
 		r.Prober.Forget(req.NamespacedName)
 		r.Capacity.Forget(req.NamespacedName)
 		deleteCapacityFallbackMetric(req.Namespace, req.Name)
-		return ctrl.Result{}, r.reap(ctx, isvc)
+		return reapResult(r.reap(ctx, isvc))
 	}
 
 	// A TrafficMap-backed publisher uses its finalizer as the teardown handshake:
@@ -92,7 +92,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		r.Prober.Forget(req.NamespacedName)
 		r.Capacity.Forget(req.NamespacedName)
 		deleteCapacityFallbackMetric(req.Namespace, req.Name)
-		return ctrl.Result{}, r.reap(ctx, isvc)
+		return reapResult(r.reap(ctx, isvc))
 	}
 
 	if err := validation.ValidateRouting(&isvc.Spec); err != nil {
@@ -436,6 +436,17 @@ func routableMessage(reason string, status metav1.ConditionStatus, entries int) 
 	default:
 		return fmt.Sprintf("%d home(s) serving", entries)
 	}
+}
+
+// reapResult turns a reap that lost an optimistic-concurrency race into a
+// requeue. The delete is fenced on the resourceVersion the reaper read, and the
+// publisher writes TrafficMap status from this same manager, so the fence can
+// miss without anything having failed; the next pass re-reads and decides again.
+func reapResult(err error) (ctrl.Result, error) {
+	if apierrors.IsConflict(err) {
+		return ctrl.Result{Requeue: true}, nil
+	}
+	return ctrl.Result{}, err
 }
 
 // reap deletes a TrafficMap with an exact source controller or matching durable
