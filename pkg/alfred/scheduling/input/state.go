@@ -8,7 +8,8 @@ import (
 )
 
 // SameSchedulingState compares the scheduling objects in two captures, ignoring
-// only resourceVersion, managedFields and Node condition lastHeartbeatTime.
+// only resourceVersion, managedFields, Namespace annotations and Node condition
+// lastHeartbeatTime.
 // These fields do not affect placement in the supported private schedulers.
 // Every other field, including unknown fields, remains significant. In
 // particular, Pod status can affect occupancy, nomination and allocated resources.
@@ -63,12 +64,35 @@ func schedulingState(s *Snapshot) (map[schedulingObjectKey]map[string]any, bool)
 		}
 		delete(meta, "resourceVersion")
 		delete(meta, "managedFields")
+		if kind == "Namespace" && !omitNamespaceAnnotations(meta) {
+			return nil, false
+		}
 		if kind == "Node" && !omitNodeHeartbeats(object) {
 			return nil, false
 		}
 		objects[key] = object
 	}
 	return objects, true
+}
+
+func omitNamespaceAnnotations(meta map[string]any) bool {
+	// The pinned in-tree plugins use Namespace names and labels for affinity;
+	// OMEGangPack uses PodGroup (not Namespace) annotations. Keep those inputs,
+	// unknown fields and all object membership unchanged. Validate the known
+	// annotation shape before omitting it, even for identical invalid captures.
+	if value := meta["annotations"]; value != nil {
+		annotations, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		for _, value := range annotations {
+			if _, ok := value.(string); !ok {
+				return false
+			}
+		}
+	}
+	delete(meta, "annotations")
+	return true
 }
 
 func omitNodeHeartbeats(object map[string]any) bool {

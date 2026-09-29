@@ -13,6 +13,13 @@ recommendations or dispatches migration requests. Before dispatch, Alfred uses
 an isolated scheduler worker with an explicitly configured Kubernetes or OME
 scheduler profile, then rechecks the source and cluster state.
 
+For the bundled, pinned scheduler profiles, Namespace annotation-only updates do
+not invalidate that final scheduling-state check. Namespace names, UIDs, labels,
+lifecycle, membership and unknown fields still do, as do annotations on Pods,
+Nodes and PodGroups. Raw simulation inputs remain unchanged. This is a narrow
+noise filter, not progress under arbitrary cluster churn or a guarantee for
+operator-supplied simulator binaries.
+
 - [`main.go`](main.go): process setup, configuration, workers and leader election.
 - [`pkg/alfred`](../../pkg/alfred): snapshots, policies, guards, dispatch journal,
   reporting and metrics.

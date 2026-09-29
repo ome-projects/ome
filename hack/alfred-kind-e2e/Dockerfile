@@ -8,6 +8,7 @@ ENTRYPOINT ["/manager"]
 FROM scratch AS alfred
 COPY alfred /alfred
 COPY alfred-simulator /alfred-simulator
+COPY alfred-simulator-barrier /alfred-simulator-barrier
 USER 65532:65532
 ENTRYPOINT ["/alfred"]
 

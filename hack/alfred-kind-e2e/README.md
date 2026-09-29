@@ -32,6 +32,7 @@ model downloads. It does not validate the production Dockerfiles.
 ## Run on an Apple Silicon Mac
 
 Requires Go, Homebrew, Helm 4, kubectl, jq, Colima, Docker CLI/buildx, and kind.
+The namespace-churn runner also uses Perl's `Time::HiRes` monotonic clock.
 Provisioning downloads public images; it does not require a registry login.
 Helm 4 is required for the explicit `--server-side=false` install option that
 lets cert-manager retain ownership of the webhook's CA bundle.
@@ -142,6 +143,43 @@ after a failure, it reports the retained narrow deny policy instead of silently
 unblocking a live pending intent. The offline shell/verifier tests run under the
 existing `hack/alfred-kind-e2e/*_test.sh` CI loop; no live cluster is used in CI.
 
+`namespace-churn.sh single` and `namespace-churn.sh gang` exercise unrelated
+Namespace metadata changes inside the final preflight window, with the real
+default-profile worker and OME gang worker respectively. Start with no fixture
+ISVCs, IRs or Pods in `alfred-e2e`; remove only the previous completed fixture
+before switching between the two cases. The runner wraps the ordinary maintenance
+scenario, retaining its source-hold, readiness, routing and completion checks.
+
+A test-image-only wrapper runs the real simulator first, holds its exact output,
+and exposes a localhost release barrier. During each of three negative holds the
+runner changes labels on a fresh empty Namespace: Alfred must report
+`SchedulingStateChanged` without a request, intent or replacement. During the
+fourth hold only annotations change: that attempt must submit within 30 seconds,
+complete one migration, and remain duplicate-free across three new decision
+cycles. Label controls preserve the affinity-input fence but do not exercise an
+active cross-namespace affinity rule. No placements or migration status are
+fabricated. This does not establish progress under Pod, membership or arbitrary
+cluster churn.
+
+The temporary registry uses a 20-second whole-worker timeout and a maximum
+10-second post-simulation hold, under the unchanged dispatch deadline. A slow
+attempt can still fail closed; no timeout authorizes output. The wrapper is not
+included in production images. The runner pins its maintenance marker, retains
+raw requests/results and hashes, API mutation responses, release receipts, the
+full annotation watch and completion samples. Re-run `verify-namespace-churn.sh`
+with the printed artifact directory to verify them offline. Cleanup clears the
+fixture trigger before restoring the registry and refuses to overwrite changed
+Deployment arguments or volumes. Failure retains diagnostic resources/evidence;
+success deletes only the temporary Namespace and ConfigMap by UID.
+
+OME can consume the annotation before a subsequent GET. Publication therefore
+requires the exact watched key/value and a matching published journal entry,
+not a prepared intent or an annotation that happens to remain visible. The
+runner's own watch spans the first hold through all completion cycles. Its
+30-second budget starts on the host's monotonic clock before release and ends
+after the complete API capture and watched-publication check; host time is never
+compared with the VM's wall clock.
+
 The gang fixture has a leader and worker, each requesting eight GPUs, scheduled
 by the real OME scheduler into one zone. Migration must replace both members in
 the other zone. The no-capacity case fills the three destination nodes with
@@ -226,7 +264,7 @@ Run offline harness checks with:
 
 ```bash
 for test in hack/alfred-kind-e2e/*_test.sh; do bash "$test" || exit; done
-go test ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/ir-status
+go test ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/ir-status ./hack/alfred-kind-e2e/simulator-barrier
 ```
 
 ## Alfred-only change boundary

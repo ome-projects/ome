@@ -23,6 +23,7 @@ cd "${project_dir}"
 cp "${script_dir}/dockerignore" "${STATE_DIR}/.dockerignore"
 go build -p "${GOMAXPROCS}" -o "${STATE_DIR}/manager" ./cmd/manager
 go build -p "${GOMAXPROCS}" -o "${STATE_DIR}/alfred" ./cmd/alfred
+go build -p "${GOMAXPROCS}" -o "${STATE_DIR}/alfred-simulator-barrier" ./hack/alfred-kind-e2e/simulator-barrier
 (cd pkg/alfred/simulator && go build -p "${GOMAXPROCS}" -o "${STATE_DIR}/alfred-simulator" ./cmd/alfred-simulator)
 (cd scheduler && go build -p "${GOMAXPROCS}" -o "${STATE_DIR}/ome-scheduler" ./cmd/ome-scheduler)
 

@@ -28,6 +28,7 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 		name         string
 		pod          func(*corev1.Pod)
 		node         func(*corev1.Node)
+		namespace    func(*corev1.Namespace)
 		source       bool
 		newPending   bool
 		realWorker   bool
@@ -35,6 +36,11 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 		wantDispatch bool
 	}{
 		{name: "pod resource version", pod: func(*corev1.Pod) {}, wantDispatch: true},
+		{name: "namespace annotations", namespace: churnNamespaceAnnotations, wantDispatch: true},
+		{name: "namespace annotations real worker", namespace: churnNamespaceAnnotations, realWorker: true, wantDispatch: true},
+		{name: "namespace annotations real gang worker", namespace: churnNamespaceAnnotations, realWorker: true, gang: true, wantDispatch: true},
+		{name: "namespace labels real worker", namespace: func(n *corev1.Namespace) { n.Labels["tenant"] = "prod" }, realWorker: true},
+		{name: "namespace labels real gang worker", namespace: func(n *corev1.Namespace) { n.Labels["tenant"] = "prod" }, realWorker: true, gang: true},
 		{name: "pod managed fields", pod: func(p *corev1.Pod) {
 			p.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "status-observer", Operation: metav1.ManagedFieldsOperationUpdate, APIVersion: "v1", FieldsType: "FieldsV1", FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:status":{}}`)}}}
 		}, wantDispatch: true},
@@ -84,6 +90,11 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 			if err := cl.Client.Create(ctx, unrelated); err != nil {
 				t.Fatal(err)
 			}
+			if tc.namespace != nil {
+				if err := cl.Client.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "other", UID: "other-namespace", Labels: map[string]string{"tenant": "other"}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			mutated := false
 			d.Simulator = simulationFunc(func(ctx context.Context, request scheduling.Request) (scheduling.Result, error) {
 				if tc.gang && (!request.RequireGang || len(request.SourcePods) != 2 || len(request.ReplacementPods) != 2) {
@@ -125,6 +136,16 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				if tc.namespace != nil {
+					var namespace corev1.Namespace
+					if err := cl.Client.Get(ctx, client.ObjectKey{Name: "other"}, &namespace); err != nil {
+						t.Fatal(err)
+					}
+					tc.namespace(&namespace)
+					if err := cl.Client.Update(ctx, &namespace); err != nil {
+						t.Fatal(err)
+					}
+				}
 				mutated = true
 				result, err := backend.Evaluate(ctx, request)
 				if err != nil || result.Decision != scheduling.DecisionFeasible {
@@ -134,6 +155,12 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 			})
 			_, decisions := d.Execute(ctx, observed, []policy.Candidate{candidate}, cfg, arbiter)
 			decision := decisionFor(t, decisions, "prod/a")
+			// Repeated changes in each simulation window must still allow
+			// bounded progress, not require a lucky quiet cluster-wide interval.
+			for attempt := 1; tc.namespace != nil && tc.wantDispatch && decision.DispatchStatus != "submitted" && attempt < 3; attempt++ {
+				_, decisions = d.Execute(ctx, observed, []policy.Candidate{candidate}, cfg, arbiter)
+				decision = decisionFor(t, decisions, "prod/a")
+			}
 			if !mutated {
 				t.Fatalf("fixture never reached the change during simulation: %+v", decision)
 			}
@@ -152,6 +179,9 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !tc.wantDispatch {
+				if tc.namespace != nil && (decision.DispatchStatus != "withheld" || decision.DispatchReason != "SchedulingStateChanged") {
+					t.Fatalf("namespace label change must invalidate scheduling state: %+v", decision)
+				}
 				if cl.patches != 0 || len(annotations) != 0 || len(journal.Entries) != 0 {
 					t.Fatalf("changed scheduling state authorized migration: decision=%+v annotations=%v journal=%+v", decision, annotations, journal)
 				}
@@ -172,6 +202,10 @@ func TestDispatcherRevalidatesSchedulingStateDuringChurn(t *testing.T) {
 			}
 		})
 	}
+}
+
+func churnNamespaceAnnotations(n *corev1.Namespace) {
+	n.Annotations = map[string]string{"example.com/checkpoint": n.ResourceVersion}
 }
 
 func churnWorkerSimulator(t *testing.T, gang bool) (scheduling.Simulator, scheduling.Config) {
