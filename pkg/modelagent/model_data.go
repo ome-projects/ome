@@ -98,6 +98,8 @@ type ModelEntry struct {
 	ModelUID              types.UID `json:"modelUID,omitempty"`
 	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`
 	NodeUID               types.UID `json:"nodeUID,omitempty"`
+	// Distinguishes a failed restore attempt from reconstructed Shared Failed state.
+	ArtifactRehydrationFailed bool `json:"artifactRehydrationFailed,omitempty"`
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig

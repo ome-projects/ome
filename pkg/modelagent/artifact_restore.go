@@ -39,6 +39,7 @@ type artifactRestoreGuard struct {
 	gopher    *Gopher
 	task      *GopherTask
 	validated bool // Source checks passed or a trusted Ready Shared parent was attached.
+	reporting bool // Publication failures must remain eligible for report recovery.
 	// Valid only while the initial-download handler retains both file locks.
 	freshSharedDownload bool
 }
@@ -68,6 +69,7 @@ func reportArtifactRestore(ctx context.Context, key string, uid types.UID, valid
 	if key != getModelID(task.BaseModel, task.ClusterBaseModel) || uid != types.UID(getModelUID(task)) {
 		return fmt.Errorf("artifact restoration belongs to another model")
 	}
+	guard.reporting = true
 	err := s.configMapReconciler.mutateConfigMapWithModelUID(ctx, key, uid, func(cm *corev1.ConfigMap) (bool, error) {
 		if err := s.validateArtifactDownload(ctx, task); err != nil {
 			return false, err
@@ -86,6 +88,7 @@ func reportArtifactRestore(ctx context.Context, key string, uid types.UID, valid
 			return false, fmt.Errorf("artifact restoration cleanup is unfinished")
 		}
 		entry.Status, entry.Progress = ModelStatusReady, nil
+		entry.ArtifactRehydrationFailed = false
 		entry.ModelUID, entry.NodeUID = uid, s.artifactNodeUID
 		entry.ArtifactRehydrationID = artifactRehydrationID(task)
 		return writeModelEntry(cm.Data, key, entry)
