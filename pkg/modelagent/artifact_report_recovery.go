@@ -34,6 +34,13 @@ func (s *Gopher) recoverArtifactReports(ctx context.Context) error {
 	}
 	for _, task := range models {
 		task.TaskType = Download
+		if isDirectOCIRestoreEligible(task) {
+			filter, err := ociRestoreShapeFilter(task, node)
+			if err != nil {
+				continue
+			}
+			task.TensorRTLLMShapeFilter = filter
+		}
 		// Satisfied reports need only this pass's live snapshots, with no
 		// admission or per-model API lookup.
 		if !s.artifactReportNeedsRecovery(task, cm, node) {
@@ -71,21 +78,15 @@ func (s *Gopher) artifactReportNeedsRecovery(task *GopherTask, cm *corev1.Config
 		return false
 	}
 	spec := taskModelSpec(task)
-	// Periodic tasks come from live objects, without Scout's task-local GPU
-	// shape filter. Apply the same Shared eligibility exclusion from the spec.
-	modelType, hasModelType := spec.AdditionalMetadata["type"]
-	if spec.ModelFormat.Name == constants.TensorRTLLM && (!hasModelType || modelType == string(constants.ServingBaseModel)) {
-		return false
-	}
 	if !(&Scout{nodeInfo: node, logger: s.logger}).shouldDownloadModel(spec.Storage) {
 		return false
 	}
 	_, eligible, err := newHfArtifactTaskInputForOCI(task, spec.Storage, s.modelRootDir)
-	direct := isDirectHfRestoreEligible(task, spec.Storage)
+	direct := isDirectHfRestoreEligible(task, spec.Storage) || isDirectOCIRestoreEligible(task)
 	if err != nil || !eligible && !direct {
 		return false
 	}
-	// Direct HF uses the configured directory, including after loss of its
+	// Direct sources use the configured directory, including after loss of their
 	// report. Existing directories are never adopted as Shared parents.
 	path := getDestPath(&spec, s.modelRootDir)
 	info, err := os.Lstat(path)

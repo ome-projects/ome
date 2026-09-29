@@ -24,7 +24,6 @@ import (
 	omev1beta1 "sigs.k8s.io/ome/pkg/client/informers/externalversions/ome/v1beta1"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/utils"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -77,12 +76,7 @@ func NewScout(ctx context.Context, nodeName string,
 	if err != nil {
 		return nil, fmt.Errorf("failed to get node info for node %s: %w", nodeName, err)
 	}
-	// Try the newer label first, then fallback to the deprecated beta label
-	instanceType, ok := nodeInfo.Labels[constants.NodeInstanceShapeLabel]
-	if !ok {
-		instanceType = nodeInfo.Labels[constants.DeprecatedNodeInstanceShapeLabel]
-	}
-	nodeShapeAlias, err := utils.GetInstanceTypeShortName(instanceType)
+	nodeShapeAlias, err := modelNodeShapeAlias(nodeInfo)
 	if err != nil {
 		// A shape alias is only needed for shape-specific TensorRT-LLM artifacts.
 		// CPU nodes do not have an entry in the GPU shape map, but can still
@@ -342,21 +336,10 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 func (w *Scout) enqueueBaseModelDownload(baseModel *v1beta1.BaseModel) {
 	w.logger.Infof("Downloading BaseModel: %s in namespace %s", baseModel.Name, baseModel.Namespace)
 
-	IsTensorrtLLMModel := baseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-	modelType := string(constants.ServingBaseModel)
-	if modelTypeFromMetadata, ok := baseModel.Spec.AdditionalMetadata["type"]; ok {
-		modelType = modelTypeFromMetadata
-	}
-
 	gopherTask := &GopherTask{
-		TaskType:  Download,
-		BaseModel: baseModel,
-		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-			IsTensorrtLLMModel: IsTensorrtLLMModel,
-			ShapeAlias:         w.nodeShapeAlias,
-			ModelType:          modelType,
-		},
+		TaskType:               Download,
+		BaseModel:              baseModel,
+		TensorRTLLMShapeFilter: newModelShapeFilter(baseModel.Spec, w.nodeShapeAlias),
 	}
 
 	w.gopherChan <- gopherTask
@@ -397,21 +380,10 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 func (w *Scout) enqueueClusterBaseModelDownload(clusterBaseModel *v1beta1.ClusterBaseModel) {
 	w.logger.Infof("Downloading ClusterBaseModel: %s", clusterBaseModel.Name)
 
-	IsTensorrtLLMModel := clusterBaseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-	modelType := string(constants.ServingBaseModel)
-	if modelTypeFromMetadata, ok := clusterBaseModel.Spec.AdditionalMetadata["type"]; ok {
-		modelType = modelTypeFromMetadata
-	}
-
 	gopherTask := &GopherTask{
-		TaskType:         Download,
-		ClusterBaseModel: clusterBaseModel,
-		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-			IsTensorrtLLMModel: IsTensorrtLLMModel,
-			ShapeAlias:         w.nodeShapeAlias,
-			ModelType:          modelType,
-		},
+		TaskType:               Download,
+		ClusterBaseModel:       clusterBaseModel,
+		TensorRTLLMShapeFilter: newModelShapeFilter(clusterBaseModel.Spec, w.nodeShapeAlias),
 	}
 
 	w.gopherChan <- gopherTask
@@ -841,21 +813,10 @@ for the provided ClusterBaseModel.
 The task is sent to w.gopherChan for processing by Gopher workers.
 */
 func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseModel *v1beta1.ClusterBaseModel) {
-	IsTensorrtLLMModel := clusterBaseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-	modelType := string(constants.ServingBaseModel)
-	if modelTypeFromMetadata, ok := clusterBaseModel.Spec.AdditionalMetadata["type"]; ok {
-		modelType = modelTypeFromMetadata
-	}
-
 	gopherTask := &GopherTask{
-		TaskType:         DownloadOverride,
-		ClusterBaseModel: clusterBaseModel,
-		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-			IsTensorrtLLMModel: IsTensorrtLLMModel,
-			ShapeAlias:         w.nodeShapeAlias,
-			ModelType:          modelType,
-		},
+		TaskType:               DownloadOverride,
+		ClusterBaseModel:       clusterBaseModel,
+		TensorRTLLMShapeFilter: newModelShapeFilter(clusterBaseModel.Spec, w.nodeShapeAlias),
 	}
 
 	w.logger.Infof("generate DownloadOverride task %v", clusterBaseModel.Spec.DisplayName)
@@ -863,20 +824,10 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseM
 }
 
 func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.BaseModel) {
-	IsTensorrtLLMModel := baseModel.Spec.ModelFormat.Name == constants.TensorRTLLM
-
-	modelType := string(constants.ServingBaseModel)
-	if modelTypeFromMetadata, ok := baseModel.Spec.AdditionalMetadata["type"]; ok {
-		modelType = modelTypeFromMetadata
-	}
 	gopherTask := &GopherTask{
-		TaskType:  DownloadOverride,
-		BaseModel: baseModel,
-		TensorRTLLMShapeFilter: &TensorRTLLMShapeFilter{
-			IsTensorrtLLMModel: IsTensorrtLLMModel,
-			ShapeAlias:         w.nodeShapeAlias,
-			ModelType:          modelType,
-		},
+		TaskType:               DownloadOverride,
+		BaseModel:              baseModel,
+		TensorRTLLMShapeFilter: newModelShapeFilter(baseModel.Spec, w.nodeShapeAlias),
 	}
 	w.logger.Infof("generate DownloadOverride task %v", baseModel.Spec.DisplayName)
 	w.gopherChan <- gopherTask
