@@ -3,13 +3,112 @@ package defrag
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 
+	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/testutil"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
+
+// Missing captured nodes must withhold a previously selected move, including
+// when another target still lets the arithmetic policy produce a candidate.
+func TestRevalidatePlacementMissingCapturedNode(t *testing.T) {
+	for _, missing := range []string{"source", "target"} {
+		t.Run(missing, func(t *testing.T) {
+			snap := testutil.NewSnapshot().WithNode("source", "h100", 8).
+				WithNode("target", "h100", 8).WithNode("alternate", "h100", 8).
+				WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "source", 1).
+				WithOtherOccupant("target", 7).WithOtherOccupant("alternate", 7).Build()
+			cfg := lowGate()
+			cfg.Policies.Defragmentation.Scoring.SizeLadder = []int{8}
+			cfg.Policies.Defragmentation.Scoring.SizePrior = map[string]float64{"8": 1}
+			*cfg.Policies.Defragmentation.Scoring.DemandBlendLambda = 1
+			candidates := executables(evaluate(t, snap, cfg))
+			if len(candidates) != 1 {
+				t.Fatalf("expected initial candidate: %+v", candidates)
+			}
+			c := candidates[0]
+			pod := snap.Workloads[c.Workload].Components[c.Component].Instances[0].Pods[0]
+			targets := map[types.NamespacedName]string{{Namespace: pod.Namespace, Name: pod.Name}: "target"}
+			delete(snap.Nodes, missing)
+			if missing == "target" && len(executables(evaluate(t, snap, cfg))) != 1 {
+				t.Fatal("alternate target must preserve arithmetic eligibility")
+			}
+			if _, ok := RevalidatePlacement(snap, cfg, c, targets); ok {
+				t.Fatal("missing captured node did not withhold the move")
+			}
+		})
+	}
+}
+
+// Replaying current window authorization must reject routine moves and lost
+// emergencies, while actual positive placement retains the emergency boost.
+func TestRevalidatePlacementWindowAndEmergency(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		closed       bool
+		agedPending  bool
+		clearPending bool
+		want         bool
+	}{
+		{name: "routine open", want: true},
+		{name: "routine closed", closed: true},
+		{name: "emergency closed", closed: true, agedPending: true, want: true},
+		{name: "emergency demand cleared", closed: true, agedPending: true, clearPending: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testutil.NewSnapshot().WithNode("source", "h100", 8).
+				WithNode("hole", "h100", 8).WithNode("wide", "h100", 8).
+				WithInstance("prod/mover", v1beta1.EngineComponent, constants.OMENative, "source", 1).
+				WithOtherOccupant("hole", 7).WithOtherOccupant("wide", 4)
+			if tc.agedPending {
+				b.WithPendingPodIn("prod", 8, 30*time.Minute, "h100")
+			}
+			snap := b.Build()
+			cfg := lowGate()
+			cfg.EmergencyPendingAgeMinutes = 15
+			cfg.MaintenanceWindows = []config.MaintenanceWindow{{Days: []string{"Thu"}, Start: "09:00", End: "17:00"}}
+			cfg.Policies.Defragmentation.Scoring.SizeLadder = []int{4, 8}
+			cfg.Policies.Defragmentation.Scoring.SizePrior = map[string]float64{"4": 1, "8": 1}
+			*cfg.Policies.Defragmentation.Scoring.DemandBlendLambda = 1
+			candidates := executables(evaluate(t, snap, cfg))
+			if len(candidates) != 1 {
+				t.Fatalf("expected initial arithmetic candidate: %+v", candidates)
+			}
+			c := candidates[0]
+			almost(t, "arithmetic benefit", c.Benefit, 0.5)
+			if c.Emergency != tc.agedPending {
+				t.Fatalf("initial emergency=%t, want %t", c.Emergency, tc.agedPending)
+			}
+			if tc.closed {
+				cfg.MaintenanceWindows[0].Days = []string{"Mon"}
+			}
+			if tc.clearPending {
+				snap.PendingPods = nil
+			}
+			pod := snap.Workloads[c.Workload].Components[c.Component].Instances[0].Pods[0]
+			targets := map[types.NamespacedName]string{{Namespace: pod.Namespace, Name: pod.Name}: "wide"}
+			got, ok := RevalidatePlacement(snap, cfg, c, targets)
+			if ok != tc.want {
+				t.Fatalf("placement eligibility=%t, want %t: %+v", ok, tc.want, got)
+			}
+			if ok {
+				almost(t, "actual benefit", got.Benefit, 1.0/3.0)
+				wantScore := 11.0 / 60.0
+				if tc.agedPending {
+					wantScore = 11.0 / 30.0
+				}
+				almost(t, "actual score", got.Score, wantScore)
+				if got.Emergency != tc.agedPending {
+					t.Fatalf("actual emergency=%t, want %t", got.Emergency, tc.agedPending)
+				}
+			}
+		})
+	}
+}
 
 // Catches scoring only part of a gang, using the hypothetical greedy targets,
 // or forgetting that a positive capacity gain still has to exceed move cost.

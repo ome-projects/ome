@@ -29,7 +29,8 @@ for mutation in \
   '.requestWatch[0].metadata.annotations["ome.io/migration-request-v1-test"]="{}"' \
   '.podWatch=[]' '.podWatch[0].type="DELETED"' '.podWatch[0].object.metadata.uid="replacement"' \
   '.baseline.allPods.items[0].spec.affinity={}' '.attempts[0].samples[0].ir.spec.component="decoder"'; do
-  if jq "${mutation}" <<<"${baseline}" | verify; then
+  mutated="$(jq "${mutation}" <<<"${baseline}")"
+  if verify <<<"${mutated}"; then
     echo "no-benefit verifier accepted invalid evidence: ${mutation}" >&2; exit 1
   fi
 done

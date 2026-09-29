@@ -37,4 +37,24 @@ watch_timeout="$(churn_watch_timeout_seconds 420)"
 grep -Fq 'kill -0 "${watch_pid}"' "${dir}/useful-defrag.sh" || {
   echo 'runner does not detect premature watch exit' >&2; exit 1;
 }
+
+# A mutation-generation failure must fail the negative suite itself; it is not
+# evidence that the verifier rejected a successfully constructed document.
+jq() {
+  for arg in "$@"; do
+    if [[ "${arg}" == '.attempts=[]' ]]; then
+      echo 'injected mutation-generation failure' >&2
+      return 42
+    fi
+  done
+  command jq "$@"
+}
+export -f jq
+if bash "${dir}/verify-no-benefit-defrag_test.sh" >"${tmp_dir}/mutation-error.log" 2>&1; then
+  echo 'negative suite treated mutation-generation failure as verifier rejection' >&2; exit 1
+else
+  rc=$?
+  [[ "${rc}" == 42 ]] || { echo "unexpected mutation failure status: ${rc}" >&2; exit 1; }
+fi
+unset -f jq
 echo 'review regression checks passed'

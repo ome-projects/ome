@@ -69,16 +69,8 @@ func RevalidatePlacement(snap *snapshot.ClusterSnapshot, cfg *config.Config, can
 	}
 	scoring := cfg.Policies.Defragmentation.Scoring
 	ladder := int64Ladder(scoring.SizeLadder)
-	bins := schedulableBins(snap, cfg, pool)
-	var totalFree int64
-	for _, bin := range bins {
-		totalFree += bin.free
-	}
-	ctx := &evalCtx{snap: snap, cfg: cfg, pool: pool, bins: bins, ladder: ladder,
-		weights:   demandWeights(ladder, demandByPoolAndSize(snap, ladder)[pool], parsePrior(scoring.SizePrior), *scoring.DemandBlendLambda),
-		totalFree: totalFree, pendings: poolPendings(snap, pool), costWeight: costWeight(cfg.Policies.Defragmentation.Aggressiveness)}
-	ctx.before = weightedFrag(bins, ladder, ctx.weights, totalFree)
-	after, ok := simulateSurgePlan(bins, plan.Moves)
+	ctx := newEvalContext(snap, cfg, pool, ladder, parsePrior(scoring.SizePrior), demandByPoolAndSize(snap, ladder)[pool])
+	after, ok := simulateSurgePlan(ctx.bins, plan.Moves)
 	if !ok {
 		return policy.Candidate{}, false
 	}

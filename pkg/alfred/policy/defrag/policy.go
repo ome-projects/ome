@@ -69,6 +69,27 @@ type evalCtx struct {
 	executionOpen bool
 }
 
+// newEvalContext fixes the scoring baseline shared by candidate selection and
+// actual-placement revalidation. Callers may reuse precomputed pool demand.
+func newEvalContext(snap *snapshot.ClusterSnapshot, cfg *config.Config, pool string,
+	ladder []int64, prior map[int64]float64, demandGPUs map[int64]int64) *evalCtx {
+	ctx := &evalCtx{
+		snap:       snap,
+		cfg:        cfg,
+		pool:       pool,
+		bins:       schedulableBins(snap, cfg, pool),
+		ladder:     ladder,
+		weights:    demandWeights(ladder, demandGPUs, prior, *cfg.Policies.Defragmentation.Scoring.DemandBlendLambda),
+		pendings:   poolPendings(snap, pool),
+		costWeight: costWeight(cfg.Policies.Defragmentation.Aggressiveness),
+	}
+	for _, bin := range ctx.bins {
+		ctx.totalFree += bin.free
+	}
+	ctx.before = weightedFrag(ctx.bins, ctx.ladder, ctx.weights, ctx.totalFree)
+	return ctx
+}
+
 // Evaluate turns the snapshot into a ranked []Candidate. Gate → enumerate → classify → simulate → score →
 // boost → rank → filter.
 func (*Policy) Evaluate(snap *snapshot.ClusterSnapshot, cfg *config.Config) []policy.Candidate {
@@ -81,9 +102,7 @@ func (*Policy) Evaluate(snap *snapshot.ClusterSnapshot, cfg *config.Config) []po
 
 	ladder := int64Ladder(d.Scoring.SizeLadder)
 	prior := parsePrior(d.Scoring.SizePrior)
-	lambda := *d.Scoring.DemandBlendLambda
 	demand := demandByPoolAndSize(snap, ladder)
-	weight := costWeight(d.Aggressiveness)
 	now := snap.Timestamp
 
 	var out []policy.Candidate
@@ -97,19 +116,8 @@ func (*Policy) Evaluate(snap *snapshot.ClusterSnapshot, cfg *config.Config) []po
 		if !executionOpen && !advisoryOpen {
 			continue
 		}
-		ctx := &evalCtx{
-			snap:          snap,
-			cfg:           cfg,
-			pool:          pool,
-			bins:          schedulableBins(snap, cfg, pool),
-			ladder:        ladder,
-			weights:       demandWeights(ladder, demand[pool], prior, lambda),
-			totalFree:     cs.TotalFree,
-			pendings:      poolPendings(snap, pool),
-			costWeight:    weight,
-			executionOpen: executionOpen,
-		}
-		ctx.before = weightedFrag(ctx.bins, ladder, ctx.weights, ctx.totalFree)
+		ctx := newEvalContext(snap, cfg, pool, ladder, prior, demand[pool])
+		ctx.executionOpen = executionOpen
 
 		for _, w := range sortedWorkloads(snap) {
 			for _, comp := range sortedComponents(w) {
