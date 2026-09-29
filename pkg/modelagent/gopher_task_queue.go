@@ -14,10 +14,18 @@ type gopherTaskQueue struct {
 	normalDownload     []*GopherTask
 	normalRevalidation []*GopherTask
 	closed             bool
+	// Entries survive pop and delayed retries. Active counts also cover a
+	// demoted retry starting before its previous worker returns.
+	pending map[*GopherTask]*gopherPendingTask
+}
+
+type gopherPendingTask struct {
+	active int
+	queued bool
 }
 
 func newGopherTaskQueue() *gopherTaskQueue {
-	queue := &gopherTaskQueue{}
+	queue := &gopherTaskQueue{pending: make(map[*GopherTask]*gopherPendingTask)}
 	queue.cond = sync.NewCond(&queue.mutex)
 	return queue
 }
@@ -31,12 +39,19 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) {
 	if q.closed {
 		return
 	}
+	if _, exists := q.pending[task]; task.ArtifactReportRecovery && !exists && q.hasPendingModelTask(task, false) {
+		return
+	}
+	if q.pending[task] == nil {
+		q.pending[task] = &gopherPendingTask{}
+	}
+	q.pending[task].queued = true
 	if task.TaskType == Delete || task.TaskType == Evict {
 		// Delete preempts pending work for the same model and should run before
 		// reuse-wait tasks, so it is the only non-FIFO insertion.
-		q.high = removeSupersededTasks(q.high, task)
-		q.normalDownload = removeSupersededTasks(q.normalDownload, task)
-		q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
+		q.high = q.removeSupersededTasks(q.high, task)
+		q.normalDownload = q.removeSupersededTasks(q.normalDownload, task)
+		q.normalRevalidation = q.removeSupersededTasks(q.normalRevalidation, task)
 		q.high = append([]*GopherTask{task}, q.high...)
 	} else if shouldUseHighPriorityQueue(task) {
 		q.high = append(q.high, task)
@@ -46,6 +61,91 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) {
 		q.normalDownload = append(q.normalDownload, task)
 	}
 	q.cond.Broadcast()
+}
+
+// Caller holds q.mutex. Explicit queued, active, and delayed work all outrank
+// periodic recovery, even if a recovery task has a later sequence number.
+func (q *gopherTaskQueue) hasPendingModelTask(task *GopherTask, explicitOnly bool) bool {
+	for pending := range q.pending {
+		if pending != task && getModelUID(pending) == getModelUID(task) && (!explicitOnly || !pending.ArtifactReportRecovery) {
+			return true
+		}
+	}
+	return false
+}
+
+func (q *gopherTaskQueue) startTask(task *GopherTask) bool {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if q.closed {
+		return false
+	}
+	if task.ArtifactReportRecovery && q.hasPendingModelTask(task, true) {
+		if pending := q.pending[task]; pending == nil || pending.active == 0 {
+			delete(q.pending, task)
+		} else {
+			pending.queued = false
+		}
+		return false
+	}
+	if q.pending[task] == nil {
+		q.pending[task] = &gopherPendingTask{}
+	}
+	q.pending[task].active++
+	q.pending[task].queued = false
+	return true
+}
+
+func (q *gopherTaskQueue) retainTask(task *GopherTask) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if q.closed {
+		return
+	}
+	if q.pending[task] == nil {
+		q.pending[task] = &gopherPendingTask{}
+	}
+	q.pending[task].queued = true
+}
+
+func (q *gopherTaskQueue) finishTask(task *GopherTask) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	pending := q.pending[task]
+	if pending == nil {
+		return
+	}
+	pending.active--
+	if pending.active == 0 && !pending.queued {
+		delete(q.pending, task)
+	}
+}
+
+func (q *gopherTaskQueue) cancelRetainedTask(task *GopherTask) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if pending := q.pending[task]; pending != nil {
+		pending.queued = false
+		if pending.active == 0 {
+			delete(q.pending, task)
+		}
+	}
+}
+
+func (q *gopherTaskQueue) removeSupersededTasks(tasks []*GopherTask, deletion *GopherTask) []*GopherTask {
+	// Remove reservations for pruned queued tasks, but keep active and delayed
+	// attempts reserved until their own completion or retry admission.
+	for _, task := range tasks {
+		if len(removeSupersededTasks([]*GopherTask{task}, deletion)) == 0 {
+			if pending := q.pending[task]; pending != nil {
+				pending.queued = false
+				if pending.active == 0 {
+					delete(q.pending, task)
+				}
+			}
+		}
+	}
+	return removeSupersededTasks(tasks, deletion)
 }
 
 func (q *gopherTaskQueue) popNormal() (*GopherTask, bool) {
@@ -85,6 +185,7 @@ func (q *gopherTaskQueue) close() {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 	q.closed = true
+	clear(q.pending)
 	q.cond.Broadcast()
 }
 
