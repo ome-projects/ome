@@ -315,7 +315,7 @@ existing tests before accepting changes necessary for this enhancement.
 
 1. **Add allowlisted fields to `runtime effective`.** Covers only
    chosen fields; a preview needs the whole spec. Rejected.
-2. **Print a raw InferenceService.** Looks appliable, and OEP-0011.1
+2. **Print a raw InferenceService.** Invites `kubectl apply`, and OEP-0011.1
    forbids non-`get` output that masquerades as an API object. Rejected.
 3. **Persist the effective spec in status.** Grows every object,
    exposes literal values to status readers, and does not work offline.
