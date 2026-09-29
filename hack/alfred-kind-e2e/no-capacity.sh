@@ -67,14 +67,14 @@ trap cleanup EXIT
 pods_json() { "${kube[@]}" -n "${namespace}" get pods -l "ome.io/inferenceservice=${name},ome.io/managed-by=OMENative" -o json; }
 endpoints_json() { "${kube[@]}" -n "${namespace}" get endpointslices -l "kubernetes.io/service-name=${routing_service}" -o json; }
 observe() {
-  nc_require_namespace
-  pods="$(pods_json)"
+  nc_require_namespace || return 1
+  pods="$(pods_json)" || return 1
   # The component headless Service publishes not-ready peer addresses;
   # migration safety depends on the actual per-revision routing Service.
-  routing_service="${name}-engine-rev-$(jq -r '.items[0].metadata.labels["ome.io/revision-hash"] // ""' <<<"${pods}")"
-  ir="$("${kube[@]}" -n "${namespace}" get inferencereplicas.ome.io "${name}-engine" -o json)"
-  isvc="$("${kube[@]}" -n "${namespace}" get inferenceservices.ome.io "${name}" -o json)"
-  endpoints="$(endpoints_json)"
+  routing_service="${name}-engine-rev-$(jq -r '.items[0].metadata.labels["ome.io/revision-hash"] // ""' <<<"${pods}")" || return 1
+  ir="$("${kube[@]}" -n "${namespace}" get inferencereplicas.ome.io "${name}-engine" -o json)" || return 1
+  isvc="$("${kube[@]}" -n "${namespace}" get inferenceservices.ome.io "${name}" -o json)" || return 1
+  endpoints="$(endpoints_json)" || return 1
 }
 request_count() { jq '[.metadata.annotations // {} | keys[] | select(startswith("ome.io/migration-request-v1-"))] | length' <<<"${isvc}"; }
 source_safe() {

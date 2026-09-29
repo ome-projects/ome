@@ -100,6 +100,75 @@ jq -e -s '
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Exercise the runner's real observe function under the same conditional call
+# used by its readiness loop. Each failed stage must stop before the next read;
+# Bash suppresses automatic errexit for every command inside an if-condition.
+observe_dir="${test_dir}/observe"
+mkdir -p "${observe_dir}"
+namespace=alfred-e2e-no-capacity-observe
+namespace_uid=namespace-uid
+name=no-capacity
+observe_fail_at=none
+pods_fixture='{"kind":"PodList","items":[{"metadata":{"uid":"source-uid","labels":{"ome.io/revision-hash":"revision-a"}}}]}'
+ir_fixture='{"kind":"InferenceReplica","metadata":{"name":"no-capacity-engine","uid":"ir-uid"}}'
+isvc_fixture='{"kind":"InferenceService","metadata":{"name":"no-capacity","uid":"isvc-uid"}}'
+endpoints_fixture='{"kind":"EndpointSliceList","items":[{"metadata":{"name":"route-a"}}]}'
+observe_kube() {
+  local request="$*"
+  printf '%s\n' "${request}" >>"${observe_dir}/calls"
+  case "${request}" in
+    "get namespace ${namespace} -o json")
+      if [[ "${observe_fail_at}" == namespace ]]; then
+        jq -cn --arg name "${namespace}" '{kind:"Namespace",metadata:{name:$name,uid:"successor-uid"}}'
+      else
+        jq -cn --arg name "${namespace}" --arg uid "${namespace_uid}" '{kind:"Namespace",metadata:{name:$name,uid:$uid}}'
+      fi
+      ;;
+    "-n ${namespace} get pods -l ome.io/inferenceservice=${name},ome.io/managed-by=OMENative -o json")
+      [[ "${observe_fail_at}" != pods ]] || return 1
+      if [[ "${observe_fail_at}" == routing ]]; then printf '{invalid-json\n'; else printf '%s\n' "${pods_fixture}"; fi
+      ;;
+    "-n ${namespace} get inferencereplicas.ome.io ${name}-engine -o json")
+      [[ "${observe_fail_at}" != ir ]] || return 1
+      printf '%s\n' "${ir_fixture}"
+      ;;
+    "-n ${namespace} get inferenceservices.ome.io ${name} -o json")
+      [[ "${observe_fail_at}" != isvc ]] || return 1
+      printf '%s\n' "${isvc_fixture}"
+      ;;
+    "-n ${namespace} get endpointslices -l kubernetes.io/service-name=${name}-engine-rev-revision-a -o json")
+      [[ "${observe_fail_at}" != endpoints ]] || return 1
+      printf '%s\n' "${endpoints_fixture}"
+      ;;
+    *) return 97 ;;
+  esac
+}
+kube=(observe_kube)
+eval "$(sed -n '/^pods_json() /p; /^endpoints_json() /p' "${dir}/no-capacity.sh")"
+eval "$(awk '/^observe\(\) \{/ {copy=1} copy {print} copy && /^}/ {exit}' "${dir}/no-capacity.sh")"
+
+for case_spec in namespace:1 pods:2 routing:2 ir:3 isvc:4 endpoints:5; do
+  observe_fail_at="${case_spec%%:*}"
+  expected_calls="${case_spec##*:}"
+  : >"${observe_dir}/calls"
+  if observe >/dev/null 2>&1; then
+    fail "observe accepted ${observe_fail_at} failure in conditional context"
+  fi
+  actual_calls="$(wc -l <"${observe_dir}/calls" | tr -d ' ')"
+  [[ "${actual_calls}" == "${expected_calls}" ]] || fail "observe continued after ${observe_fail_at} failure: ${actual_calls} calls"
+done
+
+observe_fail_at=none
+: >"${observe_dir}/calls"
+if ! observe; then fail 'observe rejected complete successful snapshots'; fi
+[[ "${routing_service}" == no-capacity-engine-rev-revision-a ]] || fail 'observe derived the wrong routing Service'
+[[ "${pods}" == "${pods_fixture}" && "${ir}" == "${ir_fixture}" && "${isvc}" == "${isvc_fixture}" && "${endpoints}" == "${endpoints_fixture}" ]] || {
+  fail 'observe did not retain successful snapshots'
+}
+[[ "$(wc -l <"${observe_dir}/calls" | tr -d ' ')" == 5 ]] || fail 'successful observe did not execute all reads'
+
+echo 'no-capacity observe failure-propagation tests passed'
+
 # CREATE is sequential and each child is bracketed by checks of the recorded
 # Namespace UID. The boundary models actual API state, not only call presence.
 create_dir="${test_dir}/create"
