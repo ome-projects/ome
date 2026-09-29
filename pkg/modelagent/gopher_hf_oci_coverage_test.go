@@ -132,6 +132,9 @@ func TestSharedOCIStatusRechecksReferenceAndReleasesLock(t *testing.T) {
 		child.HfArtifactKey = ""
 		_, err = writeModelEntry(cm.Data, input.ChildModelKey, child)
 		require.NoError(t, err)
+		// Persist the concurrent change: the cleanup-path check also reads
+		// under the parent lock before status publication rechecks ownership.
+		require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, action.GetNamespace()))
 		return true, cm, nil
 	})
 	_, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready})
