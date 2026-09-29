@@ -16,8 +16,8 @@ with the `models.ome/reserve-model-artifact` label.
 Deletion only ever affects the node-local copy. The source — an OCI Object
 Storage bucket or a Hugging Face repository — is never touched.
 
-To release a recorded Shared artifact while retaining the model resource, see
-[Shared artifact eviction](/ome/docs/administration/shared-hf-artifacts/#evicting-a-shared-artifact-while-keeping-the-model).
+To release a recorded Direct or Shared artifact while retaining the model resource, see
+[Artifact eviction](/ome/docs/administration/shared-hf-artifacts/#evicting-an-artifact-while-keeping-the-model).
 Eviction retains an `Evicted` node status entry; the ordinary deletion described
 below removes that entry.
 
