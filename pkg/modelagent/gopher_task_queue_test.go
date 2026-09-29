@@ -1,11 +1,13 @@
 package modelagent
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -292,4 +294,130 @@ func TestGopherTaskQueueEnqueueWakesMatchingBlockedWorker(t *testing.T) {
 	default:
 	}
 	queue.close()
+}
+
+func TestGopherTaskQueueKeepsRepeatedEvictions(t *testing.T) {
+	for _, changedMetadata := range []bool{false, true} {
+		t.Run(fmt.Sprint(changedMetadata), func(t *testing.T) {
+			s, first := newEvictionQueueTestGopher()
+			second := *first
+			second.BaseModel = first.BaseModel.DeepCopy()
+			if changedMetadata {
+				second.BaseModel.ResourceVersion = "newer"
+				second.BaseModel.Annotations = map[string]string{"request": "newer"}
+			}
+			s.enqueueTask(first)
+			s.enqueueTask(&second)
+			require.Equal(t, 2, s.taskQueue.len(), "each eviction must retain its queued task")
+			queued, ok := s.taskQueue.popHighPriority()
+			require.True(t, ok)
+			require.Same(t, first, queued)
+			_, finish, admitted, err := s.beginTask(queued)
+			require.NoError(t, err)
+			require.True(t, admitted)
+			finish(false)
+			queued, ok = s.taskQueue.popHighPriority()
+			require.True(t, ok)
+			require.Same(t, &second, queued)
+			_, finish, admitted, err = s.beginTask(queued)
+			require.NoError(t, err)
+			require.True(t, admitted, "later eviction must progress after earlier completion")
+			finish(false)
+		})
+	}
+}
+
+func TestGopherTaskQueueRepeatedEvictionWaitsForActiveCleanup(t *testing.T) {
+	s, first := newEvictionQueueTestGopher()
+	s.enqueueTask(first)
+	_, _ = s.taskQueue.popHighPriority()
+	_, finishFirst, admitted, err := s.beginTask(first)
+	require.NoError(t, err)
+	require.True(t, admitted)
+	second := *first
+	second.Sequence = 0
+	s.enqueueTask(&second)
+	_, _ = s.taskQueue.popHighPriority()
+	_, _, admitted, err = s.beginTask(&second)
+	require.NoError(t, err)
+	require.False(t, admitted, "worker must requeue while cleanup owns the model")
+	finishFirst(false)
+	retry := waitForEvictionQueueRetry(t, s)
+	s.enqueueTask(retry)
+	_, _ = s.taskQueue.popHighPriority()
+	_, finishSecond, admitted, err := s.beginTask(retry)
+	require.NoError(t, err)
+	require.True(t, admitted)
+	finishSecond(false)
+}
+
+func TestGopherTaskQueueDeleteSupersedesEvictionReservation(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprint(active), func(t *testing.T) {
+			s, eviction := newEvictionQueueTestGopher()
+			s.enqueueTask(eviction)
+			var finishEviction func(bool)
+			if active {
+				_, _ = s.taskQueue.popHighPriority()
+				_, finish, admitted, err := s.beginTask(eviction)
+				require.NoError(t, err)
+				require.True(t, admitted)
+				finishEviction = finish
+			}
+			download := *eviction
+			download.TaskType, download.Sequence = Download, 0
+			s.enqueueTask(&download)
+			deletion := *eviction
+			deletion.TaskType, deletion.Sequence = Delete, 0
+			s.enqueueTask(&deletion)
+			require.Equal(t, 1, s.taskQueue.len(), "Delete removes queued eviction and download intent")
+			queued, _ := s.taskQueue.popHighPriority()
+			require.Same(t, &deletion, queued)
+			_, finishDelete, admitted, err := s.beginTask(queued)
+			require.NoError(t, err)
+			if active {
+				require.False(t, admitted, "Delete must wait for all active eviction cleanup")
+				finishEviction(true) // Even a pending-cleanup retry must yield to Delete.
+				retry := waitForEvictionQueueRetry(t, s)
+				s.enqueueTask(retry)
+				queued, _ = s.taskQueue.popHighPriority()
+				_, finishDelete, admitted, err = s.beginTask(queued)
+				require.NoError(t, err)
+			}
+			require.True(t, admitted, "Delete must not wait on a pruned eviction reservation")
+			finishDelete(false)
+			_, _, admitted, err = s.beginTask(eviction)
+			require.NoError(t, err)
+			require.False(t, admitted, "superseded eviction retries must remain stale")
+			download.Sequence = 0
+			s.enqueueTask(&download)
+			queued, _ = s.taskQueue.popNormal()
+			_, finishDownload, admitted, err := s.beginTask(queued)
+			require.NoError(t, err)
+			require.True(t, admitted, "later downloads must not inherit the old reservation")
+			finishDownload(false)
+		})
+	}
+}
+
+func newEvictionQueueTestGopher() (*Gopher, *GopherTask) {
+	gopher := &Gopher{
+		artifactRouting: gopherArtifactRouting{known: true}, taskQueue: newGopherTaskQueue(),
+		gopherChan: make(chan *GopherTask, 10), samePathWaitDelay: time.Millisecond, logger: zap.NewNop().Sugar(),
+	}
+	task := &GopherTask{TaskType: Evict, SharedArtifact: true, BaseModel: &v1beta1.BaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "model-uid"},
+	}}
+	return gopher, task
+}
+
+func waitForEvictionQueueRetry(t *testing.T, s *Gopher) *GopherTask {
+	t.Helper()
+	select {
+	case retry := <-s.gopherChan:
+		return retry
+	case <-time.After(time.Second):
+		t.Fatal("waiting task did not release its worker and requeue")
+		return nil
+	}
 }

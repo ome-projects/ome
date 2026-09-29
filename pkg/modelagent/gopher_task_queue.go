@@ -37,7 +37,11 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) {
 		q.high = removeSupersededTasks(q.high, task)
 		q.normalDownload = removeSupersededTasks(q.normalDownload, task)
 		q.normalRevalidation = removeSupersededTasks(q.normalRevalidation, task)
-		q.high = append([]*GopherTask{task}, q.high...)
+		if task.TaskType == Delete {
+			q.high = append([]*GopherTask{task}, q.high...)
+		} else {
+			q.high = append(q.high, task)
+		}
 	} else if shouldUseHighPriorityQueue(task) {
 		q.high = append(q.high, task)
 	} else if task.RevalidationReplay {
@@ -120,12 +124,14 @@ func removeSupersededTasks(tasks []*GopherTask, deleteTask *GopherTask) []*Gophe
 	if modelUID == "" {
 		return tasks
 	}
+	// Repeated evictions keep their individual tasks and are serialized by the
+	// tracker. Only a real Delete supersedes queued eviction intent.
 	// Direct and shared deletes can retry while newer download intent arrives.
 	// Match admission's sequenced coordination; non-file tasks keep legacy pruning.
 	preserveNewerTasks := usesArtifactTaskCoordinator(deleteTask)
 	kept := tasks[:0]
 	for _, task := range tasks {
-		if task.TaskType == Delete || getModelUID(task) != modelUID {
+		if task.TaskType == Delete || (deleteTask.TaskType == Evict && task.TaskType == Evict) || getModelUID(task) != modelUID {
 			kept = append(kept, task)
 			continue
 		}

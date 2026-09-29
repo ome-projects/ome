@@ -56,6 +56,9 @@ type GopherTask struct {
 	HfResolvedRevision string
 	// NodeIneligible marks a Delete sent because the model no longer targets this node.
 	NodeIneligible bool
+	// Bounds snapshot refreshes independently of waits for an active file task.
+	restoreRefreshStartedAt  time.Time
+	completedArtifactRequest *completedArtifactRequest
 }
 
 type Gopher struct {
@@ -236,6 +239,9 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 		s.taskQueue = newGopherTaskQueue()
 	}
 	if (task.TaskType == Delete || task.TaskType == Evict) && usesArtifactTaskCoordinator(task) {
+		if task.TaskType == Delete {
+			s.taskTracker.supersedeDeleteBarrier(gopherTaskModelKey(task), task.Sequence)
+		}
 		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
 		if result == gopherTaskStale {
 			return
@@ -307,9 +313,37 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 		}
 	}
 	labelOp := *op
-	if labelOp.ModelStateOnNode == Ready && s.omeClient != nil {
+	if op.ModelStateOnNode != Deleted && artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}) != "" {
+		labelOp.requireNodeCAS = true
 		labelOp.validateReady = func() error {
-			return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: labelOp.BaseModel, ClusterBaseModel: labelOp.ClusterBaseModel})
+			return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel})
+		}
+	}
+	if labelOp.ModelStateOnNode == Deleted && s.omeClient != nil {
+		labelOp.requireNodeCAS = true
+		task := &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
+		labelOp.deleteReadyAllowed = func() (bool, error) {
+			current, err := liveArtifactModel(ctx, s.omeClient, task)
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			return getModelUID(task) == getModelUID(current), nil
+		}
+	}
+	if labelOp.ModelStateOnNode == Ready && s.omeClient != nil {
+		task := &GopherTask{BaseModel: labelOp.BaseModel, ClusterBaseModel: labelOp.ClusterBaseModel}
+		labelOp.validateReady = func() error {
+			return s.validateArtifactDownload(ctx, task)
+		}
+		if request := artifactRehydrationID(task); activeArtifactRestore(ctx, task) {
+			labelOp.artifactRequestID, labelOp.requireNodeCAS = request, true
+			labelOp.validateReady = func() error { return s.validateArtifactRestoreReport(ctx, task) }
+			// The attachment path already committed the report. Do not let a
+			// generic status update replace its proof with marker-only readiness.
+			return s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
 		}
 	}
 	err = s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
@@ -402,6 +436,16 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 	processHFSource func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error),
 	downloadOCI func(context.Context, *ociobjectstore.ObjectURI, string, *GopherTask) error,
 ) error {
+	err := s.processTaskAttemptWithSourceAdapters(task, allowFallbackDownload, processHFSource, downloadOCI)
+	return s.refreshArtifactRestoreTask(task, err)
+}
+
+// Finish the attempt and release its locks and coordinator slot before a
+// refreshed metadata snapshot can be admitted as another attempt.
+func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFallbackDownload bool,
+	processHFSource func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error),
+	downloadOCI func(context.Context, *ociobjectstore.ObjectURI, string, *GopherTask) error,
+) error {
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
 	}
@@ -420,8 +464,23 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 		return err
 	}
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
+		ctx = s.artifactRestoreContext(ctx, task)
+		if waiting, err := s.prepareHfArtifactRestoreCleanup(ctx, task, allowFallbackDownload); waiting || err != nil {
+			return err
+		}
 		if err := s.validateArtifactDownload(ctx, task); err != nil {
 			return err
+		}
+		s.classifyCompletedArtifactRequest(ctx, task)
+		ctx = s.artifactRestoreContext(ctx, task)
+		if activeArtifactRestore(ctx, task) {
+			_, eligible, err := newHfArtifactTaskInputForOCI(task, taskModelSpec(task).Storage, s.modelRootDir)
+			if err != nil {
+				return err
+			}
+			if !eligible && !isDirectHfReuseEligible(task, taskModelSpec(task).Storage) {
+				return fmt.Errorf("artifact restoration requires an eligible Shared source")
+			}
 		}
 	}
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
@@ -1387,6 +1446,16 @@ func (s *Gopher) requeueArtifactWait(task *GopherTask, waitingOnKey string) bool
 		task.SamePathWaitStartedAt = now
 	} else if now.Sub(task.SamePathWaitStartedAt) >= timeout {
 		s.logger.Warnf("Timed out waiting for artifact operation %s for %s", waitingOnKey, getModelInfoForLogging(task))
+		return false
+	}
+
+	return s.scheduleArtifactWait(task, waitingOnKey)
+}
+
+// Schedule a delayed attempt after its caller checks the appropriate budget.
+// File waits and snapshot refreshes retain independent deadlines.
+func (s *Gopher) scheduleArtifactWait(task *GopherTask, waitingOnKey string) bool {
+	if task == nil || s.gopherChan == nil {
 		return false
 	}
 
