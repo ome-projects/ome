@@ -171,7 +171,7 @@ func TestRecoveryCoverageDeletionParentCacheEvictionGuards(t *testing.T) {
 			require.True(t, valid, "exercise the ownership guard, not invalid-record rejection")
 			c.hfArtifactCache[input.Parent.Key] = string(raw)
 
-			unlock, acquired, err := h.tryArtifactOperation(input)
+			unlock, acquired, err := h.tryArtifactOperation(context.Background(), input)
 			require.NoError(t, err)
 			require.True(t, acquired)
 			defer unlock()

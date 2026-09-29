@@ -21,7 +21,7 @@ func unmaterializedArtifactEntry(data map[string]string, key string, uid types.U
 		if entry.ModelUID != "" && entry.ModelUID != uid {
 			return false, fmt.Errorf("eviction model entry belongs to another model UID")
 		}
-		if entry.Status != ModelStatusUpdating || entry.Config != nil || entry.HfArtifactKey != "" || entry.HfArtifactPendingDownload != nil || entry.HfArtifactPendingDeletion != nil || entry.Progress != nil {
+		if entry.Status != ModelStatusUpdating || entry.Config != nil || entry.HfArtifactKey != "" || entry.HfArtifactPendingDownload != nil || entry.HfArtifactPendingDeletion != nil || entry.DirectArtifactPendingDeletion != nil || entry.Progress != nil {
 			return false, nil
 		}
 	}

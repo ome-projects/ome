@@ -8,7 +8,7 @@ import (
 // handleDelete removes this child's references and symlink. Parent deletion
 // requires an exclusive lock and no remaining recorded or filesystem children.
 func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifactTaskInput) (hfArtifactTaskResult, error) {
-	unlock, acquired, err := h.tryArtifactOperation(input)
+	unlock, acquired, err := h.tryArtifactOperation(ctx, input)
 	if err != nil || !acquired {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -132,7 +133,7 @@ func TestSharedRestoreReadyMarkerCannotBypassStartupValidation(t *testing.T) {
 	parent, found, err := h.repository.Get(ctx, input.Parent.Identity)
 	require.NoError(t, err)
 	require.True(t, found)
-	unlock, acquired, err := h.tryArtifactOperation(input)
+	unlock, acquired, err := h.tryArtifactOperation(context.Background(), input)
 	require.NoError(t, err)
 	require.True(t, acquired)
 	defer unlock()
@@ -155,7 +156,7 @@ func TestSharedRestoreChecksStartupBeforeConfigMapWriteLock(t *testing.T) {
 	parent, found, err := h.repository.Get(ctx, input.Parent.Identity)
 	require.NoError(t, err)
 	require.True(t, found)
-	unlock, acquired, err := h.tryArtifactOperation(input)
+	unlock, acquired, err := h.tryArtifactOperation(context.Background(), input)
 	require.NoError(t, err)
 	require.True(t, acquired)
 	defer unlock()
@@ -212,16 +213,18 @@ func TestSharedRestoreRejectsStaleAuthority(t *testing.T) {
 
 func TestScoutSharedRestoreUsesNormalDownload(t *testing.T) {
 	for _, cluster := range []bool{false, true} {
-		for _, kind := range []string{"request", "unevict", "source override", "repair annotation override", "unrelated annotation"} {
+		for _, kind := range []string{"request", "unevict", "residency only", "source override", "repair annotation override", "unrelated annotation"} {
 			t.Run(fmt.Sprintf("%v/%s", cluster, kind), func(t *testing.T) {
 				scout, tasks := newScoutForUpdateTest(t)
 				old := newBaseModel("model", v1beta1.ReuseIfExists, "hf://org/model")
 				old.Annotations = map[string]string{testRestoreAnnotation: "request-1"}
 				model := old.DeepCopy()
-				model.Annotations[testRestoreAnnotation] = "request-2"
+				if kind != "residency only" {
+					model.Annotations[testRestoreAnnotation] = "request-2"
+				}
 				want := Download
 				switch kind {
-				case "unevict":
+				case "unevict", "residency only":
 					old.Annotations[artifactResidencyAnnotation] = "Evicted"
 				case "source override":
 					model.Spec.Storage.StorageUri = ptr("hf://other/model")
@@ -280,11 +283,15 @@ func TestSharedRestoreRepairsTrackedSiblings(t *testing.T) {
 			seedTestChildModelEntry(t, s.sharedHfArtifactHandler().repository, second)
 			require.NoError(t, runTestHfArtifactDownload(s.sharedHfArtifactHandler(), second))
 			require.NoError(t, s.configMapReconciler.ReconcileModelStatus(context.Background(), &ConfigMapStatusOp{BaseModel: sibling, ModelStatus: ModelStatusReady}))
+			original, err := os.ReadFile(filepath.Join(input.Parent.LocalPath, "config.json"))
+			require.NoError(t, err)
+			withdrawalRejected := false
 			if mode == "missing" {
 				require.NoError(t, os.RemoveAll(input.Parent.LocalPath))
 			}
 			if mode == "withdrawal failure" {
 				s.kubeClient.(*fake.Clientset).PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+					withdrawalRejected = true
 					return true, nil, apierrors.NewBadRequest("readiness patch rejected")
 				})
 			}
@@ -293,6 +300,10 @@ func TestSharedRestoreRepairsTrackedSiblings(t *testing.T) {
 			if mode == "withdrawal failure" {
 				require.True(t, err != nil || result.Outcome == hfArtifactTaskRetry)
 				require.Zero(t, downloads)
+				require.True(t, withdrawalRejected)
+				remaining, err := os.ReadFile(filepath.Join(input.Parent.LocalPath, "config.json"))
+				require.NoError(t, err)
+				require.Equal(t, original, remaining)
 				return
 			}
 			require.NoError(t, err)
@@ -509,15 +520,17 @@ func TestSharedRestoreLostResponses(t *testing.T) {
 					require.Equal(t, "/metadata/resourceVersion", patch[0]["path"])
 					object, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("nodes"), "", s.configMapReconciler.nodeName)
 					require.NoError(t, err)
-					node := object.(*corev1.Node)
-					key, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+					node := object.(*corev1.Node).DeepCopy()
+					original, err := json.Marshal(node)
 					require.NoError(t, err)
-					node.Labels[key] = "Ready"
+					submitted, err := jsonpatch.DecodePatch(action.(ktesting.PatchAction).GetPatch())
+					require.NoError(t, err)
+					patched, err := submitted.Apply(original)
+					require.NoError(t, err)
+					require.NoError(t, json.Unmarshal(patched, node))
+					require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), node, ""))
 					if stage == "labels missing node" {
 						require.NoError(t, client.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("nodes"), "", node.Name))
-					}
-					if stage != "labels missing node" {
-						require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), node, ""))
 					}
 					if stage == "labels changed request" {
 						current := task.BaseModel.DeepCopy()

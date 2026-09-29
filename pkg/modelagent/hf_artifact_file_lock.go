@@ -1,10 +1,12 @@
 package modelagent
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gofrs/flock"
 	"golang.org/x/sys/unix"
@@ -67,13 +69,18 @@ func tryHfArtifactFileLock(root, directory, key string) (*flock.Flock, bool, err
 
 // tryParentFileOperation retains the local guard used by label callbacks and
 // adds cross-process exclusion. Contention never blocks a queue worker.
-func (h *hfArtifactTaskHandler) tryParentFileOperation(parent HfArtifactEntry, root string) (func(), bool, error) {
+func (h *hfArtifactTaskHandler) tryParentFileOperation(ctx context.Context, parent HfArtifactEntry, root string) (func(), bool, error) {
 	unlock, acquired := h.tryParentOperation(parent.Key)
 	if !acquired {
 		return nil, false, nil
 	}
 	lock, acquired, err := tryHfArtifactParentFileLock(parent, root)
 	if err != nil || !acquired {
+		unlock()
+		return nil, false, err
+	}
+	if err := h.repository.configMaps.checkDirectCleanupForWriter(ctx, parent.LocalPath); err != nil {
+		_ = lock.Close()
 		unlock()
 		return nil, false, err
 	}
@@ -87,16 +94,21 @@ func (h *hfArtifactTaskHandler) tryParentFileOperation(parent HfArtifactEntry, r
 
 // All child-changing operations take parent then child, including replacements
 // that use a different parent identity but the same child path.
-func (h *hfArtifactTaskHandler) tryArtifactOperation(input hfArtifactTaskInput) (func(), bool, error) {
+func (h *hfArtifactTaskHandler) tryArtifactOperation(ctx context.Context, input hfArtifactTaskInput) (func(), bool, error) {
 	if err := input.validateFilesystemPaths(input.Parent); err != nil {
 		return nil, false, err
 	}
-	unlock, acquired, err := h.tryParentFileOperation(input.Parent, input.ModelStoreRoot)
+	unlock, acquired, err := h.tryParentFileOperation(ctx, input.Parent, input.ModelStoreRoot)
 	if err != nil || !acquired {
 		return nil, false, err
 	}
 	child, acquired, err := tryHfArtifactChildFileLock(input)
 	if err != nil || !acquired {
+		unlock()
+		return nil, false, err
+	}
+	if err := h.repository.configMaps.checkDirectCleanupForWriter(ctx, input.ChildModelPath); err != nil {
+		_ = child.Close()
 		unlock()
 		return nil, false, err
 	}
@@ -106,4 +118,13 @@ func (h *hfArtifactTaskHandler) tryArtifactOperation(input hfArtifactTaskInput) 
 		}
 		unlock()
 	}, true, nil
+}
+
+// Shared writers must not inherit a Direct receipt owner's cleanup exemption.
+// Preserve caller cancellation while bounding each lock-held API check.
+func (c *ConfigMapReconciler) checkDirectCleanupForWriter(ctx context.Context, path string) error {
+	ctx = context.WithValue(ctx, artifactCleanupGuardKey{}, (*artifactCleanupGuard)(nil))
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return c.checkDirectCleanupPath(ctx, path)
 }

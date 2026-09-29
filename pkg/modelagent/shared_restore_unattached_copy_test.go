@@ -44,6 +44,7 @@ func TestSharedRestoreAfterEvictionWithUnattachedCopy(t *testing.T) {
 				copy.Spec.Storage.DownloadPolicy = ptr(v1beta1.AlwaysDownload)
 			case "retained directory":
 				require.NoError(t, os.MkdirAll(input.Parent.LocalPath, 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(input.Parent.LocalPath, "sentinel"), []byte("retained model files"), 0o600))
 			case "alias through child", "alias through descendant":
 				target := input.ChildModelPath
 				if scenario == "alias through descendant" {
@@ -105,6 +106,11 @@ func TestSharedRestoreAfterEvictionWithUnattachedCopy(t *testing.T) {
 			if scenario != "queued copy" && scenario != "copy during Updating" && scenario != "copy queued with Updating entry" {
 				require.Error(t, err)
 				require.Zero(t, downloads)
+				if scenario == "retained directory" {
+					contents, err := os.ReadFile(filepath.Join(input.Parent.LocalPath, "sentinel"))
+					require.NoError(t, err)
+					require.Equal(t, "retained model files", string(contents))
+				}
 				return
 			}
 			require.NoError(t, err)

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func TestHfArtifactFileLockProcess(t *testing.T) {
@@ -187,7 +191,7 @@ func TestHfArtifactFileLocksContendAcrossRootAliases(t *testing.T) {
 			secondRepository, _ := newTestHfArtifactRepository(t, map[string]string{})
 			firstHandler := newHfArtifactTaskHandler(firstRepository)
 			secondHandler := newHfArtifactTaskHandler(secondRepository)
-			unlock, acquired, err := firstHandler.tryArtifactOperation(first)
+			unlock, acquired, err := firstHandler.tryArtifactOperation(context.Background(), first)
 			require.NoError(t, err)
 			require.True(t, acquired)
 			firstReleased := false
@@ -199,24 +203,94 @@ func TestHfArtifactFileLocksContendAcrossRootAliases(t *testing.T) {
 
 			if scenario == "same child with different parents" {
 				// Prove that the child lock, not parent contention, blocks this owner.
-				parentUnlock, acquired, err := secondHandler.tryParentFileOperation(second.Parent, second.ModelStoreRoot)
+				parentUnlock, acquired, err := secondHandler.tryParentFileOperation(context.Background(), second.Parent, second.ModelStoreRoot)
 				require.NoError(t, err)
 				require.True(t, acquired)
 				parentUnlock()
 			}
-			_, acquired, err = secondHandler.tryArtifactOperation(second)
+			_, acquired, err = secondHandler.tryArtifactOperation(context.Background(), second)
 			require.NoError(t, err)
 			require.False(t, acquired)
 
 			unlock()
 			firstReleased = true
-			secondUnlock, acquired, err := secondHandler.tryArtifactOperation(second)
+			secondUnlock, acquired, err := secondHandler.tryArtifactOperation(context.Background(), second)
 			require.NoError(t, err)
 			require.True(t, acquired, "the competing owner can acquire after release")
 			defer secondUnlock()
-			_, acquired, err = firstHandler.tryArtifactOperation(first)
+			_, acquired, err = firstHandler.tryArtifactOperation(context.Background(), first)
 			require.NoError(t, err)
 			require.False(t, acquired, "alias ownership also excludes the canonical owner")
 		})
 	}
+}
+
+// The transport waits for request cancellation, with a test-only escape hatch
+// so a missing caller context fails rather than hanging the test.
+type artifactCheckTransport func(*http.Request) (*http.Response, error)
+
+func (f artifactCheckTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestSharedFileCheckHonorsCallerDeadlineAndReleasesLocks(t *testing.T) {
+	for _, mode := range []string{"deadline", "cancel"} {
+		for _, blockedRead := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%s/%d", mode, blockedRead), func(t *testing.T) {
+				input := testHfArtifactTaskInput(t, t.TempDir(), "child")
+				repo, fakeClient := newTestHfArtifactRepository(t, map[string]string{})
+				h := newHfArtifactTaskHandler(repo)
+				reads := 0
+				var cancel context.CancelFunc
+				client, err := kubernetes.NewForConfig(&rest.Config{Host: "https://test.invalid", Transport: artifactCheckTransport(func(r *http.Request) (*http.Response, error) {
+					reads++
+					if reads == blockedRead {
+						if mode == "cancel" {
+							cancel()
+						}
+						select {
+						case <-r.Context().Done():
+							return nil, r.Context().Err()
+						case <-time.After(time.Second):
+							return nil, fmt.Errorf("request ignored caller deadline")
+						}
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"node-1","namespace":"ome"},"data":{}}`))}, nil
+				})})
+				require.NoError(t, err)
+				repo.configMaps.kubeClient = client
+				ctx := context.Background()
+				if mode == "cancel" {
+					ctx, cancel = context.WithCancel(ctx)
+				} else {
+					ctx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
+				}
+				defer cancel()
+				result, err := h.handleDownload(ctx, input, writeTestHfArtifactFiles)
+				require.NoError(t, err)
+				if mode == "cancel" {
+					require.ErrorIs(t, result.RetryReason, context.Canceled)
+				} else {
+					require.ErrorIs(t, result.RetryReason, context.DeadlineExceeded)
+				}
+				repo.configMaps.kubeClient = fakeClient
+				unlock, acquired, err := h.tryArtifactOperation(context.Background(), input)
+				require.NoError(t, err)
+				require.True(t, acquired, "all file and operation locks must be released")
+				unlock()
+			})
+		}
+	}
+}
+
+func TestSharedFileCheckHasDefaultTimeout(t *testing.T) {
+	repo, _ := newTestHfArtifactRepository(t, map[string]string{})
+	before := time.Now()
+	client, err := kubernetes.NewForConfig(&rest.Config{Host: "https://test.invalid", Transport: artifactCheckTransport(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		require.True(t, ok, "lock-held checks must have a deadline even without a caller deadline")
+		require.WithinDuration(t, before.Add(10*time.Second), deadline, time.Second)
+		return nil, context.Canceled
+	})})
+	require.NoError(t, err)
+	repo.configMaps.kubeClient = client
+	require.ErrorIs(t, repo.configMaps.checkDirectCleanupForWriter(context.Background(), t.TempDir()), context.Canceled)
 }

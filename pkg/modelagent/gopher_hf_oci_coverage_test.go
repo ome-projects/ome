@@ -132,6 +132,9 @@ func TestSharedOCIStatusRechecksReferenceAndReleasesLock(t *testing.T) {
 		child.HfArtifactKey = ""
 		_, err = writeModelEntry(cm.Data, input.ChildModelKey, child)
 		require.NoError(t, err)
+		// Persist the concurrent change: the cleanup-path check also reads
+		// under the parent lock before status publication rechecks ownership.
+		require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, action.GetNamespace()))
 		return true, cm, nil
 	})
 	_, err := s.lockHfChildStatus(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Ready})
@@ -238,7 +241,7 @@ func TestSharedOCIRejectsReplacedPathsBeforeStatusOrPreservation(t *testing.T) {
 					require.False(t, action.Matches("update", "configmaps") || action.Matches("patch", "nodes"),
 						"stale paths must be rejected before status or reference writes: %s %s", action.GetVerb(), action.GetResource().Resource)
 				}
-				unlock, acquired, err := handler.tryArtifactOperation(input)
+				unlock, acquired, err := handler.tryArtifactOperation(context.Background(), input)
 				require.NoError(t, err)
 				require.True(t, acquired, "rejection must release the original local, parent-file, and child-file locks")
 				unlock()
