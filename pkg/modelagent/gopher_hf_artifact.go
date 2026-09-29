@@ -21,6 +21,7 @@ import (
 // handled distinguishes that fallback from a completed shared-artifact task;
 // waiting prevents deferred work from being published as Ready by Gopher.
 func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spec v1beta1.BaseModelSpec, allowDownload bool) (handled, waiting bool, err error) {
+	ctx = s.artifactRestoreContext(ctx, task)
 	if s.isOrdinaryArtifactTask(task) {
 		return false, false, nil
 	}
@@ -96,6 +97,9 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 	}
 	switch result.Outcome {
 	case hfArtifactTaskUseDefaultDownload:
+		if artifactRehydrationID(task) != "" {
+			return true, false, fmt.Errorf("Shared restoration cannot adopt a resident Direct path")
+		}
 		if isSharedHfArtifactSymlink(input.ChildModelPath) {
 			return true, false, fmt.Errorf("refusing default download through an unrelated shared artifact symlink")
 		}
@@ -332,8 +336,39 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 			op.BaseModel = model
 		}
 		if status == ModelStatusReady && s.omeClient != nil {
+			if artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}) != "" {
+				// Startup and sibling repair did not validate this request. Its
+				// normal download task owns reporting and paired label publication.
+				continue
+			}
 			op.validateReady = func() error {
 				return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel})
+			}
+		}
+		if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil {
+			// Shared repair must positively withdraw every tracked child's
+			// readiness before replacing bytes, including on label retries.
+			op.nodeUID = s.artifactNodeUID
+			childTask := &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
+			op.validateReady = func() error {
+				if err := validateArtifactRestore(ctx); err != nil {
+					return err
+				}
+				if err := s.validateArtifactDownload(ctx, childTask); err != nil {
+					return err
+				}
+				cm, err := s.configMapReconciler.getConfigMap(ctx)
+				if err != nil {
+					return err
+				}
+				entry, err := existingModelEntry(cm.Data, key)
+				if err != nil {
+					return err
+				}
+				if entry.ModelUID != types.UID(getModelUID(childTask)) {
+					return fmt.Errorf("Shared repair child UID changed")
+				}
+				return nil
 			}
 		}
 		if err := s.nodeLabelReconciler.ReconcileNodeLabels(op); err != nil {
@@ -346,6 +381,54 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 // runHfArtifactDownload keeps expensive validation and writes on normal workers.
 // A Failed parent with children is repaired in place, never reset as a new copy.
 func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, input hfArtifactTaskInput, allowDownload bool, validate hfArtifactValidateFunc, download hfArtifactDownloadFunc) (hfArtifactTaskResult, error) {
+	ctx = s.artifactRestoreContext(ctx, task)
+	ctx, releaseFileLocks := directFileOperationContext(ctx)
+	defer releaseFileLocks()
+	if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil {
+		if err := validateArtifactRestore(ctx); err != nil {
+			return hfArtifactTaskResult{}, err
+		}
+		if !allowDownload {
+			s.demoteToNormalPriority(task)
+			return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
+		}
+		input.pathUsers = func(ctx context.Context, path string) (bool, error) {
+			return s.sharedArtifactPathUsers(ctx, input, path, true)
+		}
+		originalValidate, originalDownload := validate, download
+		validate = func(path string) (bool, error) {
+			if err := validateArtifactRestore(ctx); err != nil {
+				return false, err
+			}
+			if originalValidate == nil {
+				return false, fmt.Errorf("Shared restoration requires byte validation")
+			}
+			valid, err := originalValidate(path)
+			guard.validated = err == nil && valid
+			return valid, err
+		}
+		download = func(path string) error {
+			if err := validateArtifactRestore(ctx); err != nil {
+				return err
+			}
+			used, err := s.sharedArtifactPathUsers(ctx, input, path, true)
+			if err != nil {
+				return err
+			}
+			if used {
+				return fmt.Errorf("cannot restore corrupt Shared bytes used by another model")
+			}
+			if originalDownload == nil {
+				return fmt.Errorf("Shared restoration requires a downloader")
+			}
+			if err := originalDownload(path); err != nil {
+				return err
+			}
+			// Source download callbacks validate their bytes before returning.
+			guard.validated = true
+			return nil
+		}
+	}
 	handler := s.sharedHfArtifactHandler()
 	if err := s.hfArtifactStartup.recover(ctx); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
@@ -366,9 +449,18 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 		}
 	}
 	if handler.childPathConflictsWithParent(input.ChildModelPath, input.Parent.LocalPath) {
+		if artifactRehydrationID(task) != "" {
+			return hfArtifactTaskResult{}, fmt.Errorf("Shared restoration cannot adopt a resident Direct path")
+		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
-	needsRepair := task.TaskType == DownloadOverride || (found && parent.Status != HfArtifactStatusUpdating &&
+	if artifactRehydrationID(task) != "" {
+		acquired, err := s.tryLockDirectModelPath(ctx, input.Parent.LocalPath)
+		if err != nil || !acquired {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
+	needsRepair := artifactRehydrationID(task) != "" || task.TaskType == DownloadOverride || (found && parent.Status != HfArtifactStatusUpdating &&
 		(parent.Status == HfArtifactStatusFailed || !handler.files.ParentReadyMarkerExists(parent)))
 	startupValidation := s.hfArtifactStartup.needsValidation(input.Parent.Key)
 	if !allowDownload && (needsRepair || !found || startupValidation) {
@@ -514,6 +606,7 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 // Completed cleanup remains handled so Delete cannot fall through to legacy
 // deletion; download callers may continue after cleanup finishes.
 func (s *Gopher) resumeHfArtifactChildDeletion(ctx context.Context, task *GopherTask, allowCleanup bool) (handled, waiting bool, err error) {
+	ctx = s.artifactRestoreContext(ctx, task)
 	if s.configMapReconciler == nil {
 		return false, false, nil
 	}
@@ -543,6 +636,24 @@ func (s *Gopher) resumeHfArtifactChildDeletion(ctx context.Context, task *Gopher
 		return true, true, nil
 	}
 	input := s.hfArtifactInputForChild(task, pending.parentForChild(key))
+	if (task.TaskType == Download || task.TaskType == DownloadOverride) && artifactRehydrationID(task) != "" && s.omeClient != nil {
+		if pending.ModelUID != input.ChildModelUID {
+			return true, false, fmt.Errorf("Shared restoration cleanup belongs to another model UID")
+		}
+		ctx, releaseFileLocks := directFileOperationContext(ctx)
+		defer releaseFileLocks()
+		acquired, err := s.tryLockDirectModelPath(ctx, pending.ParentPath)
+		if err != nil || !acquired {
+			return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, err))
+		}
+		input.beforeDelete = func(ctx context.Context) error { return s.validateArtifactDownload(ctx, task) }
+		input.pathUsers = func(ctx context.Context, path string) (bool, error) {
+			return s.sharedArtifactPathUsers(ctx, input, path, false)
+		}
+		input.completeDeletion = func(ctx context.Context, expected HfArtifactPendingDeletion) error {
+			return handler.repository.finishPendingDeletion(ctx, key, expected)
+		}
+	}
 	input.RetainDeletionReceipt = task.TaskType == Delete
 	input.PreserveChildPath = task.TaskType == Delete && s.isReservingModelArtifact(task)
 	err = s.hfArtifactStartup.recover(ctx)

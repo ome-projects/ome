@@ -34,6 +34,7 @@ func (s *Gopher) processDirectHfModel(ctx context.Context, task *GopherTask, spe
 }
 
 func (source directHfSource) process(ctx context.Context, s *Gopher, task *GopherTask, spec v1beta1.BaseModelSpec, allowDownload bool) (bool, error) {
+	ctx = s.artifactRestoreContext(ctx, task)
 	ctx, releaseFileLocks := directFileOperationContext(ctx)
 	defer releaseFileLocks()
 	if err := ctx.Err(); err != nil {
@@ -213,6 +214,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	}
 	if isSharedHfArtifactSymlink(destination) {
 		return false, fmt.Errorf("direct HF destination %s is a shared link without a usable persisted reference", destination)
+	}
+	if artifactRehydrationID(task) != "" {
+		return false, fmt.Errorf("artifact restoration requires an eligible Shared source and destination")
 	}
 	if !allowDownload {
 		s.demoteToNormalPriority(task)

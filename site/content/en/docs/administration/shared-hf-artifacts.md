@@ -239,8 +239,33 @@ publish this model as Ready while `Evicted` remains requested.
 
 Choose eviction only after deciding that serving workloads no longer require
 this model. The agent checks local file ownership, not Pods or serving demand.
-This phase does not provide a restoration request protocol or migrate resident
-files between storage layouts.
+Resident files are not migrated between storage layouts.
+
+## Restoring or validating a Shared artifact
+
+Remove `ome.io/artifact-residency: Evicted` and set a new, nonempty
+`ome.io/artifact-rehydration-id` on an eligible Shared model. Use a Kubernetes
+label value, for example `restore-20260929-1`. Changing these controls queues
+normal reuse: healthy bytes are validated and reattached without downloading.
+Missing or corrupt bytes use the existing Shared download and repair flow.
+Direct or Local borrowers and unrecorded child links prevent unsafe replacement;
+tracked Shared siblings use coordinated readiness withdrawal and repair.
+
+Interrupted cleanup finishes at its original paths before restoration proceeds.
+Current source and download policy select the layout at the configured
+destination; an old `Evicted` report does not preserve the former layout.
+An existing ordinary directory is never adopted into Shared storage. This
+request protocol currently supports Shared restoration only; unsupported paths
+do not acknowledge the request. Downloads without this annotation keep their
+existing behavior.
+
+The agent first records `Ready`, `modelUID`, `artifactRehydrationID`, and
+`nodeUID` in the per-node ConfigMap. It then publishes the model's existing
+Ready label together with `ome.io/artifact-<UID hash>` set to that request ID.
+The hash is the first 24 bytes of SHA-256 of the model UID, encoded as hex.
+An older Ready label alone is not acknowledgement of the new request. Each
+node reports independently; replaced models, replaced Nodes, or changed
+requests cannot complete an older attempt.
 
 ## When the agent falls back to a per-model copy
 

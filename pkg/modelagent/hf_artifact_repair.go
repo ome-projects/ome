@@ -80,6 +80,15 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 		return newHfArtifactRetryResult(parent.Key, errors.Join(err, h.markParentFailed(ctx, parent))), nil
 	}
 	if !valid {
+		if input.pathUsers != nil {
+			used, err := input.pathUsers(ctx, parent.LocalPath)
+			if err != nil {
+				return h.markLockedParentFailed(ctx, parent, err)
+			}
+			if used {
+				return h.markLockedParentFailed(ctx, parent, fmt.Errorf("cannot repair Shared bytes used by another model"))
+			}
+		}
 		if download == nil {
 			return h.markLockedParentFailed(ctx, parent, fmt.Errorf("download function for shared Hugging Face parent %s is nil", parent.Key))
 		}
@@ -104,12 +113,18 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 		}
 		// Leave the old marker alone until validation and status updates have
 		// succeeded. The download callback may now replace corrupt files.
+		if err := validateArtifactRestore(ctx); err != nil {
+			return h.markLockedParentFailed(ctx, parent, err)
+		}
 		if err := os.Remove(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName)); err != nil && !os.IsNotExist(err) {
 			return h.markLockedParentFailed(ctx, parent, err)
 		}
 		if err := download(parent.LocalPath); err != nil {
 			return h.markLockedParentFailed(ctx, parent, err)
 		}
+	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return h.markLockedParentFailed(ctx, parent, err)
 	}
 	if err := h.files.WriteParentReadyMarker(parent); err != nil {
 		return h.markLockedParentFailed(ctx, parent, err)

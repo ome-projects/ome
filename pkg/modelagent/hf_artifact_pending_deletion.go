@@ -257,6 +257,9 @@ func (r *HfArtifactRepository) finishPendingDeletion(ctx context.Context, key st
 			return false, fmt.Errorf("pending shared deletion for %s changed", key)
 		}
 		child.HfArtifactPendingDeletion = nil
+		if child.Config != nil {
+			child.Config.Artifact = Artifact{}
+		}
 		return writeModelEntry(cm.Data, key, child)
 	})
 }
@@ -317,6 +320,9 @@ func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input
 		}
 	}
 	if !referenced {
+		if err := validateArtifactRestore(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
 		if err := validateArtifactCleanup(ctx); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}

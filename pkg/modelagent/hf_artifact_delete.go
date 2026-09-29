@@ -141,6 +141,9 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 	if err := validateArtifactCleanup(ctx); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
 	if err := h.files.RemoveParentDirectory(parent.LocalPath); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}

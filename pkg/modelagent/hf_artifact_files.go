@@ -267,10 +267,19 @@ func (files hfArtifactFiles) RemoveChildSymlink(childModelPath, parentPath strin
 // stops at the first matching child. An error prevents destructive parent work.
 // WalkDir inspects symlinks without following them. This is a point-in-time
 // filesystem check, not a lock against concurrent child creation.
-func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, error) {
+func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string, ignoredChildren ...string) (bool, error) {
 	root, err := canonicalHfArtifactStoreRoot(modelStoreRoot)
 	if err != nil {
 		return false, err
+	}
+	ignored := make(map[string]bool, len(ignoredChildren))
+	for _, path := range ignoredChildren {
+		canonical, err := hfArtifactPathInRoot(path, modelStoreRoot, root)
+		if err != nil {
+			return false, err
+		}
+		ignored[canonical] = true
+		ignored[filepath.Clean(path)] = true
 	}
 	cleanParentPath, err := hfArtifactPathInRoot(parentPath, modelStoreRoot, root)
 	if err != nil {
@@ -292,18 +301,35 @@ func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, err
 		if path != root && entry.IsDir() && (path == cleanParentPath || entry.Name() == hfArtifactLockDirectory) {
 			return filepath.SkipDir
 		}
-		if entry.Type()&os.ModeSymlink == 0 {
+		if entry.Type()&os.ModeSymlink == 0 || ignored[path] {
 			return nil
 		}
 		target, err := readChildSymlinkTarget(path)
 		if err != nil {
 			return err
 		}
-		// Absolute targets may use a different OS spelling of the store root.
-		canonicalTarget, err := hfArtifactPathInRoot(target, modelStoreRoot, root)
-		if err == nil && hfArtifactInputPathWithin(cleanParentPath, canonicalTarget) {
-			foundChild = true
-			return filepath.SkipAll
+		// Resolution fails when a tracked child points at a missing parent
+		// or descendant. Its lexical path still proves this alias is a user.
+		for child := range ignored {
+			if hfArtifactInputPathWithin(child, target) {
+				foundChild = true
+				return filepath.SkipAll
+			}
+		}
+		// Repair may ignore recorded child links, but an unrecorded alias
+		// through one of those children remains an unmanaged borrower.
+		targets := []string{target}
+		if resolved, err := filepath.EvalSymlinks(target); err == nil {
+			targets = append(targets, resolved)
+		}
+		// Retain both spellings: unlinking a child must preserve aliases
+		// through it, while repair must also see aliases through other links.
+		for _, target := range targets {
+			canonicalTarget, err := hfArtifactPathInRoot(target, modelStoreRoot, root)
+			if err == nil && hfArtifactInputPathWithin(cleanParentPath, canonicalTarget) {
+				foundChild = true
+				return filepath.SkipAll
+			}
 		}
 		return nil
 	})

@@ -167,6 +167,9 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
 	created, err := h.files.createChildSymlink(input.ChildModelPath, parent.LocalPath)
 	if err != nil {
 		if errors.Is(err, errHfArtifactChildPathConflict) {
@@ -194,6 +197,9 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 
 	storedParent, found, err := h.repository.GetParentForChild(ctx, input.ChildModelKey)
 	if err == nil && found && storedParent.Key == parent.Key {
+		if err := reportSharedRestore(ctx, input, storedParent); err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
 	if err == nil {
