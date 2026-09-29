@@ -315,6 +315,10 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 	}
 
 	if w.shouldDownloadModel(baseModel.Spec.Storage) {
+		if artifactEvictionRequested(&GopherTask{BaseModel: baseModel}) {
+			w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: baseModel}
+			return
+		}
 		// Refresh the node info
 		var err error
 		w.nodeInfo, err = w.kubeClient.CoreV1().Nodes().Get(w.ctx, w.nodeName, metav1.GetOptions{})
@@ -366,6 +370,10 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 	}
 
 	if w.shouldDownloadModel(clusterBaseModel.Spec.Storage) {
+		if artifactEvictionRequested(&GopherTask{ClusterBaseModel: clusterBaseModel}) {
+			w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: clusterBaseModel}
+			return
+		}
 		// Refresh the node info
 		var err error
 		w.nodeInfo, err = w.kubeClient.CoreV1().Nodes().Get(w.ctx, w.nodeName, metav1.GetOptions{})
@@ -426,10 +434,16 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		w.logger.Infof("BaseModel %s in namespace %s no longer matches this node, deleting", newBaseModel.Name, newBaseModel.Namespace)
 		w.gopherChan <- &GopherTask{TaskType: Delete, BaseModel: newBaseModel, NodeIneligible: true}
 		return
-	case !wasEligible && isEligible:
-		w.enqueueBaseModelDownload(newBaseModel)
-		return
 	case !isEligible:
+		return
+	}
+
+	if artifactEvictionRequested(&GopherTask{BaseModel: newBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: newBaseModel}
+		return
+	}
+	if !wasEligible {
+		w.enqueueBaseModelDownload(newBaseModel)
 		return
 	}
 
@@ -483,10 +497,16 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		w.logger.Infof("ClusterBaseModel %s no longer matches this node, deleting", newClusterBaseModel.Name)
 		w.gopherChan <- &GopherTask{TaskType: Delete, ClusterBaseModel: newClusterBaseModel, NodeIneligible: true}
 		return
-	case !wasEligible && isEligible:
-		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
-		return
 	case !isEligible:
+		return
+	}
+
+	if artifactEvictionRequested(&GopherTask{ClusterBaseModel: newClusterBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: newClusterBaseModel}
+		return
+	}
+	if !wasEligible {
+		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
 		return
 	}
 
