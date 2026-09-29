@@ -420,7 +420,7 @@ func TestDirectHfDispatcherCancellationSkipsFailure(t *testing.T) {
 	core, _ := observer.New(zap.DebugLevel)
 	g.logger = zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
 		if strings.HasPrefix(entry.Message, "Starting Hugging Face download") {
-			g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
+			g.enqueueTask(&GopherTask{TaskType: Delete, BaseModel: task.BaseModel})
 		}
 		return nil
 	})).Sugar()
@@ -657,7 +657,7 @@ func TestCanceledConfigParsingIsNotOptional(t *testing.T) {
 				existing.Name, existing.UID = "existing", "existing-uid"
 				g.baseModelLister = &mockBaseModelLister{models: []*v1beta1.BaseModel{task.BaseModel, existing}}
 				require.NoError(t, g.safeNodeLabelReconciliation(context.Background(), &NodeLabelOp{BaseModel: existing, ModelStateOnNode: Ready}))
-				cancel = func() { g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task)) }
+				cancel = func() { g.enqueueTask(&GopherTask{TaskType: Delete, BaseModel: task.BaseModel}) }
 				run = func() error { return g.processTask(task) }
 			case "shared OCI":
 				var input hfArtifactTaskInput

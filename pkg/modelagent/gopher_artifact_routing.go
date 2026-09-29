@@ -60,7 +60,7 @@ func (s *Gopher) hasSharedArtifactTasks() bool {
 }
 
 func (s *Gopher) cleanupDeletingModel(current, cleanup *GopherTask) error {
-	if current.SharedArtifact {
+	if usesArtifactTaskCoordinator(current) {
 		s.enqueueTask(cleanup)
 		return nil
 	}
@@ -118,8 +118,8 @@ func (s *Gopher) isOrdinaryArtifactTask(task *GopherTask) bool {
 	return s.artifactRouting.known && !task.SharedArtifact
 }
 
-// beginTask keeps shared serialization at the dispatch boundary. Ordinary
-// tasks retain cancellation and deletion timing without acquiring shared state.
+// beginTask serializes file-changing attempts through finalization. Local,
+// PVC, and vendor tasks retain their non-file legacy handling.
 func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool, error) {
 	ctx := context.Background()
 	task.Sequence = s.taskTracker.ensureSequence(task.Sequence)
@@ -130,7 +130,10 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 	s.routeArtifactTaskLocked(task)
 	defer s.artifactRouting.mutex.Unlock()
 	key := gopherTaskModelKey(task)
-	if !task.SharedArtifact {
+	if s.isTaskModelReplaced(task) {
+		return ctx, func(bool) {}, false, nil
+	}
+	if !usesArtifactTaskCoordinator(task) {
 		if task.TaskType == Delete {
 			s.taskTracker.cancelLegacyDownload(key)
 			attempt := s.taskTracker.beginLegacyTask(key, nil)
@@ -140,13 +143,10 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 		attempt := s.taskTracker.beginLegacyTask(key, cancel)
 		return ctx, func(bool) { s.taskTracker.finishLegacyTask(attempt); cancel() }, true, nil
 	}
-	if s.isTaskModelReplaced(task) {
-		return ctx, func(bool) {}, false, nil
-	}
 	if task.TaskType == Delete {
 		attempt, outcome := s.taskTracker.beginDelete(key, task.Sequence)
 		if outcome != gopherTaskProceed {
-			err := s.waitForActiveTask(task, outcome)
+			err := s.requeueTaskOnWait(task, outcome)
 			s.taskTracker.finishDelete(attempt, outcome == gopherTaskWait && err == nil)
 			return ctx, func(bool) {}, false, err
 		}
@@ -156,17 +156,17 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 	attempt, outcome := s.taskTracker.beginDownload(key, task.Sequence, cancel)
 	if outcome != gopherTaskProceed {
 		cancel()
-		return ctx, func(bool) {}, false, s.waitForActiveTask(task, outcome)
+		return ctx, func(bool) {}, false, s.requeueTaskOnWait(task, outcome)
 	}
 	return ctx, func(bool) { s.taskTracker.finishDownload(attempt); cancel() }, true, nil
 }
 
 // A live in-process owner is not an abandoned parent. Keep queued intent until
 // it finishes; the bounded parent-state retry budget must not discard it.
-func (s *Gopher) waitForActiveTask(task *GopherTask, outcome gopherTaskStartResult) error {
+func (s *Gopher) requeueTaskOnWait(task *GopherTask, outcome gopherTaskStartResult) error {
 	if outcome == gopherTaskWait {
 		task.SamePathWaitStartedAt = time.Time{}
-		if !s.requeueSamePathInFlightReuseWait(task, gopherTaskModelKey(task)) {
+		if !s.requeueArtifactWait(task, gopherTaskModelKey(task)) {
 			return fmt.Errorf("cannot requeue task waiting for active model operation")
 		}
 	}

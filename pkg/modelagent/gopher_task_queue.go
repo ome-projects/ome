@@ -120,13 +120,18 @@ func removeSupersededTasks(tasks []*GopherTask, deleteTask *GopherTask) []*Gophe
 	if modelUID == "" {
 		return tasks
 	}
+	// Direct and shared deletes can retry while newer download intent arrives.
+	// Match admission's sequenced coordination; non-file tasks keep legacy pruning.
+	preserveNewerTasks := usesArtifactTaskCoordinator(deleteTask)
 	kept := tasks[:0]
 	for _, task := range tasks {
-		if task.TaskType != Delete && getModelUID(task) == modelUID &&
-			(!deleteTask.SharedArtifact || deleteTask.Sequence == 0 || task.Sequence == 0 || task.Sequence <= deleteTask.Sequence) {
+		if task.TaskType == Delete || getModelUID(task) != modelUID {
+			kept = append(kept, task)
 			continue
 		}
-		kept = append(kept, task)
+		if preserveNewerTasks && deleteTask.Sequence != 0 && task.Sequence != 0 && task.Sequence > deleteTask.Sequence {
+			kept = append(kept, task)
+		}
 	}
 	return kept
 }

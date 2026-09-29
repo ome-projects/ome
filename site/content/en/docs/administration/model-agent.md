@@ -107,6 +107,27 @@ For models using SafeTensors format:
 - **Node Labeling**: Apply labels to nodes indicating model availability
 - **Metric Emission**: Update Prometheus metrics for monitoring
 
+### Download and Deletion Coordination
+
+Direct Hugging Face and OCI downloads hold the destination's file-operation
+lock through file writes, ownership metadata updates, and Ready publication.
+Deletion acquires the same lock before checking references and removing files;
+cleanup of a legacy Hugging Face parent also locks that parent's destination.
+Busy operations return to the existing task queue without holding file locks
+while queued. Lock files in `.hf-artifact-locks` must not be removed manually.
+
+A Delete request cancels the active download for that model and waits for the
+attempt to finish. OCI bulk downloads may continue writing after cancellation,
+so cleanup can remain queued until the transfer returns. Cleanup no longer
+assumes that a fixed two-second delay is sufficient, and canceled attempts
+cannot publish Ready after cleanup. Old tasks for a replaced model UID are
+ignored.
+
+This coordination applies to ordinary agent downloads and deletion, independent
+of control-plane lifecycle feature flags. The reserve-artifact label and other
+models' references still preserve files. Local and PVC files are not deleted;
+their node labels and ConfigMap bookkeeping are still removed.
+
 ## Configuration Reference
 
 ### Command Line Arguments

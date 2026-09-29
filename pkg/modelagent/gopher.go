@@ -232,7 +232,7 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue()
 	}
-	if task.TaskType == Delete && task.SharedArtifact {
+	if task.TaskType == Delete && usesArtifactTaskCoordinator(task) {
 		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
 		if result == gopherTaskStale {
 			return
@@ -379,6 +379,15 @@ func (s *Gopher) processTask(task *GopherTask) error {
 }
 
 func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload bool) error {
+	return s.processTaskWithSourceAdapters(task, allowFallbackDownload, s.processDirectHfModel, s.downloadModel)
+}
+
+// Keep source adapters scoped to an invocation, including cancellation-
+// insensitive downloaders that must return before this attempt releases files.
+func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDownload bool,
+	processHFSource func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error),
+	downloadOCI func(context.Context, *ociobjectstore.ObjectURI, string, *GopherTask) error,
+) error {
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
 	}
@@ -390,6 +399,8 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 	}
 	keepDeleteBarrier := false
 	defer func() { finish(keepDeleteBarrier) }()
+	ctx, releaseFileLocks := directFileOperationContext(ctx)
+	defer releaseFileLocks()
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
 
 	// Get model type, namespace, and name for metrics
@@ -414,6 +425,21 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				})
 			}
 			s.logger.Infof("Model %s no longer exists, skipping stale download task", modelInfo)
+			return nil
+		}
+	}
+
+	if isDirectFileTask(task) {
+		acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&baseModelSpec, s.modelRootDir))
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			err := s.requeueTaskOnWait(task, gopherTaskWait)
+			keepDeleteBarrier = task.TaskType == Delete && err == nil
+			return err
+		}
+		if s.isTaskModelReplaced(task) {
 			return nil
 		}
 	}
@@ -483,9 +509,16 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				s.logger.Errorf("Failed to get target directory path for model %s: %v", modelInfo, err)
 				return err
 			}
+			acquired, err := s.tryLockDirectModelPath(ctx, destPath)
+			if err != nil {
+				return err
+			}
+			if !acquired {
+				return s.requeueTaskOnWait(task, gopherTaskWait)
+			}
 			downloadObjectStorageModel := func() error {
 				err = utils.Retry(s.downloadRetry, 100*time.Millisecond, func() error {
-					downloadErr := s.downloadModel(ctx, osUri, destPath, task)
+					downloadErr := downloadOCI(ctx, osUri, destPath, task)
 					if downloadErr != nil {
 						// Check if context was cancelled
 						if ctx.Err() != nil {
@@ -520,7 +553,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 				if matchedKey, reused := s.findReadyObjectStorageModelWithSamePath(ctx, task, baseModelSpec, destPath); reused {
 					s.logger.Infof("Reusing Ready same-path model artifact for %s/%s from %s at %s", namespace, name, matchedKey, destPath)
 				} else if matchedKey, wait := s.findUpdatingObjectStorageModelWithSamePath(ctx, task, baseModelSpec, destPath); wait &&
-					s.requeueSamePathInFlightReuseWait(task, matchedKey) {
+					s.requeueArtifactWait(task, matchedKey) {
 					return nil
 				} else if !allowFallbackDownload {
 					s.demoteToNormalPriority(task)
@@ -557,7 +590,7 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			s.logger.Infof("Skipping download for model %s", modelInfo)
 		case storage.StorageTypeHuggingFace:
 			s.logger.Infof("Starting Hugging Face download for model %s", modelInfo)
-			waiting, err := s.processDirectHfModel(ctx, task, baseModelSpec, allowFallbackDownload)
+			waiting, err := processHFSource(ctx, task, baseModelSpec, allowFallbackDownload)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -624,10 +657,6 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			s.logger.Infof("Successfully downloaded ClusterBaseModel %s", task.ClusterBaseModel.Name)
 		}
 	case Delete:
-		if !task.SharedArtifact {
-			// Preserve the existing ordinary deletion grace period.
-			time.Sleep(2 * time.Second)
-		}
 		// Now proceed with deletion
 		handled, waiting, sharedErr := s.processSharedHfArtifactDelete(ctx, task)
 		if sharedErr != nil {
@@ -638,6 +667,21 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 			return nil
 		}
 		if !handled {
+			// Shared handling can fall back to the Direct deletion path.
+			if storageType == storage.StorageTypeOCI || storageType == storage.StorageTypeHuggingFace {
+				acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&baseModelSpec, s.modelRootDir))
+				if err != nil {
+					return err
+				}
+				if !acquired {
+					err := s.requeueTaskOnWait(task, gopherTaskWait)
+					keepDeleteBarrier = err == nil
+					return err
+				}
+				if s.isTaskModelReplaced(task) {
+					return nil
+				}
+			}
 			switch storageType {
 			case storage.StorageTypeOCI:
 				s.logger.Infof("Starting deletion for model %s", modelInfo)
@@ -681,6 +725,27 @@ func (s *Gopher) processTaskWithOptions(task *GopherTask, allowFallbackDownload 
 					s.logger.Infof("model %s artifact deletion will be skipped", modelInfo)
 				}
 				if isRemoveParent && parentName != "" && parentDir != "" {
+					acquired, err := s.tryLockDirectModelPath(ctx, parentDir)
+					if err != nil {
+						return err
+					}
+					if !acquired {
+						err := s.requeueTaskOnWait(task, gopherTaskWait)
+						keepDeleteBarrier = err == nil
+						return err
+					}
+					// A parent writer may have completed since the first lookup.
+					referenced, err := s.isPathReferencedByOtherModels(parentDir, nil, nil)
+					if err != nil {
+						s.logger.Warnf("Cannot check references for parent model artifact directory %s: %v", parentDir, err)
+						break
+					}
+					if referenced {
+						break
+					}
+					if !s.isRemoveParentArtifactDirectory(ctx, false, parentName, parentDir) {
+						break
+					}
 					// check whether the parent directory still has other directory points to it using symbolic link
 					isParentHasSymbolicLinkPointedTo, symbolicLinkSearchErr := utils.HasSymlinkPointingToDir(s.modelRootDir, parentDir)
 					if symbolicLinkSearchErr != nil {
@@ -831,7 +896,7 @@ func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
 			s.logger.Warnf("Cannot check latest BaseModel %s/%s before download: %v", task.BaseModel.Namespace, task.BaseModel.Name, err)
 			return false, false
 		}
-		if task.SharedArtifact && latestModel.UID != task.BaseModel.UID {
+		if latestModel.UID != task.BaseModel.UID {
 			return true, false
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
@@ -850,7 +915,7 @@ func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
 			s.logger.Warnf("Cannot check latest ClusterBaseModel %s before download: %v", task.ClusterBaseModel.Name, err)
 			return false, false
 		}
-		if task.SharedArtifact && latestModel.UID != task.ClusterBaseModel.UID {
+		if latestModel.UID != task.ClusterBaseModel.UID {
 			return true, false
 		}
 		isDeleting := latestModel.DeletionTimestamp != nil
@@ -1093,7 +1158,10 @@ func (s *Gopher) getHuggingFaceToken(ctx context.Context, task *GopherTask, base
 func getDestPath(baseModel *v1beta1.BaseModelSpec, modelRootDir string) string {
 
 	storagePath := *baseModel.Storage.StorageUri
-	destPath := *baseModel.Storage.Path
+	var destPath string
+	if baseModel.Storage.Path != nil {
+		destPath = *baseModel.Storage.Path
+	}
 
 	if len(destPath) == 0 {
 		if strings.HasSuffix(modelRootDir, "/") {
@@ -1275,7 +1343,7 @@ func getTaskModelCreationTime(task *GopherTask) time.Time {
 	return time.Time{}
 }
 
-func (s *Gopher) requeueSamePathInFlightReuseWait(task *GopherTask, matchedKey string) bool {
+func (s *Gopher) requeueArtifactWait(task *GopherTask, waitingOnKey string) bool {
 	if task == nil || s.gopherChan == nil {
 		return false
 	}
@@ -1287,7 +1355,7 @@ func (s *Gopher) requeueSamePathInFlightReuseWait(task *GopherTask, matchedKey s
 	if task.SamePathWaitStartedAt.IsZero() {
 		task.SamePathWaitStartedAt = now
 	} else if now.Sub(task.SamePathWaitStartedAt) >= timeout {
-		s.logger.Warnf("Timed out waiting for model %s for %s", matchedKey, getModelInfoForLogging(task))
+		s.logger.Warnf("Timed out waiting for artifact operation %s for %s", waitingOnKey, getModelInfoForLogging(task))
 		return false
 	}
 
@@ -1295,11 +1363,11 @@ func (s *Gopher) requeueSamePathInFlightReuseWait(task *GopherTask, matchedKey s
 	if delay <= 0 {
 		delay = defaultSamePathWaitDelay
 	}
-	s.logger.Infof("Same-path model %s is Updating for %s; requeueing after %s before starting duplicate download", matchedKey, getModelInfoForLogging(task), delay)
+	s.logger.Infof("Waiting for artifact operation %s for %s; requeueing after %s", waitingOnKey, getModelInfoForLogging(task), delay)
 	time.AfterFunc(delay, func() {
 		defer func() {
 			if r := recover(); r != nil {
-				s.logger.Warnf("Cannot requeue same-path wait task for %s because gopher channel is closed: %v", getModelInfoForLogging(task), r)
+				s.logger.Warnf("Cannot requeue artifact wait task for %s because gopher channel is closed: %v", getModelInfoForLogging(task), r)
 			}
 		}()
 		s.gopherChan <- task

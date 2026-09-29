@@ -1026,7 +1026,7 @@ func TestRequeueSamePathInFlightReuseWaitTimesOut(t *testing.T) {
 		},
 	}
 
-	requeued := g.requeueSamePathInFlightReuseWait(task, "default.basemodel.model")
+	requeued := g.requeueArtifactWait(task, "default.basemodel.model")
 
 	assert.False(t, requeued)
 	select {
@@ -2518,7 +2518,7 @@ func TestOCICanceledDownloadDoesNotRecordFailure(t *testing.T) {
 	// Cancel after registration during the Updating write, before OCI access.
 	client := g.configMapReconciler.kubeClient.(*k8sfake.Clientset)
 	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
-		g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
+		g.enqueueTask(&GopherTask{TaskType: Delete, BaseModel: task.BaseModel})
 		return false, nil, nil
 	})
 	require.ErrorIs(t, g.processTask(task), context.Canceled)

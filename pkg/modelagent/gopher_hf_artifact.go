@@ -619,7 +619,7 @@ func (s *Gopher) requeueHfArtifactTask(task *GopherTask, result hfArtifactTaskRe
 	if result.RetryReason != nil {
 		s.logger.Warnf("Shared artifact %s needs retry: %v", result.RetryParentKey, result.RetryReason)
 	}
-	if s.requeueSamePathInFlightReuseWait(task, result.RetryParentKey) {
+	if s.requeueArtifactWait(task, result.RetryParentKey) {
 		return nil
 	}
 	return fmt.Errorf("shared artifact %s retry budget exhausted (last error: %v)", result.RetryParentKey, result.RetryReason)
