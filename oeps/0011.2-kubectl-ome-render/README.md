@@ -74,7 +74,8 @@ way to preview the result.
 
 - Print the merged and defaulted component specs for one
   InferenceService, identical to what the controller computes from the
-  same inputs.
+  same inputs. Service-level VirtualDeployment is the one exception; see
+  [Render Pipeline](#render-pipeline).
 - Support the live and active (pinned) views of `runtime effective`.
 - Render fully offline from manifest files, so a preview can compare
   two Git revisions without cluster access.
@@ -181,6 +182,22 @@ inputs (cluster or files)
 
 A nil `DeployConfig` keeps today's behavior for existing callers.
 
+**Service-level VirtualDeployment.** The controller treats a service as
+virtual when `InferenceServiceDeploymentMode` returns
+`VirtualDeployment`: the deployment-mode annotation, or, without one,
+`spec.deploymentMode`. It then only sets status URLs; it merges nothing,
+applies no defaults, and creates no workloads. `render` uses the same
+helper but does not stop early. It still merges and prints the
+components as inspection data, not specs the controller reconciles:
+
+- Every component's `deploymentMode` is `VirtualDeployment`, with source
+  `ServiceAnnotation` or `ServiceSpec`.
+- `specdefaults` is not called and `deployDefaults` is `NotApplicable`.
+  The ConfigMap is still read and validated, as the controller does
+  before its early return.
+- The runtime is still required for the merge, but neither it nor any
+  component `spec` field affects reconciliation.
+
 ### Inputs
 
 **Cluster mode** (no `-f`): objects are read as `runtime effective`
@@ -211,7 +228,7 @@ sources:
   - kind: ConfigMap
     name: ome/inferenceservice-config
     origin: Observed
-deployDefaults: Applied         # Applied or NotApplicable
+deployDefaults: Applied         # or NotApplicable (service-level Virtual)
 components:
   engine:
     deploymentMode: OMENative
@@ -245,7 +262,10 @@ Planned PRs:
 1. This OEP.
 2. Export `ParseDeployConfig`, thread `*DeployConfig` through
    `MergeEffectiveComponents` (nil at existing call sites), add a
-   ConfigMap loader. No user-visible change.
+   ConfigMap loader. Detect service-level Virtual with
+   `InferenceServiceDeploymentMode`, passing the deploy config's
+   `defaultDeploymentMode` (`RawDeployment` when there is none), instead
+   of the annotation alone.
 3. `runtime render` in cluster mode.
 4. File mode.
 
@@ -257,8 +277,10 @@ existing tests before accepting changes necessary for this enhancement.
 - `controllerconfig`: `ParseDeployConfig` accepts and rejects the same
   inputs as before.
 - `pkg/cli/effective`: for RawDeployment, OMENative, leader and worker,
-  PD disaggregation, and VirtualDeployment fixtures, output equals
-  calling the controller helpers directly. This guards against drift.
+  and PD disaggregation fixtures, output equals calling the controller
+  helpers directly. This guards against drift. VirtualDeployment
+  fixtures, set by annotation and by `spec.deploymentMode`, resolve every
+  component to `VirtualDeployment` and skip `specdefaults`.
 - `pkg/cli/cmd/runtime`: each failure row, the `--deploy-config`
   override, `--view active`, and golden YAML and JSON outputs.
 - Integration: TBD, possibly an envtest case comparing a reconciled
