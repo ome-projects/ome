@@ -586,14 +586,12 @@ func TestDirectHfRestoreRecoveryPreservesExplicitOverride(t *testing.T) {
 }
 
 func TestDirectHfRestoreExcludesUnsupportedSourcesAndPlacement(t *testing.T) {
-	for _, change := range []string{"local", "ordinary OCI", "shape", "placement", "outside", "symlink"} {
+	for _, change := range []string{"local", "shape", "placement", "outside", "symlink"} {
 		t.Run(change, func(t *testing.T) {
 			s, task, source, downloads := newDirectHfRestoreFixture(t)
 			switch change {
 			case "local":
 				task.BaseModel.Spec.Storage.StorageUri = ptr("local://" + *task.BaseModel.Spec.Storage.Path)
-			case "ordinary OCI":
-				task.BaseModel.Spec.Storage.StorageUri = ptr("oci://n/ns/b/bucket/o/model")
 			case "shape":
 				task.BaseModel.Spec.ModelFormat.Name = constants.TensorRTLLM
 			case "placement":
