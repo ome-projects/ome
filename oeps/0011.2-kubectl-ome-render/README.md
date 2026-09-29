@@ -224,10 +224,10 @@ view: Live                      # Live or Active
 sources:
   - kind: InferenceService
     name: prod/chat
-    origin: Observed            # Observed or File
+    origin: Cluster             # Cluster or File
   - kind: ConfigMap
     name: ome/inferenceservice-config
-    origin: Observed
+    origin: Cluster
 deployDefaults: Applied         # or NotApplicable (service-level Virtual)
 components:
   engine:

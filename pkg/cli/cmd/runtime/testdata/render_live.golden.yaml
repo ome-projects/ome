@@ -1,0 +1,43 @@
+apiVersion: cli.ome.io/v1alpha1
+components:
+  engine:
+    deploymentMode: RawDeployment
+    deploymentModeSource: Default
+    spec:
+      maxReplicas: 6
+      minReplicas: 2
+      runner:
+        args:
+        - --token=secret-argument-canary
+        env:
+        - name: TOKEN
+          value: secret-environment-canary
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              key: secret-key-ref-key-canary
+              name: secret-key-ref-name-canary
+        image: private.registry.invalid/runtime:credential-canary
+        name: runner
+        resources: {}
+      terminationGracePeriodSeconds: 45
+      volumes:
+      - name: runtime-secret
+        secret:
+          secretName: secret-volume-ref-name-canary
+deployDefaults: Applied
+kind: RenderedInferenceService
+metadata:
+  name: service
+  namespace: team-a
+sources:
+- kind: InferenceService
+  name: team-a/service
+  origin: Cluster
+- kind: ClusterServingRuntime
+  name: cluster-runtime
+  origin: Cluster
+- kind: ConfigMap
+  name: control-plane/inferenceservice-config
+  origin: Cluster
+view: Live

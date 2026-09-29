@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/apierror"
@@ -13,6 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/cli/namespace"
 	"sigs.k8s.io/ome/pkg/cli/paging"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 )
 
 var (
@@ -23,13 +25,21 @@ var (
 	errInferenceServiceVersionEmpty      = errors.New("InferenceService GET returned an empty resourceVersion")
 )
 
+// deployConfigLoader supplies the deploy defaults merged into component specs.
+type deployConfigLoader func(ctx context.Context, kube kubernetes.Interface, omeNamespace string) (*controllerconfig.DeployConfig, error)
+
 type runtimeEvidenceOptions struct {
 	IncludeHistory bool
+	// LoadDeployConfig, when set, runs after the InferenceService is read,
+	// and its result fills deploy defaults in the live and active merges.
+	LoadDeployConfig deployConfigLoader
 }
 
 type runtimeEvidence struct {
 	inferenceService *v1beta1.InferenceService
 	state            *effective.RuntimeState
+	omeNamespace     string
+	deployConfig     *controllerconfig.DeployConfig
 }
 
 func collectRuntimeEvidence(
@@ -79,6 +89,16 @@ func collectRuntimeEvidence(
 		return nil, fmt.Errorf("construct runtime client: %w", err)
 	}
 	liveResolver := effective.NewRuntimeResolver(runtimeClient)
+	var deployConfig *controllerconfig.DeployConfig
+	if options.LoadDeployConfig != nil {
+		requestContext, cancel := context.WithTimeout(ctx, limits.RequestTimeout)
+		deployConfig, err = options.LoadDeployConfig(requestContext, kubeClient, resolved.OMENamespace)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		liveResolver.SetDeployConfig(deployConfig)
+	}
 	pinResolver, err := effective.NewRuntimePinResolver(
 		kubeClient.AppsV1(), liveResolver, resolved.OMENamespace, limits,
 	)
@@ -91,7 +111,10 @@ func collectRuntimeEvidence(
 	if err != nil {
 		return nil, fmt.Errorf("collect runtime evidence: %w", err)
 	}
-	return &runtimeEvidence{inferenceService: isvc, state: state}, nil
+	return &runtimeEvidence{
+		inferenceService: isvc, state: state,
+		omeNamespace: resolved.OMENamespace, deployConfig: deployConfig,
+	}, nil
 }
 
 func bindInferenceService(isvc *v1beta1.InferenceService, wantNamespace, name string) error {

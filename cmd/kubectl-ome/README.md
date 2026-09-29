@@ -180,6 +180,7 @@ An empty list succeeds; human output writes its empty-result notice to stderr.
 | `runtime explain --model MODEL` | Which live runtimes match a model according to the operator's runtime-selection engine, including rejection reasons. |
 | `runtime explain --isvc SERVICE` | The same selection explanation for a service's model. |
 | `runtime effective SERVICE` | Live versus controller-active runtime evidence, inheritance, pins, and drift. |
+| `runtime render SERVICE` | The complete engine, decoder, and router specs the controller acts on, after the runtime merge and deploy defaults. Unredacted. |
 | `runtime history SERVICE` | Retention-bounded runtime ControllerRevision evidence. |
 | `runtime tree RUNTIME` | Parent paths, inheriting descendants, and explicit InferenceService users. |
 | `accelerator explain SERVICE` | Declared accelerator policy, reported selection, verified AcceleratorClass identity, and base/applied requests. |
@@ -199,6 +200,22 @@ kubectl ome runtime explain --isvc chat --with-effective -n team-a
 kubectl ome runtime tree shared-runtime --kind ClusterServingRuntime -o json
 kubectl ome runtime history chat -n team-a -o wide
 kubectl ome accelerator explain chat -n team-a -o json
+```
+
+`runtime render` prints a `RenderedInferenceService` (`cli.ome.io/v1alpha1`)
+as YAML or JSON. `--view live` (the default) merges the runtime as it is now;
+`--view active` merges the pinned ControllerRevision. Deploy defaults come
+from the `inferenceservice-config` ConfigMap in `--ome-namespace`, or from a
+ConfigMap manifest given with `--deploy-config`. A missing, forbidden, or
+invalid ConfigMap fails the command. Unlike the diagnostic reports, the output
+is not redacted: it can contain literal environment values and credentials
+placed inline in the service or runtime. Diff two renders to preview a runtime
+or deploy default change:
+
+```sh
+kubectl ome runtime render chat -n team-a > before.yaml
+kubectl ome runtime render chat -n team-a --deploy-config proposed-config.yaml > after.yaml
+diff before.yaml after.yaml
 ```
 
 Runtime history is retained evidence, not a complete audit log. Compact

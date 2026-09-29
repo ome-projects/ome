@@ -114,6 +114,7 @@ func TestRootCommandTree(t *testing.T) {
 		"ome runtime effective",
 		"ome runtime explain",
 		"ome runtime history",
+		"ome runtime render",
 		"ome runtime sync",
 		"ome runtime tree",
 		"ome scale",
