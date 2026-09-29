@@ -248,6 +248,7 @@ func TestSharedRestoreRefreshedIneligibleSourceStopsBeforeFiles(t *testing.T) {
 	task.SamePathWaitStartedAt = time.Time{}
 	policy := v1beta1.AlwaysDownload
 	task.BaseModel.Spec.Storage.DownloadPolicy = &policy
+	task.BaseModel.Spec.Storage.StorageUri = ptr("local://" + *task.BaseModel.Spec.Storage.Path)
 	current := &GopherTask{BaseModel: task.BaseModel.DeepCopy()}
 	current.BaseModel.Annotations["description"] = "updated"
 	updateRestoreRefreshModel(t, s, current)
@@ -257,5 +258,5 @@ func TestSharedRestoreRefreshedIneligibleSourceStopsBeforeFiles(t *testing.T) {
 	require.ErrorContains(t, s.processTaskWithSourceAdapters(refreshed, true, func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error) {
 		t.Fatal("active restore with an ineligible source cannot touch files")
 		return false, nil
-	}, nil), "eligible HF or Shared source")
+	}, nil), "eligible HF or OCI source")
 }

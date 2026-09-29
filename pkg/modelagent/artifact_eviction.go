@@ -121,6 +121,21 @@ func (s *Gopher) validateArtifactDownloadWithUIDFence(ctx context.Context, task 
 		return &artifactRestoreSnapshotChanged{current: current, node: node}
 	}
 
+	// Status callbacks reconstruct model-only tasks. Keep the source subset
+	// pinned to this attempt when those callbacks run under its restore guard.
+	shapeTask := task
+	if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil && getModelUID(guard.task) == getModelUID(task) {
+		shapeTask = guard.task
+	}
+	if isDirectOCIRestoreEligible(shapeTask) && (shapeTask.TaskType == Download || shapeTask.TaskType == DownloadOverride) {
+		filter, err := ociRestoreShapeFilter(shapeTask, node)
+		if err != nil {
+			return err
+		}
+		if filter != nil && !reflect.DeepEqual(filter, shapeTask.TensorRTLLMShapeFilter) {
+			return fmt.Errorf("OCI restoration node shape filter is absent or changed")
+		}
+	}
 	return nil
 }
 
