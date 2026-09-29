@@ -11,9 +11,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	alfredstatus "sigs.k8s.io/ome/pkg/alfred/irstatus"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
+	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling/input"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
@@ -31,7 +33,11 @@ type dispatchEvidence struct {
 }
 
 func (d *Dispatcher) freshObservation(ctx context.Context, cfg *config.Config) (*snapshot.ClusterSnapshot, error) {
-	return snapshot.Build(ctx, d.Reader, snapshot.Options{Now: d.now, DefaultMovable: cfg.DefaultMovable,
+	return d.observationFrom(ctx, d.Reader, cfg)
+}
+
+func (d *Dispatcher) observationFrom(ctx context.Context, reader client.Reader, cfg *config.Config) (*snapshot.ClusterSnapshot, error) {
+	return snapshot.Build(ctx, reader, snapshot.Options{Now: d.now, DefaultMovable: cfg.DefaultMovable,
 		TriggerConditions: cfg.Policies.NodeHealth.TriggerConditions, PreemptibleLabels: cfg.SpotPolicy.PreemptibleLabels,
 		NodeSuspicionWindow: cfg.NodeSuspicionWindow(), MaintenanceTriggers: cfg.Policies.NodeHealth.Maintenance.Triggers,
 		OMENativeExecutor: snapshot.OMENativeExecutorState{Available: true, WireVersion: "v1", Reason: "OperatorConfigured"}})
@@ -159,6 +165,23 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	if !input.SameSchedulingState(captured, finalCapture) {
 		return empty, "SchedulingStateChanged"
 	}
+	if finalCandidate.Policy == defrag.PolicyName {
+		// Build both sides of the capacity calculation from the accepted
+		// capture, never the independently listed policy observation. The
+		// result still refers to the original request's synthetic identities.
+		scoringSnapshot, err := d.observationFrom(ctx, &dispatchCaptureReader{capture: finalCapture, metadata: d.Reader}, cfg)
+		if err != nil {
+			return empty, "ObservationUnavailable"
+		}
+		placements, err := input.SourcePlacementTargets(request, result)
+		if err != nil {
+			return empty, "SourceChanged"
+		}
+		finalCandidate, ok = defrag.RevalidatePlacement(scoringSnapshot, cfg, finalCandidate, placements)
+		if !ok {
+			return empty, "PolicyNoLongerEligible"
+		}
+	}
 	if reason := dispatchBudget(finalCapture, j, finalCandidate, cfg, d.now(), existing); reason != "" {
 		return empty, reason
 	}
@@ -198,8 +221,8 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	if !valid {
 		return empty, "InvalidCooldown"
 	}
-	current.HintTargetNodes = append([]string(nil), hints...)
-	return dispatchEvidence{candidate: current, owner: finalOwner, ir: finalIR, fingerprint: fingerprint, targets: names,
+	finalCandidate.HintTargetNodes = append([]string(nil), hints...)
+	return dispatchEvidence{candidate: finalCandidate, owner: finalOwner, ir: finalIR, fingerprint: fingerprint, targets: names,
 		historyWindow: historyWindow}, ""
 }
 

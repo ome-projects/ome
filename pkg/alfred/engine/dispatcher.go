@@ -118,6 +118,7 @@ func (d *Dispatcher) Execute(ctx context.Context, observed *snapshot.ClusterSnap
 		if reason != "" {
 			return out, withholdDecisions(decisions, reason)
 		}
+		recordAcceptedCandidate(out, decisions, evidence.candidate)
 		e = d.attemptDispatch(ctx, cm, j, pending, evidence, cfg)
 		return reportDispatchEntry(out, decisions, e)
 	}
@@ -140,6 +141,7 @@ func (d *Dispatcher) Execute(ctx context.Context, observed *snapshot.ClusterSnap
 			decisions[i].DispatchReason = reason
 			continue
 		}
+		recordAcceptedCandidate(out, decisions, evidence.candidate)
 		e, err := newDispatchEntry(evidence.candidate, evidence.owner.UID, evidence.ir.Name, evidence.ir.UID, evidence.fingerprint, d.now())
 		if err != nil {
 			decisions[i].DispatchReason = "InvalidRequest"
@@ -242,6 +244,25 @@ func reportDispatchEntry(cs []policy.Candidate, ds []Decision, e dispatchEntry) 
 		}
 	}
 	return append(cs, c), append(ds, decision)
+}
+
+// A successful preflight may rescore a candidate or reconstruct it on retry.
+// Report that accepted assessment, retaining the separate advisory simulation's
+// diagnostics. Journal reconciliation alone does not establish a fresh score.
+func recordAcceptedCandidate(cs []policy.Candidate, ds []Decision, c policy.Candidate) {
+	for i := range cs {
+		if sameDispatchSource(cs[i], c) && sameDispatchCause(cs[i], c) {
+			if c.Scheduling == nil {
+				c.Scheduling = cs[i].Scheduling
+			}
+			cs[i] = c
+		}
+	}
+	for i := range ds {
+		if sameDispatchSource(ds[i].Candidate, c) && sameDispatchCause(ds[i].Candidate, c) {
+			ds[i].Candidate = c
+		}
+	}
 }
 
 func sameDispatchSource(a, b policy.Candidate) bool {

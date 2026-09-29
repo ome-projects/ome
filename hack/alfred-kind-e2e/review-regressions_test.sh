@@ -22,21 +22,18 @@ if STATE_DIR="${tmp_dir}" CLUSTER_NAME=production bash "${dir}/kwok.sh" verify >
 fi
 [[ ! -e "${CALLS}" ]] || { echo 'invalid cluster name reached kubectl' >&2; exit 1; }
 
-# Guard the ordering of the real runner's completion check. This is a script
-# contract test, not a substitute for the live defragmentation scenario.
-awk '
-  /if jq.*phase=="Completed"/ { completed=1; next }
-  completed && /get pods .*current-pods.json/ { refreshed=1 }
-  completed && /all\(.items\[\];.metadata.uid!=\$uid\)/ {
-    if (!refreshed) exit 1
-    checked=1
-  }
-  END { if (!checked) exit 1 }
-' "${dir}/useful-defrag.sh" || {
-  echo 'completion uses a pre-completion Pod snapshot' >&2; exit 1;
-}
-watch_timeout="$(sed -n 's/.*--watch --request-timeout=\([0-9]*\)s.*/\1/p' "${dir}/useful-defrag.sh")"
-((watch_timeout > 120 + 180)) || { echo 'watch cannot cover Helm plus observation budget' >&2; exit 1; }
+# Exercise the raw completion contract: an IR Completed record cannot make an
+# old held Pod snapshot pass. Three fresh cycle witnesses are additionally
+# required by the full verifier; a source-text ordering regex cannot prove that.
+baseline="$(jq -n -f "${dir}/useful-defrag-fixture.jq")"
+jq -e -L "${dir}" -f "${dir}/verify-useful-defrag.jq" <<<"${baseline}" >/dev/null
+if jq '.completionBaseline.pods=.held.pods | .completionBaseline.allPods=.held.allPods' <<<"${baseline}" |
+  jq -e -L "${dir}" -f "${dir}/verify-useful-defrag.jq" >/dev/null; then
+  echo 'completion accepted a pre-completion Pod snapshot' >&2; exit 1
+fi
+source "${dir}/namespace-churn-lib.sh"
+watch_timeout="$(churn_watch_timeout_seconds 420)"
+((watch_timeout > 120 + 240)) || { echo 'watch cannot cover Helm plus observation budget' >&2; exit 1; }
 grep -Fq 'kill -0 "${watch_pid}"' "${dir}/useful-defrag.sh" || {
   echo 'runner does not detect premature watch exit' >&2; exit 1;
 }

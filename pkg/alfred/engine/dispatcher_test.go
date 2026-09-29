@@ -147,6 +147,10 @@ func dispatchFixture(t *testing.T, gang bool) (*Dispatcher, *dispatchClient, *sn
 		t.Fatal(err)
 	}
 	c.Executable, c.AdvisoryReason, c.FootprintGPUs = true, "", 1
+	// Generic dispatcher tests exercise journal/CAS/identity behavior through
+	// a synthetic maintenance policy, not defragmentation authorization. Real defrag tests
+	// replace this policy and obtain candidates from an actual GPU distribution.
+	c.Policy, c.Reason = "nodehealth", policy.ReasonNodeMaintenance
 	c.HintTargetNodes = []string{"target"}
 	c.PlacementTargetNodes = []string{"target", "target-worker"}
 	cfg, err := config.Load([]byte(schedulingProfilesYAML + "mode: execute\n"))

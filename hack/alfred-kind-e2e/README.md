@@ -31,7 +31,9 @@ model downloads. It does not validate the production Dockerfiles.
 
 ## Run on an Apple Silicon Mac
 
-Requires Go, Homebrew, Helm 4, kubectl, jq, Colima, Docker CLI/buildx, and kind.
+Requires Go, Homebrew, Helm 4, kubectl, jq, Mike Farah yq v4, Colima,
+Docker CLI/buildx, and kind. The no-benefit runner and offline raw-evidence
+verifier use yq v4 to check the original YAML policy.
 The namespace-churn runner also uses Perl's `Time::HiRes` monotonic clock.
 Provisioning downloads public images; it does not require a registry login.
 Helm 4 is required for the explicit `--server-side=false` install option that
@@ -240,6 +242,7 @@ removed as shown above. They intentionally refuse to displace unrelated pods.
 bash hack/alfred-kind-e2e/gang.sh partial-restart
 # Remove the gang fixture and await its children before the next command.
 bash hack/alfred-kind-e2e/useful-defrag.sh
+bash hack/alfred-kind-e2e/no-benefit-defrag.sh
 bash hack/alfred-kind-e2e/scenario.sh hint-exhaustion-single
 bash hack/alfred-kind-e2e/scenario.sh target-health-race-single
 ```
@@ -259,6 +262,54 @@ another run. Delayed helpers restore manager arguments and their own node change
 and blockers. A cleared unhealthy signal remains in Alfred's one-minute recovery
 quarantine, so allow that interval before running another capacity-sensitive case.
 Useful-defrag restores the original Alfred configuration before removing capacity.
+It retains failed fixtures; successful cleanup uses UID-fenced deletes and waits
+for disappearance. Its proof keeps the same 8-GPU beneficiary Pod and unchanged
+scheduling spec: initially unschedulable, still unbound while replacement readiness
+is held, then bound to the vacated source node. Raw Pod and EndpointSlice samples
+prove the source-to-replacement handoff; raw Nodes and all Pods prove the capacity
+distribution and unchanged blockers. A complete owner-fenced annotation watch,
+matching completed OME migration and Alfred journal entry, and three newer
+completed decision cycles guard against duplicate or merely attempted migrations.
+
+The sealed `evidence.json` includes these raw observations. Recheck it offline:
+
+```bash
+jq -e -L hack/alfred-kind-e2e -f hack/alfred-kind-e2e/verify-useful-defrag.jq \
+  "${STATE_DIR}/artifacts/<useful-defrag-run>/evidence.json"
+```
+
+This is an observed useful outcome in the controlled fixture. Scheduler simulation
+is only a prediction: migration-v1 node hints do not reserve or bind destinations,
+and KWOK does not demonstrate real inference availability or GPU behavior.
+
+The no-benefit test is the complementary negative control. Four identical 8-GPU
+nodes have free capacity `[7,1,8,0]`. Moving the 1-GPU source into the 1-GPU hole
+would create another 8-GPU slot. Its unchanged required node affinity, however,
+allows only nodes a and c. The real standard scheduler therefore places the
+simulated replacement on c, producing `[8,1,7,0]`: no additional 8-GPU slot.
+Alfred must reject this feasible but unhelpful placement before requesting any
+migration. Three distinct completed decisions must report a positive initial
+candidate withheld as `PolicyNoLongerEligible`; absent candidates, unsupported
+simulation, other rejection reasons, or stale reports do not pass.
+
+The test uses the existing real-worker barrier, not a fabricated scheduler
+result or a separate replay. It saves exact request/result bytes and release
+receipts, stable node/occupant identities, raw source/readiness/routing samples,
+and full owner and Pod watches. The installed policy uses a pure 8-GPU prior;
+its API response is checked against the claimed configuration. Cleanup restores
+the original policy with UID/exact-key preconditions and verifies its reload in
+the same Alfred Pod before removing the barrier. Failures retain evidence and
+fixtures; uncertainty about disabling defrag retains the barrier too. It needs
+an empty `alfred-e2e` namespace and the same dedicated cluster as the other tests.
+
+```bash
+bash hack/alfred-kind-e2e/verify-no-benefit-defrag.sh \
+  "${STATE_DIR}/artifacts/<no-benefit-defrag-run>"
+```
+
+This small geometry proves actual-placement benefit gating for the standard
+scheduler profile. It does not establish exhaustive gang, demand, topology,
+competition, scale, or real model-serving qualification.
 
 Run offline harness checks with:
 

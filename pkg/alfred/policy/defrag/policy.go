@@ -248,9 +248,7 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		return policy.Candidate{}, false
 	}
 
-	benefit := ctx.before - weightedFrag(after, ctx.ladder, ctx.weights, ctx.totalFree)
-	cost := costOMENativeSurge
-	score := benefit - ctx.costWeight*cost
+	benefit, cost, score, emergency := scorePlacement(ctx, w, from, after)
 	if score <= 0 {
 		c := advisory(w, comp, inst.Index,
 			policy.AdvisoryNonExecutableObservedFragmentation, from, 0)
@@ -259,16 +257,6 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		c.Cost = cost
 		c.Score = score
 		return c, true
-	}
-
-	emergency := unblocksOverAgePending(ctx, w, after)
-	if emergency {
-		score *= emergencyBoostFactor
-	}
-	if spotPrefersSource(w, ctx.cfg) {
-		if node := ctx.snap.Nodes[from]; node != nil && node.Preemptible {
-			score *= spotSourceBoostFactor
-		}
 	}
 
 	return policy.Candidate{
@@ -289,6 +277,25 @@ func evaluateInstance(ctx *evalCtx, w *snapshot.Workload, comp *snapshot.Compone
 		Score:                score,
 		Emergency:            emergency,
 	}, true
+}
+
+func scorePlacement(ctx *evalCtx, w *snapshot.Workload, from string, after []binState) (benefit, cost, score float64, emergency bool) {
+	benefit = ctx.before - weightedFrag(after, ctx.ladder, ctx.weights, ctx.totalFree)
+	cost = costOMENativeSurge
+	score = benefit - ctx.costWeight*cost
+	if score <= 0 {
+		return
+	}
+	emergency = unblocksOverAgePending(ctx, w, after)
+	if emergency {
+		score *= emergencyBoostFactor
+	}
+	if spotPrefersSource(w, ctx.cfg) {
+		if node := ctx.snap.Nodes[from]; node != nil && node.Preemptible {
+			score *= spotSourceBoostFactor
+		}
+	}
+	return
 }
 
 // unblocksOverAgePending reports whether the simulated after-state seats a

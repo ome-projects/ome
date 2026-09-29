@@ -81,6 +81,8 @@ jobs:
           command -v helm
           command -v kubectl
           command -v jq
+          command -v yq
+          yq --version | grep -Eq 'github.com/mikefarah/yq/.*version v4\.'
           make envtest
           assets="$(./bin/setup-envtest use 1.30 -p path)"
           test -n "$assets"
