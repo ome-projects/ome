@@ -296,9 +296,15 @@ The test uses the existing real-worker barrier, not a fabricated scheduler
 result or a separate replay. It saves exact request/result bytes and release
 receipts, stable node/occupant identities, raw source/readiness/routing samples,
 and full owner and Pod watches. The installed policy uses a pure 8-GPU prior;
-its API response is checked against the claimed configuration. Cleanup restores
-the original policy with UID/exact-key preconditions and verifies its reload in
-the same Alfred Pod before removing the barrier. Failures retain evidence and
+its API response is checked against the claimed configuration. The negative
+runner copies the disabled policy to a temporary mutable ConfigMap and points
+only its test deployment at that copy, leaving the Helm-managed policy and its
+field ownership untouched. Cleanup disables the temporary policy with
+UID/exact-key preconditions and verifies its reload in the same Alfred Pod
+before restoring the original deployment and removing the barrier. It also
+checks that the original policy bytes, UID, and field ownership did not change.
+Deletion records include kind and UID so same-name objects cannot overwrite
+each other's evidence. Failures retain evidence and
 fixtures; uncertainty about disabling defrag retains the barrier too. It needs
 an empty `alfred-e2e` namespace and the same dedicated cluster as the other tests.
 

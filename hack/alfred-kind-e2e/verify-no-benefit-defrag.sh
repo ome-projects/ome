@@ -20,10 +20,16 @@ for index in 1 2 3; do
     "${art}/evidence.json" >/dev/null
 done
 [[ ! -s "${art}/requests.stderr" && ! -s "${art}/pods.stderr" ]]
-jq -e --slurpfile before "${art}/config-before.json" --slurpfile enabled "${art}/config-enabled.json" '
+jq -e --slurpfile before "${art}/config-before.json" --slurpfile enabled "${art}/config-enabled.json" \
+  --slurpfile original "${art}/original-config.json" --slurpfile deployment "${art}/deployment-barrier.json" '
   ($before[0].metadata.uid|type=="string" and length>0) and
+  ($original[0].metadata.uid|type=="string" and length>0) and
+  $original[0].metadata.name=="alfred-config" and $original[0].metadata.namespace=="ome" and
+  $before[0].metadata.uid!=$original[0].metadata.uid and $before[0].data==$original[0].data and
+  $before[0].metadata.name==.policyName and $before[0].metadata.namespace=="ome" and
   $enabled[0].metadata.uid==$before[0].metadata.uid and
-  $enabled[0].metadata.name=="alfred-config" and $enabled[0].metadata.namespace=="ome" and
+  $enabled[0].metadata.name==.policyName and $enabled[0].metadata.namespace=="ome" and
+  ([$deployment[0].spec.template.spec.containers[0].args[]|select(startswith("--config-name="))])==["--config-name="+.policyName] and
   .config==($enabled[0].data["config.yaml"]|fromjson)' "${art}/evidence.json" >/dev/null
 original="$(jq -r '.data["config.yaml"]' "${art}/config-before.json" | yq -o=json '.')"
 jq -e --argjson original "${original}" '

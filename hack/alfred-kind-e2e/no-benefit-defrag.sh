@@ -12,6 +12,7 @@ run_id="$(date -u +%Y%m%d%H%M%S)-$$"
 art="${STATE_DIR}/artifacts/no-benefit-defrag-${run_id}"
 mkdir -p "${art}"
 registry_name="alfred-no-benefit-${run_id}"
+policy_name="${registry_name}-policy"
 runtime="alfred-no-benefit-${run_id}"
 configured=false; registry_installed=false; cordoned=false; passed=false
 request_pid=''; pod_pid=''; enabled=''; service=''; alfred_pod=''; alfred_uid=''
@@ -48,17 +49,17 @@ metrics() {
 restore_config() {
   local current patch deadline cycle
   metrics "${art}/reload-before" || return 1
-  current="$("${k[@]}" -n ome get cm alfred-config -o json)" || return 1
+  current="$("${k[@]}" -n ome get cm "${policy_name}" -o json)" || return 1
   patch="$(nd_config_patch "$(cat "${art}/config-before.json")" "${current}" "${enabled}" restore)" || return 1
   # An uncertain enable may not have applied. With no override present, leave
   # the fail-closed barrier in place rather than invent reload evidence.
   [[ "${patch}" != '[]' ]] || { echo 'No policy transition to verify; retaining barrier' >&2; return 1; }
   cycle="$("${k[@]}" -n ome get cm alfred-recommendations -o json | jq -er '.data["last-cycle.json"]|fromjson|.timestamp')" || return 1
-  "${k[@]}" -n ome patch cm alfred-config --type=json -p "${patch}" -o json >"${art}/config-restored.json" || return 1
+  "${k[@]}" -n ome patch cm "${policy_name}" --type=json -p "${patch}" -o json >"${art}/config-restored.json" || return 1
   deadline=$((SECONDS+60))
   while ((SECONDS<deadline)); do
     metrics "${art}/reload-after" || return 1
-    "${k[@]}" -n ome get cm alfred-config -o json >"${art}/config-verified.json" || return 1
+    "${k[@]}" -n ome get cm "${policy_name}" -o json >"${art}/config-verified.json" || return 1
     jq -e --slurpfile old "${art}/config-before.json" '.metadata.uid==$old[0].metadata.uid and .data["config.yaml"]==$old[0].data["config.yaml"]' "${art}/config-verified.json" >/dev/null || return 1
     if jq -e --slurpfile before "${art}/reload-before.json" '.success>($before[0].success // 0) and (.failure // 0)==($before[0].failure // 0)' "${art}/reload-after.json" >/dev/null; then
       capture "${art}/disabled-observed.json" || return 1
@@ -72,7 +73,7 @@ restore_config() {
   return 1
 }
 cleanup() {
-  local rc=$? current patch object uid name resource namespace
+  local rc=$? current patch object uid name resource namespace key
   for pid in "${request_pid}" "${pod_pid}"; do
     if [[ -n "${pid}" ]]; then kill "${pid}" 2>/dev/null || true; wait "${pid}" 2>/dev/null || true; fi
   done
@@ -80,8 +81,11 @@ cleanup() {
     restore_config || { echo "Config cleanup incomplete; retained barrier and evidence: ${art}" >&2; exit 1; }
   fi
   if [[ "${registry_installed}" == true ]]; then
+    "${k[@]}" -n ome get cm alfred-config --show-managed-fields -o json >"${art}/original-config-after.json" || exit 1
+    jq -e --slurpfile old "${art}/original-config.json" '.metadata.uid==$old[0].metadata.uid and
+      .data==$old[0].data and .metadata.managedFields==$old[0].metadata.managedFields' "${art}/original-config-after.json" >/dev/null || exit 1
     current="$("${k[@]}" -n ome get deployment ome-alfred -o json)" || exit 1
-    patch="$(churn_restore_patch "$(cat "${art}/deployment-before.json")" "${current}" "${registry_name}")" || exit 1
+    patch="$(nd_deployment_patch "$(cat "${art}/deployment-before.json")" "${current}" "${registry_name}" "${policy_name}" restore)" || exit 1
     if [[ "${patch}" != '[]' ]]; then
       "${k[@]}" -n ome patch deployment ome-alfred --type=json -p "${patch}" -o json >"${art}/deployment-restored.json" || exit 1
       "${k[@]}" -n ome rollout status deployment/ome-alfred --timeout=180s >>"${art}/cleanup.log" 2>&1 || exit 1
@@ -89,10 +93,11 @@ cleanup() {
   fi
   if [[ "${cordoned}" == true ]]; then "${k[@]}" uncordon alfred-kwok-gpu-c >/dev/null || rc=1; fi
   if [[ "${passed}" == true && "${rc}" == 0 ]]; then
-    nd_created_objects "${art}/fixture-created.json" "${art}/registry-created.json" >"${art}/cleanup-objects.jsonl" || exit 1
+    nd_created_objects "${art}/fixture-created.json" "${art}/registry-created.json" "${art}/config-before.json" >"${art}/cleanup-objects.jsonl" || exit 1
     # Only these exact created identities are disposable; keep namespace/journal.
     while IFS= read -r object; do
       uid="$(jq -er '.metadata.uid' <<<"${object}")"; name="$(jq -er '.metadata.name' <<<"${object}")"
+      key="$(nd_cleanup_key <<<"${object}")" || exit 1
       namespace="$(jq -r '.metadata.namespace // ""' <<<"${object}")"
       case "$(jq -r '.kind' <<<"${object}")" in
         Pod) resource="/api/v1/namespaces/${namespace}/pods/${name}" ;;
@@ -101,8 +106,8 @@ cleanup() {
         ConfigMap) resource="/api/v1/namespaces/ome/configmaps/${name}" ;;
         *) echo 'Unexpected cleanup kind' >&2; exit 1 ;;
       esac
-      jq -n --arg uid "${uid}" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' >"${art}/delete-${name}.json"
-      "${k[@]}" delete --raw "${resource}" -f "${art}/delete-${name}.json" >"${art}/deleted-${name}.json" || rc=1
+      jq -n --arg uid "${uid}" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' >"${art}/delete-${key}.json"
+      "${k[@]}" delete --raw "${resource}" -f "${art}/delete-${key}.json" >"${art}/deleted-${key}.json" || rc=1
     done <"${art}/cleanup-objects.jsonl"
     "${k[@]}" -n alfred-e2e wait --for=delete inferenceservice/single --timeout=90s >>"${art}/cleanup.log" 2>&1 || rc=1
     "${k[@]}" -n alfred-e2e wait --for=delete pods --all --timeout=90s >>"${art}/cleanup.log" 2>&1 || rc=1
@@ -118,7 +123,9 @@ trap cleanup EXIT
 "${k[@]}" get inferenceservices,inferencereplicas -A -o json | jq -e '.items|length==0' >/dev/null
 "${k[@]}" -n alfred-e2e get pods -o json | jq -e '.items|length==0' >/dev/null
 "${k[@]}" get nodes -l alfred-e2e/virtual=true -o json | jq -e '(.items|length)==4 and all(.items[];.spec.unschedulable!=true and .metadata.labels["maintenance.example.com/state"]==null)' >/dev/null
-"${k[@]}" -n ome get cm alfred-config -o json >"${art}/config-before.json"
+"${k[@]}" -n ome get cm alfred-config --show-managed-fields -o json >"${art}/original-config.json"
+jq --arg name "${policy_name}" '{apiVersion:"v1",kind:"ConfigMap",metadata:{name:$name,namespace:"ome"},data}' "${art}/original-config.json" |
+  "${k[@]}" create -f - -o json >"${art}/config-before.json"
 jq -r '.data["config.yaml"]' "${art}/config-before.json" | yq -o=json '.' >"${art}/config-before-parsed.json"
 jq -e '.mode=="execute" and .policies.defragmentation.enabled==false' "${art}/config-before-parsed.json" >/dev/null
 jq '.policies.defragmentation|=(.enabled=true|.fragmentationThreshold=0.1|.scoring.sizeLadder=[8]|.scoring.sizePrior={"8":1}|.scoring.demandBlendLambda=1)' "${art}/config-before-parsed.json" >"${art}/enabled-config.json"
@@ -132,14 +139,7 @@ jq -n --slurpfile original "${art}/registry-before.json" --arg name "${registry_
   .data["workers.json"]|=(fromjson|.workers[].binaryPath="/alfred-simulator-barrier"|tojson)|
   .data["barrier.json"]=({profile:$profile,namespace:"alfred-e2e",workload:"single"}|tojson)' |
   "${k[@]}" create -f - -o json >"${art}/registry-created.json"
-patch="$(jq -c --arg registry "${registry_name}" '
-  if (.spec.template.spec.containers|length)!=1 or .spec.template.spec.containers[0].name!="alfred" or
-    ([.spec.template.spec.volumes[]|select(.name=="simulation")]|length)!=1 or
-    ([.spec.template.spec.containers[0].args[]|select(startswith("--simulation-timeout="))]|length)!=1
-  then error("unexpected deployment") else
-  [{op:"test",path:"/metadata/uid",value:.metadata.uid},{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
-   {op:"replace",path:"/spec/template/spec/volumes",value:(.spec.template.spec.volumes|map(if .name=="simulation" then .configMap.name=$registry else . end))},
-   {op:"replace",path:"/spec/template/spec/containers/0/args",value:(.spec.template.spec.containers[0].args|map(if startswith("--simulation-timeout=") then "--simulation-timeout=20s" else . end))}] end' "${art}/deployment-before.json")"
+patch="$(nd_deployment_patch "$(cat "${art}/deployment-before.json")" "$(cat "${art}/deployment-before.json")" "${registry_name}" "${policy_name}" install)"
 registry_installed=true
 "${k[@]}" -n ome patch deployment ome-alfred --type=json -p "${patch}" -o json >"${art}/deployment-barrier.json"
 "${k[@]}" -n ome rollout status deployment/ome-alfred --timeout=180s >"${art}/barrier-rollout.log" 2>&1
@@ -179,9 +179,9 @@ cordoned=false
 echo 'Waiting for the configured recent-placement cooldown'
 deadline=$((SECONDS+65)); while ((SECONDS<deadline)); do sleep 1; done
 capture "${art}/baseline.json"
-jq -n --argjson profile "${profile}" --arg service "${service}" --slurpfile baseline "${art}/baseline.json" \
+jq -n --argjson profile "${profile}" --arg service "${service}" --arg policy "${policy_name}" --slurpfile baseline "${art}/baseline.json" \
   --slurpfile source "${art}/source.json" --slurpfile config "${art}/enabled-config.json" '
-  {scenario:"no-benefit-defrag",profile:$profile,routingService:$service,baseline:$baseline[0],source:$source[0],config:$config[0]}' >"${art}/context.json"
+  {scenario:"no-benefit-defrag",profile:$profile,policyName:$policy,routingService:$service,baseline:$baseline[0],source:$source[0],config:$config[0]}' >"${art}/context.json"
 idle "${art}/baseline.json"
 owner_uid="$(jq -er '.isvc.metadata.uid' "${art}/baseline.json")"
 "${k[@]}" -n alfred-e2e get inferenceservice single --watch --request-timeout="$(churn_watch_timeout_seconds 360)s" -o json >"${art}/requests.jsonl" 2>"${art}/requests.stderr" &
@@ -191,10 +191,10 @@ pod_pid=$!
 deadline=$((SECONDS+15))
 until [[ -s "${art}/requests.jsonl" && -s "${art}/pods.jsonl" ]]; do kill -0 "${request_pid}"; kill -0 "${pod_pid}"; ((SECONDS<deadline)); sleep 0.1; done
 churn_watch_requests "${art}/requests.jsonl" "${owner_uid}" | jq -e 'length==0' >/dev/null
-current="$("${k[@]}" -n ome get cm alfred-config -o json)"
+current="$("${k[@]}" -n ome get cm "${policy_name}" -o json)"
 patch="$(nd_config_patch "$(cat "${art}/config-before.json")" "${current}" "${enabled}" install)"
 configured=true
-"${k[@]}" -n ome patch cm alfred-config --type=json -p "${patch}" -o json >"${art}/config-enabled.json"
+"${k[@]}" -n ome patch cm "${policy_name}" --type=json -p "${patch}" -o json >"${art}/config-enabled.json"
 for index in 1 2 3; do
   echo "Waiting for real no-benefit preflight ${index}"
   prefix="${art}/barrier-${index}"

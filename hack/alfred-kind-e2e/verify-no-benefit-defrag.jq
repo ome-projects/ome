@@ -2,6 +2,7 @@ include "placement-pause-sample";
 include "no-benefit-defrag-sample";
 . as $e |
 .scenario=="no-benefit-defrag" and
+(.policyName|type=="string" and startswith("alfred-no-benefit-") and endswith("-policy")) and
 .profile.schedulerName=="alfred-default-scheduler" and .profile.backend=="kind-default-v135" and
 all(.profile.schedulerVersion,.profile.configurationID,.baseline.isvc.metadata.uid,.baseline.ir.metadata.uid,
   .source.metadata.uid,.baseline.recommendations.metadata.uid;type=="string" and length>0) and

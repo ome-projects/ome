@@ -15,7 +15,7 @@ def report($index): $baseline | .recommendations.data["last-cycle.json"] =
   ({timestamp:("2026-09-29T04:00:0"+($index|tostring)+"Z"),mode:"execute",recommendations:[
     {workload:"alfred-e2e/single",component:"engine",instance:0,policy:"defragmentation",reason:"Fragmentation",
      fromNode:"alfred-kwok-gpu-a",score:0.35,outcome:"withheld",dispatchStatus:"withheld",dispatchReason:"PolicyNoLongerEligible"}]}|tojson);
-{scenario:"no-benefit-defrag",profile:$profile,source:.source,routingService:.routingService,baseline:$baseline,
+{scenario:"no-benefit-defrag",policyName:"alfred-no-benefit-fixture-policy",profile:$profile,source:.source,routingService:.routingService,baseline:$baseline,
  config:{mode:"execute",policies:{defragmentation:{enabled:true,fragmentationThreshold:0.1,scoring:{sizeLadder:[8],sizePrior:{"8":1},demandBlendLambda:1}}}},
  requestWatch:[$baseline.isvc],podWatch:[$baseline.allPods.items[]|{type:"ADDED",object:.}],
  attempts:[range(1;4)|. as $index|
