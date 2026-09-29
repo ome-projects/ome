@@ -218,6 +218,18 @@ kubectl ome runtime render chat -n team-a --deploy-config proposed-config.yaml >
 diff before.yaml after.yaml
 ```
 
+With `-f` (repeatable), the service, runtimes, and models come from manifest
+files and the command makes no API request, so CI can diff two revisions of a
+GitOps repository. `-f` requires `--deploy-config` and supports only
+`--view live`. Other kinds in the files are skipped with a notice on stderr,
+objects without a namespace get the `-n` namespace, and an object defined twice
+fails the command:
+
+```sh
+kubectl ome runtime render chat -n team-a -f base/chat.yaml -f base/runtimes.yaml \
+  --deploy-config base/inferenceservice-config.yaml > before.yaml
+```
+
 Runtime history is retained evidence, not a complete audit log. Compact
 history tables may use display fingerprints such as `PREFIX#DIGEST`; copy
 real revision identities from `-o wide` or structured output for operations.

@@ -51,6 +51,13 @@ func renderFactory(t *testing.T, reversed bool) *acquisitionFactory {
 
 func executeRender(t *testing.T, f *acquisitionFactory, files map[string]string, args ...string) (string, error) {
 	t.Helper()
+	out, errOut, err := executeRenderStreams(t, f, files, args...)
+	require.Empty(t, errOut)
+	return out, err
+}
+
+func executeRenderStreams(t *testing.T, f *acquisitionFactory, files map[string]string, args ...string) (string, string, error) {
+	t.Helper()
 	var out, errOut bytes.Buffer
 	o := &renderOptions{
 		IOStreams:        genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: &out, ErrOut: &errOut},
@@ -69,8 +76,7 @@ func executeRender(t *testing.T, f *acquisitionFactory, files map[string]string,
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	err := cmd.Execute()
-	require.Empty(t, errOut.String())
-	return out.String(), err
+	return out.String(), errOut.String(), err
 }
 
 func assertRenderGolden(t *testing.T, name, got string) {

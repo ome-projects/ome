@@ -84,6 +84,7 @@ type renderOptions struct {
 	view             string
 	output           string
 	deployConfigPath string
+	filenames        []string
 }
 
 func newRenderCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -111,6 +112,12 @@ inferenceservice-config ConfigMap in --ome-namespace. --deploy-config reads
 the ConfigMap from a manifest file instead, for example to preview a change
 to the defaults.
 
+-f reads the InferenceService, runtimes, and models from manifest files
+instead of the cluster, for example to diff two revisions of a GitOps
+repository. Other kinds are skipped with a notice. -f requires
+--deploy-config, supports only --view live, and makes no API request.
+Objects without a namespace get the -n namespace.
+
 --view live merges the runtime as it is now; --view active merges the
 ControllerRevision the controller has pinned.
 
@@ -126,7 +133,8 @@ The output is a cli.ome.io/v1alpha1 object for reading and diffing. It
 cannot be applied.`,
 		Example: `  kubectl ome runtime render chat -n prod
   kubectl ome runtime render chat -n prod --view active -o json
-  kubectl ome runtime render chat -n prod --deploy-config ./inferenceservice-config.yaml`,
+  kubectl ome runtime render chat -n prod --deploy-config ./inferenceservice-config.yaml
+  kubectl ome runtime render chat -n prod -f service.yaml -f runtimes.yaml --deploy-config ./inferenceservice-config.yaml`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.name = args[0]
@@ -140,6 +148,8 @@ cannot be applied.`,
 	cmd.Flags().StringVarP(&o.output, "output", "o", "yaml", "Output format: yaml or json")
 	cmd.Flags().StringVar(&o.deployConfigPath, "deploy-config", "",
 		"Read deploy defaults from an inferenceservice-config ConfigMap manifest instead of the cluster")
+	cmd.Flags().StringArrayVarP(&o.filenames, "filename", "f", nil,
+		"Read the InferenceService, runtimes, and models from manifest files instead of the cluster (repeatable)")
 	o.namespaceOptions.AddOMEFlags(cmd.Flags())
 	return cmd
 }
@@ -158,10 +168,21 @@ func (o *renderOptions) validate() error {
 	default:
 		return fmt.Errorf("unsupported output format %q (supported: yaml, json)", o.output)
 	}
+	if len(o.filenames) > 0 {
+		if o.deployConfigPath == "" {
+			return errors.New("-f requires --deploy-config")
+		}
+		if o.view == "active" {
+			return errors.New("--view active needs the cluster and cannot be used with -f")
+		}
+	}
 	return nil
 }
 
 func (o *renderOptions) run(ctx context.Context, f factory.Factory) error {
+	if len(o.filenames) > 0 {
+		return o.runFiles(ctx, f)
+	}
 	loader, deployConfigSource := o.deployConfigLoader()
 	evidence, err := collectRuntimeEvidence(
 		ctx, f, o.namespaceOptions, o.name, o.limits,

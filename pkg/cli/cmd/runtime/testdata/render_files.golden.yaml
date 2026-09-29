@@ -1,0 +1,34 @@
+apiVersion: cli.ome.io/v1alpha1
+components:
+  engine:
+    deploymentMode: RawDeployment
+    deploymentModeSource: Default
+    spec:
+      maxReplicas: 6
+      minReplicas: 3
+      runner:
+        args:
+        - --port=8080
+        image: runtime:v1
+        name: runner
+        resources: {}
+      terminationGracePeriodSeconds: 45
+deployDefaults: Applied
+kind: RenderedInferenceService
+metadata:
+  name: service
+  namespace: team-a
+sources:
+- kind: InferenceService
+  name: team-a/service
+  origin: File
+- kind: ClusterBaseModel
+  name: llama
+  origin: File
+- kind: ServingRuntime
+  name: team-a/vllm
+  origin: File
+- kind: ConfigMap
+  name: deploy.yaml
+  origin: File
+view: Live
