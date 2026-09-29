@@ -124,6 +124,18 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(report['queued_concerns'], self.context['pending_concerns'])
         self.assertEqual(len(report['missing_shards']), len(discovery.SHARDS))
 
+    def test_partial_discovery_removes_selected_identity_from_prior_queue(self):
+        """Selecting a newer source for a concern retires its old pending copy."""
+        old = docs.validate_item(proposal(source_sha='a' * 40))
+        other_area = docs.validate_item(proposal(area='other-area', question='Another area'))
+        self.context['pending_concerns'] = [old, other_area]
+        self.scans[0].update(inspected_commits=['b' * 40],
+                             concerns=[proposal(source_sha='b' * 40)])
+        with patch.object(discovery, 'partition', return_value=self.assignments):
+            report = discovery.build_report(self.scans[:1], self.context)
+        self.assertEqual(report['selected'][0]['source_sha'], 'b' * 40)
+        self.assertEqual(report['queued_concerns'], [other_area])
+
     def test_partial_mode_never_accepts_invalid_or_duplicate_received_scans(self):
         """Only absence is tolerated; malformed received evidence still fails."""
         scan = self.scans[0]

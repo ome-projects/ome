@@ -162,9 +162,9 @@ def build_report(scans, context):
     missing = [name for name in expected if name not in received]
     queued = deferred_queue(scans, deferred, context['existing_prs'])
     if missing:
-        selected_keys = {item['key'] for item in selected}
+        selected_ids = {(item['area'], item['concern']) for item in selected}
         queued.extend(item for item in context.get('pending_concerns', [])
-                      if docs.validate_item(item)['key'] not in selected_keys)
+                      if (item['area'], item['concern']) not in selected_ids)
     return {'base_sha': context['base_sha'], 'scans': scans, 'selected': selected,
             'deferred': deferred, 'queued_concerns': pending_from_report({'queued_concerns': queued}, context),
             'expected_shards': expected, 'missing_shards': missing, 'complete': not missing,
