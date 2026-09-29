@@ -368,7 +368,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	switch {
 	case wasEligible && !isEligible:
 		w.logger.Infof("BaseModel %s in namespace %s no longer matches this node, deleting", newBaseModel.Name, newBaseModel.Namespace)
-		w.deleteBaseModel(newBaseModel)
+		w.gopherChan <- &GopherTask{TaskType: Delete, BaseModel: newBaseModel, NodeIneligible: true}
 		return
 	case !wasEligible && isEligible:
 		w.enqueueBaseModelDownload(newBaseModel)
@@ -425,7 +425,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	switch {
 	case wasEligible && !isEligible:
 		w.logger.Infof("ClusterBaseModel %s no longer matches this node, deleting", newClusterBaseModel.Name)
-		w.deleteClusterBaseModel(newClusterBaseModel)
+		w.gopherChan <- &GopherTask{TaskType: Delete, ClusterBaseModel: newClusterBaseModel, NodeIneligible: true}
 		return
 	case !wasEligible && isEligible:
 		w.enqueueClusterBaseModelDownload(newClusterBaseModel)

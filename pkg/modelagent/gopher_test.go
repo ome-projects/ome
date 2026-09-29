@@ -1554,6 +1554,82 @@ func TestProcessTask_TerminatingClusterBaseModelRunsDeleteCleanup(t *testing.T) 
 	assert.NotContains(t, latest.Data, modelKey)
 }
 
+// A Delete during a download finds the model's entry without config.artifact, and
+// later Deletes find no entry. Neither may keep the files of a model that is being
+// deleted or no longer targets this node. Other Deletes keep them, since a Delete
+// event can arrive for a model that still exists.
+func TestProcessTask_HfDeleteRemovesFilesOnlyWhenConfirmed(t *testing.T) {
+	modelKey := constants.GetModelConfigMapKey("", "model", true)
+	downloading := `{"name":"model","status":"Updating","progress":{"phase":"Downloading","completedBytes":1}}`
+	withArtifact := entryJSON("sha", modelKey, "/models/model")
+	for _, tc := range []struct {
+		name        string
+		entry       string // the model's ConfigMap entry; empty when there is none
+		deleting    bool   // the task's model has a deletion timestamp
+		cached      string // the lister's copy of the model: "", "live", or "deleting"
+		ineligible  bool
+		download    bool
+		wantRemoved bool
+	}{
+		{name: "entry removed by an earlier Delete", deleting: true, wantRemoved: true},
+		{name: "downloading", entry: downloading, deleting: true, wantRemoved: true},
+		{name: "download failed", entry: `{"name":"model","status":"Failed"}`, deleting: true, wantRemoved: true},
+		{name: "metadata parse failed", entry: `{"name":"model","status":"Ready"}`, deleting: true, wantRemoved: true},
+		{name: "no longer targets this node", entry: downloading, cached: "live", ineligible: true, wantRemoved: true},
+		{name: "download finds model deleting", entry: downloading, cached: "deleting", download: true, wantRemoved: true},
+		{name: "unconfirmed and not cached", entry: withArtifact},
+		{name: "unconfirmed and live", entry: withArtifact, cached: "live"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			data := map[string]string{}
+			if tc.entry != "" {
+				data[modelKey] = tc.entry
+			}
+			g := newGopherForProcessTask(makeConfigMap("node-1", data))
+			g.modelRootDir = t.TempDir()
+			path := filepath.Join(g.modelRootDir, "model")
+			weights := filepath.Join(path, "model.safetensors")
+			require.NoError(t, os.Mkdir(path, 0o755))
+			require.NoError(t, os.WriteFile(weights, []byte("weights"), 0o644))
+			uri := "hf://org/model"
+			model := &v1beta1.ClusterBaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "model", UID: "uid-model"},
+				Spec:       v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &path}},
+			}
+			now := metav1.Now()
+			lister := &mockClusterBaseModelLister{}
+			if tc.cached != "" {
+				latest := model.DeepCopy()
+				if tc.cached == "deleting" {
+					latest.DeletionTimestamp = &now
+				}
+				lister.models = []*v1beta1.ClusterBaseModel{latest}
+			}
+			g.baseModelLister = &mockBaseModelLister{}
+			g.clusterBaseModelLister = lister
+			if tc.deleting {
+				model.DeletionTimestamp = &now
+			}
+			task := &GopherTask{TaskType: Delete, ClusterBaseModel: model, NodeIneligible: tc.ineligible}
+			if tc.download {
+				task.TaskType = Download
+			}
+
+			require.NoError(t, g.processTask(task))
+
+			if !tc.wantRemoved {
+				assert.FileExists(t, weights)
+				return
+			}
+			assert.NoDirExists(t, path)
+			cm, err := g.configMapReconciler.getConfigMap(context.Background())
+			require.NoError(t, err)
+			assert.NotContains(t, cm.Data, modelKey)
+		})
+	}
+}
+
 func newGopherWithEmptyClient(nodeName, namespace string, t *testing.T) (*Gopher, *k8sfake.Clientset) {
 	client := k8sfake.NewSimpleClientset()
 	logger := zaptest.NewLogger(t).Sugar()
@@ -1711,6 +1787,19 @@ func TestHasChildrenPaths_GetConfigMapError(t *testing.T) {
 	assert.Contains(t, err.Error(), "cannot retrieve node configmap and cannot determine whether it has childrenPaths and will regard it has")
 }
 
+func TestHasChildrenPaths_MissingEntry_NoChildren(t *testing.T) {
+	cm := makeConfigMap("node-1", map[string]string{})
+	g, client := newGopherAndClientWithConfigMap(cm, t)
+
+	childrenPaths, parentName, parentDir, err := g.parseModelConfigDataEntry(context.Background(), "clusterbasemodel.child")
+
+	assert.NoError(t, err, "a missing entry records no children")
+	assert.Empty(t, childrenPaths)
+	assert.Empty(t, parentName)
+	assert.Empty(t, parentDir)
+	assert.Equal(t, 1, countConfigMapGets(client))
+}
+
 func TestHasChildrenPaths_ParentParseError(t *testing.T) {
 	// Prepare parent with a child path and a malformed child entry to cause parsing error
 	parentKey := "clusterbasemodel.parent"
@@ -1727,8 +1816,8 @@ func TestHasChildrenPaths_ParentParseError(t *testing.T) {
 	part["childrenPaths"] = []interface{}{childPath}
 	parentEntryWithChild, _ := json.Marshal(pobj)
 
-	// Malformed child entry to trigger error in getParentPathAndChildrenPaths (missing config/artifact)
-	childEntry := "{}"
+	// Malformed child entry to trigger error in getParentPathAndChildrenPaths (invalid JSON)
+	childEntry := `{"config":`
 
 	cm := makeConfigMap("node-x", map[string]string{
 		parentKey: string(parentEntryWithChild),
@@ -2105,7 +2194,7 @@ func TestIsSkippingArtifactDeletion_ParseError_TreatsAsHasChildren(t *testing.T)
 
 	// Malformed entry for the current model key to cause parse error in parseModelConfigDataEntry
 	cm := makeConfigMap(node, map[string]string{
-		childKey: "{}",
+		childKey: `{"config":`,
 	})
 	g, client := newGopherAndClientWithConfigMap(cm, t)
 	// No references and no reserve labels
@@ -2159,6 +2248,84 @@ func TestIsSkippingArtifactDeletion_GetConfigMapError_TreatsAsHasChildren(t *tes
 	assert.Empty(t, parentName, "parent name should be empty when configmap cannot be retrieved")
 	assert.Empty(t, parentDir, "parent dir should be empty when configmap cannot be retrieved")
 	assert.Equal(t, 1, countConfigMapGets(client), "expected a ConfigMap get attempt")
+}
+
+func TestIsSkippingArtifactDeletion_MissingEntry_ProceedsWithoutParentLookup(t *testing.T) {
+	cm := makeConfigMap("node-1", map[string]string{})
+	g, client := newGopherAndClientWithConfigMap(cm, t)
+	g.baseModelLister = &mockBaseModelLister{}
+	g.clusterBaseModelLister = &mockClusterBaseModelLister{}
+	task := &GopherTask{
+		TaskType: Delete,
+		BaseModel: &v1beta1.BaseModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "child"},
+			Spec:       v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{}},
+		},
+	}
+
+	skip, isRemoveParent, parentName, parentDir := g.isSkippingArtifactDeletion(context.Background(), task, "/models/child", true)
+
+	assert.False(t, skip, "a missing entry records no children")
+	assert.False(t, isRemoveParent)
+	assert.Empty(t, parentName)
+	assert.Empty(t, parentDir)
+	assert.Equal(t, 1, countConfigMapGets(client), "no parent is recorded, so there is no parent to look up")
+	assert.Zero(t, countConfigMapUpdates(client))
+}
+
+// Hugging Face reuse before shared artifacts linked a model's path to another
+// model's directory, and the link can outlive that directory's ConfigMap entry.
+func TestIsSkippingArtifactDeletion_LinkFromOtherModel(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		linkTarget string // target of the other model's path, relative to the model root
+		deleteLink bool   // the deleted model's path is itself a link to the directory
+		wantSkip   bool
+	}{
+		{name: "other model links to the directory", linkTarget: "parent", wantSkip: true},
+		{name: "other model links elsewhere", linkTarget: "elsewhere"},
+		{name: "other model link is dangling", linkTarget: "missing"},
+		{name: "deleted path is a sibling link", linkTarget: "parent", deleteLink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(root, "parent"), 0o755))
+			require.NoError(t, os.Mkdir(filepath.Join(root, "elsewhere"), 0o755))
+			destPath := filepath.Join(root, "parent")
+			if tc.deleteLink {
+				destPath = filepath.Join(root, "child")
+				require.NoError(t, os.Symlink("parent", destPath))
+			}
+			otherPath := filepath.Join(root, "other")
+			require.NoError(t, os.Symlink(tc.linkTarget, otherPath))
+			uri := "hf://org/model"
+			g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
+			g.modelRootDir = root
+			g.baseModelLister = &mockBaseModelLister{}
+			g.clusterBaseModelLister = &mockClusterBaseModelLister{models: []*v1beta1.ClusterBaseModel{{
+				ObjectMeta: metav1.ObjectMeta{Name: "other"},
+				Spec:       v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &otherPath}},
+			}}}
+			task := &GopherTask{TaskType: Delete, ClusterBaseModel: &v1beta1.ClusterBaseModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "deleted"},
+				Spec:       v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri, Path: &destPath}},
+			}}
+
+			skip, isRemoveParent, _, _ := g.isSkippingArtifactDeletion(context.Background(), task, destPath, true)
+
+			assert.Equal(t, tc.wantSkip, skip)
+			assert.False(t, isRemoveParent)
+		})
+	}
+}
+
+func TestIsLinkedByOtherModel_ListErrorKeepsDirectory(t *testing.T) {
+	g := newGopherWithConfigMap(makeConfigMap("node-1", map[string]string{}))
+	g.baseModelLister = &mockBaseModelLister{err: errors.New("lister failed")}
+	g.clusterBaseModelLister = &mockClusterBaseModelLister{}
+	task := &GopherTask{TaskType: Delete, ClusterBaseModel: &v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "deleted"}}}
+
+	assert.True(t, g.isLinkedByOtherModel(t.TempDir(), task))
 }
 
 func Test_hasChildrenPaths_ParseErrorReturnsTrue(t *testing.T) {

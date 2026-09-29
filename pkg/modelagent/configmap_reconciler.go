@@ -981,7 +981,7 @@ Parameters:
 Returns:
   - parentPath: Normalized map extracted from config.artifact.parentPath (possibly empty).
   - children: Slice extracted from config.artifact.childrenPaths (possibly empty).
-  - error: Parsing or structure conversion errors as described above.
+  - error: An error if dataEntry is not a JSON object.
 */
 func (c *ConfigMapReconciler) getParentPathAndChildrenPaths(modelTypeAndModelName string, dataEntry string) (map[string]string, []string, error) {
 	// Parse the JSON into a generic map
@@ -991,17 +991,10 @@ func (c *ConfigMapReconciler) getParentPathAndChildrenPaths(modelTypeAndModelNam
 		return make(map[string]string), []string{}, fmt.Errorf("invalid JSON for key %s: %w", modelTypeAndModelName, err)
 	}
 	c.logger.Infof("current data: modelTypeAndModelName: %s, dataEntry: %s", modelTypeAndModelName, dataEntry)
-	// Navigate nested structure: config → artifact
-	config, okConfig := obj[ConfigAttr].(map[string]interface{})
-	if !okConfig {
-		// No config => no children paths
-		return make(map[string]string), []string{}, fmt.Errorf("invalid config conversion")
-	}
-	artifact, okArtifact := config[ArtifactAttr].(map[string]interface{})
-	if !okArtifact {
-		// No artifact => no children paths
-		return make(map[string]string), []string{}, fmt.Errorf("invalid artifact conversion")
-	}
+	// Navigate nested structure: config → artifact. A download writes config only after
+	// it and its metadata parse succeed; an entry without it has no children paths.
+	config, _ := obj[ConfigAttr].(map[string]interface{})
+	artifact, _ := config[ArtifactAttr].(map[string]interface{})
 
 	children := extractChildrenPaths(artifact)
 

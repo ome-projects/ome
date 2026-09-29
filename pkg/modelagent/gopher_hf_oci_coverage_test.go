@@ -436,6 +436,8 @@ func TestSharedOCIRoutingPreservesOrdinaryDeletionSemantics(t *testing.T) {
 				s, task, input := newTestHfArtifactGopher(t)
 				task.TaskType = Delete
 				task.BaseModel.Annotations = nil
+				now := metav1.Now()
+				task.BaseModel.DeletionTimestamp = &now
 				task.BaseModel.Spec.Storage.DownloadPolicy = nil
 				task.BaseModel.Spec.Storage.StorageUri = &source
 				if cluster {

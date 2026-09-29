@@ -1796,38 +1796,25 @@ func TestGetParentPathAndChildrenPaths_WrongTypeParentPath_NoErrorEmpty(t *testi
 	assert.ElementsMatch(t, []string{"/a"}, children)
 }
 
-func TestGetParentPathAndChildrenPaths_MissingConfig_Error(t *testing.T) {
+// A download writes config.artifact only after it and its metadata parse succeed.
+func TestGetParentPathAndChildrenPaths_NoArtifact_NoChildren(t *testing.T) {
 	reconciler, _, _ := setupConfigMapTest(t)
 
-	obj := map[string]interface{}{} // no config
-	b, _ := json.Marshal(obj)
-
-	parent, children, err := reconciler.getParentPathAndChildrenPaths("k", string(b))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid config conversion")
-	// Function returns empty map/slice on this error (not nil)
-	assert.NotNil(t, parent)
-	assert.NotNil(t, children)
-	assert.Empty(t, parent)
-	assert.Empty(t, children)
-}
-
-func TestGetParentPathAndChildrenPaths_MissingArtifact_Error(t *testing.T) {
-	reconciler, _, _ := setupConfigMapTest(t)
-
-	obj := map[string]interface{}{
-		ConfigAttr: map[string]interface{}{}, // config present, artifact missing
+	for name, dataEntry := range map[string]string{
+		"no_config":               `{}`,
+		"downloading":             `{"name":"m","status":"Updating","progress":{"phase":"Downloading","completedBytes":1}}`,
+		"download_failed":         `{"name":"m","status":"Failed"}`,
+		"config_without_artifact": `{"name":"m","status":"Ready","config":{"modelType":"llama"}}`,
+		"config_not_object":       `{"config":"oops"}`,
+		"artifact_not_object":     `{"config":{"artifact":["/a"]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			parent, children, err := reconciler.getParentPathAndChildrenPaths("k", dataEntry)
+			assert.NoError(t, err)
+			assert.Empty(t, parent)
+			assert.Empty(t, children)
+		})
 	}
-	b, _ := json.Marshal(obj)
-
-	parent, children, err := reconciler.getParentPathAndChildrenPaths("k", string(b))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid artifact conversion")
-	// Function returns empty map/slice on this error (not nil)
-	assert.NotNil(t, parent)
-	assert.NotNil(t, children)
-	assert.Empty(t, parent)
-	assert.Empty(t, children)
 }
 
 func TestGetParentPathAndChildrenPaths_InvalidJSON_Error(t *testing.T) {

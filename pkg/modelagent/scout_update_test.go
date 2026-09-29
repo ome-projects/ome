@@ -366,6 +366,9 @@ func checkScoutUpdateTask(t *testing.T, scout *Scout, tasks chan *GopherTask, cl
 	} else {
 		assert.Same(t, newModel, task.BaseModel)
 	}
+	if want == Delete {
+		assert.Equal(t, newModel.DeletionTimestamp == nil, task.NodeIneligible, "only a placement change marks the node ineligible")
+	}
 	if want == Download {
 		require.NotNil(t, task.TensorRTLLMShapeFilter)
 		assert.Equal(t, scout.nodeShapeAlias, task.TensorRTLLMShapeFilter.ShapeAlias)
