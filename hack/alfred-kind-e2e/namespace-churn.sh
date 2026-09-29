@@ -184,8 +184,9 @@ for index in 1 2 3 4; do
   if [[ -z "${owner_uid}" ]]; then
     owner_uid="$(jq -er '.isvc.metadata.uid' <<<"${sample}")"
     ir_uid="$(jq -er '.ir.metadata.uid' <<<"${sample}")"
+    watch_timeout="$(churn_watch_timeout_seconds "${ALFRED_E2E_DEADLINE_SECONDS:-360}")"
     "${kube[@]}" -n alfred-e2e get inferenceservice "${workload}" --watch \
-      --request-timeout=600s -o json >"${request_watch_file}" 2>"${artifact_dir}/request-annotation-watch.stderr" &
+      --request-timeout="${watch_timeout}s" -o json >"${request_watch_file}" 2>"${artifact_dir}/request-annotation-watch.stderr" &
     request_watch_pid=$!
     # kubectl lists before watching from that list's resourceVersion. Require
     # the real initial object before releasing the first held simulation.

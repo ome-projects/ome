@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # Pure boundary checks shared by the live runner and its offline tests.
+churn_watch_timeout_seconds() {
+  # Barrier waits overlap the nested request/migration/drain deadline. Keep
+  # observing afterward through diagnostics, cleanup, API capture and three
+  # completion cycles, including bounded API-call overhead. Cleanup stops the
+  # watch promptly; its lifetime must not shorten any acceptance deadline.
+  printf '%s\n' "$(($1 + 600))"
+}
+
 churn_request_published() {
   jq -e --arg owner "$1" --arg ir "$2" '
     . as $s | .requests as $requests |

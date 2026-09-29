@@ -3,6 +3,17 @@ set -euo pipefail
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${dir}/namespace-churn-lib.sh"
 
+# The observer must cover the nested deadline plus post-deadline diagnostics,
+# cleanup, initial API capture and completion sampling (at least 375s total).
+# A fixed 600s watch truncates both a slow default run and an extended run.
+for deadline in 360 1200 3600; do
+  watch_timeout="$(churn_watch_timeout_seconds "${deadline}")"
+  if ((watch_timeout <= deadline + 375 || watch_timeout > deadline + 1800)); then
+    echo "watch ends before allowed completion work: deadline=${deadline}, watch=${watch_timeout}" >&2
+    exit 1
+  fi
+done
+
 # OME consumes a published annotation quickly. The watch, bound to the exact
 # journal identity/payload, must prove publication even after consumption.
 payload='{"schemaVersion":"v1","component":"engine","instance":0,"from_node":"source","requested_by":"alfred"}'
