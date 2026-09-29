@@ -39,6 +39,8 @@ func TestHfArtifactFilesHasChildren(t *testing.T) {
 		parentMissing bool
 		otherParent   bool
 		insideParent  bool
+		descendant    bool
+		siblingPrefix bool
 		wantChildren  bool
 	}{
 		{name: "absolute child link", wantChildren: true},
@@ -46,6 +48,9 @@ func TestHfArtifactFilesHasChildren(t *testing.T) {
 		{name: "dangling child link", relativeLink: true, parentMissing: true, wantChildren: true},
 		{name: "link to another parent", otherParent: true},
 		{name: "link inside parent is not a child", insideParent: true},
+		{name: "link to parent descendant", descendant: true, wantChildren: true},
+		{name: "relative link to parent descendant", descendant: true, relativeLink: true, wantChildren: true},
+		{name: "same prefix sibling is not a descendant", siblingPrefix: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -61,6 +66,12 @@ func TestHfArtifactFilesHasChildren(t *testing.T) {
 			target := parentPath
 			if tt.otherParent {
 				target = filepath.Join(root, "_artifacts", "another-parent")
+			}
+			if tt.descendant {
+				target = filepath.Join(parentPath, "subdir")
+			}
+			if tt.siblingPrefix {
+				target = parentPath + "-sibling"
 			}
 			if tt.relativeLink {
 				var err error

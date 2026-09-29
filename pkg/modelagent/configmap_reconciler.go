@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/util/retry"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -47,13 +48,14 @@ type CacheEntry struct {
 // It provides self-healing capabilities through periodic reconciliation to recover from
 // manual ConfigMap deletions or modifications without requiring agent restarts.
 type ConfigMapReconciler struct {
-	kubeClient      kubernetes.Interface   // Kubernetes client for ConfigMap CRUD operations
-	nodeName        string                 // The name of the node (used as ConfigMap name)
-	namespace       string                 // The namespace to store the ConfigMap in
-	logger          *zap.SugaredLogger     // Logger for recording operations
-	modelCache      map[string]*CacheEntry // In-memory cache of model information
-	hfArtifactCache map[string]string      // Immutable committed parent JSON, guarded by cacheMutex.
-	evictedModels   map[string]struct{}    // Prevent observing an evicted model back into the cache.
+	artifactModelClient omeclient.Interface
+	kubeClient          kubernetes.Interface   // Kubernetes client for ConfigMap CRUD operations
+	nodeName            string                 // The name of the node (used as ConfigMap name)
+	namespace           string                 // The namespace to store the ConfigMap in
+	logger              *zap.SugaredLogger     // Logger for recording operations
+	modelCache          map[string]*CacheEntry // In-memory cache of model information
+	hfArtifactCache     map[string]string      // Immutable committed parent JSON, guarded by cacheMutex.
+	evictedModels       map[string]struct{}    // Prevent observing an evicted model back into the cache.
 	// Lock order: parent operation mutex (when held), configMapMutationMutex,
 	// cacheMutex. Never hold cacheMutex across an API call or a mutation callback.
 	configMapMutationMutex sync.Mutex
@@ -521,6 +523,9 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 	return retry.OnError(retry.DefaultRetry, func(err error) bool {
 		return errors.IsConflict(err) || errors.IsAlreadyExists(err)
 	}, func() error {
+		if err := validateArtifactCleanup(ctx); err != nil {
+			return err
+		}
 		configMap, needCreate, err := c.getOrCreateConfigMap(ctx)
 		if err != nil {
 			return err
@@ -548,6 +553,12 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 			return err
 		}
 		if changed || restored {
+			if err := validateArtifactCleanup(ctx); err != nil {
+				return err
+			}
+			if err := c.validateArtifactReadyEntries(ctx, before, configMap.Data, modelID); err != nil {
+				return err
+			}
 			if needCreate {
 				_, err = c.kubeClient.CoreV1().ConfigMaps(c.namespace).Create(ctx, configMap, metav1.CreateOptions{})
 			} else {
