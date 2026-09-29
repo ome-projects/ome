@@ -481,8 +481,8 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 			if err != nil {
 				return err
 			}
-			if !eligible && !isDirectHfReuseEligible(task, taskModelSpec(task).Storage) {
-				return fmt.Errorf("artifact restoration requires an eligible Shared source")
+			if !eligible && !isDirectHfRestoreEligible(task, taskModelSpec(task).Storage) {
+				return fmt.Errorf("artifact restoration requires an eligible HF or Shared source")
 			}
 		}
 	}
