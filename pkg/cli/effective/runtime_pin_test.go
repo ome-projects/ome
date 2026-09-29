@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 )
@@ -457,4 +458,46 @@ func TestResolveAutoSyncUsesLiveAndRetainsStatusPinAsInactiveEvidence(t *testing
 	assert.Equal(t, 1, revisionCalls)
 	assert.False(t, got.HistoryRequested)
 	assert.False(t, got.HistoryComplete)
+}
+
+type deployConfigLiveResolver struct {
+	liveRuntimeResolverFunc
+	deployConfig *controllerconfig.DeployConfig
+}
+
+func (r deployConfigLiveResolver) DeployConfig() *controllerconfig.DeployConfig {
+	return r.deployConfig
+}
+
+func TestResolveActiveRevisionUsesLiveResolverDeployConfig(t *testing.T) {
+	autoSync := false
+	requested := revisionFixture(t, runtimeselector.KindClusterServingRuntime, "", "runtime", runtimeSpecFixture("requested"))
+	grace := int64(45)
+	resolver, err := newRuntimePinResolver(
+		func(string) revisionNamespace {
+			return revisionNamespaceStub{get: func(context.Context, string, metav1.GetOptions) (*appsv1.ControllerRevision, error) {
+				return requested.DeepCopy(), nil
+			}}
+		},
+		deployConfigLiveResolver{
+			liveRuntimeResolverFunc: func(context.Context, *v1beta1.InferenceService) (*LiveConfiguration, error) {
+				live := livePinFixture("runtime", runtimeselector.KindClusterServingRuntime, "", false)
+				live.Runtime.spec = runtimeSpecFixture("live")
+				return live, nil
+			},
+			deployConfig: &controllerconfig.DeployConfig{TerminationGracePeriodSeconds: &grace},
+		},
+		"ome", testPinLimits,
+	)
+	require.NoError(t, err)
+
+	got, err := resolver.Resolve(context.Background(), pinISVC("runtime", &autoSync, requested.Name), RuntimeResolveOptions{})
+
+	require.NoError(t, err)
+	active, err := got.RequireActive()
+	require.NoError(t, err)
+	components := active.Components()
+	require.Len(t, components, 1)
+	require.NotNil(t, components[0].engine.TerminationGracePeriodSeconds)
+	assert.Equal(t, grace, *components[0].engine.TerminationGracePeriodSeconds)
 }

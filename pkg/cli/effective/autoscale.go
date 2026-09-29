@@ -258,21 +258,21 @@ func (AutoscalingResolution) GoString() string {
 }
 
 // IsServiceVirtualDeployment reports the controller's service-level early
-// exit. Only a valid top-level annotation triggers this path; component
-// annotations and the typed field are resolved later by normal dispatch.
+// exit, set by a valid top-level annotation or by spec.deploymentMode.
+// Component annotations are resolved later by normal dispatch.
 func IsServiceVirtualDeployment(isvc *v1beta1.InferenceService) bool {
-	if isvc == nil {
-		return false
-	}
-	mode, found := isvcutils.GetDeploymentModeFromAnnotations(isvc.Annotations)
-	return found && mode == constants.VirtualDeployment
+	_, virtual := ServiceVirtualDeployment(isvc, nil)
+	return virtual
 }
 
 // ResolveVirtualAutoscaling explains the controller's VirtualDeployment
 // early exit without acquiring model, runtime, revision, or child objects.
 func ResolveVirtualAutoscaling(isvc *v1beta1.InferenceService) (AutoscalingResolution, error) {
-	if isvc == nil || isvc.Name == "" || isvc.Namespace == "" || isvc.UID == "" ||
-		isvc.ResourceVersion == "" || !IsServiceVirtualDeployment(isvc) {
+	if isvc == nil || isvc.Name == "" || isvc.Namespace == "" || isvc.UID == "" || isvc.ResourceVersion == "" {
+		return AutoscalingResolution{}, ErrAutoscalingEvidenceInvalid
+	}
+	serviceSource, virtual := ServiceVirtualDeployment(isvc, nil)
+	if !virtual {
 		return AutoscalingResolution{}, ErrAutoscalingEvidenceInvalid
 	}
 	result := AutoscalingResolution{
@@ -292,7 +292,7 @@ func ResolveVirtualAutoscaling(isvc *v1beta1.InferenceService) (AutoscalingResol
 		}
 		component := EffectiveAutoscalingComponent{
 			Type: componentType, DeploymentMode: constants.VirtualDeployment,
-			DeploymentModeSource: DeploymentModeServiceAnnotation,
+			DeploymentModeSource: serviceSource,
 			State:                AutoscalingComponentUnsupported, Bounds: AutoscalingBounds{State: AutoscalingBoundsUnavailable},
 			ScaleToZero: scaleToZero, Issues: []AutoscalingIssueCode{AutoscalingIssueDeploymentModeUnsupported},
 		}

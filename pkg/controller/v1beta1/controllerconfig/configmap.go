@@ -1603,7 +1603,7 @@ func NewDeployConfig(clientset kubernetes.Interface) (*DeployConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseDeployConfig(configMap)
+	return ParseDeployConfig(configMap)
 }
 
 // NewDeployConfigCached is the ConfigCache-backed variant of NewDeployConfig
@@ -1613,10 +1613,13 @@ func NewDeployConfigCached(cache *ConfigCache, clientset kubernetes.Interface) (
 	if err != nil {
 		return nil, err
 	}
-	return parseDeployConfig(configMap)
+	return ParseDeployConfig(configMap)
 }
 
-func parseDeployConfig(configMap *v1.ConfigMap) (*DeployConfig, error) {
+// ParseDeployConfig decodes and validates the deploy block of an
+// inferenceservice-config ConfigMap. It is exported so clients that read the
+// ConfigMap themselves, such as kubectl-ome, apply the controller's rules.
+func ParseDeployConfig(configMap *v1.ConfigMap) (*DeployConfig, error) {
 	deployConfig := &DeployConfig{}
 	if deploy, ok := configMap.Data[DeployConfigName]; ok {
 		err := json.Unmarshal([]byte(deploy), &deployConfig)

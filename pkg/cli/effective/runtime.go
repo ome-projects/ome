@@ -17,6 +17,8 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/specdefaults"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
@@ -352,9 +354,10 @@ func (LiveConfiguration) MarshalYAML() (any, error) {
 // used by the operator and observes declared inheritance as separate
 // provenance.
 type RuntimeResolver struct {
-	client    ctrlclient.Client
-	selector  runtimeSelector
-	resolveMu sync.Mutex
+	client       ctrlclient.Client
+	selector     runtimeSelector
+	deployConfig *controllerconfig.DeployConfig
+	resolveMu    sync.Mutex
 }
 
 func NewRuntimeResolver(client ctrlclient.Client) *RuntimeResolver {
@@ -367,6 +370,21 @@ func NewRuntimeResolver(client ctrlclient.Client) *RuntimeResolver {
 
 func newRuntimeResolver(client ctrlclient.Client, selector runtimeSelector) *RuntimeResolver {
 	return &RuntimeResolver{client: client, selector: selector}
+}
+
+// SetDeployConfig makes later resolutions fill unset component fields from
+// the operator's deploy defaults. Nil, the default, leaves them unset.
+func (r *RuntimeResolver) SetDeployConfig(deployConfig *controllerconfig.DeployConfig) {
+	r.resolveMu.Lock()
+	defer r.resolveMu.Unlock()
+	r.deployConfig = deployConfig
+}
+
+// DeployConfig returns the deploy defaults set by SetDeployConfig, or nil.
+func (r *RuntimeResolver) DeployConfig() *controllerconfig.DeployConfig {
+	r.resolveMu.Lock()
+	defer r.resolveMu.Unlock()
+	return r.deployConfig
 }
 
 // ResolveLive resolves the exact live runtime snapshot used by the operator
@@ -413,7 +431,7 @@ func (r *RuntimeResolver) ResolveLive(ctx context.Context, isvc *v1beta1.Inferen
 	}
 	snapshot, snapshotFound := runtimeSnapshotFor(r.client, kind, namespace, reference.name)
 
-	components, err := MergeEffectiveComponents(isvc, reference.spec)
+	components, err := MergeEffectiveComponents(isvc, reference.spec, r.deployConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -765,9 +783,11 @@ func classifyInheritanceUnavailable(err error) InheritanceUnavailableReason {
 }
 
 // MergeEffectiveComponents applies an authoritative operator runtime snapshot
-// to the service and resolves each resulting deployment mode. Inputs are not
-// modified.
-func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1beta1.ServingRuntimeSpec) ([]EffectiveComponent, error) {
+// to the service and resolves each resulting deployment mode. A non-nil
+// deployConfig also fills unset fields from the operator's deploy defaults, as
+// the controller does before rendering workloads; nil leaves them unset.
+// Inputs are not modified.
+func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1beta1.ServingRuntimeSpec, deployConfig *controllerconfig.DeployConfig) ([]EffectiveComponent, error) {
 	if isvc == nil {
 		return nil, errors.New("InferenceService must not be nil")
 	}
@@ -788,20 +808,24 @@ func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1bet
 	if err != nil {
 		return nil, fmt.Errorf("resolve component deployment modes: %w", err)
 	}
-	serviceVirtual := false
-	if mode, found := isvcutils.GetDeploymentModeFromAnnotations(isvc.Annotations); found && mode == constants.VirtualDeployment {
-		// The controller handles a service-level VirtualDeployment annotation
-		// before runtime selection or component reconciliation. That global
-		// early exit takes precedence over all per-component mode inputs.
-		engineMode, decoderMode, routerMode = mode, mode, mode
-		serviceVirtual = true
+	serviceSource, serviceVirtual := ServiceVirtualDeployment(isvc, deployConfig)
+	if serviceVirtual {
+		// The controller handles a service-level VirtualDeployment before
+		// runtime selection or component reconciliation. That global early
+		// exit takes precedence over all per-component mode inputs, and no
+		// deploy defaults apply.
+		engineMode, decoderMode, routerMode = constants.VirtualDeployment, constants.VirtualDeployment, constants.VirtualDeployment
+	} else if deployConfig != nil {
+		specdefaults.Engine(engine, engineMode, deployConfig)
+		specdefaults.Decoder(decoder, decoderMode, deployConfig)
+		specdefaults.Router(router, routerMode, deployConfig)
 	}
 
 	components := make([]EffectiveComponent, 0, 3)
 	if engine != nil {
 		source := componentDeploymentModeSource(engine.Annotations, engine.Leader != nil || engine.Worker != nil, isvc.Spec.DeploymentMode)
 		if serviceVirtual {
-			source = DeploymentModeServiceAnnotation
+			source = serviceSource
 		}
 		components = append(components, EffectiveComponent{
 			Type:                 v1beta1.EngineComponent,
@@ -813,7 +837,7 @@ func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1bet
 	if decoder != nil {
 		source := componentDeploymentModeSource(decoder.Annotations, decoder.Leader != nil || decoder.Worker != nil, isvc.Spec.DeploymentMode)
 		if serviceVirtual {
-			source = DeploymentModeServiceAnnotation
+			source = serviceSource
 		}
 		components = append(components, EffectiveComponent{
 			Type:                 v1beta1.DecoderComponent,
@@ -825,7 +849,7 @@ func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1bet
 	if router != nil {
 		source := componentDeploymentModeSource(router.Annotations, false, isvc.Spec.DeploymentMode)
 		if serviceVirtual {
-			source = DeploymentModeServiceAnnotation
+			source = serviceSource
 		}
 		components = append(components, EffectiveComponent{
 			Type:                 v1beta1.RouterComponent,
@@ -835,6 +859,25 @@ func MergeEffectiveComponents(isvc *v1beta1.InferenceService, runtimeSpec *v1bet
 		})
 	}
 	return components, nil
+}
+
+// ServiceVirtualDeployment reports whether the controller treats the whole
+// service as a VirtualDeployment, and whether the annotation or
+// spec.deploymentMode set it. It uses the controller's own service-level mode
+// resolution, with the deploy config's default mode, or RawDeployment when
+// deployConfig is nil or sets none.
+func ServiceVirtualDeployment(isvc *v1beta1.InferenceService, deployConfig *controllerconfig.DeployConfig) (ComponentDeploymentModeSource, bool) {
+	defaultMode := constants.RawDeployment
+	if deployConfig != nil && deployConfig.DefaultDeploymentMode != "" {
+		defaultMode = constants.DeploymentModeType(deployConfig.DefaultDeploymentMode)
+	}
+	if isvc == nil || isvcutils.InferenceServiceDeploymentMode(isvc, defaultMode) != constants.VirtualDeployment {
+		return "", false
+	}
+	if _, found := isvcutils.GetDeploymentModeFromAnnotations(isvc.Annotations); found {
+		return DeploymentModeServiceAnnotation, true
+	}
+	return DeploymentModeServiceSpec, true
 }
 
 func componentDeploymentModeSource(

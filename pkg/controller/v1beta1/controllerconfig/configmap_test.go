@@ -1338,7 +1338,7 @@ func TestDeployConfig_UpdateStrategyDefaults(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, err := parseDeployConfig(&v1.ConfigMap{Data: map[string]string{DeployConfigName: tt.block}})
+			cfg, err := ParseDeployConfig(&v1.ConfigMap{Data: map[string]string{DeployConfigName: tt.block}})
 			if tt.expectedError != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.expectedError)

@@ -337,6 +337,56 @@ func TestResolveVirtualAutoscalingPreservesAdmissionFailures(t *testing.T) {
 	}
 }
 
+func TestResolveVirtualAutoscalingFollowsControllerServiceMode(t *testing.T) {
+	virtual := constants.VirtualDeployment
+	tests := []struct {
+		name       string
+		configure  func(*v1beta1.InferenceService)
+		wantSource ComponentDeploymentModeSource
+		wantErr    bool
+	}{
+		{
+			name: "annotation",
+			configure: func(isvc *v1beta1.InferenceService) {
+				isvc.Annotations = map[string]string{constants.DeploymentMode: string(virtual)}
+			},
+			wantSource: DeploymentModeServiceAnnotation,
+		},
+		{
+			name:       "spec field",
+			configure:  func(isvc *v1beta1.InferenceService) { isvc.Spec.DeploymentMode = &virtual },
+			wantSource: DeploymentModeServiceSpec,
+		},
+		{
+			name: "annotation overrides spec field",
+			configure: func(isvc *v1beta1.InferenceService) {
+				isvc.Spec.DeploymentMode = &virtual
+				isvc.Annotations = map[string]string{constants.DeploymentMode: string(constants.RawDeployment)}
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := autoscaleISVC(constants.RawDeployment)
+			isvc.Spec.DeploymentMode = nil
+			tt.configure(isvc)
+
+			got, err := ResolveVirtualAutoscaling(isvc)
+
+			assert.Equal(t, !tt.wantErr, IsServiceVirtualDeployment(isvc))
+			if tt.wantErr {
+				require.ErrorIs(t, err, ErrAutoscalingEvidenceInvalid)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, got.Components, 1)
+			assert.Equal(t, constants.VirtualDeployment, got.Components[0].DeploymentMode)
+			assert.Equal(t, tt.wantSource, got.Components[0].DeploymentModeSource)
+		})
+	}
+}
+
 func TestResolveAutoscalingRejectsShadowedInvalidRuntimeAutoscalerConfiguration(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1137,7 +1187,7 @@ func baseAutoscaleRuntime() *v1beta1.ServingRuntimeSpec {
 
 func autoscaleRuntimeState(t *testing.T, isvc *v1beta1.InferenceService, runtimeSpec *v1beta1.ServingRuntimeSpec) *RuntimeState {
 	t.Helper()
-	components, err := MergeEffectiveComponents(isvc, runtimeSpec)
+	components, err := MergeEffectiveComponents(isvc, runtimeSpec, nil)
 	require.NoError(t, err)
 	return &RuntimeState{
 		Generation:         isvc.Generation,

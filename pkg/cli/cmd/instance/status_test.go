@@ -268,7 +268,7 @@ func TestStatusEffectiveRuntimeComponentModeOverridesServiceSpecBothWays(t *test
 	}
 }
 
-func TestStatusEffectiveRuntimeComponentModeOverridesTypedVirtualServiceSpec(t *testing.T) {
+func TestStatusTypedVirtualServiceSpecOverridesComponentMode(t *testing.T) {
 	t.Parallel()
 	isvc := commandISVC()
 	kind := "ServingRuntime"
@@ -291,12 +291,13 @@ func TestStatusEffectiveRuntimeComponentModeOverridesTypedVirtualServiceSpec(t *
 	out, err := executeStatus(t, factory.Static{OME: ome, Kube: kube, Runtime: ctrl, NS: "prod"}, statusCommandDependencies(), "chat", "0", "--component", "engine", "-o", "json")
 
 	require.NoError(t, err)
-	assert.Contains(t, out, `"state": "Reported"`)
-	assert.Contains(t, out, `"mode": "OMENative"`)
-	assert.Contains(t, out, `"source": "ComponentAnnotation"`)
-	assert.Contains(t, out, `"name": "`+pod.Name+`"`)
-	require.Len(t, ome.Actions(), 2)
-	assert.Equal(t, "list", ome.Actions()[1].GetVerb())
+	// The controller returns early for a service-level VirtualDeployment set
+	// by spec.deploymentMode, before any component annotation is read.
+	assert.Contains(t, out, `"state": "NotOMENative"`)
+	assert.Contains(t, out, `"mode": "VirtualDeployment"`)
+	assert.Contains(t, out, `"source": "ServiceSpec"`)
+	assert.NotContains(t, out, `"name": "`+pod.Name+`"`)
+	require.Len(t, ome.Actions(), 1)
 }
 
 func TestStatusUsesPinnedRuntimeAndExplicitControlPlaneNamespace(t *testing.T) {
@@ -687,9 +688,14 @@ func TestStatusDefinitiveDeploymentModeResolutionIsFailClosed(t *testing.T) {
 	}{
 		{name: "typed raw requires runtime merge", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &raw }, want: false},
 		{name: "typed native", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) { isvc.Spec.DeploymentMode = &native }, want: false},
-		{name: "typed virtual requires runtime merge", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
+		{name: "typed virtual wins", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
 			mode := constants.VirtualDeployment
 			isvc.Spec.DeploymentMode = &mode
+		}, want: true},
+		{name: "service raw annotation overrides typed virtual", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
+			mode := constants.VirtualDeployment
+			isvc.Spec.DeploymentMode = &mode
+			isvc.Annotations = map[string]string{constants.DeploymentMode: string(raw)}
 		}, want: false},
 		{name: "engine annotation raw", component: omev1beta1.EngineComponent, mutate: func(isvc *omev1beta1.InferenceService) {
 			isvc.Spec.Engine = &omev1beta1.EngineSpec{ComponentExtensionSpec: omev1beta1.ComponentExtensionSpec{Annotations: map[string]string{constants.DeploymentMode: string(raw)}}}

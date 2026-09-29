@@ -742,7 +742,7 @@ func TestMergeEffectiveComponentsReportsDeploymentModeSource(t *testing.T) {
 				DeploymentMode: test.specMode,
 				Engine:         test.engine,
 			}}
-			got, err := MergeEffectiveComponents(isvc, &v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{}})
+			got, err := MergeEffectiveComponents(isvc, &v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{}}, nil)
 			require.NoError(t, err)
 			require.Len(t, got, 1)
 			assert.Equal(t, test.wantMode, got[0].DeploymentMode)
@@ -908,13 +908,13 @@ func TestResolveLivePropagatesResolutionFailures(t *testing.T) {
 }
 
 func TestMergeEffectiveComponentsValidatesInputs(t *testing.T) {
-	_, err := MergeEffectiveComponents(nil, &v1beta1.ServingRuntimeSpec{})
+	_, err := MergeEffectiveComponents(nil, &v1beta1.ServingRuntimeSpec{}, nil)
 	require.ErrorContains(t, err, "must not be nil")
 
-	_, err = MergeEffectiveComponents(&v1beta1.InferenceService{}, nil)
+	_, err = MergeEffectiveComponents(&v1beta1.InferenceService{}, nil, nil)
 	require.ErrorContains(t, err, "must not be nil")
 
-	_, err = MergeEffectiveComponents(&v1beta1.InferenceService{}, &v1beta1.ServingRuntimeSpec{})
+	_, err = MergeEffectiveComponents(&v1beta1.InferenceService{}, &v1beta1.ServingRuntimeSpec{}, nil)
 	require.ErrorContains(t, err, "engine component is required")
 }
 

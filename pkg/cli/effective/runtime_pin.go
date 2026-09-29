@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/paging"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 )
@@ -26,6 +27,12 @@ var ErrActiveRuntimeInconsistent = errors.New("active runtime configuration is n
 
 type liveRuntimeResolver interface {
 	ResolveLive(context.Context, *v1beta1.InferenceService) (*LiveConfiguration, error)
+}
+
+// deployConfigSource is implemented by live resolvers that carry deploy
+// defaults, so the active revision is merged with the same defaults.
+type deployConfigSource interface {
+	DeployConfig() *controllerconfig.DeployConfig
 }
 
 type revisionNamespace interface {
@@ -350,6 +357,7 @@ type RuntimeState struct {
 	LiveToActive            RuntimeHashRelation
 	LiveShortHash           string
 	live                    *LiveConfiguration
+	deployConfig            *controllerconfig.DeployConfig
 	active                  *ActiveConfiguration
 	revisions               []RuntimeRevisionObservation
 	issues                  []RuntimeSourceIssue
@@ -462,6 +470,9 @@ func (r *RuntimePinResolver) Resolve(ctx context.Context, isvc *v1beta1.Inferenc
 		SelectionSource: RuntimeSelected, LiveToActive: RuntimeHashRelationUnknown,
 		live: live, HistoryRequested: false, HistoryComplete: false,
 		inferenceService: binding,
+	}
+	if source, ok := r.live.(deployConfigSource); ok {
+		state.deployConfig = source.DeployConfig()
 	}
 	state.StatusFreshness = deriveStatusFreshness(state.Generation, state.ObservedGeneration)
 	state.SyncTokenState = deriveSyncTokenState(
@@ -629,7 +640,7 @@ func (s *RuntimeState) activateRevision(isvc *v1beta1.InferenceService, observat
 		s.PinState = RuntimePinStateRevisionDisabled
 		return
 	}
-	components, err := MergeEffectiveComponents(isvc, observation.spec)
+	components, err := MergeEffectiveComponents(isvc, observation.spec, s.deployConfig)
 	if err != nil {
 		s.PinState = RuntimePinStateRevisionInvalid
 		return

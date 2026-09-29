@@ -396,8 +396,8 @@ func deploymentUnavailableReason(state *effective.RuntimeState) reportv1alpha1.U
 }
 
 func definitiveStatusDeployment(isvc *omev1beta1.InferenceService, component omev1beta1.ComponentType) (constants.DeploymentModeType, effective.ComponentDeploymentModeSource, bool) {
-	if value, present := isvc.Annotations[constants.DeploymentMode]; present && constants.DeploymentModeType(value) == constants.VirtualDeployment {
-		return constants.VirtualDeployment, effective.DeploymentModeServiceAnnotation, true
+	if source, virtual := effective.ServiceVirtualDeployment(isvc, nil); virtual {
+		return constants.VirtualDeployment, source, true
 	}
 	var annotations map[string]string
 	switch component {
