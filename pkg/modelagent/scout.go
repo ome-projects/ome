@@ -314,6 +314,10 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		return
 	}
 
+	if artifactEvictionRequested(&GopherTask{BaseModel: baseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: baseModel}
+		return
+	}
 	if w.shouldDownloadModel(baseModel.Spec.Storage) {
 		// Refresh the node info
 		var err error
@@ -365,6 +369,10 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		return
 	}
 
+	if artifactEvictionRequested(&GopherTask{ClusterBaseModel: clusterBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: clusterBaseModel}
+		return
+	}
 	if w.shouldDownloadModel(clusterBaseModel.Spec.Storage) {
 		// Refresh the node info
 		var err error
@@ -417,6 +425,10 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		return
 	}
 
+	if artifactEvictionRequested(&GopherTask{BaseModel: newBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: newBaseModel}
+		return
+	}
 	// Placement changes add or remove this node without refreshing an artifact
 	// on a node that remains eligible.
 	wasEligible := w.shouldDownloadModel(oldBaseModel.Spec.Storage)
@@ -476,6 +488,10 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	// Placement changes add or remove this node without refreshing an artifact
 	// on a node that remains eligible.
+	if artifactEvictionRequested(&GopherTask{ClusterBaseModel: newClusterBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: newClusterBaseModel}
+		return
+	}
 	wasEligible := w.shouldDownloadModel(oldClusterBaseModel.Spec.Storage)
 	isEligible := w.shouldDownloadModel(newClusterBaseModel.Spec.Storage)
 	switch {

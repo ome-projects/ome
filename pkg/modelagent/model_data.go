@@ -4,6 +4,8 @@ package modelagent
 import (
 	"encoding/json"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"sigs.k8s.io/ome/pkg/modelparser"
 )
 
@@ -20,6 +22,8 @@ const (
 	ModelStatusFailed ModelStatus = "Failed"
 	// ModelStatusDeleted indicates the model was deleted
 	ModelStatusDeleted ModelStatus = "Deleted"
+	// ModelStatusEvicted retains the CR's entry after node-local artifact cleanup.
+	ModelStatusEvicted ModelStatus = "Evicted"
 )
 
 // ConfigParsingAnnotation is the annotation key to skip config parsing
@@ -90,6 +94,8 @@ type ModelEntry struct {
 	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
 	// Initial downloads retain their destination before a Ready reference exists.
 	HfArtifactPendingDownload *HfArtifactPendingDownload `json:"hfArtifactPendingDownload,omitempty"`
+	// Pins a completed eviction acknowledgement across agent restarts.
+	ModelUID types.UID `json:"modelUID,omitempty"`
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig
