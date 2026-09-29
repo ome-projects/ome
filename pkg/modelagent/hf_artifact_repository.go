@@ -338,6 +338,7 @@ func (r *HfArtifactRepository) AddModelReference(ctx context.Context, expected H
 		stored.Children[modelKey] = modelPath
 		model.HfArtifactKey = stored.Key
 		model.HfArtifactPendingDownload = nil
+		model.ModelUID = modelUID
 
 		artifactChanged, err := writeHfArtifactEntry(configMap.Data, stored)
 		if err != nil {

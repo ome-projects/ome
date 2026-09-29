@@ -458,7 +458,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
-		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
+		{"Annotations", artifactDownloadAnnotations(oldBaseModel.Annotations), artifactDownloadAnnotations(newBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -470,6 +470,8 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	if policyChanged || hasChanges {
 		w.logger.Infof("BaseModel %s needs refresh in namespace %s", newBaseModel.GetName(), newBaseModel.GetNamespace())
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
+	} else if oldBaseModel.Annotations[artifactResidencyAnnotation] != newBaseModel.Annotations[artifactResidencyAnnotation] || artifactRehydrationID(&GopherTask{BaseModel: oldBaseModel}) != artifactRehydrationID(&GopherTask{BaseModel: newBaseModel}) {
+		w.enqueueBaseModelDownload(newBaseModel)
 	}
 }
 
@@ -519,7 +521,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
-		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
+		{"Annotations", artifactDownloadAnnotations(oldClusterBaseModel.Annotations), artifactDownloadAnnotations(newClusterBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -530,6 +532,8 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	if policyChanged || hasChanges {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
+	} else if oldClusterBaseModel.Annotations[artifactResidencyAnnotation] != newClusterBaseModel.Annotations[artifactResidencyAnnotation] || artifactRehydrationID(&GopherTask{ClusterBaseModel: oldClusterBaseModel}) != artifactRehydrationID(&GopherTask{ClusterBaseModel: newClusterBaseModel}) {
+		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
 	}
 }
 

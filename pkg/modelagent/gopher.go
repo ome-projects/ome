@@ -309,9 +309,37 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 		}
 	}
 	labelOp := *op
-	if labelOp.ModelStateOnNode == Ready && s.omeClient != nil {
+	if op.ModelStateOnNode != Deleted && artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}) != "" {
+		labelOp.nodeUID = s.artifactNodeUID
 		labelOp.validateReady = func() error {
-			return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: labelOp.BaseModel, ClusterBaseModel: labelOp.ClusterBaseModel})
+			return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel})
+		}
+	}
+	if labelOp.ModelStateOnNode == Deleted && s.omeClient != nil && s.artifactNodeUID != "" {
+		labelOp.nodeUID = s.artifactNodeUID
+		task := &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}
+		labelOp.deleteReadyAllowed = func() (bool, error) {
+			current, err := liveArtifactModel(ctx, s.omeClient, task)
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			return getModelUID(task) == getModelUID(current), nil
+		}
+	}
+	if labelOp.ModelStateOnNode == Ready && s.omeClient != nil {
+		task := &GopherTask{BaseModel: labelOp.BaseModel, ClusterBaseModel: labelOp.ClusterBaseModel}
+		labelOp.validateReady = func() error {
+			return s.validateArtifactDownload(ctx, task)
+		}
+		if request := artifactRehydrationID(task); request != "" {
+			labelOp.artifactRequestID, labelOp.nodeUID = request, s.artifactNodeUID
+			labelOp.validateReady = func() error { return s.validateArtifactRestoreReport(ctx, task) }
+			// The attachment path already committed the report. Do not let a
+			// generic status update replace its proof with marker-only readiness.
+			return s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
 		}
 	}
 	err = s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
@@ -422,8 +450,18 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 		return err
 	}
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
+		ctx = s.artifactRestoreContext(ctx, task)
 		if err := s.validateArtifactDownload(ctx, task); err != nil {
 			return err
+		}
+		if artifactRehydrationID(task) != "" {
+			_, eligible, err := newHfArtifactTaskInputForOCI(task, taskModelSpec(task).Storage, s.modelRootDir)
+			if err != nil {
+				return err
+			}
+			if !eligible && !isDirectHfReuseEligible(task, taskModelSpec(task).Storage) {
+				return fmt.Errorf("artifact restoration requires an eligible Shared source")
+			}
 		}
 	}
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)

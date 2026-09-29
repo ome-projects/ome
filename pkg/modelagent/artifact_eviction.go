@@ -11,10 +11,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
@@ -69,6 +71,9 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 		return err
 	}
 	if s.omeClient == nil {
+		if artifactRehydrationID(task) != "" {
+			return fmt.Errorf("live model client is required for artifact restoration")
+		}
 		return nil
 	}
 	current, err := liveArtifactModel(ctx, s.omeClient, task)
@@ -77,6 +82,39 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 	}
 	if getModelUID(current) != getModelUID(task) || artifactEvictionRequested(current) || isModelResourceDeleting(current.BaseModel, current.ClusterBaseModel) {
 		return fmt.Errorf("model is evicted, deleting, or replaced; artifact publication is blocked")
+	}
+	request := artifactRehydrationID(task)
+	if request != artifactRehydrationID(current) {
+		return fmt.Errorf("artifact restoration request changed")
+	}
+	if request == "" {
+		return nil
+	}
+	if len(validation.IsValidLabelValue(request)) != 0 {
+		return fmt.Errorf("artifact restoration request must be a valid Kubernetes label value")
+	}
+	if getModelUID(task) == "" || s.configMapReconciler.isModelMutationBlocked(getModelID(task.BaseModel, task.ClusterBaseModel), types.UID(getModelUID(task))) {
+		return fmt.Errorf("artifact restoration model UID is absent or superseded")
+	}
+	if !reflect.DeepEqual(downloadOverrideInputsFromSpec(taskModelSpec(task)), downloadOverrideInputsFromSpec(taskModelSpec(current))) {
+		return fmt.Errorf("artifact restoration source, path, policy, or placement changed")
+	}
+	if task.BaseModel != nil {
+		if !reflect.DeepEqual(task.BaseModel.Labels, current.BaseModel.Labels) || !reflect.DeepEqual(task.BaseModel.Annotations, current.BaseModel.Annotations) {
+			return fmt.Errorf("artifact restoration metadata changed")
+		}
+	} else if !reflect.DeepEqual(task.ClusterBaseModel.Labels, current.ClusterBaseModel.Labels) || !reflect.DeepEqual(task.ClusterBaseModel.Annotations, current.ClusterBaseModel.Annotations) {
+		return fmt.Errorf("artifact restoration metadata changed")
+	}
+	if s.kubeClient == nil || s.artifactNodeUID == "" {
+		return fmt.Errorf("startup Node identity is required for artifact restoration")
+	}
+	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if node.UID != s.artifactNodeUID || node.DeletionTimestamp != nil || !(&Scout{nodeInfo: node, logger: s.logger}).shouldDownloadModel(taskModelSpec(current).Storage) {
+		return fmt.Errorf("artifact restoration Node identity or eligibility changed")
 	}
 	return nil
 }
@@ -104,8 +142,13 @@ func (c *ConfigMapReconciler) validateArtifactReadyEntries(ctx context.Context, 
 			}
 		}
 		current := models[key]
-		if current == nil || artifactEvictionRequested(current) || isModelResourceDeleting(current.BaseModel, current.ClusterBaseModel) {
-			if key == modelID {
+		requestUnproven := false
+		if current != nil && artifactRehydrationID(current) != "" {
+			guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard)
+			requestUnproven = guard == nil || !guard.validated || getModelID(guard.task.BaseModel, guard.task.ClusterBaseModel) != key || entry.ModelUID != types.UID(getModelUID(current)) || entry.ArtifactRehydrationID != artifactRehydrationID(current) || entry.NodeUID != guard.gopher.artifactNodeUID
+		}
+		if requestUnproven || current == nil || artifactEvictionRequested(current) || isModelResourceDeleting(current.BaseModel, current.ClusterBaseModel) {
+			if key == modelID && !requestUnproven {
 				return fmt.Errorf("model %s cannot publish Ready while evicted, deleting, or absent", key)
 			}
 			// Cache restoration and sibling repair must not republish Ready or
@@ -269,7 +312,7 @@ func (s *Gopher) processArtifactEviction(ctx context.Context, task *GopherTask) 
 		return s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel, ModelStatus: ModelStatusUpdating})
 	}
 	input.pathUsers = func(ctx context.Context, target string) (bool, error) {
-		return s.sharedArtifactPathUsers(ctx, input, target)
+		return s.sharedArtifactPathUsers(ctx, input, target, false)
 	}
 	input.completeDeletion = func(ctx context.Context, expected HfArtifactPendingDeletion) error {
 		return h.repository.configMaps.mutateConfigMapWithRetry(ctx, func(cm *corev1.ConfigMap) (bool, error) {
@@ -301,13 +344,16 @@ func (s *Gopher) processArtifactEviction(ctx context.Context, task *GopherTask) 
 
 // Combine live source paths with persisted ownership, including old paths in
 // cleanup receipts. Canonicalize spelling but retain the leaf symlink itself.
-func (s *Gopher) sharedArtifactPathUsers(ctx context.Context, input hfArtifactTaskInput, target string) (bool, error) {
-	return s.artifactPathUsers(ctx, input.ChildModelKey, input.ChildModelPath, input.ModelStoreRoot, target, &input.Parent)
+func (s *Gopher) sharedArtifactPathUsers(ctx context.Context, input hfArtifactTaskInput, target string, repair bool) (bool, error) {
+	return s.artifactPathUsers(ctx, input.ChildModelKey, input.ChildModelPath, input.ModelStoreRoot, target, &input.Parent, repair)
 }
 
 // The supplied Shared parent excludes its own relationship from borrower detection.
-func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, modelRoot, target string, sharedParent *HfArtifactEntry) (bool, error) {
+func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, modelRoot, target string, sharedParent *HfArtifactEntry, repair bool) (bool, error) {
 	input := hfArtifactTaskInput{ChildModelKey: childKey, ChildModelPath: childPath, ModelStoreRoot: modelRoot, Parent: *sharedParent}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return false, err
+	}
 	if err := validateArtifactCleanup(ctx); err != nil {
 		return false, err
 	}
@@ -319,6 +365,7 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 	if err != nil {
 		return false, err
 	}
+	protectedPaths := []string{target}
 	matches := func(path string) (bool, error) {
 		if path == "" {
 			return false, nil
@@ -333,12 +380,17 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 		if resolved, err := filepath.EvalSymlinks(path); err == nil {
 			paths = append(paths, resolved)
 		}
+		if linked, err := readChildSymlinkTarget(path); err == nil {
+			paths = append(paths, linked)
+		}
 		if canonical, err := hfArtifactPathInRoot(path, input.ModelStoreRoot, root); err == nil {
 			paths = append(paths, canonical)
 		}
 		for _, path := range paths {
-			if hfArtifactInputPathWithin(target, path) || hfArtifactInputPathWithin(path, target) {
-				return true, nil
+			for _, protected := range protectedPaths {
+				if hfArtifactInputPathWithin(protected, path) || hfArtifactInputPathWithin(path, protected) {
+					return true, nil
+				}
 			}
 		}
 		return false, nil
@@ -361,20 +413,76 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 	if err != nil {
 		return false, err
 	}
+	cm, err := s.configMapReconciler.getConfigMap(ctx)
+	if err != nil {
+		return false, err
+	}
+	// Only matching managed siblings are excluded: repair withdraws their Ready
+	// status before replacing files. Other path users still block repair.
+	repairChildren := make(map[string]bool)
+	ignoredLinks := []string{input.ChildModelPath}
+	if repair {
+		protectedChildren := []string{input.ChildModelPath}
+		if raw, found := cm.Data[input.Parent.Key]; found {
+			parent, err := decodeHfArtifactEntry(input.Parent.Key, raw)
+			if err != nil {
+				return false, err
+			}
+			if parent.LocalPath != input.Parent.LocalPath {
+				return false, fmt.Errorf("Shared repair parent path changed")
+			}
+			for key, path := range parent.Children {
+				protectedChildren = append(protectedChildren, path)
+				model := models[key]
+				if model == nil || key == input.ChildModelKey {
+					continue
+				}
+				entry, err := existingModelEntry(cm.Data, key)
+				if err != nil {
+					return false, err
+				}
+				if entry.HfArtifactKey != parent.Key || entry.ModelUID == "" || entry.ModelUID != types.UID(getModelUID(model)) || entry.HfArtifactPendingDeletion != nil || isModelResourceDeleting(model.BaseModel, model.ClusterBaseModel) {
+					continue
+				}
+				compatible, err := s.sharedRepairSiblingMatches(ctx, model, parent, path)
+				if err != nil {
+					return false, err
+				}
+				if !compatible {
+					continue
+				}
+				repairChildren[key] = true
+				ignoredLinks = append(ignoredLinks, path)
+			}
+		}
+		// Borrowers can name missing descendants through managed links. Full
+		// symlink resolution cannot prove that use, so retain both spellings
+		// of every tracked child for the live and persisted path comparisons.
+		for _, path := range protectedChildren {
+			canonical, err := hfArtifactPathInRoot(path, input.ModelStoreRoot, root)
+			if err != nil {
+				return false, err
+			}
+			protectedPaths = append(protectedPaths, filepath.Clean(path), canonical)
+		}
+	}
+	guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard)
+	parentPath, parentPathErr := hfArtifactPathInRoot(input.Parent.LocalPath, input.ModelStoreRoot, root)
+	freshDownload := parentPathErr == nil && repair && guard != nil && guard.freshSharedDownload &&
+		getModelID(guard.task.BaseModel, guard.task.ClusterBaseModel) == input.ChildModelKey && target == parentPath
 	for key, model := range models {
-		if key == input.ChildModelKey {
+		if key == input.ChildModelKey || repairChildren[key] {
+			continue
+		}
+		if freshDownload && s.isUnattachedSharedCopy(model, guard.task, input, cm.Data) {
 			continue
 		}
 		if used, err := modelUses(taskModelSpec(model)); used || err != nil {
 			return used, err
 		}
 	}
-	cm, err := s.configMapReconciler.getConfigMap(ctx)
-	if err != nil {
-		return false, err
-	}
 	for key, raw := range cm.Data {
-		if key == input.ChildModelKey || key == input.Parent.Key {
+		if key == input.ChildModelKey || repairChildren[key] {
 			continue
 		}
 		var paths []string
@@ -383,9 +491,13 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 			if err != nil {
 				return false, err
 			}
-			paths = append(paths, parent.LocalPath)
-			for _, path := range parent.Children {
-				paths = append(paths, path)
+			if key != input.Parent.Key {
+				paths = append(paths, parent.LocalPath)
+			}
+			for child, path := range parent.Children {
+				if child != input.ChildModelKey && !repairChildren[child] {
+					paths = append(paths, path)
+				}
 			}
 		} else {
 			entry, err := existingModelEntry(cm.Data, key)
@@ -408,7 +520,65 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 			}
 		}
 	}
+	if repair && !freshDownload {
+		return (hfArtifactFiles{}).HasChildren(target, input.ModelStoreRoot, ignoredLinks...)
+	}
 	return false, nil
+}
+
+// Match a tracked sibling to this parent without changing ownership or files.
+func (s *Gopher) sharedRepairSiblingMatches(ctx context.Context, model *GopherTask, parent HfArtifactEntry, path string) (bool, error) {
+	probe := *model
+	probe.TaskType = Download
+	candidate, eligible, err := newHfArtifactTaskInputForOCI(&probe, taskModelSpec(model).Storage, s.modelRootDir)
+	if err != nil {
+		return false, err
+	}
+	if !eligible && isDirectHfReuseEligible(&probe, taskModelSpec(model).Storage) {
+		components, err := storage.ParseHuggingFaceStorageURI(*taskModelSpec(model).Storage.StorageUri)
+		if err != nil {
+			return false, err
+		}
+		guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard)
+		sameSource := guard != nil && *taskModelSpec(model).Storage.StorageUri == *taskModelSpec(guard.task).Storage.StorageUri
+		if components.ModelID == parent.Identity.ModelID && (components.Branch == parent.Identity.CommitSHA || sameSource) {
+			candidate, eligible, err = newHfArtifactTaskInput(&probe, taskModelSpec(model).Storage, s.modelRootDir, parent.Identity)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+	return eligible && candidate.Parent.Key == parent.Key && candidate.ChildModelPath == path, nil
+}
+
+// Only a compatible, unattached copy can share an initial download's proof.
+// Persisted receipts and artifact paths are still checked by the caller.
+func (s *Gopher) isUnattachedSharedCopy(model, owner *GopherTask, input hfArtifactTaskInput, data map[string]string) bool {
+	if getModelUID(model) == "" || isModelResourceDeleting(model.BaseModel, model.ClusterBaseModel) || artifactEvictionRequested(model) {
+		return false
+	}
+	spec := taskModelSpec(model)
+	if !sameModelStoragePath(taskModelSpec(owner).Storage, spec.Storage, input.ModelStoreRoot, input.ChildModelPath) {
+		return false
+	}
+	probe := *model
+	probe.TaskType = Download
+	candidate, eligible, err := newHfArtifactTaskInputForOCI(&probe, spec.Storage, input.ModelStoreRoot)
+	if err == nil && !eligible && isDirectHfReuseEligible(&probe, spec.Storage) && spec.ModelFormat.Name != constants.TensorRTLLM {
+		candidate, eligible, err = newHfArtifactTaskInput(&probe, spec.Storage, input.ModelStoreRoot, input.Parent.Identity)
+	}
+	if err != nil || !eligible || candidate.Parent.Key != input.Parent.Key || candidate.ChildModelPath != input.ChildModelPath {
+		return false
+	}
+	key := getModelID(model.BaseModel, model.ClusterBaseModel)
+	if _, exists := data[key]; !exists {
+		return true
+	}
+	entry, err := existingModelEntry(data, key)
+	return err == nil && entry.Status == ModelStatusUpdating && entry.Config == nil && entry.Progress == nil &&
+		entry.HfArtifactKey == "" && entry.HfArtifactPendingDeletion == nil && entry.HfArtifactPendingDownload == nil &&
+		(entry.ModelUID == "" || entry.ModelUID == types.UID(getModelUID(model))) &&
+		(entry.NodeUID == "" || entry.NodeUID == s.artifactNodeUID)
 }
 
 // Keys can contain truncated names and namespaces. Resolve key-only ownership
