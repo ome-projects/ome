@@ -116,6 +116,15 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 				}
 			}
 		}
+		if input.pathUsers != nil {
+			used, err := input.pathUsers(ctx, parent.LocalPath)
+			if err != nil {
+				return h.finishParentWithError(ctx, parent, err)
+			}
+			if used {
+				return h.finishParentWithError(ctx, parent, fmt.Errorf("cannot repair Shared bytes used by another model"))
+			}
+		}
 		// ConfigMap loss can leave local users absent from parent.Children.
 		// Valid bytes can be adopted, but replacing invalid bytes would bypass
 		// status/ownership checks for those unknown users. This also protects
@@ -132,12 +141,18 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 		}
 		// Leave the old marker alone until validation and status updates have
 		// succeeded. The download callback may now replace corrupt files.
+		if err := validateArtifactRestore(ctx); err != nil {
+			return h.finishParentWithError(ctx, parent, err)
+		}
 		if err := os.Remove(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName)); err != nil && !os.IsNotExist(err) {
 			return h.finishParentWithError(ctx, parent, err)
 		}
 		if err := download(parent.LocalPath); err != nil {
 			return h.finishParentWithError(ctx, parent, err)
 		}
+	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return h.finishParentWithError(ctx, parent, err)
 	}
 	if err := h.files.WriteParentReadyMarker(parent); err != nil {
 		return h.finishParentWithError(ctx, parent, err)

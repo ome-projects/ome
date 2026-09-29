@@ -24,8 +24,11 @@ type NodeLabelOp struct {
 	ModelStateOnNode ModelStateOnNode
 	BaseModel        *v1beta1.BaseModel
 	ClusterBaseModel *v1beta1.ClusterBaseModel
-	// Scoped to one publication; recheck live intent inside every Ready retry.
-	validateReady func() error
+	// Recheck live intent on every label retry, including readiness withdrawal.
+	validateReady      func() error
+	artifactRequestID  string
+	nodeUID            types.UID
+	deleteReadyAllowed func() (bool, error)
 }
 
 // NodeLabelReconciler handles updating node labels œwith model status information
@@ -92,7 +95,7 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	// First get the node to check existing labels
 	node, err := n.kubeClient.CoreV1().Nodes().Get(context.TODO(), n.nodeName, metav1.GetOptions{})
 	if err != nil {
-		if op.ModelStateOnNode == Ready && op.validateReady != nil {
+		if op.nodeUID != "" || op.ModelStateOnNode == Ready && op.validateReady != nil {
 			return err
 		}
 		if errors.IsNotFound(err) {
@@ -105,8 +108,21 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 		return err
 	}
 
-	if op.ModelStateOnNode == Ready && op.validateReady != nil {
+	if op.validateReady != nil {
 		if err := op.validateReady(); err != nil {
+			return err
+		}
+	}
+	if op.nodeUID != "" && node.UID != op.nodeUID {
+		return fmt.Errorf("Node identity changed before artifact publication")
+	}
+	requestKey := constants.GetModelArtifactRequestLabel(getModelResourceUID(op.BaseModel, op.ClusterBaseModel))
+	// Delete may remove the old UID's request label, but must preserve a
+	// same-name replacement's Ready label.
+	removeReady := true
+	if op.ModelStateOnNode == Deleted && op.deleteReadyAllowed != nil {
+		removeReady, err = op.deleteReadyAllowed()
+		if err != nil {
 			return err
 		}
 	}
@@ -118,13 +134,13 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	switch op.ModelStateOnNode {
 	case Deleted:
 		// For delete operations, if the label doesn't exist, the operation is already complete
-		if !labelExists {
+		if (!labelExists || !removeReady) && node.Labels[requestKey] == "" {
 			n.logger.Infof("Label %s already removed from node %s for %s - operation is idempotent", labelKey, n.nodeName, modelInfo)
 			return nil
 		}
 	case Ready, Updating, Failed:
 		// For add/update operations, if the label already has the desired value, skip
-		if labelExists && currentValue == string(op.ModelStateOnNode) {
+		if labelExists && currentValue == string(op.ModelStateOnNode) && (op.artifactRequestID == "" || node.Labels[requestKey] == op.artifactRequestID) {
 			n.logger.Infof("Label %s already set to %s on node %s for %s - operation is idempotent",
 				labelKey, string(op.ModelStateOnNode), n.nodeName, modelInfo)
 			return nil
@@ -136,6 +152,32 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	if err != nil {
 		n.logger.Errorf("Failed to get node label patch payload for %s: %v", modelInfo, err)
 		return nil // Don't retry for payload generation issues
+	}
+	if op.nodeUID != "" {
+		payload := []interface{}{
+			patchStringValue{Op: "test", Path: "/metadata/uid", Value: string(op.nodeUID)},
+			patchStringValue{Op: "test", Path: "/metadata/resourceVersion", Value: node.ResourceVersion},
+		}
+		if len(node.Labels) == 0 {
+			payload = append(payload, map[string]interface{}{"op": "add", "path": "/metadata/labels", "value": map[string]string{}})
+		}
+		if op.ModelStateOnNode == Deleted {
+			if removeReady && labelExists {
+				payload = append(payload, patchStringValue{Op: "remove", Path: "/metadata/labels/" + strings.ReplaceAll(labelKey, "/", "~1")})
+			}
+			if node.Labels[requestKey] != "" {
+				payload = append(payload, patchStringValue{Op: "remove", Path: "/metadata/labels/" + strings.ReplaceAll(requestKey, "/", "~1")})
+			}
+		} else {
+			payload = append(payload, patchStringValue{Op: "add", Path: "/metadata/labels/" + strings.ReplaceAll(labelKey, "/", "~1"), Value: string(op.ModelStateOnNode)})
+			if op.artifactRequestID != "" {
+				payload = append(payload, patchStringValue{Op: "add", Path: "/metadata/labels/" + strings.ReplaceAll(requestKey, "/", "~1"), Value: op.artifactRequestID})
+			}
+		}
+		payloadBytes, err = json.Marshal(payload)
+		if err != nil {
+			return err
+		}
 	}
 	n.logger.Debugf("Generated node label patch payload for %s: %s", modelInfo, string(payloadBytes))
 
@@ -155,7 +197,7 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	)
 	if err != nil {
 		// Check for specific error types and handle them gracefully
-		if op.ModelStateOnNode == Ready && op.validateReady != nil {
+		if op.nodeUID != "" || op.ModelStateOnNode == Ready && op.validateReady != nil {
 			return err
 		}
 		if errors.IsNotFound(err) {

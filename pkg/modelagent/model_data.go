@@ -94,8 +94,10 @@ type ModelEntry struct {
 	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
 	// Initial downloads retain their destination before a Ready reference exists.
 	HfArtifactPendingDownload *HfArtifactPendingDownload `json:"hfArtifactPendingDownload,omitempty"`
-	// Pins a completed eviction acknowledgement across agent restarts.
-	ModelUID types.UID `json:"modelUID,omitempty"`
+	// Pins artifact ownership and residency reports to this Model CR instance.
+	ModelUID              types.UID `json:"modelUID,omitempty"`
+	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`
+	NodeUID               types.UID `json:"nodeUID,omitempty"`
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig
