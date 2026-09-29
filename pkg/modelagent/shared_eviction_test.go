@@ -427,7 +427,7 @@ func TestSharedEvictionWaitsForExistingDownload(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- s.processTaskWithSourceAdapters(download, true, func(ctx context.Context, _ *GopherTask, _ v1beta1.BaseModelSpec, _ bool) (bool, error) {
-			unlock, acquired, err := s.sharedHfArtifactHandler().tryArtifactOperation(input)
+			unlock, acquired, err := s.sharedHfArtifactHandler().tryArtifactOperation(context.Background(), input)
 			if err != nil || !acquired {
 				return false, errors.New("download lock unavailable")
 			}

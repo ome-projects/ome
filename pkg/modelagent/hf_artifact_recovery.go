@@ -98,7 +98,7 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.Status != ModelStatusEvicted && model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.HfArtifactPendingDownload == nil && entry.ModelEntryJSON == "" {
+	if model.Status != ModelStatusEvicted && model.HfArtifactKey == "" && model.HfArtifactPendingDownload == nil && model.HfArtifactPendingDeletion == nil && model.DirectArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
 		// Live residency validation can suppress a cached Ready entry during
 		// reconstruction. Keep the typed cache aligned with that committed state.
 		if c.artifactModelClient != nil && c.modelCache[key] != nil && before[key] != raw {
@@ -188,6 +188,9 @@ func (c *ConfigMapReconciler) cachedConfigMapEntries() (map[string]string, map[s
 	defer c.cacheMutex.RUnlock()
 	models := make(map[string]string, len(c.modelCache))
 	for key, entry := range c.modelCache {
+		if _, evicted := c.evictedModels[key]; evicted {
+			continue
+		}
 		if entry == nil || entry.ModelStatus == ModelStatusDeleted || c.isModelMutationBlockedLocked(key, entry.ModelUID) {
 			continue
 		}
@@ -228,7 +231,8 @@ func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]st
 	}
 	if cached.HfArtifactKey != "" && (childErr != nil || child.HfArtifactKey == "") ||
 		cached.HfArtifactPendingDownload != nil && (childErr != nil || child.HfArtifactPendingDownload == nil) ||
-		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) {
+		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) ||
+		cached.DirectArtifactPendingDeletion != nil && (childErr != nil || child.DirectArtifactPendingDeletion == nil) {
 		return fmt.Errorf("shared artifact state for model %s requires reconciliation", key)
 	}
 	return nil

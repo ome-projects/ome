@@ -40,6 +40,9 @@ func (r *HfArtifactRepository) rememberDownload(ctx context.Context, input hfArt
 		if err != nil {
 			return false, err
 		}
+		if child.DirectArtifactPendingDeletion != nil {
+			return false, fmt.Errorf("model %s has unfinished Direct artifact cleanup", input.ChildModelKey)
+		}
 		if child.HfArtifactPendingDeletion != nil {
 			return false, fmt.Errorf("model %s has unfinished shared artifact deletion", input.ChildModelKey)
 		}
@@ -172,7 +175,7 @@ func (s *Gopher) reconcileHfArtifactCleanup(ctx context.Context, task *GopherTas
 	}
 	receipt := pending.deletionReceipt()
 	input := s.hfArtifactInputForChild(task, receipt.parentForChild(key))
-	unlock, acquired, err := h.tryArtifactOperation(input)
+	unlock, acquired, err := h.tryArtifactOperation(ctx, input)
 	if err != nil || !acquired {
 		return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, err))
 	}

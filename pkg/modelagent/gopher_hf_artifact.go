@@ -256,7 +256,7 @@ func (s *Gopher) lockHfChildStatus(ctx context.Context, op *NodeLabelOp) (func()
 		return noop, err
 	}
 	input := s.hfArtifactInputForChild(task, parent)
-	unlock, acquired, err := handler.tryParentFileOperation(parent, input.ModelStoreRoot)
+	unlock, acquired, err := handler.tryParentFileOperation(ctx, parent, input.ModelStoreRoot)
 	if err != nil {
 		return noop, err
 	}
@@ -695,7 +695,7 @@ func (s *Gopher) releaseHfArtifactChild(ctx context.Context, input hfArtifactTas
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	if preserve {
-		unlock, acquired, err := handler.tryArtifactOperation(input)
+		unlock, acquired, err := handler.tryArtifactOperation(ctx, input)
 		if err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}

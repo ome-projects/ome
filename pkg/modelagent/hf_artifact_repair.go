@@ -17,7 +17,7 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 	validate hfArtifactValidateFunc,
 	download hfArtifactDownloadFunc,
 ) (hfArtifactTaskResult, error) {
-	unlock, acquired, err := h.tryArtifactOperation(input)
+	unlock, acquired, err := h.tryArtifactOperation(ctx, input)
 	if err != nil || !acquired {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}

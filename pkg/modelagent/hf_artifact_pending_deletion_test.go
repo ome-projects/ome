@@ -430,7 +430,7 @@ func TestHfArtifactPendingDeletionUIDTakeover(t *testing.T) {
 					return writeModelEntry(cm.Data, input.ChildModelKey, child)
 				}))
 			}
-			unlock, acquired, err := handler.tryArtifactOperation(current)
+			unlock, acquired, err := handler.tryArtifactOperation(context.Background(), current)
 			require.NoError(t, err)
 			require.True(t, acquired)
 			result, err := handler.resumePendingDeletion(context.Background(), current, pending)
