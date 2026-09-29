@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -59,14 +60,14 @@ func TestOCIToPVCReplicator_Replicate_Success(t *testing.T) {
 	}
 
 	// Mock the download function to simulate successful downloads
-	downloadCalled := false
+	var downloadCalled atomic.Bool
 	downloadObjectsFromOCIOSDataStoreFunc = func(
 		objects <-chan common.ReplicationObject,
 		ociOSDataStore *ociobjectstore.OCIOSDataStore,
 		replicationInput common.ReplicationInput,
 		localDirectoryPath string,
 		results chan<- *ReplicationResult) {
-		downloadCalled = true
+		downloadCalled.Store(true)
 
 		// Simulate successful downloads
 		for obj := range objects {
@@ -93,7 +94,7 @@ func TestOCIToPVCReplicator_Replicate_Success(t *testing.T) {
 
 	// Assertions
 	assert.NoError(t, err)
-	assert.True(t, downloadCalled, "downloadObjectsFromOCIOSDataStoreFunc should be called")
+	assert.True(t, downloadCalled.Load(), "downloadObjectsFromOCIOSDataStoreFunc should be called")
 	mockLogger.AssertExpectations(t)
 }
 
@@ -144,14 +145,14 @@ func TestOCIToPVCReplicator_Replicate_PartialFailure(t *testing.T) {
 	}
 
 	// Mock the download function to simulate mixed results
-	downloadCalled := false
+	var downloadCalled atomic.Bool
 	downloadObjectsFromOCIOSDataStoreFunc = func(
 		objects <-chan common.ReplicationObject,
 		ociOSDataStore *ociobjectstore.OCIOSDataStore,
 		replicationInput common.ReplicationInput,
 		localDirectoryPath string,
 		results chan<- *ReplicationResult) {
-		downloadCalled = true
+		downloadCalled.Store(true)
 
 		objectCount := 0
 		for obj := range objects {
@@ -187,7 +188,7 @@ func TestOCIToPVCReplicator_Replicate_PartialFailure(t *testing.T) {
 	// Assertions
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "1/3 replications failed")
-	assert.True(t, downloadCalled, "downloadObjectsFromOCIOSDataStoreFunc should be called")
+	assert.True(t, downloadCalled.Load(), "downloadObjectsFromOCIOSDataStoreFunc should be called")
 	mockLogger.AssertExpectations(t)
 }
 
@@ -237,14 +238,14 @@ func TestOCIToPVCReplicator_Replicate_AllFailures(t *testing.T) {
 	}
 
 	// Mock the download function to simulate all failures
-	downloadCalled := false
+	var downloadCalled atomic.Bool
 	downloadObjectsFromOCIOSDataStoreFunc = func(
 		objects <-chan common.ReplicationObject,
 		ociOSDataStore *ociobjectstore.OCIOSDataStore,
 		replicationInput common.ReplicationInput,
 		localDirectoryPath string,
 		results chan<- *ReplicationResult) {
-		downloadCalled = true
+		downloadCalled.Store(true)
 
 		for obj := range objects {
 			if strings.HasSuffix(obj.GetName(), "/") {
@@ -272,7 +273,7 @@ func TestOCIToPVCReplicator_Replicate_AllFailures(t *testing.T) {
 	// Assertions
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "2/2 replications failed")
-	assert.True(t, downloadCalled, "downloadObjectsFromOCIOSDataStoreFunc should be called")
+	assert.True(t, downloadCalled.Load(), "downloadObjectsFromOCIOSDataStoreFunc should be called")
 	mockLogger.AssertExpectations(t)
 }
 

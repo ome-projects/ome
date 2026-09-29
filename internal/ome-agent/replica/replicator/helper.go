@@ -164,8 +164,12 @@ func downloadSnapshotWithTimeouts(
 		req.RepoID, req.Revision, opts.DownloadTimeout, opts.StaleProgressTimeout)
 
 	resultCh := make(chan hfSnapshotDownloadResult, 1)
+	// Read the hook before starting the goroutine: on a timeout this function
+	// returns while the download may still be running, so a read inside the
+	// goroutine could race with a test restoring the hook.
+	download := downloadSnapHook
 	go func() {
-		path, err := downloadSnapHook(ctx, hubClient, req)
+		path, err := download(ctx, hubClient, req)
 		resultCh <- hfSnapshotDownloadResult{path: path, err: err}
 	}()
 
