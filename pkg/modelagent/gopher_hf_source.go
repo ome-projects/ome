@@ -34,6 +34,8 @@ func (s *Gopher) processDirectHfModel(ctx context.Context, task *GopherTask, spe
 }
 
 func (source directHfSource) process(ctx context.Context, s *Gopher, task *GopherTask, spec v1beta1.BaseModelSpec, allowDownload bool) (bool, error) {
+	ctx, releaseFileLocks := directFileOperationContext(ctx)
+	defer releaseFileLocks()
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -215,6 +217,13 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if !allowDownload {
 		s.demoteToNormalPriority(task)
 		return true, nil
+	}
+	acquired, err := s.tryLockDirectModelPath(ctx, destination)
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		return true, s.requeueTaskOnWait(task, gopherTaskWait)
 	}
 	if err := checkDirectHfDestinationAncestors(destination); err != nil {
 		return false, err

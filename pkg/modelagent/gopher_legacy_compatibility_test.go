@@ -63,7 +63,7 @@ func TestOptInWaitsForOrdinaryDeletion(t *testing.T) {
 	_, finish, proceed, err := s.beginTask(shared)
 	defer finish(false)
 	require.NoError(t, err)
-	require.False(t, proceed, "shared writes must wait through the ordinary delete grace period")
+	require.False(t, proceed, "shared writes must wait through ordinary delete finalization")
 	select {
 	case <-s.gopherChan:
 	case <-time.After(time.Second):
@@ -71,16 +71,37 @@ func TestOptInWaitsForOrdinaryDeletion(t *testing.T) {
 	}
 }
 
-func TestOrdinaryDeleteKeepsExistingQueueDiscardBehavior(t *testing.T) {
-	_, download, _ := newTestHfArtifactGopher(t)
-	download.Sequence = 2
-	deletion := *download
-	deletion.TaskType = Delete
-	deletion.Sequence = 1
-	deletion.SharedArtifact = false
-	require.Empty(t, removeSupersededTasks([]*GopherTask{download}, &deletion))
-	deletion.SharedArtifact = true
-	require.Len(t, removeSupersededTasks([]*GopherTask{download}, &deletion), 1)
+func TestDeleteQueuePruningMatchesTaskCoordination(t *testing.T) {
+	for _, tc := range []struct {
+		uri       string
+		sequenced bool
+	}{
+		{uri: "oci://n/ns/b/bucket/o/model", sequenced: true},
+		{uri: "hf://org/model", sequenced: true},
+		{uri: "local:///model"},
+		{uri: "pvc://claim"},
+		{uri: "vendor://model"},
+	} {
+		t.Run(tc.uri, func(t *testing.T) {
+			_, download, _ := newTestHfArtifactGopher(t)
+			download.BaseModel.Spec.Storage.StorageUri = stringPtr(tc.uri)
+			download.Sequence = 2
+			deletion := *download
+			deletion.TaskType = Delete
+			deletion.Sequence = 1
+			deletion.SharedArtifact = false
+			kept := removeSupersededTasks([]*GopherTask{download}, &deletion)
+			if tc.sequenced {
+				require.Len(t, kept, 1, "Direct Delete must preserve newer queued intent")
+			} else {
+				require.Empty(t, kept, "non-file tasks retain legacy pruning")
+			}
+			deletion.SharedArtifact = true
+			require.Len(t, removeSupersededTasks([]*GopherTask{download}, &deletion), 1)
+			download.Sequence = deletion.Sequence
+			require.Empty(t, removeSupersededTasks([]*GopherTask{download}, &deletion))
+		})
+	}
 }
 
 func TestOrdinaryTaskSkipsSharedStateLookup(t *testing.T) {
@@ -144,7 +165,7 @@ func TestActiveSharedTaskWaitDoesNotExpireQueuedIntent(t *testing.T) {
 	s.samePathWaitDelay = time.Millisecond
 	s.samePathWaitTimeout = time.Second
 	task.SamePathWaitStartedAt = time.Now().Add(-time.Hour)
-	require.NoError(t, s.waitForActiveTask(task, gopherTaskWait))
+	require.NoError(t, s.requeueTaskOnWait(task, gopherTaskWait))
 	select {
 	case retry := <-s.gopherChan:
 		require.Same(t, task, retry)

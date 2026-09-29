@@ -1026,7 +1026,7 @@ func TestRequeueSamePathInFlightReuseWaitTimesOut(t *testing.T) {
 		},
 	}
 
-	requeued := g.requeueSamePathInFlightReuseWait(task, "default.basemodel.model")
+	requeued := g.requeueArtifactWait(task, "default.basemodel.model")
 
 	assert.False(t, requeued)
 	select {
@@ -1617,6 +1617,17 @@ func TestProcessTask_HfDeleteRemovesFilesOnlyWhenConfirmed(t *testing.T) {
 			}
 
 			require.NoError(t, g.processTask(task))
+
+			if tc.download {
+				require.FileExists(t, weights)
+				require.NotNil(t, g.taskQueue)
+				require.Equal(t, 1, g.taskQueue.len())
+				cleanup, ok := g.taskQueue.popHighPriority()
+				require.True(t, ok)
+				require.Equal(t, Delete, cleanup.TaskType)
+				require.Equal(t, getModelUID(task), getModelUID(cleanup))
+				require.NoError(t, g.processTask(cleanup))
+			}
 
 			if !tc.wantRemoved {
 				assert.FileExists(t, weights)
@@ -2518,7 +2529,7 @@ func TestOCICanceledDownloadDoesNotRecordFailure(t *testing.T) {
 	// Cancel after registration during the Updating write, before OCI access.
 	client := g.configMapReconciler.kubeClient.(*k8sfake.Clientset)
 	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
-		g.taskTracker.cancelLegacyDownload(gopherTaskModelKey(task))
+		g.enqueueTask(&GopherTask{TaskType: Delete, BaseModel: task.BaseModel})
 		return false, nil, nil
 	})
 	require.ErrorIs(t, g.processTask(task), context.Canceled)

@@ -149,9 +149,9 @@ func (tracker *gopherTaskTracker) beginDelete(modelUID string, sequence uint64) 
 	return attempt, gopherTaskProceed
 }
 
-// Legacy tasks retain their existing overlap and latest-download
-// cancellation behavior. Tracking all attempts only guards a later transition
-// to shared ownership; it does not serialize ordinary downloads.
+// Non-file tasks retain their existing overlap and latest-download
+// cancellation behavior. Tracking them also guards a later transition to a
+// Direct or shared download for the same model.
 func (tracker *gopherTaskTracker) beginLegacyTask(modelUID string, cancel context.CancelFunc) *gopherLegacyAttempt {
 	tracker.mutex.Lock()
 	defer tracker.mutex.Unlock()

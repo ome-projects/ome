@@ -493,6 +493,7 @@ func TestDirectHfSourceOrdinaryPathCompatibility(t *testing.T) {
 				path := ""
 				task.BaseModel.Spec.Storage.Path = &path
 			case "relative":
+				t.Chdir(t.TempDir())
 				expected = "relative-model-path"
 				task.BaseModel.Spec.Storage.Path = &expected
 			case "space":
