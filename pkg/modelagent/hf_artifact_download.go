@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 )
 
 // handleDownload checks the child, reads the parent, then either downloads an
@@ -79,7 +80,15 @@ func (h *hfArtifactTaskHandler) downloadParentAndAttachChild(
 	if err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
-	if err := h.validateParentForInitialDownload(parent, root); err != nil {
+	// An absent child cannot be an existing link to ignore, but aliases through
+	// its future path must be covered by the same scans as aliases to the parent.
+	var absentChildren []string
+	if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil {
+		if _, err := os.Lstat(input.ChildModelPath); os.IsNotExist(err) {
+			absentChildren = []string{input.ChildModelPath}
+		}
+	}
+	if err := h.validateParentForInitialDownload(parent, root, absentChildren...); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 
@@ -99,12 +108,21 @@ func (h *hfArtifactTaskHandler) downloadParentAndAttachChild(
 	}
 	// Acquisition returns current state, not the earlier snapshot. Recheck both
 	// recorded and local children before resetting files under this lock.
-	if err := h.validateParentForInitialDownload(parent, root); err != nil {
+	if err := h.validateParentForInitialDownload(parent, root, absentChildren...); err != nil {
 		return newHfArtifactRetryResult(parent.Key, errors.Join(err, h.releaseParentLock(ctx, parent, HfArtifactStatusFailed))), nil
 	}
 
 	if download == nil {
 		return h.finishParentWithError(ctx, parent, fmt.Errorf("download function for shared Hugging Face parent %s is nil", parent.Key))
+	}
+	if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil {
+		// The existing checks above already excluded all local child links.
+		// Observe absence before ResetParentDirectory creates the directory;
+		// its download callback may reuse this proof without another scan.
+		_, parentErr := os.Lstat(parent.LocalPath)
+		_, childErr := os.Lstat(input.ChildModelPath)
+		guard.freshSharedDownload = os.IsNotExist(parentErr) && os.IsNotExist(childErr)
+		defer func() { guard.freshSharedDownload = false }()
 	}
 	if err := h.files.ResetParentDirectory(parent.LocalPath); err != nil {
 		return h.finishParentWithError(ctx, parent, err)
@@ -126,11 +144,11 @@ func (h *hfArtifactTaskHandler) downloadParentAndAttachChild(
 
 // validateParentForInitialDownload excludes parents that need shared-parent
 // repair. Empty ConfigMap references alone do not prove there are no children.
-func (h *hfArtifactTaskHandler) validateParentForInitialDownload(parent HfArtifactEntry, modelStoreRoot string) error {
+func (h *hfArtifactTaskHandler) validateParentForInitialDownload(parent HfArtifactEntry, modelStoreRoot string, absentChildren ...string) error {
 	if len(parent.Children) != 0 {
 		return fmt.Errorf("shared Hugging Face parent %s with children requires repair", parent.Key)
 	}
-	hasChildren, err := h.files.HasChildren(parent.LocalPath, modelStoreRoot)
+	hasChildren, err := h.files.HasChildren(parent.LocalPath, modelStoreRoot, absentChildren...)
 	if err != nil {
 		return err
 	}
@@ -182,6 +200,9 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 	if h.repository.isChildMutationBlocked(input.ChildModelKey, input.ChildModelUID) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
 	created, err := h.files.createChildSymlink(input.ChildModelPath, parent.LocalPath)
 	if err != nil {
 		if errors.Is(err, errHfArtifactChildPathConflict) {
@@ -209,6 +230,9 @@ func (h *hfArtifactTaskHandler) attachChildToReadyParent(
 
 	storedParent, found, err := h.repository.GetParentForChild(ctx, input.ChildModelKey)
 	if err == nil && found && storedParent.Key == parent.Key {
+		if err := reportSharedRestore(ctx, input, storedParent); err != nil {
+			return newHfArtifactRetryResult(parent.Key, err), nil
+		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
 	}
 	if err == nil {

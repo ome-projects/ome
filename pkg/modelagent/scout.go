@@ -466,6 +466,8 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	if policyChanged || hasChanges {
 		w.logger.Infof("BaseModel %s needs refresh in namespace %s", newBaseModel.GetName(), newBaseModel.GetNamespace())
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
+	} else if oldBaseModel.Annotations[artifactResidencyAnnotation] != newBaseModel.Annotations[artifactResidencyAnnotation] || artifactRehydrationID(&GopherTask{BaseModel: oldBaseModel}) != artifactRehydrationID(&GopherTask{BaseModel: newBaseModel}) {
+		w.enqueueBaseModelDownload(newBaseModel)
 	}
 }
 
@@ -528,6 +530,8 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 	if policyChanged || hasChanges {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
+	} else if oldClusterBaseModel.Annotations[artifactResidencyAnnotation] != newClusterBaseModel.Annotations[artifactResidencyAnnotation] || artifactRehydrationID(&GopherTask{ClusterBaseModel: oldClusterBaseModel}) != artifactRehydrationID(&GopherTask{ClusterBaseModel: newClusterBaseModel}) {
+		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
 	}
 }
 
