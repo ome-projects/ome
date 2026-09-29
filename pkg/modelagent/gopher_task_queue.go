@@ -31,7 +31,7 @@ func (q *gopherTaskQueue) enqueue(task *GopherTask) {
 	if q.closed {
 		return
 	}
-	if task.TaskType == Delete {
+	if task.TaskType == Delete || task.TaskType == Evict {
 		// Delete preempts pending work for the same model and should run before
 		// reuse-wait tasks, so it is the only non-FIFO insertion.
 		q.high = removeSupersededTasks(q.high, task)
@@ -95,7 +95,7 @@ func (q *gopherTaskQueue) len() int {
 }
 
 func shouldUseHighPriorityQueue(task *GopherTask) bool {
-	return task.TaskType == Delete || isObjectStorageDownloadTask(task) || (!task.NormalPriorityOnly && !task.RevalidationReplay && !task.SamePathWaitStartedAt.IsZero())
+	return task.TaskType == Delete || task.TaskType == Evict || isObjectStorageDownloadTask(task) || (!task.NormalPriorityOnly && !task.RevalidationReplay && !task.SamePathWaitStartedAt.IsZero())
 }
 
 func isObjectStorageDownloadTask(task *GopherTask) bool {
