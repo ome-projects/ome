@@ -56,6 +56,8 @@ cleanup_probe='
   eval "$(sed -n "/^cleanup() {/,/^trap cleanup EXIT/p" "$1")"
   if [[ "$3" == nounset ]]; then
     (( ${missing_deadline:-0} > 0 && missing_deadline < 1 ))
+  elif [[ "$3" == direct-nounset ]]; then
+    : "${missing_deadline}"
   fi
   exit 0
 '
@@ -64,6 +66,8 @@ for failure in zero nounset; do
     'maintenance-single failed; diagnostics: offline-diagnostics' \
     bash -c "${cleanup_probe}" -- "${scenario}" false "${failure}"
 done
+expect_rejected direct-nounset 'missing_deadline: unbound variable' \
+  bash -c "${cleanup_probe}" -- "${scenario}" false direct-nounset
 bash -c "${cleanup_probe}" -- "${scenario}" true zero
 
 echo "scenario preflight tests passed"

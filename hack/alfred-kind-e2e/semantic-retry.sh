@@ -35,19 +35,28 @@ sr_request_patch() {
 }
 
 sr_set_policy() {
-  local revision="$1" paused="$2" owner patch
-  owner="$("${kube[@]}" -n "${namespace}" get inferenceservice "${isvc_name}" -o json)" || return 1
-  patch="$(jq -cen --argjson owner "${owner}" --arg uid "${sr_owner_uid}" \
-    --argjson revision "${revision}" --argjson paused "${paused}" '
-    if $owner.metadata.uid != $uid or ($owner.metadata.resourceVersion|type) != "string" or
-      ($owner.metadata.resourceVersion|length) == 0 or ($owner.metadata.annotations|type) != "object"
-    then error("authority owner identity/annotations unavailable") else
-    [{op:"test",path:"/metadata/uid",value:$uid},
-     {op:"test",path:"/metadata/resourceVersion",value:$owner.metadata.resourceVersion},
-     {op:"add",path:"/metadata/annotations/ome.io~1placement-execution",value:
-       ({planID:"alfred-e2e-pause",revision:$revision,sourceUID:"alfred-e2e-source",
-         clusterUID:"alfred-e2e-member",pauseSurge:$paused}|tojson)}] end')" || return 1
-  "${kube[@]}" -n "${namespace}" patch inferenceservice "${isvc_name}" --type=json -p "${patch}" >/dev/null
+  local revision="$1" paused="$2" owner patch attempt version previous_version=''
+  for attempt in 1 2 3 4 5; do
+    owner="$("${kube[@]}" -n "${namespace}" get inferenceservice "${isvc_name}" -o json)" || return 1
+    version="$(jq -er '.metadata.resourceVersion' <<<"${owner}")" || return 1
+    # Retry only when the failed precondition could have raced an API update,
+    # not an unchanged object rejected by admission/RBAC or an unknown error.
+    [[ -z "${previous_version}" || "${version}" != "${previous_version}" ]] || return 1
+    patch="$(jq -cen --argjson owner "${owner}" --arg uid "${sr_owner_uid}" \
+      --argjson revision "${revision}" --argjson paused "${paused}" '
+      if $owner.metadata.uid != $uid or ($owner.metadata.resourceVersion|type) != "string" or
+        ($owner.metadata.resourceVersion|length) == 0 or ($owner.metadata.annotations|type) != "object"
+      then error("authority owner identity/annotations unavailable") else
+      [{op:"test",path:"/metadata/uid",value:$uid},
+       {op:"test",path:"/metadata/resourceVersion",value:$owner.metadata.resourceVersion},
+       {op:"add",path:"/metadata/annotations/ome.io~1placement-execution",value:
+         ({planID:"alfred-e2e-pause",revision:$revision,sourceUID:"alfred-e2e-source",
+           clusterUID:"alfred-e2e-member",pauseSurge:$paused}|tojson)}] end')" || return 1
+    if "${kube[@]}" -n "${namespace}" patch inferenceservice "${isvc_name}" --type=json -p "${patch}" >/dev/null; then return 0; fi
+    previous_version="${version}"
+    if ((attempt < 5)); then sleep 0.2; fi
+  done
+  return 1
 }
 
 sr_delete_uid() {

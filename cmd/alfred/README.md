@@ -64,9 +64,11 @@ event stamps, previous-failure diagnostics and condition messages do not.
 
 Pre-upgrade prepared requests retain their original strict fingerprint: Alfred
 never rewrites their fence to authorize a retry. Unknown fingerprint versions
-cannot be retried, but already published requests still reconcile. A pause that
-outlasts the acknowledgement deadline can leave a request stalled; this change
-does not resume stalled requests. The pre-dispatch checks do not provide an atomic
+cannot be retried, but already published requests still reconcile. `SourceChanged`
+also covers unknown or malformed stored fingerprints, so it does not always mean
+the live source changed. A pause that outlasts the acknowledgement deadline can
+leave a request stalled; this change does not resume stalled requests. The
+pre-dispatch checks do not provide an atomic
 transaction across owner and replica objects, fence future consumer acceptance,
 or reserve a destination. Typed source fingerprints cover fields known to the
 running Alfred binary, not unknown fields from a newer API version.

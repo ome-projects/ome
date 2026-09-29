@@ -199,6 +199,59 @@ done
   [[ "$(<"${artifact_dir}/cursor")" == 5 ]] || fail 'collector counted the pre-existing completion report'
   [[ -s "${artifact_dir}/retry-completion-baseline.json" ]] || fail 'completion boundary was not retained'
 )
+# Retry only after the same owner's resourceVersion advances, always rebuilding
+# the UID/RV-fenced patch from a fresh API read. Persistent churn stays bounded.
+for policy_case in transient churn stable-error successor missing-annotations; do
+  (
+    policy_live="${test_dir}/policy-${policy_case}.json"
+    printf '%s\n' '{"metadata":{"uid":"owner-uid","resourceVersion":"123","annotations":{"existing":"kept"}}}' >"${policy_live}"
+    patch_attempts=0
+    sleep() { :; }
+    mock_retry_policy_kube() {
+      if [[ "$*" == *'get inferenceservice '* ]]; then
+        cat "${policy_live}"
+      elif [[ "$*" == *'patch inferenceservice '* ]]; then
+        local patch='' previous='' arg
+        patch_attempts=$((patch_attempts + 1))
+        for arg in "$@"; do
+          if [[ "${previous}" == -p ]]; then patch="${arg}"; fi
+          previous="${arg}"
+        done
+        # The API changes after the GET but before evaluating the JSON patch.
+        if [[ "${policy_case}" == churn || "${patch_attempts}" == 1 ]]; then
+          case "${policy_case}" in
+            transient|churn) mutation='.metadata.resourceVersion |= (tonumber + 1 | tostring)' ;;
+            stable-error) return 1 ;;
+            successor) mutation='.metadata.uid="successor" | .metadata.resourceVersion="124"' ;;
+            missing-annotations) mutation='.metadata.resourceVersion="124" | del(.metadata.annotations)' ;;
+          esac
+          jq "${mutation}" "${policy_live}" >"${policy_live}.next"
+          mv "${policy_live}.next" "${policy_live}"
+        fi
+        jq -e --slurpfile live "${policy_live}" '
+          length == 3 and .[0] == {op:"test",path:"/metadata/uid",value:$live[0].metadata.uid} and
+          .[1] == {op:"test",path:"/metadata/resourceVersion",value:$live[0].metadata.resourceVersion} and
+          .[2].op == "add" and .[2].path == "/metadata/annotations/ome.io~1placement-execution"' <<<"${patch}" >/dev/null || return 1
+        jq --argjson patch "${patch}" '.metadata.annotations["ome.io/placement-execution"]=$patch[2].value' \
+          "${policy_live}" >"${policy_live}.next"
+        mv "${policy_live}.next" "${policy_live}"
+      else fail "unexpected retry authority operation: $*"; fi
+    }
+    kube=(mock_retry_policy_kube)
+    if [[ "${policy_case}" == transient ]]; then
+      sr_set_policy 3 false || fail 'authority write did not recover from one resourceVersion conflict'
+      [[ "${patch_attempts}" == 2 ]] || fail 'authority conflict did not retry exactly once'
+      jq -e '.metadata.uid == "owner-uid" and .metadata.annotations.existing == "kept" and
+        (.metadata.annotations["ome.io/placement-execution"] | fromjson | .revision == 3 and .pauseSurge == false)' \
+        "${policy_live}" >/dev/null || fail 'retried authority write changed identity or unrelated metadata'
+    else
+      if sr_set_policy 3 false 2>/dev/null; then fail "authority write accepted ${policy_case}"; fi
+      if [[ "${policy_case}" == churn ]]; then expected_attempts=5; else expected_attempts=1; fi
+      [[ "${patch_attempts}" == "${expected_attempts}" ]] || fail "wrong retry bound for ${policy_case}: ${patch_attempts}"
+      jq -e '.metadata.annotations["ome.io/placement-execution"] == null' "${policy_live}" >/dev/null || fail "authority write mutated ${policy_case}"
+    fi
+  )
+done
 # A successor racing the cleanup pause must never receive that policy. Exercise
 # the actual cleanup and authority writer; replace only the API boundary.
 (
