@@ -1,6 +1,7 @@
 package modelagent
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -77,6 +78,11 @@ func (h *hfArtifactTaskHandler) tryParentFileOperation(parent HfArtifactEntry, r
 		unlock()
 		return nil, false, err
 	}
+	if err := h.repository.configMaps.checkDirectCleanupPath(context.Background(), parent.LocalPath); err != nil {
+		_ = lock.Close()
+		unlock()
+		return nil, false, err
+	}
 	return func() {
 		if err := lock.Close(); err != nil {
 			h.repository.configMaps.logger.Errorf("Close shared artifact lock: %v", err)
@@ -97,6 +103,11 @@ func (h *hfArtifactTaskHandler) tryArtifactOperation(input hfArtifactTaskInput) 
 	}
 	child, acquired, err := tryHfArtifactChildFileLock(input)
 	if err != nil || !acquired {
+		unlock()
+		return nil, false, err
+	}
+	if err := h.repository.configMaps.checkDirectCleanupPath(context.Background(), input.ChildModelPath); err != nil {
+		_ = child.Close()
 		unlock()
 		return nil, false, err
 	}

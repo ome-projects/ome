@@ -93,13 +93,21 @@ type ModelEntry struct {
 	// Pending cleanup survives reference removal until local and parent cleanup finish.
 	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
 	// Initial downloads retain their destination before a Ready reference exists.
-	HfArtifactPendingDownload *HfArtifactPendingDownload `json:"hfArtifactPendingDownload,omitempty"`
+	HfArtifactPendingDownload     *HfArtifactPendingDownload     `json:"hfArtifactPendingDownload,omitempty"`
+	DirectArtifactPendingDeletion *DirectArtifactPendingDeletion `json:"directArtifactPendingDeletion,omitempty"`
 	// Pins artifact ownership and residency reports to this Model CR instance.
 	ModelUID              types.UID `json:"modelUID,omitempty"`
 	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`
 	NodeUID               types.UID `json:"nodeUID,omitempty"`
 	// Distinguishes a failed restore attempt from reconstructed Shared Failed state.
 	ArtifactRehydrationFailed bool `json:"artifactRehydrationFailed,omitempty"`
+}
+
+// Completed eviction proof can outlive its ConfigMap entry after a lost delete response.
+// Use the same proof when retaining it in cache and consuming it during cleanup.
+func isCompletedArtifactEviction(entry ModelEntry, uid types.UID) bool {
+	return entry.Status == ModelStatusEvicted && entry.ModelUID != "" && entry.ModelUID == uid &&
+		entry.HfArtifactKey == "" && entry.HfArtifactPendingDeletion == nil && entry.DirectArtifactPendingDeletion == nil
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig
