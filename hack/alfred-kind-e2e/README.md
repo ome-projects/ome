@@ -194,6 +194,21 @@ distinguishes capacity exhaustion from every other scheduling failure. Neither
 `Unsupported` nor the generic `SimulationNotFeasible` report is itself accepted
 as a capacity diagnosis.
 
+Each no-capacity run uses unique DNS names and creates its Namespace, runtime,
+InferenceService, and blocker Pods one at a time. The API response for every
+CREATE supplies the recorded UID; a missing, malformed, conflicting, or wrong
+response stops the run without lookup-based adoption. Namespaced writes check
+the recorded Namespace UID before and after the request. Kubernetes cannot make
+a child CREATE conditional on its parent Namespace UID, so these checks detect
+replacement but do not claim cross-resource atomicity.
+
+Failures retain the fixture and diagnostics. The source Node marker is added and
+cleared with UID, resourceVersion, and label-state JSON Patch tests. Only an
+accepted scenario with a successfully cleared trigger may delete fixtures:
+cleanup deletes the recorded Namespace by UID, waits for that exact identity to
+disappear, then deletes the recorded runtime by UID. A same-name successor is
+reported and left untouched.
+
 To inspect only this test cluster:
 
 ```bash
