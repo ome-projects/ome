@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -149,6 +150,11 @@ func NewScout(ctx context.Context, nodeName string,
 	return scout, nil
 }
 
+// NodeUID returns the cached Node UID for initialization, before Run refreshes nodeInfo.
+func (w *Scout) NodeUID() types.UID {
+	return w.nodeInfo.UID
+}
+
 func (w *Scout) Run(stopCh <-chan struct{}) error {
 	defer runtime.HandleCrash()
 
@@ -258,6 +264,10 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		return
 	}
 
+	if artifactEvictionRequested(&GopherTask{BaseModel: baseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: baseModel}
+		return
+	}
 	if w.shouldDownloadModel(baseModel.Spec.Storage) {
 		// Refresh the node info
 		var err error
@@ -309,6 +319,10 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		return
 	}
 
+	if artifactEvictionRequested(&GopherTask{ClusterBaseModel: clusterBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: clusterBaseModel}
+		return
+	}
 	if w.shouldDownloadModel(clusterBaseModel.Spec.Storage) {
 		// Refresh the node info
 		var err error
@@ -361,6 +375,10 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		return
 	}
 
+	if artifactEvictionRequested(&GopherTask{BaseModel: newBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, BaseModel: newBaseModel}
+		return
+	}
 	// Placement changes add or remove this node without refreshing an artifact
 	// on a node that remains eligible.
 	wasEligible := w.shouldDownloadModel(oldBaseModel.Spec.Storage)
@@ -420,6 +438,10 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	// Placement changes add or remove this node without refreshing an artifact
 	// on a node that remains eligible.
+	if artifactEvictionRequested(&GopherTask{ClusterBaseModel: newClusterBaseModel}) {
+		w.gopherChan <- &GopherTask{TaskType: Evict, ClusterBaseModel: newClusterBaseModel}
+		return
+	}
 	wasEligible := w.shouldDownloadModel(oldClusterBaseModel.Spec.Storage)
 	isEligible := w.shouldDownloadModel(newClusterBaseModel.Spec.Storage)
 	switch {

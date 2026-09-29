@@ -13,6 +13,11 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	defer unlock()
+	if input.beforeDelete != nil {
+		if err := input.beforeDelete(ctx); err != nil {
+			return hfArtifactTaskResult{}, err
+		}
+	}
 	if err := h.retryPendingParentFailure(ctx, input.Parent.Key); err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
@@ -31,6 +36,9 @@ func (h *hfArtifactTaskHandler) handleDelete(ctx context.Context, input hfArtifa
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
 	if !found {
+		if input.completeDeletion != nil {
+			return hfArtifactTaskResult{}, fmt.Errorf("Shared eviction ownership disappeared")
+		}
 		return h.removeUnreferencedChildSymlink(ctx, input)
 	}
 	if parent.Key != input.Parent.Key {
@@ -129,6 +137,9 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 			return newHfArtifactRetryResult(parent.Key, err), nil
 		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskDone}, nil
+	}
+	if err := validateArtifactCleanup(ctx); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
 	}
 	if err := h.files.RemoveParentDirectory(parent.LocalPath); err != nil {
 		return newHfArtifactRetryResult(parent.Key, err), nil

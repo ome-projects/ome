@@ -213,6 +213,35 @@ So in the example above, deleting `llama-3-1-8b-chatbot` removes its symlink
 and its reference; the parent copy stays for `llama-3-1-8b-instruct`.
 Deleting both removes the parent directory as well.
 
+## Evicting a Shared artifact while keeping the model
+
+For a model with a recorded Shared relationship on the node, set:
+
+```yaml
+metadata:
+  annotations:
+    ome.io/artifact-residency: Evicted
+```
+
+The value is case-sensitive. Each agent withdraws that model's readiness,
+releases its Shared reference, and removes unreferenced local files. The model
+resource and remote source remain. Its entry in the per-node status ConfigMap
+reports `Evicted` with `modelUID` after cleanup finishes. Shared children,
+ordinary models borrowing the paths, and pending cleanups can keep files
+resident; `Evicted` acknowledges release of this model's ownership, not that
+every shared byte was removed.
+
+Eviction requires persisted Shared ownership. Missing or unsupported ownership
+fails explicitly and preserves files. Failed readiness withdrawal or ownership
+lookups also block cleanup. Interrupted cleanup resumes at its recorded paths;
+do not edit cleanup records or delete lock files. Existing downloads cannot
+publish this model as Ready while `Evicted` remains requested.
+
+Choose eviction only after deciding that serving workloads no longer require
+this model. The agent checks local file ownership, not Pods or serving demand.
+This phase does not provide a restoration request protocol or migrate resident
+files between storage layouts.
+
 ## When the agent falls back to a per-model copy
 
 `ReuseIfExists` is best-effort admission into sharing; ineligible models keep

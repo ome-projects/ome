@@ -283,6 +283,14 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 	if s.nodeLabelReconciler == nil {
 		return nil
 	}
+	var liveModels map[string]*GopherTask
+	if s.omeClient != nil {
+		var err error
+		liveModels, err = liveArtifactModels(ctx, s.omeClient)
+		if err != nil {
+			return err
+		}
+	}
 	for key, status := range statuses {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -292,7 +300,13 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 			return fmt.Errorf("invalid shared artifact child key %q", key)
 		}
 		op := &NodeLabelOp{ModelStateOnNode: ModelStateOnNode(status)}
-		if cluster {
+		if liveModels != nil {
+			model := liveModels[key]
+			if model == nil || isModelResourceDeleting(model.BaseModel, model.ClusterBaseModel) || status == ModelStatusReady && artifactEvictionRequested(model) {
+				continue
+			}
+			op.BaseModel, op.ClusterBaseModel = model.BaseModel, model.ClusterBaseModel
+		} else if cluster {
 			if s.clusterBaseModelLister == nil {
 				return fmt.Errorf("ClusterBaseModel lister is unavailable for %s", key)
 			}
@@ -316,6 +330,11 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 				return err
 			}
 			op.BaseModel = model
+		}
+		if status == ModelStatusReady && s.omeClient != nil {
+			op.validateReady = func() error {
+				return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel})
+			}
 		}
 		if err := s.nodeLabelReconciler.ReconcileNodeLabels(op); err != nil {
 			return err

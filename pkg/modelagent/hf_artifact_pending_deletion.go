@@ -296,20 +296,43 @@ func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input
 	if err != nil {
 		return newHfArtifactRetryResult(input.Parent.Key, err), nil
 	}
-	if !referenced && h.hasOtherPathUsers != nil {
+	if !referenced && input.pathUsers != nil {
+		referenced, err = input.pathUsers(ctx, input.ChildModelPath)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	} else if !referenced && h.hasOtherPathUsers != nil {
 		referenced, err = h.hasOtherPathUsers(input)
 		if err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}
 	}
 	referenced = referenced || input.PreserveChildPath
+	if !referenced && input.completeDeletion != nil {
+		// An alias can point through this child to the shared parent. Scan
+		// before unlinking: resolving the alias afterward would lose that proof.
+		referenced, err = h.files.HasChildren(input.ChildModelPath, input.ModelStoreRoot)
+		if err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	}
 	if !referenced {
+		if err := validateArtifactCleanup(ctx); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
 		if err := h.files.RemoveChildSymlink(input.ChildModelPath, pending.ParentPath); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}
 	}
 	if found && len(parent.Children) == 0 && pending.ParentLockID != "" {
-		if referenced {
+		parentReferenced := referenced
+		if !parentReferenced && input.pathUsers != nil {
+			parentReferenced, err = input.pathUsers(ctx, parent.LocalPath)
+			if err != nil {
+				return newHfArtifactRetryResult(parent.Key, err), nil
+			}
+		}
+		if parentReferenced {
 			if err := h.releaseParentDeletionLock(ctx, parent, pending.ParentWasReady); err != nil {
 				return newHfArtifactRetryResult(parent.Key, err), nil
 			}
@@ -320,7 +343,11 @@ func (h *hfArtifactTaskHandler) resumePendingDeletion(ctx context.Context, input
 			}
 		}
 	}
-	if !input.RetainDeletionReceipt {
+	if input.completeDeletion != nil {
+		if err := input.completeDeletion(ctx, *pending); err != nil {
+			return newHfArtifactRetryResult(input.Parent.Key, err), nil
+		}
+	} else if !input.RetainDeletionReceipt {
 		if err := h.repository.finishPendingDeletion(ctx, input.ChildModelKey, *pending); err != nil {
 			return newHfArtifactRetryResult(input.Parent.Key, err), nil
 		}

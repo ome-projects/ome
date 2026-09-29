@@ -76,7 +76,12 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
+	if model.Status != ModelStatusEvicted && model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
+		// Live residency validation can suppress a cached Ready entry during
+		// reconstruction. Keep the typed cache aligned with that committed state.
+		if c.artifactModelClient != nil && c.modelCache[key] != nil && before[key] != raw {
+			c.modelCache[key].ModelStatus = model.Status
+		}
 		// Only explicit ordinary writes may seed typed recovery. Observing
 		// unrelated records, including at startup, must not adopt them.
 		if modelID == "" && before[key] != raw && c.modelCache[key] == nil {

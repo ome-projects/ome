@@ -262,7 +262,7 @@ func (files hfArtifactFiles) RemoveChildSymlink(childModelPath, parentPath strin
 	return os.Remove(childModelPath)
 }
 
-// HasChildren scans modelStoreRoot for any child symlink to this parent,
+// HasChildren scans modelStoreRoot for any child symlink to this path or a descendant,
 // including links missing from the ConfigMap. It skips the parent contents and
 // stops at the first matching child. An error prevents destructive parent work.
 // WalkDir inspects symlinks without following them. This is a point-in-time
@@ -301,7 +301,7 @@ func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, err
 		}
 		// Absolute targets may use a different OS spelling of the store root.
 		canonicalTarget, err := hfArtifactPathInRoot(target, modelStoreRoot, root)
-		if err == nil && canonicalTarget == cleanParentPath {
+		if err == nil && hfArtifactInputPathWithin(cleanParentPath, canonicalTarget) {
 			foundChild = true
 			return filepath.SkipAll
 		}

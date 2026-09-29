@@ -285,6 +285,7 @@ func initializeComponents(
 		baseModelInformer.Lister(),
 		clusterBaseModelInformer.Lister(),
 		modelagent.WithModelVerificationConcurrency(cfg.effectiveVerificationConcurrency()),
+		modelagent.WithArtifactEviction(omeClient, scout.NodeUID()),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)

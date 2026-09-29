@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +17,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
+	omeinformers "sigs.k8s.io/ome/pkg/client/informers/externalversions"
+	"sigs.k8s.io/ome/pkg/modelagent"
 )
 
 func setupTestEnv(t *testing.T) {
@@ -155,6 +165,44 @@ func TestEffectiveVerificationConcurrency(t *testing.T) {
 			assert.Equal(t, tc.want, c.effectiveVerificationConcurrency())
 		})
 	}
+}
+
+func TestInitializeComponentsReadsNodeOnce(t *testing.T) {
+	originalConfig, originalViper := cfg, v
+	t.Cleanup(func() { cfg, v = originalConfig, originalViper })
+	// "x" hashes to zero startup jitter.
+	cfg = &config{nodeName: "x", namespace: "ome", modelsRootDir: t.TempDir()}
+	v = viper.New()
+
+	var nodeReads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/nodes/x" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		nodeReads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(&corev1.Node{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Node"},
+			ObjectMeta: metav1.ObjectMeta{Name: "x", UID: "startup-node-uid"},
+		}))
+	}))
+	t.Cleanup(server.Close)
+	clientConfig := &rest.Config{Host: server.URL}
+	kubeClient, err := kubernetes.NewForConfig(clientConfig)
+	require.NoError(t, err)
+	omeClient, err := omeclient.NewForConfig(clientConfig)
+	require.NoError(t, err)
+	factory := omeinformers.NewSharedInformerFactory(omeClient, 0)
+
+	scout, gopher, err := initializeComponents(context.Background(), kubeClient, omeClient,
+		factory, nil, make(chan *modelagent.GopherTask, 1), setupTestLogger(t))
+	require.NoError(t, err)
+	require.NotNil(t, scout)
+	require.NotNil(t, gopher)
+	require.Equal(t, "startup-node-uid", string(scout.NodeUID()))
+	require.EqualValues(t, 1, nodeReads.Load(), "reuse Scout's startup Node snapshot")
 }
 
 func TestInitializeLogger(t *testing.T) {

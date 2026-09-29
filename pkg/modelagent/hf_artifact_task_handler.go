@@ -56,6 +56,11 @@ type hfArtifactTaskInput struct {
 	RetainDeletionReceipt bool
 	// A reserve-artifact delete must preserve its symlink on cleanup retries too.
 	PreserveChildPath bool
+	// Invocation-scoped eviction integrations; ordinary deletion keeps its
+	// existing behavior when these are absent.
+	beforeDelete     func(context.Context) error
+	pathUsers        func(context.Context, string) (bool, error)
+	completeDeletion func(context.Context, HfArtifactPendingDeletion) error
 }
 
 func (input hfArtifactTaskInput) modelStoreRoot() (string, error) {

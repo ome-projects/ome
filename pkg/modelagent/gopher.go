@@ -12,6 +12,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 	"go.uber.org/zap"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omeclient "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/logging"
@@ -36,6 +38,7 @@ const (
 	Download         GopherTaskType = "Download"
 	DownloadOverride GopherTaskType = "DownloadOverride"
 	Delete           GopherTaskType = "Delete"
+	Evict            GopherTaskType = "Evict"
 )
 
 type GopherTask struct {
@@ -66,6 +69,8 @@ type Gopher struct {
 	modelRootDir             string
 	xetConfig                *xet.Config
 	kubeClient               kubernetes.Interface
+	omeClient                omeclient.Interface
+	artifactNodeUID          types.UID
 	gopherChan               chan *GopherTask
 	nodeLabelReconciler      *NodeLabelReconciler
 	metrics                  *Metrics
@@ -232,7 +237,7 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue()
 	}
-	if task.TaskType == Delete && usesArtifactTaskCoordinator(task) {
+	if (task.TaskType == Delete || task.TaskType == Evict) && usesArtifactTaskCoordinator(task) {
 		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
 		if result == gopherTaskStale {
 			return
@@ -298,7 +303,18 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 		return err
 	}
 	defer unlock()
-	err = s.nodeLabelReconciler.ReconcileNodeLabels(op)
+	if op.ModelStateOnNode != Deleted {
+		if err := s.validateArtifactDownload(ctx, &GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}); err != nil {
+			return err
+		}
+	}
+	labelOp := *op
+	if labelOp.ModelStateOnNode == Ready && s.omeClient != nil {
+		labelOp.validateReady = func() error {
+			return s.validateArtifactDownload(ctx, &GopherTask{BaseModel: labelOp.BaseModel, ClusterBaseModel: labelOp.ClusterBaseModel})
+		}
+	}
+	err = s.nodeLabelReconciler.ReconcileNodeLabels(&labelOp)
 	if err != nil {
 		return err
 	}
@@ -401,6 +417,15 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 	defer func() { finish(keepDeleteBarrier) }()
 	ctx, releaseFileLocks := directFileOperationContext(ctx)
 	defer releaseFileLocks()
+	if task.TaskType == Evict {
+		keepDeleteBarrier, err = s.processArtifactEviction(ctx, task)
+		return err
+	}
+	if task.TaskType == Download || task.TaskType == DownloadOverride {
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return err
+		}
+	}
 	s.logger.Infof("Processing gopher task: %s, type: %s", modelInfo, task.TaskType)
 
 	// Get model type, namespace, and name for metrics
@@ -460,6 +485,9 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 		if err != nil {
 			s.logger.Errorf("Failed to set model %s status to Updating: %v", modelInfo, err)
 			// Continue with download anyway
+		}
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return err
 		}
 	}
 
