@@ -52,12 +52,33 @@ func usesArtifactTaskCoordinator(task *GopherTask) bool {
 
 func (s *Gopher) tryLockDirectModelPath(ctx context.Context, path string) (bool, error) {
 	locks := ctx.Value(directFileOperationKey{}).(map[string]*flock.Flock)
-	path, err := filepath.Abs(path)
+	path, err := canonicalDirectModelPath(path)
 	if err != nil {
 		return false, err
 	}
+	if locks[path] != nil {
+		return true, s.configMapReconciler.checkDirectCleanupPath(ctx, path)
+	}
+	// Use the existing child lock key and directory, without imposing shared
+	// layout input restrictions (ordinary destinations can contain whitespace).
+	root := filepath.Dir(path)
+	lock, acquired, err := tryHfArtifactFileLock(root, filepath.Join(root, hfArtifactLockDirectory), "child:"+path)
+	if acquired {
+		locks[path] = lock
+		if err := s.configMapReconciler.checkDirectCleanupPath(ctx, path); err != nil {
+			return false, err
+		}
+	}
+	return acquired, err
+}
+
+func canonicalDirectModelPath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
 	if path == string(filepath.Separator) {
-		return false, fmt.Errorf("direct model destination cannot be the filesystem root")
+		return "", fmt.Errorf("direct model destination cannot be the filesystem root")
 	}
 	// Resolve directory aliases, including an ordinary symlinked model root.
 	// Keep the leaf unresolved: deleting a legacy child removes its link.
@@ -69,18 +90,8 @@ func (s *Gopher) tryLockDirectModelPath(ctx context.Context, path string) (bool,
 			break
 		}
 		if !os.IsNotExist(err) || ancestor == filepath.Dir(ancestor) {
-			return false, err
+			return "", err
 		}
 	}
-	if locks[path] != nil {
-		return true, nil
-	}
-	// Use the existing child lock key and directory, without imposing shared
-	// layout input restrictions (ordinary destinations can contain whitespace).
-	root := filepath.Dir(path)
-	lock, acquired, err := tryHfArtifactFileLock(root, filepath.Join(root, hfArtifactLockDirectory), "child:"+path)
-	if acquired {
-		locks[path] = lock
-	}
-	return acquired, err
+	return path, nil
 }

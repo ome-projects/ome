@@ -91,7 +91,8 @@ type ModelEntry struct {
 	Progress      *DownloadProgress `json:"progress,omitempty"`      // Download progress, nil when not downloading
 	HfArtifactKey string            `json:"hfArtifactKey,omitempty"` // ConfigMap key of the shared HF artifact used by this model
 	// Pending cleanup survives reference removal until local and parent cleanup finish.
-	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
+	HfArtifactPendingDeletion     *HfArtifactPendingDeletion     `json:"hfArtifactPendingDeletion,omitempty"`
+	DirectArtifactPendingDeletion *DirectArtifactPendingDeletion `json:"directArtifactPendingDeletion,omitempty"`
 	// Pins artifact ownership and residency reports to this Model CR instance.
 	ModelUID              types.UID `json:"modelUID,omitempty"`
 	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -164,8 +165,9 @@ func (c *ConfigMapReconciler) validateArtifactReadyEntries(ctx context.Context, 
 // Carries this task's cleanup checks into ConfigMap updates, so each retry
 // rechecks live intent and Model/Node identity.
 type artifactCleanupGuard struct {
-	gopher *Gopher
-	task   *GopherTask
+	gopher        *Gopher
+	task          *GopherTask
+	directReceipt *DirectArtifactPendingDeletion
 }
 type artifactCleanupGuardKey struct{}
 
@@ -174,7 +176,28 @@ func validateArtifactCleanup(ctx context.Context) error {
 	if guard == nil {
 		return nil
 	}
-	return guard.validate(ctx)
+	if err := guard.validate(ctx); err != nil {
+		return err
+	}
+	cm, err := guard.gopher.configMapReconciler.getConfigMap(ctx)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	key := getModelID(guard.task.BaseModel, guard.task.ClusterBaseModel)
+	if _, found := cm.Data[key]; !found {
+		return nil
+	}
+	entry, err := existingModelEntry(cm.Data, key)
+	if err != nil {
+		return err
+	}
+	if entry.DirectArtifactPendingDeletion != nil && (entry.HfArtifactKey != "" || entry.HfArtifactPendingDeletion != nil) {
+		return fmt.Errorf("model has conflicting Direct and Shared cleanup ownership")
+	}
+	return nil
 }
 
 func (g *artifactCleanupGuard) validate(ctx context.Context) error {
@@ -183,26 +206,37 @@ func (g *artifactCleanupGuard) validate(ctx context.Context) error {
 		return err
 	}
 	current, err := liveArtifactModel(ctx, s.omeClient, task)
+	if apierrors.IsNotFound(err) && task.TaskType == Delete {
+		current, err = nil, nil
+	}
 	if err != nil {
 		return err
 	}
-	if getModelUID(task) == "" || getModelUID(task) != getModelUID(current) || !artifactEvictionRequested(current) || isModelResourceDeleting(current.BaseModel, current.ClusterBaseModel) {
+	if getModelUID(task) == "" || current != nil && getModelUID(task) != getModelUID(current) {
 		return fmt.Errorf("eviction model UID or intent changed")
 	}
-	if !hasEvictableArtifactSource(current) {
+	if task.TaskType == Evict && (!artifactEvictionRequested(current) || isModelResourceDeleting(current.BaseModel, current.ClusterBaseModel)) {
+		return fmt.Errorf("eviction model UID or intent changed")
+	}
+	if task.TaskType == Evict && !hasEvictableArtifactSource(current) {
 		return fmt.Errorf("artifact eviction requires a current Hugging Face or OCI source")
 	}
-	if s.configMapReconciler.isModelMutationBlocked(getModelID(task.BaseModel, task.ClusterBaseModel), types.UID(getModelUID(task))) {
+	if task.TaskType != Delete && s.configMapReconciler.isModelMutationBlocked(getModelID(task.BaseModel, task.ClusterBaseModel), types.UID(getModelUID(task))) {
 		return fmt.Errorf("eviction model UID is superseded in node state")
 	}
-	if !reflect.DeepEqual(downloadOverrideInputsFromSpec(taskModelSpec(task)), downloadOverrideInputsFromSpec(taskModelSpec(current))) {
+	if task.TaskType == Download || task.TaskType == DownloadOverride {
+		if err := s.validateArtifactDownload(ctx, task); err != nil {
+			return err
+		}
+	}
+	if current != nil && !reflect.DeepEqual(downloadOverrideInputsFromSpec(taskModelSpec(task)), downloadOverrideInputsFromSpec(taskModelSpec(current))) {
 		return fmt.Errorf("eviction source or download inputs changed")
 	}
-	if task.BaseModel != nil {
+	if current != nil && task.BaseModel != nil {
 		if !reflect.DeepEqual(task.BaseModel.Labels, current.BaseModel.Labels) || !reflect.DeepEqual(task.BaseModel.Annotations, current.BaseModel.Annotations) {
 			return fmt.Errorf("eviction model metadata changed")
 		}
-	} else if !reflect.DeepEqual(task.ClusterBaseModel.Labels, current.ClusterBaseModel.Labels) || !reflect.DeepEqual(task.ClusterBaseModel.Annotations, current.ClusterBaseModel.Annotations) {
+	} else if current != nil && (!reflect.DeepEqual(task.ClusterBaseModel.Labels, current.ClusterBaseModel.Labels) || !reflect.DeepEqual(task.ClusterBaseModel.Annotations, current.ClusterBaseModel.Annotations)) {
 		return fmt.Errorf("eviction model metadata changed")
 	}
 	if s.kubeClient == nil || s.artifactNodeUID == "" {
@@ -274,7 +308,10 @@ func (s *Gopher) processArtifactEviction(ctx context.Context, task *GopherTask) 
 	if err != nil {
 		return false, err
 	}
-	if entry.Status == ModelStatusEvicted && entry.ModelUID == types.UID(getModelUID(task)) && entry.HfArtifactKey == "" && entry.HfArtifactPendingDeletion == nil {
+	if entry.DirectArtifactPendingDeletion != nil && (entry.HfArtifactKey != "" || entry.HfArtifactPendingDeletion != nil) {
+		return false, fmt.Errorf("model has conflicting Direct and Shared cleanup ownership")
+	}
+	if entry.Status == ModelStatusEvicted && entry.ModelUID == types.UID(getModelUID(task)) && entry.HfArtifactKey == "" && entry.HfArtifactPendingDeletion == nil && entry.DirectArtifactPendingDeletion == nil {
 		return false, guard.withdrawReady(ctx)
 	}
 	parent, found, err := h.repository.GetParentForChild(ctx, key)
@@ -282,7 +319,7 @@ func (s *Gopher) processArtifactEviction(ctx context.Context, task *GopherTask) 
 		return false, err
 	}
 	if !found {
-		return false, fmt.Errorf("eviction requires persisted Shared ownership for %s", key)
+		return s.processDirectEviction(ctx, guard, entry)
 	}
 	input := s.hfArtifactInputForChild(task, parent)
 	if pending := entry.HfArtifactPendingDeletion; pending != nil && pending.ModelUID != input.ChildModelUID {
@@ -319,7 +356,7 @@ func (s *Gopher) processArtifactEviction(ctx context.Context, task *GopherTask) 
 			if err != nil {
 				return false, err
 			}
-			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion == nil || *child.HfArtifactPendingDeletion != expected {
+			if child.DirectArtifactPendingDeletion != nil || child.HfArtifactKey != "" || child.HfArtifactPendingDeletion == nil || *child.HfArtifactPendingDeletion != expected {
 				return false, fmt.Errorf("eviction cleanup receipt changed")
 			}
 			child.HfArtifactPendingDeletion = nil
@@ -347,9 +384,13 @@ func (s *Gopher) sharedArtifactPathUsers(ctx context.Context, input hfArtifactTa
 	return s.artifactPathUsers(ctx, input.ChildModelKey, input.ChildModelPath, input.ModelStoreRoot, target, &input.Parent, repair)
 }
 
-// The supplied Shared parent excludes its own relationship from borrower detection.
+// A nil parent checks Direct ownership; Shared callers supply their persisted
+// parent so its own relationship is excluded from borrower detection.
 func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, modelRoot, target string, sharedParent *HfArtifactEntry, repair bool) (bool, error) {
-	input := hfArtifactTaskInput{ChildModelKey: childKey, ChildModelPath: childPath, ModelStoreRoot: modelRoot, Parent: *sharedParent}
+	input := hfArtifactTaskInput{ChildModelKey: childKey, ChildModelPath: childPath, ModelStoreRoot: modelRoot}
+	if sharedParent != nil {
+		input.Parent = *sharedParent
+	}
 	if err := validateArtifactRestore(ctx); err != nil {
 		return false, err
 	}
@@ -514,6 +555,9 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 			}
 			if pending := entry.HfArtifactPendingDeletion; pending != nil {
 				paths = append(paths, pending.ChildPath, pending.ParentPath)
+			}
+			if pending := entry.DirectArtifactPendingDeletion; pending != nil {
+				paths = append(paths, pending.Path)
 			}
 			if entry.Config != nil {
 				for _, path := range entry.Config.Artifact.ParentPath {

@@ -213,9 +213,9 @@ So in the example above, deleting `llama-3-1-8b-chatbot` removes its symlink
 and its reference; the parent copy stays for `llama-3-1-8b-instruct`.
 Deleting both removes the parent directory as well.
 
-## Evicting a Shared artifact while keeping the model
+## Evicting an artifact while keeping the model
 
-For a model with a recorded Shared relationship on the node, set:
+For a Hugging Face or OCI model with recorded Direct or Shared ownership on the node, set:
 
 ```yaml
 metadata:
@@ -224,18 +224,31 @@ metadata:
 ```
 
 The value is case-sensitive. Each agent withdraws that model's readiness,
-releases its Shared reference, and removes unreferenced local files. The model
+releases its ownership, and removes unreferenced local files. The model
 resource and remote source remain. Its entry in the per-node status ConfigMap
 reports `Evicted` with `modelUID` after cleanup finishes. Shared children,
 ordinary models borrowing the paths, and pending cleanups can keep files
 resident; `Evicted` acknowledges release of this model's ownership, not that
 every shared byte was removed.
 
-Eviction requires persisted Shared ownership. Missing or unsupported ownership
+Direct eviction requires a canonical directory under the model store and a
+named agent entry containing parsed configuration or completed `Ready` status;
+ordinary OCI does not require Hugging Face identity metadata. Direct borrowers,
+recorded child relationships, and ambiguous layouts block eviction. Shared
+eviction follows the persisted relationship, independently of download policy.
+Missing or unsupported ownership
 fails explicitly and preserves files. Failed readiness withdrawal or ownership
 lookups also block cleanup. Interrupted cleanup resumes at its recorded paths;
 do not edit cleanup records or delete lock files. Existing downloads cannot
 publish this model as Ready while `Evicted` remains requested.
+
+An unfinished Direct cleanup records its original path and model UID in
+`directArtifactPendingDeletion`, bound to the entry's Node UID. Writers cannot
+overwrite this path until cleanup finishes, including after restart or a change
+to the configured destination. Completion clears the receipt; a repeated
+eviction cannot delete newly reused files. Ordinary Delete settles pending
+cleanup and removes the model entry, preserving reserved artifacts and current
+Local/PVC/vendor files.
 
 Choose eviction only after deciding that serving workloads no longer require
 this model. The agent checks local file ownership, not Pods or serving demand.

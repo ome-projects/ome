@@ -388,9 +388,19 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 		// Shared ownership needs an explicit UID handoff. Ordinary entries,
 		// including completed opt-outs, retain their existing deletion behavior.
 		var child ModelEntry
-		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil) {
+		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil || child.DirectArtifactPendingDeletion != nil) {
 			c.cacheMutex.Unlock()
 			return fmt.Errorf("cannot delete shared model %s owned by another UID", modelID)
+		}
+	}
+	// Keep only exact completed eviction proof through an unacknowledged
+	// final removal. The eviction/UID fences below still exclude it from
+	// Ready mutations and cache restoration; Delete alone can consume it.
+	var completed *CacheEntry
+	if cached := c.modelCache[modelID]; cached != nil {
+		var child ModelEntry
+		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && child.Status == ModelStatusEvicted && child.ModelUID != "" && child.ModelUID == modelUID && child.HfArtifactKey == "" && child.HfArtifactPendingDeletion == nil && child.DirectArtifactPendingDeletion == nil {
+			completed = &CacheEntry{ModelName: child.Name, ModelStatus: ModelStatusEvicted, ModelUID: modelUID, ModelEntryJSON: cached.ModelEntryJSON}
 		}
 	}
 	if isModelResourceDeleting(baseModel, clusterBaseModel) {
@@ -399,6 +409,9 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 	} else {
 		// A later selector or affinity update may require new work using the same UID.
 		c.evictCachedModelLocked(modelID)
+	}
+	if completed != nil {
+		c.modelCache[modelID] = completed
 	}
 	c.cacheMutex.Unlock()
 
@@ -412,6 +425,9 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 		// after file cleanup. Check ownership on every final-removal CAS attempt.
 		var child ModelEntry
 		if json.Unmarshal([]byte(raw), &child) == nil {
+			if child.DirectArtifactPendingDeletion != nil || child.Status == ModelStatusEvicted && child.ModelUID != modelUID {
+				return false, fmt.Errorf("Direct artifact cleanup or ownership changed before deleting model %s", modelID)
+			}
 			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil && child.HfArtifactPendingDeletion.ModelUID != modelUID {
 				return false, fmt.Errorf("shared artifact ownership changed before deleting model %s", modelID)
 			}
@@ -422,6 +438,15 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 	if err != nil {
 		c.logger.Errorf("Failed to update ConfigMap after model deletion: %v", err)
 		return err
+	}
+	// A no-op retry after a lost response may have no live entry to evict.
+	// Clear only this attempt's proof, never a replacement cache owner.
+	if completed != nil {
+		c.cacheMutex.Lock()
+		if c.modelCache[modelID] == completed {
+			c.evictCachedModelLocked(modelID)
+		}
+		c.cacheMutex.Unlock()
 	}
 
 	c.logger.Infof("Successfully deleted model %s from ConfigMap and cache", modelInfo)
@@ -659,6 +684,9 @@ func (c *ConfigMapReconciler) isModelRestoreBlocked(modelID string, modelUID typ
 	c.cacheMutex.RLock()
 	defer c.cacheMutex.RUnlock()
 	if c.isModelMutationBlockedLocked(modelID, modelUID) {
+		return true
+	}
+	if _, evicted := c.evictedModels[modelID]; evicted {
 		return true
 	}
 	_, exists := c.modelCache[modelID]

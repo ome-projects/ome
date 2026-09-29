@@ -514,6 +514,17 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 		}
 	}
 
+	if handled, waiting, err := s.resumeDirectArtifactCleanup(ctx, task); err != nil || waiting || handled && task.TaskType == Delete {
+		if err != nil && (task.TaskType == Download || task.TaskType == DownloadOverride) {
+			s.metrics.RecordFailedDownload(modelType, namespace, name, "artifact_cleanup_error")
+			if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+				s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second)
+			}
+		}
+		keepDeleteBarrier = waiting && task.TaskType == Delete
+		return err
+	}
+
 	if isDirectFileTask(task) {
 		acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&baseModelSpec, s.modelRootDir))
 		if err != nil {
