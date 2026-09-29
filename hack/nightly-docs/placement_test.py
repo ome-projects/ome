@@ -128,6 +128,32 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual(downloaded, list(range(1, len(reports) + 1)))
         self.assertEqual(queue, [self.item])
 
+    def test_full_run_can_recover_a_queue_despite_missing_scan_artifacts(self):
+        """A partial production report may seed recovery; a pilot still may not."""
+        report = {'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
+                  'expected_shards': [name for name, _, _ in discovery.SHARDS],
+                  'scans': [{'shard': discovery.SHARDS[0][0]}], 'complete': False,
+                  'missing_shards': [name for name, _, _ in discovery.SHARDS[1:]]}
+        def run(*args):
+            if args[:3] == ('gh', 'run', 'download'):
+                Path(args[-1], 'nightly-docs-discovery-report.json').write_text(json.dumps(report))
+                return ''
+            if 'artifacts?' in args[2]:
+                return json.dumps([{'artifacts': [{'name': 'nightly-docs-discovery-report', 'expired': False}]}])
+            return json.dumps([{'workflow_runs': [{'id': 1, 'status': 'completed', 'head_branch': 'main',
+                                                  'head_repository': {'full_name': 'o/r'}}]}])
+        with patch.object(docs, 'run', side_effect=run):
+            self.assertEqual(discovery.previous_pending('o/r', 'main',
+                             {'code_history': ['a' * 40 + ' old']}), [self.item])
+
+    def test_recovered_queue_drops_recorded_concerns_but_keeps_file_blocked_work(self):
+        """Recovery cannot resurrect a merged/declined concern or lose blocked work."""
+        report = {'queued_concerns': [self.item]}
+        context = {'code_history': ['a' * 40 + ' old'], 'existing_prs': [pr(self.item, state='closed')]}
+        self.assertEqual(discovery.pending_from_report(report, context), [])
+        context['existing_prs'] = [pr(self.item, body=docs.MARKER + 'other -->', branch='codex/nightly-docs-other')]
+        self.assertEqual(discovery.pending_from_report(report, context), [self.item])
+
     def test_queue_never_reads_branch_pilot_artifacts(self):
         runs = {'workflow_runs': [
             {'id': 1, 'status': 'completed', 'head_branch': 'codex/pilot', 'head_repository': {'full_name': 'o/r'}},

@@ -166,7 +166,7 @@ jobs:
           claude_args: >-
             --model claude-fable-5
             --effort xhigh
-            --max-turns 100
+            --max-turns 200
             --tools "Read,Glob,Grep"
             --allowedTools "Read,Glob,Grep"
             --json-schema '{"type":"object","additionalProperties":false,"properties":{"concerns":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{"area":{"type":"string"},"concern":{"type":"string"},"source_commit":{"type":"integer","minimum":1},"title":{"type":"string"},"question":{"type":"string"},"evidence":{"type":"string"},"doc_paths":{"type":"array","minItems":1,"items":{"type":"string"}},"placement":{"type":"object","additionalProperties":false,"properties":{"examined_pages":{"type":"array","minItems":1,"items":{"type":"string"}},"canonical_pages":{"type":"array","items":{"type":"string"}},"new_page_reason":{"type":"string"}},"required":["examined_pages","canonical_pages","new_page_reason"]}},"required":["area","concern","source_commit","title","question","evidence","doc_paths","placement"]}},"inspected_commits":{"type":"array","items":{"type":"integer","minimum":1}},"remaining_work":{"type":"string"}},"required":["concerns","inspected_commits","remaining_work"]}'
@@ -184,11 +184,15 @@ jobs:
 
   plan:
     needs: [prepare, discover]
+    # Failed scans remain failed, but cannot suppress validated sibling artifacts.
+    if: always() && !cancelled() && needs.prepare.result == 'success'
     runs-on: ome-runner-cpu
     timeout-minutes: 15
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
+      complete: ${{ steps.plan.outputs.complete }}
+      missing: ${{ steps.plan.outputs.missing }}
       base_sha: ${{ needs.prepare.outputs.base_sha }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -225,7 +229,7 @@ jobs:
 
   write:
     needs: plan
-    if: needs.plan.outputs.count != '0'
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.count != '0'
     runs-on: ome-runner-cpu
     timeout-minutes: 60
     permissions:
@@ -409,3 +413,21 @@ jobs:
           path: ${{ env.VALIDATION_DIR }}
           retention-days: 14
           if-no-files-found: error
+
+  discovery-coverage:
+    needs: plan
+    if: always() && !cancelled() && needs.plan.result == 'success'
+    runs-on: ome-runner-cpu
+    timeout-minutes: 5
+    env:
+      COMPLETE: ${{ needs.plan.outputs.complete }}
+      MISSING_SHARDS: ${{ needs.plan.outputs.missing }}
+    steps:
+      - name: Report incomplete discovery without blocking successful concerns
+        run: |
+          if [ "$COMPLETE" != 'true' ]; then
+            echo "::error::Missing validated discovery scans: $MISSING_SHARDS"
+            echo "Successful scans continue through normal review and publication guards."
+            exit 1
+          fi
+          echo "All requested discovery scans supplied validated results."

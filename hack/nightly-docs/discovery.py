@@ -91,11 +91,13 @@ def validate_scan(raw, context, slug, history):
             "inspected_commits": inspected, "remaining_work": result["remaining_work"]}
 
 
-def combine(scans, context):
+def combine(scans, context, allow_partial=False):
     expected = context.get("selected_shards", [slug for slug, _, _ in SHARDS])
     by_slug = {scan["shard"]: scan for scan in scans}
-    if len(by_slug) != len(scans) or set(by_slug) != set(expected):
-        raise ValueError("Missing or duplicate discovery scans")
+    if len(by_slug) != len(scans) or not set(by_slug) <= set(expected):
+        raise ValueError("Unknown or duplicate discovery scans")
+    if not allow_partial and set(by_slug) != set(expected):
+        raise ValueError("Missing discovery scans")
     assignments = partition(context)
     for slug, scan in by_slug.items():
         if scan["base_sha"] != context["base_sha"]:
@@ -103,7 +105,7 @@ def combine(scans, context):
         validate_scan(json.dumps(scan), context, slug, assignments[slug])
     selected, occupied, keys, identities, questions, deferred = [], set(), set(), set(), set(), []
     # Round robin prevents the first large subsystem from consuming the cap.
-    for row in zip_longest(*(by_slug[slug]["concerns"] for slug in expected)):
+    for row in zip_longest(*(by_slug[slug]["concerns"] for slug in expected if slug in by_slug)):
         for proposal in row:
             if proposal is None:
                 continue
@@ -152,6 +154,24 @@ def deferred_queue(scans, deferred, prs):
     return queued_concerns
 
 
+def build_report(scans, context):
+    """Keep validated partial work while explicitly reporting missing coverage."""
+    selected, deferred = combine(scans, context, allow_partial=True)
+    expected = context.get('selected_shards', [name for name, _, _ in SHARDS])
+    received = {scan['shard'] for scan in scans}
+    missing = [name for name in expected if name not in received]
+    queued = deferred_queue(scans, deferred, context['existing_prs'])
+    if missing:
+        selected_keys = {item['key'] for item in selected}
+        queued.extend(item for item in context.get('pending_concerns', [])
+                      if docs.validate_item(item)['key'] not in selected_keys)
+    return {'base_sha': context['base_sha'], 'scans': scans, 'selected': selected,
+            'deferred': deferred, 'queued_concerns': pending_from_report({'queued_concerns': queued}, context),
+            'expected_shards': expected, 'missing_shards': missing, 'complete': not missing,
+            'doc_inventory': context.get('doc_inventory', []),
+            'dry_run': context.get('dry_run', False), 'max_prs': context.get('max_prs', docs.MAX_PRS)}
+
+
 def pending_from_report(report, context):
     """Carry deferred concerns as evidence; revalidate against current docs/history."""
     history = {line.split()[0] for line in context['code_history']}
@@ -159,6 +179,9 @@ def pending_from_report(report, context):
     for proposal in report.get('queued_concerns', []):
         item = docs.validate_item(proposal)
         identity = (item['area'], item['concern'])
+        if any(f"{docs.MARKER}{item['key']} -->" in pr['body'] or item['branch'] == pr['branch']
+               for pr in context.get('existing_prs', [])):
+            continue
         if item['source_sha'] in history and identity not in seen:
             seen.add(identity)
             result.append(item)
@@ -184,10 +207,11 @@ def previous_pending(repo, branch, context):
             docs.run('gh', 'run', 'download', str(run['id']), '--repo', repo,
                      '--name', 'nightly-docs-discovery-report', '--dir', directory)
             report = json.loads(Path(directory, 'nightly-docs-discovery-report.json').read_text())
-        # Only full, publishing runs may replace the retained queue. A pilot
-        # dispatched on main is still a pilot, regardless of its branch.
+        # A full production attempt may carry a partial recovery report.
+        # Filtered/dry-run pilots still cannot replace the production queue.
         if (report.get('dry_run') is not False or report.get('max_prs') != docs.MAX_PRS
-                or {scan['shard'] for scan in report.get('scans', [])} != {name for name, _, _ in SHARDS}):
+                or set(report.get('expected_shards', [scan['shard'] for scan in report.get('scans', [])]))
+                != {name for name, _, _ in SHARDS}):
             continue
         return pending_from_report(report, context)
     return []
@@ -229,17 +253,20 @@ def main():
                           f"{len(scan['concerns'])} proposed concerns.\n")
     elif command == "combine":
         scans = [json.loads(path.read_text()) for path in Path(os.environ["SCAN_DIR"]).glob("*.json")]
-        selected, deferred = combine(scans, context)
-        queued_concerns = deferred_queue(scans, deferred, context['existing_prs'])
-        report = {"queued_concerns": queued_concerns, "doc_inventory": context["doc_inventory"],
-                  "base_sha": context["base_sha"], "scans": scans, "selected": selected,
-                  "deferred": deferred, "dry_run": context["dry_run"], "max_prs": context["max_prs"]}
+        report = build_report(scans, context)
+        selected, deferred = report['selected'], report['deferred']
         Path(os.environ["REPORT_OUTPUT"]).write_text(json.dumps(report, indent=2))
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write("matrix=" + json.dumps({"include": selected}) + "\n")
             output.write(f"count={len(selected)}\n")
+            output.write(f"complete={str(report['complete']).lower()}\n")
+            output.write("missing=" + ", ".join(report['missing_shards']) + "\n")
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
             summary.write(f"Selected {len(selected)} independent concerns; deferred {len(deferred)}.\n\n")
+            if report['missing_shards']:
+                summary.write("**Incomplete discovery**: no validated result from "
+                              + ", ".join(report['missing_shards'])
+                              + ". Successful scans continue; missing scans remain eligible next run.\n\n")
             summary.write("| Scan | Eligible commits | Reported inspected | Proposals |\n| --- | ---: | ---: | ---: |\n")
             assignments = partition(context)
             for scan in scans:

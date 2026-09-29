@@ -11,8 +11,9 @@ the existing release-driven Pages workflow publishes the website separately.
    calling a model. Partition the full first-parent code/configuration history
    into eight focused scans: CLI observation, CLI actions, model storage,
    runtimes/accelerators, workloads/rollouts, networking/traffic,
-   autoscaling/quota, and operations. Each scan has its own 100-turn budget
-   (80 turns for discovery, reserving headroom for the result). Commits touching
+   autoscaling/quota, and operations. Each scan has a 200-turn hard ceiling
+   and an 80-turn investigation target, leaving headroom for tool batches and
+   structured output. The ceiling is not a target for more investigation. Commits touching
    several areas can appear in several scans; otherwise-unassigned commits go
    to operations. No eligible commit is dropped by the partition.
    There is no date cutoff or persisted success cursor: older gaps and failed or
@@ -22,7 +23,7 @@ the existing release-driven Pages workflow publishes the website separately.
    existing candidate pages, identify canonical pages needing correction, and
    justify each new page. A new page cannot substitute for fixing an existing
    false claim, including claims left behind by a merged related documentation PR.
-2. Combine the eight validated results in round-robin order and select
+2. Combine the available validated results in round-robin order and select
    **at most 100 independent concerns per run**, not 100 per scan. Each concern answers
    one concrete user question or corrects one stale claim and cites a source
    commit. Sharing a subsystem or source commit never justifies bundling fixes.
@@ -94,16 +95,30 @@ The `nightly-docs-discovery-report` artifact (14-day retention) contains every
 scan, the selected plan, and reasons for deferring proposals. Concerns deferred
 for a shared canonical page or the PR cap are saved as `queued_concerns`. The
 next run paginates default-branch runs from the last 14 days to find the newest
-eligible retained plan and supplies that queue for fresh evaluation. Only reports covering all eight
-scans with the default 100-concern cap and dry-run disabled may seed the queue;
+eligible retained plan and supplies that queue for fresh evaluation. Only runs
+that requested all eight scans with the default 100-concern cap and dry-run
+disabled may seed the queue, including incomplete production runs;
 branch pilots and limited/dry runs on main cannot replace it. Deferred records
 use the full source/area/concern key, so equal slugs in different areas do not
 queue selected work by accident.
 This is a best-effort queue within artifact retention; full-history discovery
 still covers older work when evidence expires. Job summaries show
 eligible commits, reported inspected commits and candidate counts by scan.
-A missing/invalid scan fails planning rather than silently treating it as an
-empty result. This makes incomplete discovery visible and retryable.
+A failed scan does not discard successful scans: planning and downstream jobs
+explicitly tolerate failed discovery dependencies. Each received artifact must
+still pass source, baseline, placement, and scope validation; invalid or duplicate
+artifacts fail planning. Missing artifacts are recorded as `missing_shards` beside
+`expected_shards` and `complete` in the report, never treated as inspected empty
+results. A separate coverage job fails when scans are missing, so the run remains
+visibly incomplete even while validated concerns proceed through normal review,
+build, and publication guards. No scans means no writing/publication jobs, but a
+report still records the missing coverage and retained queue.
+Incomplete reports preserve prior unselected pending concerns alongside newly
+deferred work, deduplicate them, and remove already recorded PR identities.
+The next nightly rechecks all code history, including failed subsystems and the
+retained pending concerns. A complete scan can retire old concerns it no longer
+proposes. This recovery remains bounded by the 100-item queue and artifact
+retention; it is not a guarantee of exhaustive discovery or an immediate retry.
 Existing PR branches are never force-pushed or overwritten. If a previous run
 pushed a branch but failed to open its PR, an exact retry can reuse that tree;
 otherwise the job fails for maintainer inspection instead of overwriting it.

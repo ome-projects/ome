@@ -98,6 +98,52 @@ class DiscoveryTests(unittest.TestCase):
                 self.combine()
             self.scans = original
 
+    def test_partial_discovery_selects_valid_work_and_preserves_unfinished_queue(self):
+        """A missing scan must not discard another scan's validated concerns."""
+        first = proposal()
+        second = proposal(concern='another-fix', question='Another claim')
+        pending = docs.validate_item(proposal(concern='prior-work', question='Prior gap',
+                                             doc_paths=[docs.DOC_ROOT + 'tasks/prior.md']))
+        self.context['pending_concerns'] = [pending]
+        self.scans[0].update(inspected_commits=['a' * 40], concerns=[first, second])
+        with patch.object(discovery, 'partition', return_value=self.assignments):
+            report = discovery.build_report(self.scans[:1], self.context)
+        self.assertEqual(len(report['selected']), 1)
+        self.assertFalse(report['complete'])
+        self.assertEqual(report['missing_shards'], [s['shard'] for s in self.scans[1:]])
+        self.assertEqual({i['concern'] for i in report['queued_concerns']}, {'another-fix', 'prior-work'})
+        self.assertEqual(report['expected_shards'], [s['shard'] for s in self.scans])
+
+    def test_all_missing_scans_preserve_queue_without_inventing_work(self):
+        """An empty artifact set must produce an explicitly incomplete report."""
+        self.context['pending_concerns'] = [docs.validate_item(proposal())]
+        with patch.object(discovery, 'partition', return_value=self.assignments):
+            report = discovery.build_report([], self.context)
+        self.assertFalse(report['complete'])
+        self.assertEqual(report['selected'], [])
+        self.assertEqual(report['queued_concerns'], self.context['pending_concerns'])
+        self.assertEqual(len(report['missing_shards']), len(discovery.SHARDS))
+
+    def test_partial_mode_never_accepts_invalid_or_duplicate_received_scans(self):
+        """Only absence is tolerated; malformed received evidence still fails."""
+        scan = self.scans[0]
+        variants = [[scan, scan], [{**scan, 'shard': 'unknown'}],
+                    [{**scan, 'base_sha': 'd' * 40}],
+                    [{**scan, 'inspected_commits': [], 'concerns': [proposal()]}]]
+        for scans in variants:
+            with self.subTest(scans=scans), patch.object(discovery, 'partition', return_value=self.assignments):
+                with self.assertRaises(ValueError):
+                    discovery.build_report(scans, self.context)
+
+    def test_complete_discovery_does_not_retain_reexamined_stale_queue(self):
+        """Successful full discovery can retire old concerns no longer proposed."""
+        self.context['pending_concerns'] = [docs.validate_item(proposal())]
+        with patch.object(discovery, 'partition', return_value=self.assignments):
+            report = discovery.build_report(self.scans, self.context)
+        self.assertTrue(report['complete'])
+        self.assertEqual(report['missing_shards'], [])
+        self.assertEqual(report['queued_concerns'], [])
+
     def test_unknown_or_uninspected_source_is_rejected(self):
         scan = self.scans[0]
         for changes in [dict(inspected_commits=['d' * 40]),
