@@ -163,20 +163,23 @@ def build_report(scans, context):
     queued = deferred_queue(scans, deferred, context['existing_prs'])
     if missing:
         selected_ids = {(item['area'], item['concern']) for item in selected}
-        queued.extend(item for item in context.get('pending_concerns', [])
-                      if (item['area'], item['concern']) not in selected_ids)
+        prior = [item for item in context.get('pending_concerns', [])
+                 if (item['area'], item['concern']) not in selected_ids]
+        queued = prior + queued
+    queued = pending_candidates(queued, context)
     return {'base_sha': context['base_sha'], 'scans': scans, 'selected': selected,
-            'deferred': deferred, 'queued_concerns': pending_from_report({'queued_concerns': queued}, context),
+            'deferred': deferred, 'queued_concerns': queued[:docs.MAX_PRS],
+            'queue_overflow': [item['key'] for item in queued[docs.MAX_PRS:]],
             'expected_shards': expected, 'missing_shards': missing, 'complete': not missing,
             'doc_inventory': context.get('doc_inventory', []),
             'dry_run': context.get('dry_run', False), 'max_prs': context.get('max_prs', docs.MAX_PRS)}
 
 
-def pending_from_report(report, context):
-    """Carry deferred concerns as evidence; revalidate against current docs/history."""
+def pending_candidates(proposals, context):
+    """Validate and deduplicate pending evidence before applying the queue cap."""
     history = {line.split()[0] for line in context['code_history']}
     result, seen = [], set()
-    for proposal in report.get('queued_concerns', []):
+    for proposal in proposals:
         item = docs.validate_item(proposal)
         identity = (item['area'], item['concern'])
         if any(f"{docs.MARKER}{item['key']} -->" in pr['body'] or item['branch'] == pr['branch']
@@ -185,7 +188,12 @@ def pending_from_report(report, context):
         if item['source_sha'] in history and identity not in seen:
             seen.add(identity)
             result.append(item)
-    return result[:docs.MAX_PRS]
+    return result
+
+
+def pending_from_report(report, context):
+    """Carry a bounded queue as evidence for fresh discovery."""
+    return pending_candidates(report.get('queued_concerns', []), context)[:docs.MAX_PRS]
 
 
 def previous_pending(repo, branch, context):
@@ -267,6 +275,13 @@ def main():
                 summary.write("**Incomplete discovery**: no validated result from "
                               + ", ".join(report['missing_shards'])
                               + ". Successful scans continue; missing scans remain eligible next run.\n\n")
+            if report['queue_overflow']:
+                summary.write(f"**Queue overflow**: {len(report['queue_overflow'])} concerns exceed the "
+                              f"{docs.MAX_PRS}-item pending queue. They remain eligible through full-history "
+                              "discovery, but are not carried as pending evidence:\n\n")
+                for key in report['queue_overflow']:
+                    summary.write(f"- `{key}`\n")
+                summary.write("\n")
             summary.write("| Scan | Eligible commits | Reported inspected | Proposals |\n| --- | ---: | ---: | ---: |\n")
             assignments = partition(context)
             for scan in scans:

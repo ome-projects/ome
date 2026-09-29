@@ -113,8 +113,12 @@ results. A separate coverage job fails when scans are missing, so the run remain
 visibly incomplete even while validated concerns proceed through normal review,
 build, and publication guards. No scans means no writing/publication jobs, but a
 report still records the missing coverage and retained queue.
-Incomplete reports preserve prior unselected pending concerns alongside newly
+Incomplete reports give prior unselected pending concerns priority over newly
 deferred work, deduplicate them, and remove already recorded PR identities.
+The pending queue holds at most 100 concerns. Any excess concerns are explicitly
+listed by key in `queue_overflow` and the job summary; they are not carried as
+pending evidence, but remain eligible through full-history discovery. Prior
+pending work therefore cannot be silently displaced by newly deferred concerns.
 The next nightly rechecks all code history, including failed subsystems and the
 retained pending concerns. A complete scan can retire old concerns it no longer
 proposes. This recovery remains bounded by the 100-item queue and artifact

@@ -147,6 +147,19 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     discovery.build_report(scans, self.context)
 
+    def test_partial_queue_preserves_prior_work_and_reports_overflow(self):
+        """The bounded queue must not silently evict work from missing scans."""
+        prior = [docs.validate_item(proposal(concern=f'prior-{i}')) for i in range(docs.MAX_PRS)]
+        self.context.update(pending_concerns=prior, max_prs=1)
+        first = proposal(concern='selected')
+        deferred = proposal(concern='newly-deferred', question='Another gap',
+                            doc_paths=[docs.DOC_ROOT + 'tasks/other.md'])
+        self.scans[0].update(inspected_commits=['a' * 40], concerns=[first, deferred])
+        with patch.object(discovery, 'partition', return_value=self.assignments):
+            report = discovery.build_report(self.scans[:1], self.context)
+        self.assertEqual(report['queued_concerns'], prior)
+        self.assertEqual(report['queue_overflow'], [docs.validate_item(deferred)['key']])
+
     def test_complete_discovery_does_not_retain_reexamined_stale_queue(self):
         """Successful full discovery can retire old concerns no longer proposed."""
         self.context['pending_concerns'] = [docs.validate_item(proposal())]
