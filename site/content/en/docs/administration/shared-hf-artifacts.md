@@ -267,6 +267,14 @@ An older Ready label alone is not acknowledgement of the new request. Each
 node reports independently; replaced models, replaced Nodes, or changed
 requests cannot complete an older attempt.
 
+At startup and every ConfigMap reconciliation interval (five minutes by default),
+the agent retries missing current-request reports or paired labels through the
+same validation path. This covers publication failures, exhausted retries,
+restart, and sibling repair. Completed reports with both labels do not queue
+work; periodic retries coalesce with pending work and preserve explicit download
+or override requests. Recovery still requires the Node instance observed at
+startup and never adopts an ordinary directory whose ownership record is absent.
+
 ## When the agent falls back to a per-model copy
 
 `ReuseIfExists` is best-effort admission into sharing; ineligible models keep

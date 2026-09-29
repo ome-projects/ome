@@ -49,6 +49,8 @@ type GopherTask struct {
 	SamePathWaitStartedAt  time.Time
 	NormalPriorityOnly     bool
 	RevalidationReplay     bool
+	// ArtifactReportRecovery is periodic work, subordinate to explicit tasks.
+	ArtifactReportRecovery bool
 	// Sequence is assigned once and retained when this logical task is requeued.
 	Sequence uint64
 	// SharedArtifact selects ownership-aware handling; ordinary tasks keep the legacy path.
@@ -176,13 +178,12 @@ func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int, numHighPriorityWorke
 		}
 	}
 
-	// Start the ConfigMap reconciliation service
-	s.configMapReconciler.StartReconciliation()
-	s.logger.Info("Started ConfigMap reconciliation service")
-
 	if s.taskQueue == nil {
 		s.taskQueue = newGopherTaskQueue()
 	}
+	// Recovery shares the existing initial and periodic reconciliation pass.
+	s.configMapReconciler.StartReconciliation(s.recoverArtifactReports)
+	s.logger.Info("Started ConfigMap reconciliation service")
 	if numHighPriorityWorker < 1 {
 		numHighPriorityWorker = 1
 	}
@@ -230,16 +231,22 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if task == nil {
 		return
 	}
+	if s.taskQueue == nil {
+		s.taskQueue = newGopherTaskQueue()
+	}
+	// Reserve explicit intent before allocating its sequence. A periodic tick
+	// must see it even if routing or admission has not reached the queue yet.
+	if !task.ArtifactReportRecovery {
+		s.taskQueue.retainTask(task)
+	}
 	s.artifactRouting.mutex.Lock()
 	s.routeArtifactTaskLocked(task)
 	s.artifactRouting.mutex.Unlock()
 	task.Sequence = s.taskTracker.ensureSequence(task.Sequence)
-	if s.taskQueue == nil {
-		s.taskQueue = newGopherTaskQueue()
-	}
 	if (task.TaskType == Delete || task.TaskType == Evict) && usesArtifactTaskCoordinator(task) {
 		attempt, result := s.taskTracker.beginDelete(gopherTaskModelKey(task), task.Sequence)
 		if result == gopherTaskStale {
+			s.taskQueue.cancelRetainedTask(task)
 			return
 		}
 		s.taskTracker.finishDelete(attempt, true)
@@ -434,6 +441,21 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 ) error {
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
+	}
+	if s.taskQueue == nil {
+		s.taskQueue = newGopherTaskQueue()
+	}
+	if !s.taskQueue.startTask(task) {
+		return nil
+	}
+	defer s.taskQueue.finishTask(task)
+	if task.ArtifactReportRecovery {
+		// A sibling or an earlier attempt may have completed since this was
+		// queued. Check before beginTask can advance the sequence fence.
+		needed, err := s.artifactReportRecoveryNeeded(context.Background(), task)
+		if err != nil || !needed {
+			return err
+		}
 	}
 	// Get model info for logging
 	modelInfo := getModelInfoForLogging(task)
@@ -1430,9 +1452,15 @@ func (s *Gopher) requeueArtifactWait(task *GopherTask, waitingOnKey string) bool
 		delay = defaultSamePathWaitDelay
 	}
 	s.logger.Infof("Waiting for artifact operation %s for %s; requeueing after %s", waitingOnKey, getModelInfoForLogging(task), delay)
+	if s.taskQueue != nil {
+		s.taskQueue.retainTask(task)
+	}
 	time.AfterFunc(delay, func() {
 		defer func() {
 			if r := recover(); r != nil {
+				if s.taskQueue != nil {
+					s.taskQueue.cancelRetainedTask(task)
+				}
 				s.logger.Warnf("Cannot requeue artifact wait task for %s because gopher channel is closed: %v", getModelInfoForLogging(task), r)
 			}
 		}()
