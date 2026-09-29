@@ -257,10 +257,10 @@ Resident files are not migrated between storage layouts.
 ## Restoring or validating an artifact
 
 Remove `ome.io/artifact-residency: Evicted` and set a new, nonempty
-`ome.io/artifact-rehydration-id` on an HF model or eligible Shared model. Use a Kubernetes
+`ome.io/artifact-rehydration-id` on an HF or OCI model. Use a Kubernetes
 label value, for example `restore-20260929-1`. Changing these controls queues
-normal reuse: healthy bytes are validated and reattached without downloading.
-Missing or corrupt bytes use the existing Shared download and repair flow.
+normal reuse: healthy bytes are validated without downloading. Shared copies
+are reattached, and missing or corrupt bytes use the existing repair flow.
 Direct or Local borrowers and unrecorded child links prevent unsafe replacement;
 tracked Shared siblings use coordinated readiness withdrawal and repair.
 
@@ -270,12 +270,23 @@ downloading, even when other models reference them. Missing or corrupt files
 are repaired only after readiness withdrawal and reference checks; inspection
 errors preserve bytes. Non-reuse HF policies continue to use Direct storage.
 
+Direct OCI directories use Object Storage listings and the existing size and
+integrity checks, without requiring HF identity metadata. The agent inspects
+all selected files before removing invalid copies; listing or inspection
+failures preserve existing bytes. Empty listings and unsafe object paths cannot
+complete restoration. TensorRT-LLM serving models retain the current node's
+shape filter, including during periodic recovery. Cancellation interrupts active
+multipart response reads; standard downloads finish the current file, and
+in-flight SDK requests retain their existing retries.
+A canceled OCI transfer keeps its file lock until all transfer workers exit.
+
 Interrupted cleanup finishes at its original paths before restoration proceeds.
 Current source and download policy select the layout at the configured
 destination; an old `Evicted` report does not preserve the former layout.
 An existing ordinary directory is never adopted into Shared storage. After
 completed eviction, a reuse-eligible HF source may select Shared at the same
-customer path. Ordinary OCI Direct and Local restoration remain unsupported.
+customer path; HF-origin OCI follows the same existing eligibility rules.
+Ordinary OCI remains Direct. Local restoration remains unsupported.
 Downloads without this annotation keep their existing behavior.
 
 The agent first records `Ready`, `modelUID`, `artifactRehydrationID`, and
@@ -292,7 +303,7 @@ same validation path. This covers publication failures, exhausted retries,
 restart, and sibling repair. Completed reports with both labels do not queue
 work; periodic retries coalesce with pending work and preserve explicit download
 or override requests. Recovery still requires the Node instance observed at
-startup. A missing Direct HF report triggers validation at the configured
+startup. A missing Direct HF or OCI report triggers validation at the configured
 directory and does not change a resident directory's layout.
 
 ## When the agent falls back to a per-model copy

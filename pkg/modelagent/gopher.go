@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -481,8 +482,8 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 			if err != nil {
 				return err
 			}
-			if !eligible && !isDirectHfRestoreEligible(task, taskModelSpec(task).Storage) {
-				return fmt.Errorf("artifact restoration requires an eligible HF or Shared source")
+			if !eligible && !isDirectHfRestoreEligible(task, taskModelSpec(task).Storage) && !isDirectOCIRestoreEligible(task) {
+				return fmt.Errorf("artifact restoration requires an eligible HF or OCI source")
 			}
 		}
 	}
@@ -648,7 +649,11 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 				return nil
 			}
 
-			if shouldUseSamePathObjectStorageReuse(task) {
+			if artifactRehydrationID(task) != "" {
+				if err := downloadObjectStorageModel(); err != nil {
+					return err
+				}
+			} else if shouldUseSamePathObjectStorageReuse(task) {
 				if matchedKey, reused := s.findReadyObjectStorageModelWithSamePath(ctx, task, baseModelSpec, destPath); reused {
 					s.logger.Infof("Reusing Ready same-path model artifact for %s/%s from %s at %s", namespace, name, matchedKey, destPath)
 				} else if matchedKey, wait := s.findUpdatingObjectStorageModelWithSamePath(ctx, task, baseModelSpec, destPath); wait &&
@@ -684,6 +689,14 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 					return ctx.Err()
 				}
 				s.logger.Errorf("Failed to parse and update model config: %v", err)
+			}
+			if artifactRehydrationID(task) != "" {
+				uid := types.UID(getModelUID(task))
+				if err := reportArtifactRestore(ctx, getModelID(task.BaseModel, task.ClusterBaseModel), uid, func(_ *corev1.ConfigMap, entry ModelEntry) error {
+					return validateDirectRestoreEntry(uid, entry)
+				}); err != nil {
+					return err
+				}
 			}
 		case storage.StorageTypeVendor:
 			s.logger.Infof("Skipping download for model %s", modelInfo)
@@ -1517,6 +1530,25 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	store, err := s.createOCIOSDataStore(taskModelSpec(task))
+	if err != nil {
+		return fmt.Errorf("failed to create object storage client: %w", err)
+	}
+	s.logger.Infof("Making call to object storage with endpoint %s", store.Client.Endpoint())
+	return s.downloadModelWithStore(ctx, uri, destPath, task, store)
+}
+
+// Each invocation owns its source client; tests replace only remote I/O.
+type ociModelStore interface {
+	ListObjects(ociobjectstore.ObjectURI) ([]objectstorage.ObjectSummary, error)
+	IsLocalCopyValid(ociobjectstore.ObjectURI, string) (bool, error)
+	BulkDownloadContext(context.Context, []ociobjectstore.ObjectURI, string, int, ...ociobjectstore.DownloadOption) error
+}
+
+func (s *Gopher) downloadModelWithStore(ctx context.Context, uri *ociobjectstore.ObjectURI, destPath string, task *GopherTask, ociOSDataStore ociModelStore) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	startTime := time.Now()
 	defer func() {
 		s.logger.Infof("Download process took %v", time.Since(startTime).Round(time.Millisecond))
@@ -1532,11 +1564,18 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	} else {
 		baseModelSpec = task.ClusterBaseModel.Spec
 	}
-
-	// Create oci object storage data store client for this task
-	ociOSDataStore, err := s.createOCIOSDataStore(baseModelSpec)
-	if err != nil {
-		return fmt.Errorf("failed to create object storage client: %w", err)
+	// SharedArtifact can stay true after falling back to a resident Direct directory.
+	// Use the destination to distinguish Direct restoration from Shared parent writes.
+	directRestore := artifactRehydrationID(task) != "" && filepath.Clean(destPath) == filepath.Clean(getDestPath(&baseModelSpec, s.modelRootDir))
+	if directRestore {
+		path, err := s.directEvictionPath(destPath)
+		if err != nil {
+			return err
+		}
+		destPath = path
+		if err := s.prepareDirectRestore(ctx, task, path, false); err != nil {
+			return err
+		}
 	}
 
 	// Check context before making expensive operations
@@ -1546,12 +1585,11 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	default:
 	}
 
-	s.logger.Infof("Making call to object storage with endpoint %s", ociOSDataStore.Client.Endpoint())
 	objects, err := ociOSDataStore.ListObjects(*uri)
 	if err != nil {
 		return fmt.Errorf("failed to list objects: %w", err)
 	}
-	if task.SharedArtifact {
+	if task.SharedArtifact && !directRestore {
 		objects = filterInternalArtifactObjectSummaries(objects)
 	}
 
@@ -1581,9 +1619,12 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	var objectUris []ociobjectstore.ObjectURI
 	for _, obj := range objects {
 		if obj.Name == nil {
+			if directRestore {
+				return fmt.Errorf("OCI restoration listing contains an unnamed object")
+			}
 			continue
 		}
-		if sharedParentDownload {
+		if sharedParentDownload || directRestore {
 			if _, err := hfArtifactObjectPath(destPath, uri.Prefix, *obj.Name); err != nil {
 				return err
 			}
@@ -1594,6 +1635,16 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 			ObjectName: *obj.Name,
 			Prefix:     uri.Prefix,
 		})
+	}
+	if directRestore {
+		valid, err := s.inspectDirectOCI(ctx, task, destPath, objectUris, ociOSDataStore)
+		if err != nil {
+			return err
+		}
+		if valid {
+			ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard).validated = true
+			return validateArtifactRestore(ctx)
+		}
 	}
 
 	// Check context before starting bulk download
@@ -1645,6 +1696,12 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 		}
 		return fmt.Errorf("integrity verification failed for %d/%d files: %s", len(verificationErrors), len(objects), strings.Join(errMsgs, "; "))
 	}
+	if directRestore {
+		if err := validateArtifactRestore(ctx); err != nil {
+			return err
+		}
+		ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard).validated = true
+	}
 
 	// Calculate and record total bytes transferred
 	var totalBytes int64
@@ -1660,7 +1717,7 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	return nil
 }
 
-func (s *Gopher) verifyDownloadedFiles(ctx context.Context, ociOSDataStore *ociobjectstore.OCIOSDataStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
+func (s *Gopher) verifyDownloadedFiles(ctx context.Context, ociOSDataStore ociModelStore, uris []ociobjectstore.ObjectURI, destPath string, task *GopherTask) map[string]error {
 	errors := s.verifyDownloadedFilesWithValidator(ctx, uris, destPath, ociOSDataStore.IsLocalCopyValid)
 
 	if ctx.Err() != nil {

@@ -97,9 +97,6 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 	}
 	switch result.Outcome {
 	case hfArtifactTaskUseDefaultDownload:
-		if artifactRehydrationID(task) != "" {
-			return true, false, fmt.Errorf("Shared restoration cannot adopt a resident Direct path")
-		}
 		if isSharedHfArtifactSymlink(input.ChildModelPath) {
 			return true, false, fmt.Errorf("refusing default download through an unrelated shared artifact symlink")
 		}
@@ -449,7 +446,7 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 		}
 	}
 	if handler.childPathConflictsWithParent(input.ChildModelPath, input.Parent.LocalPath) {
-		if artifactRehydrationID(task) != "" {
+		if artifactRehydrationID(task) != "" && !isDirectOCIRestoreEligible(task) {
 			return hfArtifactTaskResult{}, fmt.Errorf("Shared restoration cannot adopt a resident Direct path")
 		}
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil

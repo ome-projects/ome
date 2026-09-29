@@ -116,6 +116,21 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 	if node.UID != s.artifactNodeUID || node.DeletionTimestamp != nil || !(&Scout{nodeInfo: node, logger: s.logger}).shouldDownloadModel(taskModelSpec(current).Storage) {
 		return fmt.Errorf("artifact restoration Node identity or eligibility changed")
 	}
+	// Status callbacks reconstruct model-only tasks. Keep the source subset
+	// pinned to this attempt when those callbacks run under its restore guard.
+	shapeTask := task
+	if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil && getModelUID(guard.task) == getModelUID(task) {
+		shapeTask = guard.task
+	}
+	if isDirectOCIRestoreEligible(shapeTask) && (shapeTask.TaskType == Download || shapeTask.TaskType == DownloadOverride) {
+		filter, err := ociRestoreShapeFilter(shapeTask, node)
+		if err != nil {
+			return err
+		}
+		if filter != nil && !reflect.DeepEqual(filter, shapeTask.TensorRTLLMShapeFilter) {
+			return fmt.Errorf("OCI restoration node shape filter is absent or changed")
+		}
+	}
 	return nil
 }
 

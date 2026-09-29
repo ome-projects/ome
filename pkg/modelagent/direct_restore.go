@@ -19,19 +19,22 @@ func validateDirectRestoreEntry(uid types.UID, entry ModelEntry) error {
 // content validation proves repair is needed.
 func (s *Gopher) prepareDirectRestore(ctx context.Context, task *GopherTask, path string, repair bool) error {
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
+	cm, err := s.configMapReconciler.getConfigMap(ctx)
+	if err != nil {
+		return err
+	}
+	entry, err := existingModelEntry(cm.Data, key)
+	if err != nil {
+		return err
+	}
+	if err := validateDirectRestoreEntry(types.UID(getModelUID(task)), entry); err != nil {
+		return err
+	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return err
+	}
 	if !repair {
-		cm, err := s.configMapReconciler.getConfigMap(ctx)
-		if err != nil {
-			return err
-		}
-		entry, err := existingModelEntry(cm.Data, key)
-		if err != nil {
-			return err
-		}
-		if err := validateDirectRestoreEntry(types.UID(getModelUID(task)), entry); err != nil {
-			return err
-		}
-		return validateArtifactRestore(ctx)
+		return nil
 	}
 	if err := s.checkDirectEvictionUsers(ctx, key, path); err != nil {
 		return err
