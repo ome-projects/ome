@@ -127,19 +127,29 @@ func NewConfigMapReconciler(nodeName string, namespace string, kubeClient kubern
 //
 // This method should be called once during component initialization,
 // typically from the model agent's main startup sequence.
-func (c *ConfigMapReconciler) StartReconciliation() {
+func (c *ConfigMapReconciler) StartReconciliation(recoverArtifactReports func(context.Context) error) {
 	c.logger.Infof("Starting ConfigMap reconciliation with interval %v", c.reconcileInterval)
 	go func() {
 		ticker := time.NewTicker(c.reconcileInterval)
 		defer ticker.Stop()
+		reconcile := func() {
+			c.reconcileConfigMaps()
+			if recoverArtifactReports != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := recoverArtifactReports(ctx); err != nil {
+					c.logger.Warnf("Artifact report recovery deferred: %v", err)
+				}
+			}
+		}
 
 		// Perform initial reconciliation immediately
-		c.reconcileConfigMaps()
+		reconcile()
 
 		for {
 			select {
 			case <-ticker.C:
-				c.reconcileConfigMaps()
+				reconcile()
 			case <-c.stopCh:
 				c.logger.Info("Stopping ConfigMap reconciliation")
 				return
@@ -723,6 +733,14 @@ func (c *ConfigMapReconciler) updateModelStatusInConfigMap(ctx context.Context, 
 				readyBlocked = true
 				return false, nil
 			}
+		}
+		if guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard); guard != nil && op.ModelStatus == ModelStatusFailed {
+			if err := guard.gopher.validateArtifactDownload(ctx, guard.task); err != nil {
+				return false, err
+			}
+			modelEntry.ModelUID, modelEntry.NodeUID = modelUID, guard.gopher.artifactNodeUID
+			modelEntry.ArtifactRehydrationID = artifactRehydrationID(guard.task)
+			modelEntry.ArtifactRehydrationFailed = !guard.reporting
 		}
 		modelEntry.Status = op.ModelStatus
 		if op.ModelStatus == ModelStatusReady || op.ModelStatus == ModelStatusFailed {
