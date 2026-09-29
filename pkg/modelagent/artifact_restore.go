@@ -84,7 +84,7 @@ func reportArtifactRestore(ctx context.Context, key string, uid types.UID, valid
 		if !guard.validated {
 			return false, fmt.Errorf("artifact restoration requires current readiness checks")
 		}
-		if entry.HfArtifactPendingDeletion != nil {
+		if entry.HfArtifactPendingDeletion != nil || entry.DirectArtifactPendingDeletion != nil {
 			return false, fmt.Errorf("artifact restoration cleanup is unfinished")
 		}
 		entry.Status, entry.Progress = ModelStatusReady, nil
@@ -116,7 +116,7 @@ func (s *Gopher) validateArtifactRestoreReport(ctx context.Context, task *Gopher
 	if err != nil {
 		return err
 	}
-	if entry.Status != ModelStatusReady || entry.ModelUID != types.UID(getModelUID(task)) || entry.NodeUID != s.artifactNodeUID || entry.ArtifactRehydrationID != artifactRehydrationID(task) || entry.HfArtifactKey == "" || entry.HfArtifactPendingDeletion != nil {
+	if entry.Status != ModelStatusReady || entry.ModelUID != types.UID(getModelUID(task)) || entry.NodeUID != s.artifactNodeUID || entry.ArtifactRehydrationID != artifactRehydrationID(task) || entry.HfArtifactPendingDeletion != nil || entry.DirectArtifactPendingDeletion != nil {
 		return fmt.Errorf("artifact restoration report is absent or stale")
 	}
 	return nil
