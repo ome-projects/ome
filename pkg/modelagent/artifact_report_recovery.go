@@ -81,14 +81,26 @@ func (s *Gopher) artifactReportNeedsRecovery(task *GopherTask, cm *corev1.Config
 		return false
 	}
 	_, eligible, err := newHfArtifactTaskInputForOCI(task, spec.Storage, s.modelRootDir)
-	if err != nil || !eligible && !isDirectHfReuseEligible(task, spec.Storage) {
+	direct := isDirectHfRestoreEligible(task, spec.Storage)
+	if err != nil || !eligible && !direct {
 		return false
 	}
-	// Current reuse policy is not ownership of an existing Direct directory.
-	// Leave such paths untouched even after loss of their ConfigMap entry.
+	// Direct HF uses the configured directory, including after loss of its
+	// report. Existing directories are never adopted as Shared parents.
 	path := getDestPath(&spec, s.modelRootDir)
 	info, err := os.Lstat(path)
-	if err != nil && !os.IsNotExist(err) || err == nil && (info.Mode()&os.ModeSymlink == 0 || !isSharedHfArtifactSymlink(path)) {
+	if err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if !isSharedHfArtifactSymlink(path) {
+			return false
+		}
+	} else if direct {
+		if _, err := s.directEvictionPath(path); err != nil {
+			return false
+		}
+	} else if err == nil {
 		return false
 	}
 	if cm == nil {
@@ -98,6 +110,6 @@ func (s *Gopher) artifactReportNeedsRecovery(task *GopherTask, cm *corev1.Config
 	label, labelErr := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel})
 	return err != nil || labelErr != nil || entry.Status != ModelStatusReady ||
 		entry.ModelUID != types.UID(getModelUID(task)) || entry.NodeUID != s.artifactNodeUID ||
-		entry.ArtifactRehydrationID != request || entry.HfArtifactKey == "" || entry.HfArtifactPendingDeletion != nil ||
+		entry.ArtifactRehydrationID != request || !direct && entry.HfArtifactKey == "" || entry.HfArtifactPendingDeletion != nil || entry.DirectArtifactPendingDeletion != nil ||
 		node.Labels[label] != string(Ready) || node.Labels[constants.GetModelArtifactRequestLabel(types.UID(getModelUID(task)))] != request
 }

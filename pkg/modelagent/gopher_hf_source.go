@@ -52,6 +52,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if !isValidHfModelID(components.ModelID) {
 		return false, fmt.Errorf("invalid direct HF model ID %q", components.ModelID)
 	}
+	if err := validateArtifactRestore(ctx); err != nil {
+		return false, err
+	}
 	// Preserve the ordinary downloader's empty-path fallback without mutating
 	// the task's spec. A missing path is not eligible for canonical-parent reuse.
 	storageSpec := *spec.Storage
@@ -100,6 +103,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 			if err == nil {
 				err = fmt.Errorf("HF revision resolution returned no immutable revision for %s", config.RepoID)
 			}
+			if artifactRehydrationID(task) != "" {
+				return false, err
+			}
 			// Unknown identity is not an identity change. Keep an existing shared
 			// copy attached until resolution can authorize any replacement.
 			if s.configMapReconciler != nil {
@@ -121,6 +127,16 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	}
 	var input hfArtifactTaskInput
 	var eligible bool
+	// An existing directory remains Direct even when today's policy could
+	// select Shared for an absent destination after completed eviction.
+	residentDirect := false
+	if artifactRehydrationID(task) != "" {
+		info, statErr := os.Lstat(destination)
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return false, statErr
+		}
+		residentDirect = statErr == nil && info.IsDir()
+	}
 	if resolved != "" {
 		identity, identityErr := newHfArtifactIdentity(config.RepoID, resolved)
 		if identityErr != nil {
@@ -128,31 +144,38 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 		}
 		task.HfResolvedRevision = identity.CommitSHA
 		config.Revision = identity.CommitSHA
-		if isDirectHfReuseEligible(task, spec.Storage) && s.configMapReconciler != nil {
+		if !residentDirect && isDirectHfReuseEligible(task, spec.Storage) && s.configMapReconciler != nil {
 			input, eligible, err = newHfArtifactTaskInput(task, spec.Storage, s.modelRootDir, identity)
 			if err != nil {
 				return false, err
 			}
 		}
 	}
-	if waiting, err := s.detachChangedDirectHfReference(ctx, task, spec, input, eligible, allowDownload); waiting || err != nil {
-		return waiting, err
+	// Fetch once per attempt. A restoration request needs immutable metadata
+	// before any replacement; ordinary ready reuse makes no extra Hub call.
+	var manifest hfSnapshotManifest
+	var manifestErr error
+	var manifestOnce sync.Once
+	getManifest := func() (hfSnapshotManifest, error) {
+		manifestOnce.Do(func() {
+			manifest, manifestErr = source.manifest(ctx, config.RepoID, config.Revision, config.Token, config.Endpoint)
+			if manifestErr == nil {
+				manifestErr = manifest.check(config.Revision)
+			}
+		})
+		return manifest, manifestErr
+	}
+	if artifactRehydrationID(task) != "" {
+		if _, err := getManifest(); err != nil {
+			return false, err
+		}
+	}
+	if !residentDirect {
+		if waiting, err := s.detachChangedDirectHfReference(ctx, task, spec, input, eligible, allowDownload); waiting || err != nil {
+			return waiting, err
+		}
 	}
 	if eligible {
-		// Fetch at most once in this attempt, only if shared validation or a
-		// download needs it. Ordinary ready reuse requires no extra Hub call.
-		var manifest hfSnapshotManifest
-		var manifestErr error
-		var manifestOnce sync.Once
-		getManifest := func() (hfSnapshotManifest, error) {
-			manifestOnce.Do(func() {
-				manifest, manifestErr = source.manifest(ctx, config.RepoID, config.Revision, config.Token, config.Endpoint)
-				if manifestErr == nil {
-					manifestErr = manifest.check(config.Revision)
-				}
-			})
-			return manifest, manifestErr
-		}
 		validate := func(parentPath string) (bool, error) {
 			manifest, err := getManifest()
 			if err != nil {
@@ -215,9 +238,6 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	if isSharedHfArtifactSymlink(destination) {
 		return false, fmt.Errorf("direct HF destination %s is a shared link without a usable persisted reference", destination)
 	}
-	if artifactRehydrationID(task) != "" {
-		return false, fmt.Errorf("artifact restoration requires an eligible Shared source and destination")
-	}
 	if !allowDownload {
 		s.demoteToNormalPriority(task)
 		return true, nil
@@ -231,6 +251,9 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 	}
 	if err := checkDirectHfDestinationAncestors(destination); err != nil {
 		return false, err
+	}
+	if artifactRehydrationID(task) != "" {
+		return false, source.restoreDirect(ctx, s, task, config, manifest)
 	}
 	if handled, err := source.reuseLegacyDescendants(ctx, s, task, spec, config); handled || err != nil {
 		return false, err

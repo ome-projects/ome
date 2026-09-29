@@ -129,7 +129,7 @@ func TestArtifactReportRecoverySatisfiedBeforeWorkerAdmission(t *testing.T) {
 }
 
 func TestArtifactReportRecoveryRejectsUnsupportedOrStaleRequests(t *testing.T) {
-	for _, change := range []string{"empty", "invalid", "evicted", "deleting", "placement", "replaced node", "local", "Direct policy", "resident Direct", "ordinary symlink", "shape filtered"} {
+	for _, change := range []string{"empty", "invalid", "evicted", "deleting", "placement", "replaced node", "local", "ordinary symlink", "shape filtered"} {
 		t.Run(change, func(t *testing.T) {
 			s, task, input := newArtifactReportRecoveryFixture(t)
 			ctx := context.Background()
@@ -153,20 +153,13 @@ func TestArtifactReportRecoveryRejectsUnsupportedOrStaleRequests(t *testing.T) {
 				require.NoError(t, err)
 			case "local":
 				task.BaseModel.Spec.Storage.StorageUri = ptr("local://" + input.ChildModelPath)
-			case "Direct policy":
-				policy := v1beta1.AlwaysDownload
-				task.BaseModel.Spec.Storage.DownloadPolicy = &policy
 			case "shape filtered":
 				task.BaseModel.Spec.ModelFormat.Name = constants.TensorRTLLM
-			case "resident Direct", "ordinary symlink":
+			case "ordinary symlink":
 				require.NoError(t, os.Remove(input.ChildModelPath))
-				if change == "ordinary symlink" {
-					directory := t.TempDir()
-					require.NoError(t, writeTestHfArtifactFiles(directory))
-					require.NoError(t, os.Symlink(directory, input.ChildModelPath))
-				} else {
-					require.NoError(t, writeTestHfArtifactFiles(input.ChildModelPath))
-				}
+				directory := t.TempDir()
+				require.NoError(t, writeTestHfArtifactFiles(directory))
+				require.NoError(t, os.Symlink(directory, input.ChildModelPath))
 				cm, err := s.configMapReconciler.getConfigMap(ctx)
 				require.NoError(t, err)
 				cm.Data = map[string]string{}
@@ -177,7 +170,7 @@ func TestArtifactReportRecoveryRejectsUnsupportedOrStaleRequests(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, s.recoverArtifactReports(ctx))
 			require.Zero(t, s.taskQueue.len())
-			if change == "resident Direct" || change == "ordinary symlink" {
+			if change == "ordinary symlink" {
 				require.FileExists(t, filepath.Join(input.ChildModelPath, "config.json"))
 			}
 		})
