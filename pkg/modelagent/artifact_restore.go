@@ -56,7 +56,7 @@ func activeArtifactRestore(ctx context.Context, task *GopherTask) bool {
 }
 
 func (s *Gopher) classifyCompletedArtifactRequest(ctx context.Context, task *GopherTask) {
-	if artifactRehydrationID(task) == "" || task.completedArtifactRequest.matches(task) || s.configMapReconciler == nil {
+	if task.ArtifactReportRecovery || artifactRehydrationID(task) == "" || task.completedArtifactRequest.matches(task) || s.configMapReconciler == nil {
 		return
 	}
 	_, eligible, err := newHfArtifactTaskInputForOCI(task, taskModelSpec(task).Storage, s.modelRootDir)
@@ -166,7 +166,7 @@ func (s *Gopher) validateArtifactRestoreReport(ctx context.Context, task *Gopher
 	if err != nil {
 		return err
 	}
-	if entry.Status != ModelStatusReady || entry.ModelUID != types.UID(getModelUID(task)) || entry.ArtifactRehydrationID != artifactRehydrationID(task) || entry.HfArtifactKey == "" || entry.HfArtifactPendingDeletion != nil || entry.DirectArtifactPendingDeletion != nil {
+	if entry.Status != ModelStatusReady || entry.ModelUID != types.UID(getModelUID(task)) || entry.ArtifactRehydrationID != artifactRehydrationID(task) || entry.HfArtifactPendingDeletion != nil || entry.DirectArtifactPendingDeletion != nil {
 		return fmt.Errorf("artifact restoration report is absent or stale")
 	}
 	return nil

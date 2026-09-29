@@ -836,3 +836,47 @@ func TestDownloadDirectHfSnapshotWaitsForFinalProgress(t *testing.T) {
 		})
 	}
 }
+
+func TestDirectHfRestoreSharedManifestFailure(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement=%t", replacement), func(t *testing.T) {
+			s, task, input := newSharedRestoreFixture(t)
+			ctx := context.Background()
+			task.BaseModel.Spec.Storage.StorageUri = ptr("hf://" + input.Parent.Identity.ModelID)
+			_, err := s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			manifestCalls := 0
+			unavailable := errors.New("manifest unavailable")
+			source := directHfSource{
+				resolve: func(context.Context, string, string, string, string) (string, error) {
+					if replacement {
+						return strings.Repeat("b", 40), nil
+					}
+					return input.Parent.Identity.CommitSHA, nil
+				},
+				manifest: func(context.Context, string, string, string, string) (hfSnapshotManifest, error) {
+					manifestCalls++
+					return hfSnapshotManifest{}, unavailable
+				},
+				download: func(context.Context, *GopherTask, *xet.DownloadConfig) error {
+					t.Fatal("Ready reuse or failed replacement must not download")
+					return nil
+				},
+			}
+			waiting, err := source.process(ctx, s, task, task.BaseModel.Spec, true)
+			if replacement {
+				require.ErrorIs(t, err, unavailable)
+				require.Equal(t, 1, manifestCalls)
+			} else {
+				require.NoError(t, err)
+				require.Zero(t, manifestCalls)
+			}
+			require.False(t, waiting)
+			parent, found, err := s.sharedHfArtifactHandler().repository.GetParentForChild(ctx, input.ChildModelKey)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, input.Parent.Key, parent.Key)
+			assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+		})
+	}
+}

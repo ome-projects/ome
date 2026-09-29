@@ -133,8 +133,16 @@ func (manifest hfSnapshotManifest) validate(ctx context.Context, directory strin
 // operation and have failed its children before calling it. Validation is read-only.
 func (manifest hfSnapshotManifest) removeInvalidFiles(ctx context.Context, directory string) error {
 	invalid, err := manifest.invalidFiles(ctx, directory)
-	if err != nil || len(invalid) == 0 {
+	if err != nil {
 		return err
+	}
+	return removeHfSnapshotFiles(ctx, directory, invalid)
+}
+
+// The caller inspects the snapshot and authorizes removal before passing paths.
+func removeHfSnapshotFiles(ctx context.Context, directory string, invalid []string) error {
+	if len(invalid) == 0 {
+		return nil
 	}
 	root, err := os.OpenRoot(directory)
 	if err != nil {
