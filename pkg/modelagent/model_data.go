@@ -97,6 +97,8 @@ type ModelEntry struct {
 	// Pins artifact ownership and residency reports to this Model CR instance.
 	ModelUID              types.UID `json:"modelUID,omitempty"`
 	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`
+	// Distinguishes a failed restore attempt from reconstructed Shared Failed state.
+	ArtifactRehydrationFailed bool `json:"artifactRehydrationFailed,omitempty"`
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig

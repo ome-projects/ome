@@ -90,16 +90,11 @@ func TestDeleteQueuePruningMatchesTaskCoordination(t *testing.T) {
 			deletion.TaskType = Delete
 			deletion.Sequence = 1
 			deletion.SharedArtifact = false
-			kept := removeSupersededTasks([]*GopherTask{download}, &deletion)
-			if tc.sequenced {
-				require.Len(t, kept, 1, "Direct Delete must preserve newer queued intent")
-			} else {
-				require.Empty(t, kept, "non-file tasks retain legacy pruning")
-			}
+			require.Equal(t, !tc.sequenced, isTaskSupersededByDeletion(download, &deletion), "Direct Delete preserves newer intent; non-file tasks retain legacy pruning")
 			deletion.SharedArtifact = true
-			require.Len(t, removeSupersededTasks([]*GopherTask{download}, &deletion), 1)
+			require.False(t, isTaskSupersededByDeletion(download, &deletion))
 			download.Sequence = deletion.Sequence
-			require.Empty(t, removeSupersededTasks([]*GopherTask{download}, &deletion))
+			require.True(t, isTaskSupersededByDeletion(download, &deletion))
 		})
 	}
 }
