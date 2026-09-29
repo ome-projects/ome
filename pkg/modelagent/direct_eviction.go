@@ -341,6 +341,9 @@ func (s *Gopher) checkDirectEvictionUsers(ctx context.Context, key, path string)
 	if err != nil {
 		return err
 	}
+	if entry.HfArtifactKey != "" || entry.HfArtifactPendingDeletion != nil {
+		return fmt.Errorf("Direct artifact still has Shared ownership or cleanup")
+	}
 	if entry.Config != nil && len(entry.Config.Artifact.ChildrenPaths) != 0 {
 		return fmt.Errorf("Direct artifact still records child paths")
 	}
