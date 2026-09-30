@@ -8,6 +8,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -24,11 +25,12 @@ const (
 // Unknown means the home could not be read, while Absent is reserved for
 // conclusive evidence that the placement copy is gone.
 type homeObservation struct {
-	state     homeObservationState
-	candidate v1beta1.CandidatePlacement
-	serving   bool
-	terminal  bool
-	err       error
+	state          homeObservationState
+	candidate      v1beta1.CandidatePlacement
+	serving        bool
+	terminal       bool
+	err            error
+	terminalMember *v1beta1.InferenceService
 }
 
 // placementObservations caches the observations made before placement gates.
@@ -50,11 +52,12 @@ func newPlacementObservations(isvc *v1beta1.InferenceService, clusters []v1beta1
 		previous: make(map[string]v1beta1.CandidatePlacement),
 		homes:    make(map[string]homeObservation),
 	}
-	selector, hasRequirements, selectorErr := requirementSelector(isvc)
+	selector, selectorErr := placementSelector(isvc)
 	o.projectAll = selectorErr != nil
 	for i := range clusters {
 		o.known[clusters[i].Name] = true
-		if selectorErr == nil && hasRequirements && selector.Matches(workloadClusterSelectorSet(&clusters[i])) {
+		_, matches := selector.Match(&clusters[i])
+		if selectorErr == nil && matches {
 			o.matches[clusters[i].Name] = true
 		}
 	}
@@ -78,25 +81,6 @@ func (o *placementObservations) projectedStanding() []string {
 
 func (o *placementObservations) projects(cluster string) bool {
 	return o.projectAll || o.matches[cluster]
-}
-
-func (o *placementObservations) projectedClusters(candidates []string) []string {
-	seen := make(map[string]bool, len(candidates)+len(o.standing))
-	clusters := make([]string, 0, len(candidates)+len(o.standing))
-	for _, cluster := range candidates {
-		if !seen[cluster] {
-			seen[cluster] = true
-			clusters = append(clusters, cluster)
-		}
-	}
-	for _, cluster := range o.projectedStanding() {
-		if !seen[cluster] {
-			seen[cluster] = true
-			clusters = append(clusters, cluster)
-		}
-	}
-	sort.Strings(clusters)
-	return clusters
 }
 
 func (r *Reconciler) observeStandingHomes(ctx context.Context, isvc *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster) *placementObservations {
@@ -131,11 +115,6 @@ func (o *placementObservations) get(cluster string) (homeObservation, bool) {
 	return home, ok
 }
 
-func (o *placementObservations) had(cluster string) bool {
-	_, ok := o.previous[cluster]
-	return ok
-}
-
 // observeHome reads one member without changing it. A disconnected or
 // unreadable member is Unknown and loses routable ready capacity for this
 // observation. NotFound, a terminating copy, a foreign same-name object, or a
@@ -162,9 +141,25 @@ func (r *Reconciler) observeHome(
 		candidate := retainedUnknownCandidate(isvc, previous)
 		return homeObservation{state: homeUnknown, candidate: candidate, err: err}
 	}
-	cl, connected := r.Clusters.ClientFor(previous.Cluster)
-	if !connected {
-		return unknown(nil)
+	var cl client.Client
+	if isvc.Status.Placement != nil && isvc.Status.Placement.Plan != nil {
+		for _, candidate := range isvc.Status.Placement.Candidates {
+			if candidate.Cluster == previous.Cluster && candidate.Allocation != nil {
+				direct, err := r.plannedClient(ctx, previous.Cluster, candidate.Allocation.ClusterUID)
+				if err != nil {
+					return unknown(err)
+				}
+				cl = direct
+				break
+			}
+		}
+	}
+	if cl == nil {
+		remote, connected := r.Clusters.ClientFor(previous.Cluster)
+		if !connected {
+			return unknown(nil)
+		}
+		cl = remote
 	}
 
 	derived := &v1beta1.InferenceService{}
@@ -182,7 +177,7 @@ func (r *Reconciler) observeHome(
 	r.observeDerivedPolicyStatus(isvc, previous.Cluster, derived)
 	r.observeDerivedRolloutStatus(isvc, previous.Cluster, derived)
 	if IsTerminallyFailed(derived, nil) {
-		return terminalHome(previous.Cluster)
+		return terminalHome(previous.Cluster, derived)
 	}
 
 	statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
@@ -199,7 +194,7 @@ func (r *Reconciler) observeHome(
 		}
 	}
 	if IsTerminallyFailed(derived, statuses) {
-		return terminalHome(previous.Cluster)
+		return terminalHome(previous.Cluster, derived)
 	}
 
 	candidate := v1beta1.CandidatePlacement{
@@ -223,14 +218,15 @@ func (r *Reconciler) observeHome(
 	}
 }
 
-func terminalHome(cluster string) homeObservation {
+func terminalHome(cluster string, member *v1beta1.InferenceService) homeObservation {
 	return homeObservation{
 		state: homePresent,
 		candidate: v1beta1.CandidatePlacement{
 			Cluster: cluster,
 			Phase:   v1beta1.CandidatePhaseAdmitting,
 		},
-		terminal: true,
+		terminal:       true,
+		terminalMember: member,
 	}
 }
 
@@ -310,23 +306,14 @@ func (r *Reconciler) writeObservedPlacement(
 	return res, err
 }
 
-func (r *Reconciler) observedStatusThenError(
-	ctx context.Context,
-	isvc *v1beta1.InferenceService,
-	observations *placementObservations,
-	cause error,
-) (ctrl.Result, error) {
-	if _, err := r.writeObservedPlacement(ctx, isvc, observations); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, cause
-}
-
 func (r *Reconciler) writeObservedSingle(
 	ctx context.Context,
 	isvc *v1beta1.InferenceService,
 	observations *placementObservations,
 ) (ctrl.Result, error) {
+	if isvc.Status.Placement != nil && isvc.Status.Placement.Plan != nil && isvc.Status.Placement.Plan.Mode == v1beta1.PlacementModeSingle {
+		return r.writeSinglePlanStatus(ctx, isvc, observations, "")
+	}
 	winner := winnerCluster(isvc)
 	if winner != "" && observations.known[winner] && !observations.projects(winner) {
 		r.clearGrace(isvc.UID)
@@ -484,7 +471,7 @@ func (r *Reconciler) writeObservedMulti(
 			continue
 		}
 		candidate := home.candidate
-		if heldSplitSliver(isvc, candidate) {
+		if !isvc.Spec.Placement.UsesClusterAffinity() && heldSplitSliver(isvc, candidate) {
 			candidate = identityCandidate(cluster)
 		}
 		candidates = append(candidates, candidate)
@@ -508,14 +495,6 @@ func (r *Reconciler) writeObservedMulti(
 	})
 }
 
-func heldSplitSliver(isvc *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) bool {
-	if placementMode(isvc) != v1beta1.PlacementModeSplit || isvc.Spec.Placement == nil || isvc.Spec.Placement.Split == nil {
-		return false
-	}
-	minimum := isvc.Spec.Placement.Split.MinReplicasPerCluster
-	return minimum > 0 && candidate.AdmittedReplicas > 0 && candidate.AdmittedReplicas < minimum
-}
-
 func observedCandidateResult(home homeObservation) placementResult {
 	phase := v1beta1.PlacementPhaseAdmitting
 	if home.candidate.Phase == v1beta1.CandidatePhaseAdmitted {
@@ -527,4 +506,12 @@ func observedCandidateResult(home homeObservation) placementResult {
 		url:        home.candidate.Endpoint, ready: home.serving,
 		readinessUnknown: home.state == homeUnknown,
 	}
+}
+
+func heldSplitSliver(isvc *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) bool {
+	if placementMode(isvc) != v1beta1.PlacementModeSplit || isvc.Spec.Placement == nil || isvc.Spec.Placement.Split == nil {
+		return false
+	}
+	minimum := isvc.Spec.Placement.Split.MinReplicasPerCluster
+	return minimum > 0 && candidate.AdmittedReplicas > 0 && candidate.AdmittedReplicas < minimum
 }

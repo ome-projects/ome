@@ -303,8 +303,12 @@ spec:
     name: srt-mistral-7b-instruct
 ```
 
-Here, the runtime specified is `srt-mistral-7b-instruct`, so the OME controller will first search the namespace for a ServingRuntime with that name. If
-none exist, the controller will then search the list of ClusterServingRuntimes.
+Here, the runtime specified is `srt-mistral-7b-instruct`. The optional `spec.runtime.kind` field scopes how that name is resolved, and it defaults to
+`ClusterServingRuntime`: the OME controller first looks for a ClusterServingRuntime with that name, and only if none exists does it fall back to a
+ServingRuntime in the InferenceService's namespace. So if a namespaced ServingRuntime and a ClusterServingRuntime share the same name, a bare `name:`
+reference resolves the ClusterServingRuntime. To select the namespaced runtime instead, set `kind: ServingRuntime`; that reference resolves only in the
+InferenceService's namespace and never falls back to cluster scope. See
+[Reference a Serving Runtime Explicitly](/ome/docs/tasks/run-workloads/reference-a-runtime-explicitly/) for the full resolution and validation behavior.
 
 Users can also implicitly specify the runtime by setting the `autoSelect` field to `true` in the `supportedModelFormats` field of the _ClusterServingRuntime_.
 ```yaml

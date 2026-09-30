@@ -251,7 +251,7 @@ func exactRelated(items []omev1beta1.InferenceReplica, parent *omev1beta1.Infere
 	result := make([]omev1beta1.InferenceReplica, 0, len(items))
 	for i := range items {
 		item := &items[i]
-		if item.Namespace == parent.Namespace && item.Spec.ParentRef.Name == parent.Name &&
+		if item.Namespace == parent.Namespace && (item.Spec.ParentRef != nil && item.Spec.ParentRef.Name == parent.Name) &&
 			hasExactControllerOwner(item.OwnerReferences, parent) {
 			result = append(result, *item)
 		}

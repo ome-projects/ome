@@ -2,9 +2,6 @@ package holds
 
 import (
 	"context"
-	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -55,7 +52,7 @@ func reportGang(ctx context.Context, in PassInput, row Row) (reading, error) {
 	if serving {
 		return reading{release: true}, nil
 	}
-	at := gangHoldObservedAt(row.Status, token, in.Input.Now())
+	at := heldSince(row.Status, token, in.Input.Now())
 	return reading{waiting: true, evidence: types.GangTermination(token, gang.Message, at)}, nil
 }
 
@@ -67,19 +64,4 @@ func gangHoldToken(state types.GangState) string {
 		return types.WaitingReasonPodGroupTerminating
 	}
 	return ""
-}
-
-// gangHoldObservedAt is the moment stamped on the hold's evidence: the
-// one already recorded when this row holds the token, otherwise now.
-//
-// Nothing measures a window from it — the only gang wait is a name being
-// collected, which resolves itself and never escalates. It is re-read so
-// that re-observing an unchanged hold produces an identical record and
-// the status no-op guard keeps the pass write-free.
-func gangHoldObservedAt(s types.InstanceStatus, token string, now time.Time) metav1.Time {
-	if s.Operation != nil && s.Operation.Waiting == token &&
-		s.LastFailure != nil && s.LastFailure.Reason == token && !s.LastFailure.Time.IsZero() {
-		return s.LastFailure.Time
-	}
-	return metav1.NewTime(now)
 }

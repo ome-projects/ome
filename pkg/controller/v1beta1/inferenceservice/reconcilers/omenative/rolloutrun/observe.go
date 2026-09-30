@@ -256,17 +256,19 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 // state that a run must wrap (the adopt-in-place trigger: an upgrade or a
 // status-loss recovery can find the engine mid-ladder with no pinned run,
 // even when the IRs have fully converged — the traffic ladder outlives pod
-// convergence). A rolled-back hold is terminal, not in-progress. With an
-// inline canary body the done sentinel is exact; for a ref-sourced canary the
-// body is not resolvable here, so any non-terminal state counts (a run that
-// opens around an already-done canary just closes Completed on the next
-// pass — harmless).
+// convergence). A revert still draining counts: the rejected target opens
+// no run of its own, and the plan gate admits the roll back to stable only
+// under a pinned run. A settled rolled-back hold is terminal, not
+// in-progress. With an inline canary body the done sentinel is exact; for a
+// ref-sourced canary the body is not resolvable here, so any non-terminal
+// state counts (a run that opens around an already-done canary just closes
+// Completed on the next pass — harmless).
 func canaryMidFlight(isvc *v1beta1.InferenceService) bool {
 	if isvc == nil || isvc.Spec.Rollout == nil {
 		return false
 	}
 	cs := rollout.CanaryStatusFor(&isvc.Status, primaryCanaryComponent(isvc))
-	if cs == nil || cs.RolledBackRevisionHash != "" {
+	if cs == nil {
 		return false
 	}
 	for gi := range isvc.Spec.Rollout.Groups {
@@ -274,12 +276,32 @@ func canaryMidFlight(isvc *v1beta1.InferenceService) bool {
 		if groupKind(g) != v1beta1.RolloutProgressionCanary {
 			continue
 		}
+		if cs.RolledBackRevisionHash != "" {
+			return revertInFlight(isvc, g)
+		}
 		if g.Canary != nil {
 			return int(cs.CurrentStep) < len(g.Canary.Steps)
 		}
 		return true
 	}
 	return false
+}
+
+// revertInFlight reports whether a canary group's unit is still rolling
+// back: its ladder rejected a revision and the primary has not yet reported
+// the revert complete. The state is read the way the run's close reads it,
+// so a run adopted around the revert is one the revert's completion closes.
+func revertInFlight(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) bool {
+	primary := primaryOfGroup(g)
+	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
+	if cs == nil || cs.RolledBackRevisionHash == "" {
+		return false
+	}
+	steps := 0
+	if g.Canary != nil {
+		steps = len(g.Canary.Steps)
+	}
+	return rollout.StateOf(cs, isvc.Status.Components[primary].RolloutPhase, steps) == rollout.CanaryStateRollingBack
 }
 
 // derivedProvenance parses the derive-time plan-source annotation

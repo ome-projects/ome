@@ -191,9 +191,9 @@ func (w statusWriter) warnStatusSizeExceeded(ctx context.Context, ir *v1beta1.In
 		return
 	}
 	var target client.Object = ir
-	if w.Client != nil && ir.Spec.ParentRef.Name != "" {
+	if parentName := ir.ParentName(); w.Client != nil && parentName != "" {
 		parent := &v1beta1.InferenceService{}
-		if err := w.Get(ctx, types.NamespacedName{Namespace: ir.Namespace, Name: ir.Spec.ParentRef.Name}, parent); err == nil {
+		if err := w.Get(ctx, types.NamespacedName{Namespace: ir.Namespace, Name: parentName}, parent); err == nil {
 			target = parent
 		}
 	}

@@ -3,6 +3,7 @@ package placement
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -55,7 +56,7 @@ func observationFixture(t *testing.T) plannedObservationFixture {
 	ir.Labels = map[string]string{constants.InferenceServicePodLabelKey: source.Name}
 	ir.Annotations = map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "3"}
 	ir.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(member, v1beta1.SchemeGroupVersion.WithKind("InferenceService"))}
-	ir.Spec.Component, ir.Spec.ParentRef.Name = v1beta1.EngineComponent, source.Name
+	ir.Spec.Component, ir.Spec.ParentRef = v1beta1.EngineComponent, &v1beta1.ParentReference{Name: source.Name}
 	ir.Spec.Replicas, ir.Spec.PlacementExecution = ptr.To[int32](1), policy
 	ir.Spec.PlacementReplicaLimit = ptr.To[int32](1)
 	ir.Status.ObservedGeneration = ir.Generation
@@ -82,6 +83,19 @@ func TestObservePlannedHome(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "observed component acknowledges pause", want: steady},
+		{name: "complete contracted policy acknowledges pause", edit: func(f *plannedObservationFixture) { f.attachContract(t) }, want: steady},
+		{name: "pruned demand cannot acknowledge pause", edit: func(f *plannedObservationFixture) {
+			f.attachContract(t)
+			f.resources.ir.Spec.PlacementExecution.Demand = nil
+		}, want: result{Home: allocation.Home{Known: true, Occupied: 1, Ready: 1}, Ready: 1, Admitted: 1}},
+		{name: "different component rendering cannot acknowledge pause", edit: func(f *plannedObservationFixture) {
+			f.attachContract(t)
+			f.resources.ir.Spec.PlacementExecution.Demand.Components[0].RenderingHash = strings.Repeat("c", 64)
+		}, want: result{Home: allocation.Home{Known: true, Occupied: 1, Ready: 1}, Ready: 1, Admitted: 1}},
+		{name: "different demand fingerprint cannot acknowledge pause", edit: func(f *plannedObservationFixture) {
+			f.attachContract(t)
+			f.resources.ir.Spec.PlacementExecution.Demand.Fingerprint = strings.Repeat("c", 64)
+		}, want: result{Home: allocation.Home{Known: true, Occupied: 1, Ready: 1}, Ready: 1, Admitted: 1}},
 		{name: "generic generation observation cannot acknowledge placement guards", edit: func(f *plannedObservationFixture) {
 			f.resources.ir.Status.PlacementObservedGeneration = 0
 		}, want: result{Home: allocation.Home{Known: true, Occupied: 1, Ready: 1}, Ready: 1, Admitted: 1}},
@@ -92,6 +106,22 @@ func TestObservePlannedHome(t *testing.T) {
 			f.resources.addGang()
 			f.extraObjects = []client.Object{testMemberPodGroup(f.resources.ir)}
 		}, want: steady},
+		{name: "partial gang cannot claim whole replica admission", edit: func(f *plannedObservationFixture) {
+			f.resources.addGang()
+			f.extraObjects = []client.Object{testMemberPodGroup(f.resources.ir)}
+			f.resources.pods = f.resources.pods[:1]
+			f.resources.ir.Status.InstanceStatuses[0].PodCount = 1
+			f.resources.ir.Status.InstanceStatuses[0].ServingPodCount = 1
+		}, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 1}, PauseAcknowledged: true, Applied: "plan-a"}},
+		{name: "creating partial gang has no admitted replica", edit: func(f *plannedObservationFixture) {
+			f.resources.addGang()
+			f.extraObjects = []client.Object{testMemberPodGroup(f.resources.ir)}
+			f.resources.pods = f.resources.pods[:1]
+			f.resources.ir.Status.ReadyReplicas = 0
+			f.resources.ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceCreating
+			f.resources.ir.Status.InstanceStatuses[0].PodCount = 1
+			f.resources.ir.Status.InstanceStatuses[0].ServingPodCount = 0
+		}, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 1}, PauseAcknowledged: true, Applied: "plan-a"}},
 		{name: "unresolved desired replicas are unknown", edit: func(f *plannedObservationFixture) { f.resources.ir.Spec.Replicas = nil }, wantErr: true},
 		{name: "router replicas remain a shared per home policy", edit: func(f *plannedObservationFixture) {
 			ir := f.resources.ir.DeepCopy()
@@ -158,12 +188,29 @@ func TestObservePlannedHome(t *testing.T) {
 			}
 		}, wantErr: true},
 		{name: "racing component version is unknown", edit: func(f *plannedObservationFixture) {
+			f.source.Status.Placement.Candidates[0].ReadyReplicas = 1
 			f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if err := c.Get(ctx, key, obj, opts...); err != nil {
 					return err
 				}
 				if _, ir := obj.(*v1beta1.InferenceReplica); ir {
 					obj.SetResourceVersion("changed")
+				}
+				return nil
+			}
+		}, wantErr: true},
+		{name: "racing member version withholds previous ready capacity", edit: func(f *plannedObservationFixture) {
+			f.source.Status.Placement.Candidates[0].ReadyReplicas = 1
+			reads := 0
+			f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := c.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				if _, member := obj.(*v1beta1.InferenceService); member {
+					reads++
+					if reads == 2 {
+						obj.SetResourceVersion("changed")
+					}
 				}
 				return nil
 			}
@@ -195,6 +242,15 @@ func TestObservePlannedHome(t *testing.T) {
 				t.Fatalf("observation error = %v, want error %t", err, tt.wantErr)
 			}
 			if tt.wantErr {
+				type evidence struct {
+					AllocationKnown, ObservationKnown bool
+					AppliedPlan                       string
+					Ready                             int32
+				}
+				got := evidence{observation.Home.Known, observation.Candidate.ObservationKnown, observation.Candidate.AppliedPlanID, observation.Candidate.ReadyReplicas}
+				if diff := cmp.Diff(evidence{}, got); diff != "" {
+					t.Errorf("unverified inventory grants readiness or movement credit (-want +got):\n%s", diff)
+				}
 				return
 			}
 			got := result{Home: observation.Home, Reserved: observation.RolloutReserved, PauseAcknowledged: observation.PauseAcknowledged, Applied: observation.Candidate.AppliedPlanID, Ready: observation.Candidate.ReadyReplicas, Admitted: observation.Candidate.AdmittedReplicas}
@@ -203,6 +259,18 @@ func TestObservePlannedHome(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (f *plannedObservationFixture) attachContract(t *testing.T) {
+	t.Helper()
+	attachCapacityContract(t, f.source)
+	policy := executionPolicy(f.source, f.source.Status.Placement.Candidates[0].Allocation)
+	raw, err := protocol.Encode(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.member.Annotations[constants.PlacementExecution] = raw
+	f.resources.ir.Spec.PlacementExecution = policy.DeepCopy()
 }
 
 func TestPlannedTrafficEvidence(t *testing.T) {
@@ -257,6 +325,74 @@ func TestPlannedTrafficEvidence(t *testing.T) {
 			known, routable, drained := plannedTrafficEvidence(source, tm, candidate)
 			if diff := cmp.Diff(tt.want, [3]bool{known, routable, drained}); diff != "" {
 				t.Errorf("traffic evidence (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFullHomeReadyRequiresEveryReplicaFloor(t *testing.T) {
+	for _, tt := range []struct {
+		name                                   string
+		engine, router                         int32
+		terminal, stale, ingressPending, ready bool
+	}{
+		{name: "complete engine", engine: 1, ready: true},
+		{name: "partial engine", engine: 2},
+		{name: "complete engine and router", engine: 1, router: 1, ready: true},
+		{name: "partial router", engine: 1, router: 2},
+		{name: "terminal member", engine: 1, terminal: true},
+		{name: "stale component acknowledgement", engine: 1, stale: true},
+		{name: "ingress is not ready", engine: 1, ingressPending: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := observationFixture(t)
+			a := f.source.Status.Placement.Candidates[0].Allocation
+			a.CurrentReplicas, a.DesiredReplicas = tt.engine, tt.engine
+			a.CurrentHome = &v1beta1.PlacementHomePolicy{InputDigest: "intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: tt.engine}}}
+			if tt.router > 0 {
+				a.CurrentHome.ReplicaFloors = append(a.CurrentHome.ReplicaFloors, v1beta1.PlacementComponentFloor{Component: v1beta1.RouterComponent, Replicas: tt.router})
+			}
+			a.DesiredHome = a.CurrentHome.DeepCopy()
+			policy := executionPolicy(f.source, a)
+			raw, err := protocol.Encode(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.member.Annotations[constants.PlacementExecution] = raw
+			if tt.ingressPending {
+				f.member.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{Status: corev1.ConditionFalse})
+			}
+			if tt.terminal {
+				f.member.Status.ModelStatus.TransitionStatus = v1beta1.InvalidSpec
+			}
+			f.resources.ir.Spec.PlacementExecution = policy.DeepCopy()
+			f.resources.ir.Spec.Replicas, f.resources.ir.Spec.PlacementReplicaLimit = ptr.To(tt.engine), ptr.To(tt.engine)
+			if tt.stale {
+				f.resources.ir.Status.PlacementObservedGeneration = 0
+			}
+			objects := []client.Object{f.member, f.resources.ir, &f.resources.pods[0]}
+			if tt.router > 0 {
+				ir := f.resources.ir.DeepCopy()
+				ir.Name, ir.UID, ir.Spec.Component = "service-router", "router-uid", v1beta1.RouterComponent
+				ir.Spec.Replicas, ir.Spec.PlacementReplicaLimit = ptr.To(tt.router), ptr.To(tt.router)
+				pod := f.resources.pods[0].DeepCopy()
+				pod.Name, pod.UID, pod.OwnerReferences[0].UID = "router-0", "router-pod", ir.UID
+				f.components = append(f.components, v1beta1.RouterComponent)
+				objects = append(objects, ir, pod)
+			}
+			scheme := testScheme(t)
+			worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
+			r, _ := newPlacer(scheme, clusters, f.source, plannedTestRegistration())
+			got, err := r.observePlannedHome(t.Context(), f.source, f.source.Status.Placement.Candidates[0], f.components)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tt.ready, got.FullHomeReady); diff != "" {
+				t.Fatal(diff)
+			}
+			if diff := cmp.Diff(tt.terminal, got.Terminal); diff != "" {
+				t.Fatal(diff)
 			}
 		})
 	}

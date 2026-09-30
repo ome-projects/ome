@@ -58,6 +58,20 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name: "valid resume target revision hash",
+			annotations: map[string]string{
+				constants.RolloutResumeAnnotation: "e5d6f79d",
+			},
+			wantOK: true,
+		},
+		{
+			name: "valid component-scoped resume target",
+			annotations: map[string]string{
+				constants.RolloutResumeAnnotation: "router=e5d6f79d",
+			},
+			wantOK: true,
+		},
+		{
 			name: "valid revision history limit",
 			annotations: map[string]string{
 				constants.RevisionHistoryLimitAnnotation: "1",
@@ -154,6 +168,29 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 				constants.RolloutPromoteAnnotation: "full",
 			},
 			wantContains: "InvalidRolloutPromoteTarget",
+		},
+		{
+			// The executor matches the value against the parked canary revision
+			// hash, so "true" could never take effect.
+			name: "resume target garbage",
+			annotations: map[string]string{
+				constants.RolloutResumeAnnotation: "true",
+			},
+			wantContains: "InvalidRolloutResumeTarget",
+		},
+		{
+			name: "resume scope is not a rollout Component",
+			annotations: map[string]string{
+				constants.RolloutResumeAnnotation: "predictor=e5d6f79d",
+			},
+			wantContains: "InvalidRolloutResumeTarget",
+		},
+		{
+			name: "resume scope with no hash",
+			annotations: map[string]string{
+				constants.RolloutResumeAnnotation: "engine=",
+			},
+			wantContains: "InvalidRolloutResumeTarget",
 		},
 		{
 			name: "traffic drain malformed JSON",

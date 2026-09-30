@@ -256,10 +256,9 @@ func drainedWhenSliceListEmpty(ctx context.Context, reader client.Reader, namesp
 	err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: serviceName}, svc)
 	if apierrors.IsNotFound(err) {
 		// No Service → no kube-proxy routing → drain is trivially
-		// complete. With the services reconciler in place this branch
-		// fires only when the Service hasn't been created yet on this
-		// reconcile pass, which is a controller bug — the service
-		// reconciliation runs before any op that needs drain.
+		// complete. A replica with no per-revision Service, such as a
+		// standalone replica whose Services no InferenceService controller
+		// creates, takes this branch on every drain.
 		return true, nil
 	}
 	if err != nil {

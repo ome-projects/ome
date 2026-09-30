@@ -784,6 +784,87 @@ func TestSurgeUpdate_SupersededSurge_AbandonsAndKeepsSource(t *testing.T) {
 	}
 }
 
+// TestSurgeUpdate_SupersededSurge_AbandonGraceBoundsUnservedReplacement
+// pins the grace the redirect deletes an abandoned replacement with. A
+// replacement that never carried the serving gate goes on the configured
+// abandoned-replacement grace, so the slot its name holds frees on that
+// bound; a replacement that has carried the gate, and an unconfigured
+// bound, keep the pod's own grace.
+func TestSurgeUpdate_SupersededSurge_AbandonGraceBoundsUnservedReplacement(t *testing.T) {
+	cases := []struct {
+		name    string
+		grace   time.Duration
+		serving bool
+		want    *int64
+	}{
+		{name: "unconfigured keeps the pod's own grace", grace: 0, serving: false, want: nil},
+		{name: "a never-served replacement takes the bound", grace: 7 * time.Second, serving: false, want: ptrInt64(7)},
+		{name: "a replacement that has served keeps its own grace", grace: 7 * time.Second, serving: true, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
+			var deletes []recordedDeleteOpts
+			funcs := fdDeleteRecorder(&deletes)
+			c := fdFakeClient(t, &funcs, isvc, ir)
+			input := legacyTestInput(isvc, c, workload.ComponentEngine)
+			plan := surgePlan()
+
+			oldPod := surgePodAtOrdinal(isvc, 0, 1, 0, true, true)
+			if err := c.Create(context.Background(), oldPod); err != nil {
+				t.Fatalf("seed source pod: %v", err)
+			}
+			rev2 := makeCR(t, c, isvc, "llama-70b-engine-rev-rev2hash")
+			if _, err := surgeUpdate(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], rev2, []*corev1.Pod{oldPod}); err != nil {
+				t.Fatalf("pass 1 (rev2 surge create): %v", err)
+			}
+			surgeName := query.PodName(isvc.Name, workload.ComponentEngine, 0, "default", 1)
+			rev2Surge := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: surgeName}, rev2Surge); err != nil {
+				t.Fatalf("rev2 surge pod missing after pass 1: %v", err)
+			}
+			if tc.serving {
+				// Marked serving without ever becoming ContainersReady: the
+				// gate is what says the pod has been in rotation.
+				rev2Surge.Status.Conditions = append(rev2Surge.Status.Conditions, corev1.PodCondition{
+					Type: podreadiness.ConditionType, Status: corev1.ConditionTrue,
+				})
+				if err := c.Status().Update(context.Background(), rev2Surge); err != nil {
+					t.Fatalf("mark rev2 surge serving: %v", err)
+				}
+			}
+
+			rev3 := makeCR(t, c, isvc, "llama-70b-engine-rev-rev3hash")
+			freshISVC := &v1beta1.InferenceService{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(isvc), freshISVC); err != nil {
+				t.Fatalf("re-read ISVC: %v", err)
+			}
+			input2 := legacyTestInput(freshISVC, c, workload.ComponentEngine)
+			input2.AbandonedReplacementGrace = tc.grace
+			workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
+
+			if _, err := surgeUpdate(context.Background(), legacyTestDeps(c), input2, plan, plan.Instances[0], rev3, []*corev1.Pod{oldPod, rev2Surge}); err != nil {
+				t.Fatalf("pass 2 (superseding rev3 bump): %v", err)
+			}
+
+			if len(deletes) != 1 || deletes[0].name != surgeName {
+				t.Fatalf("deletes = %+v, want exactly the abandoned surge pod %s", deletes, surgeName)
+			}
+			got := deletes[0].grace
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("abandoned surge pod deleted with grace %d, want the pod's own grace", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Fatalf("abandoned surge pod deleted with grace %v, want %d", got, *tc.want)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(oldPod), &corev1.Pod{}); err != nil {
+				t.Fatalf("source pod (ord=0) must be kept during the redirect; got %v", err)
+			}
+		})
+	}
+}
+
 // TestSurgeUpdate_SingleBump_DoesNotShiftTarget pins the
 // target-stability invariant: a single bump (no in-flight surge) followed by a
 // re-invoke at the SAME target must NOT alter the recorded
@@ -3473,5 +3554,88 @@ func TestSurgeUpdate_UnknownTargetHeldWithoutForceDeletePolicy(t *testing.T) {
 	}
 	if got.failed || got.blocks != 0 {
 		t.Errorf("a held name is not a failure: lastFailure=%v retryBlocks=%d", got.failed, got.blocks)
+	}
+}
+
+// TestSurgeUpdate_DrainGateHoldsTheSourceUntilAllowed pins the drain-time
+// gate: with the replacement past the promote bar, a denying DrainGate keeps
+// the source serving at Step=Surge and records the hold; once the gate allows,
+// the same pass takes the source out of rotation.
+func TestSurgeUpdate_DrainGateHoldsTheSourceUntilAllowed(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
+	oldPod := surgePodAtOrdinal(isvc, 0, 1, 0, true, true)
+	surgePod := surgePodAtOrdinal(isvc, 0, 1, 1, true, true)
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: "llama-70b-engine-rev-v2hash", Namespace: isvc.Namespace,
+	}}
+	surgePod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(target.Name)
+	podReadyAt(surgePod, minReadyWindowStart.Add(-time.Minute))
+	c := legacyNewFakeClient(t, isvc, ir, oldPod, surgePod, target)
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	input.Clock = clocktesting.NewFakeClock(minReadyWindowStart)
+	input.DrainHolds = &workload.DrainHolds{}
+	plan := surgePlan()
+	if err := status.StampSurging(context.Background(), input, 0, target.Name,
+		workload.UpdateStrategySurgeThenDrain, plan.InstanceReadyTimeout); err != nil {
+		t.Fatalf("pre-stamp surge: %v", err)
+	}
+	input.ObservedState.InstanceStatuses[0].Phase = workload.InstancePhaseUpdating
+	input.ObservedState.InstanceStatuses[0].Operation = &workload.InstanceOperation{
+		Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepSurge, TargetRevision: target.Name,
+	}
+
+	var asked [][]string
+	allow := false
+	input.DrainGate = func(sourcePods []string) (bool, workload.RolloutHoldGate, string) {
+		asked = append(asked, sourcePods)
+		if allow {
+			return true, "", ""
+		}
+		return false, workload.RolloutHoldGatePairing, "peer cohort not serving"
+	}
+	sourceServing := func() bool {
+		fresh := &corev1.Pod{}
+		err := c.Get(context.Background(), client.ObjectKeyFromObject(oldPod), fresh)
+		if apierrors.IsNotFound(err) {
+			return false // drained and deleted
+		}
+		if err != nil {
+			t.Fatalf("read source: %v", err)
+		}
+		return podreadiness.IsServing(fresh)
+	}
+
+	// Denied: the source keeps serving, the row stays at Step=Surge, the
+	// hold names the gate and the target.
+	if _, err := surgeUpdate(context.Background(), legacyTestDeps(c), input, plan,
+		plan.Instances[0], target, []*corev1.Pod{oldPod, surgePod}); err != nil {
+		t.Fatalf("surgeUpdate under a denying drain gate: %v", err)
+	}
+	if len(asked) != 1 || len(asked[0]) != 1 || asked[0][0] != oldPod.Name {
+		t.Fatalf("the gate must be asked once with the source pod, got %v", asked)
+	}
+	if !sourceServing() {
+		t.Fatalf("a held drain must leave the source serving")
+	}
+	if got := string(legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0].Operation.Step); got != string(workload.UpdateStepSurge) {
+		t.Fatalf("a held drain must keep the row at Step=Surge, got %q", got)
+	}
+	hold := input.DrainHolds.First()
+	if hold == nil || hold.Gate != workload.RolloutHoldGatePairing || hold.Target != target.Name {
+		t.Fatalf("the hold must be recorded with the gate and the target, got %+v", hold)
+	}
+
+	// Allowed: the same pass takes the source out of rotation.
+	allow = true
+	if _, err := surgeUpdate(context.Background(), legacyTestDeps(c), input, plan,
+		plan.Instances[0], target, []*corev1.Pod{oldPod, surgePod}); err != nil {
+		t.Fatalf("surgeUpdate under an allowing drain gate: %v", err)
+	}
+	if sourceServing() {
+		t.Fatalf("an admitted drain must take the source out of rotation")
+	}
+	if got := string(legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0].Operation.Step); got != string(workload.UpdateStepSurgeDrain) {
+		t.Fatalf("an admitted drain must move the row to Step=SurgeDrain, got %q", got)
 	}
 }

@@ -28,10 +28,11 @@ func OperationUnschedulable(op *InstanceOperation) bool {
 // wait outside the workload's control: admission having refused its
 // create for lack of quota, the scheduler finding no placement for its
 // pods, the gang scheduler unable to admit its PodGroup, a node that
-// stopped reporting a pod whose name the operation needs, or an operator
-// pause holding the attempt at a step boundary. Each is a wait an
-// operator or another controller resolves, so the InstanceReadyTimeout
-// clock must not run through any of them.
+// stopped reporting a pod whose name the operation needs, capacity a
+// provisioner has not readied for a pod the operation withholds, or an
+// operator pause holding the attempt at a step boundary. Each is a wait
+// an operator or another controller resolves, so the
+// InstanceReadyTimeout clock must not run through any of them.
 //
 // The quota wait is read off both the recorded refusal and its token.
 // The refusal is recorded on the pass admission said no and reported as
@@ -40,7 +41,8 @@ func OperationUnschedulable(op *InstanceOperation) bool {
 // row reports the wait either way.
 func OperationExternallyHeld(op *InstanceOperation) bool {
 	return OperationCapacityRefused(op) || OperationQuotaHeld(op) || OperationUnschedulable(op) ||
-		OperationGangHeld(op) || OperationNodeUnknown(op) || OperationPaused(op)
+		OperationGangHeld(op) || OperationNodeUnknown(op) || OperationCapacityProvisioning(op) ||
+		OperationPaused(op)
 }
 
 // OperationQuotaHeld reports whether the operation carries the quota

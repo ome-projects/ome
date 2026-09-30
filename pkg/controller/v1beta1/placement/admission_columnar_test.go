@@ -2,9 +2,10 @@ package placement
 
 import (
 	"context"
-	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,6 +20,9 @@ func columnarScheme(t *testing.T) *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	if err := v1beta1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
 	}
 	return scheme
 }
@@ -78,7 +82,7 @@ func placementDecisionsFor(t *testing.T, reads client.Reader, isvc *v1beta1.Infe
 // predicates through componentIRStatuses against the same logical rows stored
 // as DenseV1 and as ColumnarV2, through the production decoded accessor.
 func TestPlacementPredicatesDecodeColumnarV2Identically(t *testing.T) {
-	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "svc"}}
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "svc", UID: "member-uid"}}
 	declareComponent(isvc, v1beta1.EngineComponent)
 	declareComponent(isvc, v1beta1.DecoderComponent)
 
@@ -86,15 +90,20 @@ func TestPlacementPredicatesDecodeColumnarV2Identically(t *testing.T) {
 	decoder := placementIR(v1beta1.DecoderComponent, v1beta1.OMENativeInstanceReady, true, false)
 	decoder.Status.InstanceStatuses[1].Phase = v1beta1.OMENativeInstanceFailed
 
-	dense := fake.NewClientBuilder().WithScheme(columnarScheme(t)).WithObjects(engine, decoder).Build()
-	columnar := fake.NewClientBuilder().WithScheme(columnarScheme(t)).
-		WithObjects(columnarTwin(t, engine), columnarTwin(t, decoder)).Build()
+	objects := observedWorkerObjects(isvc, engine, decoder)
+	dense := fake.NewClientBuilder().WithScheme(columnarScheme(t)).WithObjects(objects...).Build()
+	for i, obj := range objects {
+		if ir, ok := obj.(*v1beta1.InferenceReplica); ok {
+			objects[i] = columnarTwin(t, ir)
+		}
+	}
+	columnar := fake.NewClientBuilder().WithScheme(columnarScheme(t)).WithObjects(objects...).Build()
 	reconciler := &Reconciler{InstanceStatusDecoder: irstatus.NewDecoder(8)}
 
 	want := placementDecisionsFor(t, reconciler.instanceStatusReader(dense), isvc)
 	got := placementDecisionsFor(t, reconciler.instanceStatusReader(columnar), isvc)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("placement decisions differ by stored encoding:\n dense:    %+v\n columnar: %+v", want, got)
+	if diff := cmp.Diff(want, got, cmp.AllowUnexported(placementDecisions{})); diff != "" {
+		t.Fatalf("placement decisions differ by stored encoding (-want +got):\n%s", diff)
 	}
 	if !want.anyAdmitted || !want.allAdmitted || want.admittedReplicas != 1 || !want.terminallyFailed {
 		t.Fatalf("fixture does not exercise the predicates as intended: %+v", want)

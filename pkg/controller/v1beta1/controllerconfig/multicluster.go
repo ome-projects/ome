@@ -84,6 +84,11 @@ type WorkloadClusterConfig struct {
 // PlacementConfig tunes the fan-out placement controller, its status
 // convergence, and its orphan GC.
 type PlacementConfig struct {
+	// MemberOperatorNamespace locates member configuration and pinned runtime
+	// revisions. Empty holds resolution whenever those inputs are required.
+	MemberOperatorNamespace string `json:"memberOperatorNamespace,omitempty"`
+	// Capacity opts into hardware-based placement. Nil keeps that mode pending.
+	Capacity *PlacementCapacityConfig `json:"capacity,omitempty"`
 	// RequeueInterval is the status-refresh poll cadence. With the cache/funnel off
 	// it also paces the cross-cluster status re-read.
 	RequeueInterval string `json:"requeueInterval,omitempty"`
@@ -120,6 +125,40 @@ type PlacementConfig struct {
 	// annotation. It names a resource the operator created, so it has no in-code
 	// default: empty leaves the choice to the placement package.
 	LocalQueue string `json:"localQueue,omitempty"`
+}
+
+// +kubebuilder:object:generate=false
+// PlacementCapacityConfig identifies reports and bounds their acceptance age.
+// All fields are required when the block is present; there are no Go defaults.
+type PlacementCapacityConfig struct {
+	RootName        string `json:"rootName"`
+	MaxAge          string `json:"maxAge"`
+	StabilityWindow string `json:"stabilityWindow"`
+	RefreshInterval string `json:"refreshInterval"`
+}
+
+func (c PlacementCapacityConfig) Validate() error {
+	var errs []error
+	if strings.TrimSpace(c.RootName) == "" {
+		errs = append(errs, errors.New("placement.capacity: rootName is required"))
+	}
+	for _, field := range []struct{ name, value string }{{"maxAge", c.MaxAge}, {"stabilityWindow", c.StabilityWindow}, {"refreshInterval", c.RefreshInterval}} {
+		if d, err := time.ParseDuration(field.value); err != nil || d <= 0 {
+			errs = append(errs, fmt.Errorf("placement.capacity.%s: must be an explicit positive duration", field.name))
+		}
+	}
+	if len(errs) == 0 && c.RefreshIntervalDuration() >= c.MaxAgeDuration() {
+		errs = append(errs, errors.New("placement.capacity.refreshInterval: must be shorter than maxAge"))
+	}
+	return errors.Join(errs...)
+}
+
+func (c PlacementCapacityConfig) MaxAgeDuration() time.Duration { return parseDurationOrZero(c.MaxAge) }
+func (c PlacementCapacityConfig) StabilityWindowDuration() time.Duration {
+	return parseDurationOrZero(c.StabilityWindow)
+}
+func (c PlacementCapacityConfig) RefreshIntervalDuration() time.Duration {
+	return parseDurationOrZero(c.RefreshInterval)
 }
 
 // +kubebuilder:object:generate=false
@@ -457,6 +496,14 @@ func (c MultiClusterConfig) Validate() error {
 	}
 	sort.Strings(keys)
 	var errs []error
+	if c.Placement.Capacity != nil {
+		if strings.TrimSpace(c.Placement.MemberOperatorNamespace) == "" {
+			errs = append(errs, errors.New("placement.memberOperatorNamespace is required for capacity placement"))
+		}
+		if err := c.Placement.Capacity.Validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, k := range keys {
 		raw := durations[k]
 		if raw == "" {

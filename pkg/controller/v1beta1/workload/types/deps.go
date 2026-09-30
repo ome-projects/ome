@@ -70,6 +70,12 @@ type Deps struct {
 	// all no-op. Idempotent.
 	EnsureGangPodGroup EnsureGangPodGroupFn
 
+	// Provisioner, when set, confines each pod to capacity it readies and
+	// withholds the pod's create until that capacity is ready; the hold
+	// pass reports the wait as WaitingReasonCapacityProvisioning. nil
+	// creates every pod unconfined.
+	Provisioner Provisioner
+
 	// Clock supplies wall-clock time for deadlines and status
 	// timestamps. nil falls back to the real clock — inject a fake
 	// (k8s.io/utils/clock/testing) for deterministic boundary tests.

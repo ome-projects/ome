@@ -10,19 +10,10 @@ import "sigs.k8s.io/ome/pkg/constants"
 const PlacementControllerName = "placement"
 
 const (
-	// AcceleratorRequirementsAnnotation holds a label-selector string of the
-	// accelerator/capability attributes a candidate WorkloadCluster MUST satisfy
-	// for this ISVC (e.g. "gpu=gb300"). Selector attributes include cluster labels
-	// and the virtual, immutable metadata.name key. An ISVC that declares neither
-	// this nor ClusterSelectorAnnotation is NOT fanned out fleet-wide. The value
-	// is user/GitOps-supplied — there is no in-code default.
-	AcceleratorRequirementsAnnotation = "ome.io/accelerator-requirements"
-
-	// ClusterSelectorAnnotation holds an optional extra selector string (e.g.
-	// "provider=cloud-a" or "metadata.name=cluster-a") AND-ed onto the accelerator
-	// requirements to further narrow candidate clusters. It is sufficient on its
-	// own to make an ISVC eligible for fleet-wide fan-out.
-	ClusterSelectorAnnotation = "ome.io/cluster-selector"
+	// AcceleratorRequirementsAnnotation identifies obsolete placement intent.
+	AcceleratorRequirementsAnnotation = constants.AcceleratorRequirements
+	// ClusterSelectorAnnotation identifies obsolete placement intent.
+	ClusterSelectorAnnotation = constants.ClusterSelector
 
 	// PlacementFinalizer lets the controller delete the derived ISVC before the
 	// source ISVC is removed.
@@ -64,12 +55,18 @@ var (
 // where the worker cluster's reconciler would (re)interpret them: the
 // placement selectors (candidate selection is the control plane's job), the
 // traffic-drain override (one shared cross-cluster routing decision), the
-// rollout operator-verbs (promote/rollback/repin advance one shared rollout,
-// owned by the control plane — a copy on every candidate would each consume
-// the verb), and the rollout plan-source provenance (system-authored during
-// derive-time policy inflation; a user-supplied value on the source must never
-// masquerade as control-plane provenance on the derived). Stripped by
-// DeriveISVC; inflation re-authors the plan-source entry afterwards.
+// rollout operator-verbs (promote/rollback/repin/resume advance one shared
+// rollout, owned by the control plane — a copy on every candidate would each
+// consume the verb, and the source's still-live copy would re-derive it onto
+// the member on the next sync, replaying it forever), and the rollout
+// plan-source provenance (system-authored during derive-time policy
+// inflation; a user-supplied value on the source must never masquerade as
+// control-plane provenance on the derived). Stripped by DeriveISVC;
+// inflation re-authors the plan-source entry afterwards.
+//
+// Nothing forwards these hub→member, and the hub runs no rollout of its own,
+// so on a placed InferenceService a verb takes effect only when applied
+// directly to the member object.
 var controlPlaneOnlyAnnotations = []string{
 	AcceleratorRequirementsAnnotation,
 	ClusterSelectorAnnotation,
@@ -77,6 +74,7 @@ var controlPlaneOnlyAnnotations = []string{
 	constants.RolloutPromoteAnnotation,
 	constants.RolloutRollbackAnnotation,
 	constants.RolloutRepinAnnotation,
+	constants.RolloutResumeAnnotation,
 	constants.RolloutPlanSourceAnnotation,
 }
 

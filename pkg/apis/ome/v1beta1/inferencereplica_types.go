@@ -1,13 +1,14 @@
 /*
-InferenceReplica is the per-(InferenceService, Component) workload CRD
-that owns the OMENative lifecycle subtree.
+InferenceReplica is the pod-set workload CRD behind OMENative: N Instances
+of the same rendered pod templates, one revision history, one rollout.
 
-Access model: this is NOT a user-facing API. The InferenceService
-controller is the sole writer of InferenceReplica specs; the
-InferenceReplica controller is the sole writer of statuses. A
-validating webhook (pkg/webhook/admission/inferencereplica) rejects
-direct user writes that lack the ome.io/controller-write annotation.
-Operators may kubectl get inferencereplicas for debugging.
+A replica has one of two forms. An InferenceService projects one replica
+per OMENative Component and is the only writer of that replica's spec
+(the projected form). A user may also create a replica directly with
+rendered runners and no parent (the standalone form); such a replica is
+governed by RBAC. The validating webhook in
+pkg/webhook/admission/inferencereplica enforces the ownership rules of
+each form. The InferenceReplica controller is the only writer of status.
 */
 
 package v1beta1
@@ -18,13 +19,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// InferenceReplica is the per-Component workload abstraction for
-// OMENative-managed InferenceService Components. One InferenceReplica
-// exists per (ISVC, Component) tuple. The ISVC controller writes the
-// spec; the InferenceReplica controller writes the status.
+// InferenceReplica is one pod set: N Instances of the same rendered pod
+// templates with one revision history and one rollout. A projected replica
+// exists per (InferenceService, Component) tuple and is named
+// <inferenceservice>-<component>; a standalone replica is named by its
+// creator.
 //
-// The scale subresource lets HPA/KEDA target the InferenceReplica
-// directly rather than indirecting through the parent ISVC.
+// The scale subresource lets HPA/KEDA target the InferenceReplica directly.
 //
 // +k8s:openapi-gen=true
 // +genclient
@@ -57,120 +58,172 @@ type InferenceReplicaList struct {
 	Items           []InferenceReplica `json:"items"`
 }
 
-// InferenceReplicaSpec is the desired state of one (ISVC, Component)
-// workload. The InferenceService controller is the sole writer; the
-// admission webhook rejects writes from other actors that lack the
-// ome.io/controller-write annotation.
+// InferenceReplicaSpec is the desired state of one pod set. Its fields fall
+// into three groups:
+//
+//   - User fields describe the pod set itself: component, set at create and
+//     immutable; the template source (runners, modelRef and runtimeRef),
+//     replicas, minReadySeconds, topologyKey, topologySpread,
+//     topologySpreadKey, lifecycle, revisionHistoryLimit and autoscaler. The
+//     owner of the replica writes them: the InferenceService controller for
+//     a projected replica, the creating user for a standalone one. Exactly
+//     one template source: runners, or modelRef and/or runtimeRef; the
+//     validating webhook enforces it.
+//   - Rollout-control fields steer a rollout across pod sets: pacing, paused,
+//     pauseMode and pairingProtocol. The InferenceService controller writes
+//     them on the replicas it orchestrates; on a standalone replica its owner
+//     sets them.
+//   - Controller-only fields carry state only the InferenceService controller
+//     can know: parentRef, placementExecution and placementReplicaLimit.
 type InferenceReplicaSpec struct {
 	// PlacementExecution is allocation authority projected from a derived service.
 	// Its generation must be observed before the control plane uses member evidence.
+	// Controller-only.
 	// +optional
 	PlacementExecution *PlacementExecutionPolicy `json:"placementExecution,omitempty"`
 	// PlacementReplicaLimit reserves the largest replica count this component
 	// may request while placement pauses growth. Only a raised placement floor
 	// can increase this limit; autoscaler requests remain in Replicas.
+	// Controller-only.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	PlacementReplicaLimit *int32 `json:"placementReplicaLimit,omitempty"`
 
-	// ParentRef names the InferenceService that owns this replica.
-	// Set by the ISVC controller at create time; immutable thereafter.
-	ParentRef ParentReference `json:"parentRef"`
+	// ParentRef names the InferenceService that projects this replica. The
+	// InferenceService controller sets it at create time and it is immutable
+	// thereafter; a standalone replica omits it. Pod, Service and
+	// ControllerRevision names derive from the parent name when set and from
+	// the replica's own name otherwise. Controller-only.
+	// +optional
+	ParentRef *ParentReference `json:"parentRef,omitempty"`
 
-	// Component is one of engine | decoder | router. Immutable;
-	// moving a workload between Component slots requires recreating
-	// the InferenceReplica.
+	// Component is the role this pod set fills: engine | decoder | router.
+	// Immutable; moving a workload between roles requires recreating the
+	// InferenceReplica.
 	Component ComponentType `json:"component"`
 
-	// Replicas is the desired Instance count. The HPA / KEDA scale
-	// subresource writes this field. Defaults to 1 when omitted.
+	// ModelRef names the BaseModel (in the replica's namespace) or
+	// ClusterBaseModel this replica serves. With it set the controller renders
+	// the pods from the model and the runtime: the runtime named by RuntimeRef,
+	// or the runtime selected for the model when RuntimeRef is absent. Fine-tuned
+	// weights and overlays render as they do on an InferenceService. Exclusive
+	// with Runners. User field.
 	// +optional
+	ModelRef *ModelRef `json:"modelRef,omitempty"`
+
+	// RuntimeRef names the ServingRuntime (in the replica's namespace) or
+	// ClusterServingRuntime whose piece for Component this replica renders.
+	// The runtime must declare that piece. Without ModelRef the piece renders
+	// as-is, with no model mounted. The runtime's pod spec places the pods
+	// (node selector, affinity, resources); a second accelerator pool is a
+	// second runtime. A pin (autoSync=false, revision) is not honored: the
+	// live runtime renders, and the validating webhook rejects a pinned
+	// reference. Exclusive with Runners. User field.
+	// +optional
+	RuntimeRef *ServingRuntimeRef `json:"runtimeRef,omitempty"`
+
+	// Replicas is the desired Instance count; nil or 0 runs one Instance.
+	// Whatever targets the scale subresource (HPA, KEDA or an external
+	// scaler) writes this field. On a projected replica the InferenceService
+	// controller writes the component's minReplicas (at least 1) at create,
+	// and thereafter while no autoscaler owns the count or the stored count
+	// is nil or 0.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// MinReadySeconds is the minimum time a newly Ready pod must stay
-	// Ready before it counts as Available, projected from the parent
-	// ISVC's spec.<component>.lifecycle.minReadySeconds. The workload
-	// engine paces rollout drains and promotions on Available pods and
-	// counts only Available pods in availableReplicas. 0 means Available
-	// as soon as Ready.
+	// MinReadySeconds is the minimum time a newly Ready pod must stay Ready
+	// before it counts as Available. The workload engine paces rollout
+	// drains and promotions on Available pods and counts only Available pods
+	// in availableReplicas; 0 means Available as soon as Ready. On a
+	// projected replica the InferenceService controller copies the
+	// component's effective lifecycle.minReadySeconds: the InferenceService's
+	// value, else the runtime's, else the operator's deploy default.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MinReadySeconds int32 `json:"minReadySeconds,omitempty"`
 
-	// TopologyKey is the resolved gang co-location node-label key for this
-	// Component, projected verbatim from the effective ISVC↔runtime
-	// component spec (spec.<component>.topologyKey, else the runtime
-	// component-config value). When set on a multi-node Component, the
-	// InferenceReplica controller auto-generates the per-Instance
-	// worker→leader podAffinity that co-locates every worker onto its
-	// gang's leader on a node sharing this label value. Nil means no
-	// auto-generated gang affinity.
+	// TopologyKey is the gang co-location node-label key for this Component.
+	// When set on a multi-node Component, the InferenceReplica controller
+	// auto-generates the per-Instance worker→leader podAffinity that
+	// co-locates every worker onto its gang's leader on a node sharing this
+	// label value. Nil means no auto-generated gang affinity. On a projected
+	// replica the value is the effective InferenceService or runtime
+	// component setting.
 	// +optional
 	TopologyKey *string `json:"topologyKey,omitempty"`
 
-	// TopologySpread is the resolved spreading policy for this
-	// Component, projected verbatim from the effective ISVC↔runtime
-	// component spec. The InferenceReplica controller renders it as a
-	// topologySpreadConstraint on each Instance's anchor pod; nil keeps
-	// pure bin-packing.
+	// TopologySpread is the spreading policy for this Component. The
+	// InferenceReplica controller renders it as a topologySpreadConstraint on
+	// each Instance's anchor pod; nil keeps pure bin-packing. On a projected
+	// replica the value is the effective InferenceService or runtime
+	// component setting.
 	// +optional
 	// +kubebuilder:validation:Enum=Preferred;Required
 	TopologySpread *TopologySpreadPolicy `json:"topologySpread,omitempty"`
 
-	// TopologySpreadKey is the resolved fault-domain node-label key
-	// TopologySpread spreads across; nil defaults to TopologyKey.
+	// TopologySpreadKey is the fault-domain node-label key TopologySpread
+	// spreads across; nil defaults to TopologyKey. On a projected replica the
+	// value is the effective InferenceService or runtime component setting.
 	// +optional
 	TopologySpreadKey *string `json:"topologySpreadKey,omitempty"`
 
-	// PairingProtocol is the engine↔decoder wire-compatibility token projected
-	// from spec.rollout.pairingProtocol on the parent InferenceService. It is
-	// folded into the revision hash (a change mints a new revision) and stamped
-	// as the ome.io/pairing-protocol label on rendered pods. Projected only
-	// onto engine and decoder — the router does not participate in P/D pairing
-	// and must not re-roll on a protocol change. Nil pairs with anything.
+	// PairingProtocol is the engine/decoder wire-compatibility token. It is
+	// folded into the revision hash (a change mints a new revision) and
+	// stamped as the ome.io/pairing-protocol label on rendered pods; nil pairs
+	// with anything. Only engine and decoder replicas pair on it; a change on
+	// any replica still mints a new revision. On a projected replica the
+	// InferenceService controller copies spec.rollout.pairingProtocol onto
+	// the engine and decoder replicas and never onto the router, which must
+	// not re-roll on a protocol change.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`
 	PairingProtocol *string `json:"pairingProtocol,omitempty"`
 
-	// Runners is the fully-rendered set of pod templates per Instance.
-	// MUST be non-empty. Single-pod Instances have one Runner with
-	// Name="default" and Size=1; multi-node Instances typically have
-	// Name="leader" (Size=1) plus Name="worker" (Size=N).
+	// Runners is the fully-rendered set of pod templates per Instance. A
+	// single-pod Instance has one Runner named "default" with Size=1; a
+	// multi-node Instance has "leader" (Size=1) and "worker" (Size=N). Required
+	// unless ModelRef or RuntimeRef is set, in which case it must be absent: the
+	// controller renders the runners from the refs and never stores them. The
+	// controller treats each Runner.Template as opaque input. User field.
 	//
-	// The InferenceService controller is the sole writer of this
-	// field. The InferenceReplica controller treats each
-	// Runner.Template as opaque input (same contract
-	// appsv1.Deployment.spec.template uses).
-	//
-	// +kubebuilder:validation:MinItems=1
+	// +optional
 	// +listType=map
 	// +listMapKey=name
-	Runners []Runner `json:"runners"`
+	Runners []Runner `json:"runners,omitempty"`
 
 	// Lifecycle holds the OMENative lifecycle policies (RestartPolicy,
-	// UpdateStrategy, ReadyPolicy, InstanceReadyTimeout,
-	// MigrationPolicy). Reuses the existing LifecycleSpec
-	// type so the projection from ISVC.spec.<component>.lifecycle is
-	// a verbatim copy.
+	// UpdateStrategy, ReadyPolicy, InstanceReadyTimeout, MigrationPolicy).
+	// An unset policy takes the fixed fallback its LifecycleSpec field
+	// names; an unset or zero instanceReadyTimeout falls back to the
+	// operator's lifecycle.instanceReadyTimeout on every replica, and with
+	// neither set operations open with no deadline. The operator's deploy
+	// defaults are applied only to a projected replica, before the copy.
+	// lifecycle.minReadySeconds is not read on a replica and is rejected on
+	// a standalone one; set spec.minReadySeconds. On a projected replica
+	// this is the component's effective lifecycle: the InferenceService's
+	// value, else the runtime's, with unset fields filled from the
+	// operator's deploy defaults.
 	// +optional
 	Lifecycle *LifecycleSpec `json:"lifecycle,omitempty"`
 
-	// Pacing is the InferenceService controller's projection of the
-	// active RolloutCoordinationGroup pacing for this replica.
-	// Written by the ISVC controller; read by the InferenceReplica
-	// controller. Includes Partition (canary hold) and MaxUnavailable
-	// (rollout budget). Nil means independent rollout.
+	// Pacing is rollout control written onto this replica: the canary
+	// partition, the rollback target and a reserved disruption budget. The
+	// InferenceService controller writes it on the replicas it orchestrates;
+	// on a standalone replica its owner sets it. Nil means the replica rolls
+	// independently.
 	// +optional
 	Pacing *InferenceReplicaPacing `json:"pacing,omitempty"`
 
-	// Autoscaler is the live autoscaler configuration that downstream
-	// scalers (HPA / KEDA / external) target. The ISVC controller projects
-	// the per-Component autoscaler defaults from ISVC.spec.<component>.autoscaler
-	// onto the corresponding IR at create time + on subsequent reconciles.
-	// External autoscalers may also write directly
-	// to this field via the /scale subresource without going through the
-	// ISVC controller.
+	// Autoscaler is the autoscaler configuration downstream scalers (HPA /
+	// KEDA / External) target. Only the InferenceService controller creates
+	// a scaler from it, so on a standalone replica the HPA and KEDA classes
+	// are rejected and an External scaler targets the scale subresource
+	// directly. On a projected replica the InferenceService controller
+	// writes the resolved per-Component autoscaler, replacing the whole
+	// block, whenever that autoscaler resolves; while an autoscaler policy
+	// fails to render, the stored block is kept as the last known good one.
 	// +optional
 	Autoscaler *ComponentAutoscaler `json:"autoscaler,omitempty"`
 
@@ -198,15 +251,13 @@ type InferenceReplicaSpec struct {
 	// +kubebuilder:validation:Enum=Recover;Freeze
 	PauseMode PauseMode `json:"pauseMode,omitempty"`
 
-	// RevisionHistoryLimit caps how many non-live ControllerRevisions
-	// the InferenceReplica controller retains for this replica,
-	// projected by the InferenceService controller from the parent
-	// ISVC's ome.io/revision-history-limit annotation. Live revisions
-	// (CurrentRevision / UpdateRevision and every per-Instance
-	// running/target revision) are never deleted regardless of the
-	// limit. Nil falls back to the operator-level
-	// lifecycle.revisionHistoryLimit config; when that is also absent,
-	// no revisions are pruned.
+	// RevisionHistoryLimit caps how many non-live ControllerRevisions the
+	// InferenceReplica controller retains. Live revisions (CurrentRevision /
+	// UpdateRevision and every per-Instance running/target revision) are never
+	// deleted regardless of the limit. Nil falls back to the operator-level
+	// lifecycle.revisionHistoryLimit config; when that is also absent, no
+	// revisions are pruned. On a projected replica the InferenceService
+	// controller copies the parent's ome.io/revision-history-limit annotation.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty"`
@@ -218,7 +269,31 @@ type InferenceReplicaSpec struct {
 // names without re-reading the metadata field.
 type ParentReference struct {
 	// Name is the name of the parent InferenceService.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+}
+
+// ParentName returns the name of the InferenceService that projects this
+// replica, or "" for a standalone replica.
+func (ir *InferenceReplica) ParentName() string {
+	if ir == nil || ir.Spec.ParentRef == nil {
+		return ""
+	}
+	return ir.Spec.ParentRef.Name
+}
+
+// NamePrefix is the name every pod, Service and ControllerRevision of this
+// replica derives from, and the value of the ome.io/inferenceservice label
+// on its pods: the parent InferenceService's name when one is set,
+// otherwise the replica's own name.
+func (ir *InferenceReplica) NamePrefix() string {
+	if ir == nil {
+		return ""
+	}
+	if parent := ir.ParentName(); parent != "" {
+		return parent
+	}
+	return ir.Name
 }
 
 // PauseMode is the enum of pause depths for InferenceReplicaSpec.Paused.
@@ -277,30 +352,30 @@ type Runner struct {
 	Template corev1.PodTemplateSpec `json:"template"`
 }
 
-// InferenceReplicaPacing is the per-replica projection of the active
-// RolloutCoordinationGroup pacing. Mirrors the corresponding
-// RollingUpdate subset so the projection is a verbatim
-// copy.
+// InferenceReplicaPacing is the rollout control written onto one replica: the
+// partition that holds Instances back, a reserved disruption budget, and the
+// revision to roll back to.
 type InferenceReplicaPacing struct {
-	// Partition holds back updates for Instances whose index is less
-	// than Partition. Mirrors RollingUpdate.Partition. 0
-	// (the default) updates all Instances. Used for canary holds.
+	// Partition holds back updates: the Partition lowest-indexed Instances
+	// not yet on the target revision, skipping any already updating to it,
+	// keep their current revision. When set it takes precedence over
+	// lifecycle.updateStrategy.rollingUpdate.partition; nil defers to it.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Partition *int32 `json:"partition,omitempty"`
 
-	// MaxUnavailable caps in-rollout disruption. Accepts either a
-	// raw count or a percent string. When nil, the InferenceReplica
-	// controller falls back to its own default budget.
+	// MaxUnavailable is reserved; setting it has no effect. Disruption during
+	// a rollout is paced by lifecycle.updateStrategy.rollingUpdate.maxUnavailable.
 	// +optional
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
 
-	// RollbackToRevision, when set, names a ControllerRevision the
-	// InferenceReplica must roll every Instance back to — overriding the
-	// rendered desired template with that revision's stored pod template (and
-	// using it as the update target). The InferenceService controller sets this
-	// during a canary rollback so the forward-roll machinery drains the canary
-	// pods back onto the stable revision. Empty in steady state.
+	// RollbackToRevision, when set, names a ControllerRevision the replica
+	// rolls every Instance back to: that revision's stored pod template
+	// becomes the update target while UpdateRevision keeps reporting the
+	// spec's own revision. The InferenceService controller sets it during a
+	// canary rollback; empty in steady state. If the named revision does not
+	// exist, the replica rolls to its spec. A revision this replica does not
+	// control is ignored and reported with a Warning event.
 	// +optional
 	RollbackToRevision *string `json:"rollbackToRevision,omitempty"`
 }

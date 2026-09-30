@@ -100,6 +100,11 @@ func executeUpdatePass(ctx context.Context, deps types.Deps, input types.Reconci
 		// promptly instead of lingering until the next denial-free pass.
 		firstDenial = nil
 	}
+	// A drain the gate held is progress withheld, not an admission denial:
+	// it is reported even when another Instance moved this pass.
+	if hold := input.DrainHolds.First(); hold != nil {
+		firstDenial = hold
+	}
 	if input.RecordRolloutHold != nil {
 		input.RecordRolloutHold(firstDenial)
 	}
@@ -194,15 +199,29 @@ func (a *updateAdmission) admit(ctx context.Context, plan types.ComponentPlan, i
 	// its outage in its serving-based unavailability, so gating its own
 	// recreate would double count and starve the recovery.
 	if a.gate != nil && !item.CoordGateExempt {
-		if allowed, gate, reason := a.gate(a.selection.Strategy, a.inFlightSurge, a.gateUnavail); !allowed {
+		mechanism := a.mechanism(item)
+		if allowed, gate, reason := a.gate(mechanism, a.inFlightSurge, a.gateUnavail); !allowed {
 			logf.FromContext(ctx).V(1).Info("update start denied by coordination gate",
 				"component", plan.Component, "instance", item.Instance.Index,
-				"target", a.target.Name, "gate", gate, "reason", reason,
+				"target", a.target.Name, "gate", gate, "reason", reason, "mechanism", mechanism,
 				"inFlightSurge", a.inFlightSurge, "gateUnavail", a.gateUnavail)
 			return false, &types.RolloutHold{Gate: gate, Reason: reason, Target: a.target.Name}
 		}
 	}
 	return true, nil
+}
+
+// mechanism is the strategy arm item's start runs on, which is what the
+// coordination gate paces by: the Component's strategy, or RecreatePod
+// when an in-place strategy resolves to a rebuild on this Instance. The
+// gate waives its capacity checks for an in-place start only because the
+// patch returns the same pod; a fallback recreate drains the pods first,
+// like any other drain-first start, and is consulted as one.
+func (a *updateAdmission) mechanism(item UpdateItem) types.UpdateStrategyType {
+	if item.RecreateFallback {
+		return types.UpdateStrategyRecreatePod
+	}
+	return a.selection.Strategy
 }
 
 // charge counts a fresh start the pass opened, so every later consult

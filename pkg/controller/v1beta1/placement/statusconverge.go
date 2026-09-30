@@ -28,10 +28,10 @@ const DefaultStatusBatchPeriod = 1 * time.Second
 // graceful-degradation default applied by resolveConvergeConfig so an unset
 // option never injects a magic literal mid-package.
 type convergeConfig struct {
-	// statusEvents is the remote watch-funnel channel feeding event-driven
+	// statusEvents contains the remote watch-funnel channels for event-driven
 	// convergence. Nil leaves the controller poll-only (it still re-reconciles on
 	// the safety requeue), so the funnel is an optimization, not a dependency.
-	statusEvents <-chan event.GenericEvent
+	statusEvents []<-chan event.GenericEvent
 	// batchPeriod debounces funnel events before they enqueue a reconcile.
 	batchPeriod time.Duration
 	// safetyRequeue is the long steady-state re-read backstop for the
@@ -45,10 +45,14 @@ type convergeConfig struct {
 // windows from minutes to milliseconds without touching package state.
 type ConvergeOption func(*convergeConfig)
 
-// WithStatusEvents wires the remote watch-funnel channel the controller consumes
+// WithStatusEvents adds a remote watch-funnel channel the controller consumes
 // via source.Channel. Without it the controller is poll-only (safety requeue).
 func WithStatusEvents(ch <-chan event.GenericEvent) ConvergeOption {
-	return func(c *convergeConfig) { c.statusEvents = ch }
+	return func(c *convergeConfig) {
+		if ch != nil {
+			c.statusEvents = append(c.statusEvents, ch)
+		}
+	}
 }
 
 // WithStatusBatchPeriod overrides the funnel-event debounce window. A

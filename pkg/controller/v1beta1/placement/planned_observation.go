@@ -22,13 +22,18 @@ import (
 
 type plannedHomeObservation struct {
 	Candidate         v1beta1.CandidatePlacement
+	Member            *v1beta1.InferenceService
 	Home              allocation.Home
 	RolloutReserved   int32
 	PauseAcknowledged bool
+	FullHomeReady     bool
+	IdleZeroFloor     bool
+	ScalingToZero     bool
+	Terminal          bool
 }
 
 // observePlannedHome reads a direct, identity-checked member inventory. Component
-// requirements must include runtime inheritance, even before those IRs exist.
+// requirements include every declared component, even before its IR exists.
 func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.InferenceService, previous v1beta1.CandidatePlacement, components []v1beta1.ComponentType) (plannedHomeObservation, error) {
 	out := plannedHomeObservation{Candidate: retainedUnknownCandidate(source, previous)}
 	out.Candidate.ObservationKnown, out.Candidate.AppliedPlanID = false, ""
@@ -52,6 +57,9 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 	} else if !isOurDerived(member, source) || member.UID == "" || member.ResourceVersion == "" {
 		return out, fmt.Errorf("member service ownership is unverified")
 	}
+	if memberExists {
+		out.Candidate.Endpoint = member.Status.URL.DeepCopy()
+	}
 	irs := &v1beta1.InferenceReplicaList{}
 	selector := client.MatchingLabels{constants.InferenceServicePodLabelKey: source.Name}
 	if err := cl.List(ctx, irs, client.InNamespace(source.Namespace), selector); err != nil {
@@ -72,6 +80,8 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 	policy := executionPolicy(source, previous.Allocation)
 	statuses := map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus{}
 	counts := map[v1beta1.ComponentType]memberResourceCount{}
+	idleComponents := map[v1beta1.ComponentType]bool{}
+	zeroRequests := map[v1beta1.ComponentType]bool{}
 	applied := memberExists && member.DeletionTimestamp.IsZero()
 	if memberExists {
 		memberPolicy, err := protocol.FromDerived(member)
@@ -90,7 +100,7 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 			return out, fmt.Errorf("component %q changed during inventory discovery", ir.Name)
 		}
 		owner := metav1.GetControllerOf(ir)
-		if owner == nil || owner.APIVersion != v1beta1.SchemeGroupVersion.String() || owner.Kind != "InferenceService" || owner.Name != source.Name || owner.UID == "" || ir.Spec.ParentRef.Name != source.Name {
+		if owner == nil || owner.APIVersion != v1beta1.SchemeGroupVersion.String() || owner.Kind != "InferenceService" || owner.Name != source.Name || owner.UID == "" || ir.ParentName() != source.Name {
 			return out, fmt.Errorf("component %q has unverified service ownership", ir.Name)
 		}
 		if memberExists && owner.UID != member.UID {
@@ -112,6 +122,11 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 		if err != nil {
 			return out, err
 		}
+		status, err := verifiedMemberAdmission(ir, byOwner[ir.UID], gangSizes)
+		if err != nil {
+			return out, err
+		}
+		ir.Status = *status
 		count, err := countMemberResources(ir, byOwner[ir.UID], gangSizes)
 		if err != nil {
 			return out, err
@@ -121,6 +136,8 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 		if ir.Spec.Replicas == nil || *ir.Spec.Replicas < 0 {
 			return out, fmt.Errorf("component %q has unresolved desired replicas", ir.Name)
 		}
+		zeroRequests[ir.Spec.Component] = *ir.Spec.Replicas == 0 && protocol.HasZeroReplicaFloor(policy, ir.Spec.Component)
+		idleComponents[ir.Spec.Component] = zeroRequests[ir.Spec.Component] && count.Occupied == 0 && count.Reserved == 0
 		// Whole replica units contain Engine and Decoder. Router stays shared
 		// within each home, with its own replica policy and readiness gate.
 		if ir.Spec.Component != v1beta1.RouterComponent {
@@ -167,14 +184,22 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 		if live.UID != member.UID || live.ResourceVersion != member.ResourceVersion {
 			return out, fmt.Errorf("member changed during resource observation")
 		}
+		out.Member = member
 	}
 	scaled := make([]v1beta1.ComponentType, 0, len(components))
 	ready := int32(math.MaxInt32)
 	allAdmitted, allServing := true, true
+	idleZeroFloor := true
+	zeroRequested := true
 	for _, component := range components {
 		count, exists := counts[component]
 		applied = applied && exists
-		allAdmitted = allAdmitted && componentHasAdmittedInstance(statuses[component])
+		admitted := componentHasAdmittedInstance(statuses[component])
+		allAdmitted = allAdmitted && admitted
+		if !admitted {
+			idleZeroFloor = idleZeroFloor && idleComponents[component]
+			zeroRequested = zeroRequested && zeroRequests[component]
+		}
 		if component == v1beta1.RouterComponent {
 			allServing = allServing && statuses[component] != nil && statuses[component].ReadyReplicas > 0
 			if count.Ready == 0 {
@@ -196,6 +221,18 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 	out.Home.Applied = applied
 	out.Home.Ready = ready
 	out.PauseAcknowledged = applied && policy.PauseSurge
+	out.FullHomeReady = applied && len(policy.ReplicaFloors) > 0
+	for _, floor := range policy.ReplicaFloors {
+		out.FullHomeReady = out.FullHomeReady && counts[floor.Component].Ready >= floor.Replicas
+	}
+	if memberExists {
+		out.Terminal = IsTerminallyFailed(member, statuses)
+	}
+	// Zero demand preserves home identity without inventing admission. Pending
+	// cleanup is distinct from an idle home and cannot establish convergence.
+	out.IdleZeroFloor = applied && memberExists && !out.Terminal && !allAdmitted && idleZeroFloor
+	out.ScalingToZero = applied && memberExists && !out.Terminal && !allAdmitted && zeroRequested && !idleZeroFloor
+	out.FullHomeReady = out.FullHomeReady && !out.Terminal
 	out.Candidate = v1beta1.CandidatePlacement{Cluster: previous.Cluster, Allocation: previous.Allocation.DeepCopy(), ObservationKnown: true, Phase: v1beta1.CandidatePhaseAdmitting}
 	if applied {
 		out.Candidate.AppliedPlanID = policy.PlanID
@@ -216,6 +253,7 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 	} else {
 		out.Home.Ready = 0
 	}
+	out.FullHomeReady = out.FullHomeReady && out.Candidate.ReadyReplicas > 0
 	return out, nil
 }
 

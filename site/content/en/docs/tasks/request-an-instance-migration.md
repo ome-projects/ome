@@ -257,3 +257,77 @@ Common exit-3 refusals:
 A refusal is not something to work around with retries in a loop: re-run the
 command once, read the fresh preview, and if it still refuses, inspect the
 service with `kubectl ome migration status` and `kubectl ome status`.
+
+## After acceptance: the controller's execution caps
+
+Acceptance only queues the request. Before the controller allocates the surge
+instance that actually executes a migration, it judges the request against the
+operator-level **migration capacity policy** — the `lifecycle.audit` block of
+the `inferenceservice-config` ConfigMap, rendered by the `ome-resources` chart
+from `ome.controller.lifecycle.audit`:
+
+```yaml
+ome:
+  controller:
+    lifecycle:
+      audit:
+        maxInFlightMigrations: 3
+        maxMigrationsPerWindow: 10
+        window: 1h
+```
+
+| Setting | Chart default | Bounds |
+| --- | --- | --- |
+| `maxInFlightMigrations` | `3` | How many migrations may be **executing** at once: non-terminal records in `status.migrations` with a surge instance allocated. |
+| `maxMigrationsPerWindow` | `10` | How many migrations, of any phase, may have had their surge **allocated** inside the trailing `window`. |
+| `window` | `1h` | The trailing window the rate cap counts over. It is also the retention horizon of `status.migrations`: terminal records completed longer ago than this are pruned (the audit ledger and `migration history` keep the evidence). |
+
+Both caps bound execution **per component** — they count the owning
+InferenceReplica's `status.migrations` records — and never queued intent:
+dispatch is serial, a queued `Accepted` record holds no resources, so a batch
+of accepted requests cannot trip the caps for the records waiting behind the
+executing one. The request being judged is excluded from both counts, and the
+two caps are independent — either one tripping rejects the request.
+
+All three fields are required when the block is present, and the OME binary has
+**no built-in caps**. An invalid block — a non-positive cap, or a missing,
+unparsable or non-positive `window` — is logged and treated as unconfigured,
+never patched up with fallback values.
+
+### Cap reached: the request fails
+
+A request judged while a cap is at its ceiling is **terminally failed**, not
+queued: its record moves to `phase: Failed` with the reason as its message —
+`in-flight migration cap reached (3/3)` or
+`migration rate cap reached (10/10 in the last 1h0m0s)` — and Warning events
+with reasons `RateLimited` and `MigrationRequestRejected` fire on the
+InferenceService. To retry, run a fresh `migration start` once capacity frees:
+an executing migration reaching a terminal phase frees its in-flight slot, and
+the rate cap frees as past allocations age out of the trailing window.
+
+### No `lifecycle.audit` at all: the request is held
+
+Removing the block does not remove the bound. The caps are the only limit on
+how much destructive migration work one requester can start, so with no policy
+the controller **holds** every accepted request instead of executing it
+unbounded:
+
+- The record stays `phase: Accepted` in `status.migrations` with the message
+  `waiting for migration capacity policy (no lifecycle.audit configured)`.
+- A Warning event with reason `MigrationPolicyUnconfigured` fires on the
+  InferenceService once per hold, not on every reconcile.
+- The InferenceReplica carries the condition `MigrationPolicyUnconfigured=True`
+  (reason `MigrationCapacityUnconfigured`, message `lifecycle.audit is not
+  configured; migration requests wait instead of executing`), projected into
+  the InferenceService's `status.components.<component>.lifecycle.conditions`.
+
+Nothing is rejected: a held request is admitted automatically on a later pass
+once the operator supplies the block, and the condition flips to `False` with
+reason `MigrationCapacityConfigured` the next time a request is judged under
+configured caps. An unconfigured policy also means no `window` exists to age
+records against, so terminal records are never pruned from
+`status.migrations` while it is absent.
+
+Watch a held or rejected request with
+[`kubectl ome migration status`](/ome/docs/tasks/kubectl-ome-migration) — the
+record's message carries the hold or failure reason.

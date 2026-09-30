@@ -37,7 +37,7 @@ func waitMigrationFixture() (*ome.InferenceService, *ome.InferenceReplica) {
 	controller := true
 	ir := &ome.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Name: "chat-engine", Namespace: "prod", UID: types.UID("PRIVATE-IR-UID"), ResourceVersion: "rv-ir", Generation: 2, Labels: map[string]string{constants.InferenceServicePodLabelKey: "chat"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}}},
-		Spec:       ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
+		Spec:       ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
 		Status:     ome.InferenceReplicaStatus{ObservedGeneration: 2, Migrations: []ome.MigrationStatus{{RequestUUID: waitMigrationID, Trigger: ome.MigrationTriggerManual, SourceInstance: 1, Phase: ome.MigrationPhaseFailed, StartedAt: metav1.NewTime(time.Unix(1000, 0)), Deadline: metav1.NewTime(time.Unix(2000, 0)), CompletedAt: waitMetaTime(time.Unix(1500, 0)), Message: "PRIVATE-STATUS-MESSAGE"}}},
 	}
 	return parent, ir

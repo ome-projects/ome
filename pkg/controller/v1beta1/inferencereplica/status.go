@@ -118,10 +118,43 @@ const (
 	ReasonNoReplicas = "NoReplicas"
 )
 
+// Ready=False reasons stamped when a replica has no pod templates to run:
+// it declares no template source, or it renders from modelRef/runtimeRef
+// and the render is blocked. The workload pass does not run and the existing
+// pods are left as they are; the runtime and model watches re-trigger the
+// replica when the referenced objects change.
+const (
+	// ReasonTemplateSourceMissing: neither runners nor a model or runtime
+	// reference is set.
+	ReasonTemplateSourceMissing = "TemplateSourceMissing"
+	// ReasonModelNotFound: no BaseModel or ClusterBaseModel carries the
+	// referenced name, or a sharded model has not finished loading.
+	ReasonModelNotFound = "ModelNotFound"
+	// ReasonModelDisabled: the referenced model is disabled.
+	ReasonModelDisabled = "ModelDisabled"
+	// ReasonRuntimeNotFound: the named runtime does not exist in the
+	// replica's namespace or at cluster scope.
+	ReasonRuntimeNotFound = "RuntimeNotFound"
+	// ReasonRuntimeDisabled: the named runtime is disabled.
+	ReasonRuntimeDisabled = "RuntimeDisabled"
+	// ReasonRuntimeSelectionFailed: no runtime serves the model, or the
+	// named runtime cannot serve it.
+	ReasonRuntimeSelectionFailed = "RuntimeSelectionFailed"
+	// ReasonRuntimePieceMissing: the runtime declares no piece for the
+	// replica's component.
+	ReasonRuntimePieceMissing = "RuntimePieceMissing"
+	// ReasonRenderFailed: the merge or the render of the pod templates
+	// failed, or this controller is not configured to render from refs.
+	ReasonRenderFailed = "RenderFailed"
+)
+
 // aggregateAndWriteStatus publishes cached Pod and EndpointSlice facts over
 // freshly read lifecycle rows, then computes the IR summaries and conditions.
-// Lifecycle fields and CurrentRevision retain their dedicated writers. A nil
-// target leaves revision pointers untouched while counters still publish.
+// Lifecycle fields and CurrentRevision retain their dedicated writers, with
+// one exception the publication owns: a settled Ready row with no pods is
+// written back as Pending (workloadstatus.DemotableReady), so the phase never
+// contradicts the zero pod count published beside it. A nil target leaves
+// revision pointers untouched while counters still publish.
 //
 // holdObserved/hold carry this pass's Update-pass rollout-hold verdict
 // (ReconcileInput.RecordRolloutHold): holdObserved is true when the Update
@@ -159,13 +192,13 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 	// plus a MatchingFields probe the live reader can't serve. r.APIReader
 	// stays reserved for the destructive/correctness-critical paths
 	// (drain/delete/recreate confirm) that genuinely need a live read.
-	pods, err := query.ListOMENativePodsByName(ctx, r.Client, ir.Namespace, ir.Spec.ParentRef.Name, component, true)
+	pods, err := query.ListOMENativePodsByName(ctx, r.Client, ir.Namespace, ir.NamePrefix(), component, true)
 	if err != nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: list pods: %w", err)
 	}
 	byIndex := query.BucketPodsByInstanceIdx(pods)
 	podObservation := workload.NewCachedSelectorPodObservation(pods, byIndex)
-	serviceName := query.HeadlessServiceName(ir.Spec.ParentRef.Name, component)
+	serviceName := query.HeadlessServiceName(ir.NamePrefix(), component)
 	availableByPod, err := workloadstatus.AvailablePodSet(ctx, r.Client, ir.Namespace, serviceName)
 	if err != nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: compute availability: %w", err)
@@ -222,6 +255,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		}
 		nextAvailableIn = counters.NextAvailableIn
 		for i := range fresh.Status.InstanceStatuses {
+			fresh.Status.InstanceStatuses[i].Phase = v1beta1convert.InstancePhaseFromWorkload(publication[i].Phase)
 			fresh.Status.InstanceStatuses[i].PodCount = publication[i].PodCount
 			fresh.Status.InstanceStatuses[i].ReadyPodCount = publication[i].ReadyPodCount
 			fresh.Status.InstanceStatuses[i].ServingPodCount = publication[i].ServingPodCount
@@ -254,7 +288,7 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		if ir.Spec.PlacementExecution != nil {
 			fresh.Status.PlacementObservedGeneration = ownerGeneration
 		}
-		fresh.Status.LabelSelector = irLabelSelectorString(fresh.Spec.ParentRef.Name, fresh.Spec.Component)
+		fresh.Status.LabelSelector = irLabelSelectorString(fresh.NamePrefix(), fresh.Spec.Component)
 
 		// Top-level Ready condition. Two-axis rule:
 		//   Status=True    when ReadyReplicas == Replicas AND
@@ -336,7 +370,8 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 
 // mirrorBack copies Component fields and transient publication counters onto
 // the caller's in-memory IR. Lifecycle fields remain owned by workload
-// operations and are left untouched.
+// operations and are left untouched, except the phase, which comes along so
+// the caller's snapshot shows the demotion the publication wrote.
 func mirrorBack(ir, fresh *v1beta1.InferenceReplica, publication []workloadtypes.InstanceStatus) {
 	ir.Status.Replicas = fresh.Status.Replicas
 	ir.Status.ReadyReplicas = fresh.Status.ReadyReplicas
@@ -423,8 +458,9 @@ func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) worklo
 	}
 }
 
-// mirrorInstanceCounters copies transient Pod counters by Instance index.
-// Lifecycle and admission fields remain untouched.
+// mirrorInstanceCounters copies the published phase and the transient Pod
+// counters by Instance index. Other lifecycle fields and admission remain
+// untouched.
 func mirrorInstanceCounters(status *v1beta1.InferenceReplicaStatus, publication []workloadtypes.InstanceStatus) {
 	if status == nil {
 		return
@@ -439,6 +475,7 @@ func mirrorInstanceCounters(status *v1beta1.InferenceReplicaStatus, publication 
 		if !ok {
 			continue
 		}
+		s.Phase = v1beta1convert.InstancePhaseFromWorkload(observed.Phase)
 		s.PodCount = observed.PodCount
 		s.ReadyPodCount = observed.ReadyPodCount
 		s.ServingPodCount = observed.ServingPodCount
@@ -755,15 +792,12 @@ func computeReadyCondition(status *v1beta1.InferenceReplicaStatus, desiredReplic
 	return cond
 }
 
-// irLabelSelectorString returns the canonical "k=v,k=v" selector
-// string the HPA scale subresource consumes via
-// IR.status.labelSelector. Formula matches the legacy ISVC-side
-// componentLabelSelectorString byte-for-byte so existing HPAs
-// continue to resolve unchanged after a workload migrates from
-// ISVC-direct to IR-driven.
-func irLabelSelectorString(isvc string, component v1beta1.ComponentType) string {
+// irLabelSelectorString returns the "k=v,k=v" selector the HPA scale
+// subresource reads from IR.status.labelSelector: the name-prefix,
+// component and managed-by labels every pod of the replica carries.
+func irLabelSelectorString(namePrefix string, component v1beta1.ComponentType) string {
 	return labels.SelectorFromSet(labels.Set{
-		constants.InferenceServicePodLabelKey: isvc,
+		constants.InferenceServicePodLabelKey: namePrefix,
 		constants.OMEComponentLabel:           string(component),
 		query.LabelManagedBy:                  query.ManagedByOMENative,
 	}).String()

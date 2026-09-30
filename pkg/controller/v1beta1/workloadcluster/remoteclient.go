@@ -77,10 +77,19 @@ func NewNeverCachingClient(fakeClient client.WithWatch) SelectivelyCachingClient
 	}
 }
 
+// DirectClientProvider explicitly exposes an uncached transport through a wrapper.
+// Implementations must preserve live reads and the underlying connection identity.
+type DirectClientProvider interface {
+	DirectClient() client.WithWatch
+}
+
 // DirectClient exposes the transport without informer reads. Callers that use
 // observations to release shared capacity must verify physical absence live.
 func DirectClient(c SelectivelyCachingClient) (client.WithWatch, bool) {
 	switch c := c.(type) {
+	case DirectClientProvider:
+		direct := c.DirectClient()
+		return direct, direct != nil
 	case *neverCachingClient:
 		if c != nil {
 			return c.WithWatch, c.WithWatch != nil

@@ -1,4 +1,4 @@
-package common
+package render
 
 import (
 	"github.com/go-logr/logr"
@@ -10,7 +10,9 @@ import (
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 )
 
-// PodSpecReconciler handles common pod spec reconciliation logic
+// PodSpecReconciler is the shared merge of the runtime's runner container into
+// a component's pod spec: the runner is strategic-merged into the container of
+// the same name (or appended) and its placeholders are replaced.
 type PodSpecReconciler struct {
 	Log logr.Logger
 }

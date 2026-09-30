@@ -95,10 +95,27 @@ func pairingISVC(protocol string) *v1beta1.InferenceService {
 	return pinActiveRun(isvc)
 }
 
+// forwardTarget is the roll target of an ordinary forward roll: a revision of
+// the Component carrying the protocol the spec declares ("" leaves the
+// revision unannotated).
+func forwardTarget(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *appsv1.ControllerRevision {
+	return pairingCR(isvc.Namespace, isvc.Name, component, "target", isvc.Spec.RolloutPairingProtocol())
+}
+
+// pairingGate builds the gate for a forward-roll step of component.
 func pairingGate(t *testing.T, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, objs ...client.Object) GateContext {
 	t.Helper()
+	return pairingGateTo(t, isvc, component, forwardTarget(isvc, component), objs...)
+}
+
+// pairingGateTo builds the gate for a step of component whose roll target is
+// the given revision.
+func pairingGateTo(t *testing.T, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, target *appsv1.ControllerRevision, objs ...client.Object) GateContext {
+	t.Helper()
 	c := fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(objs...).Build()
-	return ResolveGateContext(context.Background(), c, isvc, component)
+	gate := ResolveGateContext(context.Background(), c, isvc, component)
+	gate.TargetRevision = target
+	return gate
 }
 
 func TestCheckPairing_InactivePaths(t *testing.T) {
@@ -340,12 +357,68 @@ func TestCheckPairing_FailsClosed(t *testing.T) {
 		},
 	}).Build()
 	gate = ResolveGateContext(context.Background(), failing, isvc, v1beta1.EngineComponent)
+	gate.TargetRevision = forwardTarget(isvc, v1beta1.EngineComponent)
 	ok, reason = gate.CheckPairing(workloadtypes.UpdateStrategySurgeThenDrain, 0, 0)
 	if ok {
 		t.Fatalf("CR read error must fail closed")
 	}
-	if !strings.Contains(reason, "failing closed") {
-		t.Errorf("reason should mark the fail-closed path: %s", reason)
+	if !strings.Contains(reason, "failing closed") || !strings.Contains(reason, "cannot read revision") {
+		t.Errorf("reason should mark the CR read as the fail-closed path: %s", reason)
+	}
+
+	// No roll target at all: the gate cannot orient the simulation.
+	gate = pairingGateTo(t, isvc, v1beta1.EngineComponent, nil, objs...)
+	ok, reason = gate.CheckPairing(workloadtypes.UpdateStrategySurgeThenDrain, 0, 0)
+	if ok {
+		t.Fatalf("a step with no target revision must fail closed")
+	}
+	if !strings.Contains(reason, "failing closed") || !strings.Contains(reason, "target revision") {
+		t.Errorf("reason should name the missing target revision: %s", reason)
+	}
+}
+
+// TestCheckPairing_RevertMovesTowardTargetRevision: mid-swap, the live spec
+// field names the new protocol while a rollback pins the stable revision as
+// the roll target. The engine's revert step moves its remaining new-cohort
+// instance back to the stable cohort, where the fully reverted decoder
+// already serves, and must be admitted for every strategy. The same fleet
+// read as a forward roll (target = the new protocol) is the last-old-engine
+// hold: the gate's direction follows the target revision, not the live
+// field.
+func TestCheckPairing_RevertMovesTowardTargetRevision(t *testing.T) {
+	isvc := pairingISVC("proto-b")
+	stable := pairingCR("prod", "llama", v1beta1.EngineComponent, "ea", "proto-a")
+	objs := []client.Object{
+		// Engine: one instance still on the stable cohort A, one on the rejected B.
+		pairingIR("prod", "llama", v1beta1.EngineComponent, servingInstances("llama", v1beta1.EngineComponent, "ea", "eb")),
+		stable,
+		pairingCR("prod", "llama", v1beta1.EngineComponent, "eb", "proto-b"),
+		// Decoder: fully reverted to A.
+		pairingIR("prod", "llama", v1beta1.DecoderComponent, servingInstances("llama", v1beta1.DecoderComponent, "da")),
+		pairingCR("prod", "llama", v1beta1.DecoderComponent, "da", "proto-a"),
+	}
+	for _, strategy := range []workloadtypes.UpdateStrategyType{workloadtypes.UpdateStrategySurgeThenDrain, workloadtypes.UpdateStrategyRecreatePod, workloadtypes.UpdateStrategyInPlaceIfPossible} {
+		gate := pairingGateTo(t, isvc, v1beta1.EngineComponent, stable, objs...)
+		if ok, reason := gate.CheckPairing(strategy, 0, 0); !ok {
+			t.Errorf("%s: reverting the engine's proto-b instance toward the reverted decoder must be admitted: %s", strategy, reason)
+		}
+	}
+	// The peer, already entirely on the stable cohort, has nothing to move
+	// and is never held by the engine's transition.
+	gate := pairingGateTo(t, isvc, v1beta1.DecoderComponent, pairingCR("prod", "llama", v1beta1.DecoderComponent, "da", "proto-a"), objs...)
+	if ok, reason := gate.CheckPairing(workloadtypes.UpdateStrategyRecreatePod, 0, 0); !ok {
+		t.Errorf("a fully reverted decoder step must be admitted: %s", reason)
+	}
+
+	// Mirror: the same fleet rolling forward to proto-b holds the last
+	// proto-a engine until a proto-b decoder serves.
+	forward := pairingGate(t, isvc, v1beta1.EngineComponent, objs...)
+	ok, reason := forward.CheckPairing(workloadtypes.UpdateStrategySurgeThenDrain, 0, 0)
+	if ok {
+		t.Fatalf("forward roll: the last proto-a engine must be held until a proto-b decoder serves")
+	}
+	if !strings.Contains(reason, `transition to "proto-b"`) {
+		t.Errorf("forward denial must name the forward target: %s", reason)
 	}
 }
 

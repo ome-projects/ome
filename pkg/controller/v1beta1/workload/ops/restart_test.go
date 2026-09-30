@@ -1682,3 +1682,140 @@ func TestDetectRestartTrigger_PromotedGangTargetOwnsAMissingMember(t *testing.T)
 		t.Errorf("the repair must name why it was opened")
 	}
 }
+
+// A settled Pending row that still records the revision it ran is a Ready
+// row demoted for losing every pod. Under RecreateInstanceOnPodRestart the
+// pod-count trigger reads it exactly as it reads Ready, so the loss is
+// repaired at that revision with the incarnation bump instead of falling
+// to a first materialization at the target. A row that never ran a
+// revision, a row holding its pod set, an operation-owned row, and every
+// other policy are left where they were, and pod-level evidence stays
+// anchored on Ready.
+func TestDetectRestartTrigger_DemotedRowRepairsAtRunningRevision(t *testing.T) {
+	demoted := func(t *testing.T, mutate func(*v1beta1.OMENativeInstanceStatus)) (workload.ReconcileInput, workload.ComponentPlan, *v1beta1.InferenceService) {
+		t.Helper()
+		resetExpectations(t)
+		isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+		row := &ir.Status.InstanceStatuses[0]
+		row.Phase = v1beta1.OMENativeInstancePending
+		row.RunningRevision = "llama-70b-engine-" + testRevisionHash
+		if mutate != nil {
+			mutate(row)
+		}
+		c := newFakeClient(t, isvc, ir)
+		input := buildTestInput(isvc, c, workload.ComponentEngine)
+		plan := buildPlanSinglePodEngineForRestart(c, isvc)
+		return input, plan, isvc
+	}
+
+	t.Run("no pods opens the repair", func(t *testing.T) {
+		input, plan, _ := demoted(t, nil)
+		needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil)
+		if !needs || reason != "pod count 0 below desired 1" {
+			t.Fatalf("trigger = (%t, %q), want the pod-count repair", needs, reason)
+		}
+	})
+
+	t.Run("a policy other than RecreateInstance leaves it to Create", func(t *testing.T) {
+		input, plan, _ := demoted(t, nil)
+		plan.RestartPolicy = workload.RestartPolicyNone
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); needs {
+			t.Fatalf("policy None repairs nothing; got reason %q", reason)
+		}
+	})
+
+	t.Run("a row that never ran a revision is a first materialization", func(t *testing.T) {
+		input, plan, _ := demoted(t, func(row *v1beta1.OMENativeInstanceStatus) { row.RunningRevision = "" })
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); needs {
+			t.Fatalf("a row with no running revision belongs to Create; got reason %q", reason)
+		}
+	})
+
+	t.Run("a row holding its pod set is not a loss", func(t *testing.T) {
+		input, plan, isvc := demoted(t, nil)
+		pod := podAtIncarnation(isvc, 0, 1, true, true)
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+			t.Fatalf("a demoted row whose pods are all present has nothing to repair; got reason %q", reason)
+		}
+	})
+
+	t.Run("pod evidence stays anchored on Ready", func(t *testing.T) {
+		readySince := metav1.NewTime(time.Now().Add(-time.Hour))
+		input, plan, isvc := demoted(t, func(row *v1beta1.OMENativeInstanceStatus) { row.ReadySince = &readySince })
+		pod := podAtIncarnation(isvc, 0, 1, true, true)
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+			runnerStatus(constants.MainContainerName, readySince.Add(20*time.Minute), nil),
+		}
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+			t.Fatalf("a container restart below Ready is the boot path; got reason %q", reason)
+		}
+	})
+
+	t.Run("an operation keeps the row with its owner", func(t *testing.T) {
+		input, plan, _ := demoted(t, func(row *v1beta1.OMENativeInstanceStatus) {
+			row.Operation = &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepSurge}
+		})
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); needs {
+			t.Fatalf("an Update-owned row is not the restart pass's to repair; got reason %q", reason)
+		}
+	})
+
+	t.Run("a block held against the running revision denies the rebuild", func(t *testing.T) {
+		input, plan, _ := demoted(t, nil)
+		input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: "llama-70b-engine-" + testRevisionHash, State: workload.RetryBlockHeld}}
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); needs {
+			t.Fatalf("below Ready a rebuild answers to the revision's RetryBlock; got reason %q", reason)
+		}
+	})
+
+	t.Run("a block on another revision does not deny it", func(t *testing.T) {
+		input, plan, _ := demoted(t, nil)
+		input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: "llama-70b-engine-0000other", State: workload.RetryBlockHeld}}
+		if needs, _ := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); !needs {
+			t.Fatalf("a block against a revision the row never ran must not hold its repair")
+		}
+	})
+}
+
+// The repair of a demoted row is the ordinary Restart: the incarnation is
+// bumped, the row moves to Restarting, and the pod set is recreated at the
+// revision the row records rather than at the Component's target.
+func TestRestart_DemotedRowRebuildsAtRunningRevision(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	running := "llama-70b-engine-" + testRevisionHash
+	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstancePending
+	ir.Status.InstanceStatuses[0].RunningRevision = running
+	c := newFakeClient(t, isvc, ir)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.ObservedState.UpdateRevision = "llama-70b-engine-0000target"
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod count 0 below desired 1")
+	if err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if done {
+		t.Fatalf("expected done=false while the rebuilt pod is not yet Ready")
+	}
+
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceRestarting || s.Incarnation != 2 || s.RunningRevision != running {
+		t.Fatalf("row after the first pass = %+v, want Restarting at incarnation 2 still recording %s", s, running)
+	}
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods: got %d want 1", len(pods.Items))
+	}
+	labels := pods.Items[0].Labels
+	if got := labels[query.LabelInstanceIncarnation]; got != "2" {
+		t.Errorf("rebuilt pod incarnation label = %q, want 2", got)
+	}
+	if want := query.RevisionFromName(running).Hash(); labels[query.LabelRevisionHash] != want {
+		t.Errorf("rebuilt pod revision label = %q, want the running revision %q, never the target", labels[query.LabelRevisionHash], want)
+	}
+}

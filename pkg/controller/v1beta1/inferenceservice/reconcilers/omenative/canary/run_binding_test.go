@@ -1,12 +1,15 @@
 package canary
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
@@ -29,6 +32,15 @@ func canaryRunFixture() *v1beta1.InferenceService {
 				}}},
 			}},
 		},
+	}
+}
+
+// bindRun drives the run-open seam with no client: a spent request is then
+// removed in-memory only, which cannot fail.
+func bindRun(t *testing.T, isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, adopting bool) {
+	t.Helper()
+	if err := BindRun(context.Background(), nil, isvc, g, adopting); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -60,7 +72,7 @@ func TestBindRunAtomicallyResetsFreshRun(t *testing.T) {
 		RolledBackRevisionHash: "router-rejected",
 	}
 
-	BindRun(isvc, rollout.CanaryGroup(isvc), false)
+	bindRun(t, isvc, rollout.CanaryGroup(isvc), false)
 	cs := isvc.Status.Canary
 	if cs.TargetID == "" || cs.TargetID == "old-target" {
 		t.Fatalf("fresh run target ID was not bound: %+v", cs)
@@ -84,7 +96,7 @@ func TestBindRunAdoptsWithoutRestart(t *testing.T) {
 		CurrentStep:        1,
 	}
 
-	BindRun(isvc, rollout.CanaryGroup(isvc), true)
+	bindRun(t, isvc, rollout.CanaryGroup(isvc), true)
 	cs := isvc.Status.Canary
 	if cs.TargetID == "" {
 		t.Fatal("adopted state must be bound to the canary target set")
@@ -129,7 +141,7 @@ func twoUnitRunFixture() *v1beta1.InferenceService {
 func TestBindRunLeavesAnIdleUnitWithoutState(t *testing.T) {
 	isvc := twoUnitRunFixture()
 	for _, g := range rollout.CanaryGroups(isvc) {
-		BindRun(isvc, g, false)
+		bindRun(t, isvc, g, false)
 	}
 	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent); cs != nil {
 		t.Fatalf("the idle engine unit was handed run state: %+v", cs)
@@ -146,8 +158,60 @@ func TestBindRunLeavesAnIdleUnitWithoutState(t *testing.T) {
 func TestBindRunSkipsAUnitWithoutAStableRevision(t *testing.T) {
 	isvc := twoUnitRunFixture()
 	isvc.Status.Rollout.ActiveRun.TargetRevisions[0].StableRevision = ""
-	BindRun(isvc, rollout.CanaryGroups(isvc)[0], false)
+	bindRun(t, isvc, rollout.CanaryGroups(isvc)[0], false)
 	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.RouterComponent); cs != nil {
 		t.Fatalf("a unit with no stable revision was handed run state: %+v", cs)
+	}
+}
+
+// A rollback request is recorded against one target. A run opened toward a
+// new target re-arms the rolled-back unit and removes the request with the
+// rejected hash, stored and in memory, so it cannot roll the new canary back
+// on its first pass.
+func TestBindRunRemovesTheRequestOfTheRolledBackTarget(t *testing.T) {
+	isvc := canaryRunFixture()
+	isvc.Namespace, isvc.Name = "ns", "svc"
+	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
+	isvc.Status.Canary = &v1beta1.CanaryStatus{
+		TargetID:               "old-target",
+		CanaryRevisionHash:     "router-rejected",
+		StableRevisionHash:     "router-a",
+		RolledBackRevisionHash: "router-rejected",
+	}
+	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithObjects(isvc).Build()
+
+	if err := BindRun(context.Background(), c, isvc, rollout.CanaryGroup(isvc), false); err != nil {
+		t.Fatal(err)
+	}
+	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.RouterComponent)
+	if cs == nil || cs.RolledBackRevisionHash != "" || cs.CanaryRevisionHash != "router-a" || cs.CurrentStep != 0 {
+		t.Fatalf("the unit was not re-armed toward the run's target: %+v", cs)
+	}
+	if _, ok := isvc.Annotations[constants.RolloutRollbackAnnotation]; ok {
+		t.Fatal("the spent rollback request is still visible to this pass")
+	}
+	if _, ok := storedAnnotations(t, c, isvc)[constants.RolloutRollbackAnnotation]; ok {
+		t.Fatal("the spent rollback request is still stored on the object")
+	}
+}
+
+// A request found on a unit that holds no rejection has not been applied to
+// any target: run open leaves it in place, and the executor applies it to
+// the target the run presents.
+func TestBindRunKeepsAnUnappliedRollbackRequest(t *testing.T) {
+	isvc := canaryRunFixture()
+	isvc.Namespace, isvc.Name = "ns", "svc"
+	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
+	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithObjects(isvc).Build()
+
+	if err := BindRun(context.Background(), c, isvc, rollout.CanaryGroup(isvc), false); err != nil {
+		t.Fatal(err)
+	}
+	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.RouterComponent); cs == nil || cs.CanaryRevisionHash != "router-a" {
+		t.Fatalf("the unit was not armed toward the run's target: %+v", cs)
+	}
+	if isvc.Annotations[constants.RolloutRollbackAnnotation] != "true" ||
+		storedAnnotations(t, c, isvc)[constants.RolloutRollbackAnnotation] != "true" {
+		t.Fatal("an unapplied request must ride into the new run")
 	}
 }

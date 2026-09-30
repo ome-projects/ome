@@ -1036,7 +1036,7 @@ func instanceReplica(
 			}},
 		},
 		Spec: omev1beta1.InferenceReplicaSpec{
-			ParentRef: omev1beta1.ParentReference{Name: isvc.Name}, Component: component,
+			ParentRef: &omev1beta1.ParentReference{Name: isvc.Name}, Component: component,
 		},
 		Status: omev1beta1.InferenceReplicaStatus{ObservedGeneration: observed, Replicas: 1},
 	}

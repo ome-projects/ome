@@ -6,7 +6,8 @@
 // without anything being wrong with it — admission refusing a create for
 // lack of quota, the scheduler finding no placement, a PodGroup name
 // still being collected, a node that stopped reporting a pod whose name
-// the operation needs, a surge whose source left the rotation, an
+// the operation needs, capacity a provisioner has not readied for a pod
+// the operation withholds, a surge whose source left the rotation, an
 // operator pause. Each records itself as a short token on Waiting, which
 // is what parks the InstanceReadyTimeout clock and what the escalation
 // pass reads to leave the row alone. The quota wait alone has a second
@@ -15,7 +16,7 @@
 // pass, and the deadline parks on either — so the clock stops on the
 // pass admission said no and stays stopped while the token lingers.
 //
-// Two rules make that safe with six writers:
+// Two rules make that safe with seven writers:
 //
 //   - RECORD EARLY. The pass runs once per observed row at the top of the
 //     pass, before any verb pass: every token is written as soon as its

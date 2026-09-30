@@ -68,6 +68,29 @@ func TestParseRolloutConfig(t *testing.T) {
 	}
 }
 
+// The canary cadences follow the same rule as the ready timeout: configured
+// in the chart, parsed here, zero when absent or unusable.
+func TestParseRolloutConfigCanaryCadences(t *testing.T) {
+	tests := []struct {
+		name       string
+		data       string
+		wantStep   time.Duration
+		wantParked time.Duration
+	}{
+		{"both cadences parse", `{"canaryRequeue": "10s", "canaryParkedRequeue": "5m"}`, 10 * time.Second, 5 * time.Minute},
+		{"absent cadences read as unconfigured", `{"defaultReadyTimeout": "15m"}`, 0, 0},
+		{"malformed cadence reads as unconfigured", `{"canaryRequeue": "soon", "canaryParkedRequeue": "-1m"}`, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := parseRolloutConfig(&v1.ConfigMap{Data: map[string]string{RolloutConfigName: tt.data}})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStep, cfg.CanaryRequeue)
+			assert.Equal(t, tt.wantParked, cfg.CanaryParkedRequeue)
+		})
+	}
+}
+
 // TestParseRolloutConfigErrors verifies malformed JSON and a nonsensical
 // negative plan-size cap are load errors.
 func TestParseRolloutConfigErrors(t *testing.T) {

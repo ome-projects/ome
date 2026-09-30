@@ -19,6 +19,36 @@ func readyPolicyPtr(v types.InstanceReadyPolicy) *types.InstanceReadyPolicy {
 	return &v
 }
 
+func TestExplicitZeroReplicas(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		replicas  int32
+		allowZero bool
+		want      int32
+	}{
+		{name: "unresolved zero retains fallback", want: 1},
+		{name: "explicit zero", allowZero: true},
+		{name: "positive count", replicas: 2, want: 2},
+		{name: "positive count with zero floor", replicas: 2, allowZero: true, want: 2},
+		{name: "negative retains fallback", replicas: -1, want: 1},
+		{name: "negative is not zero", replicas: -1, allowZero: true, want: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := types.WorkloadDesiredSpec{Replicas: tt.replicas, AllowZeroReplicas: tt.allowZero}
+			got, err := BuildPlan(types.ComponentEngine, desired, types.WorkloadObservedState{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tt.want, got.Replicas); diff != "" {
+				t.Fatal(diff)
+			}
+			if diff := cmp.Diff(int(tt.want), len(got.Instances)); diff != "" {
+				t.Fatalf("initial instances: %s", diff)
+			}
+		})
+	}
+}
+
 // singlePodDesired builds a single-pod WorkloadDesiredSpec for tests.
 // replicas <= 0 mirrors the production path where MinReplicas=nil/0
 // defaults to 1.

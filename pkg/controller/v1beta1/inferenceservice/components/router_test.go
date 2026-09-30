@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 func TestRouterReconcileRejectsInvalidPDBBeforeChildMutation(t *testing.T) {
@@ -174,9 +175,9 @@ func TestResolveComponentPDBBudgetForMode(t *testing.T) {
 	}{
 		{name: "nil base", mode: constants.RawDeployment},
 		{name: "nil config", base: &BaseComponentFields{}, mode: constants.OMENative},
-		{name: "raw fallback", base: &BaseComponentFields{InferenceServiceConfig: config}, mode: constants.RawDeployment, wantMin: &rawMinimum},
-		{name: "OMENative fallback", base: &BaseComponentFields{InferenceServiceConfig: config}, mode: constants.OMENative, wantMax: &omeMaximum},
-		{name: "unsupported mode", base: &BaseComponentFields{InferenceServiceConfig: config}, mode: constants.PDDisaggregated},
+		{name: "raw fallback", base: &BaseComponentFields{Piece: render.Piece{InferenceServiceConfig: config}}, mode: constants.RawDeployment, wantMin: &rawMinimum},
+		{name: "OMENative fallback", base: &BaseComponentFields{Piece: render.Piece{InferenceServiceConfig: config}}, mode: constants.OMENative, wantMax: &omeMaximum},
+		{name: "unsupported mode", base: &BaseComponentFields{Piece: render.Piece{InferenceServiceConfig: config}}, mode: constants.PDDisaggregated},
 	}
 
 	for _, tt := range tests {
@@ -215,9 +216,9 @@ func TestConfigEnvVars_SortedDeterministic(t *testing.T) {
 	}
 
 	want := []string{"ALPHA", "B_FLAG", "MIDDLE", "OME_DEBUG", "ZED"}
-	first := configEnvVars(config)
+	first := render.ConfigEnvVars(config)
 	if len(first) != len(want) {
-		t.Fatalf("configEnvVars returned %d vars, want %d", len(first), len(want))
+		t.Fatalf("ConfigEnvVars returned %d vars, want %d", len(first), len(want))
 	}
 	for i, name := range want {
 		if first[i].Name != name {
@@ -231,7 +232,7 @@ func TestConfigEnvVars_SortedDeterministic(t *testing.T) {
 	// Repeated conversion of the same map must produce the identical
 	// sequence — the property the pod template hash depends on.
 	for run := 0; run < 20; run++ {
-		again := configEnvVars(config)
+		again := render.ConfigEnvVars(config)
 		for i := range want {
 			if again[i] != first[i] {
 				t.Fatalf("run %d: env[%d] = %+v, want %+v (order must be stable)", run, i, again[i], first[i])
@@ -242,10 +243,10 @@ func TestConfigEnvVars_SortedDeterministic(t *testing.T) {
 
 // TestConfigEnvVars_Empty covers nil and empty maps.
 func TestConfigEnvVars_Empty(t *testing.T) {
-	if got := configEnvVars(nil); len(got) != 0 {
-		t.Errorf("configEnvVars(nil) = %v, want empty", got)
+	if got := render.ConfigEnvVars(nil); len(got) != 0 {
+		t.Errorf("render.ConfigEnvVars(nil) = %v, want empty", got)
 	}
-	if got := configEnvVars(map[string]string{}); len(got) != 0 {
-		t.Errorf("configEnvVars(empty) = %v, want empty", got)
+	if got := render.ConfigEnvVars(map[string]string{}); len(got) != 0 {
+		t.Errorf("render.ConfigEnvVars(empty) = %v, want empty", got)
 	}
 }

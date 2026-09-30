@@ -1,0 +1,28 @@
+{{- if and .Values.ome.multicluster.enabled (eq .Values.ome.multicluster.role "control-plane") .Values.ome.multicluster.config.placement.capacity }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-placement-capacity-reader
+rules:
+- apiGroups:
+  - ome.io
+  resources:
+  - acceleratorquotas
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-placement-capacity-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-placement-capacity-reader
+subjects:
+- kind: ServiceAccount
+  name: ome-controller-manager
+  namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -64,6 +64,11 @@ var (
 		Help: "Count of canary rollbacks by cause (analysis|manual) per (namespace, isvc, component).",
 	}, []string{"namespace", "isvc", "component", "cause"})
 
+	canaryResumeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ome_canary_resume_total",
+		Help: "Count of ome.io/rollout-resume verbs processed, by outcome (applied|rejected|ignored) per (namespace, isvc, component).",
+	}, []string{"namespace", "isvc", "component", "outcome"})
+
 	// Sampler saturation observability. MaxConcurrency is a fleet-wide ceiling, so
 	// at hundreds of concurrent canaries queries queue behind the semaphore and the
 	// effective sample interval degrades — which can spuriously trip the analysis
@@ -89,7 +94,7 @@ func init() {
 	ctrlmetrics.Registry.MustRegister(
 		canaryPhaseTotal, canaryStepTotal, canaryCurrentStep, canaryTrafficWeight, canaryCompleteTotal,
 		canaryAnalysisEvaluations, canaryAnalysisMetricValue, canaryAnalysisFailedChecks, canaryRollbackTotal,
-		canarySamplerInflight, canarySamplerQueueDepth, canarySamplerStarvedTotal,
+		canaryResumeTotal, canarySamplerInflight, canarySamplerQueueDepth, canarySamplerStarvedTotal,
 	)
 }
 
@@ -113,6 +118,22 @@ func recordRollback(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, cau
 	canaryRollbackTotal.WithLabelValues(isvc.Namespace, isvc.Name, string(c), cause).Inc()
 }
 
+// Outcomes of an ome.io/rollout-resume verb, the values of the resume
+// counter's outcome label.
+const (
+	// resumeApplied: a parked canary re-entered the ladder.
+	resumeApplied = "applied"
+	// resumeRejected: the verb addressed a parked canary it could not resume.
+	resumeRejected = "rejected"
+	// resumeIgnored: the verb addressed no canary and was removed.
+	resumeIgnored = "ignored"
+)
+
+// recordResume emits the resume counter with its outcome.
+func recordResume(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, outcome string) {
+	canaryResumeTotal.WithLabelValues(isvc.Namespace, isvc.Name, string(c), outcome).Inc()
+}
+
 // DeleteForISVC drops every canary series carrying the given
 // (namespace, isvc) label pair. Called on terminal ISVC delete so the
 // per-ISVC vectors do not leak unbounded series after teardown.
@@ -130,6 +151,7 @@ func DeleteForISVC(namespace, isvc string) {
 	canaryAnalysisMetricValue.DeletePartialMatch(match)
 	canaryAnalysisFailedChecks.DeletePartialMatch(match)
 	canaryRollbackTotal.DeletePartialMatch(match)
+	canaryResumeTotal.DeletePartialMatch(match)
 }
 
 func outcomeLabel(o analysis.Outcome) string {

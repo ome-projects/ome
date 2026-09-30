@@ -139,15 +139,17 @@ func TestInflateRolloutGroups_MissingResolutionErrors(t *testing.T) {
 }
 
 // The rollout verbs and the plan-source provenance are control-plane-owned:
-// repin must never ride to a member (each copy would consume it), and a
+// repin and resume must never ride to a member (each copy would consume it,
+// and the source's live copy would re-derive it back on the next sync), and a
 // user-supplied plan-source value must never masquerade as system provenance.
 func TestDeriveISVC_StripsRolloutOwnedAnnotations(t *testing.T) {
 	src := srcISVC("gpu=gb300")
 	src.Annotations[constants.RolloutRepinAnnotation] = "now"
+	src.Annotations[constants.RolloutResumeAnnotation] = "e5d6f79d"
 	src.Annotations[constants.RolloutPlanSourceAnnotation] = "9=user-forged@rp1:deadbeef"
 
 	d := DeriveISVC(src, "", "")
-	for _, k := range []string{constants.RolloutRepinAnnotation, constants.RolloutPlanSourceAnnotation} {
+	for _, k := range []string{constants.RolloutRepinAnnotation, constants.RolloutResumeAnnotation, constants.RolloutPlanSourceAnnotation} {
 		_, has := d.Annotations[k]
 		assert.Falsef(t, has, "annotation %q must be stripped from the derived object", k)
 	}

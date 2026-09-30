@@ -290,7 +290,7 @@ func historyCommandIR(parent *omev1beta1.InferenceService) omev1beta1.InferenceR
 				Name: parent.Name, UID: parent.UID, Controller: &controller,
 			}},
 		},
-		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: omev1beta1.EngineComponent},
+		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: &omev1beta1.ParentReference{Name: parent.Name}, Component: omev1beta1.EngineComponent},
 		Status: omev1beta1.InferenceReplicaStatus{ObservedGeneration: 2},
 	}
 }

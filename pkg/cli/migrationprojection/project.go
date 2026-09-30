@@ -248,7 +248,7 @@ func validateSource(
 	}
 	component, componentValid := canonicalComponent(ir.Spec.Component)
 	labelValid := ir.Labels[constants.InferenceServicePodLabelKey] == parent.Name
-	parentValid := ir.Spec.ParentRef.Name == parent.Name
+	parentValid := (ir.Spec.ParentRef != nil && ir.Spec.ParentRef.Name == parent.Name)
 	ownerValid := hasExactControllerOwner(ir.OwnerReferences, parent)
 	bound := identityValid && componentValid && (!requireRelationshipLabel || labelValid) && parentValid && ownerValid
 	freshness := reportv1alpha1.StatusFreshnessInvalid

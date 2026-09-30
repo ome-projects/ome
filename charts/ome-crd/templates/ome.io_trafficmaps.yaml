@@ -1,4 +1,3 @@
----
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -129,6 +128,7 @@ spec:
                 - Single
                 - All
                 - Split
+                - SplitByCapacity
                 type: string
               observedISVCGeneration:
                 format: int64

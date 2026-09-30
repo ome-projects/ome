@@ -214,7 +214,7 @@ func TestCollectLongNameUsesBoundedNamespaceScanAndExactOwnership(t *testing.T) 
 	wrongOwner := testIR(parent, "wrong-owner", omev1beta1.RouterComponent)
 	wrongOwner.OwnerReferences[0].UID = "someone-else"
 	wrongParent := testIR(parent, "wrong-parent", omev1beta1.DecoderComponent)
-	wrongParent.Spec.ParentRef.Name = "someone-else"
+	wrongParent.Spec.ParentRef = &omev1beta1.ParentReference{Name: "someone-else"}
 	omeClient := omefake.NewSimpleClientset(parent)
 	omeClient.PrependReactor("list", "inferencereplicas", func(action ktesting.Action) (bool, runtime.Object, error) {
 		opts := action.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
@@ -393,7 +393,7 @@ func testIR(parent *omev1beta1.InferenceService, name string, component omev1bet
 			}},
 		},
 		Spec: omev1beta1.InferenceReplicaSpec{
-			ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: component,
+			ParentRef: &omev1beta1.ParentReference{Name: parent.Name}, Component: component,
 		},
 	}
 }

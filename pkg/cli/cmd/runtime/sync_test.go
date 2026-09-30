@@ -168,7 +168,7 @@ func TestRuntimeSyncNativeStableSnapshotAndSafetyRecheck(t *testing.T) {
 			f, v := syncFixture(t)
 			mode := constants.OMENative
 			v.Spec.DeploymentMode = &mode
-			ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: v.Name + "-engine", Namespace: v.Namespace, UID: "ir-uid", ResourceVersion: "ir-rv", Generation: 1, Labels: map[string]string{constants.InferenceServiceLabel: v.Name}, Annotations: map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "3"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: v.Name, UID: v.UID, Controller: kptr.To(true)}}}, Spec: v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: v.Name}, Component: v1beta1.EngineComponent}, Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 1}}
+			ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: v.Name + "-engine", Namespace: v.Namespace, UID: "ir-uid", ResourceVersion: "ir-rv", Generation: 1, Labels: map[string]string{constants.InferenceServiceLabel: v.Name}, Annotations: map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "3"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: v.Name, UID: v.UID, Controller: kptr.To(true)}}}, Spec: v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: v.Name}, Component: v1beta1.EngineComponent}, Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 1}}
 			client := omefake.NewSimpleClientset(v, ir)
 			reads := 0
 			client.PrependReactor("list", "inferencereplicas", func(ktesting.Action) (bool, kruntime.Object, error) {

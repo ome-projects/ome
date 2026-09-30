@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -26,6 +27,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/sliceprovision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
@@ -1328,5 +1330,244 @@ func TestTeardown_ForceDeleteEscalation_UnwedgesDeadNodePod(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), &v1beta1.InferenceReplica{}); !apierrors.IsNotFound(err) {
 		t.Errorf("teardown must complete once the wedge is escalated; get returned %v", err)
+	}
+}
+
+// terminatingSliceIR is optedInIR stamped Terminating with the teardown
+// finalizer and no Instance left, DeletionTimestamp at dt.
+func terminatingSliceIR(dt time.Time) *v1beta1.InferenceReplica {
+	ir := optedInIR("llama-engine", "prod", 1)
+	ts := metav1.NewTime(dt)
+	ir.DeletionTimestamp = &ts
+	ir.Finalizers = []string{TeardownFinalizer}
+	return ir
+}
+
+// irGone reports whether ir's deletion finished.
+func irGone(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica) bool {
+	t.Helper()
+	err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), &v1beta1.InferenceReplica{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get IR: %v", err)
+	}
+	return apierrors.IsNotFound(err)
+}
+
+// TestTeardown_TPUSlices_HoldTheFinalizerUntilReleased pins the slice
+// completion gate: once the workload is gone the owned slices are
+// released, and the finalizer holds, with a TeardownBlocked warning
+// naming them, until a live read finds none.
+func TestTeardown_TPUSlices_HoldTheFinalizerUntilReleased(t *testing.T) {
+	const sliceHold = "example.com/hold"
+	ctx := context.Background()
+	ir := terminatingSliceIR(time.Now())
+	r, c := newSliceReconciler(t, ir)
+	rec := record.NewFakeRecorder(32)
+	r.Recorder = rec
+	name := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+	slice := getSlice(t, c, name)
+	slice.SetFinalizers([]string{sliceHold})
+	if err := c.Update(ctx, slice); err != nil {
+		t.Fatalf("hold the slice: %v", err)
+	}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+
+	for pass := 0; pass < 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if irGone(t, c, ir) {
+			t.Fatalf("pass %d lifted the finalizer while an owned slice remains", pass)
+		}
+	}
+	if slice = getSlice(t, c, name); slice == nil || slice.GetDeletionTimestamp() == nil {
+		t.Fatalf("the owned slice must be released; got %v", slice)
+	}
+	blocked := eventsContaining(drainEvents(rec), ReasonTeardownBlocked)
+	if len(blocked) == 0 {
+		t.Fatal("a teardown held by its slices must warn TeardownBlocked")
+	}
+	for _, want := range []string{"owned TPU slices are being released", sliceprovision.LabelOwnerUID + "=" + string(ir.UID)} {
+		if !strings.Contains(blocked[0], want) {
+			t.Errorf("TeardownBlocked message must contain %q; got %q", want, blocked[0])
+		}
+	}
+
+	slice.SetFinalizers(nil)
+	if err := c.Update(ctx, slice); err != nil {
+		t.Fatalf("finish the slice's deletion: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("completion pass: %v", err)
+	}
+	if !irGone(t, c, ir) {
+		t.Fatal("the finalizer must lift once no owned slice remains")
+	}
+}
+
+// TestTeardown_TPUSlices_OutliveTheirPods pins the teardown order: an
+// Instance's slice is released only once the Instance's pod is gone.
+func TestTeardown_TPUSlices_OutliveTheirPods(t *testing.T) {
+	const podHold = "example.com/hold"
+	ctx := context.Background()
+	ir := terminatingSliceIR(time.Now())
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+	}
+	r, c := newSliceReconciler(t, ir)
+	name := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+	pod := podForIR(ir, 0, string(v1beta1.RunnerNameDefault), 0, true, true)
+	pod.Spec.NodeSelector = map[string]string{sliceKeySlice: name}
+	pod.Finalizers = []string{podHold}
+	if err := c.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	reconcile := func(stage string, pass int) {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("%s pass %d: %v", stage, pass, err)
+		}
+	}
+
+	for pass := 0; pass < 10 && pod.DeletionTimestamp == nil; pass++ {
+		reconcile("teardown", pass)
+		if err := c.Get(ctx, client.ObjectKeyFromObject(pod), pod); err != nil {
+			t.Fatalf("get pod: %v", err)
+		}
+	}
+	if pod.DeletionTimestamp == nil {
+		t.Fatal("teardown must delete the pod")
+	}
+	for pass := 0; pass < 3; pass++ {
+		reconcile("terminating", pass)
+	}
+	if getSlice(t, c, name) == nil {
+		t.Fatal("a slice must outlive the pod confined to it")
+	}
+	if irGone(t, c, ir) {
+		t.Fatal("the finalizer must hold while the pod terminates")
+	}
+
+	pod.Finalizers = nil
+	if err := c.Update(ctx, pod); err != nil {
+		t.Fatalf("release the pod: %v", err)
+	}
+	for pass := 0; pass < 10 && !irGone(t, c, ir); pass++ {
+		reconcile("release", pass)
+	}
+	if !irGone(t, c, ir) {
+		t.Fatal("teardown must complete once the pod is gone")
+	}
+	if got := sliceNames(t, c); len(got) != 0 {
+		t.Fatalf("slices %v survive the teardown", got)
+	}
+}
+
+// TestTeardown_TPUSlices_ReleaseIsConfirmedAPassLater pins the passes a
+// teardown takes: a slice's release is confirmed by a later live read, so
+// an owner holding a slice, opted in or not, completes one pass after an
+// owner holding none.
+func TestTeardown_TPUSlices_ReleaseIsConfirmedAPassLater(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		optedIn    bool
+		holds      bool
+		wantPasses int
+	}{
+		{name: "opted in, holding none", optedIn: true, wantPasses: 1},
+		{name: "opted in, holding a slice", optedIn: true, holds: true, wantPasses: 2},
+		{name: "opted out, holding a slice", holds: true, wantPasses: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := terminatingSliceIR(time.Now())
+			if !tc.optedIn {
+				ir.Spec.Runners[0].Template.Annotations = nil
+			}
+			r, c := newSliceReconciler(t, ir)
+			if tc.holds {
+				seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+			}
+			for pass := 1; pass <= tc.wantPasses; pass++ {
+				if irGone(t, c, ir) {
+					t.Fatalf("teardown completed in %d pass(es), want %d", pass-1, tc.wantPasses)
+				}
+				if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+					t.Fatalf("pass %d: %v", pass, err)
+				}
+			}
+			if !irGone(t, c, ir) {
+				t.Fatalf("teardown must complete in %d pass(es)", tc.wantPasses)
+			}
+			if got := sliceNames(t, c); len(got) != 0 {
+				t.Fatalf("slices %v survive the teardown", got)
+			}
+		})
+	}
+}
+
+// TestTeardown_TPUSlices_DeadlineReleasesSlicesUnderSurvivors pins the
+// deadline release: past lifecycle.teardown.deadline the owned slices are
+// released with the finalizer, a surviving pod's included, and a failed
+// release is reported without keeping the finalizer.
+func TestTeardown_TPUSlices_DeadlineReleasesSlicesUnderSurvivors(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		failRelease  bool
+		wantExceeded int
+	}{
+		{name: "released", wantExceeded: 1},
+		{name: "release fails", failRelease: true, wantExceeded: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			base := time.Now()
+			ir := terminatingSliceIR(base.Add(-time.Hour))
+			r, c := newSliceReconciler(t, ir)
+			r.Clock = clocktesting.NewFakeClock(base)
+			withLifecycleConfig(r, `{"teardown":{"deadline":"30m"}}`)
+			rec := record.NewFakeRecorder(32)
+			r.Recorder = rec
+			name := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+			survivor := podForIR(ir, 0, string(v1beta1.RunnerNameDefault), 0, true, true)
+			survivor.Spec.NodeSelector = map[string]string{sliceKeySlice: name}
+			if err := c.Create(ctx, survivor); err != nil {
+				t.Fatalf("create pod: %v", err)
+			}
+			if tc.failRelease {
+				r.Client = interceptor.NewClient(c, interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if _, ok := obj.(*unstructured.Unstructured); ok {
+							return errors.New("injected slice delete failure")
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+			}
+
+			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if !irGone(t, c, ir) {
+				t.Fatal("the finalizer must lift past the deadline")
+			}
+			if released := getSlice(t, c, name) == nil; released == tc.failRelease {
+				t.Fatalf("slice released = %v, want %v", released, !tc.failRelease)
+			}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(survivor), &corev1.Pod{}); err != nil {
+				t.Fatalf("the surviving pod is background GC's, must not be touched: %v", err)
+			}
+			exceeded := eventsContaining(drainEvents(rec), ReasonTeardownDeadlineExceeded)
+			if len(exceeded) != tc.wantExceeded {
+				t.Fatalf("TeardownDeadlineExceeded warnings = %v, want %d", exceeded, tc.wantExceeded)
+			}
+			if tc.failRelease {
+				failed := eventsContaining(exceeded, "releasing owned TPU slices failed")
+				if len(failed) != 1 || !strings.Contains(failed[0], "injected slice delete failure") ||
+					!strings.Contains(failed[0], sliceprovision.LabelOwnerUID+"="+string(ir.UID)) {
+					t.Fatalf("the failed release must be reported with its error and the slices' selector; got %v", exceeded)
+				}
+			}
+		})
 	}
 }

@@ -260,7 +260,7 @@ func commandIR(parent *omev1beta1.InferenceService, component omev1beta1.Compone
 				Name: parent.Name, UID: parent.UID, Controller: &controller,
 			}},
 		},
-		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: component},
+		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: &omev1beta1.ParentReference{Name: parent.Name}, Component: component},
 		Status: omev1beta1.InferenceReplicaStatus{ObservedGeneration: 2},
 	}
 }

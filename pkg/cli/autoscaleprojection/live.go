@@ -151,7 +151,7 @@ func unavailableLiveScaleEvidence(err error) reportv1alpha1.AutoscaleLiveScaleEv
 func validSelectedIR(ir *ome.InferenceReplica, parent *ome.InferenceService, component ome.ComponentType, name string) bool {
 	if ir == nil || ir.Name != name || ir.Namespace != parent.Namespace || !safeScaleIdentity(string(ir.UID)) || !safeScaleIdentity(ir.ResourceVersion) || ir.Generation <= 0 ||
 		ir.Kind != "" && ir.Kind != "InferenceReplica" || ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1" ||
-		ir.Spec.ParentRef.Name != parent.Name || ir.Spec.Component != component || ir.Spec.Replicas == nil || *ir.Spec.Replicas < 0 || ir.Status.Replicas < 0 ||
+		(ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != parent.Name) || ir.Spec.Component != component || ir.Spec.Replicas == nil || *ir.Spec.Replicas < 0 || ir.Status.Replicas < 0 ||
 		ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] != strconv.FormatInt(parent.Generation, 10) ||
 		len(ir.OwnerReferences) == 0 || len(ir.OwnerReferences) > 16 {
 		return false

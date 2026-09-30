@@ -38,7 +38,12 @@ GOLANGCI_LINT = $(PROJECT_DIR)/bin/golangci-lint
 .PHONY: golangci-lint
 golangci-lint: fix-tools-gomod ## 🔍 Download golangci-lint locally if necessary
 	@echo "🔍 Installing golangci-lint..."
-	cd $(TOOLS_DIR) && GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	@# The module proxy drops a download stream now and then; a bounded retry absorbs it.
+	@cd $(TOOLS_DIR) && for attempt in 1 2 3; do \
+		GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) && break; \
+		if [ "$$attempt" = 3 ]; then echo "golangci-lint install failed after 3 attempts" >&2; exit 1; fi; \
+		echo "golangci-lint install attempt $$attempt failed; retrying"; sleep 5; \
+	done
 	@echo "✅ Installation complete"
 
 

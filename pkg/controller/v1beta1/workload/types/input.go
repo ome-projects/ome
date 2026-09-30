@@ -185,6 +185,13 @@ type ReconcileInput struct {
 	// pacing, surge / unavailability budgets, sequential rollout
 	// ordering) that workload code MUST NOT know about.
 	//
+	// strategy is the mechanism the start runs on, not merely the
+	// Component's declared strategy: a start that rebuilds its pods under
+	// another declaration — a crash-loop repair, a gang whose in-place
+	// strategy resolves to a recreate — is consulted as RecreatePod. A
+	// gate that waives its capacity checks for an in-place start therefore
+	// waives them only for a start that returns the same pod.
+	//
 	// allowed=false skips this Instance for this reconcile pass; the
 	// dispatcher emits a short requeue. inFlightSurge / inFlightUnavail
 	// are the dispatcher's within-pass counters so the gate can
@@ -195,6 +202,22 @@ type ReconcileInput struct {
 	//
 	// Nil is treated as always-allowed.
 	UpdateGate func(strategy UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (allowed bool, gate RolloutHoldGate, denyReason string)
+
+	// DrainGate, when non-nil, is asked by a surge update right before it
+	// takes its source out of rotation, with the replacement already
+	// serving. It is the drain-time half of a cross-Component gate that
+	// UpdateGate can only evaluate at operation start; sourcePods names the
+	// pods about to leave rotation. allowed=false keeps the source serving
+	// at Step=Surge for this pass, the op records the hold through
+	// DrainHolds, and the dispatcher requeues at the update cadence.
+	//
+	// Nil is treated as always-allowed.
+	DrainGate func(sourcePods []string) (allowed bool, gate RolloutHoldGate, denyReason string)
+
+	// DrainHolds receives the holds DrainGate produced this pass; the
+	// dispatcher allocates it before the Update pass and reports the first
+	// one through RecordRolloutHold.
+	DrainHolds *DrainHolds
 
 	// PauseNewSurge holds fresh migration reservations while an external
 	// placement plan owns the shared allowance. Allocated migrations continue.
@@ -245,6 +268,17 @@ type ReconcileInput struct {
 	// escalation entirely, leaving the hold to park the
 	// InstanceReadyTimeout clock for as long as it lasts.
 	UnschedulableGrace time.Duration
+
+	// AbandonedReplacementGrace is the termination grace a rollout gives a
+	// replacement pod it abandons before the pod ever carried the serving
+	// gate: a surge replacement superseded by a newer revision, or retired
+	// after its attempt failed, while still pulling, scheduling or failing
+	// readiness. Such a pod has never been in rotation and owes no
+	// in-flight work, and its own terminationGracePeriodSeconds would
+	// otherwise hold its surge slot for that long. Operator config
+	// (lifecycle.abandonedReplacementGracePeriod); zero or negative leaves
+	// every abandoned replacement its own grace.
+	AbandonedReplacementGrace time.Duration
 
 	// MigrationAudit bounds migration admission against the owner's
 	// migration records. nil = unconfigured → a request is held until

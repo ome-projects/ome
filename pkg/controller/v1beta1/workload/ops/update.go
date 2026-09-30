@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -41,8 +42,61 @@ func UpdateRequeueInterval(input workload.ReconcileInput) time.Duration {
 // rotation and the replacement's Ready age decides when it may leave. Past
 // that step the source is already draining, and a replacement that flaps
 // Ready must not hold the drained source out of service for another window.
+// drainAdmitted asks the adapter's DrainGate whether the source pods may
+// leave rotation now that their replacement serves. A denial keeps the
+// source at Step=Surge for this pass and records the hold; the next pass
+// asks again. No gate means the drain proceeds.
+func drainAdmitted(input workload.ReconcileInput, sourcePods []*corev1.Pod, target string) bool {
+	if input.DrainGate == nil {
+		return true
+	}
+	names := make([]string, 0, len(sourcePods))
+	for _, pod := range sourcePods {
+		if pod != nil && pod.DeletionTimestamp == nil {
+			names = append(names, pod.Name)
+		}
+	}
+	allowed, gate, reason := input.DrainGate(names)
+	if allowed {
+		return true
+	}
+	input.DrainHolds.Observe(workload.RolloutHold{Gate: gate, Reason: reason, Target: target})
+	return false
+}
+
 func surgeWindowApplies(s *workload.InstanceStatus) bool {
 	return s == nil || s.Operation == nil || s.Operation.Step == workload.UpdateStepSurge
+}
+
+// abandonedReplacementDeleteOptions bounds the termination grace of a
+// replacement the rollout abandons before it ever carried the serving
+// gate: it has never been in rotation and owes no in-flight work, so
+// waiting out its own grace would only hold its surge slot, and with it
+// the budget, against the revision that supersedes it. A pod that has
+// carried the gate in either direction, and an unconfigured bound, keep
+// the pod's own grace.
+func abandonedReplacementDeleteOptions(input workload.ReconcileInput, pod *corev1.Pod) []client.DeleteOption {
+	if input.AbandonedReplacementGrace <= 0 || podHasServingCondition(pod) {
+		return nil
+	}
+	seconds := int64(math.Ceil(input.AbandonedReplacementGrace.Seconds()))
+	return []client.DeleteOption{client.GracePeriodSeconds(seconds)}
+}
+
+// podHasServingCondition reports whether any writer has set the serving
+// gate on the pod. The renderer only declares the gate on the spec; the
+// condition appears the first time the rollout marks the pod serving or
+// holds it out of rotation, so its absence proves the pod never served.
+func podHasServingCondition(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == podreadiness.ConditionType {
+			return true
+		}
+	}
+	return false
 }
 
 // Update drives one Instance toward the target ControllerRevision.
@@ -175,35 +229,32 @@ const (
 	updateModeSurge
 )
 
+// InPlaceFallsBackToRecreate reports whether an in-place strategy runs as
+// a recreate on this Instance. inPlaceEligible compares only the leader's
+// PodSpec, so a multi-pod Instance always rebuilds: a worker-only image
+// bump patched in place would leave the workers on the old image
+// (split-brain). Both in-place variants fall back the same way, whatever
+// the diff; InPlaceOnly's strict rejection applies to single-pod
+// Instances only. The update pass reads this ahead of the coordination
+// gate consult, since a fallback recreate takes capacity out of rotation
+// the way any drain-first start does.
+func InPlaceFallsBackToRecreate(strategy workload.UpdateStrategyType, multiPod bool) bool {
+	return multiPod && (strategy == workload.UpdateStrategyInPlaceIfPossible ||
+		strategy == workload.UpdateStrategyInPlaceOnly)
+}
+
 // chooseUpdateModeForInstance is chooseUpdateMode with the multi-pod
-// adjustment layered on top.
-//
-// Multi-pod adjustment:
-//   - In-place modes → recreate: inPlaceEligible compares only the
-//     leader's PodSpec, so a worker-only image bump would produce an
-//     in-place rollout that patches only the leader, leaving workers
-//     on the old image (split-brain).
-//
-// SurgeThenDrain keeps updateModeSurge for gangs — surgeUpdate performs a
-// per-gang index surge (a whole replacement gang at a fresh instance
-// index, gang-scheduled via its own PodGroup, then the source gang is
-// drained). RecreatePod is already recreate; multiPod has no additional
-// effect on it.
+// adjustment layered on top: in-place modes route to recreate for a gang
+// (InPlaceFallsBackToRecreate). SurgeThenDrain keeps updateModeSurge for
+// gangs — surgeUpdate performs a per-gang index surge (a whole
+// replacement gang at a fresh instance index, gang-scheduled via its own
+// PodGroup, then the source gang is drained). RecreatePod is already
+// recreate; multiPod has no additional effect on it.
 func chooseUpdateModeForInstance(strategy workload.UpdateStrategyType, running, target *corev1.PodSpec, multiPod bool) (updateMode, error) {
-	mode, err := chooseUpdateMode(strategy, running, target)
-	if err != nil {
-		// InPlaceOnly + ineligible diff is the only error path. For
-		// multi-pod fall back to recreate: in-place cannot safely roll
-		// a worker-only change. Single-pod keeps the strict semantic.
-		if multiPod && strategy == workload.UpdateStrategyInPlaceOnly {
-			return updateModeRecreate, nil
-		}
-		return mode, err
-	}
-	if multiPod && mode == updateModeInPlace {
+	if InPlaceFallsBackToRecreate(strategy, multiPod) {
 		return updateModeRecreate, nil
 	}
-	return mode, nil
+	return chooseUpdateMode(strategy, running, target)
 }
 
 // chooseUpdateMode resolves strategy + eligibility into a mode. nil

@@ -9,7 +9,8 @@
 // them.
 //
 // The capacity/traffic/promotion machinery is component-agnostic. In a
-// multi-Component (PD) group the primary Component drives the traffic
-// steps while every other bumped Component stages its own canary
-// capacity (see dispatch.go).
+// multi-Component (PD) group the primary Component carries the step machine
+// while every other bumped Component stages its own canary capacity, and
+// every member publishes the step's traffic weights on its own revisions
+// (see dispatch.go).
 package canary

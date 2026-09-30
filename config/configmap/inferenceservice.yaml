@@ -30,6 +30,39 @@ data:
       "defaultDeploymentMode": "RawDeployment"
     }
 
+  # tpuSliceProvisioning describes TPU node pools that provision slices on
+  # demand. Omit this key to provision no slices. Read once at manager startup;
+  # when present every field is required (slice.annotations may be {}), the
+  # binary has no default for any of them, and an invalid block prevents
+  # startup. Pools without the provisionOnly label are never provisioned or
+  # released. Example for GKE dynamic slicing with single-host Ironwood slices:
+  #
+  # tpuSliceProvisioning: |-
+  #   {
+  #     "chipResource": "google.com/tpu",
+  #     "nodeLabels": {
+  #       "accelerator": "cloud.google.com/gke-tpu-accelerator",
+  #       "topology": "cloud.google.com/gke-tpu-topology",
+  #       "slice": "cloud.google.com/gke-tpu-slice"
+  #     },
+  #     "provisionOnly": {
+  #       "key": "cloud.google.com/gke-accelerator-topology-mode",
+  #       "value": "PROVISION_ONLY"
+  #     },
+  #     "accelerators": {
+  #       "tpu7x": { "sliceType": "tpu7x", "chipsPerHost": 4, "topologies": ["2x2x1"] }
+  #     },
+  #     "slice": {
+  #       "ownerKindLabel": "cloud.google.com/slice-owner-kind",
+  #       "ownerNameLabel": "cloud.google.com/slice-owner-name",
+  #       "annotations": {
+  #         "cloud.google.com/managed-by": "slice-scheduler",
+  #         "slice.gke.io/retry-on-failure": "true"
+  #       },
+  #       "readyStates": ["ACTIVE", "ACTIVE_DEGRADED"]
+  #     }
+  #   }
+
   # The scale-up and scale-down Pod batch sizes bound create and delete work in
   # Pod-equivalent units. Each Instance or gang is selected atomically, and a
   # first eligible Instance larger than its budget proceeds alone. Omitting a
@@ -65,6 +98,17 @@ data:
     {
       "instanceStatusEncoding": "ColumnarV2",
       "maxDecodedInstances": 20000
+    }
+
+  # The identity the InferenceService controller writes with: the
+  # InferenceReplica admission webhook admits spec writes on the replicas an
+  # InferenceService projects only from a listed username or group. The
+  # username is the manager's ServiceAccount in the namespace it runs in.
+  inferenceReplica: |-
+    {
+      "controllerIdentity": {
+        "usernames": ["system:serviceaccount:ome:ome-controller-manager"]
+      }
     }
 
   modelInit: |-

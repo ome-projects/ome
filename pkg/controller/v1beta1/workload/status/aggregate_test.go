@@ -171,3 +171,35 @@ func TestCountAvailablePods_MinReadySecondsWindow(t *testing.T) {
 			counters.AvailablePodCount, counters.ReadyPodCount, counters.NextAvailableIn)
 	}
 }
+
+// A settled Ready row is demotable under every restart policy: the rule
+// reads the row alone, because the running revision the demotion keeps is
+// what each policy's rebuild path keys on. A row an operation owns, and a
+// row in any other phase, is not the truth pass's to move.
+func TestDemotableReady(t *testing.T) {
+	tests := []struct {
+		name string
+		row  types.InstanceStatus
+		want bool
+	}{
+		{name: "settled Ready row", row: types.InstanceStatus{Phase: types.InstancePhaseReady, RunningRevision: "rev-a"}, want: true},
+		{name: "settled Ready row without a revision", row: types.InstanceStatus{Phase: types.InstancePhaseReady}, want: true},
+		{name: "Ready row an operation owns", row: types.InstanceStatus{Phase: types.InstancePhaseReady,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurge}}, want: false},
+		{name: "already Pending", row: types.InstanceStatus{Phase: types.InstancePhasePending, RunningRevision: "rev-a"}, want: false},
+		{name: "Restarting", row: types.InstanceStatus{Phase: types.InstancePhaseRestarting,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationRestart, Step: types.RestartStepDrain}}, want: false},
+		{name: "Failed", row: types.InstanceStatus{Phase: types.InstancePhaseFailed}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			row := test.row
+			if got := status.DemotableReady(&row); got != test.want {
+				t.Errorf("DemotableReady(%+v) = %t, want %t", row, got, test.want)
+			}
+		})
+	}
+	if status.DemotableReady(nil) {
+		t.Errorf("a nil row is the Empty slot, never a demotion candidate")
+	}
+}

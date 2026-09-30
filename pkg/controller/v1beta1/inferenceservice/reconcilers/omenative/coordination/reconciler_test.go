@@ -2144,3 +2144,104 @@ func TestReconcile_GCRetainsTargetRevisionServicesWithoutPods(t *testing.T) {
 		}
 	}
 }
+
+// A canary group's Components stay the canary engine's while the run that
+// pinned the group is open, even after the group is edited out of the spec:
+// the run continues on the pinned plan, and two writers on one traffic field
+// is the hazard this guards.
+func TestReconcile_PinnedCanaryGroupKeepsOwnership(t *testing.T) {
+	isvc := testOMENativeISVC()
+	group := v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Canary: &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("50%"), Traffic: 10},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		}},
+	}
+	// The spec does not carry the group; the open run still pins it.
+	isvc.Spec.Rollout = &v1beta1.RolloutSpec{}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{ActiveRun: &v1beta1.RolloutRun{
+		RunID: "run-1",
+		Plan:  v1beta1.RolloutRunPlan{Groups: []v1beta1.RolloutRunGroup{{Source: v1beta1.RolloutPlanSourceInline, Group: group}}},
+	}}
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {Traffic: []v1beta1.ComponentTrafficTarget{
+			{RevisionName: "llama-engine-rev-canaryhash", Percent: 10},
+			{RevisionName: "llama-engine-rev-stablehash", Percent: 90},
+		}},
+	}
+	pods := []runtime.Object{
+		buildPod(isvc, v1beta1.EngineComponent, "canaryhash", 0),
+		buildPod(isvc, v1beta1.EngineComponent, "stablehash", 1),
+	}
+	c := testClient(pods...)
+	if _, err := Reconcile(context.Background(), ReconcileInputs{
+		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
+		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, target := range isvc.Status.Components[v1beta1.EngineComponent].Traffic {
+		var want int32
+		switch target.RevisionName {
+		case "llama-engine-rev-canaryhash":
+			want = 10
+		case "llama-engine-rev-stablehash":
+			want = 90
+		default:
+			t.Fatalf("coordination wrote traffic for a pinned canary group: %q", target.RevisionName)
+		}
+		if target.Percent != want {
+			t.Errorf("%s: got %d%% want %d%% — coordination overwrote the pinned canary's step weight", target.RevisionName, target.Percent, want)
+		}
+	}
+}
+
+// A canary group's secondary is the canary engine's as much as its primary:
+// coordination writes neither's traffic, whatever the pod proportions say, so
+// the step weight the canary engine published on the secondary stands.
+func TestReconcile_LeavesCanarySecondaryTrafficToTheCanaryEngine(t *testing.T) {
+	isvc := testOMENativeISVC()
+	isvc.Spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
+		Canary: &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("50%"), Traffic: 10},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		}},
+	}}}
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.DecoderComponent: {Traffic: []v1beta1.ComponentTrafficTarget{
+			{RevisionName: "llama-decoder-rev-canaryhash", Percent: 10},
+			{RevisionName: "llama-decoder-rev-stablehash", Percent: 90},
+		}},
+	}
+	pods := []runtime.Object{
+		buildPod(isvc, v1beta1.DecoderComponent, "canaryhash", 0),
+		buildPod(isvc, v1beta1.DecoderComponent, "stablehash", 1),
+	}
+	c := testClient(pods...)
+	if _, err := Reconcile(context.Background(), ReconcileInputs{
+		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
+		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent, v1beta1.DecoderComponent),
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := isvc.Status.Components[v1beta1.DecoderComponent].Traffic
+	if len(got) != 2 {
+		t.Fatalf("coordination rewrote a canary secondary's traffic: %+v", got)
+	}
+	for _, target := range got {
+		var want int32
+		switch target.RevisionName {
+		case "llama-decoder-rev-canaryhash":
+			want = 10
+		case "llama-decoder-rev-stablehash":
+			want = 90
+		default:
+			t.Fatalf("coordination wrote traffic for a canary secondary: %q", target.RevisionName)
+		}
+		if target.Percent != want {
+			t.Errorf("%s: got %d%% want %d%% — coordination overwrote the canary secondary's step weight", target.RevisionName, target.Percent, want)
+		}
+	}
+}

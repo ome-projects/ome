@@ -15,7 +15,7 @@ import (
 
 // ResolveClusterRuntime walks the inherit-from chain rooted at the
 // named ClusterServingRuntime and returns the merged spec.
-func ResolveClusterRuntime(ctx context.Context, c client.Client, name string) (*v1beta1.ServingRuntimeSpec, []string, error) {
+func ResolveClusterRuntime(ctx context.Context, c client.Reader, name string) (*v1beta1.ServingRuntimeSpec, []string, error) {
 	csr := &v1beta1.ClusterServingRuntime{}
 	if err := c.Get(ctx, types.NamespacedName{Name: name}, csr); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -34,7 +34,7 @@ func ResolveClusterRuntime(ctx context.Context, c client.Client, name string) (*
 // ResolveNamespacedRuntime walks the inherit-from chain rooted at the
 // named namespaced ServingRuntime. Parents are looked up in the same
 // namespace first, falling back to cluster scope.
-func ResolveNamespacedRuntime(ctx context.Context, c client.Client, namespace, name string) (*v1beta1.ServingRuntimeSpec, []string, error) {
+func ResolveNamespacedRuntime(ctx context.Context, c client.Reader, namespace, name string) (*v1beta1.ServingRuntimeSpec, []string, error) {
 	sr := &v1beta1.ServingRuntime{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, sr); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -50,7 +50,7 @@ func ResolveNamespacedRuntime(ctx context.Context, c client.Client, namespace, n
 	return Resolve(ctx, start, namespacedFetcher(c, namespace), constants.RuntimeInheritMaxDepth)
 }
 
-func clusterFetcher(c client.Client) Fetcher {
+func clusterFetcher(c client.Reader) Fetcher {
 	return func(ctx context.Context, name string) (*RuntimeRef, error) {
 		csr := &v1beta1.ClusterServingRuntime{}
 		if err := c.Get(ctx, types.NamespacedName{Name: name}, csr); err != nil {
@@ -67,7 +67,7 @@ func clusterFetcher(c client.Client) Fetcher {
 	}
 }
 
-func namespacedFetcher(c client.Client, namespace string) Fetcher {
+func namespacedFetcher(c client.Reader, namespace string) Fetcher {
 	return func(ctx context.Context, name string) (*RuntimeRef, error) {
 		sr := &v1beta1.ServingRuntime{}
 		err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sr)

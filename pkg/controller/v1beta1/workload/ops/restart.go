@@ -30,10 +30,12 @@ func RestartRequeueInterval(input workload.ReconcileInput) time.Duration {
 
 // DetectRestartTrigger fires when the Instance is mid-restart, when
 // Phase=Ready and a pod is Failed / the live pod count is below
-// desired, or when a materialized Instance has lost a gang member in
-// any phase (see instanceLostGangMember). A Migrate-owned Instance is
-// suppressed because Migrate's source-pod deletion would otherwise trip
-// the "pod count below desired" trigger on the source.
+// desired, when a row demoted for losing every pod (types.DemotedReady)
+// is still short of its pod set, or when a materialized Instance has
+// lost a gang member in any phase (see instanceLostGangMember). A
+// Migrate-owned Instance is suppressed because Migrate's source-pod
+// deletion would otherwise trip the "pod count below desired" trigger on
+// the source.
 //
 // The restart policy is read here rather than by the caller: all of the
 // above is RestartPolicyRecreateInstance's, while driving an
@@ -105,29 +107,38 @@ func DetectRestartTriggerWithPods(input workload.ReconcileInput, plan workload.C
 		return false, ""
 	}
 	if s.Phase != workload.InstancePhaseReady {
-		// Below Ready only gang-member loss triggers. Pod-level failure
+		// Below Ready, gang-member loss triggers. Pod-level failure
 		// evidence stays Ready-gated: a container that dies while the
 		// Instance is still forming is the ordinary boot path.
 		if reason, lost := instanceLostGangMember(input, plan, s, expected, instancePods); lost {
 			return true, reason
 		}
-		return false, ""
-	}
-
-	for _, pod := range instancePods {
-		if reason, restarted := runnerRestartedSinceReady(pod, s.ReadySince); restarted {
-			return true, reason
+		// A row demoted for losing every pod (types.DemotedReady) is read
+		// by its pod count below, as Ready is: the running revision it
+		// kept is what the repair rebuilds at, and pods that turn out to
+		// be present return it to Ready through the promote path. Below
+		// Ready the rebuild answers to that revision's RetryBlock, as
+		// every re-materialization does. Every other row below Ready is
+		// its own pass's to materialize.
+		if !workload.DemotedReady(s) || rebuildRetryBlockDenies(input, s) {
+			return false, ""
 		}
-		if pod.Status.Phase == corev1.PodFailed {
-			// Build a richer reason from the failed pod's container
-			// termination so the RestartTriggered event names the actual
-			// cause (OOMKilled exit 137, CrashLoopBackOff, ...) instead of
-			// the bare "pod X Failed". Falls back to the pod name when no
-			// per-container detail is available.
-			if t := workload.PodTermination(pod, metav1.NewTime(input.Now())); t != nil {
-				return true, t.ShortString()
+	} else {
+		for _, pod := range instancePods {
+			if reason, restarted := runnerRestartedSinceReady(pod, s.ReadySince); restarted {
+				return true, reason
 			}
-			return true, fmt.Sprintf("pod %s Failed", pod.Name)
+			if pod.Status.Phase == corev1.PodFailed {
+				// Build a richer reason from the failed pod's container
+				// termination so the RestartTriggered event names the actual
+				// cause (OOMKilled exit 137, CrashLoopBackOff, ...) instead of
+				// the bare "pod X Failed". Falls back to the pod name when no
+				// per-container detail is available.
+				if t := workload.PodTermination(pod, metav1.NewTime(input.Now())); t != nil {
+					return true, t.ShortString()
+				}
+				return true, fmt.Sprintf("pod %s Failed", pod.Name)
+			}
 		}
 	}
 	// Terminal pods are absent for the count: a Succeeded pod, or a Failed

@@ -5,160 +5,36 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
-	"sigs.k8s.io/ome/pkg/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
-func overlayVolumeName(modelName string) string {
-	return "model-overlay-" + modelName
-}
+// The overlay helpers operate on the embedded render.Piece. These forwarders
+// keep the component-level names for callers holding a *BaseComponentFields,
+// which may be nil.
 
 func AppendOverlayVolumes(b *BaseComponentFields, overlays []isvcutils.ResolvedOverlay, podSpec *corev1.PodSpec) {
-	if podSpec == nil {
-		return
-	}
-	for _, ov := range overlays {
-		if vol, ok := overlayVolume(ov); ok {
-			podSpec.Volumes = utils.AppendVolumeIfNotExists(podSpec.Volumes, vol)
-		}
-	}
+	render.AppendOverlayVolumes(pieceOf(b), overlays, podSpec)
 }
 
 func AppendOverlayVolumeMounts(b *BaseComponentFields, overlays []isvcutils.ResolvedOverlay, container *corev1.Container) {
-	if container == nil {
-		return
-	}
-	for _, ov := range overlays {
-		if vm, ok := overlayVolumeMount(ov); ok {
-			isvcutils.AppendVolumeMount(container, &vm)
-		}
-	}
+	render.AppendOverlayVolumeMounts(pieceOf(b), overlays, container)
 }
 
 func AppendOverlayEnvVars(b *BaseComponentFields, overlays []isvcutils.ResolvedOverlay, container *corev1.Container) {
-	if container == nil {
-		return
-	}
-	envs := make([]corev1.EnvVar, 0, len(overlays))
-	for _, ov := range overlays {
-		if path, ok := overlayEffectivePath(ov); ok {
-			envs = append(envs, corev1.EnvVar{
-				Name:  isvcutils.OverlayEnvVarName(ov.Ref.Name),
-				Value: path,
-			})
-		}
-	}
-	if len(envs) > 0 {
-		isvcutils.AppendEnvVarsIfNotExist(container, &envs)
-	}
+	render.AppendOverlayEnvVars(pieceOf(b), overlays, container)
 }
 
-// AnyOverlayIsSharded gates cluster_cache env injection when the
-// primary isn't Sharded — a Sharded overlay still needs the daemon
-// envs to fetch its data at runtime.
+// AnyOverlayIsSharded reports whether any mounted overlay is Sharded.
 func AnyOverlayIsSharded(overlays []isvcutils.ResolvedOverlay) bool {
-	for _, ov := range overlays {
-		if !ov.Skipped() && isvcutils.IsShardedBaseModel(ov.Spec) {
-			return true
-		}
-	}
-	return false
+	return render.AnyOverlayIsSharded(overlays)
 }
 
+// MountedOverlaySummary lists the overlays that reach the pods, for status.
 func MountedOverlaySummary(overlays []isvcutils.ResolvedOverlay) []v1beta1.MountedOverlay {
-	out := make([]v1beta1.MountedOverlay, 0, len(overlays))
-	for _, ov := range overlays {
-		if ov.Skipped() {
-			continue
-		}
-		entry := v1beta1.MountedOverlay{
-			Name:         ov.Ref.Name,
-			EnvVar:       isvcutils.OverlayEnvVarName(ov.Ref.Name),
-			Distribution: overlayDistributionString(ov.Spec),
-		}
-		if vm, ok := overlayVolumeMount(ov); ok {
-			entry.MountPath = vm.MountPath
-		}
-		out = append(out, entry)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return render.MountedOverlaySummary(overlays)
 }
 
+// SkippedOverlayReasons lists why each skipped overlay was left out.
 func SkippedOverlayReasons(overlays []isvcutils.ResolvedOverlay) []string {
-	var out []string
-	for _, ov := range overlays {
-		if ov.Skipped() {
-			out = append(out, ov.SkipReason)
-		}
-	}
-	return out
-}
-
-// overlayEffectivePath: PVC/PerNode → mount path; Sharded → storage URI.
-// Sharded data is fetched at runtime; PVC/PerNode is mounted on disk.
-func overlayEffectivePath(ov isvcutils.ResolvedOverlay) (string, bool) {
-	if ov.Skipped() || ov.Spec == nil || ov.Spec.Storage == nil {
-		return "", false
-	}
-	if isvcutils.IsShardedBaseModel(ov.Spec) {
-		if ov.Spec.Storage.StorageUri == nil || *ov.Spec.Storage.StorageUri == "" {
-			return "", false
-		}
-		return *ov.Spec.Storage.StorageUri, true
-	}
-	return isvcutils.OverlayMountPath(ov.Ref.Name), true
-}
-
-func overlayVolume(ov isvcutils.ResolvedOverlay) (corev1.Volume, bool) {
-	if ov.Skipped() || ov.Spec == nil || ov.Spec.Storage == nil || isvcutils.IsShardedBaseModel(ov.Spec) {
-		return corev1.Volume{}, false
-	}
-	if pvc := parsePVCStorage(ov.Spec.Storage); pvc != nil {
-		return corev1.Volume{
-			Name: overlayVolumeName(ov.Ref.Name),
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: pvc.PVCName,
-					ReadOnly:  true,
-				},
-			},
-		}, true
-	}
-	if ov.Spec.Storage.Path != nil {
-		return corev1.Volume{
-			Name: overlayVolumeName(ov.Ref.Name),
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{Path: *ov.Spec.Storage.Path},
-			},
-		}, true
-	}
-	return corev1.Volume{}, false
-}
-
-func overlayVolumeMount(ov isvcutils.ResolvedOverlay) (corev1.VolumeMount, bool) {
-	if ov.Skipped() || ov.Spec == nil || ov.Spec.Storage == nil || isvcutils.IsShardedBaseModel(ov.Spec) {
-		return corev1.VolumeMount{}, false
-	}
-	vm := corev1.VolumeMount{
-		Name:      overlayVolumeName(ov.Ref.Name),
-		MountPath: isvcutils.OverlayMountPath(ov.Ref.Name),
-		ReadOnly:  true,
-	}
-	if pvc := parsePVCStorage(ov.Spec.Storage); pvc != nil {
-		vm.SubPath = pvc.SubPath
-		return vm, true
-	}
-	if ov.Spec.Storage.Path != nil {
-		return vm, true
-	}
-	return corev1.VolumeMount{}, false
-}
-
-func overlayDistributionString(spec *v1beta1.BaseModelSpec) string {
-	if spec == nil || spec.Distribution == nil {
-		return string(v1beta1.DistributionPerNode)
-	}
-	return string(*spec.Distribution)
+	return render.SkippedOverlayReasons(overlays)
 }

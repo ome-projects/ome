@@ -1077,6 +1077,14 @@ const (
 	goodImage  = "registry.test/serving:v1"
 	badImage   = "registry.test/serving:broken"
 	fixedImage = "registry.test/serving:v2"
+	// stuckImage runs but never passes readiness: no terminal waiting
+	// reason, so nothing escalates it before the operation deadline.
+	stuckImage = "registry.test/serving:never-ready"
+
+	// terminationFinalizer is the harness's stand-in for a kubelet that
+	// has not finished terminating a deleted pod: the fake client keeps a
+	// finalized object as Terminating until the finalizer is removed.
+	terminationFinalizer = "test.workload.ome.io/terminating"
 )
 
 // recoveryHarness is the closed reconcile loop: fake client + simulated
@@ -1110,6 +1118,18 @@ type recoveryHarness struct {
 	revV1    *appsv1.ControllerRevision
 	revBad   *appsv1.ControllerRevision
 	revFixed *appsv1.ControllerRevision
+
+	// podGrace enables the kubelet termination model: a deleted pod stays
+	// Terminating until the grace its delete names has elapsed on the fake
+	// clock, and podGrace is the grace a delete that names none is owed
+	// (the pod's own terminationGracePeriodSeconds). Zero removes pods on
+	// delete, as the bare fake client does.
+	podGrace time.Duration
+	// abandonGrace is the input's AbandonedReplacementGrace.
+	abandonGrace time.Duration
+	// terminatingUntil is, per Terminating pod, the fake-clock instant the
+	// kubelet model finishes its termination.
+	terminatingUntil map[string]time.Time
 }
 
 func recoveryPodSpec(image string) *corev1.PodSpec {
@@ -1125,20 +1145,21 @@ func newRecoveryHarness(t *testing.T, multiPod bool) *recoveryHarness {
 	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
 		Name: recoveryOwner, Namespace: recoveryNS, UID: "uid-1",
 	}}
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
-		WithObjects(isvc).Build()
-
 	h := &recoveryHarness{
-		t:        t,
-		ctx:      context.Background(),
-		c:        c,
-		isvc:     isvc,
-		clk:      clocktesting.NewFakeClock(time.Now()),
-		multiPod: multiPod,
-		replicas: 1,
-		requeue:  testRequeueIntervals,
+		t:                t,
+		ctx:              context.Background(),
+		isvc:             isvc,
+		clk:              clocktesting.NewFakeClock(time.Now()),
+		multiPod:         multiPod,
+		replicas:         1,
+		requeue:          testRequeueIntervals,
+		terminatingUntil: map[string]time.Time{},
 	}
+	h.c = fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
+		WithObjects(isvc).
+		WithInterceptorFuncs(interceptor.Funcs{Delete: h.interceptDelete}).
+		Build()
 	h.revV1 = h.ensureRevision(recoveryPodSpec(goodImage))
 	h.revBad = h.ensureRevision(recoveryPodSpec(badImage))
 	h.revFixed = h.ensureRevision(recoveryPodSpec(fixedImage))
@@ -1204,6 +1225,7 @@ func (h *recoveryHarness) kubelet() {
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.DeletionTimestamp != nil {
+			h.finishTermination(pod)
 			continue
 		}
 		if pod.CreationTimestamp.IsZero() {
@@ -1214,7 +1236,16 @@ func (h *recoveryHarness) kubelet() {
 				h.t.Fatalf("kubelet stamp creation %s: %v", pod.Name, err)
 			}
 		}
-		if pod.Spec.Containers[0].Image == badImage {
+		if pod.Spec.Containers[0].Image == stuckImage {
+			pod.Status.Phase = corev1.PodRunning
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name:  pod.Spec.Containers[0].Name,
+				Ready: false,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}}
+			setPodCondition(pod, corev1.ContainersReady, corev1.ConditionFalse, h.clk.Now())
+			setPodCondition(pod, corev1.PodReady, corev1.ConditionFalse, h.clk.Now())
+		} else if pod.Spec.Containers[0].Image == badImage {
 			pod.Status.Phase = corev1.PodPending
 			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 				Name: pod.Spec.Containers[0].Name,
@@ -1259,6 +1290,71 @@ func setPodCondition(pod *corev1.Pod, condType corev1.PodConditionType, status c
 	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
 		Type: condType, Status: status, LastTransitionTime: metav1.NewTime(now),
 	})
+}
+
+// interceptDelete is the kubelet termination model's apiserver half: with
+// podGrace set, a pod's first delete pins it as Terminating (through the
+// harness finalizer) and records when the grace its delete names elapses
+// on the fake clock; the pod's own grace applies to a delete that names
+// none. Without podGrace the delete goes straight to the fake client.
+func (h *recoveryHarness) interceptDelete(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || h.podGrace <= 0 {
+		return cl.Delete(ctx, obj, opts...)
+	}
+	stored := &corev1.Pod{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), stored); err != nil {
+		return err
+	}
+	if stored.DeletionTimestamp == nil {
+		grace := h.podGrace
+		options := &client.DeleteOptions{}
+		for _, opt := range opts {
+			opt.ApplyToDelete(options)
+		}
+		if options.GracePeriodSeconds != nil {
+			grace = time.Duration(*options.GracePeriodSeconds) * time.Second
+		}
+		h.terminatingUntil[pod.Name] = h.clk.Now().Add(grace)
+		stored.Finalizers = append(stored.Finalizers, terminationFinalizer)
+		if err := cl.Update(ctx, stored); err != nil {
+			return err
+		}
+	}
+	return cl.Delete(ctx, stored, opts...)
+}
+
+// finishTermination is the kubelet termination model's node half: once
+// the recorded grace has elapsed the finalizer comes off and the object
+// leaves, exactly as a kubelet that only stops the pod when its grace
+// runs out.
+func (h *recoveryHarness) finishTermination(pod *corev1.Pod) {
+	h.t.Helper()
+	if h.podGrace <= 0 || h.clk.Now().Before(h.terminatingUntil[pod.Name]) {
+		return
+	}
+	pod.Finalizers = nil
+	if err := h.c.Update(h.ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		h.t.Fatalf("kubelet finish termination %s: %v", pod.Name, err)
+	}
+	delete(h.terminatingUntil, pod.Name)
+}
+
+// livePodOnImage reports whether a live (not Terminating) pod runs image.
+func (h *recoveryHarness) livePodOnImage(image string) bool {
+	for _, pod := range h.livePods() {
+		if pod.Spec.Containers[0].Image == image {
+			return true
+		}
+	}
+	return false
+}
+
+// surgeOpen reports whether the Instance carries an in-flight surge step.
+func (h *recoveryHarness) surgeOpen(idx int32) bool {
+	s := h.instance(idx)
+	return s != nil && s.Phase == workloadtypes.InstancePhaseUpdating &&
+		s.Operation != nil && s.Operation.Step == workloadtypes.UpdateStepSurge
 }
 
 func (h *recoveryHarness) irKey() types.NamespacedName {
@@ -1343,6 +1439,8 @@ func (h *recoveryHarness) buildInput() workloadtypes.ReconcileInput {
 		StuckPodGrace:     30 * time.Second,
 		Requeue:           h.requeue,
 		Clock:             h.clk,
+
+		AbandonedReplacementGrace: h.abandonGrace,
 		WarnRetryHeld: func(rev string, attempts int32, reason string) {
 			h.heldWarnings = append(h.heldWarnings, fmt.Sprintf("%s attempts=%d %s", rev, attempts, reason))
 		},
@@ -1639,6 +1737,59 @@ func TestCorrectiveRecovery_SinglePod_RollForward(t *testing.T) {
 	if !converged {
 		h.dumpState("roll-forward wedged (single-pod)")
 		t.Fatalf("single-pod roll-forward after Held did not converge")
+	}
+}
+
+// TestCorrectiveRecovery_SinglePod_StuckSurgeAbandonedOnBoundedGrace covers
+// the corrective edit behind a stuck surge. The replacement of an in-flight
+// surge runs but never becomes ContainersReady: nothing escalates it before
+// the operation deadline, and it holds the Instance's surge slot. A
+// corrective revision abandons it, and the replacement it never marked
+// serving must go on the configured abandoned-replacement grace rather than
+// on the pod's own termination grace, which here is far longer than the
+// run: the kubelet model keeps a deleted pod Terminating for the grace its
+// delete names. The corrective replacement lands within that bound, the
+// source serves throughout, and the Instance converges on the corrective
+// revision.
+func TestCorrectiveRecovery_SinglePod_StuckSurgeAbandonedOnBoundedGrace(t *testing.T) {
+	h := newRecoveryHarness(t, false)
+	h.podGrace = 10 * time.Minute
+	h.abandonGrace = 10 * time.Second
+	h.driveToReadyOnV1()
+
+	revStuck := h.ensureRevision(recoveryPodSpec(stuckImage))
+	h.setTarget(revStuck, stuckImage)
+	if !h.run(10, func() bool { return h.surgeOpen(0) && h.livePodOnImage(stuckImage) }) {
+		h.dumpState("surge toward the never-Ready revision")
+		t.Fatalf("the surge toward the never-Ready revision never opened")
+	}
+	h.settle(3)
+	if !h.surgeOpen(0) || h.instance(0).Phase == workloadtypes.InstancePhaseFailed {
+		h.dumpState("stuck surge")
+		t.Fatalf("a Running, never-Ready replacement must hold the surge open, not escalate")
+	}
+
+	// Every pass advances the clock by at least the dispatcher cadence, so
+	// this bound is a few cadences past the abandoned-replacement grace and
+	// far short of the pod's own grace.
+	h.setTarget(h.revFixed, fixedImage)
+	landed := h.runWithInvariant(8,
+		func() bool { return h.livePodOnImage(fixedImage) },
+		func() {
+			if len(h.servingPods()) == 0 {
+				t.Fatalf("no pod serving while the stuck surge is abandoned: the source left rotation before the corrective replacement was ready")
+			}
+		})
+	if !landed {
+		h.dumpState("corrective edit behind the stuck surge")
+		t.Fatalf("the corrective replacement did not land within the abandoned-replacement grace: the abandoned never-Ready replacement held the surge slot for its own termination grace")
+	}
+	if h.livePodOnImage(stuckImage) {
+		t.Fatalf("the abandoned never-Ready replacement is still live beside the corrective one")
+	}
+	if !h.run(80, func() bool { return h.converged(h.revFixed.Name) }) {
+		h.dumpState("corrective convergence")
+		t.Fatalf("the corrective revision did not converge after the stuck surge was abandoned")
 	}
 }
 
@@ -4023,5 +4174,74 @@ func TestReadyRow_ServingGateFlipsStampNoTransition(t *testing.T) {
 				t.Errorf("RunningRevision: got %q want %q", got.RunningRevision, before.RunningRevision)
 			}
 		})
+	}
+}
+
+// TestPauseFreeze_RecreatePolicyTotalLossDemotesThenRepairs: the only pod
+// of a converged Instance under RecreateInstanceOnPodRestart is deleted
+// while the Component is frozen. Freeze suspends the repair, never the
+// truth: the row is demoted to Pending with its running revision kept, and
+// stays so with nothing recreated for the length of the freeze. Once the
+// pause is downgraded to a plain one the restart pass repairs the row at
+// the revision it ran, with the incarnation bump, although the Component's
+// target moved on under the freeze.
+func TestPauseFreeze_RecreatePolicyTotalLossDemotesThenRepairs(t *testing.T) {
+	h := newRecoveryHarness(t, false)
+	policy := workloadtypes.RestartPolicyRecreateInstance
+	h.lifecycle.RestartPolicy = &policy
+	h.setTarget(h.revV1, goodImage)
+	if !h.run(30, func() bool { return h.allReady(1) }) {
+		h.dumpState("initial create")
+		t.Fatalf("initial create never converged")
+	}
+	ready := h.instance(0)
+	readyIncarnation, running := ready.Incarnation, ready.RunningRevision
+	if running != h.revV1.Name {
+		t.Fatalf("converged row records %q, want %s", running, h.revV1.Name)
+	}
+
+	h.setTarget(h.revFixed, fixedImage)
+	h.desired.Paused = true
+	h.desired.PauseFreeze = true
+	h.losePods(0)
+	h.step()
+
+	if s := h.instance(0); s == nil || s.Phase != workloadtypes.InstancePhasePending || s.Operation != nil ||
+		s.RunningRevision != running || s.Incarnation != readyIncarnation {
+		h.dumpState("frozen with no pods")
+		t.Fatalf("demotion: got %+v, want Phase=Pending with no operation, the running revision and the incarnation kept", s)
+	}
+	for i := 0; i < 2; i++ {
+		h.step()
+	}
+	if pods := h.podsOf(0); len(pods) != 0 {
+		t.Fatalf("frozen passes recreated %d pod(s)", len(pods))
+	}
+	if s := h.instance(0); s == nil || s.Phase != workloadtypes.InstancePhasePending || s.Incarnation != readyIncarnation {
+		t.Fatalf("demotion did not hold across frozen passes: %+v", s)
+	}
+
+	h.desired.PauseFreeze = false
+	repaired := func() bool {
+		s := h.instance(0)
+		return s != nil && s.Phase == workloadtypes.InstancePhaseReady && s.Operation == nil && s.Incarnation > readyIncarnation
+	}
+	if !h.run(30, repaired) {
+		h.dumpState("after the downgrade to a plain pause")
+		t.Fatalf("the plain pause never repaired the demoted Instance")
+	}
+	s := h.instance(0)
+	if s.RunningRevision != running {
+		t.Fatalf("repaired row records %q, want the running revision %s: repair never advances a rollout", s.RunningRevision, running)
+	}
+	pods := h.podsOf(0)
+	if len(pods) != 1 {
+		t.Fatalf("repaired Instance has %d live pod(s), want 1", len(pods))
+	}
+	if got, want := pods[0].Labels[query.LabelRevisionHash], query.RevisionFromName(running).Hash(); got != want {
+		t.Fatalf("rebuilt pod revision label = %q, want %q (the running revision, not the target minted under the freeze)", got, want)
+	}
+	if got := pods[0].Labels[query.LabelInstanceIncarnation]; got != strconv.FormatInt(s.Incarnation, 10) {
+		t.Fatalf("rebuilt pod incarnation label = %q, want %d", got, s.Incarnation)
 	}
 }

@@ -114,8 +114,10 @@ func EnterReady(s *types.InstanceStatus, now time.Time) {
 // DemoteUnbacked applies the truth pass to one row: a status-only
 // Ready→Pending transition for an Instance the decision layer proved
 // unbacked. Counters, revisions and Incarnation are preserved —
-// recovery stays with the ordinary passes, which re-materialize a
-// Pending Instance's pods exactly as they would a Ready one's.
+// recovery stays with the ordinary passes: Create re-materializes a
+// Pending Instance's pods exactly as it would a Ready one's, and under
+// RecreateInstanceOnPodRestart the restart pass reads the kept running
+// revision (types.DemotedReady) and rebuilds at it.
 //
 // The precondition is re-checked on the fresh row, so an operation that
 // claimed the row since selection keeps it and the demotion no-ops.

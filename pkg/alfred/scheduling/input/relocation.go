@@ -130,7 +130,7 @@ func occupiedInstanceIndexes(s *Snapshot, source Source) (map[string]bool, error
 	occupied := make(map[string]bool)
 	for i := range s.InferenceReplicas {
 		ir := &s.InferenceReplicas[i]
-		if ir.Namespace != source.Namespace || ir.Spec.ParentRef.Name != source.InferenceService || ir.Spec.Component != source.Component {
+		if ir.Namespace != source.Namespace || (ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != source.InferenceService) || ir.Spec.Component != source.Component {
 			continue
 		}
 		rows, err := alfredstatus.Rows(&ir.Status)

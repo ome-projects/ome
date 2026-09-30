@@ -312,6 +312,13 @@ func gangSurgeUpdate(ctx context.Context, deps workload.Deps, input workload.Rec
 			input.PromoteWindow.Observe(wait)
 			return false, nil
 		}
+		// The drain is also where a cross-Component gate can act with the
+		// replacement gang already serving; a held source keeps serving at
+		// Step=Surge, exactly as under a pause.
+		if !promotedSurgeTarget && src.Operation != nil && src.Operation.Step == workload.UpdateStepSurge &&
+			!drainAdmitted(input, sourcePods, surgeTargetName) {
+			return false, nil
+		}
 	}
 	if !promotedSurgeTarget && input.ApplyInstanceMutationsWithRetryBlock != nil {
 		claimed, err := claimGangSurgeDrain(ctx, input, src, surgeMarker)
@@ -557,7 +564,9 @@ func abandonFailedGangSurge(ctx context.Context, deps workload.Deps, input workl
 		return false, nil
 	}
 
-	// 1. Delete the wedged surge gang's pods.
+	// 1. Delete the wedged surge gang's pods. The source stays at its surge
+	// step, holding the budget, until they are gone, so a member that never
+	// carried the serving gate goes on the abandoned-replacement grace.
 	surgePods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), ns, owner, comp, surgeIdx)
 	if err != nil {
 		return false, fmt.Errorf("list failed surge gang pods (instance=%d): %w", surgeIdx, err)
@@ -571,7 +580,7 @@ func abandonFailedGangSurge(ctx context.Context, deps workload.Deps, input workl
 				continue
 			}
 			deps.ExpectationsCache().ExpectDeletes(ns, owner, comp, surgeIdx, 1)
-			if err := deps.Client.Delete(ctx, pod); err != nil {
+			if err := deps.Client.Delete(ctx, pod, abandonedReplacementDeleteOptions(input, pod)...); err != nil {
 				deps.ExpectationsCache().ObservedDelete(ns, owner, comp, surgeIdx)
 				if apierrors.IsNotFound(err) {
 					continue

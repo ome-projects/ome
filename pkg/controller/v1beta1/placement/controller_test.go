@@ -6,14 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
@@ -23,7 +22,9 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 )
 
@@ -44,6 +45,13 @@ func (f fakeClusters) ClientFor(name string) (workloadcluster.SelectivelyCaching
 	return c, ok
 }
 
+func (f fakeClusters) ClientForUID(name string, uid types.UID) (workloadcluster.SelectivelyCachingClient, bool) {
+	if uid != types.UID(name+"-uid") {
+		return nil, false
+	}
+	return f.ClientFor(name)
+}
+
 func (f fakeClusters) Connected() []string {
 	names := make([]string, 0, len(f.m))
 	for n := range f.m {
@@ -54,7 +62,7 @@ func (f fakeClusters) Connected() []string {
 
 func readyWC(name string, labels map[string]string) *v1beta1.WorkloadCluster {
 	return &v1beta1.WorkloadCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid"), Labels: labels},
 		Status: v1beta1.WorkloadClusterStatus{Conditions: []metav1.Condition{
 			{Type: v1beta1.WorkloadClusterReady, Status: metav1.ConditionTrue, Reason: "Reachable"},
 		}},
@@ -64,18 +72,31 @@ func readyWC(name string, labels map[string]string) *v1beta1.WorkloadCluster {
 func srcISVC(selector string) *v1beta1.InferenceService {
 	return &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "svc", Namespace: "prod", UID: "uid-1",
-			Annotations: map[string]string{ClusterSelectorAnnotation: selector},
+			Name: "svc", Namespace: "prod", UID: "uid-1", Generation: 1,
+			Annotations: map[string]string{},
 		},
 		Spec: v1beta1.InferenceServiceSpec{
-			Engine: &v1beta1.EngineSpec{Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "ome-container", Image: "img"}}},
+			DeploymentMode: ptr.To(constants.OMENative),
+			Runtime:        &v1beta1.ServingRuntimeRef{Name: "placement-runtime"},
+			Placement:      &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle, ClusterAffinity: testAffinity(selector)},
+			Engine:         &v1beta1.EngineSpec{Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "ome-container", Image: "img"}}},
 		},
 	}
 }
 
+func backendTestRuntime() *v1beta1.ClusterServingRuntime {
+	return &v1beta1.ClusterServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "placement-runtime", UID: "runtime-uid"}, Spec: v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1)}}}}
+}
+
 // emptyWorker is a fresh fake worker client (status subresource registered).
 func emptyWorker(s *runtime.Scheme) client.WithWatch {
-	return fakeclient.NewClientBuilder().WithScheme(s).WithStatusSubresource(&v1beta1.InferenceService{}).Build()
+	return fakeclient.NewClientBuilder().WithScheme(s).WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(backendTestRuntime()).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if _, ok := obj.(*v1beta1.InferenceService); ok && obj.GetUID() == "" {
+			obj.SetUID(types.UID("member-" + obj.GetName()))
+			obj.SetGeneration(1)
+		}
+		return cl.Create(ctx, obj, opts...)
+	}}).Build()
 }
 
 // workerWithAdmittedDerived returns a worker whose derived ISVC already reports
@@ -83,6 +104,7 @@ func emptyWorker(s *runtime.Scheme) client.WithWatch {
 func workerWithAdmittedDerived(t *testing.T, s *runtime.Scheme) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent, true) // from admission_test.go
+	derived.UID = "member-uid"
 	derived.Namespace = "prod"
 	derived.Name = "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
@@ -91,7 +113,7 @@ func workerWithAdmittedDerived(t *testing.T, s *runtime.Scheme) client.WithWatch
 	engineIR := irWithInstances(v1beta1.EngineComponent, true)
 	w := fakeclient.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&v1beta1.InferenceService{}).
-		WithObjects(derived, engineIR).Build()
+		WithObjects(observedWorkerObjects(derived, engineIR)...).Build()
 	// Ensure the admitted status is stored (if the builder didn't persist it).
 	cur := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, cur))
@@ -132,12 +154,13 @@ func cpPlacement(t *testing.T, cp client.Client) *v1beta1.PlacementStatus {
 func workerWithAdmittedURL(t *testing.T, s *runtime.Scheme, host string) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent, true)
+	derived.UID = "member-uid"
 	derived.Namespace, derived.Name = "prod", "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
 	derived.Status.URL = &apis.URL{Scheme: "https", Host: host}
 	engineIR := irWithInstances(v1beta1.EngineComponent, true)
 	w := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(derived, engineIR).Build()
+		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(observedWorkerObjects(derived, engineIR)...).Build()
 	cur := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, cur))
 	if cur.Status.URL == nil {
@@ -154,6 +177,7 @@ func workerWithReadyURL(t *testing.T, s *runtime.Scheme, host string, ready int3
 func workerWithReplicaCounts(t *testing.T, s *runtime.Scheme, host string, admitted, ready int32) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent, true)
+	derived.UID = "member-uid"
 	derived.Namespace, derived.Name = "prod", "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
 	derived.Status.URL = &apis.URL{Scheme: "https", Host: host}
@@ -167,7 +191,7 @@ func workerWithReplicaCounts(t *testing.T, s *runtime.Scheme, host string, admit
 	engineIR := irWithInstances(v1beta1.EngineComponent, instances...)
 	engineIR.Status.ReadyReplicas = ready
 	return fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(derived, engineIR).Build()
+		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(observedWorkerObjects(derived, engineIR)...).Build()
 }
 
 func workerWithPDReplicaCounts(
@@ -178,6 +202,7 @@ func workerWithPDReplicaCounts(
 ) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent, true)
+	derived.UID = "member-uid"
 	declareComponent(derived, v1beta1.DecoderComponent)
 	derived.Namespace, derived.Name = "prod", "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
@@ -202,7 +227,7 @@ func workerWithPDReplicaCounts(
 
 	return fakeclient.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&v1beta1.InferenceService{}).
-		WithObjects(derived, engineIR, decoderIR).Build()
+		WithObjects(observedWorkerObjects(derived, engineIR, decoderIR)...).Build()
 }
 
 func cpStatusURL(t *testing.T, cp client.Client) *apis.URL {
@@ -713,11 +738,12 @@ func TestReconcile_ReplaceOnWinnerLostAfterGrace(t *testing.T) {
 func workerWithUnadmittedDerived(t *testing.T, s *runtime.Scheme) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent)
+	derived.UID = "member-uid"
 	derived.Namespace, derived.Name = "prod", "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
 	engineIR := irWithInstances(v1beta1.EngineComponent, false) // present, NOT admitted
 	return fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(derived, engineIR).Build()
+		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(observedWorkerObjects(derived, engineIR)...).Build()
 }
 
 func TestReconcile_WinnerLostAdmissionWithinGraceHolds(t *testing.T) {
@@ -828,7 +854,7 @@ func TestReconcile_StickyWinnerSweepsStrayLoser(t *testing.T) {
 	s := testScheme(t)
 	// a is connected and carries a STRAY derived (origin-labeled), not in status.
 	wa := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(&v1beta1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", Labels: map[string]string{PlacementOriginLabel: "uid-1"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "stray-uid", Labels: map[string]string{PlacementOriginLabel: "uid-1"}},
 	}).Build()
 	wb := workerWithAdmittedDerived(t, s) // winner b, admitted
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
@@ -857,10 +883,10 @@ func TestReconcile_StickyWinnerSweepsStrayLoser(t *testing.T) {
 func TestReconcile_DeleteRemovesDerivedEverywhere(t *testing.T) {
 	s := testScheme(t)
 	wa := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(&v1beta1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", Labels: map[string]string{PlacementOriginLabel: "uid-1"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "stray-uid", Labels: map[string]string{PlacementOriginLabel: "uid-1"}},
 	}).Build()
 	wb := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(&v1beta1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", Labels: map[string]string{PlacementOriginLabel: "uid-1"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "stray-uid", Labels: map[string]string{PlacementOriginLabel: "uid-1"}},
 	}).Build()
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(wa),
@@ -945,10 +971,16 @@ func TestReconcile_PublishesEndpointWhenAdmitted(t *testing.T) {
 
 	// The winner's per-candidate Endpoint is populated too (the per-home model
 	// All/Split build on; in Single the top-level Endpoint stays authoritative).
-	require.Len(t, p.Candidates, 1)
-	assert.Equal(t, "b", p.Candidates[0].Cluster)
-	require.NotNil(t, p.Candidates[0].Endpoint)
-	assert.Equal(t, "svc.prod.b.example", p.Candidates[0].Endpoint.Host)
+	winner := candidatesByCluster(p.Candidates)["b"]
+	require.NotNil(t, winner.Allocation)
+	assert.Positive(t, winner.Allocation.DesiredReplicas)
+	require.NotNil(t, winner.Endpoint)
+	assert.Equal(t, "svc.prod.b.example", winner.Endpoint.Host)
+	for _, candidate := range p.Candidates {
+		if candidate.Cluster != "b" {
+			assert.Zero(t, candidate.Allocation.DesiredReplicas)
+		}
+	}
 }
 
 func TestReconcile_PlacedButNoEndpointYet(t *testing.T) {
@@ -1153,17 +1185,6 @@ func (c irGetFailClient) Get(ctx context.Context, key client.ObjectKey, obj clie
 	return c.WithWatch.Get(ctx, key, obj, opts...)
 }
 
-// updateFailClient permits observation reads but rejects an update apply.
-type updateFailClient struct {
-	client.WithWatch
-	updates int
-}
-
-func (c *updateFailClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
-	c.updates++
-	return apierrors.NewInternalError(errors.New("update rejected"))
-}
-
 // failIRGetAfterClient allows a fixed number of authoritative IR reads, then
 // fails later reads while recording successful remote updates.
 type failIRGetAfterClient struct {
@@ -1335,17 +1356,17 @@ func TestPlaceOn_PreservesWorkerMetadata(t *testing.T) {
 	// Pre-existing derived that IS ours (carries the origin marker) plus a
 	// worker-added label + annotation the worker reconciler stamped on it.
 	existing := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
-		Name: "svc", Namespace: "prod",
+		Name: "svc", Namespace: "prod", UID: "member-uid",
 		Labels:      map[string]string{"worker.io/managed": "yes", PlacementOriginLabel: "uid-1"},
 		Annotations: map[string]string{"worker.io/state": "bookkeeping"},
 	}}
-	w := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(existing).Build()
+	w := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(existing, backendTestRuntime()).Build()
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
-	r, _ := newPlacer(s, clusters, srcISVC(""))
+	r, _ := newPlacer(s, clusters, srcISVC(""), readyWC("a", nil))
 
-	require.NoError(t, r.placeOn(context.Background(), "a", w, srcISVC("")))
+	require.NoError(t, r.placeOn(context.Background(), "a", srcISVC(""), false))
 
 	got := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, got))
@@ -1364,7 +1385,7 @@ func TestPlaceOn_RefusesToClobberForeignISVC(t *testing.T) {
 	// A foreign object: same name/namespace, NO origin markers, a distinct Spec.
 	foreign := &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "svc", Namespace: "prod",
+			Name: "svc", Namespace: "prod", UID: "member-uid",
 			Labels:      map[string]string{"owner": "some-user"},
 			Annotations: map[string]string{"note": "hand-rolled"},
 		},
@@ -1372,13 +1393,13 @@ func TestPlaceOn_RefusesToClobberForeignISVC(t *testing.T) {
 			Router: &v1beta1.RouterSpec{Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "user-container", Image: "user-img"}}},
 		},
 	}
-	w := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(foreign).Build()
+	w := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(foreign, backendTestRuntime()).Build()
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
-	r, _ := newPlacer(s, clusters, srcISVC(""))
+	r, _ := newPlacer(s, clusters, srcISVC(""), readyWC("a", nil))
 
-	err := r.placeOn(context.Background(), "a", w, srcISVC(""))
+	err := r.placeOn(context.Background(), "a", srcISVC(""), false)
 	require.Error(t, err, "placeOn must refuse to clobber a foreign same-named ISVC")
 
 	got := &v1beta1.InferenceService{}
@@ -1397,16 +1418,16 @@ func TestPlaceOn_RefusesToClobberForeignISVC(t *testing.T) {
 func TestPlaceOn_UpdatesOwnDerived(t *testing.T) {
 	s := testScheme(t)
 	existing := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
-		Name: "svc", Namespace: "prod",
+		Name: "svc", Namespace: "prod", UID: "member-uid",
 		Labels: map[string]string{PlacementOriginLabel: "uid-1"},
 	}}
-	w := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(existing).Build()
+	w := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(existing, backendTestRuntime()).Build()
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
-	r, _ := newPlacer(s, clusters, srcISVC(""))
+	r, _ := newPlacer(s, clusters, srcISVC(""), readyWC("a", nil))
 
-	require.NoError(t, r.placeOn(context.Background(), "a", w, srcISVC("")), "re-apply of our own derived must succeed")
+	require.NoError(t, r.placeOn(context.Background(), "a", srcISVC(""), false), "re-apply of our own derived must succeed")
 
 	got := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, got))
@@ -1417,13 +1438,13 @@ func TestPlaceOn_UpdatesOwnDerived(t *testing.T) {
 // placeOn must create the derived when no object exists on the candidate.
 func TestPlaceOn_CreatesWhenAbsent(t *testing.T) {
 	s := testScheme(t)
-	w := fakeclient.NewClientBuilder().WithScheme(s).Build()
+	w := emptyWorker(s)
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
-	r, _ := newPlacer(s, clusters, srcISVC(""))
+	r, _ := newPlacer(s, clusters, srcISVC(""), readyWC("a", nil))
 
-	require.NoError(t, r.placeOn(context.Background(), "a", w, srcISVC("")), "first-time create must succeed")
+	require.NoError(t, r.placeOn(context.Background(), "a", srcISVC(""), false), "first-time create must succeed")
 
 	got := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, got))
@@ -1782,18 +1803,18 @@ func TestReconcile_SingleModeRemoteIRFailureDoesNotBlockRace(t *testing.T) {
 func TestIsvcsForClusterChange_EnqueuesOnlyMatchingCandidates(t *testing.T) {
 	s := testScheme(t)
 	// match: selector gpu=gb300 matches the changed cluster.
-	match := srcISVCNamed("match", map[string]string{AcceleratorRequirementsAnnotation: "gpu=gb300"})
+	match := srcISVCNamed("match", "gpu=gb300")
 	// noMatch: requires a different accelerator; the changed cluster is not a candidate.
-	noMatch := srcISVCNamed("nomatch", map[string]string{AcceleratorRequirementsAnnotation: "gpu=h100"})
+	noMatch := srcISVCNamed("nomatch", "gpu=h100")
 	// nameMatch: selects the changed cluster through its immutable object name.
-	nameMatch := srcISVCNamed("name-match", nil)
-	nameMatch.Spec.Placement = &v1beta1.PlacementSpec{ClusterSelector: "metadata.name=b"}
+	nameMatch := srcISVCNamed("name-match")
+	nameMatch.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle, ClusterAffinity: testAffinity("metadata.name=b")}
 	// nameNoMatch: selects a different cluster name.
-	nameNoMatch := srcISVCNamed("name-nomatch", nil)
-	nameNoMatch.Spec.Placement = &v1beta1.PlacementSpec{ClusterSelector: "metadata.name=c"}
+	nameNoMatch := srcISVCNamed("name-nomatch")
+	nameNoMatch.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle, ClusterAffinity: testAffinity("metadata.name=c")}
 	// noReq: declares no placement requirement; never fanned out, must be excluded
 	// (and is not even in the index).
-	noReq := srcISVCNamed("noreq", nil)
+	noReq := srcISVCNamed("noreq")
 
 	c := indexedPlacementClient(t, s, match, noMatch, nameMatch, nameNoMatch, noReq)
 	r := &Reconciler{Client: c, Scheme: s, Log: log.Log}
@@ -1817,7 +1838,7 @@ func TestIsvcsForClusterChange_EnqueuesStatusReferencedClusterOnLabelLoss(t *tes
 	s := testScheme(t)
 	// Selector requires gpu=gb300, but the changed cluster has LOST that label.
 	// The ISVC is currently placed on "b", so it must be re-evaluated.
-	placed := srcISVCNamed("placed", map[string]string{AcceleratorRequirementsAnnotation: "gpu=gb300"})
+	placed := srcISVCNamed("placed", "gpu=gb300")
 	placed.Status.Placement = &v1beta1.PlacementStatus{
 		Cluster: "b", Phase: v1beta1.PlacementPhasePlaced,
 		Candidates: []v1beta1.CandidatePlacement{{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted}},
@@ -1836,9 +1857,9 @@ func TestIsvcsForClusterChange_EnqueuesStatusReferencedClusterOnLabelLoss(t *tes
 // Index: the field-index extractor marks exactly the requirement-
 // declaring ISVCs (and leaves the rest unindexed).
 func TestPlacementEligibleIndexExtractor(t *testing.T) {
-	withAccel := srcISVCNamed("a", map[string]string{AcceleratorRequirementsAnnotation: "gpu=gb300"})
-	withSelector := srcISVCNamed("b", map[string]string{ClusterSelectorAnnotation: "provider=cloud-a"})
-	withNone := srcISVCNamed("c", nil)
+	withAccel := srcISVCNamed("a", "gpu=gb300")
+	withSelector := srcISVCNamed("b", "provider=cloud-a")
+	withNone := srcISVCNamed("c")
 
 	assert.Equal(t, []string{placementEligibleIndexValue}, placementEligibleIndexExtractor(withAccel))
 	assert.Equal(t, []string{placementEligibleIndexValue}, placementEligibleIndexExtractor(withSelector))
@@ -1847,18 +1868,17 @@ func TestPlacementEligibleIndexExtractor(t *testing.T) {
 	assert.Nil(t, placementEligibleIndexExtractor(&v1beta1.WorkloadCluster{}))
 }
 
-// srcISVCNamed builds a placement source ISVC with a given name and annotation
-// set (nil annotations => no placement requirement).
-func srcISVCNamed(name string, annotations map[string]string) *v1beta1.InferenceService {
-	return &v1beta1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: "prod", UID: types.UID("uid-" + name),
-			Annotations: annotations,
-		},
-		Spec: v1beta1.InferenceServiceSpec{
-			Engine: &v1beta1.EngineSpec{Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "ome-container", Image: "img"}}},
-		},
+// srcISVCNamed builds a named source; omitted selectors produce a local service.
+func srcISVCNamed(name string, selectors ...string) *v1beta1.InferenceService {
+	source := srcISVC("")
+	source.Name = name
+	source.UID = types.UID("uid-" + name)
+	if len(selectors) == 0 {
+		source.Spec.Placement = nil
+	} else {
+		source.Spec.Placement.ClusterAffinity = testAffinity(selectors...)
 	}
+	return source
 }
 
 // indexedPlacementClient builds a fake control-plane client with the placement-
@@ -1931,7 +1951,7 @@ func TestReconcile_FanOutBoundsStuckClusterAndProceeds(t *testing.T) {
 func srcISVCMode(mode v1beta1.PlacementMode, requirements string) *v1beta1.InferenceService {
 	i := srcISVC("")
 	i.Annotations = nil
-	i.Spec.Placement = &v1beta1.PlacementSpec{Mode: mode, Requirements: requirements}
+	i.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: mode, ClusterAffinity: testAffinity(requirements)}
 	return i
 }
 
@@ -1954,11 +1974,12 @@ func placedAllISVC() *v1beta1.InferenceService {
 func workerWithGatedDerived(t *testing.T, s *runtime.Scheme) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent)
+	derived.UID = "member-uid"
 	derived.Namespace, derived.Name = "prod", "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
 	engineIR := irWithInstances(v1beta1.EngineComponent, false) // present, NOT admitted
 	return fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(derived, engineIR).Build()
+		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(observedWorkerObjects(derived, engineIR)...).Build()
 }
 
 func candidatesByCluster(cs []v1beta1.CandidatePlacement) map[string]v1beta1.CandidatePlacement {
@@ -2157,7 +2178,7 @@ func TestReconcile_AllModeUnreadableHomeDoesNotBorrowLegacyReady(t *testing.T) {
 		"an unproven carried count must not become routing weight")
 }
 
-func TestReconcile_AllModeDisconnectDoesNotRetainNonCandidateHome(t *testing.T) {
+func TestReconcile_AllModeBackendHoldRetainsOutgoingHome(t *testing.T) {
 	s := testScheme(t)
 	isvc := placedAllISVC()
 	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}, isvc,
@@ -2170,9 +2191,13 @@ func TestReconcile_AllModeDisconnectDoesNotRetainNonCandidateHome(t *testing.T) 
 	p := cpPlacement(t, cp)
 	require.NotNil(t, p)
 	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
-	require.Len(t, p.Candidates, 1)
-	assert.Equal(t, "a", p.Candidates[0].Cluster)
-	assert.Equal(t, "svc.a.example", p.Candidates[0].Endpoint.Host)
+	got := map[string]string{}
+	for _, candidate := range p.Candidates {
+		got[candidate.Cluster] = candidate.Endpoint.Host
+	}
+	if diff := cmp.Diff(map[string]string{"a": "svc.a.example", "b": "svc.b.example"}, got); diff != "" {
+		t.Fatalf("held homes (-want +got):\n%s", diff)
+	}
 }
 
 // TestReconcile_AllModePartialAdmitStaysPlaced: one home admitted, one still
@@ -2231,7 +2256,7 @@ func TestReconcile_AllModeRemoteIRFailureDoesNotHideHealthyHome(t *testing.T) {
 	assert.Equal(t, v1beta1.CandidatePhaseAdmitted, by["b"].Phase)
 }
 
-func TestReconcile_AllModePostApplyIRFailureKeepsFreshObservation(t *testing.T) {
+func TestReconcile_AllModeRepeatedIRFailureKeepsFreshObservation(t *testing.T) {
 	s := testScheme(t)
 	worker := &failIRGetAfterClient{
 		WithWatch:        workerWithReplicaCounts(t, s, "fresh.a.example", 3, 2),
@@ -2253,8 +2278,8 @@ func TestReconcile_AllModePostApplyIRFailureKeepsFreshObservation(t *testing.T) 
 	res, err := r.Reconcile(context.Background(), req())
 	require.NoError(t, err)
 	assert.Equal(t, time.Second, res.RequeueAfter)
-	assert.Equal(t, 2, worker.irGets, "the IR read after the successful apply must fail")
-	assert.Positive(t, worker.updates, "the derived apply must complete before the failed read")
+	assert.Greater(t, worker.irGets, worker.successfulIRGets, "the later authoritative inventory must fail")
+	assert.Zero(t, worker.updates, "unknown physical inventory cannot authorize a member refresh")
 
 	got := &v1beta1.InferenceService{}
 	require.NoError(t, cp.Get(context.Background(), req().NamespacedName, got))
@@ -2322,10 +2347,10 @@ func TestReconcile_SplitWithNoDesiredReplicasHoldsPending(t *testing.T) {
 func srcISVCSplit(requirements string, replicas int32) *v1beta1.InferenceService {
 	i := srcISVC("")
 	i.Annotations = nil
-	i.Spec.Placement = &v1beta1.PlacementSpec{
-		Mode:         v1beta1.PlacementModeSplit,
-		Requirements: requirements,
-		Split:        &v1beta1.SplitSpec{Replicas: &replicas},
+	i.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
+		Mode:            v1beta1.PlacementModeSplit,
+		ClusterAffinity: testAffinity(requirements),
+		Split:           &v1beta1.SplitSpec{Replicas: &replicas},
 	}
 	return i
 }
@@ -2336,6 +2361,7 @@ func srcISVCSplit(requirements string, replicas int32) *v1beta1.InferenceService
 func workerWithReplicas(t *testing.T, s *runtime.Scheme, host string, admitted, ready int32) client.WithWatch {
 	t.Helper()
 	derived := isvcWithInstances(v1beta1.EngineComponent)
+	derived.UID = "member-uid"
 	derived.Namespace, derived.Name = "prod", "svc"
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
 	derived.Status.URL = &apis.URL{Scheme: "https", Host: host}
@@ -2349,7 +2375,7 @@ func workerWithReplicas(t *testing.T, s *runtime.Scheme, host string, admitted, 
 	ir := irWithInstances(v1beta1.EngineComponent, flags...)
 	ir.Status.ReadyReplicas = ready
 	w := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(derived, ir).Build()
+		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(observedWorkerObjects(derived, ir)...).Build()
 	cur := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, cur))
 	if cur.Status.URL == nil {
@@ -2368,45 +2394,6 @@ func TestSplitDesiredReplicas(t *testing.T) {
 	assert.Equal(t, int32(3), splitDesiredReplicas(i))
 	// Zero when neither is declared.
 	assert.Equal(t, int32(0), splitDesiredReplicas(srcISVCMode(v1beta1.PlacementModeSplit, "gpu=gb300")))
-}
-
-// TestReconcile_SplitPackedFillsAcrossHomes: N=3 packed across two homes that
-// admit 2 and 1 — both kept with per-home admitted/ready counts, and the
-// apportioned replica count is applied to each home's derived.
-func TestReconcile_SplitPackedFillsAcrossHomes(t *testing.T) {
-	s := testScheme(t)
-	wa := workerWithReplicas(t, s, "svc.a.example", 2, 2)
-	wb := workerWithReplicas(t, s, "svc.b.example", 1, 1)
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}
-	r, cp := newPlacer(s, clusters, srcISVCSplit("gpu=gb300", 3),
-		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	_, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	p := cpPlacement(t, cp)
-	require.NotNil(t, p)
-	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
-	assert.Empty(t, p.Cluster, "Split has no single winner cluster")
-	by := candidatesByCluster(p.Candidates)
-	require.Contains(t, by, "a")
-	require.Contains(t, by, "b")
-	assert.Equal(t, int32(2), by["a"].AdmittedReplicas)
-	assert.Equal(t, int32(2), by["a"].ReadyReplicas)
-	require.NotNil(t, by["a"].Endpoint)
-	assert.Equal(t, int32(1), by["b"].AdmittedReplicas)
-	assert.Equal(t, int32(1), by["b"].ReadyReplicas)
-
-	// Both homes are already admitted summing to the floor, so this is a TRIM
-	// pass: each home is pinned to its admitted count (no over-request / gated
-	// remainder), and the apportioned count lands on the derived engine.
-	da := &v1beta1.InferenceService{}
-	require.NoError(t, wa.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, da))
-	require.NotNil(t, da.Spec.Engine.MinReplicas)
-	assert.Equal(t, 2, *da.Spec.Engine.MinReplicas, "home pinned to its admitted count")
 }
 
 // Split observes each home independently: one home's failed authoritative IR
@@ -2467,170 +2454,6 @@ func TestReconcile_SplitUnreadableHomeKeepsItsShare(t *testing.T) {
 	assert.Zero(t, zc.ReadyReplicas, "unknown health must not remain routable")
 }
 
-func TestReconcile_SplitApplyFailurePreservesObservedStandingHome(t *testing.T) {
-	s := testScheme(t)
-	worker := &updateFailClient{WithWatch: workerWithReplicas(t, s, "fresh.a.example", 1, 1)}
-	src := srcISVCSplit("gpu=gb300", 2)
-	src.Finalizers = []string{PlacementFinalizer}
-	src.Status.Placement = &v1beta1.PlacementStatus{
-		Phase: v1beta1.PlacementPhasePlaced,
-		Candidates: []v1beta1.CandidatePlacement{{
-			Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted,
-			Endpoint: apis.HTTPS("stale.a.example"), AdmittedReplicas: 4, ReadyReplicas: 4,
-		}},
-	}
-	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(worker),
-	}}, src, readyWC("a", map[string]string{"gpu": "gb300"}))
-
-	res, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-	assert.Equal(t, time.Second, res.RequeueAfter)
-	assert.Positive(t, worker.updates, "the positive target must attempt an update")
-
-	got := &v1beta1.InferenceService{}
-	require.NoError(t, cp.Get(context.Background(), req().NamespacedName, got))
-	p := got.Status.Placement
-	require.NotNil(t, p)
-	by := candidatesByCluster(p.Candidates)
-	candidate, ok := by["a"]
-	require.True(t, ok)
-	assert.Equal(t, v1beta1.CandidatePhaseAdmitted, candidate.Phase)
-	require.NotNil(t, candidate.Endpoint)
-	assert.Equal(t, "fresh.a.example", candidate.Endpoint.Host)
-	assert.Equal(t, int32(1), candidate.AdmittedReplicas)
-	assert.Equal(t, int32(1), candidate.ReadyReplicas)
-	ready := got.Status.GetCondition(apis.ConditionReady)
-	require.NotNil(t, ready)
-	assert.Equal(t, corev1.ConditionTrue, ready.Status)
-	assert.Equal(t, placementReadyReasonReady, ready.Reason)
-}
-
-// conflictUpdateClient rejects every apply with an optimistic-lock conflict, as
-// a member-side writer racing the placer to the derived copy would.
-type conflictUpdateClient struct {
-	client.WithWatch
-	updates int
-}
-
-func (c *conflictUpdateClient) Update(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-	c.updates++
-	return apierrors.NewConflict(
-		schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "inferenceservices"},
-		obj.GetName(),
-		errors.New("the object has been modified; please apply your changes to the latest version and try again"),
-	)
-}
-
-// recordingSink keeps the messages logged at each severity so a test can pin
-// which outcomes the placer reports as failures.
-type recordingSink struct {
-	infos  []string
-	errors []string
-}
-
-func (s *recordingSink) Init(logr.RuntimeInfo)               {}
-func (s *recordingSink) Enabled(int) bool                    { return true }
-func (s *recordingSink) Info(_ int, msg string, _ ...any)    { s.infos = append(s.infos, msg) }
-func (s *recordingSink) Error(_ error, msg string, _ ...any) { s.errors = append(s.errors, msg) }
-func (s *recordingSink) WithValues(...any) logr.LogSink      { return s }
-func (s *recordingSink) WithName(string) logr.LogSink        { return s }
-
-func TestReconcile_SplitApplyConflictRetriesWithoutErrorLog(t *testing.T) {
-	s := testScheme(t)
-	worker := &conflictUpdateClient{WithWatch: workerWithReplicas(t, s, "fresh.a.example", 1, 1)}
-	src := srcISVCSplit("gpu=gb300", 2)
-	src.Finalizers = []string{PlacementFinalizer}
-	src.Status.Placement = &v1beta1.PlacementStatus{
-		Phase: v1beta1.PlacementPhasePlaced,
-		Candidates: []v1beta1.CandidatePlacement{{
-			Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted,
-			Endpoint: apis.HTTPS("stale.a.example"), AdmittedReplicas: 4, ReadyReplicas: 4,
-		}},
-	}
-	r, _ := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(worker),
-	}}, src, readyWC("a", map[string]string{"gpu": "gb300"}))
-	sink := &recordingSink{}
-	r.Log = logr.New(sink)
-
-	res, err := r.Reconcile(context.Background(), req())
-
-	require.NoError(t, err)
-	assert.Equal(t, time.Second, res.RequeueAfter, "a conflicted apply retries on the next pass")
-	assert.Positive(t, worker.updates)
-	assert.Empty(t, sink.errors, "an optimistic-lock conflict is a retry, not a failure")
-	assert.Contains(t, sink.infos, "split: place conflicted on cluster; retrying")
-}
-
-func TestReconcile_SplitDeleteFailureKeepsObservedHome(t *testing.T) {
-	s := testScheme(t)
-	wa := workerWithReplicas(t, s, "fresh.a.example", 1, 1)
-	wb := deleteFailClient{WithWatch: workerWithReplicas(t, s, "fresh.b.example", 1, 1)}
-	src := srcISVCSplit("gpu=gb300", 1)
-	src.Finalizers = []string{PlacementFinalizer}
-	src.Status.Placement = &v1beta1.PlacementStatus{
-		Phase: v1beta1.PlacementPhasePlaced,
-		Candidates: []v1beta1.CandidatePlacement{
-			{Cluster: "a", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("stale.a.example"), AdmittedReplicas: 1, ReadyReplicas: 1},
-			{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS("stale.b.example"), AdmittedReplicas: 1, ReadyReplicas: 1},
-		},
-	}
-	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}, src, readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	res, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-	assert.Equal(t, time.Second, res.RequeueAfter)
-	assert.True(t, hasDerived(t, wb), "the failed deletion leaves the remote copy present")
-
-	p := cpPlacement(t, cp)
-	require.NotNil(t, p)
-	by := candidatesByCluster(p.Candidates)
-	candidate, ok := by["b"]
-	require.True(t, ok, "a failed deletion must not erase an observed home")
-	assert.Equal(t, v1beta1.CandidatePhaseAdmitted, candidate.Phase)
-	require.NotNil(t, candidate.Endpoint)
-	assert.Equal(t, "fresh.b.example", candidate.Endpoint.Host)
-	assert.Equal(t, int32(1), candidate.AdmittedReplicas)
-	assert.Equal(t, int32(1), candidate.ReadyReplicas)
-}
-
-func TestReconcile_SplitReservesStandingHomeAcrossReadinessGate(t *testing.T) {
-	s := testScheme(t)
-	wa := emptyWorker(s)
-	wb := workerWithReplicas(t, s, "svc.b.example", 1, 1)
-	src := srcISVCSplit("gpu=gb300", 2)
-	src.Status.Placement = &v1beta1.PlacementStatus{
-		Phase: v1beta1.PlacementPhasePlaced,
-		Candidates: []v1beta1.CandidatePlacement{{
-			Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted,
-			Endpoint: apis.HTTPS("stale.b.example"), AdmittedReplicas: 1, ReadyReplicas: 1,
-		}},
-	}
-	wcB := readyWC("b", map[string]string{"gpu": "gb300"})
-	wcB.Status.Conditions[0].Status = metav1.ConditionFalse
-	r, cp := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}, src, readyWC("a", map[string]string{"gpu": "gb300"}), wcB)
-
-	_, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	derivedA := &v1beta1.InferenceService{}
-	require.NoError(t, wa.Get(context.Background(), req().NamespacedName, derivedA))
-	require.NotNil(t, derivedA.Spec.Engine.MinReplicas)
-	assert.Equal(t, 1, *derivedA.Spec.Engine.MinReplicas,
-		"the observed standing share must be reserved before apportioning")
-	by := candidatesByCluster(cpPlacement(t, cp).Candidates)
-	require.Contains(t, by, "b")
-	assert.Equal(t, int32(1), by["b"].ReadyReplicas)
-	assert.Equal(t, "svc.b.example", by["b"].Endpoint.Host)
-}
-
 func TestReconcile_SplitTerminalHomeIsObservedWithoutReapply(t *testing.T) {
 	s := testScheme(t)
 	derived := isvcWithPhases(v1beta1.EngineComponent, v1beta1.OMENativeInstanceFailed)
@@ -2670,33 +2493,6 @@ func TestReconcile_SplitTerminalHomeIsObservedWithoutReapply(t *testing.T) {
 	assert.Zero(t, p.Candidates[0].ReadyReplicas)
 }
 
-func TestReconcile_SplitBalancedExcludesTerminalHomeFromApportionment(t *testing.T) {
-	s := testScheme(t)
-	terminalDerived := isvcWithPhases(v1beta1.EngineComponent, v1beta1.OMENativeInstanceFailed)
-	terminalDerived.Namespace, terminalDerived.Name = "prod", "svc"
-	terminalDerived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
-	terminalIR := irWithPhases(v1beta1.EngineComponent, v1beta1.OMENativeInstanceFailed)
-	wa := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).
-		WithObjects(terminalDerived, terminalIR).Build()
-	wb := workerWithReplicas(t, s, "svc.b.example", 1, 1)
-	src := srcISVCSplit("gpu=gb300", 2)
-	src.Spec.Placement.Split.Spread = true
-	r, _ := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}, src, readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	_, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	derivedB := &v1beta1.InferenceService{}
-	require.NoError(t, wb.Get(context.Background(), req().NamespacedName, derivedB))
-	require.NotNil(t, derivedB.Spec.Engine.MinReplicas)
-	assert.Equal(t, 2, *derivedB.Spec.Engine.MinReplicas,
-		"a terminal home must not consume a balanced allocation share")
-}
-
 func TestReconcile_SplitNormalizesCarriedLegacyCandidatePhase(t *testing.T) {
 	s := testScheme(t)
 	src := srcISVCSplit("gpu=gb300", 1)
@@ -2716,146 +2512,6 @@ func TestReconcile_SplitNormalizesCarriedLegacyCandidatePhase(t *testing.T) {
 	assert.Equal(t, v1beta1.PlacementPhaseAdmitting, p.Phase)
 	require.Len(t, p.Candidates, 1)
 	assert.Equal(t, v1beta1.CandidatePhaseAdmitting, p.Candidates[0].Phase)
-}
-
-// TestReconcile_SplitMaxPerClusterCapsDerivedCeiling: maxReplicasPerCluster is
-// the hard per-cluster ceiling, so it clamps each home's derived MaxReplicas
-// DOWN from the declared engine.maxReplicas — the home may burst up to the cap
-// locally, never past it. Min stays the apportioned share (a=2, b=1 for floor 3).
-func TestReconcile_SplitMaxPerClusterCapsDerivedCeiling(t *testing.T) {
-	s := testScheme(t)
-	wa := workerWithReplicas(t, s, "svc.a.example", 2, 2)
-	wb := workerWithReplicas(t, s, "svc.b.example", 1, 1)
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}
-	src := srcISVCSplit("gpu=gb300", 3)
-	src.Spec.Engine.MaxReplicas = 9 // declared ceiling the cap must override
-	src.Spec.Placement.Split.MaxReplicasPerCluster = 2
-	r, cp := newPlacer(s, clusters, src,
-		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	_, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	require.Equal(t, v1beta1.PlacementPhasePlaced, cpPlacement(t, cp).Phase)
-	get := func(w client.Client) *v1beta1.InferenceService {
-		d := &v1beta1.InferenceService{}
-		require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, d))
-		return d
-	}
-	da, db := get(wa), get(wb)
-	assert.Equal(t, 2, da.Spec.Engine.MaxReplicas, "home a ceiling clamped to the cap, not 9")
-	assert.Equal(t, 2, db.Spec.Engine.MaxReplicas, "home b ceiling clamped to the cap, not 9")
-	require.NotNil(t, da.Spec.Engine.MinReplicas)
-	require.NotNil(t, db.Spec.Engine.MinReplicas)
-	assert.Equal(t, 2, *da.Spec.Engine.MinReplicas, "a floor = its share")
-	assert.Equal(t, 1, *db.Spec.Engine.MinReplicas, "b floor = its share")
-}
-
-// TestReconcile_SplitTrimsOverAdmission: two homes admit 4 and 2 but the floor
-// is 4 — TRIM keeps the preferred home full (4) and sheds the excess from the
-// least-preferred (b scaled to 0 / swept), converging the request sum to 4.
-func TestReconcile_SplitTrimsOverAdmission(t *testing.T) {
-	s := testScheme(t)
-	wa := workerWithReplicas(t, s, "svc.a.example", 4, 4)
-	wb := workerWithReplicas(t, s, "svc.b.example", 2, 2)
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}
-	r, cp := newPlacer(s, clusters, srcISVCSplit("gpu=gb300", 4),
-		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	_, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	p := cpPlacement(t, cp)
-	require.NotNil(t, p)
-	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
-	// a keeps the whole floor; b is trimmed away (target 0 -> derived swept).
-	da := &v1beta1.InferenceService{}
-	require.NoError(t, wa.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, da))
-	require.NotNil(t, da.Spec.Engine.MinReplicas)
-	assert.Equal(t, 4, *da.Spec.Engine.MinReplicas, "preferred home kept full")
-	assert.False(t, hasDerived(t, wb), "excess least-preferred home trimmed away")
-	by := candidatesByCluster(p.Candidates)
-	require.Contains(t, by, "a")
-	assert.NotContains(t, by, "b")
-}
-
-func TestSplitApportion(t *testing.T) {
-	cs := []string{"a", "b", "c"}
-	adm := func(a, b, c int32) map[string]int32 { return map[string]int32{"a": a, "b": b, "c": c} }
-
-	// FILL from empty: Packed over-requests the whole floor on the frontier;
-	// already-admitted replicas shrink what later clusters are asked for.
-	assert.Equal(t, map[string]int32{"a": 6, "b": 6, "c": 6}, splitApportion(cs, adm(0, 0, 0), 6, 0, false),
-		"all gated -> each candidate over-requested the deficit (trim converges later)")
-	assert.Equal(t, map[string]int32{"a": 6, "b": 2, "c": 2}, splitApportion(cs, adm(4, 0, 0), 6, 0, false),
-		"a holds 4 -> b/c asked for the remaining 2")
-
-	// TRIM: admitted >= floor -> pin preferred full, shed least-preferred.
-	assert.Equal(t, map[string]int32{"a": 4, "b": 0, "c": 0}, splitApportion(cs, adm(4, 2, 0), 4, 0, false),
-		"floor met by a -> b's excess trimmed to 0")
-	assert.Equal(t, map[string]int32{"a": 3, "b": 2, "c": 0}, splitApportion(cs, adm(3, 3, 3), 5, 0, false),
-		"pin a=3, b=2, shed c")
-
-	// maxPerCluster caps each request.
-	assert.Equal(t, map[string]int32{"a": 3, "b": 3, "c": 3}, splitApportion(cs, adm(0, 0, 0), 9, 3, false),
-		"cap forces the fill to spread across clusters")
-
-	// Balanced (spread): even share on every candidate.
-	assert.Equal(t, map[string]int32{"a": 2, "b": 2, "c": 2}, splitApportion(cs, adm(0, 0, 0), 6, 0, true))
-}
-
-// TestReconcile_SplitPackedSkipsUnneededCluster: N=2 met entirely by home a, so
-// candidate b is not used (no derived, not a home).
-func TestReconcile_SplitPackedSkipsUnneededCluster(t *testing.T) {
-	s := testScheme(t)
-	wa := workerWithReplicas(t, s, "svc.a.example", 2, 2)
-	wb := emptyWorker(s)
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}
-	r, cp := newPlacer(s, clusters, srcISVCSplit("gpu=gb300", 2),
-		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	_, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	p := cpPlacement(t, cp)
-	require.NotNil(t, p)
-	assert.Equal(t, v1beta1.PlacementPhasePlaced, p.Phase)
-	require.Len(t, p.Candidates, 1, "floor met by a; b not used")
-	assert.Equal(t, "a", p.Candidates[0].Cluster)
-	assert.Equal(t, int32(2), p.Candidates[0].AdmittedReplicas)
-	assert.False(t, hasDerived(t, wb), "unneeded cluster b is not placed on")
-}
-
-// TestReconcile_SplitAdmittingWhileAllGated: nothing admitted yet -> Admitting, homes
-// retained as placed candidates, fast requeue.
-func TestReconcile_SplitAdmittingWhileAllGated(t *testing.T) {
-	s := testScheme(t)
-	wa, wb := emptyWorker(s), emptyWorker(s)
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": workloadcluster.NewNeverCachingClient(wa),
-		"b": workloadcluster.NewNeverCachingClient(wb),
-	}}
-	r, cp := newPlacer(s, clusters, srcISVCSplit("gpu=gb300", 2),
-		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-
-	res, err := r.Reconcile(context.Background(), req())
-	require.NoError(t, err)
-
-	p := cpPlacement(t, cp)
-	require.NotNil(t, p)
-	assert.Equal(t, v1beta1.PlacementPhaseAdmitting, p.Phase)
-	assert.Positive(t, res.RequeueAfter, "keeps filling while the floor is unmet")
-	assert.True(t, hasDerived(t, wa))
-	assert.True(t, hasDerived(t, wb))
 }
 
 func TestSplitScaleComponentsAndAccounting(t *testing.T) {

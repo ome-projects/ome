@@ -2,6 +2,7 @@ package irprojector
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -305,7 +306,7 @@ func TestEnsureInferenceReplica_Update_PreservesGeneration(t *testing.T) {
 
 	g.Expect(second.Spec.Replicas).To(gomega.Equal(first.Spec.Replicas))
 	g.Expect(second.Spec.Component).To(gomega.Equal(first.Spec.Component))
-	g.Expect(second.Spec.ParentRef).To(gomega.Equal(first.Spec.ParentRef))
+	g.Expect(second.ParentName()).To(gomega.Equal(isvc.Name))
 	g.Expect(second.ResourceVersion).To(gomega.Equal(firstRV),
 		"identical re-projection must not bump ResourceVersion (no-op guard)")
 }
@@ -569,7 +570,7 @@ func TestEnsureInferenceReplica_AlreadyExists_PropagatedAsUpdate(t *testing.T) {
 			},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: "llama"},
+			ParentRef: &v1beta1.ParentReference{Name: "llama"},
 			Component: v1beta1.EngineComponent,
 		},
 	}
@@ -1434,4 +1435,165 @@ func TestEnsureInferenceReplica_UnchangedPacingPartition_NoWrite(t *testing.T) {
 	_, err = EnsureInferenceReplica(context.Background(), again)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(patches).To(gomega.Equal(0), "an unchanged pacing partition must not write")
+}
+
+// TestProjectedReplicaCarriesItsParentRef pins that a projected replica
+// names the InferenceService that projects it.
+func TestProjectedReplicaCarriesItsParentRef(t *testing.T) {
+	isvc := baselineISVC("svc", "team-a")
+	p := minimalParams(t, isvc, nil)
+	ir := newInferenceReplica(p, InferenceReplicaName(isvc.Name, p.Component))
+	if ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != "svc" {
+		t.Fatalf("ParentRef = %+v, want &{Name: svc}", ir.Spec.ParentRef)
+	}
+	if got := ir.ParentName(); got != "svc" {
+		t.Fatalf("ParentName = %q, want svc", got)
+	}
+}
+
+// TestEnsureInferenceReplicaRefusesAForeignReplica pins that a standalone
+// replica holding the projected name is reported and left untouched, never
+// adopted.
+func TestEnsureInferenceReplicaRefusesAForeignReplica(t *testing.T) {
+	isvc := baselineISVC("svc", "team-a")
+	standalone := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc-engine", Namespace: "team-a", UID: "replica-uid"},
+		Spec:       v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	p := minimalParams(t, isvc, fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(standalone).Build())
+	_, err := EnsureInferenceReplica(context.Background(), p)
+	if err == nil || !strings.Contains(err.Error(), "not projected by InferenceService") {
+		t.Fatalf("expected a foreign-replica error, got %v", err)
+	}
+	fresh := &v1beta1.InferenceReplica{}
+	if gerr := p.Client.Get(context.Background(), client.ObjectKeyFromObject(standalone), fresh); gerr != nil {
+		t.Fatalf("get: %v", gerr)
+	}
+	if fresh.Spec.ParentRef != nil || len(fresh.OwnerReferences) != 0 {
+		t.Fatalf("the standalone replica must be left untouched, got parentRef=%v owners=%v", fresh.Spec.ParentRef, fresh.OwnerReferences)
+	}
+}
+
+// TestProjectedBy pins which live replicas the projector treats as its own:
+// one this InferenceService controls, or one with no controller that names
+// it as parent. Any other controller, including a same-named
+// InferenceService with another UID, keeps the replica out of reach.
+func TestProjectedBy(t *testing.T) {
+	isvc := baselineISVC("svc", "team-a")
+	parent := &v1beta1.ParentReference{Name: "svc"}
+	cases := []struct {
+		name   string
+		owner  *metav1.OwnerReference
+		parent *v1beta1.ParentReference
+		want   bool
+	}{
+		{name: "controlled by this InferenceService", owner: metav1.NewControllerRef(isvc, isvcGVK), parent: parent, want: true},
+		{name: "no controller and a matching parentRef", parent: parent, want: true},
+		{name: "no controller and no parentRef", want: false},
+		{name: "no controller and a parentRef naming another InferenceService", parent: &v1beta1.ParentReference{Name: "other"}, want: false},
+		{
+			name:   "controlled by a Deployment",
+			owner:  &metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "svc", UID: "deployment-uid", Controller: ptr.To(true)},
+			parent: parent,
+			want:   false,
+		},
+		{
+			name:   "controlled by a same-named InferenceService with another UID",
+			owner:  &metav1.OwnerReference{APIVersion: isvcGVK.GroupVersion().String(), Kind: isvcGVK.Kind, Name: "svc", UID: "old-uid", Controller: ptr.To(true)},
+			parent: parent,
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := &v1beta1.InferenceReplica{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc-engine", Namespace: "team-a"},
+				Spec:       v1beta1.InferenceReplicaSpec{ParentRef: tc.parent, Component: v1beta1.EngineComponent},
+			}
+			if tc.owner != nil {
+				ir.OwnerReferences = []metav1.OwnerReference{*tc.owner}
+			}
+			if got := projectedBy(ir, isvc); got != tc.want {
+				t.Fatalf("projectedBy = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEnsureInferenceReplicaWaitsForAPreviousIncarnation pins that a replica
+// still controlled by a deleted InferenceService of the same name is
+// reported as awaiting removal, not as a name to change, and left untouched.
+func TestEnsureInferenceReplicaWaitsForAPreviousIncarnation(t *testing.T) {
+	isvc := baselineISVC("svc", "team-a")
+	isvc.UID = "new-uid"
+	previous := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc-engine",
+			Namespace: "team-a",
+			UID:       "replica-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: isvcGVK.GroupVersion().String(),
+				Kind:       isvcGVK.Kind,
+				Name:       "svc",
+				UID:        "old-uid",
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: "svc"}, Component: v1beta1.EngineComponent},
+	}
+	p := minimalParams(t, isvc, fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(previous).Build())
+	before := &v1beta1.InferenceReplica{}
+	if gerr := p.Client.Get(context.Background(), client.ObjectKeyFromObject(previous), before); gerr != nil {
+		t.Fatalf("get: %v", gerr)
+	}
+
+	_, err := EnsureInferenceReplica(context.Background(), p)
+	if err == nil || !strings.Contains(err.Error(), "still belongs to a previous InferenceService") || !strings.Contains(err.Error(), "old-uid") {
+		t.Fatalf("expected a previous-incarnation error naming old-uid, got %v", err)
+	}
+	fresh := &v1beta1.InferenceReplica{}
+	if gerr := p.Client.Get(context.Background(), client.ObjectKeyFromObject(previous), fresh); gerr != nil {
+		t.Fatalf("get: %v", gerr)
+	}
+	if fresh.ResourceVersion != before.ResourceVersion || fresh.OwnerReferences[0].UID != "old-uid" {
+		t.Fatalf("the previous incarnation's replica must be left untouched, got resourceVersion %s (was %s) owners=%v",
+			fresh.ResourceVersion, before.ResourceVersion, fresh.OwnerReferences)
+	}
+}
+
+// TestEnsureInferenceReplicaWaitsForADeletingReplica pins that a replica
+// already being deleted is reported as awaiting removal, not as a name to
+// change, and left untouched.
+func TestEnsureInferenceReplicaWaitsForADeletingReplica(t *testing.T) {
+	isvc := baselineISVC("svc", "team-a")
+	deletedAt := metav1.Now()
+	deleting := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "svc-engine",
+			Namespace:         "team-a",
+			UID:               "replica-uid",
+			DeletionTimestamp: &deletedAt,
+			// The fake client stores a deleting object only while a finalizer holds it.
+			Finalizers: []string{"ome.io/ir-teardown"},
+		},
+		Spec: v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	p := minimalParams(t, isvc, fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(deleting).Build())
+	before := &v1beta1.InferenceReplica{}
+	if gerr := p.Client.Get(context.Background(), client.ObjectKeyFromObject(deleting), before); gerr != nil {
+		t.Fatalf("get: %v", gerr)
+	}
+
+	_, err := EnsureInferenceReplica(context.Background(), p)
+	if err == nil || !strings.Contains(err.Error(), "is being deleted") || strings.Contains(err.Error(), "rename") ||
+		strings.Contains(err.Error(), "previous InferenceService") {
+		t.Fatalf("expected an awaiting-deletion error, got %v", err)
+	}
+	fresh := &v1beta1.InferenceReplica{}
+	if gerr := p.Client.Get(context.Background(), client.ObjectKeyFromObject(deleting), fresh); gerr != nil {
+		t.Fatalf("get: %v", gerr)
+	}
+	if fresh.ResourceVersion != before.ResourceVersion {
+		t.Fatalf("the deleting replica must be left untouched, got resourceVersion %s (was %s)", fresh.ResourceVersion, before.ResourceVersion)
+	}
 }

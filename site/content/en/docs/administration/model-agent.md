@@ -320,7 +320,7 @@ The Model Agent supports graceful cancellation of ongoing downloads:
 
 This prevents the issue where deleting a model resource would wait for the entire download to complete before deletion.
 
-**Note**: For OCI Object Storage downloads, cancellation is best-effort as the underlying bulk download doesn't support granular cancellation yet. However, Hugging Face downloads support immediate cancellation.
+**Note**: For OCI Object Storage downloads, standard downloads stop between files (the file currently being transferred runs to completion), while multipart downloads of large files are interrupted mid-transfer, cleaning up per-part temporary files and the `.temp` assembly file. In-flight OCI SDK requests retain their retry policy and complete before cancellation takes effect, so cancellation may be delayed while an active request finishes. Hugging Face downloads support immediate cancellation.
 
 ### Worker Pool Management
 

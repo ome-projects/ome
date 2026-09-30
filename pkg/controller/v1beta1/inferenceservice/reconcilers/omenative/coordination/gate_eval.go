@@ -3,6 +3,7 @@ package coordination
 import (
 	"context"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,30 +35,37 @@ import (
 // rolls mis-models the surge as a capacity loss and deadlocks symmetric
 // RatioBalanced groups.
 //
-// In-place strategies (InPlaceIfPossible / InPlaceOnly) skip CheckRatio
-// entirely. For in-place the drain is paired 1:1 with a same-pod return
-// (mark-not-ready -> patch -> mark-ready), so the net capacity change is
-// ~0; running the gate would project a -1 loss that misrepresents that
-// transient as permanent and indefinitely over-blocks the smaller
-// Component of a ratio pair (e.g. the decoder in a 4:2 engine:decoder
-// pair with 25% tolerance deadlocks because 4:1 = 4.0 sits above the
-// [1.5, 2.5] band). CheckUnavailability (called below for non-surge
-// strategies, which includes both in-place variants) already governs
-// concurrent disruption via the MaxUnavailable budget, so RatioBalanced
-// safety is preserved without the structural deadlock. The
+// strategy is the mechanism the start runs on, as the workload reports it
+// (ReconcileInput.UpdateGate): a gang whose in-place strategy resolves to
+// a recreate arrives as RecreatePod, so an in-place value here is a
+// single-pod start. In-place starts (InPlaceIfPossible / InPlaceOnly) skip
+// CheckRatio entirely. For in-place the drain is paired 1:1 with a
+// same-pod return (mark-not-ready -> patch -> mark-ready), so the net
+// capacity change is ~0; running the gate would project a -1 loss that
+// misrepresents that transient as permanent and indefinitely over-blocks
+// the smaller Component of a ratio pair (e.g. the decoder in a 4:2
+// engine:decoder pair with 25% tolerance deadlocks because 4:1 = 4.0 sits
+// above the [1.5, 2.5] band). CheckUnavailability (called below for
+// non-surge strategies, which includes both in-place variants) already
+// governs concurrent disruption via the MaxUnavailable budget, so
+// RatioBalanced safety is preserved without the structural deadlock. The
 // RatioGateBypassed event + metric fire so operators see why the gate
 // did not run.
 //
 // Reads authoritative InferenceReplica status via the provided context and
-// reader. recorder may be nil (the event is best-effort observability).
-// defaults carries the operator-configured group fill-ins (e.g. the ratio
-// tolerance default) so the gates see the same resolved groups as the
-// coordination reconciler.
+// reader. targetRevision is the ControllerRevision the Component's Instances
+// move to in this pass (the rollback revision while a rollback is pinned,
+// else the spec target); the pairing gate orients its cohort simulation by
+// that revision's protocol. recorder may be nil (the event is best-effort
+// observability). defaults carries the operator-configured group fill-ins
+// (e.g. the ratio tolerance default) so the gates see the same resolved
+// groups as the coordination reconciler.
 func EvaluateUpdateGate(
 	ctx context.Context,
 	reads client.Reader,
 	isvc *v1beta1.InferenceService,
 	component v1beta1.ComponentType,
+	targetRevision *appsv1.ControllerRevision,
 	recorder record.EventRecorder,
 	defaults GroupDefaults,
 	strategy workloadtypes.UpdateStrategyType,
@@ -67,6 +75,7 @@ func EvaluateUpdateGate(
 	// MembershipFor + nil-isvc / no-coord short-circuit) runs once instead of
 	// four times -- see the coordination.GateContext docs.
 	gateCtx := ResolveGateContextWithDefaults(ctx, reads, isvc, component, defaults)
+	gateCtx.TargetRevision = targetRevision
 
 	// The plan gate precedes every content gate: with no pinned run there is
 	// no validated plan to evaluate the other gates against.
@@ -121,4 +130,15 @@ func EvaluateUpdateGate(
 		return false, v1beta1.RolloutHoldGateSequential, reason
 	}
 	return true, "", ""
+}
+
+// GateWaitsOnPeerCounters reports whether a hold on gate is released by a
+// peer Component's serving counters moving. The pair floor and the ratio
+// band simulate the step against the peers' live serving counts, so a
+// replica they deny waits on exactly those transitions. Every other gate
+// waits on something else: a peer's revision or the plan pin (Sequential,
+// Plan), the Component's own budget (Budget), or its own retry state
+// (RetryBlock, Held).
+func GateWaitsOnPeerCounters(gate v1beta1.RolloutHoldGate) bool {
+	return gate == v1beta1.RolloutHoldGatePairing || gate == v1beta1.RolloutHoldGateRatio
 }

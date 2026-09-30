@@ -245,7 +245,7 @@ func validParent(parent *v1beta1.InferenceService, target Target) bool {
 func validReplicaIdentity(ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, target Target) bool {
 	if (ir.Kind != "" && ir.Kind != "InferenceReplica") || (ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1") ||
 		ir.Name != target.IRName || len(validation.IsDNS1123Subdomain(ir.Name)) != 0 || ir.Namespace != target.Namespace || !validIdentity(ir.ResourceVersion) || ir.Generation <= 0 ||
-		ir.Spec.ParentRef.Name != target.ParentName || string(ir.Spec.Component) != target.Component ||
+		(ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != target.ParentName) || string(ir.Spec.Component) != target.Component ||
 		len(parent.Name) <= 63 && ir.Labels[constants.InferenceServiceLabel] != target.ParentName ||
 		len(ir.Annotations) > 256 || len(ir.Labels) > 256 || len(ir.Finalizers) > 64 ||
 		len(ir.OwnerReferences) > 16 || len(ir.Status.Conditions) > 64 || len(ir.Status.Migrations) > 256 || len(ir.Status.Traffic) > 8 ||

@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/alfred/placement"
@@ -99,22 +100,37 @@ func normalizeSourcePlacementAnnotation(annotations map[string]string, authority
 	if !exists {
 		return nil
 	}
-	var policy v1beta1.PlacementExecutionPolicy
-	if json.Unmarshal([]byte(raw), &policy) != nil || protocol.Validate(&policy) != nil {
-		// A template override is not placement authority. Keep it byte-exact.
+	policy, err := protocol.Decode(raw)
+	if err != nil || protocol.Validate(policy) != nil {
+		// A template override or an unreadable value is not placement
+		// authority. Keep it byte-exact.
 		return nil
 	}
 	policy.Revision = authority.Revision
-	if policy != *authority {
+	if !equality.Semantic.DeepEqual(*policy, *authority) {
 		return nil
 	}
-	// Preserve all available JSON members, including unknown fields. Only the
-	// validated revision changes across retries; the rest remains fenced.
+	// Only the validated revision changes across retries. Clear it in place,
+	// inside the versioned envelope or on the bare policy, so every retry of
+	// the same request fences on the same value.
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
 		return fmt.Errorf("source placement fingerprint: %w", err)
 	}
-	fields["revision"] = json.RawMessage("0")
+	if inner, ok := fields["policy"]; ok {
+		var policyFields map[string]json.RawMessage
+		if err := json.Unmarshal(inner, &policyFields); err != nil {
+			return fmt.Errorf("source placement fingerprint: %w", err)
+		}
+		policyFields["revision"] = json.RawMessage("0")
+		normalizedPolicy, err := json.Marshal(policyFields)
+		if err != nil {
+			return fmt.Errorf("source placement fingerprint: %w", err)
+		}
+		fields["policy"] = normalizedPolicy
+	} else {
+		fields["revision"] = json.RawMessage("0")
+	}
 	normalized, err := json.Marshal(fields)
 	if err != nil {
 		return fmt.Errorf("source placement fingerprint: %w", err)

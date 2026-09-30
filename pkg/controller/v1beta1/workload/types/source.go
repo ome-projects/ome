@@ -16,6 +16,9 @@ import (
 type WorkloadDesiredSpec struct {
 	// Replicas is the desired Instance count.
 	Replicas int32
+	// AllowZeroReplicas marks an explicitly resolved scale-to-zero policy.
+	// Without it, zero retains the workload adapter's unset-count fallback.
+	AllowZeroReplicas bool
 
 	// MinReadySeconds is how long (in seconds) a newly Ready pod must stay
 	// Ready before it is Available. BuildPlan copies it onto

@@ -84,7 +84,7 @@ func heldWaitFixture() (*ome.InferenceService, *ome.InferenceReplica) {
 			},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}},
 		},
-		Spec:   ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
+		Spec:   ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
 		Status: ome.InferenceReplicaStatus{ObservedGeneration: 2},
 	}
 	return parent, ir
@@ -348,7 +348,7 @@ func TestHeldRevisionWaitAcceptsLongParentAndOpaqueActionIdentities(t *testing.T
 	parent.Name = strings.Repeat("a", 64)
 	parent.UID = "arn:aws:parent/abc+v1"
 	parent.ResourceVersion = "rv:parent/17+1"
-	ir.Spec.ParentRef.Name = parent.Name
+	ir.Spec.ParentRef = &ome.ParentReference{Name: parent.Name}
 	ir.OwnerReferences[0].Name = parent.Name
 	ir.OwnerReferences[0].UID = parent.UID
 	delete(ir.Labels, constants.InferenceServiceLabel)

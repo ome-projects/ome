@@ -1391,7 +1391,7 @@ func splitRiskInput(owner client.Object, idx int32) workload.ReconcileInput {
 
 func warnSplitRisk(t *testing.T, rec record.EventRecorder, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, pod *corev1.Pod) {
 	t.Helper()
-	if err := maybeWarnGangSplitRisk(context.Background(), workload.Deps{Recorder: rec}, input, plan, inst, runner, pod); err != nil {
+	if err := maybeWarnGangSplitRisk(context.Background(), workload.Deps{Recorder: rec}, input, plan, inst, runner, pod, false); err != nil {
 		t.Fatalf("warn gang split risk: %v", err)
 	}
 }
@@ -1497,5 +1497,239 @@ func TestMaybeWarnGangSplitRisk_RecommendationIsProviderNeutral(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected GangSplitRisk event")
+	}
+}
+
+// placer is a Provisioner that readies every slot not in withheld,
+// confining each to selector, and records every slot it is asked to
+// place.
+type placer struct {
+	withheld map[string]bool
+	selector map[string]string
+	err      error
+	placed   []string
+}
+
+func placerSlot(runner string, ordinal int32) string {
+	return fmt.Sprintf("%s/%d", runner, ordinal)
+}
+
+func (p *placer) Place(_ context.Context, _ workload.ReconcileInput, _ workload.ComponentPlan, _ workload.InstancePlan, runner workload.RunnerPlan, ordinal int32) (map[string]string, bool, error) {
+	slot := placerSlot(runner.Name, ordinal)
+	p.placed = append(p.placed, slot)
+	if p.err != nil {
+		return nil, false, p.err
+	}
+	if p.withheld[slot] {
+		return nil, false, nil
+	}
+	return p.selector, true, nil
+}
+
+func (p *placer) Pending(context.Context, workload.ReconcileInput, workload.ComponentPlan, workload.InstancePlan, workload.RunnerPlan, int32) (string, bool, error) {
+	return "", false, nil
+}
+
+const provisionedSelectorKey = "example.com/capacity"
+
+// TestCreate_ProvisionerWithholdsThePodUntilItsCapacityIsReady: the
+// Create pass commits the attempt but creates nothing while the
+// provisioner withholds the pod — no pod means nothing for the scheduler
+// to place onto capacity that is not there — and once the capacity is
+// ready the pod is created confined to it.
+func TestCreate_ProvisionerWithholdsThePodUntilItsCapacityIsReady(t *testing.T) {
+	input, plan, tcr, _, c, isvc := createGateFixture(t, time.Now())
+	p := &placer{
+		withheld: map[string]bool{placerSlot(workload.RunnerDefault, 0): true},
+		selector: map[string]string{provisionedSelectorKey: "unit-a"},
+	}
+	deps := legacyTestDeps(c)
+	deps.Provisioner = p
+
+	if _, err := Create(context.Background(), deps, *input, plan, tcr); err != nil {
+		t.Fatalf("withheld create: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Fatalf("a withheld pod must not be created: got %d", len(pods))
+	}
+	if s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]; s.Phase != v1beta1.OMENativeInstanceCreating {
+		t.Errorf("the attempt is committed while its pod waits: got %q", s.Phase)
+	}
+	if want := []string{placerSlot(workload.RunnerDefault, 0)}; !reflect.DeepEqual(p.placed, want) {
+		t.Errorf("placed = %v, want %v", p.placed, want)
+	}
+
+	p.withheld = nil
+	next := legacyTestInput(isvc, c, workload.ComponentEngine)
+	next.Clock = input.Clock
+	if _, err := Create(context.Background(), deps, next, plan, tcr); err != nil {
+		t.Fatalf("ready create: %v", err)
+	}
+	pods := createGatePods(t, c, isvc.Namespace)
+	if len(pods) != 1 {
+		t.Fatalf("a ready pod must be created: got %d", len(pods))
+	}
+	if got := pods[0].Spec.NodeSelector[provisionedSelectorKey]; got != "unit-a" {
+		t.Errorf("nodeSelector[%s] = %q, want the provisioned capacity", provisionedSelectorKey, got)
+	}
+}
+
+// TestCreate_AConfinedGangIsNotWarnedAboutSplitting: a gang the
+// provisioner confines shares one unit of capacity, so its workers are
+// co-located without any podAffinity. The split-risk warning is for a
+// gang nothing confines.
+func TestCreate_AConfinedGangIsNotWarnedAboutSplitting(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selector map[string]string
+		wantWarn int
+	}{
+		{"confined", map[string]string{provisionedSelectorKey: "unit-a"}, 0},
+		{"unconfined", nil, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, _, tcr, _, c, isvc := createGateFixture(t, time.Now())
+			rec := record.NewFakeRecorder(8)
+			deps := legacyTestDeps(c)
+			deps.Recorder = rec
+			deps.Provisioner = &placer{selector: tc.selector}
+
+			plan := legacyMultiPodComponentPlan(workload.UpdateStrategyRecreatePod)
+			if _, err := Create(context.Background(), deps, *input, plan, tcr); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			pods := createGatePods(t, c, isvc.Namespace)
+			if len(pods) != 2 {
+				t.Fatalf("the gang must be created: got %d pod(s)", len(pods))
+			}
+			for _, pod := range pods {
+				if got, want := pod.Spec.NodeSelector[provisionedSelectorKey], tc.selector[provisionedSelectorKey]; got != want {
+					t.Errorf("pod %s nodeSelector[%s] = %q, want %q", pod.Name, provisionedSelectorKey, got, want)
+				}
+			}
+			if got := countGangSplitWarnings(rec); got != tc.wantWarn {
+				t.Errorf("GangSplitRisk warnings = %d, want %d", got, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// TestCreate_ProvisionerErrorFailsThePass: a provisioner that cannot
+// answer is not a withheld pod; the pass reports the error, names the
+// pod, and creates nothing.
+func TestCreate_ProvisionerErrorFailsThePass(t *testing.T) {
+	input, plan, tcr, _, c, isvc := createGateFixture(t, time.Now())
+	boom := errors.New("capacity read failed")
+	deps := legacyTestDeps(c)
+	deps.Provisioner = &placer{err: boom}
+
+	_, err := Create(context.Background(), deps, *input, plan, tcr)
+	if !errors.Is(err, boom) {
+		t.Fatalf("Create err = %v, want the provisioner's error", err)
+	}
+	if !strings.Contains(err.Error(), query.PodName(isvc.Name, workload.ComponentEngine, 0, workload.RunnerDefault, 0)) {
+		t.Errorf("error must name the pod: %v", err)
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Fatalf("no pod may be created when placement fails: got %d", len(pods))
+	}
+}
+
+// TestProvisionPods_AnInstanceStartsTogether: every member is asked —
+// so provisioning starts for all of them on the same pass — but one
+// withheld member withholds the whole batch.
+func TestProvisionPods_AnInstanceStartsTogether(t *testing.T) {
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategyRecreatePod)
+	inst := plan.Instances[0]
+	targets := []podTarget{
+		{Name: "leader-0", Runner: inst.Runners[0], Ordinal: 0},
+		{Name: "worker-0", Runner: inst.Runners[1], Ordinal: 0},
+	}
+
+	t.Run("one withheld member withholds all", func(t *testing.T) {
+		p := &placer{withheld: map[string]bool{placerSlot(workload.RunnerLeader, 0): true}}
+		_, ready, err := provisionPods(context.Background(), workload.Deps{Provisioner: p}, workload.ReconcileInput{}, plan, inst, targets)
+		if err != nil || ready {
+			t.Fatalf("provisionPods = ready %v, err %v; want withheld", ready, err)
+		}
+		if len(p.placed) != len(targets) {
+			t.Errorf("placed = %v, want every member asked", p.placed)
+		}
+	})
+
+	t.Run("ready members carry their selectors in target order", func(t *testing.T) {
+		p := &placer{selector: map[string]string{provisionedSelectorKey: "unit-a"}}
+		selectors, ready, err := provisionPods(context.Background(), workload.Deps{Provisioner: p}, workload.ReconcileInput{}, plan, inst, targets)
+		if err != nil || !ready {
+			t.Fatalf("provisionPods = ready %v, err %v; want ready", ready, err)
+		}
+		if len(selectors) != len(targets) || selectors[1][provisionedSelectorKey] != "unit-a" {
+			t.Errorf("selectors = %v, want one per target", selectors)
+		}
+	})
+
+	t.Run("no provisioner places every member unconfined", func(t *testing.T) {
+		selectors, ready, err := provisionPods(context.Background(), workload.Deps{}, workload.ReconcileInput{}, plan, inst, targets)
+		if err != nil || !ready || len(selectors) != len(targets) {
+			t.Fatalf("provisionPods = %v, ready %v, err %v; want every target ready and unconfined", selectors, ready, err)
+		}
+		for i, s := range selectors {
+			if len(s) != 0 {
+				t.Errorf("selectors[%d] = %v, want none", i, s)
+			}
+		}
+	})
+}
+
+// TestConfine: the provisioned selector is merged into the pod, never
+// aliased, and a template that selects the same key with another value
+// is refused rather than overridden.
+func TestConfine(t *testing.T) {
+	selector := map[string]string{provisionedSelectorKey: "unit-a"}
+
+	pod := &corev1.Pod{}
+	if err := confine(pod, selector); err != nil {
+		t.Fatalf("confine: %v", err)
+	}
+	if pod.Spec.NodeSelector[provisionedSelectorKey] != "unit-a" {
+		t.Errorf("nodeSelector = %v, want the provisioned key", pod.Spec.NodeSelector)
+	}
+	pod.Spec.NodeSelector["other"] = "x"
+	if _, aliased := selector["other"]; aliased {
+		t.Error("the pod must not share the provisioner's map")
+	}
+
+	agreeing := &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: map[string]string{provisionedSelectorKey: "unit-a", "zone": "z1"}}}
+	if err := confine(agreeing, selector); err != nil {
+		t.Errorf("an agreeing template: %v", err)
+	}
+	if agreeing.Spec.NodeSelector["zone"] != "z1" {
+		t.Errorf("the template's own keys must survive: %v", agreeing.Spec.NodeSelector)
+	}
+
+	conflicting := &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: map[string]string{provisionedSelectorKey: "unit-b"}}}
+	if err := confine(conflicting, selector); err == nil {
+		t.Error("a template selecting other capacity must be refused")
+	}
+
+	if err := confine(&corev1.Pod{}, nil); err != nil {
+		t.Errorf("no selector is a no-op: %v", err)
+	}
+}
+
+// TestCreate_ConflictingSelectorCreatesNothing: a template that already
+// pins the provisioner's key to other capacity would never schedule, so
+// the create fails instead of landing an unplaceable pod.
+func TestCreate_ConflictingSelectorCreatesNothing(t *testing.T) {
+	input, plan, tcr, _, c, isvc := createGateFixture(t, time.Now())
+	input.DesiredSpec.PodSpec.NodeSelector = map[string]string{provisionedSelectorKey: "unit-b"}
+	deps := legacyTestDeps(c)
+	deps.Provisioner = &placer{selector: map[string]string{provisionedSelectorKey: "unit-a"}}
+
+	if _, err := Create(context.Background(), deps, *input, plan, tcr); err == nil {
+		t.Fatal("Create must refuse a template that selects other capacity")
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Fatalf("no pod may be created: got %d", len(pods))
 	}
 }

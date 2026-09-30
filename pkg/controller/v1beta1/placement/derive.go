@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -68,6 +67,10 @@ func DeriveISVC(src *v1beta1.InferenceService, controlPlaneID, localQueue string
 	// source's GitOps bookkeeping.
 	for _, k := range controlPlaneOnlyAnnotations {
 		delete(d.Annotations, k)
+	}
+	delete(d.Annotations, constants.PlacementPolicy)
+	if src.Spec.Placement.UsesClusterAffinity() {
+		d.Annotations[constants.PlacementPolicy] = string(v1beta1.PlacementPolicyClusterAffinity)
 	}
 	for k := range d.Annotations {
 		for _, p := range controlPlaneOnlyAnnotationPrefixes {
@@ -160,34 +163,6 @@ func inflateRolloutGroups(d *v1beta1.InferenceService, policies map[string]resol
 // arm (which then outranks a coexisting PolicyRef).
 func hasInlineProgression(g *v1beta1.RolloutGroup) bool {
 	return g.Canary != nil || g.BlueGreen != nil || g.RollingUpdate != nil
-}
-
-// setDerivedReplicas pins Split's apportioned replica band on a derived ISVC's
-// scalable components: MinReplicas becomes this home's share of the floor (Kueue
-// admits as many as fit), and MaxReplicas becomes the per-cluster ceiling so the
-// home can autoscale UP locally under load but no further. maxPer > 0 is the hard
-// ceiling from spec.placement.split.maxReplicasPerCluster; maxPer <= 0 means no
-// cap was declared, so the component's own MaxReplicas stands (only raised to
-// keep Max >= Min). The apportioned share is always <= maxPer (splitApportion
-// caps it), so Min <= Max holds. Applied to Engine and, when present, Decoder (a
-// PD pair scales 1:1).
-func setDerivedReplicas(d *v1beta1.InferenceService, replicas, maxPer int32) {
-	n := int(replicas)
-	apply := func(c *v1beta1.ComponentExtensionSpec) {
-		c.MinReplicas = ptr.To(n)
-		switch {
-		case maxPer > 0:
-			c.MaxReplicas = int(maxPer)
-		case c.MaxReplicas < n:
-			c.MaxReplicas = n
-		}
-	}
-	if d.Spec.Engine != nil {
-		apply(&d.Spec.Engine.ComponentExtensionSpec)
-	}
-	if d.Spec.Decoder != nil {
-		apply(&d.Spec.Decoder.ComponentExtensionSpec)
-	}
 }
 
 // stampQueue adds the Kueue queue-name label to a component's pod metadata.

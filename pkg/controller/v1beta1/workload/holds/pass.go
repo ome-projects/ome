@@ -3,8 +3,10 @@ package holds
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
@@ -69,6 +71,22 @@ func (in PassInput) serving(ctx context.Context, row Row) (bool, error) {
 		return false, err
 	}
 	return query.PodSetFullyServing(attributed, row.Desired), nil
+}
+
+// heldSince is the moment stamped on a hold's evidence when the wait
+// itself carries no time of its own: the one already recorded when the
+// row holds the token, otherwise now.
+//
+// Nothing measures a window from it — a hold stamped this way resolves
+// itself and never escalates. It is re-read so that re-observing an
+// unchanged hold produces an identical record and the status no-op guard
+// keeps the pass write-free.
+func heldSince(s types.InstanceStatus, token string, now time.Time) metav1.Time {
+	if s.Operation != nil && s.Operation.Waiting == token &&
+		s.LastFailure != nil && s.LastFailure.Reason == token && !s.LastFailure.Time.IsZero() {
+		return s.LastFailure.Time
+	}
+	return metav1.NewTime(now)
 }
 
 // Result reports which authority owns each row's token after the pass.

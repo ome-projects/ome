@@ -741,21 +741,26 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 	if err != nil {
 		return types.ReconcileInput{}, err
 	}
+	abandonedReplacementGrace, err := ParseDuration("config.abandonedReplacementGrace", d.cfg.AbandonedReplacementGrace)
+	if err != nil {
+		return types.ReconcileInput{}, err
+	}
 
 	input := types.ReconcileInput{
-		OwnerObject:              d.owner,
-		OwnerGVK:                 v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"),
-		EventTarget:              d.owner,
-		Key:                      d.key(),
-		DesiredSpec:              desired,
-		ObservedState:            observed,
-		ScaleDownRequeueInterval: scaleDown,
-		StuckPodGrace:            stuckPodGrace,
-		UnschedulableGrace:       unschedulableGrace,
-		Requeue:                  types.RequeueIntervals{Operation: requeueOperation, Gate: requeueGate},
-		Gangs:                    types.NewGangObservations(),
-		Teardown:                 d.teardown,
-		Clock:                    d.clock,
+		OwnerObject:               d.owner,
+		OwnerGVK:                  v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"),
+		EventTarget:               d.owner,
+		Key:                       d.key(),
+		DesiredSpec:               desired,
+		ObservedState:             observed,
+		ScaleDownRequeueInterval:  scaleDown,
+		StuckPodGrace:             stuckPodGrace,
+		UnschedulableGrace:        unschedulableGrace,
+		AbandonedReplacementGrace: abandonedReplacementGrace,
+		Requeue:                   types.RequeueIntervals{Operation: requeueOperation, Gate: requeueGate},
+		Gangs:                     types.NewGangObservations(),
+		Teardown:                  d.teardown,
+		Clock:                     d.clock,
 		Disposition: types.DispositionDeps{
 			PodSpec:                desired.PodSpec,
 			AutoMigrateMaxAttempts: d.cfg.AutoMigrateBudget,

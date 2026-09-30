@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/pdb"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 func TestReconcileOMENativePDBUsesConfiguredFallback(t *testing.T) {
@@ -392,7 +393,7 @@ func omeNativePDBTestScheme(t *testing.T) *runtime.Scheme {
 }
 
 func omeNativePDBTestBase(cl client.Client, scheme *runtime.Scheme, config *controllerconfig.InferenceServicesConfig) *BaseComponentFields {
-	return &BaseComponentFields{Client: cl, Scheme: scheme, InferenceServiceConfig: config}
+	return &BaseComponentFields{Piece: render.Piece{InferenceServiceConfig: config}, Client: cl, Scheme: scheme}
 }
 
 func omeNativePDBTestObjects(component v1beta1.ComponentType) (*v1beta1.InferenceService, metav1.ObjectMeta) {
@@ -416,7 +417,7 @@ func omeNativePDBTestIR(isvc *v1beta1.InferenceService, component v1beta1.Compon
 			UID:       types.UID("pdb-test-ir-uid"),
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: isvc.Name},
+			ParentRef: &v1beta1.ParentReference{Name: isvc.Name},
 			Component: component,
 			Replicas:  &replicas,
 			Runners:   runners,

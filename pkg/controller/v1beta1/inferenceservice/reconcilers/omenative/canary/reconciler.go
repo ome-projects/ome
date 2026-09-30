@@ -5,21 +5,13 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
-
-// reconcileRequeue is how soon the controller re-checks an in-progress canary
-// (capacity coming up, an Auto pause timer, or a drain window).
-const reconcileRequeue = 10 * time.Second
-
-// failedRequeue is the slow heartbeat once a canary step is escalated to Failed —
-// the rollout is parked (stable keeps serving) until the operator acts, so there
-// is no need to tight-poll.
-const failedRequeue = 5 * time.Minute
 
 // ReconcileInputs is the subset of state the canary executor needs. It mirrors
 // coordination.ReconcileInputs. DesiredReplicas and ReadyCanaryInstances are
@@ -31,7 +23,10 @@ type ReconcileInputs struct {
 	// not watch (the analysis auth Secret): reading those through the cached
 	// Client would spin up a cluster-wide informer for the type.
 	Reader client.Reader
-	ISVC   *v1beta1.InferenceService
+	// Recorder publishes the operator-verb outcomes an operator needs to tell
+	// an applied verb from an inapplicable one. nil (tests) silences them.
+	Recorder record.EventRecorder
+	ISVC     *v1beta1.InferenceService
 	// Group is the canary group being dispatched — the unit's own ladder. Nil
 	// resolves it from Component.
 	Group              *v1beta1.RolloutGroup
@@ -52,12 +47,28 @@ type ReconcileInputs struct {
 	ReadyCanaryInstances *int32
 	DesiredReplicas      int32
 	PerRevisionPods      map[string]int32
+	// GroupTotalPerRevisionPods counts every pod of every configured member
+	// of the canary group per revision hash, ready or not, keyed by
+	// Component (primary included). A revert is complete when the rejected
+	// pods are gone, not merely unready, so the revert-complete check reads
+	// it. nil (single-Component callers) checks the primary's ready pods alone.
+	GroupTotalPerRevisionPods map[v1beta1.ComponentType]map[string]int32
+	// GroupStableRevisionHashes is each member's persisted stable revision,
+	// keyed by Component; the primary's is the identity the executor resolves
+	// itself. A member with none recorded is not waited on.
+	GroupStableRevisionHashes map[v1beta1.ComponentType]string
 	// SecondaryCapacityReady is true when every NON-primary component's canary
 	// Instances have reached that component's step newCount. The primary uses its
 	// exact complete-PodReady target Instance count. Single-component canaries
 	// pass true.
 	SecondaryCapacityReady bool
-	Now                    time.Time
+	// Secondaries carries each NON-primary member's revision pair and pairing
+	// protocols, keyed by Component. Every member publishes the ladder's
+	// weights on its own revisions wherever the primary's traffic is written;
+	// a member absent here has its traffic left alone. nil (single-Component
+	// callers) writes the primary's alone.
+	Secondaries map[v1beta1.ComponentType]MemberRevisions
+	Now         time.Time
 	// Sampler reads analysis metric results without blocking the reconcile: a miss
 	// kicks a bounded background query and an event re-reconciles when it lands.
 	// The controller wires *Sampler; tests inject a fake. Only used by analysis steps.
@@ -87,6 +98,24 @@ type ReconcileInputs struct {
 	// sets one. Zero means no configured default: the gate never escalates to
 	// Failed on capacity wait alone.
 	DefaultReadyTimeout time.Duration
+	// Requeue is the operator-configured cadence at which an in-progress step
+	// is re-checked (capacity coming up, a timed pause, a drain window);
+	// ParkedRequeue is the heartbeat of a Failed park. Zero means
+	// unconfigured: the executor asks for the controller's rate-limited
+	// requeue instead of a fixed cadence.
+	Requeue       time.Duration
+	ParkedRequeue time.Duration
+}
+
+// MemberRevisions is one secondary's revision pair: the target its capacity
+// gate verified and its persisted stable revision, with the pairing protocol
+// each was minted under. A member that was not bumped names the same revision
+// twice; a member with no stable revision leaves it empty.
+type MemberRevisions struct {
+	CanaryRevisionHash    string
+	StableRevisionHash    string
+	CanaryPairingProtocol string
+	StablePairingProtocol string
 }
 
 // The ready Pod count bounds the exact ready Instance count and remains the
@@ -176,6 +205,25 @@ type Result struct {
 	RolledBack   bool
 	Partition    int32
 	RequeueAfter time.Duration
+	// Requeue asks for the controller's rate-limited requeue when no cadence
+	// is configured for the wait the executor is in.
+	Requeue bool
+	// Consume lists the operator annotations this pass applied. The controller
+	// removes them after the status write that carries their effect has
+	// landed; each applied verb leaves a record in status (PromotedThrough)
+	// that keeps the still-visible annotation inert until then.
+	Consume []string
+}
+
+// wake sets the result's requeue from a configured cadence, falling back to
+// the controller's rate-limited requeue when none is configured.
+func (r *Result) wake(d time.Duration) *Result {
+	if d > 0 {
+		r.RequeueAfter = d
+	} else {
+		r.Requeue = true
+	}
+	return r
 }
 
 // Reconcile advances the canary toward the declared plan, mutating isvc.Status
@@ -183,6 +231,22 @@ type Result struct {
 // performs capacity → traffic → pause, advancing on promotion; the final step
 // (TrafficWeight 100) drains and scales the stable revision down.
 func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
+	// Operator annotations are applied in status first and removed by the
+	// controller after the flush; the pass only records which ones it took,
+	// and deletes them in-memory so nothing later in the pass re-reads them.
+	var consumed []string
+	take := func(key string) {
+		delete(in.ISVC.Annotations, key)
+		consumed = append(consumed, key)
+	}
+	res, err := reconcile(ctx, in, take)
+	if res != nil {
+		res.Consume = consumed
+	}
+	return res, err
+}
+
+func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Result, error) {
 	// The legacy single-run field is a projection of per-unit state, so it is
 	// re-derived on every exit path rather than written alongside each mutation
 	// — a copy published once would freeze while the run advanced past it.
@@ -211,7 +275,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// step with its clocks intact. Both pause depths hold the canary equally;
 	// the depth only changes whether Instance repair keeps running underneath.
 	if paused, _ := constants.RolloutPauseState(in.ISVC.Annotations); paused {
-		return pausedResult(cs, plan, in.DesiredReplicas), nil
+		return pausedResult(in, cs, plan), nil
 	}
 	targetChanged := cs != nil && in.RunActive && in.TargetID != "" && cs.TargetID != "" && cs.TargetID != in.TargetID
 	if cs != nil && cs.TargetID == "" && in.TargetID != "" {
@@ -227,138 +291,24 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		cs.StableRevisionHash = in.StableRevisionHash
 	}
 
-	// Bind an active canary to the IR's authoritative target before handling
-	// operator commands. A changed target starts the staged plan with fresh
-	// per-target state while preserving the original stable identity.
-	phase := in.ISVC.Status.Components[in.Component].RolloutPhase
-	if cs != nil && int(cs.CurrentStep) < len(plan.Steps) &&
-		cs.RolledBackRevisionHash == "" && phase != v1beta1.RolloutPhaseFailed {
-		if cs.StableRevisionHash == "" && in.StableRevisionHash != "" {
-			cs.StableRevisionHash = in.StableRevisionHash
-		}
-		// Retargets re-arm only under a pinned run: the run layer closes and
-		// reopens the run on a target change in the same pass, so RunActive
-		// here means the fresh run is already pinned. Without one, hold state
-		// as-is rather than start a fresh canary on an unpinned plan.
-		if in.RunActive && in.CanaryRevisionHash != "" && (targetChanged || in.CanaryRevisionHash != cs.CanaryRevisionHash) {
-			resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
-		}
+	// Resume (ome.io/rollout-resume): the operator cleared a terminal hold.
+	// It runs ahead of the holds themselves — those re-arm only toward a NEW
+	// target, which is exactly the escape this verb exists to provide without
+	// one — and returns rather than falling through, so the step machine only
+	// sees the re-armed status once the observation it reads has caught up.
+	if resumed, err := handleResume(ctx, in, cs, take); err != nil {
+		return nil, err
+	} else if resumed {
+		return (&Result{Active: true}).wake(in.Requeue), nil
 	}
 
-	// Rollback (ome.io/rollout-rollback): abandon the canary and return the
-	// component to the stable revision, then HOLD there rejecting the rolled-back
-	// revision. The revert itself is driven by the controller — seeing
-	// cs.RolledBackRevisionHash it points the IR at the stable ControllerRevision
-	// so every Instance rolls back. Here we record the rejected revision, shift
-	// traffic to stable, and re-arm only when a different target appears (clearing
-	// the annotation alone never retries the rejected revision).
-	if cs != nil {
-		if cs.RolledBackRevisionHash != "" {
-			// Re-arm to a fresh canary ONLY when a genuinely NEW target appears.
-			// During the revert the IR targets the stable revision, so the
-			// observed target (in.CanaryRevisionHash) reports stable — that is the
-			// revision we're holding on, not a new target. Exclude both the stable
-			// revision and the rejected revision itself.
-			stableHash := stableHashFor(cs, in.PerRevisionPods, cs.RolledBackRevisionHash)
-			if in.RunActive && in.CanaryRevisionHash != "" &&
-				(targetChanged || (in.CanaryRevisionHash != cs.RolledBackRevisionHash && in.CanaryRevisionHash != stableHash)) {
-				if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutRollbackAnnotation); err != nil {
-					return nil, err
-				}
-				resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
-				// fall through: start a fresh canary toward the new target.
-			} else {
-				return reconcileRollback(in, cs), nil
-			}
-		} else if isRollbackRequested(in.ISVC) && int(cs.CurrentStep) < len(plan.Steps) {
-			cs.RolledBackRevisionHash = cs.CanaryRevisionHash
-			recordRollback(in.ISVC, in.Component, "manual")
-			return reconcileRollback(in, cs), nil
-		}
-	}
-
-	// Failed is a parked terminal: a step escalated to Failed (capacity gate timed
-	// out before the canary pods were Ready, or analysis stalled inconclusive past
-	// the ready-timeout) is HELD there — stable keeps serving until the operator
-	// decides. Like the rolled-back hold above, re-arm only when a genuinely NEW
-	// target appears; otherwise return without re-stamping StepEnteredTime or
-	// re-evaluating. Re-stamping would reset the stall/ready-timeout clock anchored
-	// on it, so the next pass would read "not stalled," flip back to Paused/Pending,
-	// then re-fail a timeout later — oscillating instead of staying Failed. The
-	// failed revision is cs.CanaryRevisionHash; exclude it and the stable revision
-	// (the observed target reports stable while no canary pods remain).
-	if cs != nil && in.ISVC.Status.Components[in.Component].RolloutPhase == v1beta1.RolloutPhaseFailed {
-		stableHash := stableHashFor(cs, in.PerRevisionPods, cs.CanaryRevisionHash)
-		if in.RunActive && in.CanaryRevisionHash != "" &&
-			(targetChanged || (in.CanaryRevisionHash != cs.CanaryRevisionHash && in.CanaryRevisionHash != stableHash)) {
-			resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
-			// fall through: start a fresh canary toward the new target.
-		} else {
-			return &Result{Active: true, RequeueAfter: failedRequeue}, nil
-		}
-	}
-
-	// Done sentinel: a finished canary KEEPS its status with CurrentStep ==
-	// len(steps) rather than clearing it. EffectivePartition maps that to the
-	// final 100% step (partition 0, all instances on the canary revision); a nil
-	// status would instead re-default to step 0's partition and hold instances
-	// back on the old revision after completion. No-op unless a new target
-	// appears, in which case start a fresh canary.
-	if cs != nil && int(cs.CurrentStep) >= len(plan.Steps) {
-		if in.RunActive && in.CanaryRevisionHash != "" && (targetChanged || in.CanaryRevisionHash != cs.CanaryRevisionHash) {
-			resetCanaryStatus(cs, in.TargetID, in.CanaryRevisionHash, in.Now)
-		} else {
-			// This return skips the main-path syncPromotedThrough, so converge any
-			// promote residue here: a canary can complete while the durable record
-			// is still waiting on observed annotation absence, and a done canary
-			// evaluates no gates, so the record has nothing left to keep inert.
-			syncPromotedThrough(ctx, in, cs)
-			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
-			return &Result{Active: false}, nil
-		}
-	}
-
-	// Initialize the state machine on first sight of a NEW canary. Don't start
-	// one when the component is already fully converged on the target revision —
-	// or when the target isn't known yet. Without a run identity, adding a canary
-	// to an already-rolled-out ISVC remains a no-op rather than a phantom rollout.
-	//
-	// The unitRetargeted clause is what keeps an IDLE unit out. A run is opened
-	// for the whole ISVC, so every group in the pinned plan is handed a
-	// TargetID even when only one unit retargeted — which disables the
-	// convergence check above for the units that did not. Arming one of those
-	// walks a full ladder, burns the unit's analysis budget on a no-op, and can
-	// reach a rollback (and its sticky reject) for a rollout that never
-	// happened. The unit that was not retargeted must sit the run out
-	// entirely.
-	//
-	// An empty StableRevisionHash means there is nothing to shift traffic
-	// from: the unit's first rollout is not a canary, so it rolls out and
-	// reads Stable instead of parking on its first step's gate.
-	if cs == nil {
-		if in.CanaryRevisionHash == "" || in.StableRevisionHash == "" ||
-			(in.TargetID == "" && readyCanaryCapacity(in) >= in.DesiredReplicas) ||
-			!unitRetargeted(in) {
-			if in.CanaryRevisionHash != "" && in.DesiredReplicas > 0 {
-				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
-			}
-			return &Result{Active: false}, nil
-		}
-		// A diverged target with no pinned run: hold as-is. The run layer
-		// opens (or parks) the run; starting the step machine here would
-		// execute an unpinned plan, and the update gates are already holding
-		// the forward roll fail-closed.
-		if !in.RunActive {
-			return &Result{Active: false}, nil
-		}
-		rollout.SetCanaryStatusFor(&in.ISVC.Status, in.Component, &v1beta1.CanaryStatus{
-			TargetID:           in.TargetID,
-			CanaryRevisionHash: in.CanaryRevisionHash,
-			StableRevisionHash: in.StableRevisionHash,
-			CurrentStep:        0,
-			StepEnteredTime:    &metav1.Time{Time: in.Now},
-		})
-		cs = rollout.CanaryStatusFor(&in.ISVC.Status, in.Component)
+	// Verbs and holds, in the order the canary grid gives them precedence.
+	// A pass that ends inside one of them returns here; otherwise cs is the
+	// (possibly freshly armed) status the step machine runs against.
+	var res *Result
+	var err error
+	if cs, res, err = applyHolds(ctx, in, cs, plan, targetChanged, take); err != nil || res != nil {
+		return res, err
 	}
 
 	// Backfill a missing stable identity from the observed stable revision (a
@@ -369,10 +319,10 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		cs.StableRevisionHash = in.StableRevisionHash
 	}
 
-	// Finish any promotion whose advance already persisted: remove the applied
-	// promote annotation (best-effort) and, once it is gone, clear the durable
-	// record so manual promotion re-arms for later steps.
-	syncPromotedThrough(ctx, in, cs)
+	// Finish any promotion whose advance already persisted: hand the applied
+	// promote annotation back for removal and, once it is gone, clear the
+	// durable record so manual promotion re-arms for later steps.
+	syncPromotedThrough(in, cs, take)
 	step := plan.Steps[cs.CurrentStep]
 
 	newCount := resolveStepNewCount(step, in.DesiredReplicas)
@@ -381,26 +331,32 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// Capacity gate: don't shift traffic until the canary pods are Ready — the
 	// primary's own newCount AND every secondary component's canary capacity (PD,
 	// so a Ready router can't advance the step while the engine/decoder canary
-	// pods behind it are still coming up). If the gate stays unsatisfied past the
-	// ready-timeout, escalate to Failed instead of polling Pending forever — the
-	// stable revision keeps serving since no traffic has shifted.
+	// pods behind it are still coming up). The wait is timed from when it
+	// began, never from the step's soak anchor, so a long bake cannot spend the
+	// budget and a dip cannot restart the soak; past the ready timeout the
+	// canary parks Failed with the stable revision still serving.
 	readyCanary := readyCanaryCapacity(in)
-	if readyCanary < newCount || !in.SecondaryCapacityReady {
-		// Anchor the ready-timeout to the start of THIS capacity wait: re-stamp
-		// StepEnteredTime on entering Pending. Anchoring on the untouched step
-		// entry would let a long bake (analysis / pause) eat the whole budget and
-		// park a healthy canary Failed the moment capacity dips mid-step. Mirrors
-		// the serving-entry re-stamps below.
-		if in.ISVC.Status.Components[in.Component].RolloutPhase != v1beta1.RolloutPhasePending {
-			cs.StepEnteredTime = &metav1.Time{Time: in.Now}
+	state := rollout.StateOf(cs, in.ISVC.Status.Components[in.Component].RolloutPhase, len(plan.Steps))
+	if (readyCanary < newCount || !in.SecondaryCapacityReady) && state != rollout.CanaryStateDraining {
+		// A drain is exempt: the final traffic write has landed, and capacity
+		// lost after cutover is the workload engine's repair, not a canary
+		// state.
+		if cs.CapacityWaitSince == nil {
+			cs.CapacityWaitSince = &metav1.Time{Time: in.Now}
 		}
 		if capacityGateExpired(cs, resolveReadyTimeout(in, plan), in.Now) {
-			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseFailed)
-			return &Result{Active: true, Partition: partition, RequeueAfter: failedRequeue}, nil
+			parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureCapacityTimeout, in.Now)
+			return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
+		}
+		if state == rollout.CanaryStateServing || state == rollout.CanaryStatePreHold {
+			// A split that was serving keeps its phase and its programmed
+			// weight through a dip; the gate only keeps the step from moving.
+			return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 		}
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePending)
-		return &Result{Active: true, Partition: partition, RequeueAfter: reconcileRequeue}, nil
+		return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 	}
+	cs.CapacityWaitSince = nil
 
 	// Pre-step hold (repin clamp): the pinned plan was replaced mid-run and
 	// the clamped step would raise exposure, so the traffic raise waits for
@@ -409,29 +365,32 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// supported warm-up pattern; exposure is the traffic write below.
 	if cs.PreStepHold {
 		if in.ISVC.Annotations[constants.RolloutPromoteAnnotation] == cs.CanaryRevisionHash {
-			if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutPromoteAnnotation); err != nil {
-				return nil, err
-			}
+			// The release is recorded like any applied promote: the record
+			// keeps the annotation inert until the controller removes it after
+			// the flush, so a lost flush cannot leave the hold released and
+			// the verb gone.
 			cs.PreStepHold = false
+			cs.PromotedThrough = cs.CanaryRevisionHash
+			take(constants.RolloutPromoteAnnotation)
 		} else {
 			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePaused)
-			return &Result{Active: true, Partition: partition, RequeueAfter: reconcileRequeue}, nil
+			return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 		}
 	}
 
-	// Capacity satisfied: program this step's external traffic weight.
-	applyTraffic(in.ISVC, in.Component, in.CanaryRevisionHash, in.StableRevisionHash,
-		in.CanaryPairingProtocol, in.StablePairingProtocol, step.Traffic)
+	// Capacity satisfied: program this step's external traffic weight on
+	// every member of the unit.
+	weightBefore := cs.ObservedTrafficWeight
+	applyGroupTraffic(in, step.Traffic)
 
 	// Final step (TrafficWeight 100): drain the stable revision, then complete.
 	if int(cs.CurrentStep) == len(plan.Steps)-1 {
-		// Anchor the drain window to the moment 100% traffic actually shifts
-		// (capacity is met here — we are past the gate, applyTraffic just ran),
-		// not to step entry. On slow capacity the final step is entered well
-		// before traffic moves, so measuring the drain from step entry could
-		// consume the whole window before cutover. Re-stamp once, on entering
-		// Promoting.
-		if in.ISVC.Status.Components[in.Component].RolloutPhase != v1beta1.RolloutPhasePromoting {
+		// Anchor the drain window and the final gate to the moment 100%
+		// traffic actually shifts, not to step entry: on slow capacity the
+		// final step is entered well before traffic moves, so measuring from
+		// step entry could consume the whole window before cutover. The pass
+		// whose traffic write moved the weight to 100 is that moment.
+		if weightBefore != 100 {
 			cs.StepEnteredTime = &metav1.Time{Time: in.Now}
 		}
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePromoting)
@@ -447,21 +406,26 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 				cs.RolledBackRevisionHash = cs.CanaryRevisionHash
 				return reconcileRollback(in, cs), nil
 			case decFailed:
-				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseFailed)
-				return &Result{Active: true, Partition: 0, RequeueAfter: failedRequeue}, nil
+				parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureAnalysisStalled, in.Now)
+				return (&Result{Active: true, Partition: 0}).wake(in.ParkedRequeue), nil
 			case decHold:
-				return &Result{Active: true, Partition: 0, RequeueAfter: stepRequeue(step)}, nil
+				// A held gate reads Paused on every step: the phase names the
+				// wait, and Promoting is the drain that follows the gate.
+				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePaused)
+				return (&Result{Active: true, Partition: 0}).wake(stepWake(in, step)), nil
 			case decAdvance:
 				// gate passed at 100% — fall through to the drain window + completion.
 			}
 		}
 		if drainElapsed(cs, plan, in.Now) {
 			// A promote that opens the final gate stays live through the drain
-			// window (the gate re-evaluates every pass until completion), so it is
-			// consumed at the completion edge. Consumption failure retries
-			// completion rather than completing with a live promote.
-			if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutPromoteAnnotation); err != nil {
-				return nil, err
+			// window (the gate re-evaluates every pass until completion). At the
+			// completion edge it is recorded and handed back for removal after
+			// the flush; the done sentinel's sync clears the record once the
+			// annotation is observed gone.
+			if v, ok := in.ISVC.Annotations[constants.RolloutPromoteAnnotation]; ok {
+				cs.PromotedThrough = v
+				take(constants.RolloutPromoteAnnotation)
 			}
 			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
 			// Mark done (sentinel), don't clear: keeps EffectivePartition at
@@ -472,13 +436,9 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 			// The canary revision is the stable revision now: drop the pre-canary
 			// identity so it cannot leak into a later rollout's rollback target.
 			cs.StableRevisionHash = ""
-			// The promote annotation is durably consumed above and a done canary
-			// evaluates no gates, so the durable promote record is spent: clear it
-			// with the same status flush rather than leaving it as residue.
-			cs.PromotedThrough = ""
 			return &Result{Active: true, Complete: true, Partition: 0}, nil
 		}
-		return &Result{Active: true, Partition: 0, RequeueAfter: reconcileRequeue}, nil
+		return (&Result{Active: true, Partition: 0}).wake(in.Requeue), nil
 	}
 
 	// Intermediate step: serving a split. Anchor the pause to the moment the split
@@ -498,24 +458,24 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 			cs.RolledBackRevisionHash = cs.CanaryRevisionHash
 			return reconcileRollback(in, cs), nil
 		case decFailed:
-			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseFailed)
-			return &Result{Active: true, Partition: partition, RequeueAfter: failedRequeue}, nil
+			parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureAnalysisStalled, in.Now)
+			return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
 		case decHold:
 			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePaused)
-			return &Result{Active: true, Partition: partition, RequeueAfter: stepRequeue(step)}, nil
+			return (&Result{Active: true, Partition: partition}).wake(stepWake(in, step)), nil
 		case decAdvance:
 			// fall through to advance.
 		}
 	}
-	advanceStep(in)
-	return &Result{Active: true, Stepped: true, Partition: partition, RequeueAfter: reconcileRequeue}, nil
+	advanceStep(in, take)
+	return (&Result{Active: true, Stepped: true, Partition: partition}).wake(in.Requeue), nil
 }
 
 // pausedResult reports a globally-paused canary's state without mutating it.
 // The rollback signal echoes persisted status so the controller neither arms
 // nor clears the IR's RollbackToRevision while paused, and the partition
 // echoes the current step so the staged split stays where it is.
-func pausedResult(cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, desiredReplicas int32) *Result {
+func pausedResult(in ReconcileInputs, cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary) *Result {
 	// Not started, or already done: inactive. A pause must not initialize the
 	// state machine (initialization stamps the step timers) — a canary toward a
 	// target that appeared while paused starts once the pause clears.
@@ -523,11 +483,11 @@ func pausedResult(cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, desiredRe
 		return &Result{Active: false}
 	}
 	if cs.RolledBackRevisionHash != "" {
-		return &Result{Active: true, RolledBack: true, RequeueAfter: reconcileRequeue}
+		return (&Result{Active: true, RolledBack: true}).wake(in.Requeue)
 	}
 	step := plan.Steps[cs.CurrentStep]
-	partition := partitionForNewCount(desiredReplicas, resolveStepNewCount(step, desiredReplicas))
-	return &Result{Active: true, Partition: partition, RequeueAfter: reconcileRequeue}
+	partition := partitionForNewCount(in.DesiredReplicas, resolveStepNewCount(step, in.DesiredReplicas))
+	return (&Result{Active: true, Partition: partition}).wake(in.Requeue)
 }
 
 // resetCanaryStatus re-arms the state machine at step 0 toward a new target,
@@ -537,13 +497,21 @@ func pausedResult(cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, desiredRe
 // StableRevisionHash is the one field PRESERVED: a mid-canary retarget does
 // not change which revision was stable when the rollout began, and dropping
 // it would make a later rollback target the partially-rolled intermediate.
-func resetCanaryStatus(cs *v1beta1.CanaryStatus, targetID, hash string, now time.Time) {
+//
+// Re-projecting the RolloutPhase is part of the re-arm. The phase lives on
+// the Component status, not in cs: left behind, a terminal phase would keep
+// a hold keyed on it from ever re-arming, and a serving phase would make the
+// re-armed step read as a split that dipped rather than one staging from
+// scratch. Pending is the honest phase at step 0, and the pass's own gate
+// overwrites it as soon as it decides.
+func resetCanaryStatus(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, cs *v1beta1.CanaryStatus, targetID, hash string, now time.Time) {
 	*cs = v1beta1.CanaryStatus{
 		TargetID:           targetID,
 		CanaryRevisionHash: hash,
 		StableRevisionHash: cs.StableRevisionHash,
 		StepEnteredTime:    &metav1.Time{Time: now},
 	}
+	setPhase(isvc, c, v1beta1.RolloutPhasePending)
 }
 
 // stableHashFor resolves the stable revision hash for rollback decisions: the
@@ -574,6 +542,7 @@ func reconcileRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 		stableProtocol = in.StablePairingProtocol
 	}
 	applyTraffic(in.ISVC, in.Component, cs.RolledBackRevisionHash, stableHash, "", stableProtocol, 0)
+	applyGroupStableTraffic(in)
 	// RolledBack is the revert-COMPLETE phase, so it must wait out every
 	// non-stable revision — not just the rejected one. A retargeted canary
 	// (A -> partial B -> retarget C -> rollback) leaves stragglers on the
@@ -591,12 +560,43 @@ func reconcileRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 			}
 		}
 	}
+	// The unit reverts as a whole, and a revert is complete only when the
+	// rejected pods are gone, ready or not. The run closes on the primary's
+	// phase, and a member's revert is an update the plan gate refuses once
+	// no run is pinned, so a primary declared RolledBack ahead of its
+	// members would strand them on the rejected revision.
+	if !rollingBack {
+		rollingBack = groupRollingBack(in, stableHash)
+	}
 	if rollingBack {
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseRollingBack)
-		return &Result{Active: true, RolledBack: true, RequeueAfter: reconcileRequeue}
+		return (&Result{Active: true, RolledBack: true}).wake(in.Requeue)
 	}
 	setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseRolledBack)
 	return &Result{Active: true, RolledBack: true}
+}
+
+// groupRollingBack reports whether any member of the canary unit, the primary
+// included, still has a pod off its stable revision. primaryStable is the
+// identity the primary's own check resolved; the other members use their
+// persisted one. A member with no stable identity is not waited on: it is
+// sent no revert signal, so nothing is in flight for it.
+func groupRollingBack(in ReconcileInputs, primaryStable string) bool {
+	for member, pods := range in.GroupTotalPerRevisionPods {
+		stable := in.GroupStableRevisionHashes[member]
+		if member == in.Component {
+			stable = primaryStable
+		}
+		if stable == "" {
+			continue
+		}
+		for h, n := range pods {
+			if h != "" && h != stable && n > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // drainElapsed reports whether the ScaleDownDelaySeconds drain window has passed
@@ -639,14 +639,13 @@ func effectiveCanaryPlan(isvc *v1beta1.InferenceService, component v1beta1.Compo
 	return g.Canary
 }
 
-// capacityGateExpired reports whether the current step has waited on capacity
-// past the timeout, measured from StepEnteredTime — re-stamped when the wait
-// begins (on entering Pending), so the budget covers only the capacity wait. A
-// nil status / missing step-entered time / non-positive timeout is never
-// treated as expired, so a transient nil cannot wrongly fail a rollout.
+// capacityGateExpired reports whether the current capacity wait has lasted
+// past the timeout, measured from CapacityWaitSince. A nil status, an
+// unrecorded wait or a non-positive timeout is never expired, so a transient
+// nil cannot wrongly fail a rollout.
 func capacityGateExpired(cs *v1beta1.CanaryStatus, timeout time.Duration, now time.Time) bool {
-	if cs == nil || cs.StepEnteredTime == nil || timeout <= 0 {
+	if cs == nil || cs.CapacityWaitSince == nil || timeout <= 0 {
 		return false
 	}
-	return !now.Before(cs.StepEnteredTime.Time.Add(timeout))
+	return !now.Before(cs.CapacityWaitSince.Time.Add(timeout))
 }

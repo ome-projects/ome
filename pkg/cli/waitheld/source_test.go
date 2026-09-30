@@ -433,7 +433,7 @@ func TestSourceSanitizesCredentialShapedExactIdentity(t *testing.T) {
 				target.Revision = target.IRName + "-aaaaaaaa"
 				evidence.Parent.Name = secret
 				evidence.Replica.Name = target.IRName
-				evidence.Replica.Spec.ParentRef.Name = secret
+				evidence.Replica.Spec.ParentRef = &v1beta1.ParentReference{Name: secret}
 				evidence.Replica.Labels[constants.InferenceServiceLabel] = secret
 				evidence.Replica.OwnerReferences[0].Name = secret
 			} else {

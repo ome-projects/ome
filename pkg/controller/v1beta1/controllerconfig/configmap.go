@@ -568,6 +568,16 @@ type LifecycleConfig struct {
 	// default: absence means the escalation does not exist and an
 	// unplaceable pod only parks the InstanceReadyTimeout clock.
 	UnschedulableGracePeriod string `json:"unschedulableGracePeriod,omitempty"`
+	// AbandonedReplacementGracePeriod is the termination grace a rollout
+	// gives a replacement pod it abandons before the pod ever entered the
+	// serving rotation (a surge replacement superseded by a newer revision,
+	// or retired after its attempt failed, while still pulling, scheduling
+	// or failing readiness). Such a pod owes no in-flight work, and its own
+	// terminationGracePeriodSeconds would otherwise hold its surge slot for
+	// that long. A duration string ("30s"). There is intentionally NO
+	// in-code default: absence leaves every abandoned replacement its own
+	// grace.
+	AbandonedReplacementGracePeriod string `json:"abandonedReplacementGracePeriod,omitempty"`
 	// GangScheduleTimeout bounds the per-PodGroup schedule timeout a
 	// multi-pod Instance derives from its Component's
 	// InstanceReadyTimeout. Absence means the escalation does not exist —
@@ -977,6 +987,24 @@ func (c *LifecycleConfig) ToUnschedulableGracePeriod() (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("invalid lifecycle.unschedulableGracePeriod: must be > 0, got %s", d)
+	}
+	return d, nil
+}
+
+// ToAbandonedReplacementGracePeriod validates and parses
+// AbandonedReplacementGracePeriod. A nil receiver or absent key is NOT an
+// error — it means an abandoned replacement keeps its own grace, which the
+// caller distinguishes from invalid by the returned zero value.
+func (c *LifecycleConfig) ToAbandonedReplacementGracePeriod() (time.Duration, error) {
+	if c == nil || c.AbandonedReplacementGracePeriod == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.AbandonedReplacementGracePeriod)
+	if err != nil {
+		return 0, fmt.Errorf("invalid lifecycle.abandonedReplacementGracePeriod %q: %w", c.AbandonedReplacementGracePeriod, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid lifecycle.abandonedReplacementGracePeriod: must be > 0, got %s", d)
 	}
 	return d, nil
 }

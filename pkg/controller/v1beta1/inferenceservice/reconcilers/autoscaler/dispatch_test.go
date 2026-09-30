@@ -78,7 +78,7 @@ func dispatchModeBridgeIR(namespace, isvcName, name string) *v1beta1.InferenceRe
 			OwnerReferences: []metav1.OwnerReference{dispatchISVCOwner(isvcName)},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: isvcName},
+			ParentRef: &v1beta1.ParentReference{Name: isvcName},
 			Component: v1beta1.EngineComponent,
 		},
 	}
@@ -681,7 +681,7 @@ func TestDispatchAutoscaler_ModeHandoffRecognizesUnlabeledIRScaler(t *testing.T)
 			OwnerReferences: []metav1.OwnerReference{isvcOwner},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: isvcName},
+			ParentRef: &v1beta1.ParentReference{Name: isvcName},
 			Component: v1beta1.EngineComponent,
 		},
 	}
@@ -796,7 +796,7 @@ func TestDispatchAutoscaler_ModeHandoffRequiresVerifiedIRBridge(t *testing.T) {
 			OwnerReferences: []metav1.OwnerReference{newISVCOwner},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: isvcName},
+			ParentRef: &v1beta1.ParentReference{Name: isvcName},
 			Component: v1beta1.EngineComponent,
 		},
 	}

@@ -100,6 +100,17 @@ var transitionWriteAllowlist = []allowedTransitionWrite{
 			"component pair; per-instance transition fields stay untouched",
 	},
 	{
+		file: "inferencereplica/status.go", fn: "aggregateAndWriteStatus", field: "Phase", count: 1,
+		why: "persists the phase the workload publication view returned (TakeInlineV1Publication " +
+			"demotes a settled Ready row with no pods to Pending by status.DemotableReady): a field " +
+			"copy from the publication row, like the counters beside it, not a second decision-maker",
+	},
+	{
+		file: "inferencereplica/status.go", fn: "mirrorInstanceCounters", field: "Phase", count: 1,
+		why: "in-memory mirror of the published phase onto the caller's IR (publication row → ir " +
+			"field copy), not a decision",
+	},
+	{
 		file: "inferencereplica/status.go", fn: "mirrorBack", field: "UpdateRevision", count: 1,
 		why: "in-memory mirror of the just-committed status onto the caller's IR (fresh → ir " +
 			"field copy), not a decision",

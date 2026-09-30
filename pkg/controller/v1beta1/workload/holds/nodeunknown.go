@@ -54,30 +54,54 @@ func reportNodeUnknown(ctx context.Context, in PassInput, row Row) (reading, err
 	return reading{waiting: true, evidence: types.NodeUnknownTermination(held[0])}, nil
 }
 
-// targetPodNames enumerates the pod names the row's plan asks for.
+// target is one pod the row's plan asks for: its name and the Runner
+// slot it renders from.
+type target struct {
+	name    string
+	runner  types.RunnerPlan
+	ordinal int32
+}
+
+// targets enumerates the pods the row's plan asks for.
 //
 // Single-pod Runners read the ordinal slot from the row's recorded
 // ActiveOrdinal, which SurgeThenDrain alternates between 0 and 1 across
 // rollouts; while such a row is mid-surge its replacement is being built
-// at the other slot, so that name is asked for too. Multi-pod Runners
+// at the other slot, so that pod is asked for too. Multi-pod Runners
 // occupy every 0..Size-1 ordinal. A row the plan no longer covers asks
-// for no name at all.
-func targetPodNames(in PassInput, row Row) map[string]struct{} {
+// for no pod at all.
+func targets(in PassInput, row Row) []target {
 	if row.Instance == nil {
 		return nil
 	}
-	names := make(map[string]struct{})
+	var out []target
+	add := func(runner types.RunnerPlan, ordinal int32) {
+		out = append(out, target{
+			name:    query.PodName(in.Input.Key.OwnerName, in.Plan.Component, row.Status.Index, runner.Name, ordinal),
+			runner:  runner,
+			ordinal: ordinal,
+		})
+	}
 	for _, runner := range row.Instance.Runners {
 		if runner.Size == 1 {
-			names[query.PodName(in.Input.Key.OwnerName, in.Plan.Component, row.Status.Index, runner.Name, row.Status.ActiveOrdinal)] = struct{}{}
+			add(runner, row.Status.ActiveOrdinal)
 			if singlePodSurgeInFlight(row.Status) {
-				names[query.PodName(in.Input.Key.OwnerName, in.Plan.Component, row.Status.Index, runner.Name, 1-row.Status.ActiveOrdinal)] = struct{}{}
+				add(runner, 1-row.Status.ActiveOrdinal)
 			}
 			continue
 		}
 		for o := int32(0); o < runner.Size; o++ {
-			names[query.PodName(in.Input.Key.OwnerName, in.Plan.Component, row.Status.Index, runner.Name, o)] = struct{}{}
+			add(runner, o)
 		}
+	}
+	return out
+}
+
+// targetPodNames is the set of names targets asks for.
+func targetPodNames(in PassInput, row Row) map[string]struct{} {
+	names := make(map[string]struct{})
+	for _, t := range targets(in, row) {
+		names[t.name] = struct{}{}
 	}
 	return names
 }

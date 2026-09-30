@@ -13,10 +13,11 @@ import (
 // boundedServiceName guarantees a Service name fits the DNS1035 label
 // limit. Names within the limit pass through unchanged; longer names are
 // truncated to a deterministic, collision-resistant `{hash}-{suffix}`
-// form via the shared constants helper. Truncated names cannot be parsed
-// back to their owner in the Service→owner event mappers, so those owners
-// fall back to the timer-poll reconcile path — correct, just not
-// event-driven.
+// form via the shared constants helper. A replica's headless Service
+// resolves through its owner reference even when truncated; a truncated
+// name cannot be parsed back to its owner, so a Service found only by
+// name parse falls back to the timer-poll reconcile path — correct, just
+// not event-driven.
 func boundedServiceName(name string) string {
 	return constants.TruncateNameWithMaxLength(name, validation.DNS1035LabelMaxLength)
 }

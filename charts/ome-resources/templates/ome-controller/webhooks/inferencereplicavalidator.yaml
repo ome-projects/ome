@@ -4,11 +4,8 @@ metadata:
   creationTimestamp: null
   name: inferencereplica.ome.io
   annotations:
-    cert-manager.io/inject-ca-from: ome/serving-cert
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/serving-cert
 webhooks:
-  # InferenceReplica is a controller-only CRD: this webhook rejects
-  # direct user writes unless the ome.io/controller-write=true annotation
-  # is present (set by the ISVC controller's client on every write).
   - clientConfig:
       caBundle: Cg==
       service:
@@ -19,6 +16,8 @@ webhooks:
     name: inferencereplica.ome-webhook-server.validator
     sideEffects: None
     admissionReviewVersions: ["v1"]
+    # Objects already being deleted skip admission, so finalizer removal
+    # during a cascade delete can never wedge behind the webhook.
     matchConditions:
       - name: skip-deletion
         expression: "!has(object.metadata.deletionTimestamp)"

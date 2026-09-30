@@ -114,6 +114,28 @@ var (
 	// the annotation after consuming it.
 	RolloutRepinAnnotation = OMEAPIGroupName + "/rollout-repin"
 
+	// RolloutResumeAnnotation is the one-shot operator verb that clears a
+	// TERMINAL canary phase (Failed, RolledBack) and re-enters the step
+	// machine at step 0 against the CURRENT target — no new revision
+	// required. Value: the parked canary revision hash (copied from
+	// status.components.<component>.canary.canaryRevisionHash), which guards
+	// against resuming a stale target; admission rejects any other shape.
+	// The optional "<component>=<hash>" form names one Component when an
+	// InferenceService has more than one canary unit parked; a bare hash is
+	// addressed to whichever Component's canary carries it. The controller
+	// clears the annotation after consuming it. No-op when the addressed
+	// Component is in no terminal phase; a value that addresses no canary
+	// unit at all is removed without effect.
+	//
+	// Resume is deliberately NOT a waiver: the ladder restarts at step 0 and
+	// every gate re-runs, so a revision that failed analysis fails again
+	// unless the underlying cause is fixed.
+	//
+	// Like the other rollout verbs this is control-plane-only: it is stripped
+	// at derive, so on a placed InferenceService it must be applied directly
+	// to the member object.
+	RolloutResumeAnnotation = OMEAPIGroupName + "/rollout-resume"
+
 	// RolloutPlanSourceAnnotation carries per-group policy provenance on a
 	// DERIVED InferenceService whose rollout groups were inflated from
 	// RolloutPolicy refs at derive time. Members copy it into the pinned

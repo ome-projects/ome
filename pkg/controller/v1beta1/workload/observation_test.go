@@ -688,3 +688,80 @@ func TestTakeInlineV1PublicationUpdatedExcludesRowsPinnedOffTarget(t *testing.T)
 		})
 	}
 }
+
+// A settled Ready row publishes against the Pod observation of its own
+// pass. With no pods it publishes Pending, the phase the truth pass moves
+// such a row to, beside the zero pod count, under every restart policy;
+// the running revision stays on the row for the pass that rebuilds it. An
+// observation that finds a Ready pod for it publishes Ready again.
+// Presence is the rule, not readiness: a pod that is not yet Ready keeps
+// the phase and the counters carry the readiness.
+func TestTakeInlineV1PublicationDemotesReadyRowWithoutPods(t *testing.T) {
+	readySince := metav1.Unix(1700000000, 0)
+	rows := func() []types.InstanceStatus {
+		return []types.InstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "rev-a", ReadySince: &readySince},
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "rev-a", ReadySince: &readySince},
+			{Index: 2, Incarnation: 1, Phase: types.InstancePhaseUpdating, RunningRevision: "rev-a", TargetRevision: "rev-b",
+				Operation: &types.InstanceOperation{ID: "update-2", Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurge, TargetRevision: "rev-b"}},
+		}
+	}
+	publish := func(t *testing.T, byInstance map[int32][]*corev1.Pod) ([]types.InstanceStatus, workload.ComponentCounters) {
+		t.Helper()
+		observation, err := workload.NewOwnedPublicationObservation(
+			rows(), workload.NewCachedSelectorPodObservation(nil, byInstance), nil, status.AvailabilityWindow{})
+		if err != nil {
+			t.Fatalf("NewOwnedPublicationObservation: %v", err)
+		}
+		statuses, counters, err := observation.TakeInlineV1Publication(map[int32]int32{0: 1, 1: 1, 2: 1}, "rev-a")
+		if err != nil {
+			t.Fatalf("TakeInlineV1Publication: %v", err)
+		}
+		return statuses, counters
+	}
+	backed := observationPod("pod-0", "node-a", true, true, false)
+
+	t.Run("no pods publishes Pending", func(t *testing.T) {
+		statuses, counters := publish(t, map[int32][]*corev1.Pod{0: {backed}})
+		if statuses[0].Phase != types.InstancePhaseReady {
+			t.Errorf("backed row phase = %s, want Ready", statuses[0].Phase)
+		}
+		if statuses[1].Phase != types.InstancePhasePending || statuses[1].PodCount != 0 {
+			t.Errorf("unbacked row = phase %s with %d pod(s), want Pending with none", statuses[1].Phase, statuses[1].PodCount)
+		}
+		if statuses[1].RunningRevision != "rev-a" {
+			t.Errorf("unbacked row RunningRevision = %q, want rev-a kept for the pass that rebuilds it", statuses[1].RunningRevision)
+		}
+		if statuses[1].ReadySince == nil || !statuses[1].ReadySince.Equal(&readySince) {
+			t.Errorf("unbacked row ReadySince = %v, want the anchor preserved", statuses[1].ReadySince)
+		}
+		if statuses[2].Phase != types.InstancePhaseUpdating {
+			t.Errorf("operation-owned row phase = %s, want Updating", statuses[2].Phase)
+		}
+		if counters.Replicas != 3 || counters.ReadyReplicas != 1 {
+			t.Errorf("counters = %+v, want 3 replicas with 1 ready", counters)
+		}
+	})
+
+	t.Run("a pod that is not yet Ready keeps the phase", func(t *testing.T) {
+		starting := observationPod("pod-1", "", false, false, false)
+		statuses, counters := publish(t, map[int32][]*corev1.Pod{0: {backed}, 1: {starting}})
+		if statuses[1].Phase != types.InstancePhaseReady || statuses[1].PodCount != 1 {
+			t.Errorf("row with a starting pod = phase %s with %d pod(s), want Ready with one", statuses[1].Phase, statuses[1].PodCount)
+		}
+		if counters.ReadyReplicas != 1 {
+			t.Errorf("ReadyReplicas = %d, want 1: readiness stays with the counters", counters.ReadyReplicas)
+		}
+	})
+
+	t.Run("a Ready pod publishes Ready again", func(t *testing.T) {
+		replacement := observationPod("pod-1", "node-b", true, true, false)
+		statuses, counters := publish(t, map[int32][]*corev1.Pod{0: {backed}, 1: {replacement}})
+		if statuses[1].Phase != types.InstancePhaseReady || statuses[1].PodCount != 1 {
+			t.Errorf("rebacked row = phase %s with %d pod(s), want Ready with one", statuses[1].Phase, statuses[1].PodCount)
+		}
+		if counters.ReadyReplicas != 2 {
+			t.Errorf("ReadyReplicas = %d, want 2", counters.ReadyReplicas)
+		}
+	})
+}

@@ -2,13 +2,11 @@ package components
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -16,7 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/common"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/pdb"
-	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 var _ Component = &Decoder{}
@@ -27,7 +25,6 @@ type Decoder struct {
 	BaseComponentFields
 	decoderSpec          *v1beta1.DecoderSpec
 	deploymentReconciler *common.DeploymentReconciler
-	podSpecReconciler    *common.PodSpecReconciler
 }
 
 // NewDecoder creates a new Decoder component instance. deps carries
@@ -47,9 +44,6 @@ func NewDecoder(deps *ComponentDeps, in ComponentInputs, decoderSpec *v1beta1.De
 			StatusManager: base.StatusManager,
 			Log:           base.Log,
 		},
-		podSpecReconciler: &common.PodSpecReconciler{
-			Log: base.Log,
-		},
 	}
 }
 
@@ -62,18 +56,14 @@ func (d *Decoder) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService)
 		return ctrl.Result{}, errors.New("decoder spec is nil")
 	}
 
-	// Reconcile fine-tuned weights if specified
-	if isvc.Spec.Model != nil && len(isvc.Spec.Model.FineTunedWeights) > 0 {
-		if err := ReconcileFineTunedWeights(&d.BaseComponentFields, isvc); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "failed to reconcile fine-tuned weights")
-		}
-	}
-
-	// Reconcile object metadata
-	objectMeta, err := d.reconcileObjectMeta(ctx, isvc)
+	// Render the pod templates: fine-tuned weights, object metadata, the
+	// primary pod and the worker pod. The decoder spec is not mutated.
+	rendered, err := render.RenderDecoder(ctx, &d.Piece, isvc, d.decoderSpec)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile object metadata")
+		return ctrl.Result{}, errors.Wrap(err, "failed to render decoder pods")
 	}
+	objectMeta, podSpec, workerPodSpec, size := rendered.ObjectMeta, rendered.Primary, rendered.Worker, rendered.WorkerSize
+
 	pdbRequest, err := resolveComponentPDBRequest(
 		&d.BaseComponentFields,
 		isvc,
@@ -89,20 +79,10 @@ func (d *Decoder) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService)
 		return ctrl.Result{}, errors.Wrap(err, "failed to preflight decoder PodDisruptionBudget")
 	}
 
-	// Reconcile pod spec
-	podSpec, err := d.reconcilePodSpec(isvc, &objectMeta)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile pod spec")
+	if err := checkPlacementDemand(ctx, &d.BaseComponentFields, isvc, v1beta1.DecoderComponent, d.decoderSpec.Leader != nil, d.decoderSpec.Worker != nil,
+		ReplicaTemplates{Primary: podSpec, Worker: workerPodSpec, WorkerSize: size}); err != nil {
+		return ctrl.Result{}, err
 	}
-
-	// Reconcile worker pod spec if needed
-	workerPodSpec, err := d.reconcileWorkerPodSpec(isvc, &objectMeta)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile worker pod spec")
-	}
-
-	// Get worker size
-	size := d.getWorkerSize()
 
 	// Reconcile deployment based on deployment mode. The deployment
 	// reconciler's RequeueAfter MUST be preserved through the rest of
@@ -139,21 +119,6 @@ func (d *Decoder) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService)
 // component enum and ComponentExtensionSpec pointer differ.
 func (d *Decoder) reconcileOMENativeSubresources(ctx context.Context, isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta, podSpec *v1.PodSpec) error {
 	return ReconcileOMENativeSubresources(ctx, &d.BaseComponentFields, isvc, v1beta1.DecoderComponent, &d.decoderSpec.ComponentExtensionSpec, objectMeta, podSpec)
-}
-
-// getWorkerSize returns the worker size for multi-node deployments
-func (d *Decoder) getWorkerSize() int {
-	var size int
-
-	// Prioritize sizes in order: Decoder.Worker -> default
-	switch {
-	case d.decoderSpec.Worker != nil && d.decoderSpec.Worker.Size != nil:
-		size = *d.decoderSpec.Worker.Size
-	default:
-		size = 0 // Default value
-	}
-
-	return size
 }
 
 // reconcileDeployment manages the deployment logic for different deployment modes
@@ -245,168 +210,36 @@ func (d *Decoder) updateDecoderStatus(isvc *v1beta1.InferenceService, objectMeta
 	return UpdateComponentStatus(&d.BaseComponentFields, isvc, v1beta1.DecoderComponent, objectMeta, &d.decoderSpec.ComponentExtensionSpec)
 }
 
-// reconcileObjectMeta creates the object metadata for the decoder
-// component. Delegates the annotation / label merge to the shared
-// ReconcileComponentObjectMeta helper in base.go; the per-component
-// name resolution stays here because decoder gates the Service-
-// existence lookup on non-MultiNode mode (engine / router don't).
-func (d *Decoder) reconcileObjectMeta(ctx context.Context, isvc *v1beta1.InferenceService) (metav1.ObjectMeta, error) {
-	decoderName, err := d.determineDecoderName(ctx, isvc)
-	if err != nil {
-		return metav1.ObjectMeta{}, err
-	}
+// The render steps below expose the library one step at a time for the tests
+// that exercise them in isolation; Reconcile renders through
+// render.RenderDecoder. Unlike RenderDecoder, they complete the runner
+// containers in place on the decoder spec.
 
+// reconcileObjectMeta builds the decoder's object metadata.
+func (d *Decoder) reconcileObjectMeta(_ context.Context, isvc *v1beta1.InferenceService) (metav1.ObjectMeta, error) {
 	var decoderAnnotations, decoderLabels map[string]string
 	if d.decoderSpec != nil {
 		decoderAnnotations = d.decoderSpec.Annotations
 		decoderLabels = d.decoderSpec.Labels
 	}
 
-	return ReconcileComponentObjectMeta(&d.BaseComponentFields, isvc, v1beta1.DecoderComponent, decoderName, decoderAnnotations, decoderLabels)
+	return ReconcileComponentObjectMeta(&d.BaseComponentFields, isvc, v1beta1.DecoderComponent, render.ComponentName(isvc, v1beta1.DecoderComponent), decoderAnnotations, decoderLabels)
 }
 
-// determineDecoderName determines the name of the decoder service.
-// The suffix is sourced from GetServiceSuffix so the engine / decoder /
-// router suffix lives in exactly one place (ComponentConfig).
-func (d *Decoder) determineDecoderName(ctx context.Context, isvc *v1beta1.InferenceService) (string, error) {
-	defaultDecoderName := isvc.Name + d.GetServiceSuffix()
-
-	if d.DeploymentMode != constants.MultiNode {
-		existing := &v1.Service{}
-		if err := d.Client.Get(ctx, types.NamespacedName{Name: defaultDecoderName, Namespace: isvc.Namespace}, existing); err == nil {
-			return defaultDecoderName, nil
-		}
-	}
-
-	// If the default name doesn't exist, use it
-	return defaultDecoderName, nil
-}
-
-// decoderUsesLeaderTemplate reports whether the decoder should source its
-// primary pod template from the Leader block (multi-pod shape — MultiNode
-// or multi-pod OMENative) rather than the top-level decoder spec
-// (single-pod shape). Pure structural check on the spec; it deliberately
-// does NOT consult the deployment mode, so dispatch-mode classification and
-// template selection stay decoupled. Mirrors engineUsesLeaderTemplate.
+// decoderUsesLeaderTemplate reports whether the decoder sources its primary
+// pod template from the Leader block.
 func decoderUsesLeaderTemplate(spec *v1beta1.DecoderSpec) bool {
-	return spec != nil && spec.Leader != nil
+	return render.DecoderUsesLeaderTemplate(spec)
 }
 
-// reconcilePodSpec creates the pod spec for the decoder component
+// reconcilePodSpec renders the decoder's primary pod.
 func (d *Decoder) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	// Template selection is keyed on the presence of a Leader block, NOT on
-	// the deployment mode. d.DeploymentMode is set authoritatively at
-	// construction time; switching on it here mis-selects the top-level
-	// (empty) template for OMENative-mode decoders that also set
-	// Leader/Worker — the dispatch classifies multi-pod OMENative as
-	// OMENative, not MultiNode, so a `case constants.MultiNode` never
-	// matches and the spec collapses to the empty top-level runner ("no
-	// containers found in pod spec and no runner spec provided"). Mirrors
-	// the engine path (engineUsesLeaderTemplate).
-	var basePodSpec v1beta1.PodSpec
-	var runnerSpec *v1beta1.RunnerSpec
-
-	if decoderUsesLeaderTemplate(d.decoderSpec) {
-		basePodSpec = d.decoderSpec.Leader.PodSpec
-		runnerSpec = d.decoderSpec.Leader.Runner
-	} else {
-		// Fallback to the top-level decoder spec — covers single-pod
-		// OMENative, RawDeployment, and the malformed-but-tolerated
-		// MultiNode-without-Leader shape.
-		basePodSpec = d.decoderSpec.PodSpec
-		runnerSpec = d.decoderSpec.Runner
-	}
-
-	if runnerSpec != nil {
-		UpdateEnvVariables(&d.BaseComponentFields, isvc, &runnerSpec.Container, objectMeta)
-		UpdateVolumeMounts(&d.BaseComponentFields, isvc, &runnerSpec.Container, objectMeta)
-		MergeDecoderResources(&d.BaseComponentFields, isvc, &runnerSpec.Container)
-		MergeRuntimeArgumentsOverride(&d.BaseComponentFields, &runnerSpec.Container)
-		if !acceleratorProvidesParallelismOverride(&d.BaseComponentFields) {
-			d.setParallelismEnvVarForDecoder(&runnerSpec.Container, d.getWorkerSize())
-		}
-	}
-
-	// Use common pod spec reconciler for base logic
-	podSpec, err := d.podSpecReconciler.ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
-	if err != nil {
-		return nil, err
-	}
-
-	UpdatePodSpecVolumes(&d.BaseComponentFields, isvc, podSpec, objectMeta)
-	UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, podSpec, v1beta1.DecoderComponent)
-	UpdateDecoderAffinity(&d.BaseComponentFields, isvc, podSpec)
-
-	d.Log.V(1).Info("Decoder PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
-	return podSpec, nil
+	return render.DecoderPodSpec(&d.Piece, isvc, d.decoderSpec, objectMeta)
 }
 
-// reconcileWorkerPodSpec reconciles the worker pod spec for multi-node deployments
+// reconcileWorkerPodSpec renders the decoder's worker pod, nil without a worker.
 func (d *Decoder) reconcileWorkerPodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	// Return nil if no worker spec is defined
-	if d.decoderSpec.Worker == nil {
-		return nil, nil
-	}
-
-	// Get leader runner spec if available
-	var workerRunner *v1beta1.RunnerSpec
-	if d.decoderSpec.Worker != nil {
-		workerRunner = d.decoderSpec.Worker.Runner
-		if workerRunner != nil {
-			UpdateVolumeMounts(&d.BaseComponentFields, isvc, &workerRunner.Container, objectMeta)
-			UpdateEnvVariables(&d.BaseComponentFields, isvc, &workerRunner.Container, objectMeta)
-			MergeDecoderResources(&d.BaseComponentFields, isvc, &workerRunner.Container)
-			MergeRuntimeArgumentsOverride(&d.BaseComponentFields, &workerRunner.Container)
-			if !acceleratorProvidesParallelismOverride(&d.BaseComponentFields) {
-				d.setParallelismEnvVarForDecoder(&workerRunner.Container, d.getWorkerSize())
-			}
-		}
-	}
-
-	// Use common reconciler for worker pod spec
-	workerPodSpec, err := d.podSpecReconciler.ReconcileWorkerPodSpec(isvc, objectMeta, &d.decoderSpec.Worker.PodSpec, workerRunner)
-	if err != nil {
-		return nil, err
-	}
-	UpdatePodSpecVolumes(&d.BaseComponentFields, isvc, workerPodSpec, objectMeta)
-	UpdatePodSpecNodeSelector(&d.BaseComponentFields, isvc, workerPodSpec, v1beta1.DecoderComponent)
-	UpdateDecoderAffinity(&d.BaseComponentFields, isvc, workerPodSpec)
-
-	d.Log.V(1).Info("Decoder Worker PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
-	return workerPodSpec, nil
-}
-
-// setParallelismEnvVarForDecoder calculates and sets the PARALLELISM_SIZE environment variable for the decoder's container.
-func (d *Decoder) setParallelismEnvVarForDecoder(container *v1.Container, workerReplicas int) {
-	if container == nil || d.decoderSpec == nil {
-		d.Log.V(2).Info("Cannot set parallelism: container or decoderSpec is nil")
-		return
-	}
-
-	numGPUsPerPod := int64(isvcutils.GetGpuCountFromContainer(container, d.InferenceServiceConfig.AcceleratorResourceNames()))
-	numLeaders := int64(0)
-	numWorkers := int64(workerReplicas)
-
-	// Determine leader presence
-	if d.decoderSpec.Leader != nil {
-		numLeaders = 1
-	} else if d.decoderSpec.Runner != nil { // Raw deployment or single pod considered as leader
-		numLeaders = 1
-	}
-
-	// Only proceed if there are GPUs and some form of parallelism (leaders or workers)
-	if numGPUsPerPod > 0 && (numLeaders > 0 || numWorkers > 0) {
-		parallelismSize := numGPUsPerPod * (numLeaders + numWorkers)
-		if parallelismSize > 0 {
-			envVar := v1.EnvVar{Name: constants.ParallelismSizeEnvVarKey, Value: strconv.FormatInt(parallelismSize, 10)}
-			isvcutils.UpdateEnvVars(container, &envVar)
-			d.Log.V(2).Info("Added parallelism env variable to decoder container", "value", parallelismSize, "containerName", container.Name)
-		} else {
-			d.Log.V(2).Info("Calculated parallelism is zero, not adding env var", "containerName", container.Name)
-		}
-	} else {
-		d.Log.V(2).Info("Conditions not met for parallelism (no GPUs or no leaders/workers)", "containerName", container.Name, "gpus", numGPUsPerPod, "leaders", numLeaders, "workers", numWorkers)
-	}
+	return render.DecoderWorkerPodSpec(&d.Piece, isvc, d.decoderSpec, objectMeta)
 }
 
 // GetComponentType implements ComponentConfig interface

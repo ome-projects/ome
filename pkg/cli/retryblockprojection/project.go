@@ -440,7 +440,7 @@ func validCollectedReplicaIdentity(ir *omev1beta1.InferenceReplica, isvc *omev1b
 	if ir == nil || !validSourceIdentity(ir.Namespace, ir.Name, ir.UID) || ir.Namespace != isvc.Namespace ||
 		(requireRelationshipLabel && ir.Labels[constants.InferenceServiceLabel] != isvc.Name) ||
 		ir.Labels[constants.OMEComponentLabel] != string(ir.Spec.Component) ||
-		ir.Spec.ParentRef.Name != isvc.Name || !validComponent(ir.Spec.Component) {
+		(ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != isvc.Name) || !validComponent(ir.Spec.Component) {
 		return false
 	}
 	return validOwner(ir.OwnerReferences, isvc)

@@ -4318,3 +4318,36 @@ func TestCreate_UnknownPhasePodKeepsThePassRequeuing(t *testing.T) {
 		t.Errorf("RequeueAfter: got %v want at most the threshold remainder %v", res.RequeueAfter, remaining)
 	}
 }
+
+// A gang demoted for losing its pods, and still recording the revision it
+// ran, is the restart pass's under RecreateInstance exactly as a Ready
+// gang is: Create must neither fill its members one by one nor stamp
+// Creating over it, or the whole-gang rebuild at the running revision is
+// lost to a pod-by-pod fill at the target.
+func TestCreate_RecreateInstance_DefersDemotedGangToRestart(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 1)
+	ir := seedReadyInstance(isvc, 0, 2)
+	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstancePending
+	ir.Status.InstanceStatuses[0].RunningRevision = "llama-70b-engine-" + testRevisionHash
+	leader := gangPod(isvc, 0, "leader", 0, 2, true /* ready */, true /* serving */)
+	c := newFakeClient(t, isvc, ir, leader)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	plan := buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
+
+	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, nil); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("Create must defer a demoted gang to Restart under RecreateInstance: got %d pod(s), want 1 (leader only)", len(pods.Items))
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstancePending || s.Operation != nil {
+		t.Fatalf("the demoted row must stay Pending with no operation (Create must not stamp Creating): got %+v", s)
+	}
+}

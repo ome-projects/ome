@@ -823,9 +823,13 @@ func allowCreateForMissingInstance(input workload.ReconcileInput, plan workload.
 			}
 		}
 	}
+	// A promoted row short of its pod set is the restart pass's under
+	// RecreateInstanceOnPodRestart — Ready, or demoted for losing every
+	// pod — and so is a gang that lost a member: filling either pod by pod
+	// would race the whole-Instance rebuild at the running revision.
 	if plan.RestartPolicy == workload.RestartPolicyRecreateInstance && len(existing) > 0 {
 		s := input.ObservedState.Instance(inst.Index)
-		if s != nil && s.Phase == workload.InstancePhaseReady {
+		if s != nil && (s.Phase == workload.InstancePhaseReady || workload.DemotedReady(s)) {
 			return false, false, 0
 		}
 		if _, lost := instanceLostGangMember(input, plan, s, inst.TotalPods(), existing); lost {
@@ -1129,6 +1133,12 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 	if input.Gangs.BlocksPods(idx) {
 		return 0, nil
 	}
+	// Capacity the provisioner has not readied withholds the whole batch:
+	// nothing created is the same wait, and the hold pass reports it.
+	selectors, ready, err := provisionPods(ctx, deps, input, plan, inst, targets)
+	if err != nil || !ready {
+		return 0, err
+	}
 	created := 0
 	revisionHash := target.Hash()
 	// Prime the gang's peer-DNS host list once. It's identical for every
@@ -1139,7 +1149,7 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 	if inst.PeerHostnames == nil && inst.TotalPods() > 1 {
 		inst.PeerHostnames = buildInstancePeerHostnames(input.Key.OwnerName, plan.Component, inst)
 	}
-	for _, t := range targets {
+	for i, t := range targets {
 		template := input.DesiredSpec.PodSpec
 		if t.Runner.Name == workload.RunnerWorker && input.DesiredSpec.WorkerPodSpec != nil {
 			template = input.DesiredSpec.WorkerPodSpec
@@ -1161,12 +1171,16 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 		if err != nil {
 			return created, fmt.Errorf("render pod %s: %w", t.Name, err)
 		}
+		if err := confine(pod, selectors[i]); err != nil {
+			return created, fmt.Errorf("confine pod %s: %w", t.Name, err)
+		}
 
 		// Advisory (non-blocking): a multi-node gang worker rendered with no
 		// co-location podAffinity — no resolved topologyKey and no
-		// operator-supplied term — may schedule across topology domains and
-		// break the runtime's collectives. Warn once per episode per row.
-		if err := maybeWarnGangSplitRisk(ctx, deps, input, plan, inst, t.Runner, pod); err != nil {
+		// operator-supplied term — and not confined by the provisioner may
+		// schedule across topology domains and break the runtime's
+		// collectives. Warn once per episode per row.
+		if err := maybeWarnGangSplitRisk(ctx, deps, input, plan, inst, t.Runner, pod, len(selectors[i]) > 0); err != nil {
 			return created, err
 		}
 
@@ -1223,6 +1237,50 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 	return created, nil
 }
 
+// provisionPods asks deps.Provisioner to place every target before any
+// is created, and reports ready only when all of them are: an Instance's
+// pods start together, so one created ahead of a withheld peer would
+// only hold capacity for an Instance that cannot run. Every target is
+// asked even after one is withheld, so provisioning starts for all of
+// them on the same pass. The selectors are index-aligned with targets;
+// a nil provisioner places every target unconfined.
+func provisionPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, targets []podTarget) ([]map[string]string, bool, error) {
+	selectors := make([]map[string]string, len(targets))
+	if deps.Provisioner == nil {
+		return selectors, true, nil
+	}
+	ready := true
+	for i, t := range targets {
+		selector, placed, err := deps.Provisioner.Place(ctx, input, plan, inst, t.Runner, t.Ordinal)
+		if err != nil {
+			return nil, false, fmt.Errorf("place pod %s: %w", t.Name, err)
+		}
+		selectors[i] = selector
+		ready = ready && placed
+	}
+	return selectors, ready, nil
+}
+
+// confine merges the provisioner's node selector into the rendered pod.
+// A key the template already selects on with a different value would
+// leave the pod unschedulable on the capacity readied for it, so it is
+// an error rather than an override either way.
+func confine(pod *corev1.Pod, selector map[string]string) error {
+	if len(selector) == 0 {
+		return nil
+	}
+	if pod.Spec.NodeSelector == nil {
+		pod.Spec.NodeSelector = make(map[string]string, len(selector))
+	}
+	for k, v := range selector {
+		if current, ok := pod.Spec.NodeSelector[k]; ok && current != v {
+			return fmt.Errorf("node selector %s=%s conflicts with the provisioned %s", k, current, v)
+		}
+		pod.Spec.NodeSelector[k] = v
+	}
+	return nil
+}
+
 // until converts an absolute policy boundary into the delay a requeue
 // takes. A zero or already-passed boundary is no delay at all — there is
 // nothing left to wait for, and asking for a zero RequeueAfter would
@@ -1250,6 +1308,8 @@ func until(now, at time.Time) time.Duration {
 //     term -> not at risk;
 //   - a hand-written operator podAffinity is preserved on the pod → not
 //     at risk;
+//   - a worker the provisioner confined shares its gang's capacity (see
+//     Provisioner.Place) → not at risk;
 //   - only a worker left with zero required podAffinity trips the warning.
 //
 // Accelerator-agnostic by construction: it inspects podAffinity, never the
@@ -1257,7 +1317,7 @@ func until(now, at time.Time) time.Duration {
 // same way. Announced once per episode on the Instance's own row, so the
 // warning reaches an operator once per workload rather than once per
 // controller process. nil-safe.
-func maybeWarnGangSplitRisk(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, pod *corev1.Pod) error {
+func maybeWarnGangSplitRisk(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, pod *corev1.Pod, confined bool) error {
 	// Only a multi-node gang WORKER can split. The leader is the domain
 	// anchor (carries no co-location term by design); single-pod Instances
 	// have nothing to co-locate.
@@ -1265,8 +1325,9 @@ func maybeWarnGangSplitRisk(ctx context.Context, deps workload.Deps, input workl
 		return nil
 	}
 	// A required podAffinity term — OME-injected or operator-supplied —
-	// means the gang is already pinned to one domain.
-	if pod == nil || hasAnyRequiredPodAffinity(pod) {
+	// or the provisioner's confinement means the gang is already pinned
+	// to one domain.
+	if pod == nil || confined || hasAnyRequiredPodAffinity(pod) {
 		return nil
 	}
 	target := workload.EventTarget(input)

@@ -74,21 +74,27 @@ func stepGated(step v1beta1.RolloutGroupStep) bool {
 	return stepIsAnalysis(step) || step.Pause != nil
 }
 
-// stepRequeue is how soon to re-check a held step: the step's analysis Interval
-// (so sampling re-runs on cadence) for an analysis step, else the standard requeue.
-func stepRequeue(step v1beta1.RolloutGroupStep) time.Duration {
+// stepWake is how soon to re-check a held step: the step's analysis Interval
+// (so sampling re-runs on cadence) for an analysis step, else the configured
+// step cadence.
+func stepWake(in ReconcileInputs, step v1beta1.RolloutGroupStep) time.Duration {
 	if step.Analysis != nil && step.Analysis.Interval.Duration > 0 {
 		return step.Analysis.Interval.Duration
 	}
-	return reconcileRequeue
+	return in.Requeue
 }
 
-// evaluateStep decides whether a gated step may advance, dispatching on the step's
-// gate by field presence: Analysis (metric sampling — the only branch that can
-// return decRollback/decFailed), a timed Pause (Duration elapsed), else Manual
-// (promote annotation). The metrics source for analysis is GroupCanary.Prometheus,
+// evaluateStep decides whether a gated step may advance. A matching promote
+// is the operator's decision on any gate: it opens a manual hold, skips a
+// timed soak and overrides analysis alike. Otherwise the step's gate decides
+// by field presence: Analysis (metric sampling — the only branch that can
+// return decRollback/decFailed), a timed Pause (Duration elapsed), else a
+// manual hold. The metrics source for analysis is GroupCanary.Prometheus,
 // supplied to the sampler via ReconcileInputs.Prometheus.
 func evaluateStep(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.RolloutGroupStep) stepDecision {
+	if shouldAdvanceManual(in.ISVC, cs) {
+		return decAdvance
+	}
 	switch {
 	case stepIsAnalysis(step):
 		return evaluateAnalysisStep(ctx, in, step.Analysis, cs, step)
@@ -98,9 +104,6 @@ func evaluateStep(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 		}
 		return decHold
 	default:
-		if shouldAdvanceManual(in.ISVC, cs) {
-			return decAdvance
-		}
 		return decHold
 	}
 }
@@ -110,9 +113,9 @@ func evaluateStep(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 // non-blocking — a miss kicks a bounded background query (the slow Prometheus
 // call never runs on the reconcile goroutine) and holds; the sampler's completion
 // event, or the step requeue, re-reconciles to consume the result. A matching
-// promote annotation overrides the gate.
+// promote overrides the gate; evaluateStep decides it first, and the gate
+// repeats the check so it stays whole for a direct caller.
 func evaluateAnalysisStep(ctx context.Context, in ReconcileInputs, a *v1beta1.RolloutAnalysis, cs *v1beta1.CanaryStatus, step v1beta1.RolloutGroupStep) stepDecision {
-	// Operator override: a matching promote annotation force-advances mid-bake.
 	if shouldAdvanceManual(in.ISVC, cs) {
 		return decAdvance
 	}
@@ -240,19 +243,26 @@ func toStatusMetricResults(mrs []analysis.MetricResult, now time.Time) []v1beta1
 // advanceStep moves to the next step: increment the index, stamp the entry time
 // (Auto timing measures from here), and record any pending promote value in
 // PromotedThrough — all one in-memory status mutation, persisted together by
-// the controller's single status flush. The annotation itself is NOT touched
-// here: metadata and status cannot be written atomically, and removing the
-// annotation before the status flush lands would lose the promote if that
-// flush then fails or the process dies. Removal happens on a later pass, after
-// the advance is durable (syncPromotedThrough); until then the recorded value
-// keeps the lingering annotation inert (see shouldAdvanceManual).
-func advanceStep(in ReconcileInputs) {
+// the controller's single status flush. The annotation is handed back for
+// removal after that flush: metadata and status cannot be written atomically,
+// and removing the annotation before the status flush lands would lose the
+// promote if that flush then fails or the process dies. Until it is observed
+// gone, the recorded value keeps the lingering annotation inert (see
+// shouldAdvanceManual).
+func advanceStep(in ReconcileInputs, take func(string)) {
 	cs := rollout.CanaryStatusFor(&in.ISVC.Status, in.Component)
 	if v, ok := in.ISVC.Annotations[constants.RolloutPromoteAnnotation]; ok {
 		cs.PromotedThrough = v
+		take(constants.RolloutPromoteAnnotation)
 	}
 	cs.CurrentStep++
 	cs.StepEnteredTime = &metav1.Time{Time: in.Now}
+	cs.CapacityWaitSince = nil
+	// The next step is staging until its own gate is met. Projecting Pending
+	// here is what tells a later capacity loss apart from the step's initial
+	// wait: a split that served and then dipped keeps its phase, a step that
+	// has not served yet reads Pending.
+	setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePending)
 	// Reset the per-step analysis budget + sampling state: the failure budget is
 	// scoped to each step (each traffic level gets its own tolerance), and the
 	// next step samples fresh.
@@ -264,13 +274,13 @@ func advanceStep(in ReconcileInputs) {
 
 // syncPromotedThrough converges the durable promote record with the live
 // annotation, on passes AFTER the advance it records has persisted. While the
-// applied annotation lingers, retry its removal — best-effort: a failure
-// leaves it inert (it matches PromotedThrough) for the next pass. Once the
-// annotation is observed gone, clear the record so a later promote of the
-// same revision is honored again. The clear waits for observed absence
-// because a stale cache can re-show the annotation after removal; clearing
-// while it is still visible would re-apply the promotion.
-func syncPromotedThrough(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanaryStatus) {
+// applied annotation lingers, hand it back for removal again; until it is
+// gone it stays inert (it matches PromotedThrough). Once the annotation is
+// observed gone, clear the record so a later promote of the same revision is
+// honored again. The clear waits for observed absence because a stale cache
+// can re-show the annotation after removal; clearing while it is still
+// visible would re-apply the promotion.
+func syncPromotedThrough(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string)) {
 	if cs.PromotedThrough == "" {
 		return
 	}
@@ -280,17 +290,19 @@ func syncPromotedThrough(ctx context.Context, in ReconcileInputs, cs *v1beta1.Ca
 		return
 	}
 	if v == cs.PromotedThrough {
-		_ = consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutPromoteAnnotation)
+		take(constants.RolloutPromoteAnnotation)
 	}
 }
 
-// consumeAnnotation removes an operator command annotation, persisting the
-// removal to the apiserver (metadata merge patch) before the in-memory delete.
-// The controller only writes the status subresource, so an in-memory delete
-// alone would leave the annotation live and re-consumed on every later pass —
-// one ome.io/rollout-promote would advance every subsequent step. The patch
-// targets a copy so the server response cannot clobber in-flight status
-// mutations on the working object. A nil client consumes in-memory only.
+// consumeAnnotation removes an operator command annotation durably, before
+// the status flush. It is the right tool only where the decision it serves
+// does not depend on the annotation and is recomputed by the next pass if
+// the flush is lost (the re-arm of a rolled-back unit, in the executor and
+// at run open); every other verb is recorded in
+// status and handed to the controller for removal after the flush. The
+// patch targets a copy so the server response cannot clobber in-flight
+// status mutations on the working object. A nil client consumes in-memory
+// only.
 func consumeAnnotation(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, key string) error {
 	if _, ok := isvc.Annotations[key]; !ok {
 		return nil

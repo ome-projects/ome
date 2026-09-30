@@ -8,11 +8,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -3387,4 +3389,105 @@ func TestInferenceService_ComponentPodDisruptionBudgetValidation(t *testing.T) {
 			runCreateAndUpdate(t, componentExtISVC(tt.mutate), tt.errMsg)
 		})
 	}
+}
+
+func TestValidateNoStandaloneReplicaCollision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1beta1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	standalone := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a"},
+		Spec:       v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	standaloneEngine := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc2-engine", Namespace: "team-a"},
+		Spec:       v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	projected := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc-engine", Namespace: "team-a"},
+		Spec: v1beta1.InferenceReplicaSpec{
+			ParentRef: &v1beta1.ParentReference{Name: "svc"},
+			Component: v1beta1.EngineComponent,
+		},
+	}
+	v := &InferenceServiceValidator{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(standalone, standaloneEngine, projected).Build()}
+
+	collides := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a"}}
+	if err := v.validateNoStandaloneReplicaCollision(context.Background(), collides); err == nil {
+		t.Fatal("an InferenceService named like a standalone replica must be rejected")
+	}
+	collidesViaComponent := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc2", Namespace: "team-a"}}
+	if err := v.validateNoStandaloneReplicaCollision(context.Background(), collidesViaComponent); err == nil {
+		t.Fatal("an InferenceService whose engine replica name is taken by a standalone replica must be rejected")
+	}
+	free := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "pool-b", Namespace: "team-a"}}
+	if err := v.validateNoStandaloneReplicaCollision(context.Background(), free); err != nil {
+		t.Fatalf("unrelated name rejected: %v", err)
+	}
+	sameAsProjected := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "team-a"}}
+	if err := v.validateNoStandaloneReplicaCollision(context.Background(), sameAsProjected); err != nil {
+		t.Fatalf("a projected replica's name is not a collision: %v", err)
+	}
+
+	// A lookup that fails for any reason but NotFound is the webhook's
+	// failure, not the request's: an internal error naming the replica.
+	failing := &InferenceServiceValidator{Reader: fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return errors.New("connection refused")
+		},
+	}).Build()}
+	err := failing.validateNoStandaloneReplicaCollision(context.Background(), free)
+	if !apierrors.IsInternalError(err) {
+		t.Fatalf("a failed lookup must be an internal error, got %v", err)
+	}
+	assert.ErrorContains(t, err, "check for a standalone InferenceReplica named team-a/pool-b")
+}
+
+// ValidateCreate runs the standalone-replica collision check through the
+// validator's Reader.
+func TestValidateCreateRejectsAStandaloneReplicaName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+	standalone := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a"},
+		Spec:       v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(standalone).Build()
+	validator := &InferenceServiceValidator{
+		Client:          fakeClient,
+		Reader:          fakeClient,
+		RuntimeSelector: runtimeselector.New(fakeClient),
+	}
+
+	_, err := validator.ValidateCreate(context.Background(), &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a"},
+	})
+	assert.ErrorContains(t, err, "a standalone InferenceReplica named pool-a exists in namespace team-a")
+	assert.ErrorContains(t, err, "would share names")
+	assert.False(t, apierrors.IsInternalError(err))
+}
+
+// ValidateCreate rejects an InferenceService whose projected engine replica
+// name is already held by a standalone InferenceReplica: a different
+// collision reason than the bare-name case above.
+func TestValidateCreateRejectsAProjectedReplicaNameHeldByAStandaloneReplica(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+	standalone := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a-engine", Namespace: "team-a"},
+		Spec:       v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(standalone).Build()
+	validator := &InferenceServiceValidator{
+		Client:          fakeClient,
+		Reader:          fakeClient,
+		RuntimeSelector: runtimeselector.New(fakeClient),
+	}
+
+	_, err := validator.ValidateCreate(context.Background(), &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a"},
+	})
+	assert.ErrorContains(t, err, "would project a replica of that name")
+	assert.False(t, apierrors.IsInternalError(err))
 }

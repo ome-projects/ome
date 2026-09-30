@@ -2,13 +2,11 @@ package components
 
 import (
 	"context"
-	"sort"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -17,6 +15,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/pdb"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/rbac"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 var _ Component = &Router{}
@@ -27,7 +26,6 @@ type Router struct {
 	BaseComponentFields
 	routerSpec           *v1beta1.RouterSpec
 	deploymentReconciler *common.DeploymentReconciler
-	podSpecReconciler    *common.PodSpecReconciler
 	rbacReconciler       *rbac.RBACReconciler
 }
 
@@ -49,9 +47,6 @@ func NewRouter(deps *ComponentDeps, in ComponentInputs, routerSpec *v1beta1.Rout
 			StatusManager: base.StatusManager,
 			Log:           base.Log,
 		},
-		podSpecReconciler: &common.PodSpecReconciler{
-			Log: base.Log,
-		},
 	}
 }
 
@@ -63,11 +58,14 @@ func (r *Router) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 	if r.routerSpec == nil {
 		return ctrl.Result{}, errors.New("router spec is nil")
 	}
-	// Reconcile object metadata
-	objectMeta, err := r.reconcileObjectMeta(ctx, isvc)
+	// Render the object metadata and the single pod. The router spec is not
+	// mutated; its config env is appended on the rendered pod only.
+	rendered, err := render.RenderRouter(ctx, &r.Piece, isvc, r.routerSpec)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile object metadata")
+		return ctrl.Result{}, errors.Wrap(err, "failed to render router pod")
 	}
+	objectMeta, podSpec := rendered.ObjectMeta, rendered.Primary
+
 	pdbRequest, err := resolveComponentPDBRequest(
 		&r.BaseComponentFields,
 		isvc,
@@ -93,12 +91,6 @@ func (r *Router) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 	)
 	if err := r.rbacReconciler.Reconcile(); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile RBAC resources")
-	}
-
-	// Reconcile pod spec
-	podSpec, err := r.reconcilePodSpec(isvc, &objectMeta)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile pod spec")
 	}
 
 	// Set the service account name in the pod spec
@@ -219,74 +211,6 @@ func (r *Router) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 // updateRouterStatus updates the status of the router component
 func (r *Router) updateRouterStatus(isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta) error {
 	return UpdateComponentStatus(&r.BaseComponentFields, isvc, v1beta1.RouterComponent, objectMeta, &r.routerSpec.ComponentExtensionSpec)
-}
-
-// reconcileObjectMeta creates the object metadata for the router
-// component. Delegates the annotation / label merge to the shared
-// ReconcileComponentObjectMeta helper in base.go.
-func (r *Router) reconcileObjectMeta(ctx context.Context, isvc *v1beta1.InferenceService) (metav1.ObjectMeta, error) {
-	routerName, err := r.determineRouterName(ctx, isvc)
-	if err != nil {
-		return metav1.ObjectMeta{}, err
-	}
-
-	var routerAnnotations, routerLabels map[string]string
-	if r.routerSpec != nil {
-		routerAnnotations = r.routerSpec.Annotations
-		routerLabels = r.routerSpec.Labels
-	}
-
-	return ReconcileComponentObjectMeta(&r.BaseComponentFields, isvc, v1beta1.RouterComponent, routerName, routerAnnotations, routerLabels)
-}
-
-// determineRouterName determines the name of the router service.
-// The suffix is sourced from GetServiceSuffix so the engine / decoder /
-// router suffix lives in exactly one place (ComponentConfig).
-func (r *Router) determineRouterName(ctx context.Context, isvc *v1beta1.InferenceService) (string, error) {
-	defaultRouterName := isvc.Name + r.GetServiceSuffix()
-
-	existing := &v1.Service{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: defaultRouterName, Namespace: isvc.Namespace}, existing); err == nil {
-		return defaultRouterName, nil
-	}
-
-	return defaultRouterName, nil
-}
-
-// reconcilePodSpec creates the pod spec for the router component
-func (r *Router) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	if r.routerSpec.Runner != nil {
-		if r.routerSpec.Config != nil {
-			r.Log.V(2).Info("Adding config to router env", "inference service", isvc.Name, "namespace", isvc.Namespace)
-			r.routerSpec.Runner.Env = append(r.routerSpec.Runner.Env, configEnvVars(r.routerSpec.Config)...)
-		}
-	}
-	// Use common pod spec reconciler for base logic
-	podSpec, err := r.podSpecReconciler.ReconcilePodSpec(isvc, objectMeta, &r.routerSpec.PodSpec, r.routerSpec.Runner)
-	if err != nil {
-		return nil, err
-	}
-
-	UpdatePodSpecVolumes(&r.BaseComponentFields, isvc, podSpec, objectMeta)
-
-	r.Log.V(1).Info("Router PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
-	return podSpec, nil
-}
-
-// configEnvVars converts a component config map to env vars in sorted
-// key order — map iteration order would churn the pod template hash
-// across reconciles and trigger spurious rollouts.
-func configEnvVars(config map[string]string) []v1.EnvVar {
-	keys := make([]string, 0, len(config))
-	for k := range config {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	envs := make([]v1.EnvVar, 0, len(keys))
-	for _, k := range keys {
-		envs = append(envs, v1.EnvVar{Name: k, Value: config[k]})
-	}
-	return envs
 }
 
 // GetComponentType implements ComponentConfig interface

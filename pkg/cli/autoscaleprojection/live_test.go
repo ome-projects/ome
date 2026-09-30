@@ -54,7 +54,7 @@ func liveReplica() *ome.InferenceReplica {
 	return &ome.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: "chat-engine", Namespace: "prod", UID: types.UID("ir-uid"), ResourceVersion: "9", Generation: 2,
 		Annotations:     map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "3"},
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: types.UID("parent-uid"), Controller: &controller}}},
-		Spec:   ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent, Replicas: &replicas},
+		Spec:   ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent, Replicas: &replicas},
 		Status: ome.InferenceReplicaStatus{ObservedGeneration: 2, Replicas: 2}}
 }
 

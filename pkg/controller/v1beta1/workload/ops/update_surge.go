@@ -245,6 +245,10 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 	// A strategy edit is NOT a redirect: the strategy is pinned for the life
 	// of the operation, so the surge finishes its cycle and the edit reaches
 	// the Instance at its next admitted attempt.
+	//
+	// The replacement goes on the abandoned-replacement grace when it never
+	// carried the serving gate: the reset waits for its name to free, and
+	// its own grace would hold the slot that long for a pod owing no work.
 	supersededTarget := row != nil && row.Operation != nil &&
 		row.Operation.TargetRevision != "" && row.Operation.TargetRevision != target.Name
 	if s := row; s != nil &&
@@ -262,7 +266,7 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 					continue
 				}
 				deps.ExpectationsCache().ExpectDeletes(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index, 1)
-				if derr := deps.Client.Delete(ctx, pod); derr != nil {
+				if derr := deps.Client.Delete(ctx, pod, abandonedReplacementDeleteOptions(input, pod)...); derr != nil {
 					deps.ExpectationsCache().ObservedDelete(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index)
 					if apierrors.IsNotFound(derr) {
 						continue
@@ -400,12 +404,13 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 	// Stale-slot eviction: the surge ordinal holds a wrong-revision pod
 	// and no valid surge is alive. Delete ONLY the pod(s) at the surge
 	// slot — the same direct eviction the superseded-surge redirect
-	// applies to a not-yet-promoted surge pod — and leave the canonical
-	// pod at the old ordinal serving untouched. Draining the source here
-	// would take the instance's only healthy pod out of rotation before
-	// a replacement exists (a per-instance outage for the whole recovery
-	// window); the real drain happens in Phase 2, after the correct-rev
-	// surge pod is Ready and in rotation.
+	// applies to a not-yet-promoted surge pod, on the same bounded grace
+	// for a pod that never served — and leave the canonical pod at the
+	// old ordinal serving untouched. Draining the source here would take
+	// the instance's only healthy pod out of rotation before a replacement
+	// exists (a per-instance outage for the whole recovery window); the
+	// real drain happens in Phase 2, after the correct-rev surge pod is
+	// Ready and in rotation.
 	if staleAtSurgeSlot && len(surgePods) == 0 {
 		if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index) {
 			return false, nil
@@ -418,7 +423,7 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 				continue
 			}
 			deps.ExpectationsCache().ExpectDeletes(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index, 1)
-			if err := deps.Client.Delete(ctx, pod); err != nil {
+			if err := deps.Client.Delete(ctx, pod, abandonedReplacementDeleteOptions(input, pod)...); err != nil {
 				deps.ExpectationsCache().ObservedDelete(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index)
 				if apierrors.IsNotFound(err) {
 					continue
@@ -467,6 +472,12 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		// there while the source keeps serving, which is the one place in
 		// the cycle where a hold costs the Instance nothing at all.
 		if plan.Paused && surgeStepIs(input, inst.Index, workload.UpdateStepSurge) {
+			return false, nil
+		}
+		// The drain is also where a cross-Component gate can act with the
+		// replacement already serving; a held source keeps serving at
+		// Step=Surge, exactly as under a pause.
+		if surgeStepIs(input, inst.Index, workload.UpdateStepSurge) && !drainAdmitted(input, oldPods, surgeTargetName) {
 			return false, nil
 		}
 		// Transition Step Surge → Drain once. Subsequent passes idempotency-

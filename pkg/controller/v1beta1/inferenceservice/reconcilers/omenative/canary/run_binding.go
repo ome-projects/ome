@@ -1,10 +1,14 @@
 package canary
 
 import (
+	"context"
 	"sort"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
@@ -15,31 +19,37 @@ const canaryTargetIDPrefix = "ct1:"
 // legacy in-flight state to an adopted run without restarting it. The controller
 // calls this before its immediate run-boundary status write so the pinned plan
 // and the corresponding step state become visible atomically.
-func BindRun(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, adopting bool) {
+//
+// A rollback request applies to the target it was recorded against. Re-arming
+// a rolled-back unit therefore removes the request with the rejected hash,
+// durably and before the write, like the executor's own re-arm: the re-arm
+// does not depend on it, and a copy left behind would roll the new canary
+// back. A nil client removes it in-memory only.
+func BindRun(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, adopting bool) error {
 	if isvc == nil || isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
-		return
+		return nil
 	}
 	targetID := activeCanaryTargetID(isvc, g)
 	if targetID == "" {
-		return
+		return nil
 	}
 	primary := primaryComponentOf(g)
 	if adopting {
 		if cs := rollout.CanaryStatusFor(&isvc.Status, primary); cs != nil && cs.TargetID == "" {
 			cs.TargetID = targetID
 		}
-		return
+		return nil
 	}
 
 	target, ok := activeRunTarget(isvc, primary)
 	if !ok || target.Revision == "" {
-		return
+		return nil
 	}
 	// No stable revision means nothing to shift traffic from: the unit's
 	// first rollout is not a canary. The step machine arms later only if a
 	// stable revision becomes known.
 	if target.StableRevision == "" {
-		return
+		return nil
 	}
 	// A run is opened for the whole InferenceService, so a group whose unit
 	// did not retarget is still handed a target. State is what arms the step
@@ -47,17 +57,23 @@ func BindRun(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, adopting b
 	// ladder, spends its analysis budget, and can reach a rollback over a
 	// rollout that never happened.
 	if !groupRetargeted(isvc, g, primary) {
-		return
+		return nil
 	}
 	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
 	if cs == nil {
 		cs = &v1beta1.CanaryStatus{}
 	}
+	if cs.RolledBackRevisionHash != "" {
+		if err := consumeAnnotation(ctx, c, isvc, constants.RolloutRollbackAnnotation); err != nil {
+			return err
+		}
+	}
 	rollout.SetCanaryStatusFor(&isvc.Status, primary, cs)
-	resetCanaryStatus(cs, targetID, target.Revision, isvc.Status.Rollout.ActiveRun.OpenedAt.Time)
+	resetCanaryStatus(isvc, primary, cs, targetID, target.Revision, isvc.Status.Rollout.ActiveRun.OpenedAt.Time)
 	if target.StableRevision != "" {
 		cs.StableRevisionHash = target.StableRevision
 	}
+	return nil
 }
 
 // activeCanaryTargetID fingerprints only the canary group's Component targets.

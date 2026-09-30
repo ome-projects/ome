@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -42,6 +43,11 @@ func main() {
 	switch os.Args[1] {
 	case "removecrdvalidation":
 		removeCRDValidation(os.Args[2])
+	case "helmchart":
+		if err := runHelmChart(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "crd-gen helmchart:", err)
+			os.Exit(1)
+		}
 	default:
 		panic(os.Args[1])
 	}

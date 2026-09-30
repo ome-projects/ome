@@ -352,7 +352,7 @@ func TestResolveConfigRunsSharedRoutingValidation(t *testing.T) {
 				Routing: &v1beta1.RoutingSpec{
 					CapacityFactors: map[string]resource.Quantity{},
 				},
-				Placement: &v1beta1.PlacementSpec{
+				Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
 					//nolint:staticcheck // compatibility coverage for deprecated spec.placement.capacityFactors
 					CapacityFactors: map[string]resource.Quantity{},
 				},

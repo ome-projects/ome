@@ -3,6 +3,7 @@ package coordination
 import (
 	"context"
 
+	appsv1 "k8s.io/api/apps/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -65,6 +66,14 @@ type GateContext struct {
 	// gates fail closed (deny with a retryable reason). There is no
 	// fallback to the ISVC's copied LifecycleStatus.
 	Reads client.Reader
+
+	// TargetRevision is the ControllerRevision the Component's Instances
+	// move to in this pass: the rollback revision while a rollback is
+	// pinned, else the spec target. The pairing gate reads the target
+	// cohort's protocol from it, so a revert is simulated toward the stable
+	// cohort even while the live spec field still names the rejected one.
+	// Nil fails the pairing gate closed.
+	TargetRevision *appsv1.ControllerRevision
 }
 
 // ResolveGateContext walks the shared prelude every Check*Gate runs:

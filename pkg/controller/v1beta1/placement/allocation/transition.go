@@ -51,6 +51,17 @@ type Step struct {
 // replicas are ready and routable. A zero target requires confirmed traffic
 // drain before removal. Unknown standing homes hold the transition.
 func Advance(in Transition) (Step, error) {
+	return advanceTransition(in, false)
+}
+
+// AdvanceWholeHomes preserves each home's full replica policy during a move.
+// A target changes directly to its desired floor, so a replacement must fit in
+// the shared allowance in full. It does not select admission-race candidates.
+func AdvanceWholeHomes(in Transition) (Step, error) {
+	return advanceTransition(in, true)
+}
+
+func advanceTransition(in Transition, wholeHomes bool) (Step, error) {
 	fromFloor, err := planTotal(in.From)
 	if err != nil {
 		return Step{}, fmt.Errorf("original plan: %w", err)
@@ -120,6 +131,9 @@ func Advance(in Transition) (Step, error) {
 		credit = min(credit, max(int64(0), ready-desiredFloor))
 	}
 	orphanCredit := max(int64(0), ready+orphanReady-desiredFloor)
+	// A resumed original home still needs publication before it can back
+	// retirement elsewhere. Only current serving capacity can fund a loss.
+	servingCredit := max(int64(0), ready-min(fromFloor, desiredFloor))
 	for _, name := range names {
 		if !in.Homes[name].Known && (in.Current[name] > 0 || in.From.Targets[name] > 0 || in.Homes[name].Occupied > 0) {
 			out.Reason = "ObservationUnknown"
@@ -178,12 +192,23 @@ func Advance(in Transition) (Step, error) {
 			unbacked = current
 		} else if !home.Routable || home.Ready == 0 {
 			unbacked = max(int32(0), current-original)
+		} else if wholeHomes {
+			// Unready surplus backs neither the original floor nor a serving
+			// replacement. It can leave with the rest of an abandoned home.
+			unbacked = max(int32(0), current-max(original, home.Ready))
 		}
 		reduce := int32(min(int64(current-goal), int64(unbacked)+max(int64(0), credit)))
-		if reduce == 0 {
+		var servingCost int64
+		if home.Routable {
+			unready := max(int32(0), current-home.Ready)
+			reduce = int32(min(int64(reduce), int64(unready)+servingCredit))
+			servingCost = int64(max(int32(0), reduce-unready))
+		}
+		if reduce == 0 || (wholeHomes && reduce < current-goal) {
 			continue
 		}
 		spent := int64(max(int32(0), reduce-unbacked))
+		servingCredit -= servingCost
 		if current == reduce && !home.Drained {
 			out.Drain = append(out.Drain, name)
 			credit -= spent
@@ -204,6 +229,7 @@ func Advance(in Transition) (Step, error) {
 		limit += int64(*in.MaxSurge)
 	}
 	available := max(int64(0), limit-used)
+	budgetBlocked := false
 	for _, name := range names {
 		home := in.Homes[name]
 		current, goal := in.Current[name], in.Desired.Targets[name]
@@ -211,6 +237,10 @@ func Advance(in Transition) (Step, error) {
 			continue
 		}
 		add := int32(min(int64(goal-current), available))
+		if wholeHomes && add < goal-current {
+			budgetBlocked = true
+			continue
+		}
 		out.Targets[name] += add
 		available -= int64(add)
 	}
@@ -220,7 +250,7 @@ func Advance(in Transition) (Step, error) {
 	}
 	if grow || shrink {
 		out.Reason = "ReplacementNotReady"
-		if grow && available == 0 {
+		if grow && (available == 0 || budgetBlocked) {
 			out.Reason = "SurgeBudgetExhausted"
 		}
 		return out, nil

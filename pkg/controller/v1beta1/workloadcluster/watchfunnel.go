@@ -72,12 +72,14 @@ type LocalKeyResolver func(remote client.Object) (local types.NamespacedName, ok
 // supplied here rather than hardcoded, so this package stays free of placement
 // imports and of magic values.
 type FunnelConfig struct {
-	// NewList returns a fresh empty list of the watched (cached) kind, used to
-	// drive EstablishWatch.
+	// MetadataOnly emits events from a direct metadata LIST/WATCH without caching
+	// resource specs or status. NewList must return PartialObjectMetadataList.
+	MetadataOnly bool
+
+	// NewList returns an empty list of the watched kind, typed or metadata-only.
 	NewList func() client.ObjectList
-	// NewObject returns a fresh empty object of the watched (cached) kind, used to
-	// register the cache event handler via AddCacheEventHandler and as the stub
-	// carried on the emitted GenericEvent.
+	// NewObject creates the local event stub. In cached mode it also identifies
+	// the watched kind when registering the informer handler.
 	NewObject func() client.Object
 	// Resolve maps a remote object to the local key to re-reconcile. Required.
 	Resolve LocalKeyResolver
@@ -94,19 +96,10 @@ type FunnelConfig struct {
 	BufferSize int
 }
 
-// StatusFunnel turns remote workload-cluster derived-object events into local
-// reconcile triggers. For every connected cluster it (1) confirms the
-// origin-scoped remote watch can be established — bounded by the Manager's
-// configured establish timeout and spaced by the retry backoff on failure — and
-// then (2) registers a cache event handler on that cluster's derived-object
-// informer; each delivered event is resolved to the LOCAL object key and pushed
-// onto a small buffered channel the placement controller consumes via
-// source.Channel. The established watch additionally serves as a liveness
-// signal: when it ends while the manager is still running, the cluster is
-// re-established.
-//
-// It implements sigs.k8s.io/controller-runtime/pkg/manager.Runnable so the cmd
-// wires it with mgr.Add(funnel); Start blocks until its context is cancelled.
+// StatusFunnel turns scoped member events into local reconcile triggers.
+// Cached kinds use informer handlers; metadata-only kinds use a direct
+// LIST/WATCH and retain no resource payloads. Both paths reconnect with the
+// manager's configured backoff and send bounded, nonblocking wakeups.
 type StatusFunnel struct {
 	mgr *Manager
 	cfg FunnelConfig
@@ -222,6 +215,10 @@ func (f *StatusFunnel) stopAll() {
 // blocks on the established watch as a liveness signal, re-establishing when it
 // ends. The cache handler registration is idempotent across re-establishment.
 func (f *StatusFunnel) watchCluster(ctx context.Context, cluster string) {
+	if f.cfg.MetadataOnly {
+		f.watchMetadataCluster(ctx, cluster)
+		return
+	}
 	log := ctrl.LoggerFrom(ctx).WithValues("cluster", cluster)
 	backoff := f.mgr.ReconnectBackoff()
 

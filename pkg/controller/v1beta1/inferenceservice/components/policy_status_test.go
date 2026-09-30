@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 // storedIRBlock is a typed-KEDA block standing in for the IR's persisted
@@ -118,8 +119,8 @@ func resolvedCondition(t *testing.T, isvc *v1beta1.InferenceService, component v
 func TestWriteComponentAutoscalerStatus_RenderedPolicyProvenance(t *testing.T) {
 	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
 	b := &BaseComponentFields{
+		Piece:          render.Piece{DeploymentMode: constants.OMENative},
 		Client:         cl,
-		DeploymentMode: constants.OMENative,
 		PolicyResolver: holdTestResolver(t, 0, holdTestPolicy("default")),
 	}
 	ext := refExt(1)
@@ -166,8 +167,8 @@ func TestWriteComponentAutoscalerStatus_RenderedPolicyProvenance(t *testing.T) {
 func TestWriteComponentAutoscalerStatus_HoldKeepsLastClassAndProvenance(t *testing.T) {
 	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
 	b := &BaseComponentFields{
+		Piece:          render.Piece{DeploymentMode: constants.OMENative},
 		Client:         cl,
-		DeploymentMode: constants.OMENative,
 		PolicyResolver: holdTestResolver(t, 0, holdTestPolicy("default")),
 	}
 	ext := refExt(1)
@@ -206,8 +207,8 @@ func TestWriteComponentAutoscalerStatus_HoldKeepsLastClassAndProvenance(t *testi
 func TestWriteComponentAutoscalerStatus_InlineShadowsPolicy(t *testing.T) {
 	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
 	b := &BaseComponentFields{
+		Piece:          render.Piece{DeploymentMode: constants.OMENative},
 		Client:         cl,
-		DeploymentMode: constants.OMENative,
 		PolicyResolver: holdTestResolver(t, 0, holdTestPolicy("default")),
 	}
 	ext := refExt(1)
@@ -240,7 +241,7 @@ func TestWriteComponentAutoscalerStatus_InlineShadowsPolicy(t *testing.T) {
 // only as False/UnsupportedDeploymentMode with no published scale target.
 func TestWriteComponentAutoscalerStatus_MultiNodeRefIsInert(t *testing.T) {
 	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
-	b := &BaseComponentFields{Client: cl, DeploymentMode: constants.MultiNode}
+	b := &BaseComponentFields{Piece: render.Piece{DeploymentMode: constants.MultiNode}, Client: cl}
 	ext := refExt(1)
 	isvc := holdTestISVC(ext)
 	objectMeta := metav1.ObjectMeta{Name: "llm-a-engine", Namespace: "default"}

@@ -53,8 +53,11 @@ type Evidence struct {
 type Sample struct {
 	ClusterUID        types.UID
 	DemandFingerprint string
-	Weight            int64
-	Pools             []Evidence
+	// DemandContract is supplied by the rendering resolver before this sample
+	// can authorize member workloads. The hardware reader does not render pods.
+	DemandContract *v1beta1.PlacementDemandContract
+	Weight         int64
+	Pools          []Evidence
 }
 
 // Reader adapts the management root's per-cluster quota reports. MaxAge and the

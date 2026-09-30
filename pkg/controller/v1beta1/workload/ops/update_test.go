@@ -817,6 +817,31 @@ func TestChooseUpdateMode_MultiPodInPlaceFallsBackToRecreate(t *testing.T) {
 	}
 }
 
+// TestInPlaceFallsBackToRecreate pins the one fallback the plan can
+// classify without a revision read: a multi-pod Instance under either
+// in-place variant rebuilds, while a single-pod Instance and every
+// non-in-place strategy keep their declared mechanism.
+func TestInPlaceFallsBackToRecreate(t *testing.T) {
+	cases := []struct {
+		strategy workload.UpdateStrategyType
+		multiPod bool
+		want     bool
+	}{
+		{workload.UpdateStrategyInPlaceIfPossible, true, true},
+		{workload.UpdateStrategyInPlaceOnly, true, true},
+		{workload.UpdateStrategyInPlaceIfPossible, false, false},
+		{workload.UpdateStrategyInPlaceOnly, false, false},
+		{workload.UpdateStrategyRecreatePod, true, false},
+		{workload.UpdateStrategySurgeThenDrain, true, false},
+		{"", true, false},
+	}
+	for _, tc := range cases {
+		if got := InPlaceFallsBackToRecreate(tc.strategy, tc.multiPod); got != tc.want {
+			t.Errorf("InPlaceFallsBackToRecreate(%q, multiPod=%v) = %v, want %v", tc.strategy, tc.multiPod, got, tc.want)
+		}
+	}
+}
+
 // TestInPlaceEligible_OnlyImageDiff confirms image-only diff is
 // eligible for in-place rollout.
 func TestInPlaceEligible_OnlyImageDiff(t *testing.T) {
@@ -2535,6 +2560,58 @@ func TestDetectUpdate_WedgedPodsReachHeld(t *testing.T) {
 // — recorded as the instance's node exclusion, executed by the ordinary
 // rebuild. That rebuild is the roll this trigger opens: an on-target row
 // left alone is never recreated, so the pod keeps its node and its UID.
+//
+// TestAbandonedReplacementDeleteOptions pins the grace an abandoned
+// replacement is deleted with: the configured bound, rounded up to whole
+// seconds, for a pod that never carried the serving gate; the pod's own
+// grace (no option) when the bound is unconfigured or the pod has carried
+// the gate in either direction.
+func TestAbandonedReplacementDeleteOptions(t *testing.T) {
+	gate := func(status corev1.ConditionStatus) *corev1.Pod {
+		return &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+			{Type: podreadiness.ConditionType, Status: status},
+		}}}
+	}
+	cases := []struct {
+		name  string
+		grace time.Duration
+		pod   *corev1.Pod
+		want  *int64
+	}{
+		{name: "unconfigured keeps the pod's own grace", grace: 0, pod: &corev1.Pod{}, want: nil},
+		{name: "negative reads as unconfigured", grace: -time.Second, pod: &corev1.Pod{}, want: nil},
+		{name: "a pod that never carried the gate takes the bound", grace: 7 * time.Second, pod: &corev1.Pod{}, want: ptrInt64(7)},
+		{name: "the bound rounds up to whole seconds", grace: 1500 * time.Millisecond, pod: &corev1.Pod{}, want: ptrInt64(2)},
+		{name: "a pod marked serving keeps its own grace", grace: 7 * time.Second, pod: gate(corev1.ConditionTrue), want: nil},
+		{name: "a pod held out of rotation keeps its own grace", grace: 7 * time.Second, pod: gate(corev1.ConditionFalse), want: nil},
+		{name: "a nil pod takes the bound", grace: 7 * time.Second, pod: nil, want: ptrInt64(7)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{AbandonedReplacementGrace: tc.grace}
+			got := recordedGrace(abandonedReplacementDeleteOptions(input, tc.pod))
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("grace = %d, want the pod's own grace", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Fatalf("grace = %v, want %d", got, *tc.want)
+			}
+		})
+	}
+}
+
+// recordedGrace reads the grace a set of delete options names, the way the
+// apiserver would receive it.
+func recordedGrace(opts []client.DeleteOption) *int64 {
+	options := &client.DeleteOptions{}
+	for _, opt := range opts {
+		opt.ApplyToDelete(options)
+	}
+	return options.GracePeriodSeconds
+}
+
+func ptrInt64(v int64) *int64 { return &v }
+
 func TestDetectUpdate_StuckPodOnTargetRelocates(t *testing.T) {
 	const suspectNode = "node-suspect"
 	t0 := time.Now()

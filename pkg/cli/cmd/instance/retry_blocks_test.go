@@ -163,7 +163,7 @@ func TestRetryBlocksSupportsLongParentNamesWithoutInvalidLabelSelector(t *testin
 	ir := commandIR(isvc)
 	ir.Name = "engine"
 	ir.UID = "engine-uid"
-	ir.Spec.ParentRef.Name = isvc.Name
+	ir.Spec.ParentRef = &omev1beta1.ParentReference{Name: isvc.Name}
 	ir.OwnerReferences[0].Name = isvc.Name
 	delete(ir.Labels, constants.InferenceServiceLabel)
 	ir.Status.RetryBlocks = []omev1beta1.RetryBlock{{
@@ -199,7 +199,7 @@ func TestRetryBlocksLongParentExactOwnerUIDClaimFailsClosed(t *testing.T) {
 	ir := commandIR(isvc)
 	ir.Name = "engine"
 	ir.UID = "engine-uid"
-	ir.Spec.ParentRef.Name = isvc.Name
+	ir.Spec.ParentRef = &omev1beta1.ParentReference{Name: isvc.Name}
 	ir.OwnerReferences[0].Name = isvc.Name
 	delete(ir.Labels, constants.InferenceServiceLabel)
 	ir.Status.RetryBlocks = []omev1beta1.RetryBlock{{

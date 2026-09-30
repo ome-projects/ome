@@ -37,7 +37,7 @@ func TestInferenceReplicaDefaultInventoryFits80Columns(t *testing.T) {
 	f := factory.Static{OME: omefake.NewSimpleClientset(&v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Name: "chat-engine", Namespace: "demo", Generation: 2},
 		Spec: v1beta1.InferenceReplicaSpec{
-			Component: v1beta1.EngineComponent, ParentRef: v1beta1.ParentReference{Name: "chat"}, Replicas: &desired,
+			Component: v1beta1.EngineComponent, ParentRef: &v1beta1.ParentReference{Name: "chat"}, Replicas: &desired,
 		},
 		Status: v1beta1.InferenceReplicaStatus{
 			Replicas: 3, ReadyReplicas: 2, AvailableReplicas: 2,
@@ -62,7 +62,7 @@ func TestInferenceReplicaWideInventoryBoundsLinesAndKeepsDetails(t *testing.T) {
 	f := factory.Static{OME: omefake.NewSimpleClientset(&v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Name: "chat-engine", Namespace: "demo", Generation: 2},
 		Spec: v1beta1.InferenceReplicaSpec{
-			Component: v1beta1.EngineComponent, ParentRef: v1beta1.ParentReference{Name: "chat"}, Replicas: &desired,
+			Component: v1beta1.EngineComponent, ParentRef: &v1beta1.ParentReference{Name: "chat"}, Replicas: &desired,
 		},
 		Status: v1beta1.InferenceReplicaStatus{
 			Replicas: 3, ReadyReplicas: 2, AvailableReplicas: 2,
@@ -104,7 +104,7 @@ func TestInferenceReplicaWideInventoryKeepsLongIdentifiers(t *testing.T) {
 	f := factory.Static{OME: omefake.NewSimpleClientset(&v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "demo"},
 		Spec: v1beta1.InferenceReplicaSpec{
-			Component: v1beta1.EngineComponent, ParentRef: v1beta1.ParentReference{Name: parent},
+			Component: v1beta1.EngineComponent, ParentRef: &v1beta1.ParentReference{Name: parent},
 		},
 	}), NS: "demo"}
 
