@@ -91,6 +91,7 @@ jobs:
       - name: Repair this concern from feedback and current implementation
         uses: anthropics/claude-code-action@v1
         with:
+          allowed_bots: 'claude,coderabbitai,github-actions'
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           prompt: >-
@@ -153,6 +154,7 @@ jobs:
         if: steps.examples.outcome == 'success' && steps.scope.outputs.changed == 'true'
         uses: anthropics/claude-code-action@v1
         with:
+          allowed_bots: 'claude,coderabbitai,github-actions'
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           prompt: >-

@@ -19,6 +19,7 @@ CHECK = "Docs maintenance"
 BOTS = {"claude", "coderabbitai"}
 TRUSTED_ASSOCIATIONS = {'OWNER', 'MEMBER', 'COLLABORATOR'}
 MAX_ATTEMPTS = 3
+MAX_INFRASTRUCTURE_ATTEMPTS = 3
 
 
 def reject_secrets(text):
@@ -97,6 +98,9 @@ def decode_state(comments):
     state = json.loads(base64.b64decode(encoded, validate=True))
     if type(state.get("attempts")) is not int or not 0 <= state["attempts"] <= MAX_ATTEMPTS:
         raise ValueError("Invalid maintenance attempt counter")
+    infrastructure = state.get('infrastructure_attempts', 0)
+    if type(infrastructure) is not int or not 0 <= infrastructure <= MAX_INFRASTRUCTURE_ATTEMPTS:
+        raise ValueError("Invalid infrastructure attempt counter")
     return state, comment["id"]
 
 
@@ -187,7 +191,8 @@ def decision(state, digest, force=False):
         return "work"
     if state.get("phase") == "ready" and state.get("signature") == digest:
         return "cached"
-    if state.get("attempts", 0) >= MAX_ATTEMPTS:
+    if (state.get("attempts", 0) >= MAX_ATTEMPTS
+            or state.get('infrastructure_attempts', 0) >= MAX_INFRASTRUCTURE_ATTEMPTS):
         return "needs-human"
     return "work"
 
@@ -202,7 +207,8 @@ def state_body(state):
     encoded = base64.b64encode(json.dumps(state, ensure_ascii=False).encode()).decode()
     return (f"{STATE}{encoded} -->\n"
             f"Documentation maintenance: **{state['phase']}**. "
-            f"Unsuccessful-round budget used: {state['attempts']}/{MAX_ATTEMPTS}.\n\n"
+            f"Unsuccessful content rounds: {state['attempts']}/{MAX_ATTEMPTS}. "
+            f"Operational attempts: {state.get('infrastructure_attempts', 0)}/{MAX_INFRASTRUCTURE_ATTEMPTS}.\n\n"
             f"Head: `{state['head']}`; reviewed main: `{state['base']}`.\n\n"
             f"<pre>{html.escape(state.get('reason', ''))}</pre>\n\n"
             f"[Workflow evidence]({state['run_url']})\n\n"
@@ -328,7 +334,7 @@ def restore(ctx, bundle=None):
 
 
 def prepare(number, directory, apply, force):
-    """Reserve one bounded attempt under the workflow's per-PR concurrency lock."""
+    """Reserve an operational attempt; charge content only after validation finishes."""
     import maintenance_checks as checks
     pr = get_pr(number)
     eligible(pr)
@@ -353,8 +359,11 @@ def prepare(number, directory, apply, force):
         ctx["findings"] = checks.document_findings(ctx["files"], Path.cwd())
         attempts = 1 if force else ctx["state"].get("attempts", 0) + 1
         ctx["attempts"] = attempts
+        ctx['infrastructure_attempts'] = (1 if force else
+                                          ctx['state'].get('infrastructure_attempts', 0) + 1)
         if apply:
-            save_state(ctx, {"phase": "working", "attempts": attempts, "head": ctx["head"],
+            save_state(ctx, {"phase": "working", "attempts": attempts - 1,
+                             "infrastructure_attempts": ctx['infrastructure_attempts'], "head": ctx["head"],
                              "base": ctx["base"], "run_url": ctx["run_url"],
                              "extra_feedback": ctx["extra_feedback"],
                              "reason": "Repair/validation in progress; no merge authorization implied."})
@@ -513,7 +522,8 @@ def finish(ctx, directory, apply):
         current = published_pr(ctx, head)
         attempts = 0 if accepted else ctx["attempts"]
         state = {"phase": "ready" if accepted else ("needs-human" if attempts >= MAX_ATTEMPTS else "needs-repair"),
-                 "attempts": attempts, "head": head, "base": ctx["base"], "reason": reason,
+                 "attempts": attempts, "infrastructure_attempts": 0,
+                 "head": head, "base": ctx["base"], "reason": reason,
                  "signature": signature(current, expected_details, ctx["extra_feedback"]),
                  "extra_feedback": ctx["extra_feedback"], "run_url": ctx["run_url"]}
         save_state(ctx, state)
@@ -545,14 +555,18 @@ def published_pr(ctx, head):
 
 
 def failure(ctx):
-    """An interrupted model/build still consumes the reserved failed-round budget."""
+    """Bound incomplete worker rounds separately from rejected documentation."""
     current = get_pr(ctx['number'])
     if current["state"] != "open":
         return
-    state = {"phase": "needs-human" if ctx["attempts"] >= MAX_ATTEMPTS else "needs-repair",
-             "attempts": ctx["attempts"], "head": current["head"]["sha"], "base": current["base"]["sha"],
+    infrastructure = ctx['infrastructure_attempts']
+    state = {"phase": "needs-human" if infrastructure >= MAX_INFRASTRUCTURE_ATTEMPTS else "retry-infrastructure",
+             "attempts": ctx["attempts"] - 1, "infrastructure_attempts": infrastructure,
+             "head": current["head"]["sha"], "base": current["base"]["sha"],
              "extra_feedback": ctx["extra_feedback"], "run_url": ctx["run_url"],
-             "reason": "A worker or publication step failed. Inspect the linked workflow before retrying; no success verdict was recorded."}
+             "reason": "A worker or publication step failed before the round completed. "
+                       "The content-repair budget was not charged. Inspect the linked workflow; "
+                       "no success verdict was recorded."}
     save_state(ctx, state)
     record_check(ctx, current["head"]["sha"], False, state["reason"])
 

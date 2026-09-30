@@ -54,6 +54,46 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(m.decision(state, "old"), "cached")
         self.assertEqual(m.decision(state, "new-feedback"), "work")
 
+    def test_operational_failures_have_a_separate_bounded_budget(self):
+        ctx = {'number': 7, 'attempts': 3, 'infrastructure_attempts': 2,
+               'extra_feedback': '', 'run_url': 'url'}
+        with patch.object(m, 'get_pr', return_value=pull()), \
+                patch.object(m, 'save_state') as save, patch.object(m, 'record_check') as record:
+            m.failure(ctx)
+        state = save.call_args.args[1]
+        self.assertEqual(state['attempts'], 2)
+        self.assertEqual(state['infrastructure_attempts'], 2)
+        self.assertEqual(state['phase'], 'retry-infrastructure')
+        self.assertFalse(record.call_args.args[2])
+        self.assertEqual(m.decision(state, 'new'), 'work')
+        state['infrastructure_attempts'] = 3
+        self.assertEqual(m.decision(state, 'new'), 'needs-human')
+        self.assertEqual(m.decision(state, 'new', True), 'work')
+        ctx['infrastructure_attempts'] = 3
+        with patch.object(m, 'get_pr', return_value=pull()), \
+                patch.object(m, 'save_state') as save, patch.object(m, 'record_check'):
+            m.failure(ctx)
+        self.assertEqual(save.call_args.args[1]['phase'], 'needs-human')
+        self.assertEqual(save.call_args.args[1]['attempts'], 2)
+
+    def test_prepare_reserves_infrastructure_budget_without_charging_content(self):
+        ctx = {'number': 7, 'head': 'b' * 40, 'base': 'a' * 40, 'files': {},
+               'state': {'attempts': 2, 'infrastructure_attempts': 1},
+               'signature': 'new', 'run_url': 'url', 'extra_feedback': ''}
+        for force in [False, True]:
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch.object(m, 'get_pr', return_value=pull()), \
+                    patch.object(m, 'context', return_value=copy.deepcopy(ctx)), \
+                    patch.object(m, 'restore'), patch.object(checks, 'document_findings', return_value=[]), \
+                    patch.object(m, 'save_state') as save, patch.object(m, 'output'):
+                m.prepare(7, Path(directory), True, force)
+                prepared = json.loads((Path(directory) / 'context.json').read_text())
+            self.assertEqual(prepared['attempts'], 1 if force else 3)
+            self.assertEqual(prepared['infrastructure_attempts'], 1 if force else 2)
+            state = save.call_args.args[1]
+            self.assertEqual(state['attempts'], 0 if force else 2)
+            self.assertEqual(state['infrastructure_attempts'], 1 if force else 2)
+
     def test_waiting_approvals_cannot_starve_repairs(self):
         prs = [{**pull(), "number": number} for number in range(1, 102)]
 
@@ -90,6 +130,10 @@ class PolicyTests(unittest.TestCase):
         state = {"attempts": 2, "phase": "working", "head": "x", "base": "y", "run_url": "url"}
         comment = {"id": 99, "user": {"login": "github-actions[bot]"}, "body": m.state_body(state)}
         self.assertEqual(m.decode_state([comment]), (state, 99))
+        for invalid in [-1, 4, True, '1']:
+            bad = {**comment, 'body': m.state_body({**state, 'infrastructure_attempts': invalid})}
+            with self.assertRaisesRegex(ValueError, 'infrastructure'):
+                m.decode_state([bad])
         with self.assertRaises(ValueError):
             m.decode_state([comment, comment])
         comment["user"]["login"] = "untrusted"
@@ -142,6 +186,10 @@ class PolicyTests(unittest.TestCase):
         for name in ['repair', 'review']:
             self.assertEqual(workflow['jobs'][name]['permissions']['contents'], 'read')
             self.assertEqual(workflow['jobs'][name]['permissions']['pull-requests'], 'read')
+            action = next(step for step in workflow['jobs'][name]['steps']
+                          if step.get('uses', '').startswith('anthropics/claude-code-action@'))
+            self.assertEqual(set(action['with']['allowed_bots'].split(',')),
+                             {'claude', 'coderabbitai', 'github-actions'})
         publisher = workflow['jobs']['validate-publish']
         self.assertNotIn('GH_TOKEN', publisher.get('env', {}))
         for step in publisher['steps']:
@@ -219,9 +267,11 @@ class PolicyTests(unittest.TestCase):
                     'REVIEW_JSON': json.dumps({'single_concern': True, 'accurate': False, 'reason': 'Wrong behavior'})}), \
                     patch.object(m, 'live_match'), patch.object(m, 'published_pr', return_value=pull()), \
                     patch.object(m, 'publish_repair') as publish, patch.object(m, 'record_check') as record, \
-                    patch.object(m, 'save_state'):
+                    patch.object(m, 'save_state') as save:
                 m.finish(ctx, root, True)
             publish.assert_not_called()
+            self.assertEqual(save.call_args.args[1]['attempts'], 1)
+            self.assertEqual(save.call_args.args[1]['infrastructure_attempts'], 0)
             self.assertFalse(record.call_args.args[2])
             self.assertFalse(json.loads((root / 'result.json').read_text())['published'])
             self.assertIn('no repair published', (root / 'summary').read_text())
