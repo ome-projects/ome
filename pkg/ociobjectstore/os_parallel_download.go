@@ -153,34 +153,9 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 			return fmt.Errorf("error downloading part %d: %v", part.partNum, part.err)
 		}
 
-		// Copy the part from the temporary file to the final position
-		tempFile, err := os.Open(part.tempFilePath)
-		if err != nil {
-			return fmt.Errorf("failed to open temporary file for part %d: %v", part.partNum, err)
-		}
-		defer tempFile.Close()
-
-		// Copy data from temp file to final file at correct offset using streaming
-		_, err = tmpFile.Seek(part.offset, 0)
-		if err != nil {
+		if err := cds.assembleDownloadedPart(tmpFile, part); err != nil {
 			os.Remove(tempTargetFilePath)
-			return fmt.Errorf("failed to seek to offset %d for part %d: %v", part.offset, part.partNum, err)
-		}
-
-		// Use pooled buffer for streaming copy
-		bufp := BufferPool.Get().(*[]byte)
-		_, err = io.CopyBuffer(tmpFile, tempFile, *bufp)
-		BufferPool.Put(bufp)
-
-		if err != nil {
-			os.Remove(tempTargetFilePath)
-			return fmt.Errorf("failed to copy part %d data at offset %d: %v", part.partNum, part.offset, err)
-		}
-
-		// Remove the temporary file
-		err = os.Remove(part.tempFilePath)
-		if err != nil {
-			cds.logger.Warnf("[%s] Failed to remove temporary file for part %d: %v", source.ObjectName, part.partNum, err)
+			return err
 		}
 	}
 
@@ -220,6 +195,31 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 	speedMBs := float64(objectSize) / 1024.0 / 1024.0 / duration.Seconds()
 	cds.logger.Infof("[%s] Multipart download completed in %.2fs (%.2f MB/s)", source.ObjectName, duration.Seconds(), speedMBs)
 	cds.logger.Infof("[%s] Multipart download completed successfully", source.ObjectName)
+	return nil
+}
+
+// assembleDownloadedPart releases the current part's file and path on every exit.
+func (cds *OCIOSDataStore) assembleDownloadedPart(target *os.File, part *DownloadedPart) error {
+	defer func() {
+		if err := os.Remove(part.tempFilePath); err != nil && !os.IsNotExist(err) {
+			cds.logger.Warnf("[%s] Failed to remove temporary file for part %d: %v", target.Name(), part.partNum, err)
+		}
+	}()
+	tempFile, err := os.Open(part.tempFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open temporary file for part %d: %v", part.partNum, err)
+	}
+	defer tempFile.Close()
+
+	if _, err := target.Seek(part.offset, 0); err != nil {
+		return fmt.Errorf("failed to seek to offset %d for part %d: %v", part.offset, part.partNum, err)
+	}
+	bufp := BufferPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(target, tempFile, *bufp)
+	BufferPool.Put(bufp)
+	if err != nil {
+		return fmt.Errorf("failed to copy part %d data at offset %d: %v", part.partNum, part.offset, err)
+	}
 	return nil
 }
 
