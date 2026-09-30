@@ -1,0 +1,537 @@
+[
+	{
+		"old": "_index.md",
+		"new": "getting-started/index.md",
+		"rewrittenFrom": "2f5da6dd"
+	},
+	{
+		"old": "overview/_index.md",
+		"new": "getting-started/introduction.md",
+		"rewrittenFrom": "73626f86"
+	},
+	{
+		"old": "installation/_index.md",
+		"new": "getting-started/install.md",
+		"rewrittenFrom": "8fcac889"
+	},
+	{
+		"old": "tasks/run-workloads/deploy-inference-service.md",
+		"new": "getting-started/serve-your-first-model.md",
+		"rewrittenFrom": "1ee89e68"
+	},
+	{
+		"old": "installation/ome-serving.md",
+		"new": "getting-started/pre-configured-models.md",
+		"rewrittenFrom": "042043ae"
+	},
+	{
+		"old": "installation/private-registries.md",
+		"new": "getting-started/private-registries.md",
+		"rewrittenFrom": "ed162ebd"
+	},
+	{
+		"old": "tasks/_index.md",
+		"new": "guides/index.md",
+		"rewrittenFrom": "2f5da6dd"
+	},
+	{
+		"old": "administration/_index.md",
+		"new": "guides/index.md",
+		"rewrittenFrom": "8c31d399"
+	},
+	{
+		"old": "tasks/run-workloads/select-accelerators.md",
+		"new": "guides/deploy-models/select-accelerators.md",
+		"rewrittenFrom": "d2ab568f"
+	},
+	{
+		"old": "tasks/run-workloads/serve-models-from-pvc.md",
+		"new": "guides/deploy-models/serve-models-from-pvc.md",
+		"rewrittenFrom": "b3f561eb"
+	},
+	{
+		"old": "tasks/run-workloads/serve-models-from-local-storage.md",
+		"new": "guides/deploy-models/serve-models-from-local-storage.md",
+		"rewrittenFrom": "97efce19"
+	},
+	{
+		"old": "tasks/run-workloads/reference-a-runtime-explicitly.md",
+		"new": "guides/deploy-models/reference-a-runtime-explicitly.md",
+		"rewrittenFrom": "5a4e8a86"
+	},
+	{
+		"old": "tasks/run-workloads/troubleshoot-runtime-selection.md",
+		"new": "guides/deploy-models/troubleshoot-runtime-selection.md",
+		"rewrittenFrom": "b9d20451"
+	},
+	{
+		"old": "tasks/run-workloads/run-benchmarks.md",
+		"new": "guides/deploy-models/run-benchmarks.md",
+		"rewrittenFrom": "51ef8126"
+	},
+	{
+		"old": "tasks/run-workloads/configure-route-timeouts.md",
+		"new": "guides/networking/configure-route-timeouts.md",
+		"rewrittenFrom": "2ebbce39"
+	},
+	{
+		"old": "tasks/run-workloads/set-service-app-protocols.md",
+		"new": "guides/networking/set-service-app-protocols.md",
+		"rewrittenFrom": "6e72729e"
+	},
+	{
+		"old": "administration/ingress.md",
+		"new": "guides/networking/configure-ingress.md",
+		"rewrittenFrom": "c6198139"
+	},
+	{
+		"old": "administration/gateway-host-schemes.md",
+		"new": "guides/networking/gateway-host-schemes.md",
+		"rewrittenFrom": "3ca0a647"
+	},
+	{
+		"old": "administration/multiple-gateways.md",
+		"new": "guides/networking/multiple-gateways.md",
+		"rewrittenFrom": "4affd2cf"
+	},
+	{
+		"old": "administration/namespace-gateways.md",
+		"new": "guides/networking/namespace-gateways.md",
+		"rewrittenFrom": "5847ff91"
+	},
+	{
+		"old": "tasks/pause-and-resume-a-rollout.md",
+		"new": "guides/roll-out-changes/pause-and-resume-a-rollout.md",
+		"rewrittenFrom": "11220a85"
+	},
+	{
+		"old": "tasks/promote-or-rollback-a-canary.md",
+		"new": "guides/roll-out-changes/promote-or-roll-back-a-canary.md",
+		"rewrittenFrom": "0e6c56f7"
+	},
+	{
+		"old": "tasks/release-a-held-revision.md",
+		"new": "guides/roll-out-changes/release-a-held-revision.md",
+		"rewrittenFrom": "497eefe0"
+	},
+	{
+		"old": "tasks/repin-a-drifted-rollout-plan.md",
+		"new": "guides/roll-out-changes/repin-a-drifted-rollout-plan.md",
+		"rewrittenFrom": "bb8f5b55"
+	},
+	{
+		"old": "tasks/run-workloads/pace-rollouts-with-min-ready-seconds.md",
+		"new": "guides/roll-out-changes/pace-rollouts-with-min-ready-seconds.md",
+		"rewrittenFrom": "17750ee2"
+	},
+	{
+		"old": "tasks/request-a-transient-scale.md",
+		"new": "guides/scale-and-migrate/request-a-transient-scale.md",
+		"rewrittenFrom": "73eef4e8"
+	},
+	{
+		"old": "tasks/request-an-instance-migration.md",
+		"new": "guides/scale-and-migrate/request-an-instance-migration.md",
+		"rewrittenFrom": "f9cf89d9"
+	},
+	{
+		"old": "administration/routing-health-probes.md",
+		"new": "guides/multi-cluster/routing-health-probes.md",
+		"rewrittenFrom": "7f0b7bd1"
+	},
+	{
+		"old": "tasks/drain-traffic-from-a-workload-cluster.md",
+		"new": "guides/multi-cluster/drain-a-workload-cluster.md",
+		"rewrittenFrom": "dd6a16f5"
+	},
+	{
+		"old": "administration/controller-configuration.md",
+		"new": "guides/operate-ome/configure-the-controller.md",
+		"rewrittenFrom": "c36230d1"
+	},
+	{
+		"old": "administration/model-agent.md",
+		"new": "guides/operate-ome/model-agent.md",
+		"rewrittenFrom": "8de82852"
+	},
+	{
+		"old": "administration/ome-scheduler.md",
+		"new": "guides/operate-ome/ome-scheduler.md",
+		"rewrittenFrom": "b7fa8323"
+	},
+	{
+		"old": "administration/accelerator-quota.md",
+		"new": "guides/operate-ome/accelerator-quota.md",
+		"rewrittenFrom": "fdc83ca9"
+	},
+	{
+		"old": "administration/shared-hf-artifacts.md",
+		"new": "guides/operate-ome/shared-hf-artifacts.md",
+		"rewrittenFrom": "ca69dc7d"
+	},
+	{
+		"old": "administration/metrics.md",
+		"new": "guides/operate-ome/metrics.md",
+		"rewrittenFrom": "23c15a51"
+	},
+	{
+		"old": "administration/alerting.md",
+		"new": "guides/operate-ome/alerting.md",
+		"rewrittenFrom": "24480b91"
+	},
+	{
+		"old": "concepts/_index.md",
+		"new": "concepts/index.md",
+		"rewrittenFrom": "8c31d399"
+	},
+	{
+		"old": "concepts/omenative.md",
+		"new": "concepts/omenative/overview.md",
+		"rewrittenFrom": "b29d19db"
+	},
+	{
+		"old": "administration/global-endpoint-publishing.md",
+		"new": "guides/multi-cluster/publish-a-global-endpoint.md",
+		"rewrittenFrom": "a8ba1ba6"
+	},
+	{
+		"old": "administration/instance-readiness-deadlines.md",
+		"new": "guides/omenative/set-instance-readiness-deadlines.md",
+		"rewrittenFrom": "7685856d"
+	},
+	{
+		"old": "administration/model-artifact-retention.md",
+		"new": "guides/operate-ome/configure-model-artifact-retention.md",
+		"rewrittenFrom": "07d049a8"
+	},
+	{
+		"old": "administration/omenative-status-encoding.md",
+		"new": "guides/omenative/change-the-status-encoding.md",
+		"rewrittenFrom": "241ce37c"
+	},
+	{
+		"old": "administration/replica-defaults.md",
+		"new": "guides/operate-ome/set-replica-defaults.md",
+		"rewrittenFrom": "22a3484f"
+	},
+	{
+		"old": "administration/routing-capacity-polling.md",
+		"new": "guides/multi-cluster/tune-routing-capacity-polling.md",
+		"rewrittenFrom": "2d26e2fb"
+	},
+	{
+		"old": "administration/stuck-deletion-recovery.md",
+		"new": "guides/omenative/recover-stuck-deletions.md",
+		"rewrittenFrom": "07abeb4d"
+	},
+	{
+		"old": "concepts/component_autoscaling.md",
+		"new": "concepts/serving/component-autoscaling.md",
+		"rewrittenFrom": "deff6fb3"
+	},
+	{
+		"old": "concepts/instance-restart-policy.md",
+		"new": "concepts/omenative/instance-restart-policy.md",
+		"rewrittenFrom": "80982230"
+	},
+	{
+		"old": "reference/model-size-range-matching.md",
+		"new": "reference/matching/model-size-range-matching.md",
+		"rewrittenFrom": "6d1777bb"
+	},
+	{
+		"old": "reference/runtime-selection-scoring.md",
+		"new": "reference/matching/runtime-selection-scoring.md",
+		"rewrittenFrom": "b015e838"
+	},
+	{
+		"old": "tasks/kubectl-ome-cluster-status.md",
+		"new": "reference/kubectl-ome/cluster.md",
+		"rewrittenFrom": "2156d4a6"
+	},
+	{
+		"old": "tasks/kubectl-ome-instance-list.md",
+		"new": "reference/kubectl-ome/instance.md",
+		"rewrittenFrom": "0b4cfd41"
+	},
+	{
+		"old": "tasks/kubectl-ome-instance-status.md",
+		"new": "reference/kubectl-ome/instance.md",
+		"rewrittenFrom": "fd439910"
+	},
+	{
+		"old": "tasks/kubectl-ome-placement.md",
+		"new": "reference/kubectl-ome/placement.md",
+		"rewrittenFrom": "5b6d8645"
+	},
+	{
+		"old": "tasks/kubectl-ome-runtime-explain.md",
+		"new": "reference/kubectl-ome/runtime.md",
+		"rewrittenFrom": "8825ad7d"
+	},
+	{
+		"old": "tasks/reset-failed-instances.md",
+		"new": "guides/omenative/reset-failed-instances.md",
+		"rewrittenFrom": "7d68d590"
+	},
+	{
+		"old": "tasks/run-workloads/bring-your-own-autoscaler.md",
+		"new": "guides/scale-and-migrate/bring-your-own-autoscaler.md",
+		"rewrittenFrom": "ea3dc708"
+	},
+	{
+		"old": "tasks/run-workloads/configure-pod-disruption-budgets.md",
+		"new": "guides/deploy-models/configure-pod-disruption-budgets.md",
+		"rewrittenFrom": "c2b656ec"
+	},
+	{
+		"old": "tasks/run-workloads/expose-without-ingress.md",
+		"new": "guides/networking/expose-without-ingress.md",
+		"rewrittenFrom": "ae881138"
+	},
+	{
+		"old": "tasks/run-workloads/scale-to-zero.md",
+		"new": "guides/scale-and-migrate/scale-to-zero-with-keda.md",
+		"rewrittenFrom": "482124b2"
+	},
+	{
+		"old": "tasks/run-workloads/spread-instances-across-fault-domains.md",
+		"new": "guides/omenative/spread-instances-across-fault-domains.md",
+		"rewrittenFrom": "5895fa7a"
+	},
+	{
+		"old": "tasks/weight-traffic-for-heterogeneous-clusters.md",
+		"new": "guides/multi-cluster/weight-traffic-for-heterogeneous-clusters.md",
+		"rewrittenFrom": "3587ea34"
+	},
+	{
+		"old": "concepts/omenative-update-strategies.md",
+		"new": "concepts/architecture/omenative-update-strategies.md",
+		"rewrittenFrom": "ef61f471"
+	},
+	{
+		"old": "concepts/base_model.md",
+		"new": "concepts/models/base-models.md",
+		"rewrittenFrom": "bf81aa4c"
+	},
+	{
+		"old": "concepts/fine_tuned_weight.md",
+		"new": "concepts/models/fine-tuned-weights.md",
+		"rewrittenFrom": "8c31d399"
+	},
+	{
+		"old": "concepts/serving_runtime.md",
+		"new": "concepts/runtimes/serving-runtimes.md",
+		"rewrittenFrom": "1ee89e68"
+	},
+	{
+		"old": "concepts/runtime_inheritance.md",
+		"new": "concepts/runtimes/runtime-inheritance.md",
+		"rewrittenFrom": "08869f00"
+	},
+	{
+		"old": "concepts/runtime-revision.md",
+		"new": "concepts/runtimes/runtime-revisions.md",
+		"rewrittenFrom": "c9ada638"
+	},
+	{
+		"old": "concepts/accelerator_class.md",
+		"new": "concepts/runtimes/accelerator-classes.md",
+		"rewrittenFrom": "69e365ce"
+	},
+	{
+		"old": "concepts/inference_service.md",
+		"new": "concepts/serving/inference-services.md",
+		"rewrittenFrom": "2656a655"
+	},
+	{
+		"old": "concepts/gang_scheduling.md",
+		"new": "concepts/serving/gang-scheduling.md",
+		"rewrittenFrom": "582ab9b2"
+	},
+	{
+		"old": "concepts/autoscaler_policy.md",
+		"new": "concepts/serving/autoscaler-policy.md",
+		"rewrittenFrom": "1838140a"
+	},
+	{
+		"old": "concepts/benchmark.md",
+		"new": "concepts/serving/benchmarks.md",
+		"rewrittenFrom": "8de82852"
+	},
+	{
+		"old": "concepts/rollout_policy.md",
+		"new": "concepts/rollouts-and-traffic/rollout-policy.md",
+		"rewrittenFrom": "8c392f08"
+	},
+	{
+		"old": "concepts/rollout_groups.md",
+		"new": "concepts/rollouts-and-traffic/rollout-groups.md",
+		"rewrittenFrom": "fe19dbe3"
+	},
+	{
+		"old": "concepts/traffic_policy.md",
+		"new": "concepts/rollouts-and-traffic/traffic-policy.md",
+		"rewrittenFrom": "13b2fd1b"
+	},
+	{
+		"old": "concepts/traffic_map.md",
+		"new": "concepts/rollouts-and-traffic/traffic-map.md",
+		"rewrittenFrom": "6bfffedd"
+	},
+	{
+		"old": "concepts/ingress.md",
+		"new": "concepts/rollouts-and-traffic/ingress.md",
+		"rewrittenFrom": "c6198139"
+	},
+	{
+		"old": "reference/_index.md",
+		"new": "reference/index.md",
+		"rewrittenFrom": "2f5da6dd"
+	},
+	{
+		"old": "reference/ome.v1beta1.md",
+		"new": "reference/api/ome.v1beta1.md",
+		"rewrittenFrom": "2656a655"
+	},
+	{
+		"old": "reference/labels-and-annotations.md",
+		"new": "reference/api/labels-and-annotations.md",
+		"rewrittenFrom": "4ed42091"
+	},
+	{
+		"old": "reference/traffic-annotations.md",
+		"new": "reference/api/traffic-annotations.md",
+		"rewrittenFrom": "ce9c565e"
+	},
+	{
+		"old": "tasks/kubectl-ome.md",
+		"new": "reference/kubectl-ome/overview.md",
+		"rewrittenFrom": "12554876"
+	},
+	{
+		"old": "tasks/kubectl-ome-accelerator-explain.md",
+		"new": "reference/kubectl-ome/accelerator.md",
+		"rewrittenFrom": "f2b7476a"
+	},
+	{
+		"old": "tasks/kubectl-ome-doctor.md",
+		"new": "reference/kubectl-ome/admin.md",
+		"rewrittenFrom": "bc44ee28"
+	},
+	{
+		"old": "tasks/kubectl-ome-autoscale-status.md",
+		"new": "reference/kubectl-ome/autoscale.md",
+		"rewrittenFrom": "ccadb15f"
+	},
+	{
+		"old": "tasks/kubectl-ome-autoscale-explain.md",
+		"new": "reference/kubectl-ome/autoscale.md",
+		"rewrittenFrom": "cd28d69a"
+	},
+	{
+		"old": "tasks/kubectl-ome-logs.md",
+		"new": "reference/kubectl-ome/logs.md",
+		"rewrittenFrom": "df178c73"
+	},
+	{
+		"old": "tasks/kubectl-ome-migration.md",
+		"new": "reference/kubectl-ome/migration.md",
+		"rewrittenFrom": "2cebb0fc"
+	},
+	{
+		"old": "tasks/kubectl-ome-rollout-explain.md",
+		"new": "reference/kubectl-ome/rollout.md",
+		"rewrittenFrom": "c650bb31"
+	},
+	{
+		"old": "tasks/kubectl-ome-rollout-history.md",
+		"new": "reference/kubectl-ome/rollout.md",
+		"rewrittenFrom": "75957e69"
+	},
+	{
+		"old": "tasks/kubectl-ome-rollout-validate.md",
+		"new": "reference/kubectl-ome/rollout.md",
+		"rewrittenFrom": "652eab96"
+	},
+	{
+		"old": "tasks/kubectl-ome-runtime-effective.md",
+		"new": "reference/kubectl-ome/runtime.md",
+		"rewrittenFrom": "4fffe042"
+	},
+	{
+		"old": "tasks/kubectl-ome-runtime-tree.md",
+		"new": "reference/kubectl-ome/runtime.md",
+		"rewrittenFrom": "b42bddd6"
+	},
+	{
+		"old": "tasks/kubectl-ome-status.md",
+		"new": "reference/kubectl-ome/status.md",
+		"rewrittenFrom": "1de07d77"
+	},
+	{
+		"old": "tasks/kubectl-ome-traffic-explain.md",
+		"new": "reference/kubectl-ome/traffic.md",
+		"rewrittenFrom": "a30a5e94"
+	},
+	{
+		"old": "tasks/kubectl-ome-traffic-status.md",
+		"new": "reference/kubectl-ome/traffic.md",
+		"rewrittenFrom": "6228e18f"
+	},
+	{
+		"old": "tasks/kubectl-ome-wait.md",
+		"new": "reference/kubectl-ome/wait.md",
+		"rewrittenFrom": "eb27c26f"
+	},
+	{
+		"old": "reference/kubectl-ome-guarded-actions.md",
+		"new": "reference/kubectl-ome/guarded-actions.md",
+		"rewrittenFrom": "6c277aac"
+	},
+	{
+		"old": "reference/model-version-matching.md",
+		"new": "reference/matching/model-version-matching.md",
+		"rewrittenFrom": "07c83415"
+	},
+	{
+		"old": "reference/runtime-accelerator-class-matching.md",
+		"new": "reference/matching/runtime-accelerator-class-matching.md",
+		"rewrittenFrom": "69e365ce"
+	},
+	{
+		"old": "reference/runtime-deployment-mode-matching.md",
+		"new": "reference/matching/runtime-deployment-mode-matching.md",
+		"rewrittenFrom": "60c70f45"
+	},
+	{
+		"old": "reference/diffusion-pipeline-runtime-matching.md",
+		"new": "reference/matching/diffusion-pipeline-runtime-matching.md",
+		"rewrittenFrom": "5b3b7c0f"
+	},
+	{
+		"old": "reference/canary-progression.md",
+		"new": "reference/rollouts/canary-progression.md",
+		"rewrittenFrom": "07a98de4"
+	},
+	{
+		"old": "reference/canary-analysis.md",
+		"new": "reference/rollouts/canary-analysis.md",
+		"rewrittenFrom": "d4cdc674"
+	},
+	{
+		"old": "reference/benchmark-output-storage.md",
+		"new": "reference/storage/benchmark-output-storage.md",
+		"rewrittenFrom": "1b935aa8"
+	},
+	{
+		"old": "developer-guide/_index.md",
+		"new": "contributing/index.md",
+		"rewrittenFrom": "8de82852"
+	},
+	{
+		"old": "developer-guide/contributing.md",
+		"new": "contributing/development-setup.md",
+		"rewrittenFrom": "777c54b7"
+	}
+]

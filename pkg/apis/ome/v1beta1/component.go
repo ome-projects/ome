@@ -27,6 +27,7 @@ type ComponentExtensionSpec struct {
 	// ServicePortAppProtocols maps generated Service port names to their
 	// Kubernetes appProtocol values. Declared ports use their container port name.
 	// +optional
+	// +ome:since=v1.3
 	ServicePortAppProtocols map[string]string `json:"servicePortAppProtocols,omitempty"`
 	// MinAvailable specifies how many component pods must still be available after the eviction
 	// +optional
@@ -48,6 +49,7 @@ type ComponentExtensionSpec struct {
 	// fixed fallbacks and never writes them back. The status counterpart is
 	// status.components.<component>.lifecycle.
 	// +optional
+	// +ome:since=v1.3
 	Lifecycle *LifecycleSpec `json:"lifecycle,omitempty"`
 
 	// Autoscaler configures the per-Component autoscaler dispatch and the
@@ -57,6 +59,7 @@ type ComponentExtensionSpec struct {
 	// here (Autoscaler.HPA.Metrics), alongside MinReplicas / MaxReplicas
 	// above. Alpha. The API may change without notice.
 	// +optional
+	// +ome:since=v1.3
 	Autoscaler *ComponentAutoscaler `json:"autoscaler,omitempty"`
 
 	// AutoscalerPolicyRef names a same-namespace AutoscalerPolicy whose
@@ -65,5 +68,6 @@ type ComponentExtensionSpec struct {
 	// documented preview/rollback mechanism. Alpha. The API may change
 	// without notice.
 	// +optional
+	// +ome:since=v1.3
 	AutoscalerPolicyRef *AutoscalerPolicyRef `json:"autoscalerPolicyRef,omitempty"`
 }

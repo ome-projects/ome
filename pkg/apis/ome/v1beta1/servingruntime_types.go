@@ -21,8 +21,8 @@ type SupportedModelFormat struct {
 	// +optional
 	ModelType *string `json:"modelType,omitempty"`
 	// Version of the model format.
-	// Used in validating that a runtime supports a predictor.
-	// It Can be "major", "major.minor" or "major.minor.patch".
+	// Runtime selection doesn't read it: to match on a version, set modelFormat.version.
+	// It can be "major", "major.minor" or "major.minor.patch".
 	// +optional
 	Version *string `json:"version,omitempty"`
 	// ModelFramework of the model, e.g., "PyTorch", "TensorFlow", "ONNX", "Transformers"
@@ -40,11 +40,12 @@ type SupportedModelFormat struct {
 	// +optional
 	DiffusionPipeline *DiffusionPipelineSpec `json:"diffusionPipeline,omitempty"`
 
-	// ModelCacheProviders lists model cache providers this runtime can load
-	// from when a BaseModel uses sharded distribution. Empty means this format
-	// supports only the default local/per-node model loading path.
+	// ModelCacheProviders lists the external model caches this runtime can
+	// load a Sharded model from. Sharded distribution is in development: OME
+	// can't serve a Sharded model yet, so this list has no effect.
 	// +optional
 	// +listType=atomic
+	// +ome:since=v1.3
 	ModelCacheProviders []ModelCacheProvider `json:"modelCacheProviders,omitempty"`
 
 	// Set to true to allow the ServingRuntime to be used for automatic model placement if
@@ -66,21 +67,21 @@ type SupportedModelFormat struct {
 	AcceleratorConfig map[string]*AcceleratorModelConfig `json:"acceleratorConfig,omitempty"`
 }
 
-// ModelCacheProvider identifies a model cache provider implementation that a
-// runtime knows how to consume.
+// ModelCacheProvider names an external model cache that a runtime can load
+// Sharded models from. Sharded distribution is in development.
 type ModelCacheProvider string
 
 const (
-	// DragonFly is the provider name used by the sharded model-cache
-	// integration.
+	// DragonFly is the provider name reserved for the sharded model cache,
+	// which is in development.
 	DragonFly ModelCacheProvider = "model_cache"
 )
 
 // AcceleratorModelConfig provides accelerator-specific overrides for this model format
 // +k8s:openapi-gen=true
 type AcceleratorModelConfig struct {
-	// MinMemoryPerBillionParams specifies memory required per billion parameters
-	// Used to calculate if a model fits on the accelerator
+	// MinMemoryPerBillionParams specifies memory required per billion parameters.
+	// OME doesn't read it.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MinMemoryPerBillionParams *int64 `json:"minMemoryPerBillionParams,omitempty"`
@@ -225,7 +226,9 @@ type ServingRuntimeSpec struct {
 	// +optional
 	DecoderConfig *DecoderSpec `json:"decoderConfig,omitempty"`
 
-	// Supported protocol versions (i.e. openAI or cohere or openInference-v1 or openInference-v2)
+	// ProtocolVersions lists the inference protocols the runtime serves:
+	// openAI, openInference-v1 or openInference-v2. Runtime selection
+	// doesn't read it.
 	// +optional
 	// +listType=atomic
 	ProtocolVersions []constants.InferenceServiceProtocol `json:"protocolVersions,omitempty"`
@@ -237,6 +240,7 @@ type ServingRuntimeSpec struct {
 	// Replaced wholesale by isvc.spec.scalingPolicy when set on the ISVC.
 	// Alpha. The API may change without notice.
 	// +optional
+	// +ome:since=v1.3
 	ScalingPolicy *ScalingPolicy `json:"scalingPolicy,omitempty"`
 
 	// AcceleratorRequirements specifies the accelerator requirements for this runtime
@@ -266,14 +270,14 @@ type AcceleratorRequirements struct {
 	// +optional
 	MinArchitectureVersion *string `json:"minArchitectureVersion,omitempty"`
 
-	// RequiredFeatures lists hardware features that must be present
-	// Examples: ["tensor-cores", "fp8", "nvlink"]
+	// RequiredFeatures lists hardware features that must be present.
+	// Examples: ["tensor-cores", "fp8", "nvlink"].
 	// +optional
 	// +listType=atomic
 	RequiredFeatures []string `json:"requiredFeatures,omitempty"`
 
-	// PreferredPrecisions lists numeric precisions in order of preference
-	// Examples: ["fp8", "fp16", "fp32"]
+	// PreferredPrecisions lists numeric precisions in order of preference.
+	// Examples: ["fp8", "fp16", "fp32"].
 	// +optional
 	// +listType=atomic
 	PreferredPrecisions []string `json:"preferredPrecisions,omitempty"`
@@ -309,6 +313,7 @@ type ServingRuntimeStatus struct {
 	// the fully-merged spec, which is large).
 	// +optional
 	// +listType=atomic
+	// +ome:since=v1.3
 	InheritanceChain []string `json:"inheritanceChain,omitempty"`
 
 	// Conditions reflect the runtime controller's view of inheritance
@@ -318,10 +323,13 @@ type ServingRuntimeStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=type
+	// +ome:since=v1.3
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// ServingRuntime is the Schema for the servingruntimes API
+// ServingRuntime defines, within one namespace, the pods that serve a model
+// and the model formats and sizes it supports, so OME can select it
+// automatically.
 // +k8s:openapi-gen=true
 // +genclient
 // +kubebuilder:object:root=true
@@ -352,7 +360,9 @@ type ServingRuntimeList struct {
 	Items           []ServingRuntime `json:"items"`
 }
 
-// ClusterServingRuntime is the Schema for the servingruntimes API
+// ClusterServingRuntime defines serving pods for the whole cluster: it has
+// the same spec as a ServingRuntime, but it's cluster-scoped rather than
+// namespaced.
 // +k8s:openapi-gen=true
 // +genclient
 // +genclient:nonNamespaced

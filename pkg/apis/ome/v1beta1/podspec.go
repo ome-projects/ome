@@ -49,6 +49,9 @@ type PodSpec struct {
 	// pod to perform user-initiated actions such as debugging. This list cannot be specified when
 	// creating a pod, and it cannot be modified by updating the pod spec. In order to add an
 	// ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.
+	// Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME
+	// creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and
+	// spec.router.
 	// +optional
 	// +patchMergeKey=name
 	// +patchStrategy=merge
@@ -148,7 +151,7 @@ type PodSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	ImagePullSecrets []v1.LocalObjectReference `json:"imagePullSecrets,omitempty" patchStrategy:"merge" patchMergeKey:"name" protobuf:"bytes,15,rep,name=imagePullSecrets"`
-	// Specifies the hostname of the Pod
+	// Specifies the hostname of the Pod.
 	// If not specified, the pod's hostname will be set to a system-defined value.
 	// +optional
 	Hostname string `json:"hostname,omitempty" protobuf:"bytes,16,opt,name=hostname"`

@@ -1,0 +1,230 @@
+name: Website
+
+on:
+  # Every pull request runs the workflow, so the Website status check
+  # always reports. The changes job skips the checks when a pull request
+  # touches none of the paths below.
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'hack/docs-examples/**'
+      - 'hack/docs-drift/**'
+      - 'hack/genref/**'
+      - 'config/crd/full/**'
+      - 'pkg/apis/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'Makefile-deps.mk'
+      - '.github/workflows/website.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-${{ github.event.pull_request.number || github.ref }}
+  # A new push to a pull request replaces its running checks. Pushes to
+  # main don't cancel each other.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect website changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      website: ${{ steps.filter.outputs.website }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The diff needs the base branch's history.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check changed paths
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        # Pushes to main are already filtered by on.push.paths. Keep the
+        # pattern in step with those paths.
+        run: |
+          pattern='^(website/|hack/(docs-examples|docs-drift|genref)/|config/crd/full/|pkg/apis/|go\.(mod|sum)$|Makefile(-deps\.mk)?$|\.github/workflows/website\.yml$)'
+          if [ "$EVENT_NAME" != pull_request ]; then
+            website=true
+          else
+            # Diff into a file, so a failed diff fails the job instead of
+            # reading as no changes.
+            git diff --name-only "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/changed.txt"
+            if grep -qE "$pattern" "$RUNNER_TEMP/changed.txt"; then
+              website=true
+            else
+              website=false
+            fi
+          fi
+          echo "website=$website" | tee -a "$GITHUB_OUTPUT"
+
+  site:
+    name: Lint, check, test and build
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: website/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # Lint and test run before check, which generates worker-configuration.d.ts.
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm check
+      - run: pnpm build
+
+  examples:
+    name: YAML examples and hack tests
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: Set up envtest
+        # The go test step and make docs-examples share these binaries.
+        run: |
+          make envtest
+          version="$(sed -n 's/^ENVTEST_K8S_VERSION = //p' Makefile)"
+          if [ -z "$version" ]; then
+            echo "::error::Couldn't read ENVTEST_K8S_VERSION from the Makefile."
+            exit 1
+          fi
+          assets="$(bin/setup-envtest use "$version" -p path)"
+          echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
+      - name: Test the hack programs
+        run: go test ./hack/docs-examples/... ./hack/docs-drift/...
+      - name: Check YAML examples against the CRDs
+        run: make docs-examples
+
+  apiref:
+    name: API reference is current
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: Regenerate the API reference
+        run: make generate-apiref
+      - name: Compare the website's copy
+        # make generate-apiref also rewrites the Hugo copy under site/,
+        # which is out of date until launch, so only the website page is
+        # compared.
+        run: |
+          if ! git diff --exit-code -- website/src/lib/content/reference/api; then
+            echo "::error title=API reference::The API reference is out of date. Run make generate-apiref and commit website/src/lib/content/reference/api."
+            exit 1
+          fi
+
+  drift:
+    name: Drift report
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The nightly docs bot changes site/ every day, so drift is expected
+    # until launch. The report is information, not a gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The report compares site/ history since each rewrite.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: Report drift between site/ and website/
+        # A built binary keeps docs-drift's exit status; go run and make
+        # turn every failure into 1 and 2.
+        run: |
+          go build -o "$RUNNER_TEMP/docs-drift" ./hack/docs-drift
+          set +e
+          "$RUNNER_TEMP/docs-drift" > drift.txt 2>&1
+          status=$?
+          set -e
+          cat drift.txt
+          {
+            echo '## Docs drift'
+            echo
+            case "$status" in
+              0) cat drift.txt ;;
+              1) echo 'Content PRs should fold these changes in and move `rewrittenFrom` forward.'
+                 echo
+                 echo '```text'
+                 cat drift.txt
+                 echo '```' ;;
+              *) echo 'The drift report failed to run; see the job log.' ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -eq 1 ]; then
+            echo "::warning title=Docs drift::site/ changed since some pages were rewritten; see the job summary."
+          fi
+          # Drift (1) is reported; only a failure to run (2) marks the job failed.
+          [ "$status" -le 1 ]
+
+  status:
+    name: Website status
+    needs: [changes, site, examples, apiref]
+    # always(), not !cancelled(): branch protection counts a skipped
+    # check as passing, so this job has to run and fail when the run is
+    # cancelled. It only reads results, so it can't hang.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          WEBSITE: ${{ needs.changes.outputs.website }}
+          SITE: ${{ needs.site.result }}
+          EXAMPLES: ${{ needs.examples.result }}
+          APIREF: ${{ needs.apiref.result }}
+        run: |
+          if [ "$CHANGES" != success ]; then
+            echo "Detecting website changes didn't succeed: changes=$CHANGES"
+            exit 1
+          fi
+          if [ "$WEBSITE" != true ]; then
+            echo "No website files changed, so the website checks didn't run."
+            exit 0
+          fi
+          if [ "$SITE" != success ] || [ "$EXAMPLES" != success ] || [ "$APIREF" != success ]; then
+            echo "A website check failed: site=$SITE, examples=$EXAMPLES, apiref=$APIREF"
+            exit 1
+          fi
+          echo "All website checks passed."

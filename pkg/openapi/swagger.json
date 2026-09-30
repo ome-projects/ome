@@ -474,7 +474,7 @@
       "type": "object",
       "properties": {
         "architectureFamilies": {
-          "description": "ArchitectureFamilies limits selection to specific families Examples: [\"nvidia-hopper\", \"nvidia-ampere\"]",
+          "description": "ArchitectureFamilies limits selection to specific families. Examples: [\"nvidia-hopper\", \"nvidia-ampere\"].",
           "type": "array",
           "items": {
             "type": "string",
@@ -511,7 +511,7 @@
           "format": "int64"
         },
         "preferredPrecisions": {
-          "description": "PreferredPrecisions lists numeric precisions in order of preference Examples: [\"fp8\", \"fp16\", \"fp32\"]",
+          "description": "PreferredPrecisions lists numeric precisions in order of preference. Examples: [\"fp8\", \"fp16\", \"fp32\"].",
           "type": "array",
           "items": {
             "type": "string",
@@ -622,7 +622,7 @@
           }
         },
         "minMemoryPerBillionParams": {
-          "description": "MinMemoryPerBillionParams specifies memory required per billion parameters Used to calculate if a model fits on the accelerator",
+          "description": "MinMemoryPerBillionParams specifies memory required per billion parameters. OME doesn't read it.",
           "type": "integer",
           "format": "int64"
         },
@@ -671,7 +671,7 @@
       }
     },
     "v1beta1.AcceleratorQuota": {
-      "description": "AcceleratorQuota is one node of the fleet quota tree. Cluster-scoped: it is fleet-level capacity policy, not a namespaced workload.\n\nThe name-length rule is deliberately at the root rather than under spec: removecrdvalidation replaces only the spec and status schemas, so a root rule is the one structural check that also holds in the minimal CRD variant.\n\nColumn names and order follow the kubectl-qt plugin, so a node reads the same either way, and the budget every node carries is in the default view rather than behind -o wide. Only status.budgets[0] fits a row; the plugin emits one per (resource, flavor) pair. Observed capacity is deliberately not a column: the root alone reports it, so in a flat list it would be blank on every other row. Read it off the root directly, or through the plugin, which has the tree to put it in.",
+      "description": "AcceleratorQuota is one node of the fleet quota tree. Cluster-scoped: it is fleet-level capacity policy, not a namespaced workload.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -947,7 +947,7 @@
           "format": "int64"
         },
         "preferredPrecisions": {
-          "description": "PreferredPrecisions lists numeric precisions in order of preference Examples: [\"fp8\", \"fp16\", \"fp32\"]",
+          "description": "PreferredPrecisions lists numeric precisions in order of preference. Examples: [\"fp8\", \"fp16\", \"fp32\"].",
           "type": "array",
           "items": {
             "type": "string",
@@ -956,7 +956,7 @@
           "x-kubernetes-list-type": "atomic"
         },
         "requiredFeatures": {
-          "description": "RequiredFeatures lists hardware features that must be present Examples: [\"tensor-cores\", \"fp8\", \"nvlink\"]",
+          "description": "RequiredFeatures lists hardware features that must be present. Examples: [\"tensor-cores\", \"fp8\", \"nvlink\"].",
           "type": "array",
           "items": {
             "type": "string",
@@ -1023,7 +1023,7 @@
       "type": "object",
       "properties": {
         "acceleratorClass": {
-          "description": "AcceleratorClass explicitly selects a specific AcceleratorClass Takes precedence over other selectors",
+          "description": "AcceleratorClass explicitly selects a specific AcceleratorClass. Takes precedence over other selectors.",
           "type": "string"
         },
         "constraints": {
@@ -1135,7 +1135,7 @@
       }
     },
     "v1beta1.AutoscalerPolicy": {
-      "description": "AutoscalerPolicy is a reusable, parameterized autoscaler template. Components attach individually via spec.\u003ccomponent\u003e.autoscalerPolicyRef on the InferenceService; the referenced template is rendered per component at reconcile time into a verbatim ComponentAutoscaler and fed to the existing autoscaler dispatch. Creating a policy actuates nothing by itself: the per-component ref is the only attachment mechanism. Alpha. The API may change without notice.",
+      "description": "AutoscalerPolicy is a reusable, parameterized autoscaler template. Components attach individually via spec.\u003ccomponent\u003e.autoscalerPolicyRef on the InferenceService; the referenced template is rendered per component at reconcile time into a verbatim ComponentAutoscaler and fed to the existing autoscaler dispatch. Creating a policy actuates nothing by itself: the per-component ref is the only attachment mechanism. Alpha. The API may change without notice.\n\nAutoscalerPolicy is off by default. To turn it on, set `ome.autoscalerPolicy.enabled` to true on both the ome-crd and ome-resources Helm charts, which install the CRD and its validating webhook. The manager looks for the CRD only when it starts.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -1311,7 +1311,7 @@
       }
     },
     "v1beta1.BaseModel": {
-      "description": "BaseModel is the Schema for the basemodels API",
+      "description": "BaseModel describes a model in one namespace: where its weights live, which nodes keep a copy, and what the model is, such as its architecture, size and capabilities.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -1405,7 +1405,7 @@
           "type": "string"
         },
         "distribution": {
-          "description": "Distribution selects how the model's bytes are made available across the cluster. A nil value is treated as DistributionPerNode (the existing per-node download behavior). Use DistributionSharded to opt the model into a sharded distribution mode where chunks are spread across cluster nodes by an external sharded cache.",
+          "description": "Distribution selects how the model's weights are laid out across the cluster. PerNode, the default, puts a full copy on each selected node. Sharded is for loading the model through an external cache that holds it in chunks across the cluster. Sharded is in development: OME has no way to configure such a cache yet, so a Sharded model can't be served. pvc:// models can't use Sharded.",
           "type": "string"
         },
         "maxTokens": {
@@ -1473,7 +1473,7 @@
       }
     },
     "v1beta1.BenchmarkJob": {
-      "description": "BenchmarkJob is the schema for the BenchmarkJobs API",
+      "description": "BenchmarkJob runs genai-bench against an InferenceService or a URL and stores the results in the output location you choose.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -1555,7 +1555,7 @@
           "$ref": "#/definitions/v1beta1.EndpointSpec"
         },
         "huggingFaceSecretReference": {
-          "description": "HuggingFaceSecretReference is a reference to a Kubernetes Secret containing the Hugging Face API key. The referenced Secret must reside in the same namespace as the BenchmarkJob. This field replaces the raw HuggingFaceAPIKey field for improved security.",
+          "description": "HuggingFaceSecretReference is a reference to a Kubernetes Secret containing the Hugging Face API key. The referenced Secret must reside in the same namespace as the BenchmarkJob.",
           "$ref": "#/definitions/v1beta1.HuggingFaceSecretReference"
         },
         "maxRequestsPerIteration": {
@@ -1583,7 +1583,7 @@
           "$ref": "#/definitions/v1beta1.StorageSpec"
         },
         "podOverride": {
-          "description": "Pod defines the pod configuration for the benchmark job. This is optional, if not provided, default values will be used.",
+          "description": "PodOverride customizes the benchmark pod. OME merges it into the pod it builds by default, so fields you leave unset keep their defaults.",
           "$ref": "#/definitions/v1beta1.PodOverride"
         },
         "resultFolderName": {
@@ -1973,7 +1973,7 @@
       }
     },
     "v1beta1.ClusterBaseModel": {
-      "description": "ClusterBaseModel is the Schema for the basemodels API",
+      "description": "ClusterBaseModel describes a model for the whole cluster: it has the same spec as a BaseModel, but it's cluster-scoped rather than namespaced.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -2078,7 +2078,7 @@
       }
     },
     "v1beta1.ClusterServingRuntime": {
-      "description": "ClusterServingRuntime is the Schema for the servingruntimes API",
+      "description": "ClusterServingRuntime defines serving pods for the whole cluster: it has the same spec as a ServingRuntime, but it's cluster-scoped rather than namespaced.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -2424,7 +2424,7 @@
       }
     },
     "v1beta1.DecoderSpec": {
-      "description": "DecoderSpec defines the configuration for the Decoder component (token generation in PD-disaggregated deployment) Used specifically for prefill-decode disaggregated deployments to handle the token generation phase. Similar to EngineSpec in structure, it allows for detailed pod and container configuration, but is specifically used for the decode phase when separating prefill and decode processes.",
+      "description": "DecoderSpec defines the configuration for the Decoder component (token generation in PD-disaggregated deployment). Used specifically for prefill-decode disaggregated deployments to handle the token generation phase. Similar to EngineSpec in structure, it allows for detailed pod and container configuration, but is specifically used for the decode phase when separating prefill and decode processes.",
       "type": "object",
       "properties": {
         "acceleratorOverride": {
@@ -2491,7 +2491,7 @@
           "type": "boolean"
         },
         "ephemeralContainers": {
-          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
           "type": "array",
           "items": {
             "default": {},
@@ -2535,7 +2535,7 @@
           "type": "boolean"
         },
         "hostname": {
-          "description": "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+          "description": "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
           "type": "string"
         },
         "imagePullSecrets": {
@@ -2575,7 +2575,7 @@
           }
         },
         "leader": {
-          "description": "Leader node configuration (only used for multi-node deployment) Defines the pod and container spec for the leader node that coordinates distributed token generation in multi-node deployments.",
+          "description": "Leader node configuration (only used for multi-node deployment). Defines the pod and container spec for the leader node that coordinates distributed token generation in multi-node deployments.",
           "$ref": "#/definitions/v1beta1.LeaderSpec"
         },
         "lifecycle": {
@@ -2665,7 +2665,7 @@
           "type": "string"
         },
         "runner": {
-          "description": "Runner container override for customizing the main container This is essentially a container spec that can override the default container Defines the main decoder container configuration, including image, resource requests/limits, environment variables, and command.",
+          "description": "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Defines the main decoder container configuration, including image, resource requests/limits, environment variables, and command.",
           "$ref": "#/definitions/v1beta1.RunnerSpec"
         },
         "runtimeClassName": {
@@ -2783,7 +2783,7 @@
           "x-kubernetes-patch-strategy": "merge,retainKeys"
         },
         "worker": {
-          "description": "Worker nodes configuration (only used for multi-node deployment) Defines the pod and container spec for worker nodes that perform distributed token generation tasks as directed by the leader.",
+          "description": "Worker nodes configuration (only used for multi-node deployment). Defines the pod and container spec for worker nodes that perform distributed token generation tasks as directed by the leader.",
           "$ref": "#/definitions/v1beta1.WorkerSpec"
         }
       }
@@ -2903,7 +2903,7 @@
       }
     },
     "v1beta1.EngineSpec": {
-      "description": "EngineSpec defines the configuration for the Engine component (can be used for both single-node and multi-node deployments) Provides a comprehensive specification for deploying model serving containers and pods. It allows for complete Kubernetes pod configuration including main containers, init containers, sidecars, volumes, and other pod-level settings. For distributed deployments, it supports leader-worker architecture configuration.",
+      "description": "EngineSpec defines the configuration for the Engine component (can be used for both single-node and multi-node deployments). Provides a comprehensive specification for deploying model serving containers and pods. It allows for complete Kubernetes pod configuration including main containers, init containers, sidecars, volumes, and other pod-level settings. For distributed deployments, it supports leader-worker architecture configuration.",
       "type": "object",
       "properties": {
         "acceleratorOverride": {
@@ -2970,7 +2970,7 @@
           "type": "boolean"
         },
         "ephemeralContainers": {
-          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
           "type": "array",
           "items": {
             "default": {},
@@ -3014,7 +3014,7 @@
           "type": "boolean"
         },
         "hostname": {
-          "description": "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+          "description": "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
           "type": "string"
         },
         "imagePullSecrets": {
@@ -3054,7 +3054,7 @@
           }
         },
         "leader": {
-          "description": "Leader node configuration (only used for multi-node deployment) Defines the pod and container spec for the leader node that coordinates distributed inference in multi-node deployments.",
+          "description": "Leader node configuration (only used for multi-node deployment). Defines the pod and container spec for the leader node that coordinates distributed inference in multi-node deployments.",
           "$ref": "#/definitions/v1beta1.LeaderSpec"
         },
         "lifecycle": {
@@ -3144,7 +3144,7 @@
           "type": "string"
         },
         "runner": {
-          "description": "Runner container override for customizing the engine container This is essentially a container spec that can override the default container Defines the main model runner container configuration, including image, resource requests/limits, environment variables, and command.",
+          "description": "Runner container override for customizing the engine container. This is essentially a container spec that can override the default container. Defines the main model runner container configuration, including image, resource requests/limits, environment variables, and command.",
           "$ref": "#/definitions/v1beta1.RunnerSpec"
         },
         "runtimeClassName": {
@@ -3262,7 +3262,7 @@
           "x-kubernetes-patch-strategy": "merge,retainKeys"
         },
         "worker": {
-          "description": "Worker nodes configuration (only used for multi-node deployment) Defines the pod and container spec for worker nodes that perform distributed processing tasks as directed by the leader.",
+          "description": "Worker nodes configuration (only used for multi-node deployment). Defines the pod and container spec for worker nodes that perform distributed processing tasks as directed by the leader.",
           "$ref": "#/definitions/v1beta1.WorkerSpec"
         }
       }
@@ -3319,7 +3319,7 @@
       }
     },
     "v1beta1.FineTunedWeight": {
-      "description": "FineTunedWeight is the Schema for the finetunedweights API",
+      "description": "FineTunedWeight describes cluster-scoped weights trained from a base model, such as a LoRA adapter, that an InferenceService serves on top of that model.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -3855,7 +3855,7 @@
       }
     },
     "v1beta1.InferenceService": {
-      "description": "InferenceService is the Schema for the InferenceServices API",
+      "description": "InferenceService ties a model to a serving runtime and declares the engine, decoder and router components that OME turns into workloads.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -3929,7 +3929,7 @@
       }
     },
     "v1beta1.InferenceServiceSpec": {
-      "description": "InferenceServiceSpec is the top level type for this resource",
+      "description": "InferenceServiceSpec is the desired state of an InferenceService.",
       "type": "object",
       "properties": {
         "acceleratorSelector": {
@@ -3937,7 +3937,7 @@
           "$ref": "#/definitions/v1beta1.AcceleratorSelector"
         },
         "decoder": {
-          "description": "Decoder defines the decoder spec This is specifically used for PD (Prefill-Decode) disaggregated serving deployments. Similar to Engine in structure, it allows for container and pod specifications, but is only utilized when implementing the disaggregated serving pattern to separate the prefill and decode phases of inference.",
+          "description": "Decoder defines the decoder spec. This is specifically used for PD (Prefill-Decode) disaggregated serving deployments. Similar to Engine in structure, it allows for container and pod specifications, but is only utilized when implementing the disaggregated serving pattern to separate the prefill and decode phases of inference.",
           "$ref": "#/definitions/v1beta1.DecoderSpec"
         },
         "deploymentMode": {
@@ -3945,7 +3945,7 @@
           "type": "string"
         },
         "engine": {
-          "description": "Engine defines the serving engine spec This provides detailed container and pod specifications for model serving. It allows defining the model runner (container spec), as well as complete pod specifications including init containers, sidecar containers, and other pod-level configurations. Engine can also be configured for multi-node deployments using leader and worker specifications.",
+          "description": "Engine defines the serving engine spec. This provides detailed container and pod specifications for model serving. It allows defining the model runner (container spec), as well as complete pod specifications including init containers, sidecar containers, and other pod-level configurations. Engine can also be configured for multi-node deployments using leader and worker specifications.",
           "$ref": "#/definitions/v1beta1.EngineSpec"
         },
         "model": {
@@ -4073,7 +4073,7 @@
           "$ref": "#/definitions/v1beta1.PlacementStatus"
         },
         "rollout": {
-          "description": "Rollout is the run-model surface: the pinned active-run plan the executors consume, the previous run's bounded record, and the always-current per-group source resolution (including shadowed-policy previews). See rollout_run_types.go.",
+          "description": "Rollout is the run-model surface: the pinned active-run plan the executors consume, the previous run's bounded record, and the always-current per-group source resolution (including shadowed-policy previews).",
           "$ref": "#/definitions/v1beta1.RolloutStatus"
         },
         "rolloutCoordination": {
@@ -4612,7 +4612,7 @@
       }
     },
     "v1beta1.LeaderSpec": {
-      "description": "LeaderSpec defines the configuration for a leader node in a multi-node component The leader node coordinates the activities of worker nodes in distributed inference or token generation setups, handling task distribution and result aggregation.",
+      "description": "LeaderSpec defines the configuration for a leader node in a multi-node component. The leader node coordinates the activities of worker nodes in distributed inference or token generation setups, handling task distribution and result aggregation.",
       "type": "object",
       "properties": {
         "activeDeadlineSeconds": {
@@ -4655,7 +4655,7 @@
           "type": "boolean"
         },
         "ephemeralContainers": {
-          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
           "type": "array",
           "items": {
             "default": {},
@@ -4699,7 +4699,7 @@
           "type": "boolean"
         },
         "hostname": {
-          "description": "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+          "description": "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
           "type": "string"
         },
         "imagePullSecrets": {
@@ -4795,7 +4795,7 @@
           "type": "string"
         },
         "runner": {
-          "description": "Runner container override for customizing the main container This is essentially a container spec that can override the default container Provides fine-grained control over the container that executes the leader node's coordination logic.",
+          "description": "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Provides fine-grained control over the container that executes the leader node's coordination logic.",
           "$ref": "#/definitions/v1beta1.RunnerSpec"
         },
         "runtimeClassName": {
@@ -5209,7 +5209,7 @@
       }
     },
     "v1beta1.ModelCacheStatus": {
-      "description": "ModelCacheStatus reports the cluster-wide cache provider identity for models that use a sharded distribution backend. In the lazy- fetch flow, the sharded-cache daemons pull bytes on demand at first inference, so there is no separate \"placement progress\" to report — Backend + SourceUri are enough to identify the cache mapping.",
+      "description": "ModelCacheStatus identifies the external cache that holds a Sharded model. Sharded distribution is in development, and OME doesn't set this yet.",
       "type": "object",
       "properties": {
         "backend": {
@@ -5229,13 +5229,13 @@
       ],
       "properties": {
         "failedCopies": {
-          "description": "How many copies of this predictor's models failed to load recently",
+          "description": "How many copies of the model failed to load recently.",
           "type": "integer",
           "format": "int32",
           "default": 0
         },
         "totalCopies": {
-          "description": "Total number copies of this predictor's models that are currently loaded",
+          "description": "How many copies of the model are loaded.",
           "type": "integer",
           "format": "int32"
         }
@@ -5278,7 +5278,7 @@
           "type": "string"
         },
         "version": {
-          "description": "Version of the model format. Used in validating that a runtime supports a predictor. It Can be \"major\", \"major.minor\" or \"major.minor.patch\".",
+          "description": "Version of the model format. Runtime selection uses it to check that a runtime supports the model. It can be \"major\", \"major.minor\" or \"major.minor.patch\".",
           "type": "string"
         },
         "weight": {
@@ -5301,7 +5301,7 @@
           "type": "string"
         },
         "version": {
-          "description": "Version of the library. Used in validating that a runtime supports a predictor. It Can be \"major\", \"major.minor\" or \"major.minor.patch\".",
+          "description": "Version of the library. Runtime selection uses it to check that a runtime supports the model. It can be \"major\", \"major.minor\" or \"major.minor.patch\".",
           "type": "string"
         },
         "weight": {
@@ -5331,11 +5331,11 @@
       "type": "object",
       "properties": {
         "apiGroup": {
-          "description": "APIGroup of the resource being referenced Defaults to `ome.io` Specifies the Kubernetes API group of the referenced model.",
+          "description": "APIGroup of the resource being referenced. Specifies the Kubernetes API group of the referenced model.",
           "type": "string"
         },
         "fineTunedWeights": {
-          "description": "Optional FineTunedWeights references References to fine-tuned weights that should be applied to the base model.",
+          "description": "FineTunedWeights names the FineTunedWeight resources to apply to the base model.",
           "type": "array",
           "items": {
             "type": "string",
@@ -5344,11 +5344,11 @@
           "x-kubernetes-list-type": "atomic"
         },
         "kind": {
-          "description": "Kind of the model being referenced Defaults to ClusterBaseModel Specifies the Kubernetes resource kind of the referenced model.",
+          "description": "Kind of the model being referenced. Specifies the Kubernetes resource kind of the referenced model.",
           "type": "string"
         },
         "name": {
-          "description": "Name of the model being referenced Identifies the specific model to be used for inference.",
+          "description": "Name of the model being referenced. Identifies the specific model to be used for inference.",
           "type": "string",
           "default": ""
         },
@@ -5404,15 +5404,15 @@
           "$ref": "#/definitions/v1beta1.FailureInfo"
         },
         "modelCopies": {
-          "description": "Model copy information of the predictor's model.",
+          "description": "How many copies of the model are loaded, and how many failed.",
           "$ref": "#/definitions/v1beta1.ModelCopies"
         },
         "modelRevisionStates": {
-          "description": "State information of the predictor's model.",
+          "description": "The model's load state in the pods that serve it.",
           "$ref": "#/definitions/v1beta1.ModelRevisionStates"
         },
         "transitionStatus": {
-          "description": "Whether the available predictor endpoints reflect the current Spec or is in transition. Empty when the InferenceService is \"lean\" (no spec.model is declared) and no model-loading lifecycle applies; the controller leaves this field unset in that case. Populated as \"InProgress\" → \"UpToDate\" (or \"BlockedByFailedLoad\"/\"InvalidSpec\") by the controller once a model is referenced.",
+          "description": "Whether the pods serving the model reflect the current spec or are in transition. Empty when the InferenceService is \"lean\" (no spec.model is declared) and no model-loading lifecycle applies; the controller leaves this field unset in that case. Populated as \"InProgress\" → \"UpToDate\" (or \"BlockedByFailedLoad\"/\"InvalidSpec\") by the controller once a model is referenced.",
           "type": "string"
         }
       }
@@ -5425,11 +5425,11 @@
       ],
       "properties": {
         "cache": {
-          "description": "Cache contains cluster-wide cache progress when the model uses a sharded distribution backend.",
+          "description": "Cache identifies the external cache behind Sharded distribution, which is in development. OME doesn't set it yet.",
           "$ref": "#/definitions/v1beta1.ModelCacheStatus"
         },
         "conditions": {
-          "description": "Conditions describe cluster-wide model readiness and cache state. Sharded models report SourceReachable, MetadataExtracted, and Ready; PerNode models continue to report node-level state through NodesReady and NodesFailed.",
+          "description": "Conditions describe cluster-wide model readiness. OME sets them only for pvc:// models, which report SourceReachable and Ready. Other models report per-node state through NodesReady and NodesFailed.",
           "type": "array",
           "items": {
             "default": {},
@@ -5445,7 +5445,7 @@
           "$ref": "#/definitions/v1.Time"
         },
         "lifecycle": {
-          "description": "LifeCycle is an enum of Deprecated, Experiment, Public, Internal",
+          "description": "LifeCycle is the model's lifecycle stage, such as Deprecated, Experiment, Public or Internal. The API server doesn't check the value, and OME doesn't set it.",
           "type": "string"
         },
         "nodesFailed": {
@@ -6009,7 +6009,7 @@
           "type": "boolean"
         },
         "ephemeralContainers": {
-          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
           "type": "array",
           "items": {
             "default": {},
@@ -6053,7 +6053,7 @@
           "type": "boolean"
         },
         "hostname": {
-          "description": "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+          "description": "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
           "type": "string"
         },
         "imagePullSecrets": {
@@ -6698,7 +6698,7 @@
       }
     },
     "v1beta1.RolloutPolicy": {
-      "description": "RolloutPolicy is a namespaced, reusable rollout progression consumed by InferenceService rollout groups via RolloutGroup.PolicyRef.",
+      "description": "RolloutPolicy is a namespaced, reusable rollout progression consumed by InferenceService rollout groups via RolloutGroup.PolicyRef. Alpha. The API may change without notice.\n\nRolloutPolicy is off by default. To turn it on, set `ome.rolloutPolicy.enabled` to true on both the ome-crd and ome-resources Helm charts, which install the CRD and its validating webhook. The manager looks for the CRD only when it starts.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -7073,7 +7073,7 @@
           "$ref": "#/definitions/v1beta1.AutoscalerPolicyRef"
         },
         "config": {
-          "description": "Additional configuration parameters for the runner This can include framework-specific settings",
+          "description": "Additional configuration parameters for the runner. This can include framework-specific settings.",
           "type": "object",
           "additionalProperties": {
             "type": "string",
@@ -7111,7 +7111,7 @@
           "type": "boolean"
         },
         "ephemeralContainers": {
-          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
           "type": "array",
           "items": {
             "default": {},
@@ -7155,7 +7155,7 @@
           "type": "boolean"
         },
         "hostname": {
-          "description": "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+          "description": "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
           "type": "string"
         },
         "imagePullSecrets": {
@@ -7571,7 +7571,7 @@
       }
     },
     "v1beta1.RunnerSpec": {
-      "description": "RunnerSpec defines container configuration plus additional config settings The Runner is the primary container that executes the model serving or token generation logic.",
+      "description": "RunnerSpec defines container configuration plus additional config settings. The Runner is the primary container that executes the model serving or token generation logic.",
       "type": "object",
       "properties": {
         "args": {
@@ -7837,7 +7837,7 @@
       }
     },
     "v1beta1.ServingRuntime": {
-      "description": "ServingRuntime is the Schema for the servingruntimes API",
+      "description": "ServingRuntime defines, within one namespace, the pods that serve a model and the model formats and sizes it supports, so OME can select it automatically.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -7994,7 +7994,7 @@
       "type": "object",
       "properties": {
         "apiGroup": {
-          "description": "APIGroup of the resource being referenced Defaults to `ome.io` Specifies the Kubernetes API group of the referenced runtime.",
+          "description": "APIGroup of the resource being referenced. Specifies the Kubernetes API group of the referenced runtime.",
           "type": "string"
         },
         "autoSync": {
@@ -8002,11 +8002,11 @@
           "type": "boolean"
         },
         "kind": {
-          "description": "Kind of the runtime being referenced Defaults to ClusterServingRuntime Specifies the Kubernetes resource kind of the referenced runtime. ClusterServingRuntime is a cluster-wide runtime, while ServingRuntime is namespace-scoped.",
+          "description": "Kind of the runtime being referenced. Specifies the Kubernetes resource kind of the referenced runtime. ClusterServingRuntime is a cluster-wide runtime, while ServingRuntime is namespace-scoped.",
           "type": "string"
         },
         "name": {
-          "description": "Name of the runtime being referenced Identifies the specific runtime environment to be used for model execution.",
+          "description": "Name of the runtime being referenced. Identifies the specific runtime environment to be used for model execution.",
           "type": "string",
           "default": ""
         },
@@ -8109,7 +8109,7 @@
           }
         },
         "protocolVersions": {
-          "description": "Supported protocol versions (i.e. openAI or cohere or openInference-v1 or openInference-v2)",
+          "description": "ProtocolVersions lists the inference protocols the runtime serves: openAI, openInference-v1 or openInference-v2. Runtime selection doesn't read it.",
           "type": "array",
           "items": {
             "type": "string",
@@ -8254,11 +8254,11 @@
       ],
       "properties": {
         "downloadPolicy": {
-          "description": "DownloadPolicy describes the policy of downloading model artifacts Supported policies: - AlwaysDownload: always download a copy of model artifact in destination path - ReuseIfExists: if the identical model artifact has been downloaded in the node, such artifact will be reused",
+          "description": "DownloadPolicy describes the policy of downloading model artifacts. Supported policies:\n\n- AlwaysDownload, the default: always download a copy of the model to its path. - ReuseIfExists: reuse Hugging Face files that another model already downloaded to the node.",
           "type": "string"
         },
         "key": {
-          "description": "StorageKey is the name of the key in a Kubernetes Secret used to authenticate access to the model storage. This key will be used to fetch credentials during model download or access.",
+          "description": "Key is the name of a Secret that holds a Hugging Face token. The model agent reads it only for hf:// models, from the model's namespace, or from the ome namespace for a ClusterBaseModel. It takes the token from the Secret's token key, or from the key that parameters.secretKey names.",
           "type": "string"
         },
         "nodeAffinity": {
@@ -8291,7 +8291,7 @@
           "type": "string"
         },
         "storageUri": {
-          "description": "StorageUri specifies the source URI of the model in a supported storage backend. Supported formats: - OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path} - Persistent Volume:    pvc://{pvc-name}/{sub-path} - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path} - Hugging Face:         hf://{org}/{repo}[@{revision}] - Amazon S3:            s3://{bucket}/{object_path} - Azure Blob Storage:   az://{account}/{container}/{object_path} - Google Cloud Storage: gs://{bucket}/{object_path} - GitHub:               github://{org}/{repo}[@{tag}] - Local filesystem:     local://{path} This field is required.",
+          "description": "StorageUri specifies the source URI of the model in a supported storage backend. Supported formats:\n\n- OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path} - Persistent Volume:    pvc://{pvc-name}/{sub-path} - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path} - Hugging Face:         hf://{org}/{repo}[@{revision}] - Amazon S3:            s3://{bucket}/{object_path} - Azure Blob Storage:   az://{account}/{container}/{object_path} - Google Cloud Storage: gs://{bucket}/{object_path} - GitHub:               github://{org}/{repo}[@{tag}] - Local filesystem:     local://{path}",
           "type": "string"
         }
       }
@@ -8323,7 +8323,7 @@
           "type": "string"
         },
         "modelCacheProviders": {
-          "description": "ModelCacheProviders lists model cache providers this runtime can load from when a BaseModel uses sharded distribution. Empty means this format supports only the default local/per-node model loading path.",
+          "description": "ModelCacheProviders lists the external model caches this runtime can load a Sharded model from. Sharded distribution is in development: OME can't serve a Sharded model yet, so this list has no effect.",
           "type": "array",
           "items": {
             "type": "string",
@@ -8358,7 +8358,7 @@
           "type": "string"
         },
         "version": {
-          "description": "Version of the model format. Used in validating that a runtime supports a predictor. It Can be \"major\", \"major.minor\" or \"major.minor.patch\".",
+          "description": "Version of the model format. Runtime selection doesn't read it: to match on a version, set modelFormat.version. It can be \"major\", \"major.minor\" or \"major.minor.patch\".",
           "type": "string"
         }
       }
@@ -8403,7 +8403,7 @@
       }
     },
     "v1beta1.TrafficMap": {
-      "description": "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status, including Published and PublicationFallback.",
+      "description": "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher. Alpha. The API may change without notice.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status, including Published and PublicationFallback.",
       "type": "object",
       "properties": {
         "apiVersion": {
@@ -8838,7 +8838,7 @@
       }
     },
     "v1beta1.WorkerSpec": {
-      "description": "WorkerSpec defines the configuration for worker nodes in a multi-node component Worker nodes perform the distributed processing tasks assigned by the leader node, enabling horizontal scaling for compute-intensive workloads.",
+      "description": "WorkerSpec defines the configuration for worker nodes in a multi-node component. Worker nodes perform the distributed processing tasks assigned by the leader node, enabling horizontal scaling for compute-intensive workloads.",
       "type": "object",
       "properties": {
         "activeDeadlineSeconds": {
@@ -8881,7 +8881,7 @@
           "type": "boolean"
         },
         "ephemeralContainers": {
-          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+          "description": "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
           "type": "array",
           "items": {
             "default": {},
@@ -8925,7 +8925,7 @@
           "type": "boolean"
         },
         "hostname": {
-          "description": "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+          "description": "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
           "type": "string"
         },
         "imagePullSecrets": {
@@ -9021,7 +9021,7 @@
           "type": "string"
         },
         "runner": {
-          "description": "Runner container override for customizing the main container This is essentially a container spec that can override the default container Provides fine-grained control over the container that executes the worker node's processing logic.",
+          "description": "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Provides fine-grained control over the container that executes the worker node's processing logic.",
           "$ref": "#/definitions/v1beta1.RunnerSpec"
         },
         "runtimeClassName": {
@@ -9121,7 +9121,7 @@
       }
     },
     "v1beta1.WorkloadCluster": {
-      "description": "WorkloadCluster registers a workload cluster OME can place workloads onto typically a GPU cluster. Cluster-scoped: it is fleet-level infrastructure, not a namespaced workload.",
+      "description": "WorkloadCluster registers a workload cluster, typically a GPU cluster, that OME can place workloads onto. Cluster-scoped: it is fleet-level infrastructure, not a namespaced workload. Alpha. The API may change without notice.",
       "type": "object",
       "properties": {
         "apiVersion": {

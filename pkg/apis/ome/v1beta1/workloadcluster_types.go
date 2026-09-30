@@ -11,8 +11,10 @@ import (
 // reads capacity live from the cluster's own Kueue.
 const WorkloadClusterReady = "Ready"
 
-// WorkloadCluster registers a workload cluster OME can place workloads onto
-// typically a GPU cluster. Cluster-scoped: it is fleet-level infrastructure, not a namespaced workload.
+// WorkloadCluster registers a workload cluster, typically a GPU cluster, that
+// OME can place workloads onto. Cluster-scoped: it is fleet-level
+// infrastructure, not a namespaced workload.
+// Alpha. The API may change without notice.
 // +genclient
 // +genclient:nonNamespaced
 // +k8s:openapi-gen=true
@@ -21,6 +23,7 @@ const WorkloadClusterReady = "Ready"
 // +kubebuilder:resource:scope=Cluster,shortName=wlc
 // +kubebuilder:printcolumn:name="Reachable",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +ome:since=v1.3
 type WorkloadCluster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

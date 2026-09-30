@@ -38,6 +38,7 @@ import (
 // +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"
 // +kubebuilder:printcolumn:name="Available",type="integer",JSONPath=".status.availableReplicas"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +ome:since=v1.3
 type InferenceReplica struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -566,8 +567,8 @@ type InstanceStatusColumns struct {
 	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
 	Admitted *string `json:"admitted,omitempty"`
 
-	// ActiveOrdinalOne is the index set of Instances whose activeOrdinal is
-	// 1. Absent means every activeOrdinal is 0.
+	// ActiveOrdinalOne is the index set of Instances whose
+	// activeOrdinal is 1. Absent means every activeOrdinal is 0.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`

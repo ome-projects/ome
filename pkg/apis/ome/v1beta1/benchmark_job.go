@@ -5,7 +5,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// BenchmarkJob is the schema for the BenchmarkJobs API
+// BenchmarkJob runs genai-bench against an InferenceService or a URL and
+// stores the results in the output location you choose.
 // +k8s:openapi-gen=true
 // +genclient
 // +kubebuilder:object:root=true
@@ -27,7 +28,6 @@ type BenchmarkJob struct {
 type BenchmarkJobSpec struct {
 	// HuggingFaceSecretReference is a reference to a Kubernetes Secret containing the Hugging Face API key.
 	// The referenced Secret must reside in the same namespace as the BenchmarkJob.
-	// This field replaces the raw HuggingFaceAPIKey field for improved security.
 	// +optional
 	HuggingFaceSecretReference *HuggingFaceSecretReference `json:"huggingFaceSecretReference,omitempty"`
 
@@ -84,7 +84,8 @@ type BenchmarkJobSpec struct {
 	// +optional
 	ResultFolderName *string `json:"resultFolderName,omitempty"`
 
-	// Pod defines the pod configuration for the benchmark job. This is optional, if not provided, default values will be used.
+	// PodOverride customizes the benchmark pod. OME merges it into the pod
+	// it builds by default, so fields you leave unset keep their defaults.
 	// +optional
 	PodOverride *PodOverride `json:"podOverride,omitempty"`
 }

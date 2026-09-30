@@ -36,6 +36,7 @@ Key packages:
 - `config/models/` and `config/runtimes/` — the catalog of pre-configured models and SGLang (`srt`) / vLLM runtime definitions.
 - `oeps/` — OME Enhancement Proposals. Major features and API changes require an OEP (see CONTRIBUTING.md); check `oeps/<n>/oep.yaml` for status before building on in-progress designs.
 - `site/` — Hugo documentation site. Use Node 20 so `package-lock.json` stays in sync with CI.
+- `website/` — the redesigned documentation site (SvelteKit on Cloudflare, Node 22 and pnpm 10) that replaces `site/` at launch. Until then, documentation changes still go to `site/`.
 
 ## Conventions
 

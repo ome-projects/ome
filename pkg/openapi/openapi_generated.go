@@ -1093,7 +1093,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorConstraints(ref common.ReferenceCall
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "ArchitectureFamilies limits selection to specific families Examples: [\"nvidia-hopper\", \"nvidia-ampere\"]",
+							Description: "ArchitectureFamilies limits selection to specific families. Examples: [\"nvidia-hopper\", \"nvidia-ampere\"].",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -1113,7 +1113,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorConstraints(ref common.ReferenceCall
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "PreferredPrecisions lists numeric precisions in order of preference Examples: [\"fp8\", \"fp16\", \"fp32\"]",
+							Description: "PreferredPrecisions lists numeric precisions in order of preference. Examples: [\"fp8\", \"fp16\", \"fp32\"].",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -1295,7 +1295,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorModelConfig(ref common.ReferenceCall
 				Properties: map[string]spec.Schema{
 					"minMemoryPerBillionParams": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MinMemoryPerBillionParams specifies memory required per billion parameters Used to calculate if a model fits on the accelerator",
+							Description: "MinMemoryPerBillionParams specifies memory required per billion parameters. OME doesn't read it.",
 							Type:        []string{"integer"},
 							Format:      "int64",
 						},
@@ -1402,7 +1402,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorQuota(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "AcceleratorQuota is one node of the fleet quota tree. Cluster-scoped: it is fleet-level capacity policy, not a namespaced workload.\n\nThe name-length rule is deliberately at the root rather than under spec: removecrdvalidation replaces only the spec and status schemas, so a root rule is the one structural check that also holds in the minimal CRD variant.\n\nColumn names and order follow the kubectl-qt plugin, so a node reads the same either way, and the budget every node carries is in the default view rather than behind -o wide. Only status.budgets[0] fits a row; the plugin emits one per (resource, flavor) pair. Observed capacity is deliberately not a column: the root alone reports it, so in a flat list it would be blank on every other row. Read it off the root directly, or through the plugin, which has the tree to put it in.",
+				Description: "AcceleratorQuota is one node of the fleet quota tree. Cluster-scoped: it is fleet-level capacity policy, not a namespaced workload.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -1889,7 +1889,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorRequirements(ref common.ReferenceCal
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "RequiredFeatures lists hardware features that must be present Examples: [\"tensor-cores\", \"fp8\", \"nvlink\"]",
+							Description: "RequiredFeatures lists hardware features that must be present. Examples: [\"tensor-cores\", \"fp8\", \"nvlink\"].",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -1909,7 +1909,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorRequirements(ref common.ReferenceCal
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "PreferredPrecisions lists numeric precisions in order of preference Examples: [\"fp8\", \"fp16\", \"fp32\"]",
+							Description: "PreferredPrecisions lists numeric precisions in order of preference. Examples: [\"fp8\", \"fp16\", \"fp32\"].",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -2033,7 +2033,7 @@ func schema_pkg_apis_ome_v1beta1_AcceleratorSelector(ref common.ReferenceCallbac
 				Properties: map[string]spec.Schema{
 					"acceleratorClass": {
 						SchemaProps: spec.SchemaProps{
-							Description: "AcceleratorClass explicitly selects a specific AcceleratorClass Takes precedence over other selectors",
+							Description: "AcceleratorClass explicitly selects a specific AcceleratorClass. Takes precedence over other selectors.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -2225,7 +2225,7 @@ func schema_pkg_apis_ome_v1beta1_AutoscalerPolicy(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "AutoscalerPolicy is a reusable, parameterized autoscaler template. Components attach individually via spec.<component>.autoscalerPolicyRef on the InferenceService; the referenced template is rendered per component at reconcile time into a verbatim ComponentAutoscaler and fed to the existing autoscaler dispatch. Creating a policy actuates nothing by itself: the per-component ref is the only attachment mechanism. Alpha. The API may change without notice.",
+				Description: "AutoscalerPolicy is a reusable, parameterized autoscaler template. Components attach individually via spec.<component>.autoscalerPolicyRef on the InferenceService; the referenced template is rendered per component at reconcile time into a verbatim ComponentAutoscaler and fed to the existing autoscaler dispatch. Creating a policy actuates nothing by itself: the per-component ref is the only attachment mechanism. Alpha. The API may change without notice.\n\nAutoscalerPolicy is off by default. To turn it on, set `ome.autoscalerPolicy.enabled` to true on both the ome-crd and ome-resources Helm charts, which install the CRD and its validating webhook. The manager looks for the CRD only when it starts.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -2529,7 +2529,7 @@ func schema_pkg_apis_ome_v1beta1_BaseModel(ref common.ReferenceCallback) common.
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "BaseModel is the Schema for the basemodels API",
+				Description: "BaseModel describes a model in one namespace: where its weights live, which nodes keep a copy, and what the model is, such as its architecture, size and capabilities.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -2722,7 +2722,7 @@ func schema_pkg_apis_ome_v1beta1_BaseModelSpec(ref common.ReferenceCallback) com
 					},
 					"distribution": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Distribution selects how the model's bytes are made available across the cluster. A nil value is treated as DistributionPerNode (the existing per-node download behavior). Use DistributionSharded to opt the model into a sharded distribution mode where chunks are spread across cluster nodes by an external sharded cache.",
+							Description: "Distribution selects how the model's weights are laid out across the cluster. PerNode, the default, puts a full copy on each selected node. Sharded is for loading the model through an external cache that holds it in chunks across the cluster. Sharded is in development: OME has no way to configure such a cache yet, so a Sharded model can't be served. pvc:// models can't use Sharded.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -2823,7 +2823,7 @@ func schema_pkg_apis_ome_v1beta1_BenchmarkJob(ref common.ReferenceCallback) comm
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "BenchmarkJob is the schema for the BenchmarkJobs API",
+				Description: "BenchmarkJob runs genai-bench against an InferenceService or a URL and stores the results in the output location you choose.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -2924,7 +2924,7 @@ func schema_pkg_apis_ome_v1beta1_BenchmarkJobSpec(ref common.ReferenceCallback) 
 				Properties: map[string]spec.Schema{
 					"huggingFaceSecretReference": {
 						SchemaProps: spec.SchemaProps{
-							Description: "HuggingFaceSecretReference is a reference to a Kubernetes Secret containing the Hugging Face API key. The referenced Secret must reside in the same namespace as the BenchmarkJob. This field replaces the raw HuggingFaceAPIKey field for improved security.",
+							Description: "HuggingFaceSecretReference is a reference to a Kubernetes Secret containing the Hugging Face API key. The referenced Secret must reside in the same namespace as the BenchmarkJob.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.HuggingFaceSecretReference"),
 						},
 					},
@@ -3040,7 +3040,7 @@ func schema_pkg_apis_ome_v1beta1_BenchmarkJobSpec(ref common.ReferenceCallback) 
 					},
 					"podOverride": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Pod defines the pod configuration for the benchmark job. This is optional, if not provided, default values will be used.",
+							Description: "PodOverride customizes the benchmark pod. OME merges it into the pod it builds by default, so fields you leave unset keep their defaults.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PodOverride"),
 						},
 					},
@@ -3683,7 +3683,7 @@ func schema_pkg_apis_ome_v1beta1_ClusterBaseModel(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "ClusterBaseModel is the Schema for the basemodels API",
+				Description: "ClusterBaseModel describes a model for the whole cluster: it has the same spec as a BaseModel, but it's cluster-scoped rather than namespaced.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -3874,7 +3874,7 @@ func schema_pkg_apis_ome_v1beta1_ClusterServingRuntime(ref common.ReferenceCallb
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "ClusterServingRuntime is the Schema for the servingruntimes API",
+				Description: "ClusterServingRuntime defines serving pods for the whole cluster: it has the same spec as a ServingRuntime, but it's cluster-scoped rather than namespaced.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -4470,7 +4470,7 @@ func schema_pkg_apis_ome_v1beta1_DecoderSpec(ref common.ReferenceCallback) commo
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "DecoderSpec defines the configuration for the Decoder component (token generation in PD-disaggregated deployment) Used specifically for prefill-decode disaggregated deployments to handle the token generation phase. Similar to EngineSpec in structure, it allows for detailed pod and container configuration, but is specifically used for the decode phase when separating prefill and decode processes.",
+				Description: "DecoderSpec defines the configuration for the Decoder component (token generation in PD-disaggregated deployment). Used specifically for prefill-decode disaggregated deployments to handle the token generation phase. Similar to EngineSpec in structure, it allows for detailed pod and container configuration, but is specifically used for the decode phase when separating prefill and decode processes.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"volumes": {
@@ -4557,7 +4557,7 @@ func schema_pkg_apis_ome_v1beta1_DecoderSpec(ref common.ReferenceCallback) commo
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -4706,7 +4706,7 @@ func schema_pkg_apis_ome_v1beta1_DecoderSpec(ref common.ReferenceCallback) commo
 					},
 					"hostname": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -5048,19 +5048,19 @@ func schema_pkg_apis_ome_v1beta1_DecoderSpec(ref common.ReferenceCallback) commo
 					},
 					"runner": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Runner container override for customizing the main container This is essentially a container spec that can override the default container Defines the main decoder container configuration, including image, resource requests/limits, environment variables, and command.",
+							Description: "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Defines the main decoder container configuration, including image, resource requests/limits, environment variables, and command.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"),
 						},
 					},
 					"leader": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Leader node configuration (only used for multi-node deployment) Defines the pod and container spec for the leader node that coordinates distributed token generation in multi-node deployments.",
+							Description: "Leader node configuration (only used for multi-node deployment). Defines the pod and container spec for the leader node that coordinates distributed token generation in multi-node deployments.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LeaderSpec"),
 						},
 					},
 					"worker": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Worker nodes configuration (only used for multi-node deployment) Defines the pod and container spec for worker nodes that perform distributed token generation tasks as directed by the leader.",
+							Description: "Worker nodes configuration (only used for multi-node deployment). Defines the pod and container spec for worker nodes that perform distributed token generation tasks as directed by the leader.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.WorkerSpec"),
 						},
 					},
@@ -5309,7 +5309,7 @@ func schema_pkg_apis_ome_v1beta1_EngineSpec(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "EngineSpec defines the configuration for the Engine component (can be used for both single-node and multi-node deployments) Provides a comprehensive specification for deploying model serving containers and pods. It allows for complete Kubernetes pod configuration including main containers, init containers, sidecars, volumes, and other pod-level settings. For distributed deployments, it supports leader-worker architecture configuration.",
+				Description: "EngineSpec defines the configuration for the Engine component (can be used for both single-node and multi-node deployments). Provides a comprehensive specification for deploying model serving containers and pods. It allows for complete Kubernetes pod configuration including main containers, init containers, sidecars, volumes, and other pod-level settings. For distributed deployments, it supports leader-worker architecture configuration.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"volumes": {
@@ -5396,7 +5396,7 @@ func schema_pkg_apis_ome_v1beta1_EngineSpec(ref common.ReferenceCallback) common
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -5545,7 +5545,7 @@ func schema_pkg_apis_ome_v1beta1_EngineSpec(ref common.ReferenceCallback) common
 					},
 					"hostname": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -5887,19 +5887,19 @@ func schema_pkg_apis_ome_v1beta1_EngineSpec(ref common.ReferenceCallback) common
 					},
 					"runner": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Runner container override for customizing the engine container This is essentially a container spec that can override the default container Defines the main model runner container configuration, including image, resource requests/limits, environment variables, and command.",
+							Description: "Runner container override for customizing the engine container. This is essentially a container spec that can override the default container. Defines the main model runner container configuration, including image, resource requests/limits, environment variables, and command.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"),
 						},
 					},
 					"leader": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Leader node configuration (only used for multi-node deployment) Defines the pod and container spec for the leader node that coordinates distributed inference in multi-node deployments.",
+							Description: "Leader node configuration (only used for multi-node deployment). Defines the pod and container spec for the leader node that coordinates distributed inference in multi-node deployments.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LeaderSpec"),
 						},
 					},
 					"worker": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Worker nodes configuration (only used for multi-node deployment) Defines the pod and container spec for worker nodes that perform distributed processing tasks as directed by the leader.",
+							Description: "Worker nodes configuration (only used for multi-node deployment). Defines the pod and container spec for worker nodes that perform distributed processing tasks as directed by the leader.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.WorkerSpec"),
 						},
 					},
@@ -6028,7 +6028,7 @@ func schema_pkg_apis_ome_v1beta1_FineTunedWeight(ref common.ReferenceCallback) c
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "FineTunedWeight is the Schema for the finetunedweights API",
+				Description: "FineTunedWeight describes cluster-scoped weights trained from a base model, such as a LoRA adapter, that an InferenceService serves on top of that model.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -6956,7 +6956,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceService(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InferenceService is the Schema for the InferenceServices API",
+				Description: "InferenceService ties a model to a serving runtime and declares the engine, decoder and router components that OME turns into workloads.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -7082,7 +7082,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InferenceServiceSpec is the top level type for this resource",
+				Description: "InferenceServiceSpec is the desired state of an InferenceService.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"deploymentMode": {
@@ -7094,13 +7094,13 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 					},
 					"engine": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Engine defines the serving engine spec This provides detailed container and pod specifications for model serving. It allows defining the model runner (container spec), as well as complete pod specifications including init containers, sidecar containers, and other pod-level configurations. Engine can also be configured for multi-node deployments using leader and worker specifications.",
+							Description: "Engine defines the serving engine spec. This provides detailed container and pod specifications for model serving. It allows defining the model runner (container spec), as well as complete pod specifications including init containers, sidecar containers, and other pod-level configurations. Engine can also be configured for multi-node deployments using leader and worker specifications.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec"),
 						},
 					},
 					"decoder": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Decoder defines the decoder spec This is specifically used for PD (Prefill-Decode) disaggregated serving deployments. Similar to Engine in structure, it allows for container and pod specifications, but is only utilized when implementing the disaggregated serving pattern to separate the prefill and decode phases of inference.",
+							Description: "Decoder defines the decoder spec. This is specifically used for PD (Prefill-Decode) disaggregated serving deployments. Similar to Engine in structure, it allows for container and pod specifications, but is only utilized when implementing the disaggregated serving pattern to separate the prefill and decode phases of inference.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec"),
 						},
 					},
@@ -7344,7 +7344,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceStatus(ref common.ReferenceCall
 					},
 					"rollout": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Rollout is the run-model surface: the pinned active-run plan the executors consume, the previous run's bounded record, and the always-current per-group source resolution (including shadowed-policy previews). See rollout_run_types.go.",
+							Description: "Rollout is the run-model surface: the pinned active-run plan the executors consume, the previous run's bounded record, and the always-current per-group source resolution (including shadowed-policy previews).",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutStatus"),
 						},
 					},
@@ -8262,7 +8262,7 @@ func schema_pkg_apis_ome_v1beta1_LeaderSpec(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "LeaderSpec defines the configuration for a leader node in a multi-node component The leader node coordinates the activities of worker nodes in distributed inference or token generation setups, handling task distribution and result aggregation.",
+				Description: "LeaderSpec defines the configuration for a leader node in a multi-node component. The leader node coordinates the activities of worker nodes in distributed inference or token generation setups, handling task distribution and result aggregation.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"volumes": {
@@ -8349,7 +8349,7 @@ func schema_pkg_apis_ome_v1beta1_LeaderSpec(ref common.ReferenceCallback) common
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -8498,7 +8498,7 @@ func schema_pkg_apis_ome_v1beta1_LeaderSpec(ref common.ReferenceCallback) common
 					},
 					"hostname": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -8735,7 +8735,7 @@ func schema_pkg_apis_ome_v1beta1_LeaderSpec(ref common.ReferenceCallback) common
 					},
 					"runner": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Runner container override for customizing the main container This is essentially a container spec that can override the default container Provides fine-grained control over the container that executes the leader node's coordination logic.",
+							Description: "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Provides fine-grained control over the container that executes the leader node's coordination logic.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"),
 						},
 					},
@@ -9270,7 +9270,7 @@ func schema_pkg_apis_ome_v1beta1_ModelCacheStatus(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "ModelCacheStatus reports the cluster-wide cache provider identity for models that use a sharded distribution backend. In the lazy- fetch flow, the sharded-cache daemons pull bytes on demand at first inference, so there is no separate \"placement progress\" to report — Backend + SourceUri are enough to identify the cache mapping.",
+				Description: "ModelCacheStatus identifies the external cache that holds a Sharded model. Sharded distribution is in development, and OME doesn't set this yet.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"backend": {
@@ -9301,7 +9301,7 @@ func schema_pkg_apis_ome_v1beta1_ModelCopies(ref common.ReferenceCallback) commo
 				Properties: map[string]spec.Schema{
 					"failedCopies": {
 						SchemaProps: spec.SchemaProps{
-							Description: "How many copies of this predictor's models failed to load recently",
+							Description: "How many copies of the model failed to load recently.",
 							Default:     0,
 							Type:        []string{"integer"},
 							Format:      "int32",
@@ -9309,7 +9309,7 @@ func schema_pkg_apis_ome_v1beta1_ModelCopies(ref common.ReferenceCallback) commo
 					},
 					"totalCopies": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Total number copies of this predictor's models that are currently loaded",
+							Description: "How many copies of the model are loaded.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
@@ -9383,7 +9383,7 @@ func schema_pkg_apis_ome_v1beta1_ModelFormat(ref common.ReferenceCallback) commo
 					},
 					"version": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Version of the model format. Used in validating that a runtime supports a predictor. It Can be \"major\", \"major.minor\" or \"major.minor.patch\".",
+							Description: "Version of the model format. Runtime selection uses it to check that a runtime supports the model. It can be \"major\", \"major.minor\" or \"major.minor.patch\".",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9424,7 +9424,7 @@ func schema_pkg_apis_ome_v1beta1_ModelFrameworkSpec(ref common.ReferenceCallback
 					},
 					"version": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Version of the library. Used in validating that a runtime supports a predictor. It Can be \"major\", \"major.minor\" or \"major.minor.patch\".",
+							Description: "Version of the library. Runtime selection uses it to check that a runtime supports the model. It can be \"major\", \"major.minor\" or \"major.minor.patch\".",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9489,7 +9489,7 @@ func schema_pkg_apis_ome_v1beta1_ModelRef(ref common.ReferenceCallback) common.O
 				Properties: map[string]spec.Schema{
 					"name": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Name of the model being referenced Identifies the specific model to be used for inference.",
+							Description: "Name of the model being referenced. Identifies the specific model to be used for inference.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -9497,14 +9497,14 @@ func schema_pkg_apis_ome_v1beta1_ModelRef(ref common.ReferenceCallback) common.O
 					},
 					"kind": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Kind of the model being referenced Defaults to ClusterBaseModel Specifies the Kubernetes resource kind of the referenced model.",
+							Description: "Kind of the model being referenced. Specifies the Kubernetes resource kind of the referenced model.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"apiGroup": {
 						SchemaProps: spec.SchemaProps{
-							Description: "APIGroup of the resource being referenced Defaults to `ome.io` Specifies the Kubernetes API group of the referenced model.",
+							Description: "APIGroup of the resource being referenced. Specifies the Kubernetes API group of the referenced model.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9516,7 +9516,7 @@ func schema_pkg_apis_ome_v1beta1_ModelRef(ref common.ReferenceCallback) common.O
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Optional FineTunedWeights references References to fine-tuned weights that should be applied to the base model.",
+							Description: "FineTunedWeights names the FineTunedWeight resources to apply to the base model.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -9621,14 +9621,14 @@ func schema_pkg_apis_ome_v1beta1_ModelStatus(ref common.ReferenceCallback) commo
 				Properties: map[string]spec.Schema{
 					"transitionStatus": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Whether the available predictor endpoints reflect the current Spec or is in transition. Empty when the InferenceService is \"lean\" (no spec.model is declared) and no model-loading lifecycle applies; the controller leaves this field unset in that case. Populated as \"InProgress\" → \"UpToDate\" (or \"BlockedByFailedLoad\"/\"InvalidSpec\") by the controller once a model is referenced.",
+							Description: "Whether the pods serving the model reflect the current spec or are in transition. Empty when the InferenceService is \"lean\" (no spec.model is declared) and no model-loading lifecycle applies; the controller leaves this field unset in that case. Populated as \"InProgress\" → \"UpToDate\" (or \"BlockedByFailedLoad\"/\"InvalidSpec\") by the controller once a model is referenced.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"modelRevisionStates": {
 						SchemaProps: spec.SchemaProps{
-							Description: "State information of the predictor's model.",
+							Description: "The model's load state in the pods that serve it.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRevisionStates"),
 						},
 					},
@@ -9640,7 +9640,7 @@ func schema_pkg_apis_ome_v1beta1_ModelStatus(ref common.ReferenceCallback) commo
 					},
 					"modelCopies": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Model copy information of the predictor's model.",
+							Description: "How many copies of the model are loaded, and how many failed.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCopies"),
 						},
 					},
@@ -9661,7 +9661,7 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 				Properties: map[string]spec.Schema{
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "LifeCycle is an enum of Deprecated, Experiment, Public, Internal",
+							Description: "LifeCycle is the model's lifecycle stage, such as Deprecated, Experiment, Public or Internal. The API server doesn't check the value, and OME doesn't set it.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -9735,7 +9735,7 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Conditions describe cluster-wide model readiness and cache state. Sharded models report SourceReachable, MetadataExtracted, and Ready; PerNode models continue to report node-level state through NodesReady and NodesFailed.",
+							Description: "Conditions describe cluster-wide model readiness. OME sets them only for pvc:// models, which report SourceReachable and Ready. Other models report per-node state through NodesReady and NodesFailed.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -9749,7 +9749,7 @@ func schema_pkg_apis_ome_v1beta1_ModelStatusSpec(ref common.ReferenceCallback) c
 					},
 					"cache": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Cache contains cluster-wide cache progress when the model uses a sharded distribution backend.",
+							Description: "Cache identifies the external cache behind Sharded distribution, which is in development. OME doesn't set it yet.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelCacheStatus"),
 						},
 					},
@@ -10661,7 +10661,7 @@ func schema_pkg_apis_ome_v1beta1_PodSpec(ref common.ReferenceCallback) common.Op
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -10810,7 +10810,7 @@ func schema_pkg_apis_ome_v1beta1_PodSpec(ref common.ReferenceCallback) common.Op
 					},
 					"hostname": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -11864,7 +11864,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutPolicy(ref common.ReferenceCallback) com
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "RolloutPolicy is a namespaced, reusable rollout progression consumed by InferenceService rollout groups via RolloutGroup.PolicyRef.",
+				Description: "RolloutPolicy is a namespaced, reusable rollout progression consumed by InferenceService rollout groups via RolloutGroup.PolicyRef. Alpha. The API may change without notice.\n\nRolloutPolicy is off by default. To turn it on, set `ome.rolloutPolicy.enabled` to true on both the ome-crd and ome-resources Helm charts, which install the CRD and its validating webhook. The manager looks for the CRD only when it starts.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -12560,7 +12560,7 @@ func schema_pkg_apis_ome_v1beta1_RouterSpec(ref common.ReferenceCallback) common
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -12709,7 +12709,7 @@ func schema_pkg_apis_ome_v1beta1_RouterSpec(ref common.ReferenceCallback) common
 					},
 					"hostname": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -13057,7 +13057,7 @@ func schema_pkg_apis_ome_v1beta1_RouterSpec(ref common.ReferenceCallback) common
 					},
 					"config": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Additional configuration parameters for the runner This can include framework-specific settings",
+							Description: "Additional configuration parameters for the runner. This can include framework-specific settings.",
 							Type:        []string{"object"},
 							AdditionalProperties: &spec.SchemaOrBool{
 								Allows: true,
@@ -13405,7 +13405,7 @@ func schema_pkg_apis_ome_v1beta1_RunnerSpec(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "RunnerSpec defines container configuration plus additional config settings The Runner is the primary container that executes the model serving or token generation logic.",
+				Description: "RunnerSpec defines container configuration plus additional config settings. The Runner is the primary container that executes the model serving or token generation logic.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"name": {
@@ -13864,7 +13864,7 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntime(ref common.ReferenceCallback) co
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "ServingRuntime is the Schema for the servingruntimes API",
+				Description: "ServingRuntime defines, within one namespace, the pods that serve a model and the model formats and sizes it supports, so OME can select it automatically.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -14151,7 +14151,7 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeRef(ref common.ReferenceCallback)
 				Properties: map[string]spec.Schema{
 					"name": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Name of the runtime being referenced Identifies the specific runtime environment to be used for model execution.",
+							Description: "Name of the runtime being referenced. Identifies the specific runtime environment to be used for model execution.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -14159,14 +14159,14 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeRef(ref common.ReferenceCallback)
 					},
 					"kind": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Kind of the runtime being referenced Defaults to ClusterServingRuntime Specifies the Kubernetes resource kind of the referenced runtime. ClusterServingRuntime is a cluster-wide runtime, while ServingRuntime is namespace-scoped.",
+							Description: "Kind of the runtime being referenced. Specifies the Kubernetes resource kind of the referenced runtime. ClusterServingRuntime is a cluster-wide runtime, while ServingRuntime is namespace-scoped.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"apiGroup": {
 						SchemaProps: spec.SchemaProps{
-							Description: "APIGroup of the resource being referenced Defaults to `ome.io` Specifies the Kubernetes API group of the referenced runtime.",
+							Description: "APIGroup of the resource being referenced. Specifies the Kubernetes API group of the referenced runtime.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -14255,7 +14255,7 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeSpec(ref common.ReferenceCallback
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Supported protocol versions (i.e. openAI or cohere or openInference-v1 or openInference-v2)",
+							Description: "ProtocolVersions lists the inference protocols the runtime serves: openAI, openInference-v1 or openInference-v2. Runtime selection doesn't read it.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -14658,14 +14658,14 @@ func schema_pkg_apis_ome_v1beta1_StorageSpec(ref common.ReferenceCallback) commo
 					},
 					"key": {
 						SchemaProps: spec.SchemaProps{
-							Description: "StorageKey is the name of the key in a Kubernetes Secret used to authenticate access to the model storage. This key will be used to fetch credentials during model download or access.",
+							Description: "Key is the name of a Secret that holds a Hugging Face token. The model agent reads it only for hf:// models, from the model's namespace, or from the ome namespace for a ClusterBaseModel. It takes the token from the Secret's token key, or from the key that parameters.secretKey names.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"storageUri": {
 						SchemaProps: spec.SchemaProps{
-							Description: "StorageUri specifies the source URI of the model in a supported storage backend. Supported formats: - OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path} - Persistent Volume:    pvc://{pvc-name}/{sub-path} - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path} - Hugging Face:         hf://{org}/{repo}[@{revision}] - Amazon S3:            s3://{bucket}/{object_path} - Azure Blob Storage:   az://{account}/{container}/{object_path} - Google Cloud Storage: gs://{bucket}/{object_path} - GitHub:               github://{org}/{repo}[@{tag}] - Local filesystem:     local://{path} This field is required.",
+							Description: "StorageUri specifies the source URI of the model in a supported storage backend. Supported formats:\n\n- OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path} - Persistent Volume:    pvc://{pvc-name}/{sub-path} - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path} - Hugging Face:         hf://{org}/{repo}[@{revision}] - Amazon S3:            s3://{bucket}/{object_path} - Azure Blob Storage:   az://{account}/{container}/{object_path} - Google Cloud Storage: gs://{bucket}/{object_path} - GitHub:               github://{org}/{repo}[@{tag}] - Local filesystem:     local://{path}",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -14699,7 +14699,7 @@ func schema_pkg_apis_ome_v1beta1_StorageSpec(ref common.ReferenceCallback) commo
 					},
 					"downloadPolicy": {
 						SchemaProps: spec.SchemaProps{
-							Description: "DownloadPolicy describes the policy of downloading model artifacts Supported policies: - AlwaysDownload: always download a copy of model artifact in destination path - ReuseIfExists: if the identical model artifact has been downloaded in the node, such artifact will be reused",
+							Description: "DownloadPolicy describes the policy of downloading model artifacts. Supported policies:\n\n- AlwaysDownload, the default: always download a copy of the model to its path. - ReuseIfExists: reuse Hugging Face files that another model already downloaded to the node.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -14742,7 +14742,7 @@ func schema_pkg_apis_ome_v1beta1_SupportedModelFormat(ref common.ReferenceCallba
 					},
 					"version": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Version of the model format. Used in validating that a runtime supports a predictor. It Can be \"major\", \"major.minor\" or \"major.minor.patch\".",
+							Description: "Version of the model format. Runtime selection doesn't read it: to match on a version, set modelFormat.version. It can be \"major\", \"major.minor\" or \"major.minor.patch\".",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -14780,7 +14780,7 @@ func schema_pkg_apis_ome_v1beta1_SupportedModelFormat(ref common.ReferenceCallba
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "ModelCacheProviders lists model cache providers this runtime can load from when a BaseModel uses sharded distribution. Empty means this format supports only the default local/per-node model loading path.",
+							Description: "ModelCacheProviders lists the external model caches this runtime can load a Sharded model from. Sharded distribution is in development: OME can't serve a Sharded model yet, so this list has no effect.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -14897,7 +14897,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMap(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status, including Published and PublicationFallback.",
+				Description: "TrafficMap is the capacity-aware routing projection of one multi-cluster InferenceService: the per-home traffic split a gateway consumes. Placement decides WHERE an ISVC's replicas run and quota decides HOW MUCH each home may run; TrafficMap decides the WEIGHTS. It is generated by a control-plane routing controller from status.placement plus accelerator-quota allocation, never hand-edited, and consumed by a gateway-neutral publisher. Alpha. The API may change without notice.\n\nOne TrafficMap exists per routed ISVC, named after it and owned by it (so it is garbage-collected with the ISVC), for as long as that ISVC is routed -- including while no home is routable, when the table is empty or all-zero and the Routable condition says why. The routing controller owns spec, SourceUID, and the Routable, CapacityFallback, and OverrideActive conditions; the publisher owns the rest of status, including Published and PublicationFallback.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -15652,7 +15652,7 @@ func schema_pkg_apis_ome_v1beta1_WorkerSpec(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "WorkerSpec defines the configuration for worker nodes in a multi-node component Worker nodes perform the distributed processing tasks assigned by the leader node, enabling horizontal scaling for compute-intensive workloads.",
+				Description: "WorkerSpec defines the configuration for worker nodes in a multi-node component. Worker nodes perform the distributed processing tasks assigned by the leader node, enabling horizontal scaling for compute-intensive workloads.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"volumes": {
@@ -15739,7 +15739,7 @@ func schema_pkg_apis_ome_v1beta1_WorkerSpec(ref common.ReferenceCallback) common
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource.",
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -15888,7 +15888,7 @@ func schema_pkg_apis_ome_v1beta1_WorkerSpec(ref common.ReferenceCallback) common
 					},
 					"hostname": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Specifies the hostname of the Pod If not specified, the pod's hostname will be set to a system-defined value.",
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -16132,7 +16132,7 @@ func schema_pkg_apis_ome_v1beta1_WorkerSpec(ref common.ReferenceCallback) common
 					},
 					"runner": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Runner container override for customizing the main container This is essentially a container spec that can override the default container Provides fine-grained control over the container that executes the worker node's processing logic.",
+							Description: "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Provides fine-grained control over the container that executes the worker node's processing logic.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"),
 						},
 					},
@@ -16148,7 +16148,7 @@ func schema_pkg_apis_ome_v1beta1_WorkloadCluster(ref common.ReferenceCallback) c
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "WorkloadCluster registers a workload cluster OME can place workloads onto typically a GPU cluster. Cluster-scoped: it is fleet-level infrastructure, not a namespaced workload.",
+				Description: "WorkloadCluster registers a workload cluster, typically a GPU cluster, that OME can place workloads onto. Cluster-scoped: it is fleet-level infrastructure, not a namespaced workload. Alpha. The API may change without notice.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {

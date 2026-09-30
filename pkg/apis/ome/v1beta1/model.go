@@ -11,8 +11,8 @@ type ModelFormat struct {
 	// +required
 	Name string `json:"name"`
 	// Version of the model format.
-	// Used in validating that a runtime supports a predictor.
-	// It Can be "major", "major.minor" or "major.minor.patch".
+	// Runtime selection uses it to check that a runtime supports the model.
+	// It can be "major", "major.minor" or "major.minor.patch".
 	// +optional
 	Version *string `json:"version,omitempty"`
 	// Operator for the selector with supported values: "Equal", "GreaterThan"
@@ -31,8 +31,8 @@ type ModelFrameworkSpec struct {
 	// +required
 	Name string `json:"name"`
 	// Version of the library.
-	// Used in validating that a runtime supports a predictor.
-	// It Can be "major", "major.minor" or "major.minor.patch".
+	// Runtime selection uses it to check that a runtime supports the model.
+	// It can be "major", "major.minor" or "major.minor.patch".
 	// +optional
 	Version *string `json:"version,omitempty"`
 	// Operator for the selector with supported values: "Equal", "GreaterThan"
@@ -114,13 +114,16 @@ type StorageSpec struct {
 	// +optional
 	Parameters *map[string]string `json:"parameters,omitempty"`
 
-	// StorageKey is the name of the key in a Kubernetes Secret used to authenticate access to the model storage.
-	// This key will be used to fetch credentials during model download or access.
+	// Key is the name of a Secret that holds a Hugging Face token. The model
+	// agent reads it only for hf:// models, from the model's namespace, or
+	// from the ome namespace for a ClusterBaseModel. It takes the token from
+	// the Secret's token key, or from the key that parameters.secretKey names.
 	// +optional
 	StorageKey *string `json:"key,omitempty"`
 
 	// StorageUri specifies the source URI of the model in a supported storage backend.
 	// Supported formats:
+	//
 	// - OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path}
 	// - Persistent Volume:    pvc://{pvc-name}/{sub-path}
 	// - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path}
@@ -130,7 +133,6 @@ type StorageSpec struct {
 	// - Google Cloud Storage: gs://{bucket}/{object_path}
 	// - GitHub:               github://{org}/{repo}[@{tag}]
 	// - Local filesystem:     local://{path}
-	// This field is required.
 	// +required
 	StorageUri *string `json:"storageUri,omitempty"`
 
@@ -145,14 +147,19 @@ type StorageSpec struct {
 	// +optional
 	NodeAffinity *v1.NodeAffinity `json:"nodeAffinity,omitempty" protobuf:"bytes,1,opt,name=nodeAffinity"`
 
-	// DownloadPolicy describes the policy of downloading model artifacts
+	// DownloadPolicy describes the policy of downloading model artifacts.
 	// Supported policies:
-	// - AlwaysDownload: always download a copy of model artifact in destination path
-	// - ReuseIfExists: if the identical model artifact has been downloaded in the node, such artifact will be reused
+	//
+	// - AlwaysDownload, the default: always download a copy of the model to its path.
+	// - ReuseIfExists: reuse Hugging Face files that another model already downloaded to the node.
 	// +optional
 	DownloadPolicy *DownloadPolicy `json:"downloadPolicy,omitempty"`
 }
 
+// DownloadPolicy decides whether a node keeps a separate copy of a model's
+// files. AlwaysDownload, the default, keeps one per model. ReuseIfExists lets
+// the model agent reuse Hugging Face files that another model already
+// downloaded to the node.
 // +kubebuilder:validation:Enum=AlwaysDownload;ReuseIfExists
 type DownloadPolicy string
 
@@ -161,7 +168,9 @@ const (
 	ReuseIfExists  DownloadPolicy = "ReuseIfExists"
 )
 
-// Distribution selects how a BaseModel's bytes are distributed across the cluster.
+// Distribution selects how a BaseModel's weights are laid out across the
+// cluster. Sharded is in development, and OME can't serve a Sharded model
+// yet.
 // +kubebuilder:validation:Enum=PerNode;Sharded
 type Distribution string
 
@@ -172,12 +181,11 @@ const (
 	// Distribution is treated as PerNode for backwards compatibility.
 	DistributionPerNode Distribution = "PerNode"
 
-	// DistributionSharded distributes the model as chunks across the cluster
-	// via an external sharded cache. The BaseModel controller probes source
-	// reachability and parses metadata through the cache; bytes are pulled
-	// on demand at first inference (lazy fetch). The model agent skips this
-	// BaseModel entirely. The specific sharded cache implementation is
-	// configured at the cluster level.
+	// DistributionSharded is for loading the model through an external cache
+	// that holds it in chunks across the cluster. It is in development: OME
+	// has no way to configure such a cache yet, so a Sharded model can't be
+	// served, and the model agent still downloads it to each selected node
+	// as for PerNode. pvc:// models can't use it.
 	DistributionSharded Distribution = "Sharded"
 )
 
@@ -234,12 +242,14 @@ type BaseModelSpec struct {
 	// +required
 	Storage *StorageSpec `json:"storage,omitempty"`
 
-	// Distribution selects how the model's bytes are made available across the
-	// cluster. A nil value is treated as DistributionPerNode (the existing
-	// per-node download behavior). Use DistributionSharded to opt the model
-	// into a sharded distribution mode where chunks are spread across cluster
-	// nodes by an external sharded cache.
+	// Distribution selects how the model's weights are laid out across the
+	// cluster. PerNode, the default, puts a full copy on each selected node.
+	// Sharded is for loading the model through an external cache that holds
+	// it in chunks across the cluster. Sharded is in development: OME has no
+	// way to configure such a cache yet, so a Sharded model can't be served.
+	// pvc:// models can't use Sharded.
 	// +optional
+	// +ome:since=v1.3
 	Distribution *Distribution `json:"distribution,omitempty"`
 
 	// ModelExtension is the common extension of the model
@@ -495,11 +505,8 @@ const (
 	ModelConditionReasonPVCConfigMissing = "PVCConfigMissing"
 )
 
-// ModelCacheStatus reports the cluster-wide cache provider identity
-// for models that use a sharded distribution backend. In the lazy-
-// fetch flow, the sharded-cache daemons pull bytes on demand at first
-// inference, so there is no separate "placement progress" to report
-// — Backend + SourceUri are enough to identify the cache mapping.
+// ModelCacheStatus identifies the external cache that holds a Sharded model.
+// Sharded distribution is in development, and OME doesn't set this yet.
 type ModelCacheStatus struct {
 	// Backend identifies the configured cache provider.
 	// +optional
@@ -512,7 +519,9 @@ type ModelCacheStatus struct {
 
 // ModelStatusSpec defines the observed state of Model weight
 type ModelStatusSpec struct {
-	// LifeCycle is an enum of Deprecated, Experiment, Public, Internal
+	// LifeCycle is the model's lifecycle stage, such as Deprecated,
+	// Experiment, Public or Internal. The API server doesn't check the
+	// value, and OME doesn't set it.
 	LifeCycle *string `json:"lifecycle,omitempty"`
 
 	// Status of the model weight
@@ -538,22 +547,24 @@ type ModelStatusSpec struct {
 	// +listType=atomic
 	NodesFailed []string `json:"nodesFailed,omitempty"`
 
-	// Conditions describe cluster-wide model readiness and cache state.
-	// Sharded models report SourceReachable, MetadataExtracted, and Ready;
-	// PerNode models continue to report node-level state through NodesReady
-	// and NodesFailed.
+	// Conditions describe cluster-wide model readiness. OME sets them only
+	// for pvc:// models, which report SourceReachable and Ready. Other models
+	// report per-node state through NodesReady and NodesFailed.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Cache contains cluster-wide cache progress when the model uses a sharded
-	// distribution backend.
+	// Cache identifies the external cache behind Sharded distribution, which
+	// is in development. OME doesn't set it yet.
 	// +optional
+	// +ome:since=v1.3
 	Cache *ModelCacheStatus `json:"cache,omitempty"`
 }
 
-// BaseModel is the Schema for the basemodels API
+// BaseModel describes a model in one namespace: where its weights live,
+// which nodes keep a copy, and what the model is, such as its architecture,
+// size and capabilities.
 // +k8s:openapi-gen=true
 // +genclient
 // +kubebuilder:object:root=true
@@ -578,7 +589,8 @@ type BaseModel struct {
 	Status ModelStatusSpec `json:"status,omitempty"`
 }
 
-// ClusterBaseModel is the Schema for the basemodels API
+// ClusterBaseModel describes a model for the whole cluster: it has the same
+// spec as a BaseModel, but it's cluster-scoped rather than namespaced.
 // +k8s:openapi-gen=true
 // +genclient
 // +genclient:nonNamespaced
@@ -623,7 +635,9 @@ type ClusterBaseModelList struct {
 	Items           []ClusterBaseModel `json:"items"`
 }
 
-// FineTunedWeight is the Schema for the finetunedweights API
+// FineTunedWeight describes cluster-scoped weights trained from a base
+// model, such as a LoRA adapter, that an InferenceService serves on top of
+// that model.
 // +k8s:openapi-gen=true
 // +genclient
 // +genclient:nonNamespaced

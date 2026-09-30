@@ -25,14 +25,15 @@ repos:
     hooks:
       - id: codespell
         # Preserve literal truncated CLI column labels in documentation samples.
-        args: ['-L', 'AfterAll,NotIn,UpToDate,WithT,allReady,rouge,trough', '--ignore-regex', '^TrafficMap (?:Admi|Trun)\.\.\.']
+        args: ['-L', 'AfterAll,NotIn,OptIn,UpToDate,WithT,allReady,rouge,trough', '--ignore-regex', '^TrafficMap (?:Admi|Trun)\.\.\.']
         exclude: |
           (?x)^(
             charts/.*/templates/.*\.yaml$|
             config/crd/.*|
             site/assets/.*\.svg$|
             .*go\.sum$|
-            .*package-lock\.json$
+            .*package-lock\.json$|
+            website/pnpm-lock\.yaml$
           )$
 
   - repo: local

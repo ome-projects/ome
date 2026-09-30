@@ -94,6 +94,7 @@ documentation:
     - any-glob-to-any-file:
       - '**/*.md'
       - 'site/**/*'
+      - 'website/**/*'
       - 'README*'
 
 # Dependencies

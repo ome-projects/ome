@@ -269,6 +269,11 @@ type AutoscalerPolicyStatus struct {
 // per-component ref is the only attachment mechanism.
 // Alpha. The API may change without notice.
 //
+// AutoscalerPolicy is off by default. To turn it on, set
+// `ome.autoscalerPolicy.enabled` to true on both the ome-crd and
+// ome-resources Helm charts, which install the CRD and its validating
+// webhook. The manager looks for the CRD only when it starts.
+//
 // +k8s:openapi-gen=true
 // +genclient
 // +kubebuilder:object:root=true
@@ -278,6 +283,7 @@ type AutoscalerPolicyStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="Attached",type="integer",JSONPath=".status.attachedComponents"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +ome:since=v1.3
 type AutoscalerPolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

@@ -228,12 +228,24 @@ const (
 	AcceleratorQuotaDistributionProportional AcceleratorQuotaDistributionPolicy = "Proportional"
 )
 
+// The name-length rule on AcceleratorQuota is deliberately at the root rather
+// than under spec: removecrdvalidation replaces only the spec and status
+// schemas, so a root rule is the one structural check that also holds in the
+// minimal CRD variant.
+//
+// The printer column names and order follow the kubectl-qt plugin, so a node
+// reads the same either way, and the budget every node carries is in the
+// default view rather than behind -o wide. Only status.budgets[0] fits a row;
+// the plugin emits one per (resource, flavor) pair. Observed capacity is
+// deliberately not a column: the root alone reports it, so in a flat list it
+// would be blank on every other row. Read it off the root directly, or
+// through the plugin, which has the tree to put it in.
+//
+// These notes are kept apart from the doc comment below so they stay out of
+// the generated API reference and OpenAPI descriptions.
+
 // AcceleratorQuota is one node of the fleet quota tree. Cluster-scoped: it is
 // fleet-level capacity policy, not a namespaced workload.
-//
-// The name-length rule is deliberately at the root rather than under spec:
-// removecrdvalidation replaces only the spec and status schemas, so a root rule
-// is the one structural check that also holds in the minimal CRD variant.
 //
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 63",message="an AcceleratorQuota name may not exceed 63 characters; it is copied into a label value on every Kueue object the node materializes"
 // +k8s:openapi-gen=true
@@ -244,13 +256,6 @@ const (
 // +kubebuilder:resource:scope=Cluster,path=acceleratorquotas,shortName=aq,singular=acceleratorquota
 // +kubebuilder:printcolumn:name="Role",type=string,JSONPath=`.spec.role`
 // +kubebuilder:printcolumn:name="Parent",type=string,JSONPath=`.spec.parentRef.name`
-// Column names and order follow the kubectl-qt plugin, so a node reads the same
-// either way, and the budget every node carries is in the default view rather
-// than behind -o wide. Only status.budgets[0] fits a row; the plugin emits one
-// per (resource, flavor) pair. Observed capacity is deliberately not a column:
-// the root alone reports it, so in a flat list it would be blank on every other
-// row. Read it off the root directly, or through the plugin, which has the tree
-// to put it in.
 // +kubebuilder:printcolumn:name="Resource",type=string,JSONPath=`.status.budgets[0].resourceName`
 // +kubebuilder:printcolumn:name="Flavor",type=string,JSONPath=`.status.budgets[0].resourceFlavor`
 // +kubebuilder:printcolumn:name="Nominal",type=string,JSONPath=`.status.budgets[0].nominal`
@@ -259,6 +264,7 @@ const (
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Degraded",type=string,JSONPath=`.status.conditions[?(@.type=="Degraded")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +ome:since=v1.3
 type AcceleratorQuota struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

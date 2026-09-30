@@ -2,6 +2,18 @@ hiddenMemberFields:
   - "TypeMeta"
   - "ObjectMeta"
 
+# List types are only containers for API responses.
+#
+# No resource has a field of the second pattern's types: enums whose fields
+# are plain strings, the runtime selector's internal result, the kedaConfig
+# types v1.3 removed, and the rollout coordination types spec.rollout
+# replaced. Don't hide a type that's only a map's value type, such as
+# AcceleratorModelConfig: genref doesn't list it under "Used by", but a
+# field still links to it.
+hideTypePatterns:
+  - "^sigs\\.k8s\\.io/ome/pkg/apis/ome/v1beta1\\.\\w+List$"
+  - "^sigs\\.k8s\\.io/ome/pkg/apis/ome/v1beta1\\.(ModelCapability|ModelAPICapability|ModelWeightStatus|ServingMode|SupportedRuntime|KedaConfig|ScalerAuthenticationRef|RolloutCoordinationSpec|RolloutCoordinationGroup|CoordinationPacing|CoordinationPacingType)$"
+
 apis:
   - name: ome
     title: OME API
@@ -27,6 +39,10 @@ externalPackages:
     target: https://pkg.go.dev/sigs.k8s.io/gateway-api/apis/v1#{{- .TypeIdentifier -}}
   - match: ^volcano\.sh/apis/batch/v1alpha1\.
     target: https://pkg.go.dev/volcano.sh/apis/batch/v1alpha1#{{- .TypeIdentifier -}}
+  - match: ^k8s\.io/apimachinery/pkg/util/intstr\.IntOrString$
+    target: https://pkg.go.dev/k8s.io/apimachinery/pkg/util/intstr#IntOrString
+  - match: ^k8s\.io/apimachinery/pkg/types\.UID$
+    target: https://pkg.go.dev/k8s.io/apimachinery/pkg/types#UID
   - match: ^k8s\.io/apimachinery/pkg/runtime\.RawExtension$
     target: https://pkg.go.dev/k8s.io/apimachinery/pkg/runtime#RawExtension
   - match: ^knative\.dev/pkg/apis\.URL$

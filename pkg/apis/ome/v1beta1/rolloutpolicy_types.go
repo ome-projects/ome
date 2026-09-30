@@ -96,6 +96,12 @@ type RolloutPolicyStatus struct {
 
 // RolloutPolicy is a namespaced, reusable rollout progression consumed by
 // InferenceService rollout groups via RolloutGroup.PolicyRef.
+// Alpha. The API may change without notice.
+//
+// RolloutPolicy is off by default. To turn it on, set
+// `ome.rolloutPolicy.enabled` to true on both the ome-crd and ome-resources
+// Helm charts, which install the CRD and its validating webhook. The manager
+// looks for the CRD only when it starts.
 //
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
@@ -104,6 +110,7 @@ type RolloutPolicyStatus struct {
 // +kubebuilder:printcolumn:name="Digest",type="string",JSONPath=".status.portableDigest"
 // +kubebuilder:printcolumn:name="Refs",type="integer",JSONPath=".status.attachedGroups"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +ome:since=v1.3
 type RolloutPolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

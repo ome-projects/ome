@@ -9,13 +9,14 @@ import (
 
 // InferenceServiceStatus defines the observed state of InferenceService
 type InferenceServiceStatus struct {
-	// Conditions for the InferenceService <br/>
-	// - EngineReady: engine readiness condition; <br/>
-	// - DecoderReady: decoder readiness condition; <br/>
-	// - RouterReady: router readiness condition; <br/>
-	// - IngressReady: ingress resource readiness; <br/>
+	// Conditions for the InferenceService:
+	//
+	// - EngineReady: engine readiness condition.
+	// - DecoderReady: decoder readiness condition.
+	// - RouterReady: router readiness condition.
+	// - IngressReady: ingress resource readiness.
 	// - Ready: component aggregate on workload clusters, or placement serving
-	//   readiness on a multi-cluster control-plane source; <br/>
+	//   readiness on a multi-cluster control-plane source.
 	duckv1.Status `json:",inline"`
 	// Addressable endpoint for the InferenceService
 	// +optional
@@ -33,6 +34,7 @@ type InferenceServiceStatus struct {
 	// status.address is the "cluster-local" entry — both projections of this list.
 	// +optional
 	// +listType=atomic
+	// +ome:since=v1.3
 	Addresses []duckv1.Addressable `json:"addresses,omitempty"`
 	// Statuses for the components of the InferenceService
 	Components map[ComponentType]ComponentStatusSpec `json:"components,omitempty"`
@@ -44,6 +46,7 @@ type InferenceServiceStatus struct {
 	// controller-owned ConfigMap).
 	// +optional
 	// +listType=atomic
+	// +ome:since=v1.3
 	MigrationHistory []MigrationHistoryEntry `json:"migrationHistory,omitempty"`
 
 	// MountedOverlays lists overlays the controller attached to the
@@ -52,6 +55,7 @@ type InferenceServiceStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=name
+	// +ome:since=v1.3
 	MountedOverlays []MountedOverlay `json:"mountedOverlays,omitempty"`
 
 	// Traffic reflects the resolved backend traffic policy
@@ -59,17 +63,20 @@ type InferenceServiceStatus struct {
 	// intent is declared via spec.traffic or any ome.io/* traffic
 	// annotation; otherwise nil so older clients see nothing.
 	// +optional
+	// +ome:since=v1.3
 	Traffic *TrafficStatus `json:"traffic,omitempty"`
 
 	// Canary tracks an in-progress spec.rollout.canary rollout (the step
 	// state machine). Absent when no canary is running.
 	// +optional
+	// +ome:since=v1.3
 	Canary *CanaryStatus `json:"canary,omitempty"`
 
 	// Placement reports multi-cluster placement of this ISVC, set by
 	// the control-plane fan-out controller. Empty on workload clusters and on
 	// single-cluster deployments.
 	// +optional
+	// +ome:since=v1.3
 	Placement *PlacementStatus `json:"placement,omitempty"`
 
 	// PinnedRevisionName is the ControllerRevision (OME ns) driving
@@ -86,8 +93,9 @@ type InferenceServiceStatus struct {
 	// Rollout is the run-model surface: the pinned active-run plan the
 	// executors consume, the previous run's bounded record, and the
 	// always-current per-group source resolution (including shadowed-policy
-	// previews). See rollout_run_types.go.
+	// previews).
 	// +optional
+	// +ome:since=v1.3
 	Rollout *RolloutStatus `json:"rollout,omitempty"`
 
 	// RolloutCoordination reports per-group cross-Component
@@ -95,6 +103,7 @@ type InferenceServiceStatus struct {
 	// when spec.rollout declares blueGreen/rollingUpdate groups
 	// (canary groups report under status.canary instead).
 	// +optional
+	// +ome:since=v1.3
 	RolloutCoordination *RolloutCoordinationStatus `json:"rolloutCoordination,omitempty"`
 }
 
@@ -132,6 +141,7 @@ type ComponentStatusSpec struct {
 	// Counterpart of the LifecycleSpec sub-block on ComponentExtensionSpec.
 	// Nil otherwise.
 	// +optional
+	// +ome:since=v1.3
 	Lifecycle *LifecycleStatus `json:"lifecycle,omitempty"`
 
 	// RolloutPhase reflects the current rollout state for this
@@ -142,6 +152,7 @@ type ComponentStatusSpec struct {
 	// the rollout contract — e.g. RawDeployment).
 	// +optional
 	// +kubebuilder:validation:Enum=Stable;Canarying;BlueGreenStandby;Pending;Paused;Promoting;RollingBack;RolledBack;Failed
+	// +ome:since=v1.3
 	RolloutPhase RolloutPhase `json:"rolloutPhase,omitempty"`
 
 	// LatestReadyRevision is the per-revision Service name
@@ -157,6 +168,7 @@ type ComponentStatusSpec struct {
 	// that fully owns this Component's traffic (i.e., the rollout has
 	// completed). Drives the consumer-side HTTPRoute backendRef.
 	// +optional
+	// +ome:since=v1.3
 	LatestRolledoutRevision string `json:"latestRolledoutRevision,omitempty"`
 
 	// PreviousRolledoutRevision is the per-revision Service name
@@ -166,6 +178,7 @@ type ComponentStatusSpec struct {
 	// advances. Retained for diagnosis and traffic reference during
 	// partial rollbacks.
 	// +optional
+	// +ome:since=v1.3
 	PreviousRolledoutRevision string `json:"previousRolledoutRevision,omitempty"`
 
 	// Traffic reports per-revision traffic weights for this
@@ -175,6 +188,7 @@ type ComponentStatusSpec struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=revisionName
+	// +ome:since=v1.3
 	Traffic []ComponentTrafficTarget `json:"traffic,omitempty"`
 
 	// Canary tracks the canary step machine for the unit this Component
@@ -188,6 +202,7 @@ type ComponentStatusSpec struct {
 	// other's step counter and revision pair. That field is retained as an
 	// alias for the entrypoint unit's run so existing readers keep working.
 	// +optional
+	// +ome:since=v1.3
 	Canary *CanaryStatus `json:"canary,omitempty"`
 
 	// Autoscaler reports the per-Component autoscaler state — resolved
@@ -197,6 +212,7 @@ type ComponentStatusSpec struct {
 	// the ISVC status writer for RawDeployment- and OMENative-managed
 	// Components. See ComponentAutoscalerStatus for the full field semantics.
 	// +optional
+	// +ome:since=v1.3
 	Autoscaler *ComponentAutoscalerStatus `json:"autoscaler,omitempty"`
 
 	// ScaleTargetRef is the canonical scale target for this Component.
@@ -208,6 +224,7 @@ type ComponentStatusSpec struct {
 	// Component has a defined scale target — independent of whether an
 	// OME-managed HPA / SO is active.
 	// +optional
+	// +ome:since=v1.3
 	ScaleTargetRef *ScaleTargetRef `json:"scaleTargetRef,omitempty"`
 }
 
@@ -297,7 +314,7 @@ const (
 )
 
 type ModelStatus struct {
-	// Whether the available predictor endpoints reflect the current Spec or is in transition.
+	// Whether the pods serving the model reflect the current spec or are in transition.
 	// Empty when the InferenceService is "lean" (no spec.model is declared) and
 	// no model-loading lifecycle applies; the controller leaves this field
 	// unset in that case. Populated as "InProgress" → "UpToDate" (or
@@ -306,7 +323,7 @@ type ModelStatus struct {
 	// +optional
 	TransitionStatus TransitionStatus `json:"transitionStatus,omitempty"`
 
-	// State information of the predictor's model.
+	// The model's load state in the pods that serve it.
 	// +optional
 	ModelRevisionStates *ModelRevisionStates `json:"modelRevisionStates,omitempty"`
 
@@ -314,7 +331,7 @@ type ModelStatus struct {
 	// +optional
 	LastFailureInfo *FailureInfo `json:"lastFailureInfo,omitempty"`
 
-	// Model copy information of the predictor's model.
+	// How many copies of the model are loaded, and how many failed.
 	// +optional
 	ModelCopies *ModelCopies `json:"modelCopies,omitempty"`
 }
@@ -328,10 +345,10 @@ type ModelRevisionStates struct {
 }
 
 type ModelCopies struct {
-	// How many copies of this predictor's models failed to load recently
+	// How many copies of the model failed to load recently.
 	// +kubebuilder:default=0
 	FailedCopies int `json:"failedCopies"`
-	// Total number copies of this predictor's models that are currently loaded
+	// How many copies of the model are loaded.
 	// +optional
 	TotalCopies int `json:"totalCopies,omitempty"`
 }
@@ -342,13 +359,13 @@ type TransitionStatus string
 
 // TransitionStatus Enum values
 const (
-	// Predictor is up-to-date (reflects current spec)
+	// The pods serving the model are up to date (reflect the current spec)
 	UpToDate TransitionStatus = "UpToDate"
 	// Waiting for target model to reach state of active model
 	InProgress TransitionStatus = "InProgress"
 	// Target model failed to load
 	BlockedByFailedLoad TransitionStatus = "BlockedByFailedLoad"
-	// Target predictor spec failed validation
+	// Target spec failed validation
 	InvalidSpec TransitionStatus = "InvalidSpec"
 )
 
