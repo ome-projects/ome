@@ -3,6 +3,8 @@ package inferencereplica
 import (
 	"context"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,9 +29,12 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/sliceprovision"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/tpuslice/gke"
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
@@ -236,6 +241,75 @@ func TestSetupWithManager_GangSchedulingFollowsThePodGroupCRD(t *testing.T) {
 			}
 			if !tc.present && err != nil {
 				t.Fatalf("setup must not touch the PodGroup index when the CRD is absent, got %v", err)
+			}
+		})
+	}
+}
+
+// TestSetupWithManager_TPUSlicesFollowTheSliceCRD pins the gated half of
+// slice provisioning: slices are read, and so provisioned and reported by
+// state, and their series are exported at zero, only when provisioning is
+// configured and the Slice CRD is installed; a configuration that would
+// overwrite a label the controller sets fails setup.
+func TestSetupWithManager_TPUSlicesFollowTheSliceCRD(t *testing.T) {
+	overwriting := sliceTestConfig()
+	overwriting.Slice.OwnerKindLabel = sliceprovision.LabelOwnerUID
+	for i, tc := range []struct {
+		name       string
+		config     *controllerconfig.TPUSliceProvisioningConfig
+		crd        bool
+		wantReader bool
+		wantErr    string
+	}{
+		{name: "configured, CRD installed", config: sliceTestConfig(), crd: true, wantReader: true},
+		{name: "configured, CRD absent", config: sliceTestConfig()},
+		{name: "unconfigured, CRD installed", crd: true},
+		{name: "configured to overwrite a controller label", config: overwriting, crd: true, wantErr: "TPU slice provisioning"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seedCRDDiscovery(false, false)
+			list := &metav1.APIResourceList{GroupVersion: gke.GroupVersion.String()}
+			if tc.crd {
+				list.APIResources = []metav1.APIResource{{Kind: gke.Kind}}
+			}
+			utils.SetAvailableResourcesForApi(gke.GroupVersion.String(), list)
+			mgr := newSetupManager(t, true)
+			r := wiredReconciler(mgr)
+			r.TPUSliceProvisioning = tc.config
+			// Each case's slices have their own type, so the series a case
+			// finds are the ones its setup exported.
+			sliceType := "setup-" + strconv.Itoa(i)
+			if tc.config != nil {
+				a := tc.config.Accelerators["tpu-a"]
+				a.SliceType = sliceType
+				tc.config.Accelerators["tpu-a"] = a
+			}
+
+			err := r.SetupWithManager(mgr)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("setup error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			if got := r.sliceReader != nil; got != tc.wantReader {
+				t.Fatalf("slices read = %v, want %v", got, tc.wantReader)
+			}
+			// The index can be registered once per cache, so a second
+			// registration fails exactly when setup registered it.
+			err = mgr.GetFieldIndexer().IndexField(context.Background(), &v1beta1.InferenceReplica{}, irUIDIndexField, irUIDIndexExtractor)
+			if got := err != nil; got != tc.wantReader {
+				t.Fatalf("InferenceReplica UID index registered = %v, want %v (second registration: %v)", got, tc.wantReader, err)
+			}
+			var wantSeries []string
+			if tc.wantReader {
+				wantSeries = []string{"2x2x1", "2x2x2"}
+			}
+			if got := createdSliceSeries(t, sliceType); !slices.Equal(got, wantSeries) {
+				t.Fatalf("created series of the configured topologies = %v, want %v", got, wantSeries)
 			}
 		})
 	}

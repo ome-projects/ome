@@ -59,12 +59,13 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun"
 	traffic "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/specdefaults"
 	isvcstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
+	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/render"
 	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
@@ -104,6 +105,7 @@ import (
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=keda.sh,resources=triggerauthentications,verbs=get;list;watch;create;update
@@ -243,6 +245,13 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// consistent.
 	log := r.Log.WithValues("namespace", isvc.Namespace, "isvc", isvc.Name)
 	ctx = ctrl.LoggerInto(ctx, log)
+	// Unsupported member authority must hold before any reconciliation writes.
+	// Deletion still follows finalizer cleanup regardless of the stored policy.
+	if isvc.DeletionTimestamp.IsZero() {
+		if _, err := protocol.FromDerived(isvc); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	deployConfig, err := controllerconfig.NewDeployConfigCached(r.ConfigCache, r.Clientset)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "fails to create DeployConfig")
@@ -252,6 +261,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// per-Component dispatch is resolved from the merged specs below.
 	deploymentMode := isvcutils.InferenceServiceDeploymentMode(isvc, constants.DeploymentModeType(deployConfig.DefaultDeploymentMode))
 	log.V(1).Info("InferenceService deployment mode resolved", "deploymentMode", deploymentMode)
+	placementMember := protocol.IsAffinityMember(isvc)
+	if placementMember && isvc.DeletionTimestamp.IsZero() && deploymentMode == constants.VirtualDeployment {
+		return r.holdPlacementBackend(ctx, isvc, fmt.Errorf("multicluster placement requires OMENative; VirtualDeployment has no member admission or surge accounting"))
+	}
 
 	// examine DeletionTimestamp to determine if object is under deletion
 	if isvc.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -306,6 +319,11 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.handleVirtualDeployment(isvc)
 	}
 
+	// The canary executor's state as this pass read it: the records, and the
+	// phase and traffic of every Component a canary group governs. The status
+	// flush keeps the live state over decisions made from a stale copy of it.
+	base := canary.NewBase(isvc)
+
 	// Initialize status if not already initialized
 	if isvc.Status.Components == nil {
 		isvc.Status.Components = make(map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec)
@@ -323,9 +341,11 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	modelConfigReconciler := multimodelconfig.NewModelConfigReconciler(r.Client, r.Clientset, r.Scheme)
-	result, err := modelConfigReconciler.Reconcile(ctx, isvc) // Added ctx
-	if err != nil {
-		return result, err
+	// A member's mounted model configuration must wait for backend validation.
+	if !placementMember {
+		if result, err := modelConfigReconciler.Reconcile(ctx, isvc); err != nil {
+			return result, err
+		}
 	}
 
 	cdeps := r.buildComponentDeps(isvcConfig)
@@ -360,19 +380,18 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	var ingressDeploymentMode constants.DeploymentModeType
 
-	// Step 1: Reconcile model first
-	baseModel, baseModelMeta, baseModelStatus, err := isvcutils.ReconcileBaseModelWithStatus(r.Client, isvc)
-	if err != nil {
-		r.Log.Error(err, "Failed to reconcile base model", "Name", isvc.Name)
-		r.Recorder.Event(isvc, v1.EventTypeWarning, "ModelReconcileError", err.Error())
-		return reconcile.Result{}, err
-	}
+	// Step 1: Reconcile model first. The model and the overlays are read
+	// here, ahead of the runtime pin, so a pin that persists status carries
+	// the overlay status and a failed model read creates no revision.
 	// Lean path: no spec.model. Operator must specify spec.runtime
 	// directly; we skip model fetch, sharded-readiness gating, overlay
 	// resolution, and runtime-vs-model validation.
-	if baseModel != nil && isvcutils.IsShardedBaseModel(baseModel) {
-		ready, message := isvcutils.ShardedBaseModelReady(baseModelStatus, baseModelMeta.Generation)
-		if !ready {
+	in := render.Inputs{Service: isvc, Client: r.Client, Runtimes: r.RuntimeSelector, Accelerators: r.AcceleratorClassSelector, Config: isvcConfig, Log: r.Log}
+	in.Model, in.ModelMeta, in.ModelStatus, err = render.ResolveModel(ctx, in)
+	if err != nil {
+		var notReady *render.ModelNotReadyError
+		if errors.As(err, &notReady) {
+			message := notReady.Message
 			if message == "" {
 				message = "sharded BaseModel is not ready"
 			}
@@ -383,150 +402,76 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			r.Recorder.Event(isvc, v1.EventTypeNormal, "ModelNotReady", message)
 			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		r.Log.Error(err, "Failed to reconcile base model", "Name", isvc.Name)
+		r.Recorder.Event(isvc, v1.EventTypeWarning, "ModelReconcileError", err.Error())
+		return reconcile.Result{}, err
 	}
+	in.ModelRead = true
 
 	// Resolve overlays. Failures here (NotFound, disabled, sharded
 	// NotReady) become Skipped entries — only transient client errors
 	// abort the reconcile.
-	resolvedOverlays, err := isvcutils.ResolveOverlays(r.Client, isvc)
+	in.Overlays, err = render.ResolveOverlays(ctx, in)
 	if err != nil {
 		r.Log.Error(err, "Failed to resolve overlays", "isvc", isvc.Name)
 		r.Recorder.Event(isvc, v1.EventTypeWarning, "OverlayResolveError", err.Error())
 		return reconcile.Result{}, err
 	}
-	isvc.Status.MountedOverlays = components.MountedOverlaySummary(resolvedOverlays)
-	setOverlaysReadyCondition(isvc, resolvedOverlays)
+	in.OverlaysRead = true
+	isvc.Status.MountedOverlays = components.MountedOverlaySummary(in.Overlays)
+	setOverlaysReadyCondition(isvc, in.Overlays)
 
 	// Step 2: Get runtime spec.
+	//   - runtime pinned    → the ControllerRevision pin, resolved here
+	//     because it creates revisions and persists status.
 	//   - runtime explicit  → fetch by name; validate against model only
 	//     if model is present.
 	//   - runtime omitted  → auto-select from model; requires a model.
-	var rt *v1beta1.ServingRuntimeSpec
-	var rtName string
-	var rtIsCluster bool
-	userSpecifiedRuntime := false
-
-	switch {
-	case isvc.Spec.Runtime != nil && isvc.Spec.Runtime.Name != "":
-		rtName = isvc.Spec.Runtime.Name
-		userSpecifiedRuntime = true
-
+	if isvc.Spec.Runtime != nil && isvc.Spec.Runtime.Name != "" && isvc.Spec.Runtime.AutoSync != nil && !*isvc.Spec.Runtime.AutoSync {
 		// When the user opts into pinning (autoSync=false), fetch the
 		// pinned ControllerRevision rather than the live runtime. The
 		// pin helper handles first-reconcile create, drift detection,
 		// and ome.io/runtime-sync ack — and persists status itself when
 		// children must be skipped.
-		if isvc.Spec.Runtime.AutoSync != nil && !*isvc.Spec.Runtime.AutoSync {
-			pin, perr := r.resolvePinnedRuntime(ctx, isvc)
-			if perr != nil {
-				r.Log.Error(perr, "Pin resolution failed", "runtime", rtName)
-				r.Recorder.Event(isvc, v1.EventTypeWarning, "RuntimePinError", perr.Error())
-				return reconcile.Result{}, perr
-			}
-			if pin.skipChildren {
-				return reconcile.Result{}, nil
-			}
-			rt = pin.spec
-			rtIsCluster = sourceKindFor(isvc.Spec.Runtime) == runtimerevision.KindClusterServingRuntime
-			break
+		pin, perr := r.resolvePinnedRuntime(ctx, isvc)
+		if perr != nil {
+			r.Log.Error(perr, "Pin resolution failed", "runtime", isvc.Spec.Runtime.Name)
+			r.Recorder.Event(isvc, v1.EventTypeWarning, "RuntimePinError", perr.Error())
+			return reconcile.Result{}, perr
 		}
-
-		if baseModel != nil {
-			if err := r.RuntimeSelector.ValidateRuntime(ctx, rtName, baseModel, isvc); err != nil {
-				// The operator named this runtime explicitly, so OME should not
-				// block on the runtime's *declared* supportedModelFormats: a
-				// generic runtime (e.g. sglang) can serve many architectures it
-				// never enumerates. Downgrade a pure compatibility mismatch
-				// (format / architecture / framework) to an advisory event and
-				// proceed — the deliberate choice wins over the declaration.
-				//
-				// A named-but-missing runtime gets the same permanent-config
-				// parking treatment as the fetch below: advisory condition +
-				// event, no error requeue, self-heals via the runtime watch.
-				//
-				// Everything else stays a hard error: a disabled runtime or a
-				// malformed model genuinely cannot run, and a sharded model
-				// with no configured cache provider physically cannot load
-				// (the webhook's modelRequiresCacheProvider guard is the same
-				// sharded check) — keep gating those.
-				switch {
-				case runtimeselector.IsRuntimeCompatibilityError(err) && !isvcutils.IsShardedBaseModel(baseModel):
-					r.Log.Info("Runtime named explicitly; proceeding despite declared-format mismatch",
-						"runtime", rtName, "model", isvc.Spec.Model.Name, "details", err.Error())
-					r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeCompatibilityAdvisory",
-						"Runtime %s does not declare support for model %s (%v); proceeding because the runtime was named explicitly",
-						rtName, isvc.Spec.Model.Name, err)
-				case runtimeselector.IsRuntimeNotFoundError(err):
-					return r.markRuntimeUnresolved(isvc, deploymentMode, rtName, err)
-				default:
-					r.Log.Error(err, "Runtime validation failed", "runtime", rtName, "model", isvc.Spec.Model.Name)
-					r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeValidationError",
-						"Runtime %s does not support model %s: %v", rtName, isvc.Spec.Model.Name, err)
-					return reconcile.Result{}, err
-				}
-			}
+		if pin.skipChildren {
+			return reconcile.Result{}, nil
 		}
-		rtSpec, isCluster, err := r.RuntimeSelector.GetRuntime(ctx, rtName, isvc.Namespace, runtimeselector.RefKind(isvc.Spec.Runtime))
-		if err != nil {
-			if runtimeselector.IsRuntimeNotFoundError(err) {
-				// A named-but-missing runtime is a permanent user-config error,
-				// not a transient failure. Don't error+requeue (which hot-loops
-				// and spams ERROR logs) and don't touch a currently-serving
-				// ISVC — surface it as an advisory condition + event and wait
-				// for the ServingRuntime watch to re-trigger once the runtime
-				// exists.
-				return r.markRuntimeUnresolved(isvc, deploymentMode, rtName, err)
-			}
-			r.Log.Error(err, "Failed to get runtime spec", "runtime", rtName)
-			r.Recorder.Event(isvc, v1.EventTypeWarning, "RuntimeFetchError", err.Error())
-			return reconcile.Result{}, err
-		}
-		r.clearRuntimeUnresolved(isvc)
-		rt = rtSpec
-		rtIsCluster = isCluster
-	case baseModel != nil:
-		selection, err := r.RuntimeSelector.SelectRuntime(ctx, baseModel, isvc)
-		if err != nil {
-			if runtimeselector.IsNoRuntimeFoundError(err) || runtimeselector.IsRuntimeNotFoundError(err) {
-				// No compatible runtime exists for the model yet — same
-				// permanent-config, non-destructive treatment as the explicit
-				// path: advisory condition + event, no error requeue, self-heals
-				// when a matching runtime is created (watch re-triggers).
-				return r.markRuntimeUnresolved(isvc, deploymentMode, isvc.Spec.Model.Name, err)
-			}
-			r.Log.Error(err, "Failed to auto-select runtime", "model", isvc.Spec.Model.Name)
-			r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeSelectionError",
-				"Failed to find runtime for model %s: %v", isvc.Spec.Model.Name, err)
-			return reconcile.Result{}, err
-		}
-		r.clearRuntimeUnresolved(isvc)
-		rt = selection.Spec
-		rtName = selection.Name
-		rtIsCluster = selection.IsCluster
-		log.Info("Auto-selected runtime", "runtime", rtName, "model", isvc.Spec.Model.Name)
-	default:
-		// No model, no runtime — webhook should have caught this; defensive
-		// guard for direct client writes that bypass admission.
-		err := fmt.Errorf("InferenceService must specify spec.runtime when spec.model is omitted")
-		r.Log.Error(err, "Cannot reconcile", "Name", isvc.Name)
-		r.Recorder.Event(isvc, v1.EventTypeWarning, "RuntimeSelectionError", err.Error())
-		return reconcile.Result{}, err
+		in.Runtime = pin.spec
+		in.RuntimeName = isvc.Spec.Runtime.Name
+		in.RuntimeIsCluster = sourceKindFor(isvc.Spec.Runtime) == runtimerevision.KindClusterServingRuntime
 	}
-
-	if err := validateResolvedRuntimeEnabled(rt, rtName, rtIsCluster); err != nil {
-		r.Log.Error(err, "Runtime validation failed", "runtime", rtName)
-		r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeValidationError",
-			"Runtime %s failed validation: %v", rtName, err)
-		return reconcile.Result{}, err
-	}
-
-	// Step 3: Merge rt and isvc specs to get final engine, decoder, and router specs
-	mergedEngine, mergedDecoder, mergedRouter, err := isvcutils.MergeRuntimeSpecs(isvc, rt, r.Log)
+	res, err := render.Resolve(ctx, in)
 	if err != nil {
-		r.Log.Error(err, "Failed to merge specs", "Name", isvc.Name)
-		r.Recorder.Event(isvc, v1.EventTypeWarning, "MergeSpecsError", err.Error())
-		return reconcile.Result{}, err
+		return r.reportResolveError(isvc, deploymentMode, in, err)
 	}
+	if res.CompatibilityAdvisory != nil {
+		// The operator named this runtime explicitly, so OME should not
+		// block on the runtime's *declared* supportedModelFormats: a
+		// generic runtime (e.g. sglang) can serve many architectures it
+		// never enumerates. A pure compatibility mismatch (format /
+		// architecture / framework) is an advisory event — the deliberate
+		// choice wins over the declaration.
+		r.Log.Info("Runtime named explicitly; proceeding despite declared-format mismatch",
+			"runtime", res.RuntimeName, "model", isvc.Spec.Model.Name, "details", res.CompatibilityAdvisory.Error())
+		r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeCompatibilityAdvisory",
+			"Runtime %s does not declare support for model %s (%v); proceeding because the runtime was named explicitly",
+			res.RuntimeName, isvc.Spec.Model.Name, res.CompatibilityAdvisory)
+	}
+	if in.Runtime == nil {
+		// RuntimeReady tracks the live lookup; a pinned runtime reports
+		// through RuntimeDrifted instead.
+		r.clearRuntimeUnresolved(isvc)
+	}
+	if !res.UserSpecifiedRuntime {
+		log.Info("Auto-selected runtime", "runtime", res.RuntimeName, "model", isvc.Spec.Model.Name)
+	}
+	mergedEngine, mergedDecoder, mergedRouter := res.Specs.Engine, res.Specs.Decoder, res.Specs.Router
 
 	// The effective serving container ports are the resolved view of the
 	// port each Component exposes. OMENative's per-revision Service
@@ -534,22 +479,28 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// this port, so it must be captured here and threaded down.
 	componentRunnerPorts := isvcutils.MergedRunnerPorts(mergedEngine, mergedDecoder, mergedRouter)
 
-	// Step 4: Determine deployment modes based on merged specs
-	engineDeploymentMode, decoderDeploymentMode, routerDeploymentMode, err := isvcutils.DetermineDeploymentModes(mergedEngine, mergedDecoder, mergedRouter, rt, isvc.Spec.DeploymentMode)
-	if err != nil {
+	// Step 4: Determine deployment modes based on merged specs and apply the
+	// deploy defaults. Placement verifies the same resolved policy used by
+	// component projectors, including replica floors supplied by operator
+	// configuration.
+	if err := render.Prepare(res, isvc.Spec.DeploymentMode, deployConfig); err != nil {
 		r.Log.Error(err, "Failed to determine deployment modes", "Name", isvc.Name)
 		r.Recorder.Event(isvc, v1.EventTypeWarning, "DeploymentModeError", err.Error())
 		return reconcile.Result{}, err
 	}
-	componentDeploymentModes := make(map[v1beta1.ComponentType]constants.DeploymentModeType, 3)
-	if mergedEngine != nil {
-		componentDeploymentModes[v1beta1.EngineComponent] = engineDeploymentMode
-	}
-	if mergedDecoder != nil {
-		componentDeploymentModes[v1beta1.DecoderComponent] = decoderDeploymentMode
-	}
-	if mergedRouter != nil {
-		componentDeploymentModes[v1beta1.RouterComponent] = routerDeploymentMode
+	componentDeploymentModes := res.Modes
+	if placementMember {
+		if err := protocol.ValidateNativeModes(componentDeploymentModes); err != nil {
+			return r.holdPlacementBackend(ctx, isvc, err)
+		}
+		if err := checkPlacementReplicaFloors(isvc, mergedEngine, mergedDecoder, mergedRouter); err != nil {
+			return r.holdPlacementCondition(ctx, isvc, v1beta1.PlacementReplicaFloorsReady, "ReplicaFloorsMismatch", err)
+		}
+		clearPlacementReplicaFloorsHold(isvc)
+		clearPlacementBackendHold(isvc)
+		if result, err := modelConfigReconciler.Reconcile(ctx, isvc); err != nil {
+			return result, err
+		}
 	}
 
 	// If both engine and decoder exist, it's PD-disaggregated. V(1):
@@ -557,15 +508,6 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if mergedEngine != nil && mergedDecoder != nil {
 		log.V(1).Info("PD-disaggregated deployment detected")
 	}
-
-	// Step 4b: fill what neither the InferenceService nor its runtime set,
-	// from operator configuration and fixed fallbacks. The merged specs are
-	// reconcile-local copies, so the stored object is never written; every
-	// reader below, from the canary partition math to the renderers, sees
-	// the resolved values.
-	specdefaults.Engine(mergedEngine, engineDeploymentMode, deployConfig)
-	specdefaults.Decoder(mergedDecoder, decoderDeploymentMode, deployConfig)
-	specdefaults.Router(mergedRouter, routerDeploymentMode, deployConfig)
 
 	// Rollout run layer: resolve and pin the effective plan BEFORE the
 	// partition stamp and the dispatch engines, so every consumer in this
@@ -607,7 +549,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			// activeRun and its step state become visible atomically. Adoption is
 			// the exception: preserve the in-flight step and attach its target ID.
 			for _, g := range rollout.CanaryGroups(isvc) {
-				canary.BindRun(isvc, g, runOutcome.Adopted)
+				if err := canary.BindRun(ctx, r.Client, isvc, g, runOutcome.Adopted); err != nil {
+					log.Error(err, "Failed to bind canary state to the rollout run")
+					return reconcile.Result{}, errors.Wrapf(err, "fails to bind canary state to the rollout run")
+				}
 			}
 		}
 		// A run boundary (open/close/repin) is persisted IMMEDIATELY: the pin
@@ -616,9 +561,14 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// in-memory pin — reopening the run next pass and flapping the
 		// projected spec under the executors.
 		if runOutcome.StateChanged {
-			if err := r.updateStatus(isvc, deploymentMode); err != nil {
+			if err := r.updateStatus(isvc, deploymentMode, base); err != nil {
 				r.Recorder.Event(isvc, v1.EventTypeWarning, "InternalError", err.Error())
 				return reconcile.Result{}, err
+			}
+			// A pass that read a stale record decides nothing further: the
+			// flush kept the live record, and the next pass decides from it.
+			if base.Stale() {
+				return reconcile.Result{Requeue: true}, nil
 			}
 		}
 	}
@@ -661,96 +611,55 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// state change — demoted to V(1) because they're hot-path /
 	// steady-state breadcrumbs.
 	if mergedEngine != nil {
-		engineACObj, engineAcName, err := r.AcceleratorClassSelector.GetAcceleratorClass(ctx, isvc, rt, v1beta1.EngineComponent)
+		piece, _, err := res.Piece(ctx, in, v1beta1.EngineComponent)
 		if err != nil {
 			log.Error(err, "Failed to get accelerator class for engine component")
 			r.Recorder.Eventf(isvc, v1.EventTypeWarning, "AcceleratorClassError", "Failed to get accelerator class for engine: %v", err)
 			return reconcile.Result{}, err
 		}
-		var engineAC *v1beta1.AcceleratorClassSpec
-		if engineACObj != nil {
-			engineAC = &engineACObj.Spec
-		}
-		engineSupportedModelFormats := r.RuntimeSelector.GetSupportedModelFormat(ctx, rt, baseModel, userSpecifiedRuntime)
 		log.V(1).Info("Creating engine reconciler",
-			"deploymentMode", engineDeploymentMode,
-			"acceleratorClass", engineAcName)
+			"deploymentMode", piece.DeploymentMode,
+			"acceleratorClass", piece.AcceleratorClassName)
 
-		engineReconciler := components.NewEngine(cdeps, components.ComponentInputs{
-			DeploymentMode:       engineDeploymentMode,
-			BaseModel:            baseModel,
-			BaseModelMeta:        baseModelMeta,
-			Runtime:              rt,
-			RuntimeName:          rtName,
-			ModelFormat:          engineSupportedModelFormats,
-			AcceleratorClass:     engineAC,
-			AcceleratorClassName: engineAcName,
-			Overlays:             resolvedOverlays,
-			PolicyResolver:       policyResolver,
-			PacingPartition:      enginePartition,
-		}, mergedEngine)
+		engineReconciler := components.NewEngine(cdeps, componentInputs(piece, policyResolver, enginePartition), mergedEngine)
 		reconcilers = append(reconcilers, engineReconciler)
 	}
 
 	if mergedDecoder != nil {
-		decoderACObj, decoderAcName, err := r.AcceleratorClassSelector.GetAcceleratorClass(ctx, isvc, rt, v1beta1.DecoderComponent)
+		piece, _, err := res.Piece(ctx, in, v1beta1.DecoderComponent)
 		if err != nil {
 			log.Error(err, "Failed to get accelerator class for decoder component")
 			r.Recorder.Eventf(isvc, v1.EventTypeWarning, "AcceleratorClassError", "Failed to get accelerator class for decoder: %v", err)
 			return reconcile.Result{}, err
 		}
-		var decoderAC *v1beta1.AcceleratorClassSpec
-		if decoderACObj != nil {
-			decoderAC = &decoderACObj.Spec
-		}
-		decoderSupportedModelFormats := r.RuntimeSelector.GetSupportedModelFormat(ctx, rt, baseModel, userSpecifiedRuntime)
 		log.V(1).Info("Creating decoder reconciler",
-			"deploymentMode", decoderDeploymentMode,
-			"acceleratorClass", decoderAcName)
+			"deploymentMode", piece.DeploymentMode,
+			"acceleratorClass", piece.AcceleratorClassName)
 
-		decoderReconciler := components.NewDecoder(cdeps, components.ComponentInputs{
-			DeploymentMode:       decoderDeploymentMode,
-			BaseModel:            baseModel,
-			BaseModelMeta:        baseModelMeta,
-			Runtime:              rt,
-			RuntimeName:          rtName,
-			ModelFormat:          decoderSupportedModelFormats,
-			AcceleratorClass:     decoderAC,
-			AcceleratorClassName: decoderAcName,
-			Overlays:             resolvedOverlays,
-			PolicyResolver:       policyResolver,
-			PacingPartition:      decoderPartition,
-		}, mergedDecoder)
+		decoderReconciler := components.NewDecoder(cdeps, componentInputs(piece, policyResolver, decoderPartition), mergedDecoder)
 		reconcilers = append(reconcilers, decoderReconciler)
 	}
 
 	// Add Router reconciler if merged router spec exists (using new v2 Router)
 	if mergedRouter != nil {
+		// The router piece takes no accelerator class and no model format, so
+		// assembling it performs no reads and cannot fail.
+		piece, _, _ := res.Piece(ctx, in, v1beta1.RouterComponent)
 		log.V(1).Info("Creating router reconciler",
-			"deploymentMode", routerDeploymentMode)
+			"deploymentMode", piece.DeploymentMode)
 
-		// Router has no supported-model-format input — ModelFormat stays nil.
-		routerReconciler := components.NewRouter(cdeps, components.ComponentInputs{
-			DeploymentMode:  routerDeploymentMode,
-			BaseModel:       baseModel,
-			BaseModelMeta:   baseModelMeta,
-			Runtime:         rt,
-			RuntimeName:     rtName,
-			Overlays:        resolvedOverlays,
-			PolicyResolver:  policyResolver,
-			PacingPartition: routerPartition,
-		}, mergedRouter) // merged router spec, not isvc.Spec.Router
+		routerReconciler := components.NewRouter(cdeps, componentInputs(piece, policyResolver, routerPartition), mergedRouter) // merged router spec, not isvc.Spec.Router
 		reconcilers = append(reconcilers, routerReconciler)
 	}
 
 	// Determine the correct ingress deployment mode using the same logic as ingress reconciler
 	// but with the already-determined deployment modes to avoid inconsistency
 	if mergedRouter != nil {
-		ingressDeploymentMode = routerDeploymentMode
+		ingressDeploymentMode = res.Modes[v1beta1.RouterComponent]
 	} else if mergedDecoder != nil {
-		ingressDeploymentMode = decoderDeploymentMode
+		ingressDeploymentMode = res.Modes[v1beta1.DecoderComponent]
 	} else {
-		ingressDeploymentMode = engineDeploymentMode
+		ingressDeploymentMode = res.Modes[v1beta1.EngineComponent]
 	}
 
 	log.V(1).Info("Determined ingress deployment mode",
@@ -767,6 +676,14 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	for _, reconciler := range reconcilers {
 		result, err := reconciler.Reconcile(ctx, isvc)
 		if err != nil {
+			// A component's failure is often a write the API server rejects,
+			// such as an InferenceReplica an admission webhook denies, which
+			// only a change to the InferenceService fixes. Record it where
+			// the owner looks. A conflict is retried at once and needs no
+			// report.
+			if !apierrors.IsConflict(err) {
+				r.Recorder.Event(isvc, v1.EventTypeWarning, "ComponentReconcileError", err.Error())
+			}
 			log.Error(err, "Failed to reconcile component",
 				"component", fmt.Sprintf("%T", reconciler))
 			return result, err
@@ -799,6 +716,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if rolloutRunRequeue > pendingRequeue.RequeueAfter {
 		pendingRequeue.RequeueAfter = rolloutRunRequeue
 	}
+	// Operator annotations the canary passes applied this reconcile. They
+	// are removed after the status write that carries their effect lands.
+	var canaryConsume []string
 	if canaryGroups := rollout.CanaryGroups(isvc); len(canaryGroups) > 0 {
 		// Resolve the metrics source + query timeout per-reconcile from the
 		// canaryAnalysis operator config (so ConfigMap edits take effect without a
@@ -809,16 +729,18 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			log.Error(err, "Failed to load canaryAnalysis config")
 			return reconcile.Result{}, errors.Wrapf(err, "fails to load canaryAnalysis config")
 		}
-		var defaultReadyTimeout time.Duration
+		var defaultReadyTimeout, canaryRequeue, canaryParkedRequeue time.Duration
 		if rolloutConfig != nil {
 			defaultReadyTimeout = rolloutConfig.DefaultReadyTimeout
+			canaryRequeue = rolloutConfig.CanaryRequeue
+			canaryParkedRequeue = rolloutConfig.CanaryParkedRequeue
 		}
 		// One dispatch per canary group. A group owns one unit, so the runs
 		// touch disjoint Components: neither can see the other's step counter,
 		// and the soonest requeue wins so the faster unit is not slowed to the
 		// pace of the slower one.
 		for _, g := range canaryGroups {
-			ra, err := canary.Dispatch(ctx, canary.DispatchDeps{
+			out, err := canary.Dispatch(ctx, canary.DispatchDeps{
 				ISVC:                     isvc,
 				Client:                   r.Client,
 				Reader:                   r.APIReader,
@@ -827,6 +749,8 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				BundledPrometheusAddress: analysisConfig.BundledPrometheusAddress,
 				QueryTimeout:             analysisConfig.QueryTimeoutDuration(),
 				DefaultReadyTimeout:      defaultReadyTimeout,
+				Requeue:                  canaryRequeue,
+				ParkedRequeue:            canaryParkedRequeue,
 				MetricProviders:          metricProviders,
 				DefaultProvider:          analysisConfig.DefaultProvider,
 				ComponentRunnerPorts:     componentRunnerPorts,
@@ -836,9 +760,13 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				log.Error(err, "Failed to reconcile canary rollout")
 				return reconcile.Result{}, errors.Wrapf(err, "fails to reconcile canary")
 			}
-			if ra > pendingRequeue.RequeueAfter {
-				pendingRequeue.RequeueAfter = ra
+			if out.RequeueAfter > pendingRequeue.RequeueAfter {
+				pendingRequeue.RequeueAfter = out.RequeueAfter
 			}
+			if out.Requeue {
+				pendingRequeue.Requeue = true
+			}
+			canaryConsume = append(canaryConsume, out.Consume...)
 		}
 	}
 	// Load the coordination tuning per-reconcile from the operator config so
@@ -866,6 +794,34 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return reconcile.Result{}, errors.Wrapf(err, "fails to reconcile coordination")
 	}
 
+	// Project IR status onto the ISVC on requeueing passes too — see the
+	// call below for what the projection is; this call exists only so the
+	// short-circuit cannot skip it.
+	//
+	// The projector is the ONLY writer of both the Lifecycle subtree and
+	// the top-level EngineReady / DecoderReady / RouterReady conditions,
+	// and a requeueing pass is the steady state of an active rollout, not
+	// an exception. Running it only on the no-requeue tail freezes the
+	// projection for as long as anything asks to requeue, and because the
+	// rollout engines gate on component readiness, that freeze sustains
+	// itself: stale NotReady conditions hold the rollout at its step, the
+	// held rollout keeps requeueing, and the requeue keeps the projection
+	// stale. The ISVC then stays Ready=False/Initializing while its live
+	// IR advances arbitrarily far, with no reconcile error and no recovery
+	// across controller restarts.
+	//
+	// The tail call stays in place after ingress / traffic / component-status
+	// cleanup, so the no-requeue path's write ordering is preserved. An
+	// unchanged rollup performs zero writes (AggregateIRStatus skips the
+	// Status().Update when the recomputed status DeepEquals the live one),
+	// so the pass that runs both calls still writes at most once.
+	if pendingRequeue.Requeue || pendingRequeue.RequeueAfter > 0 {
+		if err = irprojector.AggregateIRStatus(ctx, r.Client, r.APIReader, isvc, componentDeploymentModes); err != nil {
+			r.Recorder.Event(isvc, v1.EventTypeWarning, "InternalError", err.Error())
+			return reconcile.Result{}, err
+		}
+	}
+
 	// If any Component asked to requeue, return that signal AFTER
 	// coordination has run. Ingress / traffic / external-service
 	// reconciliation downstream is skipped this pass — they re-run on
@@ -878,9 +834,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// flushing it here those writes are dropped on every requeuing pass,
 	// which is the steady state during active rollouts.
 	if pendingRequeue.Requeue || pendingRequeue.RequeueAfter > 0 {
-		if err := r.updateStatus(isvc, deploymentMode); err != nil {
+		if err := r.flushStatusThenConsume(ctx, isvc, deploymentMode, canaryConsume, base); err != nil {
 			r.Recorder.Event(isvc, v1.EventTypeWarning, "InternalError", err.Error())
 			return reconcile.Result{}, err
+		}
+		if base.Stale() {
+			pendingRequeue.Requeue = true
 		}
 		return pendingRequeue, nil
 	}
@@ -1010,17 +969,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// a retry; first-reconcile NotFound is swallowed inside the
 	// helper (the next reconcile picks up the IR's fresh status once
 	// the cache observes it).
-	componentModes := map[v1beta1.ComponentType]constants.DeploymentModeType{
-		v1beta1.EngineComponent:  engineDeploymentMode,
-		v1beta1.DecoderComponent: decoderDeploymentMode,
-		v1beta1.RouterComponent:  routerDeploymentMode,
-	}
-	if err = irprojector.AggregateIRStatus(ctx, r.Client, r.APIReader, isvc, componentModes); err != nil {
+	if err = irprojector.AggregateIRStatus(ctx, r.Client, r.APIReader, isvc, componentDeploymentModes); err != nil {
 		r.Recorder.Event(isvc, v1.EventTypeWarning, "InternalError", err.Error())
 		return reconcile.Result{}, err
 	}
 
-	if err = r.updateStatus(isvc, deploymentMode); err != nil {
+	if err = r.flushStatusThenConsume(ctx, isvc, deploymentMode, canaryConsume, base); err != nil {
 		// A terminal status conflict is benign — requeue and re-reconcile
 		// off fresh state instead of surfacing an ERROR-level failure.
 		if apierrors.IsConflict(err) {
@@ -1029,18 +983,92 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		r.Recorder.Event(isvc, v1.EventTypeWarning, "InternalError", err.Error())
 		return reconcile.Result{}, err
 	}
+	if base.Stale() {
+		return ctrl.Result{Requeue: true}, nil
+	}
 
 	return ctrl.Result{}, nil
 }
 
-func validateResolvedRuntimeEnabled(runtimeSpec *v1beta1.ServingRuntimeSpec, runtimeName string, isCluster bool) error {
-	if runtimeSpec != nil && runtimeSpec.IsDisabled() {
-		return &runtimeselector.RuntimeDisabledError{
-			RuntimeName: runtimeName,
-			IsCluster:   isCluster,
-		}
+// componentInputs carries one role's render inputs, with the reconcile's
+// policy resolver and the role's canary partition, into its component
+// reconciler.
+func componentInputs(p *render.Piece, policies *autoscaler.PolicyResolver, partition *int32) components.ComponentInputs {
+	return components.ComponentInputs{
+		DeploymentMode:       p.DeploymentMode,
+		BaseModel:            p.BaseModel,
+		BaseModelMeta:        p.BaseModelMeta,
+		Runtime:              p.Runtime,
+		RuntimeName:          p.RuntimeName,
+		ModelFormat:          p.SupportedModelFormat,
+		AcceleratorClass:     p.AcceleratorClass,
+		AcceleratorClassName: p.AcceleratorClassName,
+		Overlays:             p.Overlays,
+		PolicyResolver:       policies,
+		PacingPartition:      partition,
 	}
-	return nil
+}
+
+// reportResolveError maps a failed runtime resolution or spec merge onto the
+// event, log line and status the InferenceService reports for it. The model
+// and the overlays are read before render.Resolve runs, so the failure is in
+// the runtime step or the merge. A named-but-missing runtime, or a model no
+// runtime supports, is a permanent user-config state: it parks the service
+// behind an advisory condition instead of an error requeue, and the runtime
+// watch re-triggers reconcile when a matching runtime appears.
+func (r *InferenceServiceReconciler) reportResolveError(isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, in render.Inputs, err error) (reconcile.Result, error) {
+	var modelName string
+	if isvc.Spec.Model != nil {
+		modelName = isvc.Spec.Model.Name
+	}
+	explicit := isvc.Spec.Runtime != nil && isvc.Spec.Runtime.Name != ""
+	// A named live runtime is validated against the model before it is
+	// fetched; a pin and a service without a model skip that check.
+	validated := explicit && in.Runtime == nil && in.Model != nil
+	var merge *render.MergeError
+	var disabled *runtimeselector.RuntimeDisabledError
+	switch {
+	case errors.As(err, &merge):
+		r.Log.Error(err, "Failed to merge specs", "Name", isvc.Name)
+		r.Recorder.Event(isvc, v1.EventTypeWarning, "MergeSpecsError", err.Error())
+		return reconcile.Result{}, err
+	case errors.Is(err, render.ErrNoTemplateSource):
+		// No model, no runtime — webhook should have caught this; defensive
+		// guard for direct client writes that bypass admission.
+		err := fmt.Errorf("InferenceService must specify spec.runtime when spec.model is omitted")
+		r.Log.Error(err, "Cannot reconcile", "Name", isvc.Name)
+		r.Recorder.Event(isvc, v1.EventTypeWarning, "RuntimeSelectionError", err.Error())
+		return reconcile.Result{}, err
+	case validated && !runtimeselector.IsRuntimeNotFoundError(err):
+		// Everything the validation reports, other than the advisory
+		// mismatch and a missing runtime, is a hard error: a disabled
+		// runtime or a malformed model genuinely cannot run, a sharded
+		// model with no configured cache provider physically cannot load
+		// (the webhook's modelRequiresCacheProvider guard is the same
+		// sharded check), and a runtime whose inheritance cannot be
+		// resolved has no spec to serve.
+		r.Log.Error(err, "Runtime validation failed", "runtime", isvc.Spec.Runtime.Name, "model", modelName)
+		r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeValidationError",
+			"Runtime %s does not support model %s: %v", isvc.Spec.Runtime.Name, modelName, err)
+		return reconcile.Result{}, err
+	case errors.As(err, &disabled):
+		r.Log.Error(err, "Runtime validation failed", "runtime", disabled.RuntimeName)
+		r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeValidationError",
+			"Runtime %s failed validation: %v", disabled.RuntimeName, err)
+		return reconcile.Result{}, err
+	case explicit && runtimeselector.IsRuntimeNotFoundError(err):
+		return r.markRuntimeUnresolved(isvc, deploymentMode, isvc.Spec.Runtime.Name, err)
+	case explicit:
+		r.Log.Error(err, "Failed to get runtime spec", "runtime", isvc.Spec.Runtime.Name)
+		r.Recorder.Event(isvc, v1.EventTypeWarning, "RuntimeFetchError", err.Error())
+		return reconcile.Result{}, err
+	case runtimeselector.IsNoRuntimeFoundError(err) || runtimeselector.IsRuntimeNotFoundError(err):
+		return r.markRuntimeUnresolved(isvc, deploymentMode, modelName, err)
+	}
+	r.Log.Error(err, "Failed to auto-select runtime", "model", modelName)
+	r.Recorder.Eventf(isvc, v1.EventTypeWarning, "RuntimeSelectionError",
+		"Failed to find runtime for model %s: %v", modelName, err)
+	return reconcile.Result{}, err
 }
 
 func (r *InferenceServiceReconciler) handleVirtualDeployment(isvc *v1beta1.InferenceService) (ctrl.Result, error) {
@@ -1080,7 +1108,7 @@ func (r *InferenceServiceReconciler) handleVirtualDeployment(isvc *v1beta1.Infer
 		Message:            "InferenceService is in VirtualDeployment mode",
 	}})
 
-	if err := r.updateStatus(isvc, constants.VirtualDeployment); err != nil {
+	if err := r.updateStatus(isvc, constants.VirtualDeployment, nil); err != nil {
 		// A terminal status conflict is benign — requeue and re-reconcile
 		// off fresh state instead of surfacing an ERROR-level failure.
 		if apierrors.IsConflict(err) {
@@ -1114,7 +1142,7 @@ func (r *InferenceServiceReconciler) markRuntimeUnresolved(isvc *v1beta1.Inferen
 		Reason:  "RuntimeNotFound",
 		Message: cause.Error(),
 	})
-	if err := r.updateStatus(isvc, deploymentMode); err != nil {
+	if err := r.updateStatus(isvc, deploymentMode, nil); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
@@ -1135,7 +1163,29 @@ func (r *InferenceServiceReconciler) clearRuntimeUnresolved(isvc *v1beta1.Infere
 	})
 }
 
-func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType) error {
+// flushStatusThenConsume writes the status, then removes the operator
+// annotations whose effect that write carried. The order is the contract: a
+// verb is consumed only once the state it produced is durable, and each
+// applied verb leaves a record in status that keeps a still-visible
+// annotation inert, so a removal that fails here is retried by a later pass
+// rather than re-applied.
+func (r *InferenceServiceReconciler) flushStatusThenConsume(ctx context.Context, isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, consume []string, base *canary.Base) error {
+	if err := r.updateStatus(isvc, deploymentMode, base); err != nil {
+		return err
+	}
+	// Decisions made from a stale record were not written, so the verbs they
+	// took stay in place for the pass that decides from the current record.
+	if len(consume) == 0 || base.Stale() {
+		return nil
+	}
+	if err := canary.ConsumeAnnotations(ctx, r.Client, isvc, consume); err != nil {
+		r.Log.V(1).Info("operator annotation removal after the status write failed; a later pass retries it",
+			"InferenceService", isvc.Name, "annotations", consume, "error", err.Error())
+	}
+	return nil
+}
+
+func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, base *canary.Base) error {
 	namespacedName := types.NamespacedName{Name: desiredService.Name, Namespace: desiredService.Namespace}
 
 	// Mirror the existing-status snapshot OUTSIDE the retry loop —
@@ -1215,10 +1265,19 @@ func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.Infere
 		if !livePreStepHold && latest.Status.Canary != nil {
 			livePreStepHold = latest.Status.Canary.PreStepHold
 		}
+		// The canary executor's record is guarded like the run pin: a pass
+		// that read a stale copy keeps the live record, phase and traffic,
+		// re-synced into its working copy so nothing after this write
+		// decides from the stale one.
+		base.PreserveFresh(&desiredService.Status, &latest.Status)
 		latest.Status = desiredService.Status
 		mergeLifecycleStatus(&latest.Status, preserved)
 		rolloutrun.PreserveNewerRun(&latest.Status, liveRollout, livePreStepHold)
-		return r.Status().Update(context.TODO(), latest)
+		if err := r.Status().Update(context.TODO(), latest); err != nil {
+			return err
+		}
+		base.Advance(&latest.Status)
+		return nil
 	}); err != nil {
 		// Same race as the top-of-function Get: if the ISVC vanished
 		// during the retry loop, there's nothing to update — drop the

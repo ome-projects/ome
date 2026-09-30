@@ -2,33 +2,75 @@ package placement
 
 import (
 	"context"
+	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
-// componentIRStatuses fetches the authoritative InferenceReplica status for
-// every declared component of isvc via the given workload-cluster reader. The
-// derived ISVC and its per-component InferenceReplicas live on the same workload
-// cluster, so `reads` must be that cluster's client. A missing IR yields a nil
-// map entry, which the predicates treat as "no status yet" — the same way the
-// pre-migration code treated an absent ISVC status copy. The authoritative IR
-// status is the source of truth; the ISVC's mirrored LifecycleStatus is no
-// longer read.
+// componentIRStatuses reads decoded member status and verifies positive
+// admission against live Pods. Missing components have no admission credit;
+// unreadable or changing inventories hold placement as unknown.
 func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService) (map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, error) {
 	out := make(map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus)
+	var pods *corev1.PodList
 	for _, c := range declaredComponents(isvc) {
 		// The predicates below inspect per-Instance rows, so the status is
 		// read through the decoded accessor; a payload that cannot be decoded
 		// is a read error and holds the placement like any other read failure.
-		st, err := irprojector.DecodedComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, c)
+		ir, _, err := irprojector.DecodedComponentIR(ctx, reads, isvc.Namespace, isvc.Name, c)
 		if err != nil {
 			return nil, err
 		}
-		out[c] = st
+		if ir == nil {
+			out[c] = nil
+			continue
+		}
+		out[c] = &ir.Status
+		if !componentHasAdmittedInstance(&ir.Status) && ir.Status.ReadyReplicas == 0 {
+			continue
+		}
+		owner := metav1.GetControllerOf(ir)
+		if isvc.UID == "" || owner == nil || owner.UID != isvc.UID || owner.Kind != "InferenceService" || owner.APIVersion != v1beta1.SchemeGroupVersion.String() {
+			return nil, fmt.Errorf("component %q has unverified service ownership", ir.Name)
+		}
+		if pods == nil {
+			pods = &corev1.PodList{}
+			if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{constants.InferenceServicePodLabelKey: isvc.Name}); err != nil {
+				return nil, err
+			}
+			if pods.Continue != "" {
+				return nil, fmt.Errorf("member pod inventory is incomplete")
+			}
+		}
+		owned := []corev1.Pod{}
+		for _, pod := range pods.Items {
+			if owner := metav1.GetControllerOf(&pod); owner != nil && owner.UID == ir.UID {
+				owned = append(owned, pod)
+			}
+		}
+		gangSizes, err := memberGangSizes(ctx, reads, ir, owned)
+		if err != nil {
+			return nil, err
+		}
+		out[c], err = verifiedMemberAdmission(ir, owned, gangSizes)
+		if err != nil {
+			return nil, err
+		}
+		live := &metav1.PartialObjectMetadata{}
+		live.SetGroupVersionKind(v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"))
+		if err := reads.Get(ctx, client.ObjectKeyFromObject(ir), live); err != nil {
+			return nil, err
+		}
+		if ir.ResourceVersion == "" || live.UID != ir.UID || live.ResourceVersion != ir.ResourceVersion {
+			return nil, fmt.Errorf("component %q changed during admission observation", ir.Name)
+		}
 	}
 	return out, nil
 }

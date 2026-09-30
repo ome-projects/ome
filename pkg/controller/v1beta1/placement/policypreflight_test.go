@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -315,30 +316,41 @@ func TestPreflightPolicies_DisconnectedCandidateStaysEligible(t *testing.T) {
 }
 
 func TestPreflightPolicies_SplitHardGate(t *testing.T) {
-	s := testScheme(t)
-	isvc := srcISVCWithRef("")
-	isvc.Spec.Placement = &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeSplit, Requirements: "gpu=gb300"}
-
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": memberWith(s, maxConsumingPolicy(testPolicyName)),
-	}}
-	r, _ := newPlacer(s, clusters, isvc, maxConsumingPolicy(testPolicyName))
-	wcs := []v1beta1.WorkloadCluster{*readyWC("a", capabilityLabels())}
-
-	// Ceiling unset + a MaxReplicas-consuming policy: hold everything.
-	out := r.preflightPolicies(context.Background(), isvc, []string{"a"}, wcs)
-	require.NotNil(t, out)
-	assert.True(t, out.hold)
-	cond := stagedPreflight(t, r, isvc.UID)
-	assert.Equal(t, corev1.ConditionFalse, cond.Status)
-	assert.Equal(t, v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling, cond.Reason)
-
-	// The one-field fix: a per-cluster ceiling releases the gate.
-	isvc.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: 45}
-	out = r.preflightPolicies(context.Background(), isvc, []string{"a"}, wcs)
-	require.NotNil(t, out)
-	assert.False(t, out.hold)
-	assert.Equal(t, []string{"a"}, out.eligible)
+	for _, mode := range []v1beta1.PlacementMode{v1beta1.PlacementModeSplit, v1beta1.PlacementModeSplitByCapacity} {
+		t.Run(string(mode), func(t *testing.T) {
+			for _, tc := range []struct {
+				name     string
+				cap      int32
+				wantHold bool
+			}{
+				{name: "unset ceiling holds", wantHold: true},
+				{name: "explicit ceiling permits placement", cap: 45},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					s := testScheme(t)
+					isvc := srcISVCWithRef("")
+					isvc.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: mode, Split: &v1beta1.SplitSpec{MaxReplicasPerCluster: tc.cap}}
+					clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"a": memberWith(s, maxConsumingPolicy(testPolicyName))}}
+					r, _ := newPlacer(s, clusters, isvc, maxConsumingPolicy(testPolicyName))
+					out := r.preflightPolicies(t.Context(), isvc, []string{"a"}, []v1beta1.WorkloadCluster{*readyWC("a", capabilityLabels())})
+					if out == nil {
+						t.Fatal("missing preflight result")
+					}
+					if diff := cmp.Diff(tc.wantHold, out.hold); diff != "" {
+						t.Error(diff)
+					}
+					cond := stagedPreflight(t, r, isvc.UID)
+					if tc.wantHold {
+						if diff := cmp.Diff(v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling, cond.Reason); diff != "" {
+							t.Error(diff)
+						}
+					} else if diff := cmp.Diff([]string{"a"}, out.eligible); diff != "" {
+						t.Error(diff)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestLiftCandidateAutoscaling(t *testing.T) {
@@ -620,7 +632,7 @@ func TestReconcile_PolicyLiftEndToEnd(t *testing.T) {
 	s := testScheme(t)
 
 	derived := srcISVCWithRef("")
-	derived.UID = ""
+	derived.UID = "member-uid"
 	derived.CreationTimestamp = metav1.Now()
 	derived.Labels = map[string]string{PlacementOriginLabel: "uid-1"}
 	derived.Status = v1beta1.InferenceServiceStatus{
@@ -635,7 +647,8 @@ func TestReconcile_PolicyLiftEndToEnd(t *testing.T) {
 	}
 	w := fakeclient.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&v1beta1.InferenceService{}).
-		WithObjects(derived, hpaPolicy(testPolicyName), irWithInstances(v1beta1.EngineComponent, true)).Build()
+		WithObjects(observedWorkerObjects(derived, irWithInstances(v1beta1.EngineComponent, true))...).
+		WithObjects(hpaPolicy(testPolicyName)).Build()
 	cur := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, cur))
 	if len(cur.Status.Components) == 0 {

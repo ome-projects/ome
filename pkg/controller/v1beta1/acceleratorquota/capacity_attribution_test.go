@@ -85,6 +85,9 @@ func TestCapacityAttributionFingerprint(t *testing.T) {
 	resources := []string{"example.com/gpu", "example.com/tpu"}
 	_, baseline := attributeCapacity(capacity.Result{}, flavors, resources)
 	key := budgetKey(resources[0], flavors[0].Name)
+	if diff := cmp.Diff("c4c5465cd2b2f95768ff8b15128d513e640436a8f732c3135b8c121085d0baad", baseline[key].FlavorSetHash); diff != "" {
+		t.Fatalf("reported mapping fingerprint (-want +got):\n%s", diff)
+	}
 	tests := []struct {
 		name       string
 		change     func([]capacity.Flavor, []string) ([]capacity.Flavor, []string)

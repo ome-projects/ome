@@ -13,6 +13,7 @@ import (
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 // TestReconcileOMENativeSubresources_SkipsPodMonitorWhenSchemeAbsent pins
@@ -29,7 +30,7 @@ func TestReconcileOMENativeSubresources_SkipsPodMonitorWhenSchemeAbsent(t *testi
 	// NOTE: monitoringv1 (PodMonitor) is deliberately NOT registered.
 
 	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
-	b := &BaseComponentFields{Client: cl, Scheme: scheme, Log: logr.Discard()}
+	b := &BaseComponentFields{Piece: render.Piece{Log: logr.Discard()}, Client: cl, Scheme: scheme}
 
 	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "dummy", Namespace: "inf-prod"}}
 	objectMeta := metav1.ObjectMeta{Name: "dummy-engine", Namespace: "inf-prod"}

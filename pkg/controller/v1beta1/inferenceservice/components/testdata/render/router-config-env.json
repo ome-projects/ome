@@ -1,0 +1,61 @@
+{
+  "runners": [
+    {
+      "name": "default",
+      "size": 1,
+      "template": {
+        "metadata": {
+          "labels": {
+            "base-model-name": "model-a",
+            "base-model-size": "SMALL",
+            "base-model-type": "Serving",
+            "component": "router",
+            "fine-tuned-serving": "false",
+            "ome.io/inferenceservice": "pool-a",
+            "serving-runtime": "runtime-a",
+            "team": "a"
+          },
+          "annotations": {
+            "example.com/owner": "team-a",
+            "ome.io/base-model-format": "safetensors",
+            "ome.io/base-model-name": "model-a",
+            "ome.io/serving-runtime": "runtime-a"
+          }
+        },
+        "spec": {
+          "volumes": [
+            {
+              "name": "model-a",
+              "persistentVolumeClaim": {
+                "claimName": "models",
+                "readOnly": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "ome-container",
+              "image": "example.com/router:v1",
+              "env": [
+                {
+                  "name": "ROUTER_BACKEND",
+                  "value": "engine"
+                },
+                {
+                  "name": "ROUTER_TIMEOUT",
+                  "value": "30"
+                }
+              ],
+              "resources": {}
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "pairingProtocol": "",
+  "excludedAnnotationKeys": [
+    "example.com/owner"
+  ],
+  "revisionHash": "b9662246"
+}

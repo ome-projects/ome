@@ -1,16 +1,18 @@
 package v1beta1
 
-import "k8s.io/apimachinery/pkg/api/resource"
+import (
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // PlacementMode is the cardinality of a multi-cluster placement: how many
 // workload clusters end up serving the InferenceService.
-// +kubebuilder:validation:Enum=Single;All;Split
+// +kubebuilder:validation:Enum=Single;All;Split;SplitByCapacity
 type PlacementMode string
 
 const (
 	// PlacementModeSingle places the InferenceService on exactly one workload
-	// cluster (the winner of the fan-out race) and sweeps the rest. This is
-	// the default.
+	// cluster (the winner of the fan-out race) and sweeps the rest.
 	PlacementModeSingle PlacementMode = "Single"
 
 	// PlacementModeAll places the InferenceService on every candidate cluster
@@ -19,95 +21,138 @@ const (
 	// redundancy / serve-everywhere.
 	PlacementModeAll PlacementMode = "All"
 
-	// PlacementModeSplit distributes the InferenceService's desired replicas
-	// fractionally across candidate clusters: each admits as many replicas as
-	// fit, every cluster that admits >=1 is kept, and the endpoint is weighted by
-	// each home's ready replicas. For scaling past a single cluster's capacity.
+	// PlacementModeSplit distributes the requested floor. ClusterAffinity uses
+	// exact weighted shares; Legacy uses admission-driven Packed or spread targets.
 	PlacementModeSplit PlacementMode = "Split"
+
+	// PlacementModeSplitByCapacity apportions the floor using verified nominal
+	// whole-replica hardware capacity, independently of quota and utilization.
+	PlacementModeSplitByCapacity PlacementMode = "SplitByCapacity"
 )
 
-// PlacementSpec declares how the control plane selects the workload clusters an
-// InferenceService is placed onto, and how many of them serve it. It subsumes the
-// legacy ome.io/accelerator-requirements and ome.io/cluster-selector annotations
-// in a typed, schema-validated form; when this field is nil the control plane
-// still honors those annotations for backward compatibility.
+// PlacementPolicy selects the matching and allocation contract.
+// +kubebuilder:validation:Enum=Legacy;ClusterAffinity
+type PlacementPolicy string
+
+const (
+	// PlacementPolicyLegacy uses selector strings and admission-driven allocation.
+	PlacementPolicyLegacy PlacementPolicy = "Legacy"
+	// PlacementPolicyClusterAffinity uses affinity and persisted allocation plans.
+	PlacementPolicyClusterAffinity PlacementPolicy = "ClusterAffinity"
+)
+
+// PlacementSpec declares multi-cluster intent. Policy omission preserves the
+// legacy selector and allocation contract, including its mode defaults.
+// +kubebuilder:validation:XValidation:rule="!has(self.policy) || self.policy != 'ClusterAffinity' || has(self.mode)",message="ClusterAffinity requires an explicit mode"
+// +kubebuilder:validation:XValidation:rule="!has(self.replacementTimeout) || (has(self.policy) && self.policy == 'ClusterAffinity' && has(self.mode) && self.mode == 'Single')",message="replacementTimeout requires ClusterAffinity Single placement"
 type PlacementSpec struct {
-	// Mode is the placement cardinality: Single (one cluster), All (every
-	// candidate), or Split (replicas distributed across clusters). Defaults to
-	// Single. All and Split are rejected by admission on a control plane that
-	// does not implement them.
-	// +kubebuilder:default=Single
+	// Policy explicitly opts into ClusterAffinity semantics. Omission is Legacy.
+	// ClusterAffinity cannot be removed from an existing service; migrating back
+	// requires draining and recreating the source and its derived workloads.
+	// +optional
+	Policy PlacementPolicy `json:"policy,omitempty"`
+
+	// Mode is required for ClusterAffinity. Legacy omission means Single.
 	// +optional
 	Mode PlacementMode `json:"mode,omitempty"`
 
-	// Requirements is the intrinsic capability selector a candidate workload
-	// cluster MUST satisfy, expressed as a Kubernetes label-selector string
-	// matched against WorkloadCluster labels plus the virtual, immutable
-	// metadata.name key (e.g. "accelerator in (gb300, tpu7x)"). It is the
-	// structured equivalent of the ome.io/accelerator-requirements annotation.
-	// Empty means no intrinsic requirement.
+	// ClusterAffinity ORs terms whose requirements are ANDed. Requires the
+	// ClusterAffinity policy; omission then matches every registration.
+	// An explicit empty or null list is invalid.
 	// +optional
+	// +nullable
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	ClusterAffinity []ClusterAffinityTerm `json:"clusterAffinity,omitempty"`
+
+	// MaxSurge is the whole-replica allowance shared by placement transitions
+	// and local rollout surge. Omission blocks disruptive movement between homes.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxSurge *int32 `json:"maxSurge,omitempty"`
+
+	// ReplacementTimeout bounds a non-admitting probe during a healthy Single
+	// move. Omission retains pending probes; a positive duration allows rotation.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="replacementTimeout must be a positive duration"
+	ReplacementTimeout *metav1.Duration `json:"replacementTimeout,omitempty"`
+
+	// LegacyFields retains explicit zero-valued obsolete fields during JSON round trips.
+	// It is serialization bookkeeping and is not a wire field.
+	LegacyFields PlacementLegacyFields `json:"-"`
+
+	// Requirements is a Legacy label selector, ANDed with ClusterSelector.
+	// Deprecated: opt into ClusterAffinity and use clusterAffinity.
+	// +optional
+	// +nullable
 	Requirements string `json:"requirements,omitempty"`
 
-	// ClusterSelector is an optional operator-imposed routing overlay
-	// (label-selector string) AND-ed onto Requirements to further narrow
-	// candidates. It can select WorkloadCluster labels (e.g. "provider=cloud-a")
-	// or immutable object names (e.g. "metadata.name in (cluster-a,cluster-c)").
-	// Structured equivalent of the ome.io/cluster-selector annotation.
+	// ClusterSelector is a Legacy selector over labels and virtual metadata.name.
+	// Deprecated: opt into ClusterAffinity and use clusterAffinity.
 	// +optional
+	// +nullable
 	ClusterSelector string `json:"clusterSelector,omitempty"`
 
-	// Split tunes Split mode (distributing replicas across clusters). Only
-	// consulted when Mode is Split; ignored otherwise. Nil means Split defaults:
-	// distribute the engine's minReplicas, packed onto the fewest clusters.
+	// Split provides the requested floor and optional per-home ceiling for
+	// Split and SplitByCapacity. ClusterAffinity rejects it in other modes.
 	// +optional
 	Split *SplitSpec `json:"split,omitempty"`
 
-	// CapacityFactors overrides the per-replica relative serving capacity of
-	// named workload clusters, keyed by WorkloadCluster name. It weights traffic
-	// for heterogeneous hardware where one cluster's replica serves more (or less)
-	// than another's: a home's routed share scales with its admitted replicas
-	// times this factor. A quantity of "2" means each replica on that cluster
-	// carries twice the share of a factor-1 replica; "500m" means half. A cluster
-	// absent from the map (or the whole field unset) uses the identity factor 1.
-	// This is a routing weight only — it does not influence placement or how many
-	// replicas a cluster admits.
-	//
+	// CapacityFactors is the Legacy alias for routing capacity factors.
 	// Deprecated: use spec.routing.capacityFactors.
 	// +optional
+	// +nullable
 	CapacityFactors map[string]resource.Quantity `json:"capacityFactors,omitempty"`
 }
 
-// SplitSpec tunes how Split mode distributes replicas across candidate
-// clusters. All fields are optional and degrade to the documented defaults.
+// SplitSpec declares the fleet floor and optional local ceiling. The floor
+// falls back only to an explicitly declared positive engine.minReplicas.
 type SplitSpec struct {
+	// LegacyFields retains explicit zero-valued obsolete fields during JSON round trips.
+	// It is serialization bookkeeping and is not a wire field.
+	LegacyFields SplitLegacyFields `json:"-"`
+
 	// Replicas is the fleet-wide desired replica count to distribute across homes.
 	// Unset falls back to the engine component's minReplicas (the guaranteed
 	// floor) — the count OME actually guarantees running and thus the one worth
 	// spreading. maxReplicas is deliberately NOT used (it is an autoscaling
 	// ceiling that stays a per-home local concern).
 	// +optional
+	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// Spread selects the apportionment policy. False (default) is Packed: fan out
-	// in preference order and fill the fewest clusters the fleet's quota forces
-	// (better locality, fewer endpoint backends). True is Balanced: apportion
-	// ~evenly (ceil(N/candidates)) so replicas spread across more clusters
-	// (blast-radius resilience over locality).
+	// Spread requests ceil(replicas/candidates) on each Legacy candidate.
+	// False uses admission-driven packing in candidate name order.
+	// Deprecated: ClusterAffinity uses exact shares and optional affinity weights.
 	// +optional
+	// +nullable
 	Spread bool `json:"spread,omitempty"`
 
-	// MaxReplicasPerCluster caps how many replicas one cluster may hold. It bounds
-	// the over-request the fractional fan-out makes, and — combined with Spread —
-	// is the lever that forces the fill to move on before a cluster is full
-	// (deliberate spread without reading capacity). Zero means no cap.
+	// MaxReplicasPerCluster is an optional local ceiling. ClusterAffinity holds
+	// plans exceeding it; Legacy clips requests to it. Zero leaves it uncapped.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	MaxReplicasPerCluster int32 `json:"maxReplicasPerCluster,omitempty"`
 
-	// MinReplicasPerCluster is the anti-sliver floor: a home that admits fewer
-	// than this is dropped and its replicas returned to the deficit, so the
-	// placement does not keep a home serving a tiny, uneconomical fraction. Zero
-	// keeps any home that admitted >=1.
+	// MinReplicasPerCluster discards Legacy homes admitted below this count.
+	// Deprecated: ClusterAffinity exact shares cannot discard a small admission.
 	// +optional
+	// +nullable
 	MinReplicasPerCluster int32 `json:"minReplicasPerCluster,omitempty"`
+}
+
+// UsesClusterAffinity reports the explicit opt-in, without inferring policy
+// from selector presence, mode, or member state.
+func (p *PlacementSpec) UsesClusterAffinity() bool {
+	return p != nil && p.Policy == PlacementPolicyClusterAffinity
+}
+
+// EffectiveMode resolves only the Legacy default. ClusterAffinity requires an
+// explicit mode so missing intent cannot acquire allocation authority.
+func (p *PlacementSpec) EffectiveMode() PlacementMode {
+	if p == nil || (!p.UsesClusterAffinity() && p.Mode == "") {
+		return PlacementModeSingle
+	}
+	return p.Mode
 }

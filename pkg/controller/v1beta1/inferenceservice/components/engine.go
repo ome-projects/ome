@@ -2,13 +2,11 @@ package components
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -16,7 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/common"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/pdb"
-	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 var _ Component = &Engine{}
@@ -27,7 +25,6 @@ type Engine struct {
 	BaseComponentFields
 	engineSpec           *v1beta1.EngineSpec
 	deploymentReconciler *common.DeploymentReconciler
-	podSpecReconciler    *common.PodSpecReconciler
 }
 
 // NewEngine creates a new Engine component instance. deps carries the
@@ -49,9 +46,6 @@ func NewEngine(deps *ComponentDeps, in ComponentInputs, engineSpec *v1beta1.Engi
 			StatusManager: base.StatusManager,
 			Log:           base.Log,
 		},
-		podSpecReconciler: &common.PodSpecReconciler{
-			Log: base.Log,
-		},
 	}
 }
 
@@ -64,18 +58,14 @@ func (e *Engine) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 		return ctrl.Result{}, errors.New("engine spec is nil")
 	}
 
-	// Reconcile fine-tuned weights if specified
-	if isvc.Spec.Model != nil && len(isvc.Spec.Model.FineTunedWeights) > 0 {
-		if err := ReconcileFineTunedWeights(&e.BaseComponentFields, isvc); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "failed to reconcile fine-tuned weights")
-		}
-	}
-
-	// Reconcile object metadata
-	objectMeta, err := e.reconcileObjectMeta(ctx, isvc)
+	// Render the pod templates: fine-tuned weights, object metadata, the
+	// primary pod and the worker pod. The engine spec is not mutated.
+	rendered, err := render.RenderEngine(ctx, &e.Piece, isvc, e.engineSpec)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile object metadata")
+		return ctrl.Result{}, errors.Wrap(err, "failed to render engine pods")
 	}
+	objectMeta, podSpec, workerPodSpec, size := rendered.ObjectMeta, rendered.Primary, rendered.Worker, rendered.WorkerSize
+
 	pdbRequest, err := resolveComponentPDBRequest(
 		&e.BaseComponentFields,
 		isvc,
@@ -91,20 +81,10 @@ func (e *Engine) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 		return ctrl.Result{}, errors.Wrap(err, "failed to preflight engine PodDisruptionBudget")
 	}
 
-	// Reconcile pod spec
-	podSpec, err := e.reconcilePodSpec(isvc, &objectMeta)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile pod spec")
+	if err := checkPlacementDemand(ctx, &e.BaseComponentFields, isvc, v1beta1.EngineComponent, e.engineSpec.Leader != nil, e.engineSpec.Worker != nil,
+		ReplicaTemplates{Primary: podSpec, Worker: workerPodSpec, WorkerSize: size}); err != nil {
+		return ctrl.Result{}, err
 	}
-
-	// Reconcile worker pod spec if needed
-	workerPodSpec, err := e.reconcileWorkerPodSpec(isvc, &objectMeta)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile worker pod spec")
-	}
-
-	// Get worker size
-	size := e.getWorkerSize()
 
 	// Reconcile deployment based on deployment mode. The deployment
 	// reconciler's RequeueAfter MUST be preserved through the rest of
@@ -148,21 +128,6 @@ func (e *Engine) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 // component enum and ComponentExtensionSpec pointer differ.
 func (e *Engine) reconcileOMENativeSubresources(ctx context.Context, isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta, podSpec *v1.PodSpec) error {
 	return ReconcileOMENativeSubresources(ctx, &e.BaseComponentFields, isvc, v1beta1.EngineComponent, &e.engineSpec.ComponentExtensionSpec, objectMeta, podSpec)
-}
-
-// getWorkerSize returns the worker size for multi-node deployments
-func (e *Engine) getWorkerSize() int {
-	var size int
-
-	// Prioritize sizes in order: Engine.Worker -> default
-	switch {
-	case e.engineSpec.Worker != nil && e.engineSpec.Worker.Size != nil:
-		size = *e.engineSpec.Worker.Size
-	default:
-		size = 0 // Default value
-	}
-
-	return size
 }
 
 // reconcileDeployment manages the deployment logic for different deployment modes
@@ -261,154 +226,36 @@ func (e *Engine) updateEngineStatus(isvc *v1beta1.InferenceService, objectMeta m
 	return UpdateComponentStatus(&e.BaseComponentFields, isvc, v1beta1.EngineComponent, objectMeta, &e.engineSpec.ComponentExtensionSpec)
 }
 
-// reconcileObjectMeta creates the object metadata for the engine
-// component. Delegates the annotation / label merge to the shared
-// ReconcileComponentObjectMeta helper in base.go; the per-component
-// name resolution stays here because the fallback rules still differ
-// across components (Decoder gates the Service-existence lookup on
-// non-MultiNode mode; engine / router don't — see section 4 of the
-// components-dispatch review).
-func (e *Engine) reconcileObjectMeta(ctx context.Context, isvc *v1beta1.InferenceService) (metav1.ObjectMeta, error) {
-	engineName, err := e.determineEngineName(ctx, isvc)
-	if err != nil {
-		return metav1.ObjectMeta{}, err
-	}
+// The render steps below expose the library one step at a time for the tests
+// that exercise them in isolation; Reconcile renders through
+// render.RenderEngine. Unlike RenderEngine, they complete the runner
+// containers in place on the engine spec.
 
+// reconcileObjectMeta builds the engine's object metadata.
+func (e *Engine) reconcileObjectMeta(_ context.Context, isvc *v1beta1.InferenceService) (metav1.ObjectMeta, error) {
 	var engineAnnotations, engineLabels map[string]string
 	if e.engineSpec != nil {
 		engineAnnotations = e.engineSpec.Annotations
 		engineLabels = e.engineSpec.Labels
 	}
 
-	return ReconcileComponentObjectMeta(&e.BaseComponentFields, isvc, v1beta1.EngineComponent, engineName, engineAnnotations, engineLabels)
+	return ReconcileComponentObjectMeta(&e.BaseComponentFields, isvc, v1beta1.EngineComponent, render.ComponentName(isvc, v1beta1.EngineComponent), engineAnnotations, engineLabels)
 }
 
-// determineEngineName determines the name of the engine service.
-// The suffix is sourced from GetServiceSuffix so the engine / decoder /
-// router suffix lives in exactly one place (ComponentConfig).
-func (e *Engine) determineEngineName(ctx context.Context, isvc *v1beta1.InferenceService) (string, error) {
-	defaultEngineName := isvc.Name + e.GetServiceSuffix()
-
-	existing := &v1.Service{}
-	if err := e.Client.Get(ctx, types.NamespacedName{Name: defaultEngineName, Namespace: isvc.Namespace}, existing); err == nil {
-		return defaultEngineName, nil
-	}
-
-	return defaultEngineName, nil
-}
-
-// engineUsesLeaderTemplate reports whether the engine should source its
-// primary pod template from the Leader block (multi-pod shape — MultiNode
-// or multi-pod OMENative) rather than the top-level engine spec
-// (single-pod shape). It is a pure structural check on the spec; it
-// deliberately does NOT consult the deployment mode, so dispatch-mode
-// classification and template selection stay decoupled.
+// engineUsesLeaderTemplate reports whether the engine sources its primary
+// pod template from the Leader block.
 func engineUsesLeaderTemplate(spec *v1beta1.EngineSpec) bool {
-	return spec != nil && spec.Leader != nil
+	return render.EngineUsesLeaderTemplate(spec)
 }
 
-// reconcilePodSpec creates the pod spec for the engine component
+// reconcilePodSpec renders the engine's primary pod.
 func (e *Engine) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	// Template selection is keyed on the presence of a Leader block, NOT on
-	// the deployment mode. e.DeploymentMode is set authoritatively at
-	// construction time; calling isvcutils.DetermineEngineDeploymentMode
-	// here would re-infer it from the spec and disagree with the dispatch
-	// for OMENative-mode engines that also set Leader/Worker (the helper
-	// returns MultiNode; the dispatch is OMENative).
-	var basePodSpec v1beta1.PodSpec
-	var runnerSpec *v1beta1.RunnerSpec
-
-	if engineUsesLeaderTemplate(e.engineSpec) {
-		basePodSpec = e.engineSpec.Leader.PodSpec
-		runnerSpec = e.engineSpec.Leader.Runner
-	} else {
-		// Fallback to the top-level engine spec — covers single-pod
-		// OMENative, RawDeployment, and the malformed-but-tolerated
-		// MultiNode-without-Leader shape.
-		basePodSpec = e.engineSpec.PodSpec
-		runnerSpec = e.engineSpec.Runner
-	}
-	if runnerSpec != nil {
-		UpdateEnvVariables(&e.BaseComponentFields, isvc, &runnerSpec.Container, objectMeta)
-		UpdateVolumeMounts(&e.BaseComponentFields, isvc, &runnerSpec.Container, objectMeta)
-		MergeEngineResources(&e.BaseComponentFields, isvc, &runnerSpec.Container)
-		MergeRuntimeArgumentsOverride(&e.BaseComponentFields, &runnerSpec.Container)
-		if !acceleratorProvidesParallelismOverride(&e.BaseComponentFields) {
-			e.setParallelismEnvVarForEngine(&runnerSpec.Container, e.getWorkerSize())
-		}
-	}
-
-	// Use common pod spec reconciler for base logic
-	podSpec, err := e.podSpecReconciler.ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
-	if err != nil {
-		return nil, err
-	}
-	UpdatePodSpecVolumes(&e.BaseComponentFields, isvc, podSpec, objectMeta)
-	UpdatePodSpecNodeSelector(&e.BaseComponentFields, isvc, podSpec, v1beta1.EngineComponent)
-	UpdateEngineAffinity(&e.BaseComponentFields, isvc, podSpec)
-
-	e.Log.V(1).Info("Engine PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
-	return podSpec, nil
+	return render.EnginePodSpec(&e.Piece, isvc, e.engineSpec, objectMeta)
 }
 
-// reconcileWorkerPodSpec reconciles the worker pod spec for multi-node deployments
+// reconcileWorkerPodSpec renders the engine's worker pod, nil without a worker.
 func (e *Engine) reconcileWorkerPodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	// Return nil if no worker spec is defined
-	if e.engineSpec.Worker == nil {
-		return nil, nil
-	}
-
-	// Get worker runner spec if available
-	var workerRunner *v1beta1.RunnerSpec
-	if e.engineSpec.Worker != nil {
-		workerRunner = e.engineSpec.Worker.Runner
-		if workerRunner != nil {
-			UpdateVolumeMounts(&e.BaseComponentFields, isvc, &workerRunner.Container, objectMeta)
-			UpdateEnvVariables(&e.BaseComponentFields, isvc, &workerRunner.Container, objectMeta)
-			MergeEngineResources(&e.BaseComponentFields, isvc, &workerRunner.Container)
-			MergeRuntimeArgumentsOverride(&e.BaseComponentFields, &workerRunner.Container)
-			if !acceleratorProvidesParallelismOverride(&e.BaseComponentFields) {
-				e.setParallelismEnvVarForEngine(&workerRunner.Container, e.getWorkerSize())
-			}
-		}
-	}
-
-	// Use common reconciler for worker pod spec
-	workerPodSpec, err := e.podSpecReconciler.ReconcileWorkerPodSpec(isvc, objectMeta, &e.engineSpec.Worker.PodSpec, workerRunner)
-	if err != nil {
-		return nil, err
-	}
-	UpdatePodSpecVolumes(&e.BaseComponentFields, isvc, workerPodSpec, objectMeta)
-	UpdatePodSpecNodeSelector(&e.BaseComponentFields, isvc, workerPodSpec, v1beta1.EngineComponent)
-	UpdateEngineAffinity(&e.BaseComponentFields, isvc, workerPodSpec)
-	e.Log.V(1).Info("Engine Worker PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
-	return workerPodSpec, nil
-}
-
-// setParallelismEnvVarForEngine calculates and sets the PARALLELISM_SIZE environment variable for the engine's container.
-func (e *Engine) setParallelismEnvVarForEngine(container *v1.Container, workerReplicas int) {
-	if container == nil || e.engineSpec == nil {
-		e.Log.V(2).Info("Cannot set parallelism: container or engineSpec is nil")
-		return
-	}
-
-	numGPUsPerPod := int64(isvcutils.GetGpuCountFromContainer(container, e.InferenceServiceConfig.AcceleratorResourceNames()))
-	numLeaders := int64(1) // at least one leader/pod
-	numWorkers := int64(workerReplicas)
-
-	// Only proceed if there are GPUs
-	if numGPUsPerPod > 0 {
-		parallelismSize := numGPUsPerPod * (numLeaders + numWorkers)
-		if parallelismSize > 0 {
-			envVar := v1.EnvVar{Name: constants.ParallelismSizeEnvVarKey, Value: strconv.FormatInt(parallelismSize, 10)}
-			isvcutils.UpdateEnvVars(container, &envVar)
-			e.Log.V(2).Info("Added parallelism env variable to engine container", "value", parallelismSize, "containerName", container.Name)
-		} else {
-			e.Log.V(2).Info("Calculated parallelism is zero, not adding env var", "containerName", container.Name)
-		}
-	} else {
-		e.Log.V(2).Info("Conditions not met for parallelism (no GPUs or no leaders/workers)", "containerName", container.Name, "gpus", numGPUsPerPod, "leaders", numLeaders, "workers", numWorkers)
-	}
+	return render.EngineWorkerPodSpec(&e.Piece, isvc, e.engineSpec, objectMeta)
 }
 
 // GetComponentType implements ComponentConfig interface

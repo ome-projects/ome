@@ -9,6 +9,7 @@ import (
 
 // InferenceServiceSpec is the top level type for this resource
 // +kubebuilder:validation:XValidation:rule="!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement) && has(self.placement.capacityFactors))",message="spec.routing.capacityFactors and deprecated spec.placement.capacityFactors must not both be set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.placement) || !has(oldSelf.placement.policy) || oldSelf.placement.policy != 'ClusterAffinity' || (has(self.placement) && has(self.placement.policy) && self.placement.policy == 'ClusterAffinity')",message="ClusterAffinity placement policy cannot be removed; drain and recreate the service to use Legacy"
 type InferenceServiceSpec struct {
 	// DeploymentMode selects the dispatch backend that drives every
 	// Component on this InferenceService. When set, it propagates to

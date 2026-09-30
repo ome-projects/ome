@@ -1,0 +1,86 @@
+{
+  "runners": [
+    {
+      "name": "default",
+      "size": 1,
+      "template": {
+        "metadata": {
+          "labels": {
+            "base-model-name": "model-a",
+            "base-model-size": "SMALL",
+            "base-model-type": "Serving",
+            "component": "decoder",
+            "fine-tuned-serving": "false",
+            "ome.io/inferenceservice": "pool-a",
+            "serving-runtime": "runtime-a",
+            "team": "a"
+          },
+          "annotations": {
+            "example.com/owner": "team-a",
+            "ome.io/base-model-format": "safetensors",
+            "ome.io/base-model-name": "model-a",
+            "ome.io/serving-runtime": "runtime-a"
+          }
+        },
+        "spec": {
+          "volumes": [
+            {
+              "name": "model-a",
+              "persistentVolumeClaim": {
+                "claimName": "models",
+                "readOnly": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "ome-container",
+              "image": "example.com/serving:v1",
+              "ports": [
+                {
+                  "name": "http",
+                  "containerPort": 8080
+                }
+              ],
+              "env": [
+                {
+                  "name": "MODEL_PATH",
+                  "value": "/opt/ml/model"
+                },
+                {
+                  "name": "PARALLELISM_SIZE",
+                  "value": "4"
+                }
+              ],
+              "resources": {
+                "limits": {
+                  "example.com/gpu": "4"
+                },
+                "requests": {
+                  "example.com/gpu": "4"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "model-a",
+                  "readOnly": true,
+                  "mountPath": "/opt/ml/model",
+                  "subPath": "model-a"
+                }
+              ]
+            }
+          ],
+          "nodeSelector": {
+            "pool": "runtime",
+            "tier": "x"
+          }
+        }
+      }
+    }
+  ],
+  "pairingProtocol": "",
+  "excludedAnnotationKeys": [
+    "example.com/owner"
+  ],
+  "revisionHash": "5e3c1e63"
+}

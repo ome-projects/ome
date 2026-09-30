@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -84,7 +85,7 @@ func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.Infer
 	}
 	ownGeneration := ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]
 	for _, peer := range coordination.ServingPeers(parent, ir.Spec.Component) {
-		peerIR, err := irprojector.ComponentIR(ctx, r.Client, ir.Namespace, ir.Spec.ParentRef.Name, peer)
+		peerIR, err := irprojector.ComponentIR(ctx, r.Client, ir.Namespace, ir.ParentName(), peer)
 		if err != nil {
 			return nil, "", err
 		}
@@ -109,14 +110,17 @@ func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.Infer
 }
 
 // peerRollTargetHash is the revision hash a peer's reconciler is rolling
-// its Instances onto: the rollback revision while a rollback is pinned
-// and its ControllerRevision still exists, else the spec target its
-// status reports. Mirrors the peer's own roll-target selection.
+// its Instances onto: the rollback revision while a rollback is pinned to
+// a ControllerRevision that still exists and the peer controls, else the
+// spec target its status reports. Matches the peer's ownership and
+// existence checks for the revision.
 func (r *Reconciler) peerRollTargetHash(ctx context.Context, peerIR *v1beta1.InferenceReplica) (string, error) {
 	if peerIR.Spec.Pacing != nil && peerIR.Spec.Pacing.RollbackToRevision != nil && *peerIR.Spec.Pacing.RollbackToRevision != "" {
 		name := *peerIR.Spec.Pacing.RollbackToRevision
 		cr := &appsv1.ControllerRevision{}
 		switch err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: peerIR.Namespace, Name: name}, cr); {
+		case err == nil && !metav1.IsControlledBy(cr, peerIR):
+			// The peer's reconciler ignores a revision it does not control, as if it were missing.
 		case err == nil:
 			return query.RevisionFromName(name).Hash(), nil
 		case apierrors.IsNotFound(err):

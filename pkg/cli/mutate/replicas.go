@@ -80,7 +80,7 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 		if len(ir.OwnerReferences) > 16 {
 			return ReplicaEvidence{}, ErrBounds
 		}
-		claims := ir.Spec.ParentRef.Name == v.Name || ir.Labels[constants.InferenceServiceLabel] == v.Name
+		claims := (ir.Spec.ParentRef != nil && ir.Spec.ParentRef.Name == v.Name) || ir.Labels[constants.InferenceServiceLabel] == v.Name
 		for _, ref := range ir.OwnerReferences {
 			if ref.UID == v.UID && ref.Controller != nil && *ref.Controller {
 				claims = true
@@ -122,7 +122,7 @@ func collectReplicaEvidence(ctx context.Context, client omeclient.OmeV1beta1Inte
 }
 
 func inspectReplica(ir *v1beta1.InferenceReplica, v *v1beta1.InferenceService, components []string, now time.Time) (ReplicaEvidence, error) {
-	if ir == nil || !SafeScalar(ir.Name) || !SafeScalar(string(ir.UID)) || !SafeScalar(ir.ResourceVersion) || ir.Namespace != v.Namespace || ir.Spec.ParentRef.Name != v.Name || ir.Generation <= 0 || ir.DeletionTimestamp != nil {
+	if ir == nil || !SafeScalar(ir.Name) || !SafeScalar(string(ir.UID)) || !SafeScalar(ir.ResourceVersion) || ir.Namespace != v.Namespace || (ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != v.Name) || ir.Generation <= 0 || ir.DeletionTimestamp != nil {
 		return ReplicaEvidence{}, ErrStale
 	}
 	if ir.Kind != "" && ir.Kind != "InferenceReplica" || ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1" {

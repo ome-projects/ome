@@ -23,6 +23,15 @@ func TestPlacementReconcileLeavesNonparticipantsUntouched(t *testing.T) {
 		configure func(*v1beta1.InferenceService)
 	}{
 		{name: "local service"},
+		{name: "empty legacy annotation", configure: func(s *v1beta1.InferenceService) { s.Annotations = map[string]string{ClusterSelectorAnnotation: ""} }},
+		{name: "empty legacy placement", configure: func(s *v1beta1.InferenceService) { s.Spec.Placement = &v1beta1.PlacementSpec{} }},
+		{name: "legacy mode without selectors", configure: func(s *v1beta1.InferenceService) {
+			s.Spec.Placement = &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeAll}
+		}},
+		{name: "empty legacy block masks annotations", configure: func(s *v1beta1.InferenceService) {
+			s.Spec.Placement = &v1beta1.PlacementSpec{}
+			s.Annotations = map[string]string{ClusterSelectorAnnotation: "region=west"}
+		}},
 		{name: "local finalizer", configure: func(s *v1beta1.InferenceService) { s.Finalizers = []string{"example.com/local-controller"} }},
 		{name: "placement finalizer without current intent", configure: func(s *v1beta1.InferenceService) { s.Finalizers = []string{PlacementFinalizer} }},
 		{name: "retained placement status without intent", configure: func(s *v1beta1.InferenceService) {
@@ -30,7 +39,7 @@ func TestPlacementReconcileLeavesNonparticipantsUntouched(t *testing.T) {
 		}},
 		{name: "derived label with copied typed intent", configure: func(s *v1beta1.InferenceService) {
 			s.Labels = map[string]string{PlacementOriginLabel: "source-uid"}
-			s.Spec.Placement = &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeSingle, Requirements: "accelerator=gpu"}
+			s.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle, Requirements: "accelerator=gpu"}
 		}},
 		{name: "derived annotation with copied legacy intent", configure: func(s *v1beta1.InferenceService) {
 			s.Annotations = map[string]string{PlacementOriginUIDAnnotation: "source-uid", ClusterSelectorAnnotation: "region=west"}
@@ -81,7 +90,7 @@ func TestPlacementParticipationRequiresSourceIntent(t *testing.T) {
 	}{
 		{name: "nil service"},
 		{name: "local service", service: &v1beta1.InferenceService{}},
-		{name: "typed selector", service: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{Requirements: "accelerator=gpu"}}}, want: true},
+		{name: "typed selector", service: &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Requirements: "accelerator=gpu"}}}, want: true},
 		{name: "legacy selector", service: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{ClusterSelectorAnnotation: "region=west"}}}, want: true},
 		{name: "derived label", service: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{PlacementOriginLabel: "source-uid"}, Annotations: map[string]string{ClusterSelectorAnnotation: "region=west"}}}},
 		{name: "derived annotation", service: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{PlacementOriginUIDAnnotation: "source-uid", ClusterSelectorAnnotation: "region=west"}}}},

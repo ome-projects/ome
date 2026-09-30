@@ -476,7 +476,7 @@ func controlledByVerifiedModeBridge(
 	}
 	return ir.Labels[constants.InferenceServicePodLabelKey] == isvcName &&
 		ir.Labels[constants.OMEComponentLabel] == component &&
-		ir.Spec.ParentRef.Name == isvcName &&
+		ir.ParentName() == isvcName &&
 		ir.Spec.Component == v1beta1.ComponentType(component), nil
 }
 

@@ -3,6 +3,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 
@@ -77,10 +78,31 @@ func ReconcileBaseModelWithStatus(cl client.Client, isvc *v1beta1.InferenceServi
 	}
 
 	if baseModel.Disabled != nil && *baseModel.Disabled {
-		return nil, nil, nil, fmt.Errorf("specified base model %s is disabled", isvc.Spec.Model.Name)
+		return nil, nil, nil, &ModelDisabledError{Name: isvc.Spec.Model.Name}
 	}
 
 	return baseModel, baseModelMeta, baseModelStatus, nil
+}
+
+// ModelDisabledError reports a model that resolved but is disabled and so
+// cannot be served.
+type ModelDisabledError struct{ Name string }
+
+func (e *ModelDisabledError) Error() string {
+	return fmt.Sprintf("specified base model %s is disabled", e.Name)
+}
+
+// IsModelDisabledError reports whether err is a disabled-model rejection.
+func IsModelDisabledError(err error) bool {
+	var disabled *ModelDisabledError
+	return goerrors.As(err, &disabled)
+}
+
+// IsModelNotFoundError reports whether err is the model lookup's not-found
+// result: neither a BaseModel in the namespace nor a ClusterBaseModel carries
+// the name.
+func IsModelNotFoundError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "No BaseModel or ClusterBaseModel with the name:")
 }
 
 // IsShardedBaseModel reports whether a model uses sharded distribution.

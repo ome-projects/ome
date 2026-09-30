@@ -31,7 +31,7 @@ func TestCollectRelatedPagesWithExactSelectorAndRejectsUnboundObjects(t *testing
 	}}
 	validEngine := relatedReplica(isvc, "chat-engine", omev1beta1.EngineComponent)
 	wrongParent := relatedReplica(isvc, "wrong-parent", omev1beta1.EngineComponent)
-	wrongParent.Spec.ParentRef.Name = "other"
+	wrongParent.Spec.ParentRef = &omev1beta1.ParentReference{Name: "other"}
 	validDecoder := relatedReplica(isvc, "chat-decoder", omev1beta1.DecoderComponent)
 	wrongOwner := relatedReplica(isvc, "wrong-owner", omev1beta1.RouterComponent)
 	wrongOwner.OwnerReferences[0].UID = types.UID("other-uid")
@@ -141,7 +141,7 @@ func TestCollectRelatedLongParentNameUsesBoundedExactRelationshipScan(t *testing
 	wrongParent := *related.DeepCopy()
 	wrongParent.Name = "wrong-parent"
 	wrongParent.UID = "wrong-parent-uid"
-	wrongParent.Spec.ParentRef.Name = "other"
+	wrongParent.Spec.ParentRef = &omev1beta1.ParentReference{Name: "other"}
 	wrongOwner := *related.DeepCopy()
 	wrongOwner.Name = "wrong-owner"
 	wrongOwner.UID = "wrong-owner-uid"
@@ -1112,7 +1112,7 @@ func TestCollectRelatedRejectsEveryIdentityMismatch(t *testing.T) {
 		{name: "empty uid", mutate: func(ir *omev1beta1.InferenceReplica) { ir.UID = "" }, want: instancecollection.RejectionMetadata},
 		{name: "unsafe uid", mutate: func(ir *omev1beta1.InferenceReplica) { ir.UID = "uid\u202e\nSECRET" }, want: instancecollection.RejectionMetadata},
 		{name: "label", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Labels[constants.InferenceServiceLabel] = "other" }, want: instancecollection.RejectionLabel},
-		{name: "parent", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Spec.ParentRef.Name = "other" }, want: instancecollection.RejectionParentReference},
+		{name: "parent", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Spec.ParentRef = &omev1beta1.ParentReference{Name: "other"} }, want: instancecollection.RejectionParentReference},
 		{name: "owner api version", mutate: func(ir *omev1beta1.InferenceReplica) { ir.OwnerReferences[0].APIVersion = "ome.io/v1" }, want: instancecollection.RejectionOwnerReference},
 		{name: "owner kind", mutate: func(ir *omev1beta1.InferenceReplica) { ir.OwnerReferences[0].Kind = "Other" }, want: instancecollection.RejectionOwnerReference},
 		{name: "owner name", mutate: func(ir *omev1beta1.InferenceReplica) { ir.OwnerReferences[0].Name = "other" }, want: instancecollection.RejectionOwnerReference},
@@ -1291,7 +1291,7 @@ func relatedReplica(
 			}},
 		},
 		Spec: omev1beta1.InferenceReplicaSpec{
-			ParentRef: omev1beta1.ParentReference{Name: isvc.Name}, Component: component,
+			ParentRef: &omev1beta1.ParentReference{Name: isvc.Name}, Component: component,
 		},
 	}
 }

@@ -20,8 +20,10 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/sliceprovision"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/tpuslice/gke"
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
@@ -29,6 +31,13 @@ import (
 //
 // Watches:
 //   - InferenceReplica (primary): re-enqueue on spec / status changes.
+//   - InferenceReplica (peers): a replica's generation, projected parent
+//     generation or revision status changing enqueues the serving peers
+//     of its parent, which pair their pods on its roll target and hold
+//     while it lags.
+//   - InferenceReplica (held peers): a replica's serving counters changing
+//     enqueues the serving peers whose recorded RolloutHold waits on them
+//     (a pairing or ratio denial); a peer nothing is held on wakes no one.
 //   - Pods: a custom handler that BOTH updates the Expectations cache
 //     (ObservedCreate / ObservedDelete) AND re-enqueues the owning IR.
 //     The expectations update is load-bearing: the workload dispatcher's
@@ -48,6 +57,14 @@ import (
 //   - ScaledObject (owned): watched only when the KEDA CRD is present
 //     (probed at setup); an unconditional watch would fail manager
 //     startup when KEDA is absent (cache-sync timeout).
+//   - TPU slices: watched only when TPU slice provisioning is configured
+//     and the Slice CRD is present (probed at setup). A slice event
+//     enqueues the InferenceReplica it was provisioned for, so a slice
+//     turning ready releases its withheld pods and a released slice
+//     completes teardown. The leader also reports the slices by state.
+//   - ServingRuntime / ClusterServingRuntime / BaseModel / ClusterBaseModel:
+//     mapped through the reference indexes onto the replicas that render
+//     their pods from modelRef or runtimeRef (watches.go).
 //
 // The parent InferenceService is NOT watched — the IR's owner ref to
 // its parent means the parent's controller already gets re-enqueued
@@ -105,6 +122,29 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return err
 	}
+	// TPU slices are provisioned only when configured and the Slice CRD is
+	// installed at setup: a watch on an absent CRD fails manager startup.
+	sliceFound := false
+	if r.TPUSliceProvisioning != nil {
+		if err := sliceprovision.CheckConfig(r.TPUSliceProvisioning); err != nil {
+			return fmt.Errorf("inferencereplica: TPU slice provisioning: %w", err)
+		}
+		if sliceFound, err = utils.IsCrdAvailable(mgr.GetConfig(), gke.GroupVersion.String(), gke.Kind); err != nil {
+			return err
+		}
+		if sliceFound {
+			r.sliceReader = mgr.GetCache()
+			sliceprovision.InitSeries(r.TPUSliceProvisioning)
+			if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1beta1.InferenceReplica{}, irUIDIndexField, irUIDIndexExtractor); err != nil {
+				return fmt.Errorf("inferencereplica: register InferenceReplica UID index: %w", err)
+			}
+			if err := mgr.Add(r.reportSliceStates(mgr.GetCache(), mgr.GetCache())); err != nil {
+				return fmt.Errorf("inferencereplica: add TPU slice state reporting: %w", err)
+			}
+		} else {
+			r.Log.Info("The InferenceReplica controller won't provision TPU slices because the " + gke.GroupVersion.String() + " " + gke.Kind + " CRD is not available; pods are created without slices until it is installed and the manager restarts.")
+		}
+	}
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		// MaxConcurrentReconciles parallelizes reconciles for distinct IRs;
@@ -119,13 +159,35 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if kedaFound {
 		b = b.Owns(&kedav1.ScaledObject{})
 	} else {
-		r.Log.Info("The InferenceReplica controller won't watch keda.sh/v1alpha1/ScaledObject resources because the CRD is not available; InferenceReplicas requesting KEDA autoscaling will fail on reconcile until KEDA is installed.")
+		r.Log.Info("The InferenceReplica controller does not watch keda.sh/v1alpha1/ScaledObject because the CRD is not installed; ScaledObject changes will not trigger replica reconciles until KEDA is installed and the manager restarts.")
 	}
-	return b.
+	if sliceFound {
+		b = b.Watches(gke.NewObject(), r.tpuSliceEventHandler())
+	}
+	if err := b.
 		Watches(
 			&corev1.Pod{},
 			newPodEventHandler(r.Expectations),
 			builder.WithPredicates(managedByOMENativePredicate()),
+		).
+		// A serving peer's roll target and status freshness gate what this
+		// replica renders (resolvePeerRevisions), so the peer's projection
+		// and status transitions enqueue its siblings: a pass held on a
+		// lagging peer is released by the catch-up it waits for.
+		Watches(
+			&v1beta1.InferenceReplica{},
+			handler.EnqueueRequestsFromMapFunc(r.peerReplicasOf),
+			builder.WithPredicates(peerRevisionPredicate()),
+		).
+		// A pairing or ratio denial simulates the step against the peers'
+		// serving counters, which the watch above leaves out. A peer's
+		// counter transition enqueues only the siblings whose recorded
+		// hold waits on it, so the denial lifts with the transition
+		// instead of with the denied replica's own backoff.
+		Watches(
+			&v1beta1.InferenceReplica{},
+			handler.EnqueueRequestsFromMapFunc(r.heldPeerReplicasOf),
+			builder.WithPredicates(peerCounterPredicate()),
 		).
 		// EndpointSlice events for OMENative drain Services (per-Component
 		// headless + per-revision routed) enqueue the owning IR so the
@@ -135,9 +197,25 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// slices that don't target an OMENative drain Service.
 		Watches(
 			&discoveryv1.EndpointSlice{},
-			handler.EnqueueRequestsFromMapFunc(EndpointSliceToIR),
+			handler.EnqueueRequestsFromMapFunc(r.endpointSliceToIR),
 		).
-		Complete(r)
+		// A replica that renders from modelRef or runtimeRef re-renders when
+		// the runtime it names (or one it inherits from), any runtime it may
+		// select, or its model changes. Status changes count: a sharded model
+		// turning Ready is what lets a blocked replica render.
+		Watches(&v1beta1.ServingRuntime{}, handler.EnqueueRequestsFromMapFunc(r.runtimeToReplicas)).
+		Watches(&v1beta1.ClusterServingRuntime{}, handler.EnqueueRequestsFromMapFunc(r.runtimeToReplicas)).
+		Watches(&v1beta1.BaseModel{}, handler.EnqueueRequestsFromMapFunc(r.modelToReplicas)).
+		Watches(&v1beta1.ClusterBaseModel{}, handler.EnqueueRequestsFromMapFunc(r.modelToReplicas)).
+		Complete(r); err != nil {
+		return err
+	}
+	// The mappers of the runtime and model watches list through these
+	// indexes; the cache accepts them until the manager starts.
+	if err := registerRefIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		return fmt.Errorf("inferencereplica: %w", err)
+	}
+	return nil
 }
 
 // validateWiring rejects a mis-wired reconciler at setup. The

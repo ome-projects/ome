@@ -32,7 +32,7 @@ func readySourceFixture(count int32) (*ome.InferenceService, *ome.InferenceRepli
 			Annotations:     map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: strconv.FormatInt(parent.Generation, 10)},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: ome.SchemeGroupVersion.String(), Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}},
 		},
-		Spec: ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
+		Spec: ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
 		Status: ome.InferenceReplicaStatus{
 			ObservedGeneration: 2, Replicas: count, ReadyReplicas: count, ServingReplicas: count, AvailableReplicas: count,
 		},

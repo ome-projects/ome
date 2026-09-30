@@ -326,13 +326,21 @@ func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedP
 // whole InferenceService, so any Component's retarget drags every other
 // Component's target into the pin; re-presenting a rejected revision would
 // re-arm a ladder already known to fail, and its rollback would then close the
-// shared run and discard the progress of the group that opened it.
+// shared run and discard the progress of the group that opened it. A unit
+// adopted mid-revert is the exception: it is pinned at the rejected revision,
+// the target the lost run held, so the revert completes under the run and
+// closes it RolledBack.
 func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1beta1.ComponentType]targetPair, stableOverrides map[v1beta1.ComponentType]string, adopting bool, now metav1.Time) {
 	rejected := stickyRejectHashes(isvc, targets)
 	var pinned []v1beta1.RolloutRunTarget
 	seen := map[v1beta1.ComponentType]bool{}
 	for i := range plan.groups {
-		for _, comp := range plan.groups[i].Group.Components {
+		g := &plan.groups[i].Group
+		// Adoption does not reset the unit, so the pin must be the target the
+		// executor's hold is keyed on; the run's close then recognizes the
+		// rollback as its own.
+		reverting := adopting && g.Canary != nil && revertInFlight(isvc, g)
+		for _, comp := range g.Components {
 			if seen[comp] {
 				continue
 			}
@@ -346,7 +354,7 @@ func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1be
 			if !carried {
 				stable = componentStableRevision(isvc, comp, rev, t, adopting)
 			}
-			if hold := rejected[comp]; hold != "" && rev == hold && stable != "" {
+			if hold := rejected[comp]; hold != "" && rev == hold && stable != "" && !reverting {
 				rev = stable
 			}
 			pinned = append(pinned, v1beta1.RolloutRunTarget{
@@ -480,7 +488,7 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 				if pinnedFor[primary] != cs.RolledBackRevisionHash {
 					continue
 				}
-				if primaryPhase(isvc, g) == v1beta1.RolloutPhaseRolledBack {
+				if rollout.StateOf(cs, primaryPhase(isvc, g), len(g.Canary.Steps)) == rollout.CanaryStateRolledBack {
 					return v1beta1.RolloutRunRolledBack, true
 				}
 				return "", false

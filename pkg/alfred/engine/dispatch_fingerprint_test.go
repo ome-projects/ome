@@ -183,6 +183,14 @@ func TestDispatchSemanticFingerprintRetainsSafetyMeaning(t *testing.T) {
 			}
 			tc.mutate(source{owner, ir, pods})
 			after, err := dispatchSourceFingerprint(owner, ir, pods, candidate.Instance, dispatchFingerprintSemantic)
+			if tc.name == "unknown-authority-field" {
+				// The transport rejects unknown authority fields, so the
+				// fingerprint fails closed instead of authorizing a retry.
+				if err == nil {
+					t.Fatal("unknown authority field was accepted")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

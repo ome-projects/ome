@@ -45,7 +45,7 @@ func readyWaitFixture(count int32) (*ome.InferenceService, *ome.InferenceReplica
 			Labels:          map[string]string{constants.InferenceServiceLabel: "chat", constants.OMEComponentLabel: "engine"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: ome.SchemeGroupVersion.String(), Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}},
 		},
-		Spec: ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
+		Spec: ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent},
 		Status: ome.InferenceReplicaStatus{
 			ObservedGeneration: 2, Replicas: count, ReadyReplicas: count,
 			ServingReplicas: count, AvailableReplicas: count,

@@ -688,6 +688,62 @@ func TestQuotaBlockedInstance_NotFailedByDeadlineBackstop(t *testing.T) {
 	}
 }
 
+// TestProvisioningHeldInstance_ParksAndSurvivesTheBackstop: a row whose
+// pod is withheld until a provisioner readies its capacity has nothing
+// wrong with it. Its clock parks while the row reports the wait, re-arms
+// from the moment the wait ends, and the backstop skips a deadline
+// stamped before the park landed.
+func TestProvisioningHeldInstance_ParksAndSurvivesTheBackstop(t *testing.T) {
+	now := time.Now()
+	held := func(deadline metav1.Time) []workloadtypes.InstanceStatus {
+		return []workloadtypes.InstanceStatus{{
+			Index: 0,
+			Phase: workloadtypes.InstancePhaseCreating,
+			Operation: &workloadtypes.InstanceOperation{
+				Type:     workloadtypes.InstanceOperationCreate,
+				Deadline: deadline,
+				Waiting:  workloadtypes.WaitingReasonCapacityProvisioning,
+			},
+		}}
+	}
+
+	t.Run("parks while held and re-arms on release", func(t *testing.T) {
+		original := metav1.NewTime(now.Add(10 * time.Minute))
+		insts := held(original)
+		input, store, _ := expireFixture(insts)
+		if err := escalation.ReconcileGatedDeadlines(context.Background(), input, insts, map[int32]bool{}, 30*time.Minute); err != nil {
+			t.Fatalf("ReconcileGatedDeadlines: %v", err)
+		}
+		if !(*store)[0].Operation.Deadline.IsZero() {
+			t.Fatalf("provisioning-held Deadline: got %v want zero (parked)", (*store)[0].Operation.Deadline)
+		}
+
+		(*store)[0].Operation.Waiting = ""
+		released := append([]workloadtypes.InstanceStatus(nil), (*store)...)
+		if err := escalation.ReconcileGatedDeadlines(context.Background(), input, released, map[int32]bool{}, 30*time.Minute); err != nil {
+			t.Fatalf("ReconcileGatedDeadlines after release: %v", err)
+		}
+		d := (*store)[0].Operation.Deadline
+		if d.IsZero() || !d.Time.After(original.Time) {
+			t.Errorf("re-armed Deadline: got %v want a fresh now+timeout (later than the original %v)", d, original)
+		}
+	})
+
+	t.Run("not failed by the backstop", func(t *testing.T) {
+		insts := held(metav1.NewTime(now.Add(-1 * time.Hour)))
+		input, store, event := expireFixture(insts)
+		if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 1), nil); err != nil {
+			t.Fatalf("escalation pass: %v", err)
+		}
+		if (*store)[0].Phase == workloadtypes.InstancePhaseFailed {
+			t.Error("a provisioning-held Instance was failed by the deadline backstop; want alive")
+		}
+		if event.count != 0 {
+			t.Errorf("event count: got %d want 0 (a capacity wait must not be reported as a failure)", event.count)
+		}
+	})
+}
+
 // TestGangSurgeSource_HeldWhileItsSurgeWaitsOnQuota is the reader side of
 // the gang-surge wait. A gang surge creates its replacement pods under
 // the SURGE index, so that row is where the quota token lands — but the

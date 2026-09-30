@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/sliceprovision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
@@ -382,8 +384,13 @@ func TestReconcile_GangCleanupRetainsStatusUntilPodGroupAbsent(t *testing.T) {
 	if statusByIndex(stored.Status.InstanceStatuses, surgeIndex) != nil {
 		t.Fatal("cleanup marker remained after authoritative PodGroup absence")
 	}
+	// The reset clears the source's operation and Failed phase in the
+	// marker's own write. The fixture gives the source no pods, so the
+	// status publication that follows reports the settled row as Pending
+	// rather than Ready.
 	source := statusByIndex(stored.Status.InstanceStatuses, 0)
-	if source == nil || source.Phase != v1beta1.OMENativeInstanceReady || source.Operation != nil {
+	if source == nil || source.Operation != nil ||
+		(source.Phase != v1beta1.OMENativeInstanceReady && source.Phase != v1beta1.OMENativeInstancePending) {
 		t.Fatalf("source was not reset atomically with marker removal: %+v", source)
 	}
 }
@@ -550,7 +557,6 @@ func TestReconcile_ParentPauseParksDeadlineBeforeRevisionError(t *testing.T) {
 	// Model a stale projection caused by an ISVC component render failure: the
 	// parent is paused, but the IR spec was never patched.
 	ir.Spec.Paused = false
-	ir.OwnerReferences = nil // force revision creation to fail before the defer
 	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
 		Index: 0,
 		Phase: v1beta1.OMENativeInstanceCreating,
@@ -568,10 +574,19 @@ func TestReconcile_ParentPauseParksDeadlineBeforeRevisionError(t *testing.T) {
 		},
 	}}
 	r, c := newReconciler(t, ir, parent)
+	// Fail revision creation so the pass errors before the status defer.
+	r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*appsv1.ControllerRevision); ok {
+				return errors.New("injected revision create failure")
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	})
 	key := types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
-	if err == nil || !strings.Contains(err.Error(), "missing controller OwnerReference") {
+	if err == nil || !strings.Contains(err.Error(), "injected revision create failure") {
 		t.Fatalf("expected pre-defer revision error, got %v", err)
 	}
 	got := &v1beta1.InferenceReplica{}
@@ -633,14 +648,14 @@ func TestReconcile_Create_MaterializesPods(t *testing.T) {
 	g.Expect(pods.Items).To(gomega.HaveLen(2),
 		"expected one pod per desired Instance; got %d", len(pods.Items))
 
-	// Pod names must follow the legacy shape <isvc>-<component>-<idx>-default-0
-	// so existing selectors keep matching.
+	// Pod names follow <prefix>-<component>-<idx>-default-0, where a
+	// projected replica's prefix is its parent ISVC's name.
 	names := podNames(pods.Items)
 	g.Expect(names).To(gomega.ContainElement(query.PodName("llama", v1beta1convert.ComponentTypeToWorkload(v1beta1.EngineComponent), 0, "default", 0)))
 	g.Expect(names).To(gomega.ContainElement(query.PodName("llama", v1beta1convert.ComponentTypeToWorkload(v1beta1.EngineComponent), 1, "default", 0)))
 
-	// Every pod must be owner-ref'd to the IR (Kind=InferenceReplica),
-	// NOT the legacy ISVC owner.
+	// Every pod must be controller-owned by the IR (Kind=InferenceReplica),
+	// not by the parent ISVC.
 	for _, pod := range pods.Items {
 		g.Expect(pod.OwnerReferences).To(gomega.HaveLen(1))
 		ref := pod.OwnerReferences[0]
@@ -663,8 +678,9 @@ func TestReconcile_Create_MaterializesPods(t *testing.T) {
 	g.Expect(got.Status.ObservedGeneration).To(gomega.Equal(int64(1)))
 	g.Expect(got.Status.LabelSelector).NotTo(gomega.BeEmpty(),
 		"LabelSelector must be set for HPA scale subresource")
-	// LabelSelector must encode the legacy OMENative pod-selector trio so
-	// existing HPAs continue to resolve.
+	// LabelSelector must encode the OMENative pod-selector trio (name
+	// prefix, component, managed-by) so the HPA's scale selector matches
+	// the replica's pods.
 	g.Expect(got.Status.LabelSelector).To(gomega.ContainSubstring("component=engine"))
 	g.Expect(got.Status.LabelSelector).To(gomega.ContainSubstring("ome.io/inferenceservice=llama"))
 	g.Expect(got.Status.LabelSelector).To(gomega.ContainSubstring("ome.io/managed-by=OMENative"))
@@ -714,13 +730,13 @@ func TestReconcile_Create_ConfiguredBatchSizeCapsPods(t *testing.T) {
 // workload/service/service_test.go — this test only verifies the wire-in.
 //
 // Asserts on the canonical shape:
-//   - Name == query.HeadlessServiceName(parent, component) so any
-//     tooling that looks for `<isvc>-<component>-headless` keeps working
+//   - Name == query.HeadlessServiceName(prefix, component), which is
+//     `<isvc>-<component>-headless` for a projected replica
 //   - ClusterIP == None so DNS returns per-pod A records (no
 //     kube-proxy load-balancing) — required for gang-init peer discovery
 //   - PublishNotReadyAddresses == true so peer DNS resolves before
 //     pods flip Ready (workers must discover each other during init)
-//   - Selector carries the legacy OMENative pod-selector trio
+//   - Selector carries the OMENative pod-selector trio
 //     (ome.io/inferenceservice + component + managed-by=OMENative) so
 //     the Service matches the same pods the workload renderer stamps
 //   - Owner ref points at the IR (Kind=InferenceReplica), NOT the
@@ -1819,10 +1835,10 @@ func TestRestart_PendingGangMemberTerminal_RebuildsInstance(t *testing.T) {
 // pass where the RetryBlock recorded against its revision has come due,
 // and is not while the block still denies the revision.
 //
-// While the block denies, the rebuild is not merely postponed — the
-// Create pass fills the missing member instead, because below Ready it
-// owns an Instance the rebuild gate declined. That is the behavior the
-// held case records.
+// While the block denies, no whole-gang rebuild opens: below Ready the
+// repair answers to the revision's RetryBlock, and a Held block denies
+// the Create pass's fill of the missing member at that revision as well,
+// so the held case records a row that waits on the record.
 func TestRestart_PendingGangMemberLost_RebuildsOnceRetryBlockIsDue(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -3142,5 +3158,368 @@ func TestReconcileUnresolvedPlacementLimitCannotAcknowledge(t *testing.T) {
 				t.Fatal("unresolved limit created pods")
 			}
 		})
+	}
+}
+
+// TestReconcile_TPUSlices_WithholdsPodsUntilTheirSliceIsReady pins the
+// opted-in create path: a pass creates each Instance's slice and withholds
+// its pod on the provisioning hold, and the pass after the slice turns
+// ready creates the pod confined to it.
+func TestReconcile_TPUSlices_WithholdsPodsUntilTheirSliceIsReady(t *testing.T) {
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 1)
+	r, c := newSliceReconciler(t, ir)
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	p, err := r.sliceProvisioner(ir)
+	if err != nil {
+		t.Fatalf("sliceProvisioner: %v", err)
+	}
+	name := p.Name(sliceprovision.Slot{Instance: 0})
+
+	for pass := 0; pass < 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if got := sliceNames(t, c); !reflect.DeepEqual(got, []string{name}) {
+		t.Fatalf("slices = %v, want [%s]", got, name)
+	}
+	if pods := listPods(t, c, ir.Namespace); len(pods) != 0 {
+		t.Fatalf("a pod must wait for its slice; created %v", podNames(pods))
+	}
+	got := &v1beta1.InferenceReplica{}
+	if err := c.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	if row := instanceStatusAt(t, got, 0); row.Operation == nil || row.Operation.Waiting != workloadtypes.WaitingReasonCapacityProvisioning {
+		t.Fatalf("Instance 0 operation = %+v, want it waiting on %s", row.Operation, workloadtypes.WaitingReasonCapacityProvisioning)
+	}
+
+	setSliceState(t, c, name, sliceStateReady)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("ready pass: %v", err)
+	}
+	pods := listPods(t, c, ir.Namespace)
+	if len(pods) != 1 {
+		t.Fatalf("pods = %v, want one once its slice is ready", podNames(pods))
+	}
+	if got := pods[0].Spec.NodeSelector[sliceKeySlice]; got != name {
+		t.Fatalf("pod selects slice %q, want %q", got, name)
+	}
+}
+
+// TestReconcile_TPUSlices_OptedOutPodsAreNotConfined pins the opt-in: a
+// pod that selects a provision-only pool, of an owner that does not opt
+// in, is created unconfined and no slice is provisioned for it.
+func TestReconcile_TPUSlices_OptedOutPodsAreNotConfined(t *testing.T) {
+	ir := optedInIR("llama-engine", "prod", 1)
+	ir.Spec.Runners[0].Template.Annotations = nil
+	r, c := newSliceReconciler(t, ir)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	pods := listPods(t, c, ir.Namespace)
+	if len(pods) != 1 {
+		t.Fatalf("pods = %v, want one", podNames(pods))
+	}
+	if got, ok := pods[0].Spec.NodeSelector[sliceKeySlice]; ok {
+		t.Fatalf("an opted-out pod must not be confined to a slice; selects %q", got)
+	}
+	if got := sliceNames(t, c); len(got) != 0 {
+		t.Fatalf("no slice may be provisioned for an opted-out owner; got %v", got)
+	}
+}
+
+// TestReconcile_TPUSlices_ScaleDownReleasesTheRemovedInstancesSlice pins
+// the per-Instance release: a removed Instance's slice outlives its
+// terminating pod and is released once the pod is gone, and the kept
+// Instance's slice stays.
+func TestReconcile_TPUSlices_ScaleDownReleasesTheRemovedInstancesSlice(t *testing.T) {
+	const podHold = "example.com/hold"
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+	}
+	r, c := newSliceReconciler(t, ir)
+	var slices [2]string
+	var removedPod client.ObjectKey
+	for i := range slices {
+		slices[i] = seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: int32(i)}, sliceStateReady)
+		pod := podForIR(ir, int32(i), string(v1beta1.RunnerNameDefault), 0, true, true)
+		pod.Spec.NodeSelector = map[string]string{sliceKeySlice: slices[i]}
+		if i == 1 {
+			pod.Finalizers = []string{podHold}
+			removedPod = client.ObjectKeyFromObject(pod)
+		}
+		if err := c.Create(ctx, pod); err != nil {
+			t.Fatalf("create pod: %v", err)
+		}
+	}
+	kept, removed := slices[0], slices[1]
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	reconcile := func(stage string, pass int) {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("%s pass %d: %v", stage, pass, err)
+		}
+	}
+
+	pod := &corev1.Pod{}
+	for pass := 0; pass < 10; pass++ {
+		reconcile("scale-down", pass)
+		if err := c.Get(ctx, removedPod, pod); err != nil {
+			t.Fatalf("get the removed Instance's pod: %v", err)
+		}
+		if pod.DeletionTimestamp != nil {
+			break
+		}
+	}
+	if pod.DeletionTimestamp == nil {
+		t.Fatal("the removed Instance's pod must be deleted")
+	}
+	for pass := 0; pass < 3; pass++ {
+		reconcile("terminating", pass)
+	}
+	if getSlice(t, c, removed) == nil {
+		t.Fatal("a slice must outlive the pod confined to it")
+	}
+
+	pod.Finalizers = nil
+	if err := c.Update(ctx, pod); err != nil {
+		t.Fatalf("release the pod: %v", err)
+	}
+	for pass := 0; pass < 10 && getSlice(t, c, removed) != nil; pass++ {
+		reconcile("release", pass)
+	}
+	if getSlice(t, c, removed) != nil {
+		t.Fatalf("the removed Instance's slice must be released once its pod is gone; slices %v", sliceNames(t, c))
+	}
+	if getSlice(t, c, kept) == nil {
+		t.Fatal("the kept Instance's slice must stay")
+	}
+	pods := listPods(t, c, ir.Namespace)
+	if len(pods) != 1 || pods[0].Spec.NodeSelector[sliceKeySlice] != kept {
+		t.Fatalf("pods = %v, want only the kept Instance's pod", podNames(pods))
+	}
+}
+
+// TestReconcile_TPUSlices_ReleasesUnusedSlicesOfAnOptedOutOwner pins the
+// release-only pass: an owner that opted out still releases the slices it
+// holds once no pod is confined to them.
+func TestReconcile_TPUSlices_ReleasesUnusedSlicesOfAnOptedOutOwner(t *testing.T) {
+	ir := optedInIR("llama-engine", "prod", 1)
+	ir.Spec.Runners[0].Template.Annotations = nil
+	r, c := newSliceReconciler(t, ir)
+	stale := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if getSlice(t, c, stale) != nil {
+		t.Fatal("a slice no pod is confined to must be released once its owner opts out")
+	}
+	if pods := listPods(t, c, ir.Namespace); len(pods) != 1 {
+		t.Fatalf("pods = %v, want the opted-out pod created unconfined", podNames(pods))
+	}
+}
+
+// TestReconcile_TPUSlices_FailuresFailThePass pins that a failed slice
+// read or release is the pass's error, and that a provisioning failure is
+// raised before any pod is created.
+func TestReconcile_TPUSlices_FailuresFailThePass(t *testing.T) {
+	failing := func(c client.WithWatch, funcs interceptor.Funcs) client.WithWatch {
+		return interceptor.NewClient(c, funcs)
+	}
+	for _, tc := range []struct {
+		name    string
+		wire    func(r *Reconciler, c client.WithWatch)
+		wantErr string
+		// wantPods is whether the pass creates the pod before failing.
+		wantPods bool
+	}{
+		{
+			name: "cached slice read",
+			wire: func(r *Reconciler, c client.WithWatch) {
+				r.sliceReader = failing(c, interceptor.Funcs{
+					List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+						if _, ok := list.(*unstructured.UnstructuredList); ok {
+							return errors.New("injected slice list failure")
+						}
+						return c.List(ctx, list, opts...)
+					},
+				})
+			},
+			wantErr: "provision TPU slices",
+		},
+		{
+			name: "slice release",
+			wire: func(r *Reconciler, c client.WithWatch) {
+				r.Client = failing(c, interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if _, ok := obj.(*unstructured.Unstructured); ok {
+							return errors.New("injected slice delete failure")
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+			},
+			wantErr:  "sweep TPU slices",
+			wantPods: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := optedInIR("llama-engine", "prod", 1)
+			ir.Spec.Runners[0].Template.Annotations = nil
+			r, c := newSliceReconciler(t, ir)
+			seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+			tc.wire(r, c)
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), "injected") {
+				t.Fatalf("Reconcile error = %v, want the %s failure", err, tc.wantErr)
+			}
+			if pods := listPods(t, c, ir.Namespace); (len(pods) > 0) != tc.wantPods {
+				t.Fatalf("pods = %v, want pods created before the failure: %v", podNames(pods), tc.wantPods)
+			}
+		})
+	}
+}
+func TestRevisionScopeUIDFollowsTheForm(t *testing.T) {
+	projected := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
+		Name: "svc-engine", Namespace: "team-a", UID: "replica-uid",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceService",
+			Name: "svc", UID: "isvc-uid", Controller: ptr.To(true),
+		}},
+	}}
+	if got, err := revisionScopeUID(projected); err != nil || got != "isvc-uid" {
+		t.Fatalf("projected scope = %q, %v, want isvc-uid", got, err)
+	}
+	// The owner is matched by group and kind, so an InferenceService served
+	// at another ome.io version keeps the parent's scope.
+	otherVersion := projected.DeepCopy()
+	otherVersion.Spec.ParentRef = &v1beta1.ParentReference{Name: "svc"}
+	otherVersion.OwnerReferences[0].APIVersion = v1beta1.SchemeGroupVersion.Group + "/v2"
+	if got, err := revisionScopeUID(otherVersion); err != nil || got != "isvc-uid" {
+		t.Fatalf("scope with an InferenceService owner at another version = %q, %v, want isvc-uid", got, err)
+	}
+	noOwnerUID := projected.DeepCopy()
+	noOwnerUID.OwnerReferences[0].UID = ""
+	if _, err := revisionScopeUID(noOwnerUID); err == nil || !strings.Contains(err.Error(), "controlling InferenceService reference has no UID") {
+		t.Fatalf("an InferenceService controller reference without a UID must be refused, got err=%v", err)
+	}
+	standalone := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a", UID: "replica-uid"}}
+	if got, err := revisionScopeUID(standalone); err != nil || got != "replica-uid" {
+		t.Fatalf("standalone scope = %q, %v, want replica-uid", got, err)
+	}
+	adopted := standalone.DeepCopy()
+	adopted.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "Deployment", Name: "operator", UID: "other-uid", Controller: ptr.To(true),
+	}}
+	if got, err := revisionScopeUID(adopted); err != nil || got != "replica-uid" {
+		t.Fatalf("scope with a non-InferenceService owner = %q, %v, want replica-uid", got, err)
+	}
+	otherGroup := standalone.DeepCopy()
+	otherGroup.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "serving.kserve.io/v1beta1", Kind: "InferenceService", Name: "svc", UID: "other-uid", Controller: ptr.To(true),
+	}}
+	if got, err := revisionScopeUID(otherGroup); err != nil || got != "replica-uid" {
+		t.Fatalf("scope with an InferenceService owner from another group = %q, %v, want replica-uid", got, err)
+	}
+	orphaned := standalone.DeepCopy()
+	orphaned.Spec.ParentRef = &v1beta1.ParentReference{Name: "svc"}
+	if _, err := revisionScopeUID(orphaned); err == nil || !strings.Contains(err.Error(), "no InferenceService controls it") {
+		t.Fatalf("a parentRef without a controlling InferenceService must be refused, got err=%v", err)
+	}
+	noUID := standalone.DeepCopy()
+	noUID.UID = ""
+	if _, err := revisionScopeUID(noUID); err == nil {
+		t.Fatal("a standalone replica without a UID must be refused")
+	}
+}
+
+func TestRollbackRevisionMustBeControlledByTheReplica(t *testing.T) {
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a", UID: "replica-uid"},
+		Spec: v1beta1.InferenceReplicaSpec{
+			Component: v1beta1.EngineComponent,
+			Pacing:    &v1beta1.InferenceReplicaPacing{RollbackToRevision: ptr.To("pool-a-engine-aaaa")},
+		},
+	}
+	owned := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: "pool-a-engine-aaaa", Namespace: "team-a",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ir, irGVK)},
+	}}
+	other := ir.DeepCopy()
+	other.Name, other.UID = "pool-b", "other-uid"
+	foreign := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: "pool-b-engine-bbbb", Namespace: "team-a",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(other, irGVK)},
+	}}
+	ownerless := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "pool-a-engine-cccc", Namespace: "team-a"}}
+	recorder := record.NewFakeRecorder(4)
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(owned, foreign, ownerless).Build()
+	r := &Reconciler{APIReader: base, Recorder: recorder}
+	expectWarning := func(what string) {
+		t.Helper()
+		select {
+		case ev := <-recorder.Events:
+			if !strings.HasPrefix(ev, corev1.EventTypeWarning) || !strings.Contains(ev, EventReasonRollbackRevisionForeign) {
+				t.Fatalf("%s: event %q is not a %s Warning", what, ev, EventReasonRollbackRevisionForeign)
+			}
+		default:
+			t.Fatalf("%s produced no warning event", what)
+		}
+	}
+
+	cr, err := r.rollbackRevision(context.Background(), ir, ir)
+	if err != nil || cr == nil || cr.Name != owned.Name {
+		t.Fatalf("owned revision: cr=%v err=%v, want %s", cr, err, owned.Name)
+	}
+
+	ir.Spec.Pacing.RollbackToRevision = ptr.To("pool-b-engine-bbbb")
+	cr, err = r.rollbackRevision(context.Background(), ir, ir)
+	if err != nil || cr != nil {
+		t.Fatalf("foreign revision: cr=%v err=%v, want nil", cr, err)
+	}
+	expectWarning("foreign revision")
+
+	ir.Spec.Pacing.RollbackToRevision = ptr.To(ownerless.Name)
+	cr, err = r.rollbackRevision(context.Background(), ir, ir)
+	if err != nil || cr != nil {
+		t.Fatalf("revision without owner references: cr=%v err=%v, want nil", cr, err)
+	}
+	expectWarning("revision without owner references")
+
+	if n := len(recorder.Events); n != 0 {
+		t.Fatalf("unexpected extra events: %d", n)
+	}
+	ir.Spec.Pacing.RollbackToRevision = ptr.To("pool-a-engine-gone")
+	cr, err = r.rollbackRevision(context.Background(), ir, ir)
+	if err != nil || cr != nil {
+		t.Fatalf("missing revision: cr=%v err=%v, want nil", cr, err)
+	}
+	select {
+	case ev := <-recorder.Events:
+		t.Fatalf("missing revision must not raise an event, got %q", ev)
+	default:
+	}
+
+	injected := errors.New("injected get failure")
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.ControllerRevision); ok {
+				return injected
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	ir.Spec.Pacing.RollbackToRevision = ptr.To(owned.Name)
+	cr, err = r.rollbackRevision(context.Background(), ir, ir)
+	if !errors.Is(err, injected) || cr != nil {
+		t.Fatalf("read failure: cr=%v err=%v, want the injected error", cr, err)
 	}
 }

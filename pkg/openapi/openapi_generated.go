@@ -60,6 +60,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobList":                 schema_pkg_apis_ome_v1beta1_BenchmarkJobList(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobSpec":                 schema_pkg_apis_ome_v1beta1_BenchmarkJobSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobStatus":               schema_pkg_apis_ome_v1beta1_BenchmarkJobStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure":                    schema_pkg_apis_ome_v1beta1_CanaryFailure(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryStatus":                     schema_pkg_apis_ome_v1beta1_CanaryStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus":        schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus":       schema_pkg_apis_ome_v1beta1_CandidateAutoscalingStatus(ref),
@@ -153,8 +154,13 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference":                  schema_pkg_apis_ome_v1beta1_ParentReference(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacityPool":            schema_pkg_apis_ome_v1beta1_PlacementCapacityPool(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacitySample":          schema_pkg_apis_ome_v1beta1_PlacementCapacitySample(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentDemand":         schema_pkg_apis_ome_v1beta1_PlacementComponentDemand(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentFloor":          schema_pkg_apis_ome_v1beta1_PlacementComponentFloor(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementDemandContract":          schema_pkg_apis_ome_v1beta1_PlacementDemandContract(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy":         schema_pkg_apis_ome_v1beta1_PlacementExecutionPolicy(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementHomePolicy":              schema_pkg_apis_ome_v1beta1_PlacementHomePolicy(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementPlanStatus":              schema_pkg_apis_ome_v1beta1_PlacementPlanStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSingleMoveStatus":        schema_pkg_apis_ome_v1beta1_PlacementSingleMoveStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec":                    schema_pkg_apis_ome_v1beta1_PlacementSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementStatus":                  schema_pkg_apis_ome_v1beta1_PlacementStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PodOverride":                      schema_pkg_apis_ome_v1beta1_PodOverride(ref),
@@ -3109,6 +3115,36 @@ func schema_pkg_apis_ome_v1beta1_BenchmarkJobStatus(ref common.ReferenceCallback
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_CanaryFailure(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "CanaryFailure is why and when a canary parked.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"reason": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Reason names the gate that gave up.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"time": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Time is when the canary parked.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+				},
+				Required: []string{"reason"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -3221,12 +3257,24 @@ func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) comm
 							},
 						},
 					},
+					"capacityWaitSince": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CapacityWaitSince is when the current step's capacity gate became unmet. The ready timeout is measured from here and never from the step's soak anchor, so a long soak cannot spend the capacity budget and a capacity dip cannot restart the soak. Cleared once the step's capacity is met.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"failed": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Failed records that the canary is parked at CurrentStep: the capacity gate stayed unmet past the ready timeout, analysis stayed inconclusive past the stall timeout, or a rollback found no stable revision to return to. While set the step machine does not run, the phase reads Failed and the stable revision keeps serving. Cleared by a re-arm toward a new target and by a rollback request.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure"),
+						},
+					},
 				},
 				Required: []string{"currentStep", "observedTrafficWeight"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AnalysisMetricResult"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AnalysisMetricResult", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure"},
 	}
 }
 
@@ -3242,6 +3290,52 @@ func schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref common.ReferenceC
 							Default: "",
 							Type:    []string{"string"},
 							Format:  "",
+						},
+					},
+					"inventoryPending": {
+						SchemaProps: spec.SchemaProps{
+							Description: "InventoryPending prevents unknown standing resources from becoming free migration capacity. It is cleared only by an identified member inventory.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"homeInputsPending": {
+						SchemaProps: spec.SchemaProps{
+							Description: "HomeInputsPending holds movement when current full-policy inputs cannot be verified, while retaining the last accepted desired floors.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"raceCandidate": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RaceCandidate authorizes cleanup of a Single race copy after another candidate wins. A retained winner does not carry this permission.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"replacementStartedAt": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReplacementStartedAt persists the start of an authorized bounded probe. The configured replacement timeout is evaluated against this instant.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.MicroTime"),
+						},
+					},
+					"matched": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Matched distinguishes a desired full-policy home from an outgoing home, including an affinity that matches every registration without terms.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"currentHome": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CurrentHome retains the full policy authorized at a home through draining.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementHomePolicy"),
+						},
+					},
+					"desiredHome": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DesiredHome is present for every intended full-policy home.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementHomePolicy"),
 						},
 					},
 					"matchingTerms": {
@@ -3310,7 +3404,7 @@ func schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref common.ReferenceC
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacitySample"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.MicroTime", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacitySample", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementHomePolicy"},
 	}
 }
 
@@ -6441,7 +6535,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplica(ref common.ReferenceCallback) 
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InferenceReplica is the per-Component workload abstraction for OMENative-managed InferenceService Components. One InferenceReplica exists per (ISVC, Component) tuple. The ISVC controller writes the spec; the InferenceReplica controller writes the status.\n\nThe scale subresource lets HPA/KEDA target the InferenceReplica directly rather than indirecting through the parent ISVC.",
+				Description: "InferenceReplica is one pod set: N Instances of the same rendered pod templates with one revision history and one rollout. A projected replica exists per (InferenceService, Component) tuple and is named <inferenceservice>-<component>; a standalone replica is named by its creator.\n\nThe scale subresource lets HPA/KEDA target the InferenceReplica directly.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
@@ -6537,25 +6631,25 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaPacing(ref common.ReferenceCall
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InferenceReplicaPacing is the per-replica projection of the active RolloutCoordinationGroup pacing. Mirrors the corresponding RollingUpdate subset so the projection is a verbatim copy.",
+				Description: "InferenceReplicaPacing is the rollout control written onto one replica: the partition that holds Instances back, a reserved disruption budget, and the revision to roll back to.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"partition": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Partition holds back updates for Instances whose index is less than Partition. Mirrors RollingUpdate.Partition. 0 (the default) updates all Instances. Used for canary holds.",
+							Description: "Partition holds back updates: the Partition lowest-indexed Instances not yet on the target revision, skipping any already updating to it, keep their current revision. When set it takes precedence over lifecycle.updateStrategy.rollingUpdate.partition; nil defers to it.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"maxUnavailable": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxUnavailable caps in-rollout disruption. Accepts either a raw count or a percent string. When nil, the InferenceReplica controller falls back to its own default budget.",
+							Description: "MaxUnavailable is reserved; setting it has no effect. Disruption during a rollout is paced by lifecycle.updateStrategy.rollingUpdate.maxUnavailable.",
 							Ref:         ref("k8s.io/apimachinery/pkg/util/intstr.IntOrString"),
 						},
 					},
 					"rollbackToRevision": {
 						SchemaProps: spec.SchemaProps{
-							Description: "RollbackToRevision, when set, names a ControllerRevision the InferenceReplica must roll every Instance back to — overriding the rendered desired template with that revision's stored pod template (and using it as the update target). The InferenceService controller sets this during a canary rollback so the forward-roll machinery drains the canary pods back onto the stable revision. Empty in steady state.",
+							Description: "RollbackToRevision, when set, names a ControllerRevision the replica rolls every Instance back to: that revision's stored pod template becomes the update target while UpdateRevision keeps reporting the spec's own revision. The InferenceService controller sets it during a canary rollback; empty in steady state. If the named revision does not exist, the replica rolls to its spec. A revision this replica does not control is ignored and reported with a Warning event.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -6572,75 +6666,86 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "InferenceReplicaSpec is the desired state of one (ISVC, Component) workload. The InferenceService controller is the sole writer; the admission webhook rejects writes from other actors that lack the ome.io/controller-write annotation.",
+				Description: "InferenceReplicaSpec is the desired state of one pod set. Its fields fall into three groups:\n\n  - User fields describe the pod set itself: component, set at create and\n    immutable; the template source (runners, modelRef and runtimeRef),\n    replicas, minReadySeconds, topologyKey, topologySpread,\n    topologySpreadKey, lifecycle, revisionHistoryLimit and autoscaler. The\n    owner of the replica writes them: the InferenceService controller for\n    a projected replica, the creating user for a standalone one. Exactly\n    one template source: runners, or modelRef and/or runtimeRef; the\n    validating webhook enforces it.\n  - Rollout-control fields steer a rollout across pod sets: pacing, paused,\n    pauseMode and pairingProtocol. The InferenceService controller writes\n    them on the replicas it orchestrates; on a standalone replica its owner\n    sets them.\n  - Controller-only fields carry state only the InferenceService controller\n    can know: parentRef, placementExecution and placementReplicaLimit.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"placementExecution": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PlacementExecution is allocation authority projected from a derived service. Its generation must be observed before the control plane uses member evidence.",
+							Description: "PlacementExecution is allocation authority projected from a derived service. Its generation must be observed before the control plane uses member evidence. Controller-only.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy"),
 						},
 					},
 					"placementReplicaLimit": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PlacementReplicaLimit reserves the largest replica count this component may request while placement pauses growth. Only a raised placement floor can increase this limit; autoscaler requests remain in Replicas.",
+							Description: "PlacementReplicaLimit reserves the largest replica count this component may request while placement pauses growth. Only a raised placement floor can increase this limit; autoscaler requests remain in Replicas. Controller-only.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"parentRef": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ParentRef names the InferenceService that owns this replica. Set by the ISVC controller at create time; immutable thereafter.",
-							Default:     map[string]interface{}{},
+							Description: "ParentRef names the InferenceService that projects this replica. The InferenceService controller sets it at create time and it is immutable thereafter; a standalone replica omits it. Pod, Service and ControllerRevision names derive from the parent name when set and from the replica's own name otherwise. Controller-only.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference"),
 						},
 					},
 					"component": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Component is one of engine | decoder | router. Immutable; moving a workload between Component slots requires recreating the InferenceReplica.",
+							Description: "Component is the role this pod set fills: engine | decoder | router. Immutable; moving a workload between roles requires recreating the InferenceReplica.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
+					"modelRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ModelRef names the BaseModel (in the replica's namespace) or ClusterBaseModel this replica serves. With it set the controller renders the pods from the model and the runtime: the runtime named by RuntimeRef, or the runtime selected for the model when RuntimeRef is absent. Fine-tuned weights and overlays render as they do on an InferenceService. Exclusive with Runners. User field.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef"),
+						},
+					},
+					"runtimeRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RuntimeRef names the ServingRuntime (in the replica's namespace) or ClusterServingRuntime whose piece for Component this replica renders. The runtime must declare that piece. Without ModelRef the piece renders as-is, with no model mounted. The runtime's pod spec places the pods (node selector, affinity, resources); a second accelerator pool is a second runtime. A pin (autoSync=false, revision) is not honored: the live runtime renders, and the validating webhook rejects a pinned reference. Exclusive with Runners. User field.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef"),
+						},
+					},
 					"replicas": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Replicas is the desired Instance count. The HPA / KEDA scale subresource writes this field. Defaults to 1 when omitted.",
+							Description: "Replicas is the desired Instance count; nil or 0 runs one Instance. Whatever targets the scale subresource (HPA, KEDA or an external scaler) writes this field. On a projected replica the InferenceService controller writes the component's minReplicas (at least 1) at create, and thereafter while no autoscaler owns the count or the stored count is nil or 0.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"minReadySeconds": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MinReadySeconds is the minimum time a newly Ready pod must stay Ready before it counts as Available, projected from the parent ISVC's spec.<component>.lifecycle.minReadySeconds. The workload engine paces rollout drains and promotions on Available pods and counts only Available pods in availableReplicas. 0 means Available as soon as Ready.",
+							Description: "MinReadySeconds is the minimum time a newly Ready pod must stay Ready before it counts as Available. The workload engine paces rollout drains and promotions on Available pods and counts only Available pods in availableReplicas; 0 means Available as soon as Ready. On a projected replica the InferenceService controller copies the component's effective lifecycle.minReadySeconds: the InferenceService's value, else the runtime's, else the operator's deploy default.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"topologyKey": {
 						SchemaProps: spec.SchemaProps{
-							Description: "TopologyKey is the resolved gang co-location node-label key for this Component, projected verbatim from the effective ISVC↔runtime component spec (spec.<component>.topologyKey, else the runtime component-config value). When set on a multi-node Component, the InferenceReplica controller auto-generates the per-Instance worker→leader podAffinity that co-locates every worker onto its gang's leader on a node sharing this label value. Nil means no auto-generated gang affinity.",
+							Description: "TopologyKey is the gang co-location node-label key for this Component. When set on a multi-node Component, the InferenceReplica controller auto-generates the per-Instance worker→leader podAffinity that co-locates every worker onto its gang's leader on a node sharing this label value. Nil means no auto-generated gang affinity. On a projected replica the value is the effective InferenceService or runtime component setting.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"topologySpread": {
 						SchemaProps: spec.SchemaProps{
-							Description: "TopologySpread is the resolved spreading policy for this Component, projected verbatim from the effective ISVC↔runtime component spec. The InferenceReplica controller renders it as a topologySpreadConstraint on each Instance's anchor pod; nil keeps pure bin-packing.",
+							Description: "TopologySpread is the spreading policy for this Component. The InferenceReplica controller renders it as a topologySpreadConstraint on each Instance's anchor pod; nil keeps pure bin-packing. On a projected replica the value is the effective InferenceService or runtime component setting.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"topologySpreadKey": {
 						SchemaProps: spec.SchemaProps{
-							Description: "TopologySpreadKey is the resolved fault-domain node-label key TopologySpread spreads across; nil defaults to TopologyKey.",
+							Description: "TopologySpreadKey is the fault-domain node-label key TopologySpread spreads across; nil defaults to TopologyKey. On a projected replica the value is the effective InferenceService or runtime component setting.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"pairingProtocol": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PairingProtocol is the engine↔decoder wire-compatibility token projected from spec.rollout.pairingProtocol on the parent InferenceService. It is folded into the revision hash (a change mints a new revision) and stamped as the ome.io/pairing-protocol label on rendered pods. Projected only onto engine and decoder — the router does not participate in P/D pairing and must not re-roll on a protocol change. Nil pairs with anything.",
+							Description: "PairingProtocol is the engine/decoder wire-compatibility token. It is folded into the revision hash (a change mints a new revision) and stamped as the ome.io/pairing-protocol label on rendered pods; nil pairs with anything. Only engine and decoder replicas pair on it; a change on any replica still mints a new revision. On a projected replica the InferenceService controller copies spec.rollout.pairingProtocol onto the engine and decoder replicas and never onto the router, which must not re-roll on a protocol change.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -6655,7 +6760,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Runners is the fully-rendered set of pod templates per Instance. MUST be non-empty. Single-pod Instances have one Runner with Name=\"default\" and Size=1; multi-node Instances typically have Name=\"leader\" (Size=1) plus Name=\"worker\" (Size=N).\n\nThe InferenceService controller is the sole writer of this field. The InferenceReplica controller treats each Runner.Template as opaque input (same contract appsv1.Deployment.spec.template uses).",
+							Description: "Runners is the fully-rendered set of pod templates per Instance. A single-pod Instance has one Runner named \"default\" with Size=1; a multi-node Instance has \"leader\" (Size=1) and \"worker\" (Size=N). Required unless ModelRef or RuntimeRef is set, in which case it must be absent: the controller renders the runners from the refs and never stores them. The controller treats each Runner.Template as opaque input. User field.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -6669,19 +6774,19 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 					},
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Lifecycle holds the OMENative lifecycle policies (RestartPolicy, UpdateStrategy, ReadyPolicy, InstanceReadyTimeout, MigrationPolicy). Reuses the existing LifecycleSpec type so the projection from ISVC.spec.<component>.lifecycle is a verbatim copy.",
+							Description: "Lifecycle holds the OMENative lifecycle policies (RestartPolicy, UpdateStrategy, ReadyPolicy, InstanceReadyTimeout, MigrationPolicy). An unset policy takes the fixed fallback its LifecycleSpec field names; an unset or zero instanceReadyTimeout falls back to the operator's lifecycle.instanceReadyTimeout on every replica, and with neither set operations open with no deadline. The operator's deploy defaults are applied only to a projected replica, before the copy. lifecycle.minReadySeconds is not read on a replica and is rejected on a standalone one; set spec.minReadySeconds. On a projected replica this is the component's effective lifecycle: the InferenceService's value, else the runtime's, with unset fields filled from the operator's deploy defaults.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
 						},
 					},
 					"pacing": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Pacing is the InferenceService controller's projection of the active RolloutCoordinationGroup pacing for this replica. Written by the ISVC controller; read by the InferenceReplica controller. Includes Partition (canary hold) and MaxUnavailable (rollout budget). Nil means independent rollout.",
+							Description: "Pacing is rollout control written onto this replica: the canary partition, the rollback target and a reserved disruption budget. The InferenceService controller writes it on the replicas it orchestrates; on a standalone replica its owner sets it. Nil means the replica rolls independently.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceReplicaPacing"),
 						},
 					},
 					"autoscaler": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Autoscaler is the live autoscaler configuration that downstream scalers (HPA / KEDA / external) target. The ISVC controller projects the per-Component autoscaler defaults from ISVC.spec.<component>.autoscaler onto the corresponding IR at create time + on subsequent reconciles. External autoscalers may also write directly to this field via the /scale subresource without going through the ISVC controller.",
+							Description: "Autoscaler is the autoscaler configuration downstream scalers (HPA / KEDA / External) target. Only the InferenceService controller creates a scaler from it, so on a standalone replica the HPA and KEDA classes are rejected and an External scaler targets the scale subresource directly. On a projected replica the InferenceService controller writes the resolved per-Component autoscaler, replacing the whole block, whenever that autoscaler resolves; while an autoscaler policy fails to render, the stored block is kept as the last known good one.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler"),
 						},
 					},
@@ -6701,17 +6806,17 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 					},
 					"revisionHistoryLimit": {
 						SchemaProps: spec.SchemaProps{
-							Description: "RevisionHistoryLimit caps how many non-live ControllerRevisions the InferenceReplica controller retains for this replica, projected by the InferenceService controller from the parent ISVC's ome.io/revision-history-limit annotation. Live revisions (CurrentRevision / UpdateRevision and every per-Instance running/target revision) are never deleted regardless of the limit. Nil falls back to the operator-level lifecycle.revisionHistoryLimit config; when that is also absent, no revisions are pruned.",
+							Description: "RevisionHistoryLimit caps how many non-live ControllerRevisions the InferenceReplica controller retains. Live revisions (CurrentRevision / UpdateRevision and every per-Instance running/target revision) are never deleted regardless of the limit. Nil falls back to the operator-level lifecycle.revisionHistoryLimit config; when that is also absent, no revisions are pruned. On a projected replica the InferenceService controller copies the parent's ome.io/revision-history-limit annotation.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 				},
-				Required: []string{"parentRef", "component", "runners"},
+				Required: []string{"component"},
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceReplicaPacing", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.Runner"},
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InferenceReplicaPacing", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ParentReference", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementExecutionPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.Runner", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef"},
 	}
 }
 
@@ -10117,6 +10222,12 @@ func schema_pkg_apis_ome_v1beta1_PlacementCapacitySample(ref common.ReferenceCal
 							Format:  "",
 						},
 					},
+					"demandContract": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DemandContract binds normalization to the member rendering authorized by this allocation. Its fingerprint must equal DemandFingerprint.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementDemandContract"),
+						},
+					},
 					"replicas": {
 						SchemaProps: spec.SchemaProps{
 							Default: 0,
@@ -10151,7 +10262,110 @@ func schema_pkg_apis_ome_v1beta1_PlacementCapacitySample(ref common.ReferenceCal
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacityPool"},
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementCapacityPool", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementDemandContract"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementComponentDemand(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementComponentDemand identifies one component's rendered replica shape.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"component": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"renderingHash": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RenderingHash includes pod shapes, worker count, mode and RuntimeClasses.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"component", "renderingHash"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementComponentFloor(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementComponentFloor records a resolved component's guaranteed count. Engine and Decoder use equal whole-replica floors; Router is independent. Zero permits steady scale-to-zero; movement requires positive floors.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"component": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"replicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+				},
+				Required: []string{"component", "replicas"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementDemandContract(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementDemandContract binds component rendering to normalized unit demand. Router is excluded because its replicas follow a per-home policy.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"fingerprint": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Fingerprint identifies the complete resolved resource/flavor demand.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"components": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"component",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Components includes exactly the declared Engine/Decoder components.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentDemand"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"fingerprint", "components"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentDemand"},
 	}
 }
 
@@ -10198,10 +10412,85 @@ func schema_pkg_apis_ome_v1beta1_PlacementExecutionPolicy(ref common.ReferenceCa
 							Format:      "",
 						},
 					},
+					"demand": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Demand requires member rendering to match the accepted normalization inputs before a component can project workloads. Absent for static plans.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementDemandContract"),
+						},
+					},
+					"replicaFloors": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"component",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "ReplicaFloors binds the full per-home policy to the floors accepted by placement. Runtime changes cannot expand a paused placement reservation.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentFloor"),
+									},
+								},
+							},
+						},
+					},
 				},
 				Required: []string{"planID", "revision", "sourceUID", "clusterUID", "pauseSurge"},
 			},
 		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentFloor", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementDemandContract"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementHomePolicy(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementHomePolicy records the full component floors of one retained home.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"inputDigest": {
+						SchemaProps: spec.SchemaProps{
+							Description: "InputDigest binds these resolved floors to the accepted source intent.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"replicaFloors": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"component",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentFloor"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"inputDigest", "replicaFloors"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementComponentFloor"},
 	}
 }
 
@@ -10217,6 +10506,33 @@ func schema_pkg_apis_ome_v1beta1_PlacementPlanStatus(ref common.ReferenceCallbac
 							Default: "",
 							Type:    []string{"string"},
 							Format:  "",
+						},
+					},
+					"mode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Mode identifies the execution semantics of this accepted plan.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"winner": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Winner commits the admitted Single home before race losers are removed. Empty means the persisted Single admission race has not selected a home.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"singleMove": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SingleMove retains bounded replacement-race state until the old home and losing probes have been removed. Winner remains the serving home.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSingleMoveStatus"),
+						},
+					},
+					"adoptionDigest": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AdoptionDigest fixes the initial intent while standing homes are being inventoried. A changed intent cannot expand an incomplete inventory.",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 					"revision": {
@@ -10291,6 +10607,35 @@ func schema_pkg_apis_ome_v1beta1_PlacementPlanStatus(ref common.ReferenceCallbac
 				Required: []string{"id", "revision", "sourceUID", "observedGeneration", "inputDigest", "pauseSurge", "requestedReplicas", "assignedReplicas", "unassignedReplicas", "originalUnassignedReplicas"},
 			},
 		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSingleMoveStatus"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_PlacementSingleMoveStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PlacementSingleMoveStatus separates replacement admission from serving handoff.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"selected": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Selected records the admitted replacement while it becomes ready and routable.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"cursor": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Cursor identifies the last nominated replacement for fair bounded retries.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -10298,39 +10643,78 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "PlacementSpec declares how the control plane selects the workload clusters an InferenceService is placed onto, and how many of them serve it. It subsumes the legacy ome.io/accelerator-requirements and ome.io/cluster-selector annotations in a typed, schema-validated form; when this field is nil the control plane still honors those annotations for backward compatibility.",
+				Description: "PlacementSpec declares multi-cluster intent. Policy omission preserves the legacy selector and allocation contract, including its mode defaults.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
-					"mode": {
+					"policy": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Mode is the placement cardinality: Single (one cluster), All (every candidate), or Split (replicas distributed across clusters). Defaults to Single. All and Split are rejected by admission on a control plane that does not implement them.",
+							Description: "Policy explicitly opts into ClusterAffinity semantics. Omission is Legacy. ClusterAffinity cannot be removed from an existing service; migrating back requires draining and recreating the source and its derived workloads.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
+					"mode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Mode is required for ClusterAffinity. Legacy omission means Single.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"clusterAffinity": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "ClusterAffinity ORs terms whose requirements are ANDed. Requires the ClusterAffinity policy; omission then matches every registration. An explicit empty or null list is invalid.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterAffinityTerm"),
+									},
+								},
+							},
+						},
+					},
+					"maxSurge": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MaxSurge is the whole-replica allowance shared by placement transitions and local rollout surge. Omission blocks disruptive movement between homes.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"replacementTimeout": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ReplacementTimeout bounds a non-admitting probe during a healthy Single move. Omission retains pending probes; a positive duration allows rotation.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
 					"requirements": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Requirements is the intrinsic capability selector a candidate workload cluster MUST satisfy, expressed as a Kubernetes label-selector string matched against WorkloadCluster labels plus the virtual, immutable metadata.name key (e.g. \"accelerator in (gb300, tpu7x)\"). It is the structured equivalent of the ome.io/accelerator-requirements annotation. Empty means no intrinsic requirement.",
+							Description: "Requirements is a Legacy label selector, ANDed with ClusterSelector. Deprecated: opt into ClusterAffinity and use clusterAffinity.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"clusterSelector": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ClusterSelector is an optional operator-imposed routing overlay (label-selector string) AND-ed onto Requirements to further narrow candidates. It can select WorkloadCluster labels (e.g. \"provider=cloud-a\") or immutable object names (e.g. \"metadata.name in (cluster-a,cluster-c)\"). Structured equivalent of the ome.io/cluster-selector annotation.",
+							Description: "ClusterSelector is a Legacy selector over labels and virtual metadata.name. Deprecated: opt into ClusterAffinity and use clusterAffinity.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"split": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Split tunes Split mode (distributing replicas across clusters). Only consulted when Mode is Split; ignored otherwise. Nil means Split defaults: distribute the engine's minReplicas, packed onto the fewest clusters.",
+							Description: "Split provides the requested floor and optional per-home ceiling for Split and SplitByCapacity. ClusterAffinity rejects it in other modes.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec"),
 						},
 					},
 					"capacityFactors": {
 						SchemaProps: spec.SchemaProps{
-							Description: "CapacityFactors overrides the per-replica relative serving capacity of named workload clusters, keyed by WorkloadCluster name. It weights traffic for heterogeneous hardware where one cluster's replica serves more (or less) than another's: a home's routed share scales with its admitted replicas times this factor. A quantity of \"2\" means each replica on that cluster carries twice the share of a factor-1 replica; \"500m\" means half. A cluster absent from the map (or the whole field unset) uses the identity factor 1. This is a routing weight only — it does not influence placement or how many replicas a cluster admits.\n\nDeprecated: use spec.routing.capacityFactors.",
+							Description: "CapacityFactors is the Legacy alias for routing capacity factors. Deprecated: use spec.routing.capacityFactors.",
 							Type:        []string{"object"},
 							AdditionalProperties: &spec.SchemaOrBool{
 								Allows: true,
@@ -10346,7 +10730,7 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/api/resource.Quantity", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec"},
+			"k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/apis/meta/v1.Duration", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterAffinityTerm", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec"},
 	}
 }
 
@@ -14583,7 +14967,7 @@ func schema_pkg_apis_ome_v1beta1_SplitSpec(ref common.ReferenceCallback) common.
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "SplitSpec tunes how Split mode distributes replicas across candidate clusters. All fields are optional and degrade to the documented defaults.",
+				Description: "SplitSpec declares the fleet floor and optional local ceiling. The floor falls back only to an explicitly declared positive engine.minReplicas.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"replicas": {
@@ -14595,21 +14979,21 @@ func schema_pkg_apis_ome_v1beta1_SplitSpec(ref common.ReferenceCallback) common.
 					},
 					"spread": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Spread selects the apportionment policy. False (default) is Packed: fan out in preference order and fill the fewest clusters the fleet's quota forces (better locality, fewer endpoint backends). True is Balanced: apportion ~evenly (ceil(N/candidates)) so replicas spread across more clusters (blast-radius resilience over locality).",
+							Description: "Spread requests ceil(replicas/candidates) on each Legacy candidate. False uses admission-driven packing in candidate name order. Deprecated: ClusterAffinity uses exact shares and optional affinity weights.",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},
 					},
 					"maxReplicasPerCluster": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxReplicasPerCluster caps how many replicas one cluster may hold. It bounds the over-request the fractional fan-out makes, and — combined with Spread — is the lever that forces the fill to move on before a cluster is full (deliberate spread without reading capacity). Zero means no cap.",
+							Description: "MaxReplicasPerCluster is an optional local ceiling. ClusterAffinity holds plans exceeding it; Legacy clips requests to it. Zero leaves it uncapped.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"minReplicasPerCluster": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MinReplicasPerCluster is the anti-sliver floor: a home that admits fewer than this is dropped and its replicas returned to the deficit, so the placement does not keep a home serving a tiny, uneconomical fraction. Zero keeps any home that admitted >=1.",
+							Description: "MinReplicasPerCluster discards Legacy homes admitted below this count. Deprecated: ClusterAffinity exact shares cannot discard a small admission.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -80,6 +81,12 @@ type UpdateItem struct {
 	// CoordGateExempt: the fresh start skips the coordination gate consult
 	// (types.RecreateOfDarkFailedRow); the per-Component budget still applies.
 	CoordGateExempt bool
+	// RecreateFallback: the Component's in-place strategy runs as a
+	// recreate on this Instance (ops.InPlaceFallsBackToRecreate), so the
+	// fresh start is consulted with the coordination gate as a RecreatePod
+	// start: it takes the pods out of rotation before anything returns,
+	// which is the capacity loss the gate waives only for a same-pod patch.
+	RecreateFallback bool
 	// CleanupOnly: the update trigger declined (zero revision distance —
 	// the corrective roll-back — or a third-party-revision leftover) but
 	// the instance carries superseded-revision wreckage
@@ -162,7 +169,8 @@ type Decision struct {
 	// The truth pass (ActionDemote) is status-only, selected only while
 	// paused (in every depth): pause suspends lifecycle operations,
 	// never status truth, while unpaused reconciles leave the correction
-	// to Create.
+	// to the status publication, which demotes the same shape at the end
+	// of every pass, and to the pass that rebuilds the row.
 	Actions []PlannedAction
 
 	// RequeueAfter is the earliest not-yet-due Backoff RetryBlock
@@ -217,16 +225,37 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 		decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionScaleDown, Extras: extras})
 	}
 
+	// Restart selection, evaluated ahead of the truth pass because the
+	// truth pass leaves the rows the repair claims. A frozen pause
+	// suspends the pass, so the selection is only worth computing — it
+	// costs a live pod read — when a repair is already under way to
+	// finish.
+	var restarts []RestartSelection
+	if !plan.PauseFreeze || anyRestartContinuation(input) {
+		selected, err := planRestartSelections(ctx, input, plan, snapshot)
+		if err != nil {
+			return Decision{}, err
+		}
+		if plan.PauseFreeze {
+			selected = restartContinuations(input, selected)
+		}
+		restarts = selected
+	}
+
 	// Truth pass, paused reconciles only: a Ready Instance whose pods are
 	// all gone, with no operation in flight and no op pass that will act
-	// (the policy is not RecreateInstanceOnPodRestart, and pause parks the
-	// Create pass that would otherwise re-materialize it), must not keep
-	// claiming Ready. Status-only; selected here, applied by Execute; runs
-	// in every pause depth because pause suspends lifecycle operations,
-	// never status truth. Unpaused reconciles skip it: Create both
-	// recovers the pods and re-stamps the phase in the same pass.
+	// (pause parks the Create pass that would otherwise re-materialize
+	// it, and the restart pass has not selected the row — a freeze
+	// suspends it), must not keep claiming Ready. Status-only; selected
+	// here, applied by Execute; runs in every pause depth because pause
+	// suspends lifecycle operations, never status truth. Unpaused
+	// reconciles skip it: the status publication demotes the same shape
+	// (status.DemotableReady) at the end of every pass, and the pass that
+	// owns the rebuild re-materializes the row when it runs. The paused
+	// pass keeps its own correction because it confirms the loss against
+	// a live read and announces it.
 	if plan.Paused {
-		demotions, err := planUnbackedDemotions(ctx, input, plan, snapshot)
+		demotions, err := planUnbackedDemotions(ctx, input, plan, snapshot, restarts)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -252,20 +281,8 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 		decision.Escalate = true
 	}
 
-	// Restart selection. A frozen pause suspends the pass, so the
-	// selection is only worth computing — it costs a live pod read —
-	// when a repair is already under way to finish.
-	if !plan.PauseFreeze || anyRestartContinuation(input) {
-		restarts, err := planRestartSelections(ctx, input, plan, snapshot)
-		if err != nil {
-			return Decision{}, err
-		}
-		if plan.PauseFreeze {
-			restarts = restartContinuations(input, restarts)
-		}
-		if len(restarts) > 0 {
-			decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionRestart, Restarts: restarts})
-		}
+	if len(restarts) > 0 {
+		decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionRestart, Restarts: restarts})
 	}
 
 	if !plan.Paused {
@@ -460,20 +477,24 @@ func anyRestartTrigger(input types.ReconcileInput, plan types.ComponentPlan, byI
 // planUnbackedDemotions selects Ready Instances with no live pods and no
 // in-flight Operation for a status-only demotion to Pending. Phase is
 // op-owned, so this narrow observation-only correction fires exclusively
-// where no op pass will: components under RecreateInstanceOnPodRestart are
-// excluded outright (their restart pass owns Ready-with-pod-loss and
-// recreates at the running revision), and an Operation in any state keeps
-// ownership with its op. Extras belong to scale-down. Candidates are
-// screened on the cached read and confirmed against the live read, so the
-// demotion can never fire on cache lag; a Terminating pod still counts as
-// live, deferring the correction until the loss is total and settled.
-func planUnbackedDemotions(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, snapshot *ObservedSnapshot) ([]types.DemotionSelection, error) {
-	if plan.RestartPolicy == types.RestartPolicyRecreateInstance {
-		return nil, nil
-	}
+// where no op pass will (status.DemotableReady): an Operation in any
+// state keeps ownership with its op, and a row the restart pass selected
+// this reconcile is left to the repair it opens — under
+// RecreateInstanceOnPodRestart and a plain pause that is every such row,
+// while a frozen pause suspends the pass and the row is demoted; the
+// running revision it keeps is what the repair rebuilds at once the pass
+// runs again. Extras belong to scale-down. Candidates are screened on the
+// cached read and confirmed against the live read, so the demotion can
+// never fire on cache lag; a Terminating pod still counts as live,
+// deferring the correction until the loss is total and settled.
+func planUnbackedDemotions(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, snapshot *ObservedSnapshot, restarts []RestartSelection) ([]types.DemotionSelection, error) {
 	planned := make(map[int32]struct{}, len(plan.Instances))
 	for _, inst := range plan.Instances {
 		planned[inst.Index] = struct{}{}
+	}
+	repairing := make(map[int32]struct{}, len(restarts))
+	for _, selection := range restarts {
+		repairing[selection.Instance.Index] = struct{}{}
 	}
 	var candidates []int32
 	for i := range input.ObservedState.InstanceStatuses {
@@ -481,7 +502,10 @@ func planUnbackedDemotions(ctx context.Context, input types.ReconcileInput, plan
 		if _, ok := planned[row.Index]; !ok {
 			continue
 		}
-		if row.Phase != types.InstancePhaseReady || row.Operation != nil {
+		if _, ok := repairing[row.Index]; ok {
+			continue
+		}
+		if !status.DemotableReady(row) {
 			continue
 		}
 		candidates = append(candidates, row.Index)
@@ -602,10 +626,11 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 		row := input.ObservedState.Instance(inst.Index)
 		startingFresh := !types.UpdateContinuation(row)
 		gateExempt := types.RecreateOfDarkFailedRow(row, strategy)
+		recreateFallback := workloadops.InPlaceFallsBackToRecreate(strategy, inst.TotalPods() > 1)
 		logf.FromContext(ctx).V(1).Info("update selected",
 			"component", plan.Component, "instance", inst.Index, "target", target.Name,
-			"startingFresh", startingFresh, "coordGateExempt", gateExempt)
-		selection.Items = append(selection.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt})
+			"startingFresh", startingFresh, "coordGateExempt", gateExempt, "recreateFallback", recreateFallback)
+		selection.Items = append(selection.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt, RecreateFallback: recreateFallback})
 	}
 	// Budgets are decided here but spent in Execute, so record them with the
 	// selection they apply to: a selection that is non-empty yet starts

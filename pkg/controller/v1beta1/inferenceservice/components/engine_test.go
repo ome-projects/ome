@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/go-logr/logr"
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -71,9 +70,13 @@ func TestEngineReconcileDeployment_ProjectsMergedTopologyKey(t *testing.T) {
 	isvc := &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "topology", Namespace: "default", UID: types.UID("topology-uid")},
 	}
-	g.Expect(c.Create(context.Background(), &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
-		Name: "topology-engine", Namespace: "default", UID: types.UID("topology-engine-uid"),
-	}})).To(gomega.Succeed())
+	g.Expect(c.Create(context.Background(), &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "topology-engine", Namespace: "default", UID: types.UID("topology-engine-uid"),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(isvc, v1beta1.SchemeGroupVersion.WithKind("InferenceService"))},
+		},
+		Spec: v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: isvc.Name}},
+	})).To(gomega.Succeed())
 	leaderPodSpec := &v1.PodSpec{Containers: []v1.Container{{Name: "leader", Image: "test:v1"}}}
 	workerPodSpec := &v1.PodSpec{Containers: []v1.Container{{Name: "worker", Image: "test:v1"}}}
 	componentMeta := metav1.ObjectMeta{
@@ -1122,60 +1125,6 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(podSpec.SchedulerName).To(gomega.Equal("custom-scheduler"))
 	})
-}
-
-// TestEngineDetermineEngineName_CtxCancellation pins that context
-// cancellation propagates through the name-discovery Get call. The earlier
-// implementation hardcoded context.TODO() inside a controller reconcile
-// flow, which silently ignored the reconcile manager's cancellation
-// signal.
-//
-// With a canceled ctx the fake client's Get returns immediately with the
-// ctx error — the determineEngineName helper does NOT propagate that error
-// (it falls back to the default name), but the test pins that the function
-// returns promptly (no hang) AND uses the supplied ctx (the ctx parameter
-// is wired through to the client Get call; a stray context.TODO would
-// shadow it and the cancellation signal would be lost).
-func TestEngineDetermineEngineName_CtxCancellation(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
-
-	scheme := runtime.NewScheme()
-	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-
-	c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
-	clientset := fake.NewClientset()
-
-	engine := NewEngine(
-		&ComponentDeps{Client: c, Clientset: clientset, Scheme: scheme, Config: &controllerconfig.InferenceServicesConfig{}},
-		ComponentInputs{DeploymentMode: constants.RawDeployment},
-		&v1beta1.EngineSpec{},
-	).(*Engine)
-
-	isvc := &v1beta1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancel so the Get observes a closed ctx immediately
-
-	done := make(chan struct{})
-	var name string
-	var err error
-	go func() {
-		defer close(done)
-		name, err = engine.determineEngineName(ctx, isvc)
-	}()
-
-	select {
-	case <-done:
-		// Function returned promptly under canceled ctx. The ctx is
-		// wired through to the client.Get call — pinning the signature
-		// shape is the primary regression guard.
-		g.Expect(err).NotTo(gomega.HaveOccurred())
-		g.Expect(name).To(gomega.Equal("test-isvc-engine"))
-	case <-time.After(2 * time.Second):
-		t.Fatal("determineEngineName did not return promptly under canceled ctx")
-	}
 }
 
 // TestEngineReconcileOMENativeSubresources_Rank0Selector pins that the

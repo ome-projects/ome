@@ -698,7 +698,7 @@ func projectionIR(parent *omev1beta1.InferenceService, name string, component om
 				Name: parent.Name, UID: parent.UID, Controller: &controller,
 			}},
 		},
-		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: component},
+		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: &omev1beta1.ParentReference{Name: parent.Name}, Component: component},
 		Status: omev1beta1.InferenceReplicaStatus{ObservedGeneration: 2},
 	}
 }

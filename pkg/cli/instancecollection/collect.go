@@ -318,7 +318,7 @@ func boundedReplicaCopy(
 			}},
 		},
 		Spec: omev1beta1.InferenceReplicaSpec{
-			ParentRef: omev1beta1.ParentReference{Name: ir.Spec.ParentRef.Name},
+			ParentRef: ir.Spec.ParentRef.DeepCopy(),
 			Component: ir.Spec.Component,
 		},
 		Status: omev1beta1.InferenceReplicaStatus{
@@ -681,7 +681,7 @@ func claimsTargetParent(
 	ir *omev1beta1.InferenceReplica,
 	isvc *omev1beta1.InferenceService,
 ) bool {
-	if ir.Spec.ParentRef.Name == isvc.Name ||
+	if (ir.Spec.ParentRef != nil && ir.Spec.ParentRef.Name == isvc.Name) ||
 		ir.Labels[constants.InferenceServiceLabel] == isvc.Name {
 		return true
 	}
@@ -706,7 +706,7 @@ func rejectionReason(
 	if requireRelationshipLabel && ir.Labels[constants.InferenceServiceLabel] != isvc.Name {
 		return RejectionLabel
 	}
-	if ir.Spec.ParentRef.Name != isvc.Name {
+	if ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != isvc.Name {
 		return RejectionParentReference
 	}
 	if !validOwner(ir.OwnerReferences, isvc) {

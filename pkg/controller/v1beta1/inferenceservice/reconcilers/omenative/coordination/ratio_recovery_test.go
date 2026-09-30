@@ -283,11 +283,11 @@ func TestCheckRatio_CapacityRecoveryUsesAuthoritativeIRState(t *testing.T) {
 		v1beta1.DecoderComponent: failed,
 	})
 
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); !allowed {
 		t.Fatalf("an all-zero serving group with positive authoritative shape must start recovery: %s", reason)
 	}
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 1, 0); allowed {
 		t.Fatalf("same-wakeup surge accounting must prevent repeated bootstrap even with MaxSurge greater than one: %s", reason)
 	}

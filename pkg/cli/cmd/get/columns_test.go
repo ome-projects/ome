@@ -256,7 +256,7 @@ func TestLongTailColumns(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "rep"},
 			Spec: v1beta1.InferenceReplicaSpec{
 				Component: v1beta1.EngineComponent,
-				ParentRef: v1beta1.ParentReference{Name: "llama-70b"},
+				ParentRef: &v1beta1.ParentReference{Name: "llama-70b"},
 				Replicas:  &desired,
 				Paused:    true,
 			},

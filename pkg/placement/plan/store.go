@@ -26,6 +26,10 @@ var (
 // Proposal contains the complete allocation, including retained outgoing homes.
 // Callers carry original floors across partial application and retargets.
 type Proposal struct {
+	Mode                       v1beta1.PlacementMode
+	Winner                     string
+	SingleMove                 *v1beta1.PlacementSingleMoveStatus
+	AdoptionDigest             string
 	InputDigest                string
 	PauseSurge                 bool
 	OriginalUnassignedReplicas int32
@@ -53,13 +57,19 @@ func SameSnapshot(expected, current *v1beta1.InferenceService) bool {
 	return a.ID == b.ID && a.Revision == b.Revision
 }
 
+// SameAllocation verifies all persisted authority, independently of changing
+// serving observations. A retained plan ID cannot stand in for pruned evidence.
+func SameAllocation(expected, current *v1beta1.InferenceService) bool {
+	return expected != nil && current != nil && planOf(expected) != nil && planOf(current) != nil && equalAllocation(expected.Status.Placement, current.Status.Placement)
+}
+
 // Persist returns only a freshly read, verified allocation. Repeated proposals
 // retain their revision; a conflict never rebases old intent onto a newer plan.
 func (s Store) Persist(ctx context.Context, source *v1beta1.InferenceService, proposal Proposal) (*v1beta1.InferenceService, error) {
 	if s.Client == nil || s.Reader == nil {
 		return nil, fmt.Errorf("placement plan store requires a client and direct reader")
 	}
-	if source == nil || source.UID == "" || source.Generation <= 0 || source.Spec.Placement == nil || !source.DeletionTimestamp.IsZero() {
+	if source == nil || source.UID == "" || source.Generation <= 0 || !source.Spec.Placement.UsesClusterAffinity() || !source.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("placement plan requires an identified live source with typed intent")
 	}
 	if source.Labels[constants.PlacementOrigin] != "" || source.Annotations[constants.PlacementOriginUID] != "" {
@@ -145,17 +155,25 @@ func mergeAllocation(source *v1beta1.InferenceService, allocation *v1beta1.Place
 	for _, desired := range allocation.Candidates {
 		candidate := old[desired.Cluster]
 		if candidate.Allocation == nil || candidate.Allocation.ClusterUID != desired.Allocation.ClusterUID {
-			candidate = v1beta1.CandidatePlacement{Cluster: desired.Cluster}
+			if candidate.Allocation == nil && allocation.Plan.Mode == v1beta1.PlacementModeAll {
+				candidate.Cluster = desired.Cluster
+				candidate.ObservationKnown, candidate.AppliedPlanID = false, ""
+			} else {
+				candidate = v1beta1.CandidatePlacement{Cluster: desired.Cluster}
+			}
 		}
 		candidate.Allocation = desired.Allocation.DeepCopy()
 		candidates = append(candidates, candidate)
 	}
 	source.Status.Placement.Plan = allocation.Plan.DeepCopy()
 	source.Status.Placement.Candidates = candidates
+	if allocation.Plan.Mode == v1beta1.PlacementModeSingle {
+		source.Status.Placement.Cluster = allocation.Plan.Winner
+	}
 }
 
 func equalAllocation(a, b *v1beta1.PlacementStatus) bool {
-	if a == nil || !equality.Semantic.DeepEqual(a.Plan, b.Plan) || len(a.Candidates) != len(b.Candidates) {
+	if a == nil || b == nil || !equality.Semantic.DeepEqual(a.Plan, b.Plan) || len(a.Candidates) != len(b.Candidates) {
 		return false
 	}
 	byName := map[string]*v1beta1.CandidateAllocationStatus{}
@@ -166,9 +184,11 @@ func equalAllocation(a, b *v1beta1.PlacementStatus) bool {
 		byName[candidate.Cluster] = candidate.Allocation
 	}
 	for _, candidate := range b.Candidates {
-		if !equality.Semantic.DeepEqual(byName[candidate.Cluster], candidate.Allocation) {
+		allocation, exists := byName[candidate.Cluster]
+		if !exists || !equality.Semantic.DeepEqual(allocation, candidate.Allocation) {
 			return false
 		}
+		delete(byName, candidate.Cluster)
 	}
 	return true
 }

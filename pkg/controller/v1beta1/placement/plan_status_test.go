@@ -4,12 +4,125 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
+
+func satisfiedSource() *v1beta1.InferenceService {
+	source := srcISVCSplit("", 18)
+	source.Status.Placement = &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{
+		ID: "plan-a", Revision: 1, SourceUID: source.UID, ObservedGeneration: source.Generation, RequestedReplicas: 18, AssignedReplicas: 18,
+	}}
+	for _, name := range []string{"member-a", "member-b", "member-c"} {
+		source.Status.Placement.Candidates = append(source.Status.Placement.Candidates, v1beta1.CandidatePlacement{
+			Cluster: name, Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: "registration-a", CurrentReplicas: 6, DesiredReplicas: 6},
+			ObservationKnown: true, AppliedPlanID: "plan-a", AdmittedReplicas: 6,
+		})
+	}
+	return source
+}
+
+func TestPlacementSatisfaction(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		edit   func(*v1beta1.InferenceService)
+		status corev1.ConditionStatus
+		reason string
+	}{
+		{name: "all shares admitted", status: corev1.ConditionTrue, reason: "AssignedFloorsAdmitted"},
+		{name: "surplus cannot cover another share", edit: func(s *v1beta1.InferenceService) {
+			s.Status.Placement.Candidates[0].AdmittedReplicas = 12
+			s.Status.Placement.Candidates[1].AdmittedReplicas = 2
+		}, status: corev1.ConditionFalse, reason: "AllocationShortfall"},
+		{name: "surplus does not break satisfaction", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Candidates[0].AdmittedReplicas = 12 }, status: corev1.ConditionTrue, reason: "AssignedFloorsAdmitted"},
+		{name: "unknown member", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Candidates[0].ObservationKnown = false }, status: corev1.ConditionUnknown, reason: "AwaitingMemberApplication"},
+		{name: "stale applied identity", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Candidates[0].AppliedPlanID = "old-plan" }, status: corev1.ConditionUnknown, reason: "AwaitingMemberApplication"},
+		{name: "unassigned floor", edit: func(s *v1beta1.InferenceService) {
+			s.Status.Placement.Plan.UnassignedReplicas = 2
+			s.Status.Placement.Plan.RequestedReplicas = 20
+		}, status: corev1.ConditionFalse, reason: "AllocationShortfall"},
+		{name: "zero target needs no admission", edit: func(s *v1beta1.InferenceService) {
+			s.Status.Placement.Candidates[0].Allocation.DesiredReplicas = 0
+			s.Status.Placement.Candidates[0].ObservationKnown = false
+			s.Status.Placement.Plan.AssignedReplicas, s.Status.Placement.Plan.RequestedReplicas = 12, 12
+		}, status: corev1.ConditionTrue, reason: "AssignedFloorsAdmitted"},
+		{name: "zero home requires member acknowledgement", edit: func(s *v1beta1.InferenceService) {
+			c := &s.Status.Placement.Candidates[0]
+			c.Allocation.DesiredReplicas = 0
+			c.Allocation.DesiredHome = &v1beta1.PlacementHomePolicy{InputDigest: "source-intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent}}}
+			c.AppliedPlanID = ""
+			s.Status.Placement.Plan.AssignedReplicas, s.Status.Placement.Plan.RequestedReplicas = 12, 12
+		}, status: corev1.ConditionUnknown, reason: "AwaitingMemberApplication"},
+		{name: "acknowledged zero home needs no admitted replicas", edit: func(s *v1beta1.InferenceService) {
+			c := &s.Status.Placement.Candidates[0]
+			c.Allocation.DesiredReplicas, c.AdmittedReplicas = 0, 0
+			c.Allocation.DesiredHome = &v1beta1.PlacementHomePolicy{InputDigest: "source-intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent}}}
+			s.Status.Placement.Plan.AssignedReplicas, s.Status.Placement.Plan.RequestedReplicas = 12, 12
+		}, status: corev1.ConditionTrue, reason: "AssignedFloorsAdmitted"},
+		{name: "source changed", edit: func(s *v1beta1.InferenceService) { s.Generation++ }, status: corev1.ConditionUnknown, reason: "AwaitingCurrentPlan"},
+		{name: "source recreated", edit: func(s *v1beta1.InferenceService) { s.UID = "source-b" }, status: corev1.ConditionUnknown, reason: "AwaitingCurrentPlan"},
+		{name: "plan identity missing", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Plan.ID = "" }, status: corev1.ConditionUnknown, reason: "AwaitingCurrentPlan"},
+		{name: "cluster identity missing", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Candidates[0].Allocation.ClusterUID = "" }, status: corev1.ConditionUnknown, reason: "AwaitingMemberApplication"},
+		{name: "missing assignment", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Candidates = s.Status.Placement.Candidates[1:] }, status: corev1.ConditionUnknown, reason: "AllocationObservationIncomplete"},
+		{name: "unidentified assignment", edit: func(s *v1beta1.InferenceService) { s.Status.Placement.Candidates[0].Allocation = nil }, status: corev1.ConditionUnknown, reason: "AllocationObservationIncomplete"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := satisfiedSource()
+			if tt.edit != nil {
+				tt.edit(source)
+			}
+			before := source.DeepCopy()
+			got := placementSatisfactionConditions(source)
+			if len(got) != 1 {
+				t.Fatalf("conditions = %v, want one", got)
+			}
+			if diff := cmp.Diff(tt.status, got[0].cond.Status); diff != "" {
+				t.Errorf("status (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.reason, got[0].cond.Reason); diff != "" {
+				t.Errorf("reason (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(before, source); diff != "" {
+				t.Errorf("source mutated (-want +got):\n%s", diff)
+			}
+		})
+	}
+	for _, status := range []*v1beta1.PlacementStatus{nil, {}} {
+		source := srcISVC("")
+		source.Status.Placement = status
+		if got := placementSatisfactionConditions(source); len(got) != 0 {
+			t.Errorf("unplanned source conditions = %v", got)
+		}
+	}
+}
+
+func TestShortfallDoesNotOverrideServingReadiness(t *testing.T) {
+	source := satisfiedSource()
+	source.Status.Placement.Candidates[1].AdmittedReplicas = 2
+	r, cp := newPlacer(testScheme(t), fakeClusters{}, source)
+	_, err := r.writePlacement(t.Context(), source, placementResult{phase: v1beta1.PlacementPhasePlaced, candidates: source.Status.Placement.Candidates, ready: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := &v1beta1.InferenceService{}
+	if err := cp.Get(t.Context(), client.ObjectKeyFromObject(source), stored); err != nil {
+		t.Fatal(err)
+	}
+	for condition, want := range map[apis.ConditionType]corev1.ConditionStatus{apis.ConditionReady: corev1.ConditionTrue, v1beta1.PlacementSatisfied: corev1.ConditionFalse} {
+		got := stored.Status.GetCondition(condition)
+		if got == nil {
+			t.Fatalf("missing condition %s", condition)
+		}
+		if diff := cmp.Diff(want, got.Status); diff != "" {
+			t.Errorf("%s (-want +got):\n%s", condition, diff)
+		}
+	}
+}
 
 func TestWritePlacementRejectsStaleSnapshot(t *testing.T) {
 	for _, tt := range []struct {

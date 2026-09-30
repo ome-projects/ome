@@ -539,6 +539,11 @@ func TestStickyRejectSuppressesReopen(t *testing.T) {
 		Canary:     canaryBody(10, 100),
 	})
 	isvc.Status.Canary = &v1beta1.CanaryStatus{RolledBackRevisionHash: "bbbbbbbb"}
+	// The primary reports the revert complete: a hold, not a revert in
+	// flight for a run to adopt.
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {RolloutPhase: v1beta1.RolloutPhaseRolledBack},
+	}
 	ir := irFixture(oldRev, newRev)
 	ir.Status.Replicas = 2
 	ir.Status.UpdatedReplicas = 0
@@ -549,6 +554,71 @@ func TestStickyRejectSuppressesReopen(t *testing.T) {
 	}
 	if v1beta1.RolloutRunActive(isvc) {
 		t.Fatal("a sticky-rejected target is a hold, not a pending roll — no run may open")
+	}
+}
+
+// The reverse of the suppression above, and the half of ome.io/rollout-resume
+// this layer owns. A completed rollback CLOSES its run, so resume cannot
+// re-enter a pinned ladder — all it does in the canary layer is clear
+// cs.RolledBackRevisionHash, and the escape only works if that makes the
+// target read diverged again here so a fresh run opens over the same revision.
+//
+// The durable LastRun record is deliberately left standing: it is what would
+// silently re-assert the hold if stickyRejectHashes ever consulted it without
+// first checking the live cs field, and resume would then succeed on the
+// canary side and stall here with no run and no event.
+func TestClearedRejectReopensRunForResume(t *testing.T) {
+	rolledBack := func(rejection string) *v1beta1.InferenceService {
+		isvc := isvcFixture(v1beta1.RolloutGroup{
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+			Canary:     canaryBody(10, 100),
+		})
+		isvc.Status.Canary = &v1beta1.CanaryStatus{RolledBackRevisionHash: rejection}
+		// The hold is settled while the rejection stands; resume re-arms the
+		// unit at Pending as it clears the rejection.
+		phase := v1beta1.RolloutPhaseRolledBack
+		if rejection == "" {
+			phase = v1beta1.RolloutPhasePending
+		}
+		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+			v1beta1.EngineComponent: {RolloutPhase: phase},
+		}
+		isvc.Status.Rollout = &v1beta1.RolloutStatus{LastRun: &v1beta1.RolloutRunRecord{
+			Outcome: v1beta1.RolloutRunRolledBack,
+			TargetRevisions: []v1beta1.RolloutRunTarget{
+				{Component: v1beta1.EngineComponent, Revision: hashOf(t, newRev), StableRevision: hashOf(t, oldRev)},
+			},
+		}}
+		return isvc
+	}
+	heldIR := func() *v1beta1.InferenceReplica {
+		// The hold leaves the IR naming the rejected revision as its spec
+		// target with its instances back on stable.
+		ir := irFixture(oldRev, newRev)
+		ir.Status.Replicas = 2
+		ir.Status.UpdatedReplicas = 0
+		return ir
+	}
+
+	// Baseline: while the rejection stands, the hold suppresses the reopen.
+	held := rolledBack(hashOf(t, newRev))
+	if _, err := Reconcile(context.Background(), testInputs(t, held, heldIR())); err != nil {
+		t.Fatal(err)
+	}
+	if v1beta1.RolloutRunActive(held) {
+		t.Fatal("the rejection must still suppress the reopen — the baseline this test contrasts with")
+	}
+
+	// Resumed: the canary layer cleared the rejection, nothing else changed.
+	resumed := rolledBack("")
+	if _, err := Reconcile(context.Background(), testInputs(t, resumed, heldIR())); err != nil {
+		t.Fatal(err)
+	}
+	if !v1beta1.RolloutRunActive(resumed) {
+		t.Fatal("clearing the rejection must reopen a run over the same revision, or resume stalls on RolledBack with no ladder to re-enter")
+	}
+	if got := pinnedRevision(resumed.Status.Rollout.ActiveRun.TargetRevisions, v1beta1.EngineComponent); got != hashOf(t, newRev) {
+		t.Fatalf("the reopened run must target the previously rejected revision, got %q", got)
 	}
 }
 
@@ -1093,5 +1163,46 @@ func TestDerivedProvenanceLeavesProgressionUnset(t *testing.T) {
 	}
 	if got[1].PolicyRef.Name != "vllm-engine-standard" || got[1].PortableDigest != "rp1:8b734048103c" {
 		t.Errorf("groups[1] = %+v", got[1])
+	}
+}
+
+// A rollback in progress keeps its run open: the run closes on the primary's
+// phase, and RollingBack is the unit still reverting (the primary's own pods
+// or a member's), so the members' reverts stay licensed by the pin.
+func TestRollingBackRunStaysOpen(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Canary:     canaryBody(10, 100),
+	})
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {
+			RolloutPhase: v1beta1.RolloutPhaseRollingBack,
+			Canary: &v1beta1.CanaryStatus{
+				CurrentStep:            1,
+				RolledBackRevisionHash: hashOf(t, newRev),
+				StableRevisionHash:     hashOf(t, oldRev),
+			},
+		},
+	}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{
+		ActiveRun: &v1beta1.RolloutRun{
+			RunID: "llm-a-run",
+			TargetRevisions: []v1beta1.RolloutRunTarget{
+				{Component: v1beta1.EngineComponent, Revision: hashOf(t, newRev), StableRevision: hashOf(t, oldRev)},
+			},
+			Plan: v1beta1.RolloutRunPlan{Groups: []v1beta1.RolloutRunGroup{{
+				Group: v1beta1.RolloutGroup{
+					Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+					Canary:     canaryBody(10, 100),
+				},
+			}}},
+		},
+	}
+	in := testInputs(t, isvc, namedIR("llm-a-engine", oldRev, newRev))
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if isvc.Status.Rollout.ActiveRun == nil {
+		t.Fatalf("a rollback still in progress must keep its run pinned, got lastRun=%+v", isvc.Status.Rollout.LastRun)
 	}
 }

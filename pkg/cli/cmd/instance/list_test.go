@@ -448,7 +448,7 @@ func commandIR(isvc *omev1beta1.InferenceService) *omev1beta1.InferenceReplica {
 			}},
 		},
 		Spec: omev1beta1.InferenceReplicaSpec{
-			ParentRef: omev1beta1.ParentReference{Name: isvc.Name}, Component: omev1beta1.EngineComponent,
+			ParentRef: &omev1beta1.ParentReference{Name: isvc.Name}, Component: omev1beta1.EngineComponent,
 		},
 		Status: omev1beta1.InferenceReplicaStatus{
 			ObservedGeneration: 2, Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1, AvailableReplicas: 1,

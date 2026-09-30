@@ -30,9 +30,10 @@
 // (`pkg/apis/ome/v1beta1`) from any file exported to callers. Adapters
 // at the edge convert between the owner-CRD shape and the
 // workload-owned types. Per-instance transition fields — Phase,
-// Operation, RunningRevision — are written only by this package tree;
-// the component-level revision pair (CurrentRevision, UpdateRevision)
-// only by the owner's controller.
+// Operation, RunningRevision — are decided only by this package tree
+// (the adapter persists the phase the publication view returns, as it
+// does the counters); the component-level revision pair
+// (CurrentRevision, UpdateRevision) only by the owner's controller.
 //
 // Callers populate a types.ReconcileInput — identity, projected
 // DesiredSpec / ObservedState, and callback closures (MutateInstance,

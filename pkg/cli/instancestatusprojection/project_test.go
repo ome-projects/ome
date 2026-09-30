@@ -1523,7 +1523,7 @@ func statusInput() instancestatusprojection.Input {
 			Labels:          map[string]string{constants.InferenceServiceLabel: "chat", constants.OMEComponentLabel: "engine"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: omev1beta1.SchemeGroupVersion.String(), Kind: "InferenceService", Name: "chat", UID: "isvc-uid", Controller: &controller}},
 		},
-		Spec: omev1beta1.InferenceReplicaSpec{ParentRef: omev1beta1.ParentReference{Name: "chat"}, Component: omev1beta1.EngineComponent},
+		Spec: omev1beta1.InferenceReplicaSpec{ParentRef: &omev1beta1.ParentReference{Name: "chat"}, Component: omev1beta1.EngineComponent},
 		Status: omev1beta1.InferenceReplicaStatus{
 			ObservedGeneration: 2, Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1, AvailableReplicas: 1,
 			CurrentRevision: "chat-engine-a", UpdateRevision: "chat-engine-b",

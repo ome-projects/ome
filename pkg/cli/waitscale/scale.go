@@ -118,7 +118,7 @@ func (e *Evaluator) Evaluate(v Evidence) (waitengine.Decision, Observation) {
 	}
 	if ir.Name != selected || ir.Namespace != p.Namespace || !safeIdentity(string(ir.UID)) || !safeIdentity(ir.ResourceVersion) || ir.Generation <= 0 ||
 		ir.Kind != "" && ir.Kind != "InferenceReplica" || ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1" ||
-		ir.Spec.ParentRef.Name != p.Name || ir.Spec.Component != e.target.Component || ir.DeletionTimestamp != nil ||
+		(ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != p.Name) || ir.Spec.Component != e.target.Component || ir.DeletionTimestamp != nil ||
 		(e.target.IRUID != "" && ir.UID != e.target.IRUID) ||
 		(e.name != "" && (e.name != ir.Name || e.uid != ir.UID)) ||
 		ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] != strconv.FormatInt(p.Generation, 10) ||

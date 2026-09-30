@@ -47,7 +47,7 @@ func TestHeldReleaseRelationshipAndBoundedIdentityRefusals(t *testing.T) {
 	}{
 		{"wrong kind", func(ir *v1beta1.InferenceReplica) { ir.Kind = "Other" }},
 		{"wrong API", func(ir *v1beta1.InferenceReplica) { ir.APIVersion = "other.io/v1" }},
-		{"wrong parent", func(ir *v1beta1.InferenceReplica) { ir.Spec.ParentRef.Name = "other" }},
+		{"wrong parent", func(ir *v1beta1.InferenceReplica) { ir.Spec.ParentRef = &v1beta1.ParentReference{Name: "other"} }},
 		{"wrong namespace", func(ir *v1beta1.InferenceReplica) { ir.Namespace = "other" }},
 		{"missing UID", func(ir *v1beta1.InferenceReplica) { ir.UID = "" }},
 		{"unsafe RV", func(ir *v1beta1.InferenceReplica) { ir.ResourceVersion = "PRIVATE\nRV" }},

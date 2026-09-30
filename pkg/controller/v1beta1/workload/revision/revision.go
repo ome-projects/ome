@@ -160,9 +160,10 @@ func (p DataPayload) MarshalJSON() ([]byte, error) {
 // recreation can leave the new owner pointing at a freshly-created
 // same-name CR (or, if GC is slower, silently flag a foreign-owner
 // collision) — both shapes drop the OMENative-on-ISVC contract that "new
-// owner ⇒ new revision history" on the floor. Empty UID hashes
-// identically to a zero-value UID; callers that legitimately have no
-// owner identity yet (test fixtures predating the fix) can pass "".
+// owner ⇒ new revision history" on the floor. An empty ownerUID is
+// accepted and leaves the hash unpartitioned, which suits only a caller
+// with no owner identity; a caller that persists revision history passes
+// its owner's UID.
 func Hash(template *corev1.PodSpec, templateMeta *metav1.ObjectMeta, collisionCount *int32, ownerUID types.UID) (string, []byte, error) {
 	return HashWithWorker(template, nil, templateMeta, collisionCount, ownerUID)
 }
@@ -488,11 +489,9 @@ func PayloadFromControllerRevision(cr *appsv1.ControllerRevision) (*DataPayload,
 // the hash — `<key.Name>-<hash>`. Deterministic, so "reuse-if-exists"
 // works.
 //
-// The ISVC adapter sets key.Name = "<isvc>-<component>", producing
-// `<isvc>-<component>-<hash>`. IR-adapter callers set key.Name the same
-// way (since one IR is one (ISVC, Component) tuple), so cross-adapter
-// CRs share the same name and the in-place migration window stays
-// seamless.
+// The InferenceReplica reconciler sets key.Name = "<prefix>-<component>"
+// (the InferenceService name for a projected replica, the replica's own
+// name for a standalone one), producing `<prefix>-<component>-<hash>`.
 func Name(key Key, hash string) string {
 	return fmt.Sprintf("%s-%s", key.Name, hash)
 }
@@ -522,14 +521,11 @@ func Labels(key Key) map[string]string {
 // for the workload owner; existing CRs keep whatever labels/owners they
 // already have.
 //
-// scopeUID partitions the revision history per parent identity so a
-// deleted-and-recreated parent of the same name does not silently
-// inherit the predecessor's CR. For the ISVC adapter this is the ISVC
-// UID; for the IR adapter this is the ISVC UID resolved from the IR's
-// controller OwnerReference so BOTH paths address the same per-ISVC
-// revision space (the IR's own UID is intentionally NOT used — that
-// would diverge the IR-managed path's hash from the direct path's hash
-// and break the shadow-mode equivalence the cutover relies on).
+// scopeUID feeds the hash and therefore the revision name: the
+// InferenceService's UID for a projected replica, the replica's own UID
+// for a standalone one, so two pod sets never share a revision name even
+// when their templates match. Listing, numbering and retention select by
+// the key's labels.
 //
 // Single-pod variant — does not hash a worker template. Multi-pod
 // callers use EnsureControllerRevisionWithWorker so worker-only spec

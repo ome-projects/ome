@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -28,6 +29,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
@@ -234,18 +236,79 @@ func TestAggregateAndWriteStatusPersistsCompactRowsAndMirrorsCurrentObservations
 		"legacy compaction writes once and the steady compact pass writes nothing")
 }
 
+// TestAggregateAndWriteStatus_DemotesReadyRowWithoutPods pins the
+// aggregator's half of the rule: a persisted Ready row whose pod is gone is
+// written back as Pending in the same status write that publishes its zero
+// pod count, under every restart policy; the caller's snapshot mirrors the
+// demotion, and the next steady pass writes nothing. The running revision
+// stays on the row: the return to Ready is the lifecycle promote's, and
+// under RecreateInstanceOnPodRestart the restart pass rebuilds at it.
+func TestAggregateAndWriteStatus_DemotesReadyRowWithoutPods(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy workloadtypes.RestartPolicy
+		want   v1beta1.OMENativeInstancePhase
+	}{
+		{name: "create-owned pod loss publishes Pending", policy: workloadtypes.RestartPolicyNone, want: v1beta1.OMENativeInstancePending},
+		{name: "restart-owned pod loss publishes Pending", policy: workloadtypes.RestartPolicyRecreateInstance, want: v1beta1.OMENativeInstancePending},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			ir := baselineIR("model-engine", "default", 1)
+			readySince := metav1.NewTime(time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC))
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+				Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+				RunningRevision: "rev-a", ReadySince: &readySince,
+			}}
+			r, stored := newReconciler(t, ir)
+			plan := workloadtypes.ComponentPlan{
+				Component:     v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
+				Replicas:      1,
+				RestartPolicy: test.policy,
+				Instances: []workloadtypes.InstancePlan{{
+					Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}},
+				}},
+			}
+
+			g.Expect(writeStatus(r, ir, plan, nil, false, nil)).To(gomega.Succeed())
+			got := &v1beta1.InferenceReplica{}
+			g.Expect(stored.Get(context.Background(), client.ObjectKeyFromObject(ir), got)).To(gomega.Succeed())
+			g.Expect(got.Status.InstanceStatuses[0].Phase).To(gomega.Equal(test.want))
+			g.Expect(got.Status.InstanceStatuses[0].PodCount).To(gomega.BeZero())
+			g.Expect(got.Status.InstanceStatuses[0].RunningRevision).To(gomega.Equal("rev-a"),
+				"the running revision survives the demotion: it is what a repair rebuilds at")
+			g.Expect(got.Status.InstanceStatuses[0].ReadySince).NotTo(gomega.BeNil())
+			g.Expect(got.Status.InstanceStatuses[0].ReadySince.Time).To(gomega.BeTemporally("==", readySince.Time),
+				"the ready anchor survives the demotion; the next promote re-stamps it")
+			g.Expect(got.Status.ReadyReplicas).To(gomega.BeZero())
+			g.Expect(ir.Status.InstanceStatuses[0].Phase).To(gomega.Equal(test.want),
+				"the caller's snapshot mirrors the published phase")
+
+			steadyRV := got.ResourceVersion
+			g.Expect(writeStatus(r, got.DeepCopy(), plan, nil, false, nil)).To(gomega.Succeed())
+			steady := &v1beta1.InferenceReplica{}
+			g.Expect(stored.Get(context.Background(), client.ObjectKeyFromObject(ir), steady)).To(gomega.Succeed())
+			g.Expect(steady.ResourceVersion).To(gomega.Equal(steadyRV),
+				"a steady publication performs no status write")
+		})
+	}
+}
+
 func TestMirrorInstanceCountersUsesTransientPublicationIntersection(t *testing.T) {
 	g := gomega.NewWithT(t)
 	status := &v1beta1.InferenceReplicaStatus{InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
 		{Index: 3, Phase: v1beta1.OMENativeInstanceDeleting, Admitted: true, PodCount: 9, NodesOccupied: []string{"old-node"}},
 		{Index: 9, Phase: v1beta1.OMENativeInstanceReady, PodCount: 7, ReadyPodCount: 6},
 		{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating},
+		{Index: 5, Phase: v1beta1.OMENativeInstanceReady, PodCount: 1, ReadyPodCount: 1},
 	}}
 	publication := []workloadtypes.InstanceStatus{
-		{Index: 1, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1, ScheduledPodCount: 1, AvailablePodCount: 1, NodesOccupied: []string{"node-a"}},
-		{Index: 3, PodCount: 2, ReadyPodCount: 2, NodesOccupied: []string{"superseded"}},
-		{Index: 3, PodCount: 4, ReadyPodCount: 3, ServingPodCount: 2, ScheduledPodCount: 4, AvailablePodCount: 1},
-		{Index: 7, PodCount: 1, ReadyPodCount: 1},
+		{Index: 1, Phase: workloadtypes.InstancePhaseUpdating, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1, ScheduledPodCount: 1, AvailablePodCount: 1, NodesOccupied: []string{"node-a"}},
+		{Index: 3, Phase: workloadtypes.InstancePhaseDeleting, PodCount: 2, ReadyPodCount: 2, NodesOccupied: []string{"superseded"}},
+		{Index: 3, Phase: workloadtypes.InstancePhaseDeleting, PodCount: 4, ReadyPodCount: 3, ServingPodCount: 2, ScheduledPodCount: 4, AvailablePodCount: 1},
+		{Index: 5, Phase: workloadtypes.InstancePhasePending},
+		{Index: 7, Phase: workloadtypes.InstancePhaseReady, PodCount: 1, ReadyPodCount: 1},
 	}
 
 	mirrorInstanceCounters(status, publication)
@@ -259,6 +322,9 @@ func TestMirrorInstanceCountersUsesTransientPublicationIntersection(t *testing.T
 	}), "caller-only rows remain untouched")
 	g.Expect(status.InstanceStatuses[2].Phase).To(gomega.Equal(v1beta1.OMENativeInstanceUpdating))
 	g.Expect(status.InstanceStatuses[2].NodesOccupied).To(gomega.Equal([]string{"node-a"}))
+	g.Expect(status.InstanceStatuses[3]).To(gomega.Equal(v1beta1.OMENativeInstanceStatus{
+		Index: 5, Phase: v1beta1.OMENativeInstancePending,
+	}), "the published phase is mirrored with the counters, so a demotion shows on the caller's snapshot")
 
 	publication[0].NodesOccupied[0] = "mutated"
 	g.Expect(status.InstanceStatuses[2].NodesOccupied).To(gomega.Equal([]string{"node-a"}),
@@ -270,10 +336,8 @@ func TestMirrorInstanceCountersUsesTransientPublicationIntersection(t *testing.T
 // pins the AvailableReplicas counter via the end-to-end Reconcile path.
 // With pods ContainersReady AND published as Ready in the per-Component
 // headless Service's EndpointSlice, AvailableReplicas should collapse
-// onto ReadyReplicas. The aggregator reads availability off the slice
-// exactly like the omenative direct path
-// (TestAggregateAndWriteStatus_PerInstanceCountersFromObservedPods),
-// so the two adapters produce byte-identical counters.
+// onto ReadyReplicas. The aggregator reads availability off the slice,
+// not off pod readiness.
 //
 // AvailableReplicas does not always mirror ReadyReplicas — the two CAN
 // diverge, see TestAggregateStatus_AvailableReplicas_ZeroWhenSliceNotReady —
@@ -382,13 +446,11 @@ func TestReconcile_WakesWhenMinReadyWindowElapses(t *testing.T) {
 // EndpointSlice-gated availability semantic: a pod ContainersReady but
 // NOT yet in any EndpointSlice's Ready endpoints reads
 // AvailablePodCount=0 → AvailableReplicas=0, while ReadyReplicas still
-// reports 1. Mirrors the omenative direct path's
-// TestAggregateAndWriteStatus_AvailableRequiresEndpointSliceReady.
+// reports 1.
 //
 // This is the "newly-Ready pod hasn't been picked up by kube-proxy
 // yet" window — operators get a useful signal that the pod is alive
-// but not in rotation, instead of the previous always-mirrors-ready
-// behavior that hid the kube-proxy lag.
+// but not in rotation, so the kube-proxy lag stays visible.
 func TestAggregateStatus_AvailableReplicas_ZeroWhenSliceNotReady(t *testing.T) {
 	g := gomega.NewWithT(t)
 	ir := baselineIR("llama-engine", "prod", 1)
@@ -1364,8 +1426,6 @@ func TestAggregateStatus_BadImageSurge_EscalatesInstanceToFailed(t *testing.T) {
 // stuck-pod grace (lifecycle stuckPodGracePeriod) must NOT escalate.
 // Without this guard, a brief transient pull failure
 // on a flaky registry would mis-classify a pod that's about to recover.
-// Mirrors the equivalent omenative-direct-path test
-// TestSurgeUpdate_ImagePullBackOff_WithinGrace_NoEscalation.
 func TestAggregateStatus_StuckPodWithinGrace_NoEscalation(t *testing.T) {
 	g := gomega.NewWithT(t)
 
@@ -2904,4 +2964,31 @@ func TestDrainOverdueCondition_ClearsWhenNoRowIsOverdue(t *testing.T) {
 	cond := computeDrainOverdueCondition(status)
 	g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
 	g.Expect(cond.Reason).To(gomega.Equal(ReasonDrainsWithinDeadline))
+}
+
+// A standalone replica's selector keys on its own name, the label value its
+// pods carry, not on a `<name>-<component>` derivation of it.
+func TestIRLabelSelectorStringForAStandaloneReplica(t *testing.T) {
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a"},
+		Spec:       v1beta1.InferenceReplicaSpec{Component: v1beta1.EngineComponent},
+	}
+	got := irLabelSelectorString(ir.NamePrefix(), ir.Spec.Component)
+	sel, err := labels.Parse(got)
+	if err != nil {
+		t.Fatalf("selector %q does not parse: %v", got, err)
+	}
+	podLabels := func(namePrefix string) labels.Set {
+		return labels.Set{
+			constants.InferenceServicePodLabelKey: namePrefix,
+			constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+			query.LabelManagedBy:                  query.ManagedByOMENative,
+		}
+	}
+	if !sel.Matches(podLabels("pool-a")) {
+		t.Fatalf("selector %q does not match the replica's own pods", got)
+	}
+	if sel.Matches(podLabels("pool-a-engine")) {
+		t.Fatalf("selector %q matches pods labeled pool-a-engine", got)
+	}
 }

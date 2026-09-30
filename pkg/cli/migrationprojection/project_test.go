@@ -182,7 +182,7 @@ func TestProjectValidatesReplicaIdentityBeforeUsingStatus(t *testing.T) {
 		{name: "name", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Name = "bad\nname" }, code: reportv1alpha1.MigrationIssueSourceIdentityInvalid},
 		{name: "uid", mutate: func(ir *omev1beta1.InferenceReplica) { ir.UID = "bad\nuid" }, code: reportv1alpha1.MigrationIssueSourceIdentityInvalid},
 		{name: "label", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Labels[constants.InferenceServicePodLabelKey] = "other" }, code: reportv1alpha1.MigrationIssueSourceLabelMismatch},
-		{name: "parentRef", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Spec.ParentRef.Name = "other" }, code: reportv1alpha1.MigrationIssueSourceParentMismatch},
+		{name: "parentRef", mutate: func(ir *omev1beta1.InferenceReplica) { ir.Spec.ParentRef = &omev1beta1.ParentReference{Name: "other"} }, code: reportv1alpha1.MigrationIssueSourceParentMismatch},
 		{name: "owner uid", mutate: func(ir *omev1beta1.InferenceReplica) { ir.OwnerReferences[0].UID = "other" }, code: reportv1alpha1.MigrationIssueSourceOwnerMismatch},
 		{name: "owner gvk", mutate: func(ir *omev1beta1.InferenceReplica) { ir.OwnerReferences[0].APIVersion = "ome.io/v9" }, code: reportv1alpha1.MigrationIssueSourceOwnerMismatch},
 		{name: "owner kind", mutate: func(ir *omev1beta1.InferenceReplica) { ir.OwnerReferences[0].Kind = "Secret" }, code: reportv1alpha1.MigrationIssueSourceOwnerMismatch},
@@ -627,7 +627,7 @@ func projectionIR(parent *omev1beta1.InferenceService, name string, component om
 				Name: parent.Name, UID: parent.UID, Controller: &controller,
 			}},
 		},
-		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: component},
+		Spec:   omev1beta1.InferenceReplicaSpec{ParentRef: &omev1beta1.ParentReference{Name: parent.Name}, Component: component},
 		Status: omev1beta1.InferenceReplicaStatus{ObservedGeneration: 3},
 	}
 }

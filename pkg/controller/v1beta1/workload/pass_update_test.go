@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ktypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -663,6 +664,121 @@ func TestReconcile_StrategyFlipMidSurge_RespectsUnavailabilityBudget(t *testing.
 			if len(surging) > maxSurge {
 				t.Errorf("%d Instances driven as surge-mode updates (indices %v, steps %v) against maxSurge=%d",
 					len(surging), surging, drivenAs, maxSurge)
+			}
+		})
+	}
+}
+
+// runnerPod is enginePod for one Runner of instance idx, so a gang
+// (leader + worker) can be seeded pod by pod.
+func runnerPod(isvc, ns string, idx int32, runner string) *corev1.Pod {
+	pod := enginePod(isvc, ns, idx)
+	pod.Name = query.PodName(isvc, types.ComponentEngine, idx, runner, 0)
+	pod.UID = ktypes.UID(pod.Name + "-uid")
+	pod.Labels[query.LabelRunner] = runner
+	return pod
+}
+
+// TestReconcile_GangInPlaceFallbackIsGatedAsRecreate pins the mechanism
+// the update pass reports to the coordination gate. The gate waives its
+// capacity checks for an in-place start because the patch returns the
+// same pod; a gang under an in-place strategy never patches, it
+// recreates, so its start must reach the gate as RecreatePod and be
+// held whenever the gate would hold a recreate. A single-pod in-place
+// start keeps its declared strategy. The gate here models the waiver:
+// it admits an in-place mechanism and holds every other one on Ratio.
+func TestReconcile_GangInPlaceFallbackIsGatedAsRecreate(t *testing.T) {
+	gang := []types.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}
+	single := []types.RunnerPlan{{Name: "default", Size: 1}}
+	cases := []struct {
+		name        string
+		strategy    types.UpdateStrategyType
+		runners     []types.RunnerPlan
+		wantConsult types.UpdateStrategyType
+		wantHeld    bool
+	}{
+		{"gang InPlaceIfPossible is consulted as a recreate and held", types.UpdateStrategyInPlaceIfPossible, gang, types.UpdateStrategyRecreatePod, true},
+		{"gang InPlaceOnly is consulted as a recreate and held", types.UpdateStrategyInPlaceOnly, gang, types.UpdateStrategyRecreatePod, true},
+		{"gang RecreatePod is held", types.UpdateStrategyRecreatePod, gang, types.UpdateStrategyRecreatePod, true},
+		{"single-pod InPlaceIfPossible keeps the waiver", types.UpdateStrategyInPlaceIfPossible, single, types.UpdateStrategyInPlaceIfPossible, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := makeScheme(t)
+			isvc := &v1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "llama-70b", Namespace: "prod", UID: "uid-1"},
+			}
+			objs := []client.Object{isvc}
+			for _, r := range tc.runners {
+				objs = append(objs, runnerPod(isvc.Name, isvc.Namespace, 0, r.Name))
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
+				WithObjects(objs...).Build()
+			deps := types.Deps{Client: c, Expectations: types.NewExpectations()}
+
+			in := minimalInput(t)
+			in.MutateInstance = roundTripMutateInstance(c, isvc, types.ComponentEngine)
+			podCount := int32(len(tc.runners))
+			in.ObservedState.InstanceStatuses = []types.InstanceStatus{{
+				Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady,
+				RunningRevision: "llama-70b-engine-priorrev", PodCount: podCount, ServingPodCount: podCount,
+			}}
+			var consulted []types.UpdateStrategyType
+			in.UpdateGate = func(strategy types.UpdateStrategyType, _, _ int32) (bool, types.RolloutHoldGate, string) {
+				consulted = append(consulted, strategy)
+				if strategy == types.UpdateStrategyInPlaceIfPossible || strategy == types.UpdateStrategyInPlaceOnly {
+					return true, "", ""
+				}
+				return false, types.RolloutHoldGateRatio, "projected serving ratio leaves the band"
+			}
+			var hold *types.RolloutHold
+			in.RecordRolloutHold = func(h *types.RolloutHold) { hold = h }
+
+			plan := types.ComponentPlan{
+				Component:      types.ComponentEngine,
+				Replicas:       1,
+				Instances:      []types.InstancePlan{{Index: 0, Incarnation: 1, Runners: tc.runners}},
+				UpdateStrategy: types.UpdateStrategy{Type: tc.strategy},
+			}
+			target := &appsv1.ControllerRevision{
+				ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newtarget", Namespace: "prod"},
+			}
+
+			_, err := workload.Reconcile(context.Background(), deps, in, plan, target)
+			if want := []types.UpdateStrategyType{tc.wantConsult}; !slices.Equal(consulted, want) {
+				t.Errorf("gate consulted with %v, want %v", consulted, want)
+			}
+			if !tc.wantHeld {
+				// The admitted start runs its op against the fake client; the
+				// op's outcome belongs to the op's own tests.
+				if err != nil {
+					t.Logf("op error after an admitted start: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if hold == nil || hold.Gate != types.RolloutHoldGateRatio {
+				t.Errorf("RolloutHold = %+v, want the gate's Ratio hold", hold)
+			}
+			// A held start touches nothing: every pod of the Instance is still
+			// there and none is terminating.
+			pods := &corev1.PodList{}
+			if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+				t.Fatalf("list pods: %v", err)
+			}
+			if len(pods.Items) != len(tc.runners) {
+				t.Errorf("held start left %d pods, want %d", len(pods.Items), len(tc.runners))
+			}
+			for i := range pods.Items {
+				if pods.Items[i].DeletionTimestamp != nil {
+					t.Errorf("held start is draining %s", pods.Items[i].Name)
+				}
+			}
+			if s := instanceStatusByIndex(c, isvc, v1beta1.EngineComponent, 0); s != nil && s.Phase != v1beta1.OMENativeInstanceReady {
+				t.Errorf("held start moved the row to %s, want Ready", s.Phase)
 			}
 		})
 	}

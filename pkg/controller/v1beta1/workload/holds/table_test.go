@@ -21,6 +21,7 @@ func TestTable_OneOrderedPair(t *testing.T) {
 		types.WaitingReasonPodGroupTerminating,
 		types.WaitingReasonNodeUnknown,
 		types.WaitingReasonSourceUnrouted,
+		types.WaitingReasonCapacityProvisioning,
 	}
 	for _, token := range facts {
 		if !takesRowFrom(token, types.WaitingReasonPaused) {
@@ -47,7 +48,7 @@ func TestTable_OneOrderedPair(t *testing.T) {
 }
 
 // TestTable_EveryTokenIsWrittenByExactlyOneAuthority: the table is the
-// one home for the six tokens, so a duplicate row — two authorities
+// one home for the seven tokens, so a duplicate row — two authorities
 // writing one token — is a precedence nobody decides.
 func TestTable_EveryTokenIsWrittenByExactlyOneAuthority(t *testing.T) {
 	seen := make(map[string]int, len(table))
@@ -92,6 +93,10 @@ func TestTable_FactHoldsRefuseATeardown(t *testing.T) {
 			types.OwnerRestart: true, types.OwnerMigrate: true,
 		},
 		types.WaitingReasonNodeUnknown: {
+			types.OwnerCreate: true, types.OwnerUpdate: true,
+			types.OwnerRestart: true, types.OwnerMigrate: true,
+		},
+		types.WaitingReasonCapacityProvisioning: {
 			types.OwnerCreate: true, types.OwnerUpdate: true,
 			types.OwnerRestart: true, types.OwnerMigrate: true,
 		},

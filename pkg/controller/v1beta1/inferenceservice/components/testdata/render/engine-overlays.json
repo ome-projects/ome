@@ -1,0 +1,103 @@
+{
+  "runners": [
+    {
+      "name": "default",
+      "size": 1,
+      "template": {
+        "metadata": {
+          "labels": {
+            "base-model-name": "model-a",
+            "base-model-size": "SMALL",
+            "base-model-type": "Serving",
+            "component": "engine",
+            "fine-tuned-serving": "false",
+            "ome.io/inferenceservice": "pool-a",
+            "serving-runtime": "runtime-a",
+            "team": "a"
+          },
+          "annotations": {
+            "example.com/owner": "team-a",
+            "ome.io/base-model-format": "safetensors",
+            "ome.io/base-model-name": "model-a",
+            "ome.io/serving-runtime": "runtime-a"
+          }
+        },
+        "spec": {
+          "volumes": [
+            {
+              "name": "model-a",
+              "persistentVolumeClaim": {
+                "claimName": "models",
+                "readOnly": true
+              }
+            },
+            {
+              "name": "model-overlay-overlay-a",
+              "persistentVolumeClaim": {
+                "claimName": "models",
+                "readOnly": true
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "ome-container",
+              "image": "example.com/serving:v1",
+              "ports": [
+                {
+                  "name": "http",
+                  "containerPort": 8080
+                }
+              ],
+              "env": [
+                {
+                  "name": "MODEL_PATH",
+                  "value": "/opt/ml/model"
+                },
+                {
+                  "name": "OVERLAY_OVERLAY_A_MODEL_PATH",
+                  "value": "/opt/ml/model-overlays/overlay-a"
+                },
+                {
+                  "name": "PARALLELISM_SIZE",
+                  "value": "2"
+                }
+              ],
+              "resources": {
+                "limits": {
+                  "example.com/gpu": "2"
+                },
+                "requests": {
+                  "example.com/gpu": "2"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "model-a",
+                  "readOnly": true,
+                  "mountPath": "/opt/ml/model",
+                  "subPath": "model-a"
+                },
+                {
+                  "name": "model-overlay-overlay-a",
+                  "readOnly": true,
+                  "mountPath": "/opt/ml/model-overlays/overlay-a",
+                  "subPath": "overlay-a"
+                }
+              ]
+            }
+          ],
+          "nodeSelector": {
+            "pool": "runtime",
+            "tier": "x"
+          }
+        }
+      }
+    }
+  ],
+  "pairingProtocol": "",
+  "excludedAnnotationKeys": [
+    "example.com/owner"
+  ],
+  "revisionHash": "e9e5ca8b"
+}

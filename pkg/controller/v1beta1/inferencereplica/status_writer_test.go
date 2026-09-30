@@ -649,6 +649,10 @@ const (
 	// directly, so a ColumnarV2 object presents no rows to it until it reads
 	// through the decoded accessor.
 	rawReaderOutsideManager = "raw reader outside the manager: stored dense rows only; a ColumnarV2 object presents no rows"
+	// storedRepresentationTransition: a watch predicate compares the stored
+	// per-Instance representation of an event's old and new objects, in
+	// either encoding, to tell that rows moved; no row is decoded or consumed.
+	storedRepresentationTransition = "watch predicate comparing the stored representation of an event's old and new objects; no row consumed"
 )
 
 type accessCounts struct {
@@ -700,7 +704,7 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "mirrorInstanceStatuses", accessCounts{reads: 4, writes: 1, readWrites: 2}, inMemoryMirror, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildPromoteCurrentRevision", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildRemoveInstance", accessCounts{reads: 1, writes: 1}, decodedObjectRows, rows)
-	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.aggregateAndWriteStatus", accessCounts{reads: 3, readWrites: 7}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.aggregateAndWriteStatus", accessCounts{reads: 3, readWrites: 8}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.reconcileHeldDeadlines", accessCounts{reads: 3, readWrites: 2}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", accessCounts{reads: 1, readWrites: 1}, inMemoryMirror, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "stagedAtPartition", read(1), decodedObjectRows, rows)
@@ -713,6 +717,9 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "Reconciler.resetInstances", accessCounts{reads: 2, readWrites: 2}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/retention.go", "Reconciler.sweepRevisions", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status_transition.go", "Reconciler.convertStoredRepresentation", read(1), decodedObjectRows, rows)
+	// The held-peer watch: the event carries the raw cached objects, and the
+	// predicate compares their stored rows as opaque values in both encodings.
+	approve("pkg/controller/v1beta1/inferencereplica/peer_watch.go", "peerCountersChanged", read(2), storedRepresentationTransition, rows, "InstanceStatusColumns")
 
 	// Break-glass repair: the only writer entry point registered with no
 	// reconciler. It installs validated replacement rows on a deep copy of
@@ -729,6 +736,7 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/reconciler.go", "buildComponentObservation", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "admittedReplicaCount", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "componentHasAdmittedInstance", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/member_admission.go", "verifiedMemberAdmission", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows+" (filters admission on a deep copy; never persists rows)", rows)
 	approve("pkg/controller/v1beta1/placement/member_resources.go", "countMemberResources", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/failed.go", "IsTerminallyFailed", read(1), decodedObjectRows, rows)
 
@@ -796,6 +804,10 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/teardown.go", "Reconciler.removeTeardownFinalizer", "Get", 1, passThroughSpecMetadata+" (finalizer removal)")
 	approve("pkg/controller/v1beta1/inferencereplica/release_held.go", "Reconciler.consumeReleaseHeldRequest", "Get", 1, passThroughSpecMetadata+" (annotation consumption)")
 	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "Reconciler.consumeResetInstancesRequest", "Get", 1, passThroughSpecMetadata+" (annotation consumption)")
+	approve("pkg/controller/v1beta1/inferencereplica/slices.go", "irExists", "List", 1, passThroughSpecMetadata+" (TPU slice owner existence by UID)")
+	approve("pkg/controller/v1beta1/inferencereplica/watches.go", "Reconciler.runtimeToReplicas", "List", 2, passThroughSpecMetadata+" (runtime watch fan-out through the reference indexes)")
+	approve("pkg/controller/v1beta1/inferencereplica/watches.go", "Reconciler.modelToReplicas", "List", 1, passThroughSpecMetadata+" (model watch fan-out through the reference index)")
+	approve("pkg/controller/v1beta1/inferencereplica/peer_watch.go", "Reconciler.heldPeerReplicasOf", "Get", 1, passThroughTopLevelStatus+" (RolloutHold of a sibling held on the peer's counters)")
 
 	// Replay harness pass-through reads.
 	approve("pkg/controller/v1beta1/workload/replay/driver.go", "driver.bumpGeneration", "Get", 1, passThroughSpecMetadata+" (replay owner generation bump)")
@@ -809,6 +821,9 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/observe.go", "observeGroupTargets", "Get", 1, passThroughTopLevelStatus+" (revision pointers and replica counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/pdb/cutover.go", "OMENativeCutoverReady", "Get", 1, passThroughTopLevelStatus+" (ready and available counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler/dispatch.go", "controlledByVerifiedModeBridge", "Get", 1, passThroughSpecMetadata+" (ownership: UID, labels, parentRef)")
+
+	// Admission pass-through reads.
+	approve("pkg/webhook/admission/isvc/inference_service_validation.go", "InferenceServiceValidator.validateNoStandaloneReplicaCollision", "Get", 1, passThroughSpecMetadata+" (standalone-name collision: parentRef)")
 
 	// Placement discovers identities before fetching bounded decoded rows.
 	approve("pkg/controller/v1beta1/placement/planned_observation.go", "Reconciler.observePlannedHome", "List", 1, passThroughSpecMetadata+" (inventory identities; each object is fetched through GetDecoded before resource accounting)")
@@ -2007,7 +2022,7 @@ func newStatusSizeIR(fixture statusSizeFixture, instances int32) *v1beta1.Infere
 			}},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: "example"},
+			ParentRef: &v1beta1.ParentReference{Name: "example"},
 			Component: v1beta1.EngineComponent,
 			Replicas:  &replicas,
 			Runners:   measurementRunners(fixture.podsPerInstance),

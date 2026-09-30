@@ -51,7 +51,7 @@ func indexInferenceReplicas(items []v1beta1.InferenceReplica) inferenceReplicaIn
 		ir := &items[i]
 		key := inferenceReplicaKey{
 			namespace: ir.Namespace,
-			parent:    ir.Spec.ParentRef.Name,
+			parent:    parentRefName(ir.Spec.ParentRef),
 			component: ir.Spec.Component,
 		}
 		index.byComponent[key] = append(index.byComponent[key], ir)
@@ -139,7 +139,7 @@ func routeWorkloadPods(
 				ownerMatched = true
 				target := inferenceReplicaKey{
 					namespace: owner.Namespace,
-					parent:    owner.Spec.ParentRef.Name,
+					parent:    parentRefName(owner.Spec.ParentRef),
 					component: owner.Spec.Component,
 				}
 				// Even a stale or malformed IR remains positive OME ownership
@@ -588,4 +588,13 @@ func invalidateInstance(component *Component, instance *Instance, reason string)
 		instance.ObservationReason = reason
 	}
 	invalidateComponent(component, reason)
+}
+
+// parentRefName is the parent InferenceService name a replica was projected
+// from; a standalone replica has none.
+func parentRefName(ref *v1beta1.ParentReference) string {
+	if ref == nil {
+		return ""
+	}
+	return ref.Name
 }

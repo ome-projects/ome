@@ -75,12 +75,18 @@ var pairingComponents = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1
 // no serving decoder yet; every serving engine then speaks a protocol no
 // serving decoder does and routing has no valid pair to place a request on.
 //
+// The target cohort is the protocol of ctx.TargetRevision, the revision the
+// Component's Instances move to in this pass — the rollback revision while a
+// rollback is pinned, else the spec target. A canary revert is therefore
+// simulated toward the stable cohort while the live spec field still names
+// the rejected protocol; the live field alone would orient it the wrong way.
+//
 // Inactive (allows) unless ALL of: the resolved group spans engine AND
-// decoder, the ISVC declares a non-empty pairing protocol, ctx.Component is
-// one of the pairing Components, and some serving instance still runs a
-// different non-empty protocol (a transition in flight). A transition to or
-// from the empty protocol never activates the gate — empty pairs with
-// anything, so every intermediate mix is routable.
+// decoder, ctx.Component is one of the pairing Components, the target
+// revision carries a non-empty pairing protocol, and some serving instance
+// still runs a different non-empty protocol (a transition in flight). A
+// transition to or from the empty protocol never activates the gate — empty
+// pairs with anything, so every intermediate mix is routable.
 //
 // When active it simulates this step's end state against authoritative IR
 // status, instance-granular (a serving instance is one with
@@ -100,8 +106,10 @@ var pairingComponents = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1
 //   - When both pairing Components are down to a single serving instance with
 //     no target-cohort capacity anywhere (the 1×1 mutual wall), denying both
 //     first movers would deadlock the rollout permanently, so the step is
-//     allowed; for surge strategies the resulting unpaired window is bounded
-//     by the peer's concurrently-approved surge.
+//     allowed. For surge strategies the drain-time check
+//     (EvaluatePairingDrain) then holds each source until the peer's target
+//     cohort serves, so admitting the first movers costs no unpaired window;
+//     a drain-first strategy has no such point and keeps the window.
 //   - When the acting Component is down to its last serving instance and the
 //     peer already serves the target cohort (the last-hop shape), the step is
 //     the acting side's final unavoidable hop and no other step can create
@@ -111,32 +119,27 @@ var pairingComponents = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1
 //     mover), and the incoming instance pairs with the peer's target
 //     capacity the moment it serves.
 //
-// Fails closed (deny, retryable reason) when IR status or a serving
-// instance's ControllerRevision cannot be read — approving a cohort-draining
-// step on unreadable protocol data is how the last pair dies silently.
+// Fails closed (deny, retryable reason) when the target revision is unknown
+// or IR status or a serving instance's ControllerRevision cannot be read —
+// approving a cohort-draining step on unreadable protocol data is how the
+// last pair dies silently.
 func (ctx GateContext) CheckPairing(strategy workloadtypes.UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (allowed bool, reason string) {
 	if ctx.ShortCircuit {
 		return true, ctx.ShortReason
 	}
-	spansEngine, spansDecoder := false, false
-	for _, c := range ctx.Group.Components {
-		switch c {
-		case v1beta1.EngineComponent:
-			spansEngine = true
-		case v1beta1.DecoderComponent:
-			spansDecoder = true
-		}
-	}
-	if !spansEngine || !spansDecoder {
+	if !groupPairsEngineAndDecoder(ctx.Group) {
 		return true, "group does not pair engine and decoder"
-	}
-	target := ctx.ISVC.Spec.RolloutPairingProtocol()
-	if target == "" {
-		return true, "no pairing protocol declared"
 	}
 	component := ctx.Component
 	if component != v1beta1.EngineComponent && component != v1beta1.DecoderComponent {
 		return true, "component does not participate in pairing"
+	}
+	target, ok, reason := ctx.targetPairingProtocol()
+	if !ok {
+		return false, reason
+	}
+	if target == "" {
+		return true, "target revision declares no pairing protocol"
 	}
 
 	// Serving instances per (Component, protocol), from authoritative IR
@@ -233,6 +236,17 @@ func (ctx GateContext) CheckPairing(strategy workloadtypes.UpdateStrategyType, i
 			target, component, proto, target)
 	}
 	return true, ""
+}
+
+// targetPairingProtocol is the cohort protocol a step of this Component
+// moves toward: the protocol of the revision its Instances are rolling to.
+// A nil TargetRevision fails closed — without the revision the unit is
+// moving to, the gate cannot tell which way the cohorts move.
+func (ctx GateContext) targetPairingProtocol() (protocol string, ok bool, reason string) {
+	if ctx.TargetRevision == nil {
+		return "", false, "pairing gate: no target revision for this step, failing closed"
+	}
+	return revision.PairingProtocolFromRevision(ctx.TargetRevision), true, ""
 }
 
 // pairableServingPairExists reports whether some serving engine and some

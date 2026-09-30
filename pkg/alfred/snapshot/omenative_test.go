@@ -489,7 +489,7 @@ func TestBuildProjectsEveryAmbiguousOwnerTargetWithoutDoubleCounting(t *testing.
 	otherISVC.Name = "other-svc"
 	otherISVC.UID = "other-isvc-uid"
 	otherIR := fixture.ir.DeepCopy()
-	otherIR.Spec.ParentRef.Name = otherISVC.Name
+	otherIR.Spec.ParentRef = &v1beta1.ParentReference{Name: otherISVC.Name}
 	otherIR.OwnerReferences[0].Name = otherISVC.Name
 	otherIR.OwnerReferences[0].UID = otherISVC.UID
 	// Deliberately retain the first IR's full name/UID identity while changing
@@ -534,7 +534,7 @@ func TestBuildProjectsOwnerTargetWithoutDeclaredOMENativeLayout(t *testing.T) {
 		{
 			name: "missing parent workload",
 			mutate: func(fixture *omeNativeFixture) {
-				fixture.ir.Spec.ParentRef.Name = "missing-svc"
+				fixture.ir.Spec.ParentRef = &v1beta1.ParentReference{Name: "missing-svc"}
 			},
 			wantISVC:  types.NamespacedName{Namespace: "prod", Name: "missing-svc"},
 			component: v1beta1.EngineComponent,
@@ -872,7 +872,7 @@ func newOMENativeFixture() *omeNativeFixture {
 			}},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: "svc"},
+			ParentRef: &v1beta1.ParentReference{Name: "svc"},
 			Component: v1beta1.EngineComponent,
 			Runners:   []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1}},
 		},

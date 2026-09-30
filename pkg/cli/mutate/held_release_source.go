@@ -85,7 +85,7 @@ func CollectHeldReleaseEvidence(ctx context.Context, client omeclient.OmeV1beta1
 		if !boundedPrivatePayload(ir) || len(ir.OwnerReferences) > 16 {
 			return HeldReleaseEvidence{}, ErrBounds
 		}
-		claims := ir.Spec.ParentRef.Name == parent.Name || ir.Labels[constants.InferenceServiceLabel] == parent.Name
+		claims := (ir.Spec.ParentRef != nil && ir.Spec.ParentRef.Name == parent.Name) || ir.Labels[constants.InferenceServiceLabel] == parent.Name
 		for _, ref := range ir.OwnerReferences {
 			if ref.UID == parent.UID && ref.Controller != nil && *ref.Controller {
 				claims = true
@@ -156,7 +156,7 @@ func CollectHeldReleaseEvidence(ctx context.Context, client omeclient.OmeV1beta1
 }
 
 func validateHeldReplicaIdentity(ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService) error {
-	if ir.Kind != "" && ir.Kind != "InferenceReplica" || ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1" || !SafeScalar(ir.Name) || len(validation.IsDNS1123Subdomain(ir.Name)) != 0 || ir.Namespace != parent.Namespace || !SafeScalar(string(ir.UID)) || !SafeScalar(ir.ResourceVersion) || ir.Spec.ParentRef.Name != parent.Name || ir.Generation <= 0 || ir.DeletionTimestamp != nil {
+	if ir.Kind != "" && ir.Kind != "InferenceReplica" || ir.APIVersion != "" && ir.APIVersion != "ome.io/v1beta1" || !SafeScalar(ir.Name) || len(validation.IsDNS1123Subdomain(ir.Name)) != 0 || ir.Namespace != parent.Namespace || !SafeScalar(string(ir.UID)) || !SafeScalar(ir.ResourceVersion) || (ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != parent.Name) || ir.Generation <= 0 || ir.DeletionTimestamp != nil {
 		return ErrHeldRelease
 	}
 	if len(ir.Annotations) > 256 || len(ir.Labels) > 256 || len(ir.Finalizers) > 64 || len(ir.OwnerReferences) > 16 || len(ir.Status.Conditions) > 64 || len(ir.Status.InstanceStatuses) > 2048 || len(ir.Status.Migrations) > 256 || !replicaPayloadBounded(ir) {

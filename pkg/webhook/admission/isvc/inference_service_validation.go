@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -28,6 +30,11 @@ import (
 type InferenceServiceValidator struct {
 	Client          client.Client
 	RuntimeSelector runtimeselector.Selector
+
+	// Reader is the live reader the standalone-replica collision check uses;
+	// a cached read could miss a replica created moments ago. Nil skips the
+	// check.
+	Reader client.Reader
 
 	// KnownPassthroughPrefixes lists the ome.io/* pass-through
 	// annotation prefixes the active Gateway-implementation translator
@@ -100,6 +107,9 @@ func (v *InferenceServiceValidator) ValidateCreate(ctx context.Context, isvc *v1
 	if err := validateMultiPodReadyPolicyNone(nil, isvc); err != nil {
 		return nil, err
 	}
+	if err := v.validateNoStandaloneReplicaCollision(ctx, isvc); err != nil {
+		return nil, err
+	}
 	warnings, err := v.validateInferenceService(ctx, isvc)
 	if err != nil {
 		return warnings, err
@@ -126,6 +136,9 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 		return nil, nil
 	}
 	if err := validateLegacyAutoscalerFieldsFromCtx(ctx); err != nil {
+		return nil, err
+	}
+	if err := validation.ValidatePlacementPolicyUpdate(&oldIsvc.Spec, &isvc.Spec); err != nil {
 		return nil, err
 	}
 	if err := validation.ValidateCoordinationUpdate(&oldIsvc.Spec, &isvc.Spec); err != nil {
@@ -158,6 +171,42 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 		return warnings, err
 	}
 	return warnings, nil
+}
+
+// validateNoStandaloneReplicaCollision rejects an InferenceService whose
+// name, or whose projected replica names, a standalone InferenceReplica
+// already uses in the namespace. With the bare name the pods and Services
+// of both would derive from the same prefix; with a projected replica's
+// name the projector would find a replica it does not control. The read is
+// live, yet an InferenceService and a standalone replica created
+// concurrently can both pass, each checked before the other is stored. A
+// failed lookup is an internal error (500), as on the replica webhook. A
+// validator without a Reader skips the check.
+func (v *InferenceServiceValidator) validateNoStandaloneReplicaCollision(ctx context.Context, isvc *v1beta1.InferenceService) error {
+	if v.Reader == nil {
+		return nil
+	}
+	candidates := []string{isvc.Name}
+	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+		candidates = append(candidates, isvc.Name+"-"+string(c))
+	}
+	for _, name := range candidates {
+		ir := &v1beta1.InferenceReplica{}
+		err := v.Reader.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: name}, ir)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return apierrors.NewInternalError(fmt.Errorf("check for a standalone InferenceReplica named %s/%s: %v", isvc.Namespace, name, err))
+		}
+		if ir.ParentName() == "" {
+			if name == isvc.Name {
+				return fmt.Errorf("a standalone InferenceReplica named %s exists in namespace %s (wait for it if it is being deleted) and its pods and Services would share names with the replicas this InferenceService projects; choose another name", name, isvc.Namespace)
+			}
+			return fmt.Errorf("a standalone InferenceReplica named %s exists in namespace %s (wait for it if it is being deleted) and this InferenceService would project a replica of that name; choose another name", name, isvc.Namespace)
+		}
+	}
+	return nil
 }
 
 // validateAddedMigrationRequests validates every migration-request
@@ -353,7 +402,7 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 	if err := validateComponentPodDisruptionBudgets(isvc); err != nil {
 		return allWarnings, err
 	}
-	if err := validation.ValidatePlacement(&isvc.Spec); err != nil {
+	if err := validation.ValidatePlacementIntent(isvc); err != nil {
 		return allWarnings, err
 	}
 	if err := validation.ValidateRouting(&isvc.Spec); err != nil {

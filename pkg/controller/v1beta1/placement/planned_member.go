@@ -23,29 +23,34 @@ type identifiedClusterClients interface {
 // plannedClient binds both the registration and transport to the accepted UID.
 // A connection selected by name alone cannot authorize an allocation mutation.
 func (r *Reconciler) plannedClient(ctx context.Context, name string, uid types.UID) (client.WithWatch, error) {
+	direct, _, err := r.plannedTransport(ctx, name, uid)
+	return direct, err
+}
+
+func (r *Reconciler) plannedTransport(ctx context.Context, name string, uid types.UID) (client.WithWatch, workloadcluster.SelectivelyCachingClient, error) {
 	if r.APIReader == nil || uid == "" {
-		return nil, fmt.Errorf("planned placement requires a direct reader and cluster UID")
+		return nil, nil, fmt.Errorf("planned placement requires a direct reader and cluster UID")
 	}
 	registration := &v1beta1.WorkloadCluster{}
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: name}, registration); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if registration.UID != uid {
-		return nil, fmt.Errorf("cluster %q registration identity changed", name)
+		return nil, nil, fmt.Errorf("cluster %q registration identity changed", name)
 	}
 	identified, ok := r.Clusters.(identifiedClusterClients)
 	if !ok {
-		return nil, fmt.Errorf("placement transport cannot verify cluster identity")
+		return nil, nil, fmt.Errorf("placement transport cannot verify cluster identity")
 	}
 	remote, ok := identified.ClientForUID(name, uid)
 	if !ok {
-		return nil, fmt.Errorf("cluster %q has no connection for its accepted UID", name)
+		return nil, nil, fmt.Errorf("cluster %q has no connection for its accepted UID", name)
 	}
 	direct, ok := workloadcluster.DirectClient(remote)
 	if !ok {
-		return nil, fmt.Errorf("cluster %q transport cannot provide direct observations", name)
+		return nil, nil, fmt.Errorf("cluster %q transport cannot provide direct observations", name)
 	}
-	return direct, nil
+	return direct, remote, nil
 }
 
 func (r *Reconciler) checkPlanCurrent(ctx context.Context, source *v1beta1.InferenceService) error {
@@ -63,15 +68,25 @@ func (r *Reconciler) checkPlanCurrent(ctx context.Context, source *v1beta1.Infer
 	if !plan.SameSnapshot(source, live) {
 		return plan.ErrStaleSnapshot
 	}
+	if !plan.SameAllocation(source, live) {
+		return plan.ErrSchemaUnsupported
+	}
 	return nil
 }
 
 func executionPolicy(source *v1beta1.InferenceService, assignment *v1beta1.CandidateAllocationStatus) *v1beta1.PlacementExecutionPolicy {
 	accepted := source.Status.Placement.Plan
-	return &v1beta1.PlacementExecutionPolicy{
+	policy := &v1beta1.PlacementExecutionPolicy{
 		PlanID: accepted.ID, Revision: accepted.Revision, SourceUID: source.UID,
 		ClusterUID: assignment.ClusterUID, PauseSurge: accepted.PauseSurge,
 	}
+	if assignment.Capacity != nil {
+		policy.Demand = assignment.Capacity.DemandContract.DeepCopy()
+	}
+	if assignment.CurrentHome != nil {
+		policy.ReplicaFloors = assignment.CurrentHome.DeepCopy().ReplicaFloors
+	}
+	return policy
 }
 
 func checkPlannedAssignment(source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) error {
@@ -82,6 +97,13 @@ func checkPlannedAssignment(source *v1beta1.InferenceService, candidate v1beta1.
 		}
 		if found || candidate.Allocation == nil || !equality.Semantic.DeepEqual(accepted.Allocation, candidate.Allocation) {
 			return fmt.Errorf("member assignment does not match persisted allocation")
+		}
+		if accepted.Allocation.Capacity != nil {
+			if _, err := plan.CanonicalCapacity(accepted.Allocation.Capacity); err != nil {
+				return err
+			}
+		} else if placementMode(source) == v1beta1.PlacementModeSplitByCapacity && accepted.Allocation.DesiredReplicas > 0 {
+			return fmt.Errorf("positive capacity allocation requires persisted demand authority")
 		}
 		found = true
 	}
@@ -94,6 +116,10 @@ func checkPlannedAssignment(source *v1beta1.InferenceService, candidate v1beta1.
 // placePlannedOn stamps member execution authority before any component can
 // acknowledge it. The member's later IR observation is the application signal.
 func (r *Reconciler) placePlannedOn(ctx context.Context, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) error {
+	return r.placePlannedMember(ctx, source, candidate, false)
+}
+
+func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement, existingOnly bool) error {
 	if err := r.checkPlanCurrent(ctx, source); err != nil {
 		return err
 	}
@@ -101,12 +127,16 @@ func (r *Reconciler) placePlannedOn(ctx context.Context, source *v1beta1.Inferen
 		return err
 	}
 	assignment := candidate.Allocation
-	if assignment == nil || assignment.CurrentReplicas <= 0 {
-		return fmt.Errorf("positive planned assignment is required for member creation")
+	if assignment == nil || assignment.CurrentReplicas < 0 || (assignment.CurrentReplicas == 0 && (assignment.CurrentHome == nil || assignment.DrainRequested)) {
+		return fmt.Errorf("member creation requires a positive allocation or an active full home")
 	}
-	cl, err := r.plannedClient(ctx, candidate.Cluster, assignment.ClusterUID)
+	cl, transport, err := r.plannedTransport(ctx, candidate.Cluster, assignment.ClusterUID)
 	if err != nil {
 		return err
+	}
+	ctx = context.WithValue(ctx, backendTargetKey{}, backendTarget{cluster: candidate.Cluster, uid: assignment.ClusterUID, transport: transport})
+	if assignment.Capacity != nil && assignment.DesiredReplicas == 0 {
+		return r.retireCapacityFloor(ctx, cl, source, assignment)
 	}
 	desired, err := r.derivedFor(source)
 	if err != nil {
@@ -116,7 +146,14 @@ func (r *Reconciler) placePlannedOn(ctx context.Context, source *v1beta1.Inferen
 	if source.Spec.Placement.Split != nil {
 		ceiling = source.Spec.Placement.Split.MaxReplicasPerCluster
 	}
-	setDerivedReplicas(desired, assignment.CurrentReplicas, ceiling)
+	if assignment.CurrentHome == nil {
+		setPlannedReplicas(desired, assignment.CurrentReplicas, ceiling)
+	} else if assignment.CurrentHome.InputDigest != source.Status.Placement.Plan.InputDigest || !equality.Semantic.DeepEqual(assignment.CurrentHome, assignment.DesiredHome) {
+		return r.syncPlannedPolicy(ctx, source, candidate)
+	}
+	if err := r.checkCapacityApplication(ctx, cl, source, desired, assignment); err != nil {
+		return err
+	}
 	policy := executionPolicy(source, assignment)
 	raw, err := protocol.Encode(policy)
 	if err != nil {
@@ -129,7 +166,98 @@ func (r *Reconciler) placePlannedOn(ctx context.Context, source *v1beta1.Inferen
 	if err := r.checkPlanCurrent(ctx, source); err != nil {
 		return err
 	}
-	return r.applyDerived(ctx, candidate.Cluster, cl, source, desired)
+	return r.applyDerived(ctx, candidate.Cluster, cl, source, desired, existingOnly)
+}
+
+// setPlannedReplicas preserves an omitted maximum for member runtime inheritance.
+// A retained floor can exceed a newly reduced cap until its replacement serves.
+func setPlannedReplicas(member *v1beta1.InferenceService, replicas, ceiling int32) {
+	apply := func(component *v1beta1.ComponentExtensionSpec) {
+		floor := int(replicas)
+		component.MinReplicas = &floor
+		if ceiling > 0 {
+			component.MaxReplicas = int(max(ceiling, replicas))
+		} else if component.MaxReplicas > 0 {
+			component.MaxReplicas = max(component.MaxReplicas, floor)
+		}
+	}
+	if member.Spec.Engine != nil {
+		apply(&member.Spec.Engine.ComponentExtensionSpec)
+	}
+	if member.Spec.Decoder != nil {
+		apply(&member.Spec.Decoder.ComponentExtensionSpec)
+	}
+}
+
+// syncPlannedPolicy updates coordination authority without a source refresh.
+// Paused full-policy homes retain their accepted floors even when member
+// runtime or operator defaults change during the transition.
+func (r *Reconciler) syncPlannedPolicy(ctx context.Context, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) error {
+	if err := r.checkPlanCurrent(ctx, source); err != nil {
+		return err
+	}
+	if err := checkPlannedAssignment(source, candidate); err != nil {
+		return err
+	}
+	policy := executionPolicy(source, candidate.Allocation)
+	cl, err := r.plannedClient(ctx, candidate.Cluster, candidate.Allocation.ClusterUID)
+	if err != nil {
+		return err
+	}
+	member := &v1beta1.InferenceService{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(source), member); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !isOurDerived(member, source) || member.UID == "" || !member.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("member identity cannot authorize a surge pause")
+	}
+	previous, err := protocol.FromDerived(member)
+	if err != nil {
+		return err
+	}
+	if err := protocol.Authorize(previous, policy); err != nil {
+		return err
+	}
+	raw, err := protocol.Encode(policy)
+	if err != nil {
+		return err
+	}
+	base := member.DeepCopy()
+	if policy.PauseSurge && candidate.Allocation.CurrentHome != nil {
+		for _, floor := range candidate.Allocation.CurrentHome.ReplicaFloors {
+			var component *v1beta1.ComponentExtensionSpec
+			switch floor.Component {
+			case v1beta1.EngineComponent:
+				if member.Spec.Engine != nil {
+					component = &member.Spec.Engine.ComponentExtensionSpec
+				}
+			case v1beta1.DecoderComponent:
+				if member.Spec.Decoder != nil {
+					component = &member.Spec.Decoder.ComponentExtensionSpec
+				}
+			case v1beta1.RouterComponent:
+				if member.Spec.Router != nil {
+					component = &member.Spec.Router.ComponentExtensionSpec
+				}
+			}
+			if component == nil {
+				return fmt.Errorf("standing home is missing its accepted %s component", floor.Component)
+			}
+			value := int(floor.Replicas)
+			component.MinReplicas = &value
+		}
+	}
+	if member.Annotations == nil {
+		member.Annotations = map[string]string{}
+	}
+	member.Annotations[constants.PlacementExecution] = raw
+	if equality.Semantic.DeepEqual(base.Spec, member.Spec) && base.Annotations[constants.PlacementExecution] == raw {
+		return nil
+	}
+	if err := r.checkPlanCurrent(ctx, source); err != nil {
+		return err
+	}
+	return cl.Patch(ctx, member, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
 // deletePlannedOn requires independently verified drain and rechecks member

@@ -11,16 +11,17 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 func newPVCBaseComponent(uri string) *BaseComponentFields {
-	return &BaseComponentFields{
+	return &BaseComponentFields{Piece: render.Piece{
 		BaseModel: &v1beta1.BaseModelSpec{
 			Storage: &v1beta1.StorageSpec{StorageUri: ptr.To(uri)},
 		},
 		BaseModelMeta: &metav1.ObjectMeta{Name: "llama-7b", Namespace: "models"},
 		Log:           ctrl.Log.WithName("test"),
-	}
+	}}
 }
 
 func TestUpdatePodSpecVolumes_PVC(t *testing.T) {
@@ -53,14 +54,14 @@ func TestUpdatePodSpecVolumes_PVC_ClusterScoped(t *testing.T) {
 func TestUpdatePodSpecVolumes_HostPath_Unchanged(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 	path := "/mnt/data/models/llama"
-	b := &BaseComponentFields{
+	b := &BaseComponentFields{Piece: render.Piece{
 		BaseModel: &v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{
 			StorageUri: ptr.To("oci://n/ns/b/bucket/o/path"),
 			Path:       &path,
 		}},
 		BaseModelMeta: &metav1.ObjectMeta{Name: "llama-7b", Namespace: "models"},
 		Log:           ctrl.Log.WithName("test"),
-	}
+	}}
 
 	podSpec := &v1.PodSpec{}
 	UpdatePodSpecVolumes(b, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})

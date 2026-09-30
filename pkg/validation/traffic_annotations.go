@@ -29,6 +29,7 @@ const (
 	kindBool
 	kindRetryOnList
 	kindPromoteTarget // canary revision hash
+	kindResumeTarget  // canary revision hash, optionally "<component>=<hash>"
 	kindTrafficDrain  // versioned JSON map of manual route-arm holds
 )
 
@@ -63,6 +64,16 @@ var trafficAnnotationKinds = map[string]trafficAnnotationKind{
 	constants.RevisionHistoryLimitAnnotation:   kindPositiveInt,
 	constants.RolloutPromoteAnnotation:         kindPromoteTarget,
 	constants.RolloutRollbackAnnotation:        kindBool,
+	constants.RolloutResumeAnnotation:          kindResumeTarget,
+}
+
+// resumableComponents are the Components a "<component>=<hash>"
+// ome.io/rollout-resume scope may name — the ones that carry a canary
+// rollout phase.
+var resumableComponents = map[string]struct{}{
+	string(v1beta1.EngineComponent):  {},
+	string(v1beta1.DecoderComponent): {},
+	string(v1beta1.RouterComponent):  {},
 }
 
 // validRetryOnTokens enumerates the documented Envoy retry-on
@@ -189,6 +200,19 @@ func validateAnnotationValue(key, value string, kind trafficAnnotationKind) erro
 		// nothing else — any other value would sit on the object doing nothing.
 		if !isRevisionHashToken(value) {
 			return fmt.Errorf("annotation %q value %q must be the canary revision hash to promote, copied from status.canary.canaryRevisionHash (lowercase alphanumeric, at least 6 chars); \"full\" is not a supported promotion target (InvalidRolloutPromoteTarget)", key, value)
+		}
+	case kindResumeTarget:
+		// Either a bare canary revision hash or "<component>=<hash>". The
+		// executor matches the hash against the parked canary revision, so
+		// anything else would sit on the object doing nothing.
+		comp, hash, scoped := strings.Cut(value, "=")
+		if !scoped {
+			hash = value
+		} else if _, ok := resumableComponents[comp]; !ok {
+			return fmt.Errorf("annotation %q scope %q is not a Component that carries a canary rollout phase; use one of engine, decoder, router (InvalidRolloutResumeTarget)", key, comp)
+		}
+		if !isRevisionHashToken(hash) {
+			return fmt.Errorf("annotation %q value %q must be the parked canary revision hash, copied from status.components.<component>.canary.canaryRevisionHash, optionally scoped as \"<component>=<hash>\" (lowercase alphanumeric, at least 6 chars) (InvalidRolloutResumeTarget)", key, value)
 		}
 	case kindTrafficDrain:
 		if _, err := trafficdrain.Parse(value); err != nil {

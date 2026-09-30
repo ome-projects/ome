@@ -122,6 +122,11 @@ var (
 	RDMAProfileAnnotationKey              = "rdma.ome.io/profile"
 	RDMAContainerNameAnnotationKey        = "rdma.ome.io/container-name"
 
+	// TPUSliceProvisioningAnnotationKey set to "true" opts an
+	// InferenceService's pods in to TPU slices the controller provisions
+	// for them on provision-only node pools.
+	TPUSliceProvisioningAnnotationKey = OMEAPIGroupName + "/tpu-slice-provisioning"
+
 	// Runtime profile injection — opt-in profiles that factor out
 	// repetitive ServingRuntime YAML (probes, /dev/shm, prometheus
 	// scrape annotations). Each is gated on its own profile annotation;
@@ -196,13 +201,10 @@ var (
 	IngressSharedHostPrefix   = OMEAPIGroupName + "/ingress-shared-host-prefix"
 	IngressAdditionalGateways = OMEAPIGroupName + "/ingress-additional-gateways"
 
-	// InferenceReplica is a controller-only CRD: the validating webhook
-	// rejects direct user writes unless this annotation is set to "true".
-	// The ISVC controller (and only the ISVC controller) stamps the
-	// annotation on every Create / Update of an InferenceReplica it owns.
-	// Convention enforcement, not a security boundary — RBAC restricting
-	// write on inferencereplicas to the OME ServiceAccount is the actual
-	// guard.
+	// InferenceReplicaControllerWriteAnnotationKey marks an InferenceReplica
+	// the InferenceService controller projects. The admission webhook reads
+	// it only when no controller identity is configured; RBAC and the
+	// configured identity are the boundary.
 	InferenceReplicaControllerWriteAnnotationKey = OMEAPIGroupName + "/controller-write"
 	InferenceReplicaControllerWriteAnnotationVal = "true"
 

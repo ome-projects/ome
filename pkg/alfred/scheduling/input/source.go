@@ -200,7 +200,7 @@ func resolveSource(s *Snapshot, source Source) (*sourceState, error) {
 
 	for i := range s.InferenceReplicas {
 		candidate := &s.InferenceReplicas[i]
-		if candidate.Namespace == source.Namespace && candidate.Spec.ParentRef.Name == source.InferenceService && candidate.Spec.Component == source.Component {
+		if candidate.Namespace == source.Namespace && (candidate.Spec.ParentRef != nil && candidate.Spec.ParentRef.Name == source.InferenceService) && candidate.Spec.Component == source.Component {
 			if state.ir != nil {
 				return nil, fmt.Errorf("source InferenceReplica is ambiguous")
 			}

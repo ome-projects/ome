@@ -1,6 +1,8 @@
 package plan
 
 import (
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +33,14 @@ func TestPlanIdentity(t *testing.T) {
 		{name: "source incarnation", mutate: func(s *v1beta1.InferenceService, _ *Proposal) { s.UID = "source-b" }},
 		{name: "source generation", mutate: func(s *v1beta1.InferenceService, _ *Proposal) { s.Generation++ }},
 		{name: "resolved demand", mutate: func(_ *v1beta1.InferenceService, p *Proposal) {
-			p.Assignments["member-a"].Capacity.DemandFingerprint = "demand-b"
+			p.Assignments["member-a"].Capacity.DemandFingerprint = strings.Repeat("d", 64)
+			p.Assignments["member-a"].Capacity.DemandContract.Fingerprint = strings.Repeat("d", 64)
+		}},
+		{name: "component order", unchanged: true, mutate: func(_ *v1beta1.InferenceService, p *Proposal) {
+			slices.Reverse(p.Assignments["member-a"].Capacity.DemandContract.Components)
+		}},
+		{name: "component rendering", mutate: func(_ *v1beta1.InferenceService, p *Proposal) {
+			p.Assignments["member-a"].Capacity.DemandContract.Components[0].RenderingHash = strings.Repeat("d", 64)
 		}},
 		{name: "hardware", mutate: func(_ *v1beta1.InferenceService, p *Proposal) {
 			a := p.Assignments["member-a"]
@@ -107,6 +116,13 @@ func TestInvalidProposal(t *testing.T) {
 		{name: "negative term", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) { a.MatchingTerms = []int32{-1} }},
 		{name: "duplicate term", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) { a.MatchingTerms = []int32{1, 1} }},
 		{name: "missing demand fingerprint", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) { a.Capacity.DemandFingerprint = "" }},
+		{name: "missing rendering contract", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) { a.Capacity.DemandContract = nil }},
+		{name: "mismatched rendering contract", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) {
+			a.Capacity.DemandContract.Fingerprint = strings.Repeat("d", 64)
+		}},
+		{name: "invalid rendering hash", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) {
+			a.Capacity.DemandContract.Components[0].RenderingHash = "invalid"
+		}},
 		{name: "missing pool evidence", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) { a.Capacity.Pools = nil }},
 		{name: "incomplete attribution", mutate: func(_ *Proposal, a *v1beta1.CandidateAllocationStatus) {
 			a.Capacity.Pools[0].Attribution.Complete = false

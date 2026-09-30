@@ -50,12 +50,16 @@ func TestReconcileSplitMemberKeepsConcreteReplicaPolicy(t *testing.T) {
 	member.UID = "member-uid"
 	member.Labels = map[string]string{PlacementOriginLabel: string(source.UID), "member-label": "keep"}
 	require.NoError(t, worker.Create(ctx, member))
-	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
+	clusters := splitTestClusters{fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"cluster-a": workloadcluster.NewNeverCachingClient(worker),
-	}}
+	}}}
+	source.Status.Placement = &v1beta1.PlacementStatus{
+		Plan:       &v1beta1.PlacementPlanStatus{ID: "plan-a", Revision: 1, SourceUID: source.UID, ObservedGeneration: source.Generation},
+		Candidates: []v1beta1.CandidatePlacement{{Cluster: "cluster-a", Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: "cluster-a-uid", CurrentReplicas: 4, DesiredReplicas: 4}}},
+	}
 	r, cp := newPlacer(scheme, clusters, source, readyWC("cluster-a", map[string]string{"accelerator": "test"}))
 	for range 2 {
-		_, err := r.Reconcile(ctx, req())
+		err := r.placePlannedOn(ctx, source, source.Status.Placement.Candidates[0])
 		require.NoError(t, err)
 		got := &v1beta1.InferenceService{}
 		require.NoError(t, worker.Get(ctx, req().NamespacedName, got))

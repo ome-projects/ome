@@ -115,7 +115,7 @@ func predictionScenario(t *testing.T, gang bool) (*snapshot.ClusterSnapshot, *pr
 	podSpec := corev1.PodSpec{SchedulerName: "default-scheduler", Containers: []corev1.Container{{Name: "model", Image: "example.invalid/model:v1",
 		Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}}}}}
 	ir := &v1beta1.InferenceReplica{ObjectMeta: meta("a-engine", "ir-uid"),
-		Spec: v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: "a"}, Component: v1beta1.EngineComponent,
+		Spec: v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: "a"}, Component: v1beta1.EngineComponent,
 			Runners: []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1, Template: corev1.PodTemplateSpec{Spec: podSpec}}}},
 		Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 1, CurrentRevision: "a-engine-rev-a", UpdateRevision: "a-engine-rev-a",
 			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,

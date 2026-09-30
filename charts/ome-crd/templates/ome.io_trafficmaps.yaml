@@ -128,6 +128,7 @@ spec:
                 - Single
                 - All
                 - Split
+                - SplitByCapacity
                 type: string
               observedISVCGeneration:
                 format: int64

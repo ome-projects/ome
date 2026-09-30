@@ -94,7 +94,9 @@ func TestScaleExactIRAndScaleRefusalMatrix(t *testing.T) {
 		{"duplicate controller", func(r *v1beta1.InferenceReplica, _ *autoscalingv1.Scale) {
 			r.OwnerReferences = append(r.OwnerReferences, r.OwnerReferences[0])
 		}},
-		{"parent mismatch", func(r *v1beta1.InferenceReplica, _ *autoscalingv1.Scale) { r.Spec.ParentRef.Name = "other" }},
+		{"parent mismatch", func(r *v1beta1.InferenceReplica, _ *autoscalingv1.Scale) {
+			r.Spec.ParentRef = &v1beta1.ParentReference{Name: "other"}
+		}},
 		{"component mismatch", func(r *v1beta1.InferenceReplica, _ *autoscalingv1.Scale) { r.Spec.Component = v1beta1.DecoderComponent }},
 		{"missing stamp", func(r *v1beta1.InferenceReplica, _ *autoscalingv1.Scale) { r.Annotations = nil }},
 		{"stale generation", func(r *v1beta1.InferenceReplica, _ *autoscalingv1.Scale) { r.Status.ObservedGeneration-- }},

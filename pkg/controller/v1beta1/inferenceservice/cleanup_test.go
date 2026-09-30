@@ -263,7 +263,7 @@ func createInferenceReplica(name, namespace, isvcName, uid string, component v1b
 			},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: isvcName},
+			ParentRef: &v1beta1.ParentReference{Name: isvcName},
 			Component: component,
 		},
 	}

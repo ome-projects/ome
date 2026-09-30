@@ -49,7 +49,7 @@ func liveIR(parentName, namespace string, replicas int32) *v1beta1.InferenceRepl
 			},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: parentName},
+			ParentRef: &v1beta1.ParentReference{Name: parentName},
 			Component: v1beta1.EngineComponent,
 		},
 		Status: v1beta1.InferenceReplicaStatus{
@@ -526,7 +526,7 @@ func TestAggregateIRStatus_MultiComponent_EmitsBothConditions(t *testing.T) {
 			},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: "llama"},
+			ParentRef: &v1beta1.ParentReference{Name: "llama"},
 			Component: v1beta1.DecoderComponent,
 		},
 		Status: v1beta1.InferenceReplicaStatus{

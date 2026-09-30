@@ -46,6 +46,16 @@ rules:
   - patch
   - update
 - apiGroups:
+  - accelerator.gke.io
+  resources:
+  - slices
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - admissionregistration.k8s.io
   resources:
   - mutatingwebhookconfigurations
@@ -71,6 +81,12 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - selfsubjectreviews
+  verbs:
+  - create
 - apiGroups:
   - autoscaling
   resources:
@@ -237,6 +253,12 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - node.k8s.io
+  resources:
+  - runtimeclasses
+  verbs:
+  - get
 - apiGroups:
   - ome.io
   resources:

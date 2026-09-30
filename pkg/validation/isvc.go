@@ -925,7 +925,7 @@ func ValidateAutoscalerPolicyRefs(isvc *v1beta1.InferenceService, featureEnabled
 }
 
 // AutoscalerPolicySplitCeilingWarning returns a webhook warning (never a
-// rejection) when spec.placement.mode=Split, at least one Component
+// rejection) when placement splits replicas, at least one Component
 // references an AutoscalerPolicy, and
 // spec.placement.split.maxReplicasPerCluster is unset or zero. Policy
 // templates render against each home's derived replica bounds; without a
@@ -933,7 +933,7 @@ func ValidateAutoscalerPolicyRefs(isvc *v1beta1.InferenceService, featureEnabled
 // one home can fabricate the whole fleet's count. Empty string when the
 // combination is absent.
 func AutoscalerPolicySplitCeilingWarning(isvc *v1beta1.InferenceService) string {
-	if isvc == nil || isvc.Spec.Placement == nil || isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplit {
+	if isvc == nil || isvc.Spec.Placement == nil || (isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplit && isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplitByCapacity) {
 		return ""
 	}
 	if s := isvc.Spec.Placement.Split; s != nil && s.MaxReplicasPerCluster > 0 {
@@ -947,8 +947,8 @@ func AutoscalerPolicySplitCeilingWarning(isvc *v1beta1.InferenceService) string 
 		return ""
 	}
 	return fmt.Sprintf(
-		"spec.placement.mode=Split with autoscalerPolicyRef on %s but spec.placement.split.maxReplicasPerCluster is unset; "+
+		"spec.placement.mode=%s with autoscalerPolicyRef on %s but spec.placement.split.maxReplicasPerCluster is unset; "+
 			"policy templates render against each home's derived bounds, and without a per-cluster cap that ceiling is unbounded (%s)",
-		strings.Join(referencing, ", "), v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling,
+		isvc.Spec.Placement.Mode, strings.Join(referencing, ", "), v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling,
 	)
 }

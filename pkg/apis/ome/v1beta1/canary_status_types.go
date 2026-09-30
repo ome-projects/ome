@@ -94,6 +94,22 @@ type CanaryStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	MetricResults []AnalysisMetricResult `json:"metricResults,omitempty"`
+
+	// CapacityWaitSince is when the current step's capacity gate became unmet.
+	// The ready timeout is measured from here and never from the step's soak
+	// anchor, so a long soak cannot spend the capacity budget and a capacity
+	// dip cannot restart the soak. Cleared once the step's capacity is met.
+	// +optional
+	CapacityWaitSince *metav1.Time `json:"capacityWaitSince,omitempty"`
+
+	// Failed records that the canary is parked at CurrentStep: the capacity
+	// gate stayed unmet past the ready timeout, analysis stayed inconclusive
+	// past the stall timeout, or a rollback found no stable revision to
+	// return to. While set the step machine does not run, the phase reads
+	// Failed and the stable revision keeps serving. Cleared by a re-arm
+	// toward a new target and by a rollback request.
+	// +optional
+	Failed *CanaryFailure `json:"failed,omitempty"`
 }
 
 // AnalysisMetricResult is the last observed evaluation of one AnalysisMetric.
@@ -129,3 +145,29 @@ type AnalysisMetricResult struct {
 	// +optional
 	Time *metav1.Time `json:"time,omitempty"`
 }
+
+// CanaryFailure is why and when a canary parked.
+type CanaryFailure struct {
+	// Reason names the gate that gave up.
+	// +kubebuilder:validation:Enum=CapacityTimeout;AnalysisStalled;StableRevisionMissing
+	Reason CanaryFailureReason `json:"reason"`
+
+	// Time is when the canary parked.
+	// +optional
+	Time *metav1.Time `json:"time,omitempty"`
+}
+
+// CanaryFailureReason enumerates why a canary parked Failed.
+type CanaryFailureReason string
+
+const (
+	// CanaryFailureCapacityTimeout: the step's canary capacity did not become
+	// Ready within the ready timeout.
+	CanaryFailureCapacityTimeout CanaryFailureReason = "CapacityTimeout"
+	// CanaryFailureAnalysisStalled: analysis produced no conclusive sample
+	// within the stall timeout.
+	CanaryFailureAnalysisStalled CanaryFailureReason = "AnalysisStalled"
+	// CanaryFailureStableRevisionMissing: a rollback found no retained
+	// ControllerRevision for the stable revision to point the workload at.
+	CanaryFailureStableRevisionMissing CanaryFailureReason = "StableRevisionMissing"
+)

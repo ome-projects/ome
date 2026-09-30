@@ -60,7 +60,7 @@ func TestQuota_ReportsTheRecordedRefusal(t *testing.T) {
 		if Enters(token, token) {
 			t.Error("a row already reporting the wait does not enter it again")
 		}
-		for _, fact := range []string{types.WaitingReasonUnschedulable, types.WaitingReasonNodeUnknown, types.WaitingReasonPodGroupTerminating, types.WaitingReasonSourceUnrouted} {
+		for _, fact := range []string{types.WaitingReasonUnschedulable, types.WaitingReasonNodeUnknown, types.WaitingReasonPodGroupTerminating, types.WaitingReasonSourceUnrouted, types.WaitingReasonCapacityProvisioning} {
 			if Enters(token, fact) {
 				t.Errorf("a row reporting %s keeps that report; the refusal is recorded, not announced", fact)
 			}

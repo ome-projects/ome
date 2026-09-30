@@ -264,6 +264,44 @@ func TestTransitionWaitsForEligibilityAndAppliedTargets(t *testing.T) {
 	require.False(t, advance(t, in).Complete, "a member must acknowledge its persisted request")
 }
 
+func TestTransitionResumedHomeRequiresServingEvidence(t *testing.T) {
+	for _, planner := range []struct {
+		name    string
+		advance func(Transition) (Step, error)
+	}{
+		{name: "replica steps", advance: Advance},
+		{name: "whole homes", advance: AdvanceWholeHomes},
+	} {
+		t.Run(planner.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name    string
+				applied bool
+				routed  bool
+				want    Step
+			}{
+				{name: "awaiting publication", applied: true,
+					want: Step{Targets: map[string]int32{"a": 4, "b": 4}, Reason: "ReplacementNotReady"}},
+				{name: "awaiting application", routed: true,
+					want: Step{Targets: map[string]int32{"a": 4, "b": 4}, Reason: "ReplacementNotReady"}},
+				{name: "verified serving", applied: true, routed: true,
+					want: Step{Targets: map[string]int32{"a": 4, "b": 4}, Drain: []string{"b"}, Reason: "AwaitingMemberConvergence"}},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					in := moving()
+					in.Current["b"], in.Homes["b"] = 4, serving(4)
+					in.Desired = Plan{Targets: map[string]int32{"a": 4}}
+					in.Homes["a"] = Home{Known: true, Applied: tt.applied, Routable: tt.routed, Ready: 4, Occupied: 4}
+					got, err := planner.advance(in)
+					require.NoError(t, err)
+					if diff := cmp.Diff(tt.want, got); diff != "" {
+						t.Fatalf("step (-want +got):\n%s", diff)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestTransitionAccountsForUnplannedOccupancy(t *testing.T) {
 	in := moving()
 	in.Homes["c"] = serving(1)
@@ -324,12 +362,22 @@ func TestTransitionRejectsInvalidAccounting(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			in := moving()
-			tt.change(&in)
-			got, err := Advance(in)
-			require.Error(t, err)
-			if diff := cmp.Diff(Step{}, got); diff != "" {
-				t.Fatalf("invalid accounting returned a step (-want +got):\n%s", diff)
+			for _, planner := range []struct {
+				name    string
+				advance func(Transition) (Step, error)
+			}{
+				{name: "replica steps", advance: Advance},
+				{name: "whole homes", advance: AdvanceWholeHomes},
+			} {
+				t.Run(planner.name, func(t *testing.T) {
+					in := moving()
+					tt.change(&in)
+					got, err := planner.advance(in)
+					require.Error(t, err)
+					if diff := cmp.Diff(Step{}, got); diff != "" {
+						t.Fatalf("invalid accounting returned a step (-want +got):\n%s", diff)
+					}
+				})
 			}
 		})
 	}

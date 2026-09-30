@@ -1,9 +1,11 @@
 package validation
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -274,4 +276,17 @@ func TestAutoscalerPolicySplitCeilingWarning(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestAutoscalerCeilingWarningSplitModes(t *testing.T) {
+	for _, mode := range []v1beta1.PlacementMode{v1beta1.PlacementModeSplit, v1beta1.PlacementModeSplitByCapacity} {
+		t.Run(string(mode), func(t *testing.T) {
+			isvc := isvcWithPolicyRefs(&v1beta1.AutoscalerPolicyRef{Name: "request-activity-v1"}, nil, nil)
+			isvc.Spec.Placement = &v1beta1.PlacementSpec{Mode: mode}
+			want := fmt.Sprintf("spec.placement.mode=%s with autoscalerPolicyRef on engine but spec.placement.split.maxReplicasPerCluster is unset; policy templates render against each home's derived bounds, and without a per-cluster cap that ceiling is unbounded (%s)", mode, v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling)
+			if diff := cmp.Diff(want, AutoscalerPolicySplitCeilingWarning(isvc)); diff != "" {
+				t.Error(diff)
+			}
+		})
+	}
 }

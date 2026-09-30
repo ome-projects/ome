@@ -2,13 +2,9 @@ package components
 
 import (
 	"context"
-	"fmt"
 	"maps"
-	"path/filepath"
-	"strconv"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -23,7 +19,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative"
@@ -32,11 +27,18 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
-	"sigs.k8s.io/ome/pkg/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
-// BaseComponentFields contains common fields for all components
+// BaseComponentFields contains common fields for all components. The
+// embedded render.Piece holds the rendering inputs (model, runtime,
+// accelerator class, config, fine-tuned weights); the rest is the
+// reconciliation wiring the pod renderers never read.
 type BaseComponentFields struct {
+	render.Piece
+
+	// Client serves the reconcilers; Piece.Client is the reader the render
+	// helpers use, and both are set from the same deps client.
 	Client    client.Client
 	Clientset kubernetes.Interface
 	// APIReader is the live (uncached) reader, typically mgr.GetAPIReader().
@@ -58,26 +60,9 @@ type BaseComponentFields struct {
 	// installed. Currently unread on the ISVC side — the projected IR
 	// carries the flag and the IR controller consults it. Other
 	// deployment modes (Raw / MultiNode / PD) ignore this field.
-	GangSchedulingAvailable           bool
-	Scheme                            *runtime.Scheme
-	InferenceServiceConfig            *controllerconfig.InferenceServicesConfig
-	DeploymentMode                    constants.DeploymentModeType
-	BaseModel                         *v1beta1.BaseModelSpec
-	BaseModelMeta                     *metav1.ObjectMeta
-	Runtime                           *v1beta1.ServingRuntimeSpec
-	RuntimeName                       string
-	AcceleratorClass                  *v1beta1.AcceleratorClassSpec
-	AcceleratorClassName              string
-	FineTunedServing                  bool
-	FineTunedServingWithMergedWeights bool
-	FineTunedWeights                  []*v1beta1.FineTunedWeight
-	StatusManager                     *status.StatusReconciler
-	Log                               logr.Logger
-	SupportedModelFormat              *v1beta1.SupportedModelFormat
-	// Overlays is the resolver output for spec.model.overlays; nil when
-	// none declared. Consumed by UpdateVolumeMounts / UpdateEnvVariables
-	// / UpdatePodSpecVolumes.
-	Overlays []isvcutils.ResolvedOverlay
+	GangSchedulingAvailable bool
+	Scheme                  *runtime.Scheme
+	StatusManager           *status.StatusReconciler
 
 	// PolicyResolver renders per-component autoscalerPolicyRef attachments;
 	// threaded from ComponentInputs (per reconcile). May be nil only in
@@ -104,6 +89,20 @@ type BaseComponentFields struct {
 // ReconcileFineTunedWeights, never at construction.
 func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName string) BaseComponentFields {
 	return BaseComponentFields{
+		Piece: render.Piece{
+			Client:                 deps.Client,
+			Log:                    ctrl.Log.WithName(loggerName),
+			InferenceServiceConfig: deps.Config,
+			DeploymentMode:         in.DeploymentMode,
+			BaseModel:              in.BaseModel,
+			BaseModelMeta:          in.BaseModelMeta,
+			Runtime:                in.Runtime,
+			RuntimeName:            in.RuntimeName,
+			SupportedModelFormat:   in.ModelFormat,
+			AcceleratorClass:       in.AcceleratorClass,
+			AcceleratorClassName:   in.AcceleratorClassName,
+			Overlays:               in.Overlays,
+		},
 		Client:                    deps.Client,
 		Clientset:                 deps.Clientset,
 		APIReader:                 deps.APIReader,
@@ -112,21 +111,19 @@ func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName 
 		GangSchedulingAvailable:   deps.GangSchedulingAvailable,
 		QuotaAcceleratorResources: deps.QuotaAcceleratorResources,
 		Scheme:                    deps.Scheme,
-		InferenceServiceConfig:    deps.Config,
-		DeploymentMode:            in.DeploymentMode,
-		BaseModel:                 in.BaseModel,
-		BaseModelMeta:             in.BaseModelMeta,
-		Runtime:                   in.Runtime,
-		RuntimeName:               in.RuntimeName,
 		StatusManager:             status.NewStatusReconciler(),
-		Log:                       ctrl.Log.WithName(loggerName),
-		SupportedModelFormat:      in.ModelFormat,
-		AcceleratorClass:          in.AcceleratorClass,
-		AcceleratorClassName:      in.AcceleratorClassName,
-		Overlays:                  in.Overlays,
 		PolicyResolver:            in.PolicyResolver,
 		PacingPartition:           in.PacingPartition,
 	}
+}
+
+// pieceOf returns b's rendering inputs, or nil when b itself is nil, so the
+// overlay forwarders accept the nil bag the overlay helpers tolerate.
+func pieceOf(b *BaseComponentFields) *render.Piece {
+	if b == nil {
+		return nil
+	}
+	return &b.Piece
 }
 
 // Common methods as functions that operate on BaseComponentFields
@@ -278,534 +275,95 @@ func resolveRawComponentAutoscaling(ctx context.Context, b *BaseComponentFields,
 	return res, nil
 }
 
-// ReconcileFineTunedWeights reconciles fine-tuned weights for any component
+// The rendering helpers operate on the embedded render.Piece. These
+// forwarders let callers holding a *BaseComponentFields use them without
+// naming the piece.
+
+// ReconcileFineTunedWeights reconciles fine-tuned weights for any component.
 func ReconcileFineTunedWeights(b *BaseComponentFields, isvc *v1beta1.InferenceService) error {
-	if isvc.Spec.Model == nil {
-		return nil
-	}
-	numOfFineTunedWeights := len(isvc.Spec.Model.FineTunedWeights)
-	if numOfFineTunedWeights == 0 {
-		return nil
-	}
-
-	b.Log.Info("FT serving mode", "Number of fine-tuned weights", numOfFineTunedWeights)
-	b.FineTunedServing = true
-
-	// TODO: lift here when start supporting stacked FT serving
-	if numOfFineTunedWeights > 1 {
-		return fmt.Errorf("stacked fine-tuned serving is not supported yet")
-	}
-
-	allFineTunedWeights := make([]*v1beta1.FineTunedWeight, 0)
-
-	for _, fineTunedWeightName := range isvc.Spec.Model.FineTunedWeights {
-		fineTunedWeight, err := isvcutils.GetFineTunedWeight(b.Client, fineTunedWeightName)
-		if err != nil {
-			return err
-		}
-		allFineTunedWeights = append(allFineTunedWeights, fineTunedWeight)
-	}
-
-	// Determine if loading merged fine-tuned weights
-	loadingMergedFineTunedWeights, err := isvcutils.LoadingMergedFineTunedWeight(allFineTunedWeights)
-	if err != nil {
-		b.Log.Error(err, "Failed to determine if loading merged fine-tuned weights")
-		return err
-	}
-	b.FineTunedServingWithMergedWeights = loadingMergedFineTunedWeights
-	b.FineTunedWeights = allFineTunedWeights
-
-	return nil
+	return render.ReconcileFineTunedWeights(&b.Piece, isvc)
 }
 
-// UpdateVolumeMounts updates volume mounts for the container
+// UpdateVolumeMounts updates volume mounts for the container.
 func UpdateVolumeMounts(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container, objectMeta *metav1.ObjectMeta) {
-	if container == nil {
-		b.Log.Error(errors.New("container is nil"), "UpdateVolumeMounts: container is nil")
-		return
-	}
-
-	// Add model volume mount if base model is specified and it's necessary
-	if b.BaseModel != nil && !isShardedModel(b.BaseModel) && b.BaseModel.Storage != nil && b.BaseModelMeta != nil {
-		if isvcutils.IsOriginalModelVolumeMountNecessary(objectMeta.Annotations) {
-			if pvc := parsePVCComponents(b); pvc != nil {
-				vm := corev1.VolumeMount{
-					Name:      b.BaseModelMeta.Name,
-					MountPath: constants.ModelDefaultMountPath,
-					SubPath:   pvc.SubPath,
-					ReadOnly:  true,
-				}
-				isvcutils.AppendVolumeMount(container, &vm)
-			} else if b.BaseModel.Storage.Path != nil {
-				vm := corev1.VolumeMount{
-					Name:      b.BaseModelMeta.Name,
-					MountPath: *b.BaseModel.Storage.Path,
-					ReadOnly:  true,
-				}
-				isvcutils.AppendVolumeMount(container, &vm)
-			}
-		}
-	}
-
-	AppendOverlayVolumeMounts(b, b.Overlays, container)
-
-	// Add fine-tuned serving volume mounts
-	if b.FineTunedServing {
-		defaultModelVolumeMount := corev1.VolumeMount{
-			Name:      constants.ModelEmptyDirVolumeName,
-			MountPath: constants.ModelDefaultMountPath,
-		}
-		isvcutils.AppendVolumeMountIfNotExist(container, &defaultModelVolumeMount)
-
-		if isvcutils.IsCohereCommand1TFewFTServing(objectMeta) {
-			// Update to have `base` sub-path in model volume mount for cohere tfew stacked serving case
-			defaultModelVolumeMountWithSubPath := corev1.VolumeMount{
-				Name:      constants.ModelEmptyDirVolumeName,
-				MountPath: filepath.Join(constants.ModelDefaultMountPath, objectMeta.Annotations[constants.BaseModelFormat]),
-				SubPath:   constants.BaseModelVolumeMountSubPath,
-			}
-			isvcutils.UpdateVolumeMount(container, &defaultModelVolumeMountWithSubPath)
-
-			tfewFineTunedWeightVolumeMount := corev1.VolumeMount{
-				Name:      constants.ModelEmptyDirVolumeName,
-				MountPath: filepath.Join(constants.CohereTFewFineTunedWeightVolumeMountPath, objectMeta.Annotations[constants.BaseModelFormat]),
-				ReadOnly:  true,
-				SubPath:   constants.FineTunedWeightVolumeMountSubPath,
-			}
-			isvcutils.AppendVolumeMount(container, &tfewFineTunedWeightVolumeMount)
-		}
-	}
+	render.UpdateVolumeMounts(&b.Piece, isvc, container, objectMeta)
 }
 
-// UpdateEnvVariables updates environment variables for the container
+// UpdateEnvVariables updates environment variables for the container.
 func UpdateEnvVariables(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container, objectMeta *metav1.ObjectMeta) {
-	if container == nil {
-		b.Log.Error(errors.New("container is nil"), "UpdateEnvVariables: container is nil")
-		return
-	}
-
-	if !b.FineTunedServing {
-		// Base model serving - add MODEL_PATH env variable if necessary
-		if modelPath, ok := modelPathEnvValue(b, objectMeta); ok {
-			b.Log.V(1).Info("Base model serving - adding MODEL_PATH env variable if not provided", "inference service", isvc.Name, "namespace", isvc.Namespace)
-			isvcutils.AppendEnvVarsIfNotExist(container, &[]corev1.EnvVar{
-				{Name: constants.ModelPathEnvVarKey, Value: modelPath},
-			})
-		}
-		AppendOverlayEnvVars(b, b.Overlays, container)
-	} else {
-		// Fine-tuned serving - add vendor-specific environment variables
-		if b.BaseModel != nil && b.BaseModel.Vendor != nil {
-			if *b.BaseModel.Vendor == string(constants.Meta) {
-				// Llama/Meta vendor specific env vars
-				isvcutils.UpdateEnvVars(container, &corev1.EnvVar{
-					Name: constants.ServedModelNameEnvVarKey,
-					Value: filepath.Join(
-						constants.LLamaVllmFTServingServedModelNamePrefix,
-						objectMeta.Annotations[constants.FineTunedAdapterInjectionKey],
-					),
-				})
-				isvcutils.AppendEnvVarsIfNotExist(container, &[]corev1.EnvVar{
-					{Name: constants.ModelPathEnvVarKey, Value: constants.ModelDefaultMountPath},
-				})
-			} else if *b.BaseModel.Vendor == string(constants.Cohere) {
-				// Cohere vendor specific env vars
-				if isvcutils.IsCohereCommand1TFewFTServing(objectMeta) {
-					isvcutils.AppendEnvVarsIfNotExist(container, &[]corev1.EnvVar{
-						{Name: constants.TFewWeightPathEnvVarKey, Value: constants.CohereTFewFineTunedWeightDefaultPath},
-					})
-				}
-			}
-		} else {
-			b.Log.Info("Warning: no vendor given in base model spec - no env var added/updated")
-		}
-	}
-
-	// append env var from runtime spec if it is specified.
-	// runner container is user values, it takes precedence over runtime values.
-	// if the env exists, update its value.
-	// if the env does not exist, append it to the list.
-	if b.SupportedModelFormat != nil && b.SupportedModelFormat.AcceleratorConfig != nil && b.AcceleratorClassName != "" {
-		acceleratorConfig := b.SupportedModelFormat.GetAcceleratorConfig(b.AcceleratorClassName)
-		if acceleratorConfig != nil {
-			envOverride := acceleratorConfig.EnvironmentOverride
-			for envName, envVar := range envOverride {
-				isvcutils.UpdateEnvVars(container, &corev1.EnvVar{
-					Name: envName, Value: envVar})
-			}
-		}
-	}
+	render.UpdateEnvVariables(&b.Piece, isvc, container, objectMeta)
 }
 
 // UpdatePodSpecNodeSelector updates pod spec node selectors for scheduling.
 func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) {
-	if b.BaseModel == nil || b.BaseModelMeta == nil {
-		applyMergedNodeSelector(b.Runtime, b.AcceleratorClass, isvc, podSpec, componentType)
-		return
-	}
-
-	// Skip node selector for fine-tuned serving with merged weights
-	// as they don't need the base model on the node
-	if b.FineTunedServingWithMergedWeights {
-		b.Log.V(2).Info("Skipping node selector for fine-tuned serving with merged weights",
-			"inferenceService", isvc.Name, "namespace", isvc.Namespace)
-		return
-	}
-
-	// Skip node selector for PVC-backed models. The model agent does not
-	// label nodes for PVC storage (PVCs aren't tied to specific nodes), so
-	// the K8s scheduler handles placement based on PVC accessibility.
-	if isPVCBaseModel(b) {
-		b.Log.V(2).Info("Skipping model node selector for PVC-backed BaseModel; runtime/AcceleratorClass selectors still apply",
-			"inferenceService", isvc.Name, "namespace", isvc.Namespace)
-		applyMergedNodeSelector(b.Runtime, b.AcceleratorClass, isvc, podSpec, componentType)
-		return
-	}
-
-	// Add preferred node affinity for model readiness using the shared utility function
-	if isShardedModel(b.BaseModel) {
-		b.Log.V(2).Info("Skipping per-node model readiness selector for sharded model",
-			"modelName", b.BaseModelMeta.Name,
-			"namespace", b.BaseModelMeta.Namespace,
-			"inferenceService", isvc.Name)
-	} else {
-		isvcutils.AddNodeSelectorForModelReadyNode(podSpec, b.BaseModelMeta)
-	}
-
-	applyMergedNodeSelector(b.Runtime, b.AcceleratorClass, isvc, podSpec, componentType)
-
-	if !isShardedModel(b.BaseModel) {
-		b.Log.V(1).Info("Added preferred node affinity for model scheduling",
-			"modelName", b.BaseModelMeta.Name,
-			"namespace", b.BaseModelMeta.Namespace,
-			"inferenceService", isvc.Name)
-	}
+	render.UpdatePodSpecNodeSelector(&b.Piece, isvc, podSpec, componentType)
 }
 
-func applyMergedNodeSelector(runtime *v1beta1.ServingRuntimeSpec, acceleratorClass *v1beta1.AcceleratorClassSpec, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) {
-	mergedNodeSelector := isvcutils.MergeNodeSelector(runtime, acceleratorClass, isvc, componentType)
-	if len(mergedNodeSelector) > 0 {
-		if podSpec.NodeSelector == nil {
-			podSpec.NodeSelector = make(map[string]string)
-		}
-		for k, v := range mergedNodeSelector {
-			podSpec.NodeSelector[k] = v
-		}
-	}
-}
-
-// UpdatePodSpecVolumes updates pod spec with common volumes
+// UpdatePodSpecVolumes updates pod spec with common volumes.
 func UpdatePodSpecVolumes(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, objectMeta *metav1.ObjectMeta) {
-	// Add model volume if base model is specified.
-	if b.BaseModel != nil && !isShardedModel(b.BaseModel) && b.BaseModel.Storage != nil && b.BaseModelMeta != nil {
-		if pvc := parsePVCComponents(b); pvc != nil {
-			modelVolume := corev1.Volume{
-				Name: b.BaseModelMeta.Name,
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: pvc.PVCName,
-						ReadOnly:  true,
-					},
-				},
-			}
-			podSpec.Volumes = append(podSpec.Volumes, modelVolume)
-		} else if b.BaseModel.Storage.Path != nil {
-			modelVolume := corev1.Volume{
-				Name: b.BaseModelMeta.Name,
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: *b.BaseModel.Storage.Path,
-					},
-				},
-			}
-			podSpec.Volumes = append(podSpec.Volumes, modelVolume)
-		}
-	}
-
-	AppendOverlayVolumes(b, b.Overlays, podSpec)
-
-	// Add empty model directory volume if required for fine-tuned serving
-	if isvcutils.IsEmptyModelDirVolumeRequired(objectMeta.Annotations) {
-		emptyModelDirVolume := corev1.Volume{
-			Name: constants.ModelEmptyDirVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{
-					Medium: corev1.StorageMediumMemory,
-				},
-			},
-		}
-		podSpec.Volumes = utils.AppendVolumeIfNotExists(podSpec.Volumes, emptyModelDirVolume)
-	}
+	render.UpdatePodSpecVolumes(&b.Piece, isvc, podSpec, objectMeta)
 }
 
-func isShardedModel(model *v1beta1.BaseModelSpec) bool {
-	return model != nil && model.Distribution != nil && *model.Distribution == v1beta1.DistributionSharded
-}
-
-func modelPathEnvValue(b *BaseComponentFields, objectMeta *metav1.ObjectMeta) (string, bool) {
-	if b == nil || b.BaseModel == nil || b.BaseModel.Storage == nil {
-		return "", false
-	}
-	if isShardedModel(b.BaseModel) {
-		if b.BaseModel.Storage.StorageUri == nil || *b.BaseModel.Storage.StorageUri == "" {
-			return "", false
-		}
-		return *b.BaseModel.Storage.StorageUri, true
-	}
-	if objectMeta == nil || !isvcutils.IsOriginalModelVolumeMountNecessary(objectMeta.Annotations) {
-		return "", false
-	}
-	if isPVCBaseModel(b) {
-		return constants.ModelDefaultMountPath, true
-	}
-	if b.BaseModel.Storage.Path == nil || *b.BaseModel.Storage.Path == "" {
-		return "", false
-	}
-	return *b.BaseModel.Storage.Path, true
-}
-
+// MergeRuntimeArgumentsOverride merges the accelerator class's runtime
+// argument overrides into the container args.
 func MergeRuntimeArgumentsOverride(b *BaseComponentFields, container *corev1.Container) {
-	// append arg var from runtime spec if it is specified
-	if b.SupportedModelFormat != nil && b.SupportedModelFormat.AcceleratorConfig != nil && b.AcceleratorClassName != "" {
-		acceleratorModelConfig := b.SupportedModelFormat.GetAcceleratorConfig(b.AcceleratorClassName)
-		if acceleratorModelConfig != nil {
-			argsOverride := acceleratorModelConfig.RuntimeArgsOverride
-			container.Args = isvcutils.MergeArgs(container.Args, argsOverride)
-
-			// if runtime argument override has TensorParallelism, update the args accordingly
-			// it will be in container.command or container.args
-			// check these two places
-			if acceleratorModelConfig.TensorParallelismOverride != nil {
-				tensorParallelismConfig := acceleratorModelConfig.TensorParallelismOverride
-
-				// Override tensor parallel size if specified
-				// --tp-size and --tp are parameters used in sglang
-				// --tensor-parallel-size is the parameter used in vllm
-				if tensorParallelismConfig.TensorParallelSize != nil && *tensorParallelismConfig.TensorParallelSize > 0 {
-					overrideParam(container, []string{"--tp-size", "--tp", "--tensor-parallel-size"}, *tensorParallelismConfig.TensorParallelSize)
-				}
-				// Override pipeline parallel size if specified
-				// --pp-size and --pp are parameters used in sglang
-				// --pipeline-parallel-size is parameter used in vllm
-				if tensorParallelismConfig.PipelineParallelSize != nil && *tensorParallelismConfig.PipelineParallelSize > 0 {
-					overrideParam(container, []string{"--pp-size", "--pp", "--pipeline-parallel-size"}, *tensorParallelismConfig.PipelineParallelSize)
-				}
-			}
-		}
-	}
+	render.MergeRuntimeArgumentsOverride(&b.Piece, container)
 }
 
-func overrideParam(container *corev1.Container, aliases []string, value int64) {
-	var updated bool
-	// First, try to override in container.Args
-	for _, alias := range aliases {
-		container.Args, updated = isvcutils.OverrideArgParam(container.Args, alias, value)
-		if updated {
-			return // Found and updated in Args
-		}
-	}
-
-	// If not found in Args, try to override in container.Command
-	for _, alias := range aliases {
-		container.Command, updated = isvcutils.OverrideCommandParam(container.Command, alias, value)
-		if updated {
-			return // Found and updated in Command
-		}
-	}
-}
-
-// isResourcesUnspecified checks if the resource requirements are unspecified
-func isResourcesUnspecified(resources corev1.ResourceRequirements) bool {
-	return resources.Limits == nil && resources.Requests == nil && len(resources.Claims) == 0
-}
-
-// MergeResources merges resource requests and limits from the runtime and accelerator class into the container
+// MergeResources merges resource requests and limits from the runtime and
+// accelerator class into the container.
 func MergeResources(b *BaseComponentFields, container *corev1.Container) {
-	isvcutils.MergeResource(container, b.AcceleratorClass, b.Runtime)
+	render.MergeResources(&b.Piece, container)
 }
 
-// MergeEngineResources merges resource requests and limits for the engine container.
-// It only merges resources from the runtime and accelerator class when the user has not
-// explicitly specified resources in the InferenceService spec. This ensures user-specified
-// resources are respected and not overridden, while providing sensible defaults from the
-// runtime and accelerator class when resources are not specified.
+// MergeEngineResources merges runtime and accelerator class resources into
+// the engine container when the service specifies none.
 func MergeEngineResources(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container) {
-	if isvc.Spec.Engine != nil &&
-		(isvc.Spec.Engine.Runner == nil ||
-			isResourcesUnspecified(isvc.Spec.Engine.Runner.Container.Resources)) {
-		b.Log.V(1).Info("Merging resources for engine container as user did not specify resources in InferenceService")
-		MergeResources(b, container)
-	}
+	render.MergeEngineResources(&b.Piece, isvc, container)
 }
 
-// MergeDecoderResources merges resource requests and limits for the decoder container.
-// It only merges resources from the runtime and accelerator class when the user has not
-// explicitly specified resources in the InferenceService spec. This ensures user-specified
-// resources are respected and not overridden, while providing sensible defaults from the
-// runtime and accelerator class when resources are not specified.
+// MergeDecoderResources merges runtime and accelerator class resources into
+// the decoder container when the service specifies none.
 func MergeDecoderResources(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container) {
-	if isvc.Spec.Decoder != nil &&
-		(isvc.Spec.Decoder.Runner == nil ||
-			isResourcesUnspecified(isvc.Spec.Decoder.Runner.Container.Resources)) {
-		b.Log.V(1).Info("Merging resources for decoder container as user did not specify resources in InferenceService")
-		MergeResources(b, container)
-	}
+	render.MergeDecoderResources(&b.Piece, isvc, container)
 }
 
-// UpdateEngineAffinity applies the accelerator class's discovery affinity to the
-// engine pod spec when the user did not specify affinity in the InferenceService.
+// UpdateEngineAffinity applies the accelerator class's discovery affinity to
+// the engine pod spec when the service specifies no affinity.
 func UpdateEngineAffinity(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
-	if isvc.Spec.Engine != nil && isvc.Spec.Engine.PodSpec.Affinity == nil {
-		mergeAcceleratorAffinity(b, podSpec)
-	}
+	render.UpdateEngineAffinity(&b.Piece, isvc, podSpec)
 }
 
-// UpdateDecoderAffinity applies the accelerator class's discovery affinity to the
-// decoder pod spec when the user did not specify affinity in the InferenceService.
+// UpdateDecoderAffinity applies the accelerator class's discovery affinity to
+// the decoder pod spec when the service specifies no affinity.
 func UpdateDecoderAffinity(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
-	if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.PodSpec.Affinity == nil {
-		mergeAcceleratorAffinity(b, podSpec)
-	}
+	render.UpdateDecoderAffinity(&b.Piece, isvc, podSpec)
 }
 
-// acceleratorProvidesParallelismOverride reports whether the selected
-// accelerator class supplies a TensorParallelismOverride for the matched
-// model format. Only then does the accelerator config own the parallelism
-// flags; otherwise the automatic PARALLELISM_SIZE computation still applies.
-func acceleratorProvidesParallelismOverride(b *BaseComponentFields) bool {
-	if b.AcceleratorClassName == "" || b.SupportedModelFormat == nil {
-		return false
-	}
-	acceleratorConfig := b.SupportedModelFormat.GetAcceleratorConfig(b.AcceleratorClassName)
-	return acceleratorConfig != nil && acceleratorConfig.TensorParallelismOverride != nil
-}
-
-// mergeAcceleratorAffinity fills the pod spec's NodeAffinity from the
-// accelerator class's discovery affinity when the pod spec has none.
-// Only NodeAffinity is taken: Discovery describes which NODES carry the
-// hardware, and copying class-level pod (anti-)affinity terms could
-// suppress the gang co-location terms OMENative injects per Instance
-// (a pre-existing required podAffinity on the gang topology key skips
-// the worker-follows-leader injection).
-func mergeAcceleratorAffinity(b *BaseComponentFields, podSpec *corev1.PodSpec) {
-	if b.AcceleratorClass == nil || b.AcceleratorClass.Discovery.Affinity == nil {
-		return
-	}
-	acAffinity := b.AcceleratorClass.Discovery.Affinity
-	if acAffinity.NodeAffinity == nil {
-		return
-	}
-	if podSpec.Affinity == nil {
-		podSpec.Affinity = &corev1.Affinity{}
-	}
-	if podSpec.Affinity.NodeAffinity == nil {
-		podSpec.Affinity.NodeAffinity = acAffinity.NodeAffinity.DeepCopy()
-	}
-}
-
-// ProcessBaseAnnotations processes common annotations
+// ProcessBaseAnnotations processes common annotations.
 func ProcessBaseAnnotations(b *BaseComponentFields, isvc *v1beta1.InferenceService, annotations map[string]string) (map[string]string, error) {
-	// Add fine-tuned weight annotations if applicable
-	if b.FineTunedServing && len(b.FineTunedWeights) > 0 {
-		// Inject ft adapter for single/non-stacked fine-tuned weight downloading
-		annotations[constants.FineTunedAdapterInjectionKey] = b.FineTunedWeights[0].Name
-
-		// Add fine-tuned weight ft strategy
-		fineTunedWeightFTStrategy, err := isvcutils.GetValueFromRawExtension(b.FineTunedWeights[0].Spec.HyperParameters, constants.StrategyConfigKey)
-		if err != nil {
-			b.Log.Error(err, "Error getting hyper-parameter strategy from FineTunedWeight", "FineTunedWeight", b.FineTunedWeights[0].Name, "namespace", isvc.Namespace)
-			return nil, err
-		}
-		if fineTunedWeightFTStrategy == nil {
-			return nil, fmt.Errorf("hyper-parameter %q not set on FineTunedWeight %s", constants.StrategyConfigKey, b.FineTunedWeights[0].Name)
-		}
-		strategy, ok := fineTunedWeightFTStrategy.(string)
-		if !ok {
-			return nil, fmt.Errorf("hyper-parameter %q on FineTunedWeight %s must be a string, got %T", constants.StrategyConfigKey, b.FineTunedWeights[0].Name, fineTunedWeightFTStrategy)
-		}
-		annotations[constants.FineTunedWeightFTStrategyKey] = strategy
-	}
-
-	if b.FineTunedServingWithMergedWeights {
-		b.Log.V(1).Info("Fine-tuned serving with merged weights", "namespace", isvc.Namespace)
-		annotations[constants.FTServingWithMergedWeightsAnnotationKey] = "true"
-	}
-
-	// Add base model specific annotations
-	if b.BaseModel != nil && b.BaseModelMeta != nil {
-		annotations[constants.BaseModelName] = b.BaseModelMeta.Name
-		if b.BaseModel.Vendor != nil {
-			annotations[constants.BaseModelVendorAnnotationKey] = *b.BaseModel.Vendor
-		}
-		annotations[constants.BaseModelFormat] = b.BaseModel.ModelFormat.Name
-		if b.BaseModel.ModelFormat.Version != nil {
-			annotations[constants.BaseModelFormatVersion] = *b.BaseModel.ModelFormat.Version
-		}
-	}
-
-	if b.RuntimeName != "" {
-		annotations[constants.ServingRuntimeKeyName] = b.RuntimeName
-	}
-
-	return annotations, nil
+	return render.ProcessBaseAnnotations(&b.Piece, isvc, annotations)
 }
 
-// ProcessBaseLabels processes common labels
+// ProcessBaseLabels processes common labels.
 func ProcessBaseLabels(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, labels map[string]string) (map[string]string, error) {
-	baseModelCategory := "SMALL"
-	if b.BaseModelMeta != nil {
-		if category, ok := b.BaseModelMeta.Annotations[constants.ModelCategoryAnnotation]; ok {
-			baseModelCategory = category
-		}
-	}
+	return render.ProcessBaseLabels(&b.Piece, isvc, componentType, labels)
+}
 
-	baseLabels := map[string]string{
-		constants.InferenceServicePodLabelKey: isvc.Name,
-		constants.OMEComponentLabel:           string(componentType),
-		constants.ServingRuntimeLabelKey:      b.RuntimeName,
-		constants.FTServingLabelKey:           strconv.FormatBool(b.FineTunedServing),
-	}
+// ReconcileComponentObjectMeta builds the common ObjectMeta block (Name,
+// Namespace, Annotations, Labels) shared by engine / decoder / router.
+func ReconcileComponentObjectMeta(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, componentName string, componentAnnotations map[string]string, componentLabels map[string]string) (metav1.ObjectMeta, error) {
+	return render.ReconcileComponentObjectMeta(&b.Piece, isvc, componentType, componentName, componentAnnotations, componentLabels)
+}
 
-	// Merge with provided labels
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	for k, v := range baseLabels {
-		labels[k] = v
-	}
+// ProcessComponentAnnotations performs the per-Component annotation build.
+func ProcessComponentAnnotations(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentAnnotations map[string]string) (map[string]string, error) {
+	return render.ProcessComponentAnnotations(&b.Piece, isvc, componentAnnotations)
+}
 
-	if b.BaseModelMeta != nil {
-		labels[constants.InferenceServiceBaseModelNameLabelKey] = b.BaseModelMeta.Name
-		labels[constants.InferenceServiceBaseModelSizeLabelKey] = baseModelCategory
-		labels[constants.BaseModelTypeLabelKey] = string(constants.ServingBaseModel)
-	}
-
-	if b.BaseModel != nil && b.BaseModel.Vendor != nil {
-		labels[constants.BaseModelVendorLabelKey] = *b.BaseModel.Vendor
-	}
-
-	// Add fine-tuned serving related labels
-	if b.FineTunedServing && len(b.FineTunedWeights) > 0 {
-		ftStrategyParameter, err := isvcutils.GetValueFromRawExtension(b.FineTunedWeights[0].Spec.HyperParameters, constants.StrategyConfigKey)
-		if err != nil {
-			b.Log.Error(err, "Error getting hyper-parameter strategy from FineTunedWeight", "FineTunedWeight", b.FineTunedWeights[0].Name, "namespace", isvc.Namespace)
-			return nil, err
-		}
-
-		fineTunedWeightFTStrategy := ""
-		if ftStrategyParameter != nil {
-			s, ok := ftStrategyParameter.(string)
-			if !ok {
-				return nil, fmt.Errorf("hyper-parameter %q on FineTunedWeight %s must be a string, got %T", constants.StrategyConfigKey, b.FineTunedWeights[0].Name, ftStrategyParameter)
-			}
-			fineTunedWeightFTStrategy = s
-		}
-		labels[constants.FineTunedWeightFTStrategyLabelKey] = fineTunedWeightFTStrategy
-
-		labels[constants.FTServingWithMergedWeightsLabelKey] = strconv.FormatBool(b.FineTunedServingWithMergedWeights)
-	}
-
-	return labels, nil
+// ProcessComponentLabels performs the per-Component label build.
+func ProcessComponentLabels(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, componentLabels map[string]string) (map[string]string, error) {
+	return render.ProcessComponentLabels(&b.Piece, isvc, componentType, componentLabels)
 }
 
 // UpdateComponentStatus updates component status based on deployment mode.
@@ -1198,91 +756,4 @@ func ReconcileOMENativeSubresources(
 		return errors.Wrapf(err, "pod monitor %s/%s", target.Namespace, target.Name)
 	}
 	return nil
-}
-
-// ReconcileComponentObjectMeta builds the common ObjectMeta block
-// (Name, Namespace, Annotations, Labels) shared by engine / decoder /
-// router. The per-Component name is resolved upstream because the
-// fallback logic (Service-existence lookup, MultiNode gating) still
-// differs across components (see section 4 of the components-dispatch
-// review). The annotation / label maps are the per-Component merge
-// (ISVC + componentExt.Annotations / componentExt.Labels) already
-// performed by the caller.
-//
-// On annotation-build failure the returned ObjectMeta carries Name +
-// Namespace only; on label-build failure it carries Name + Namespace +
-// Annotations, so callers see exactly the metadata built before the
-// failure.
-func ReconcileComponentObjectMeta(
-	b *BaseComponentFields,
-	isvc *v1beta1.InferenceService,
-	componentType v1beta1.ComponentType,
-	componentName string,
-	componentAnnotations map[string]string,
-	componentLabels map[string]string,
-) (metav1.ObjectMeta, error) {
-	annotations, err := ProcessComponentAnnotations(b, isvc, componentAnnotations)
-	if err != nil {
-		return metav1.ObjectMeta{
-			Name:      componentName,
-			Namespace: isvc.Namespace,
-		}, err
-	}
-
-	labels, err := ProcessComponentLabels(b, isvc, componentType, componentLabels)
-	if err != nil {
-		return metav1.ObjectMeta{
-			Name:        componentName,
-			Namespace:   isvc.Namespace,
-			Annotations: annotations,
-		}, err
-	}
-
-	return metav1.ObjectMeta{
-		Name:        componentName,
-		Namespace:   isvc.Namespace,
-		Labels:      labels,
-		Annotations: annotations,
-	}, nil
-}
-
-// ProcessComponentAnnotations performs the per-Component annotation
-// build: filter the ISVC-level annotations against the disallowed
-// list, union them with the Component-level annotations, then hand
-// off to ProcessBaseAnnotations for the FT / BaseModel / runtime
-// annotations the base layer adds.
-func ProcessComponentAnnotations(
-	b *BaseComponentFields,
-	isvc *v1beta1.InferenceService,
-	componentAnnotations map[string]string,
-) (map[string]string, error) {
-	annotations := utils.Filter(isvc.Annotations, func(key string) bool {
-		return !utils.Includes(constants.ServiceAnnotationDisallowedList, key)
-	})
-
-	mergedAnnotations := annotations
-	if componentAnnotations != nil {
-		mergedAnnotations = utils.Union(annotations, componentAnnotations)
-	}
-	delete(mergedAnnotations, constants.InferenceServiceInPlaceImageTransitionAnnotationKey)
-
-	return ProcessBaseAnnotations(b, isvc, mergedAnnotations)
-}
-
-// ProcessComponentLabels performs the per-Component label build:
-// union the ISVC-level labels with the Component-level labels, then
-// hand off to ProcessBaseLabels for the FT / BaseModel / runtime
-// labels the base layer adds.
-func ProcessComponentLabels(
-	b *BaseComponentFields,
-	isvc *v1beta1.InferenceService,
-	componentType v1beta1.ComponentType,
-	componentLabels map[string]string,
-) (map[string]string, error) {
-	// Union always copies: ProcessBaseLabels mutates the map it is
-	// handed, and aliasing isvc.Labels would leak one component's
-	// stamps into the next component's build.
-	mergedLabels := utils.Union(isvc.Labels, componentLabels)
-
-	return ProcessBaseLabels(b, isvc, componentType, mergedLabels)
 }

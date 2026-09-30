@@ -29,7 +29,7 @@ func splitISVC(ns, name string, replicas int32) *v1beta1.InferenceService {
 	return &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
 		Spec: v1beta1.InferenceServiceSpec{
-			Placement: &v1beta1.PlacementSpec{
+			Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
 				Mode:            v1beta1.PlacementModeSplit,
 				Requirements:    "accelerator=tpu7x",
 				ClusterSelector: "region=us-east",
@@ -137,7 +137,7 @@ func TestRecordPolicy_SplitFieldsAndModeChange(t *testing.T) {
 		t.Errorf("max_per_cluster = %v, want 4", got)
 	}
 
-	isvc.Spec.Placement = &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeSingle}
+	isvc.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle}
 	recordPolicy(isvc)
 
 	if got := testutil.CollectAndCount(placementSplitReplicas); got != 0 {

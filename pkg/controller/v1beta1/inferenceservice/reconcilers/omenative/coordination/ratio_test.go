@@ -1302,7 +1302,7 @@ func TestEvaluateUpdateGate_RatioBalancedSurgeNotDeadlocked(t *testing.T) {
 	isvc := mkSymmetricRatioFixture(25)
 	client := fakeClientForISVC(isvc)
 
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); !allowed {
 		t.Errorf("SurgeThenDrain RatioBalanced 4:4 must be allowed (no deadlock); got denied: %s", reason)
 	}
@@ -1420,7 +1420,7 @@ func TestEvaluateUpdateGate_RatioBalancedHoldsLeadingComponent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			isvc := mkRatioProgressFixture(tc.tol, tc.origE, tc.newE, tc.origD, tc.newD)
 			client := fakeClientForISVC(isvc)
-			allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, tc.comp, nil, GroupDefaults{},
+			allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, tc.comp, forwardTarget(isvc, tc.comp), nil, GroupDefaults{},
 				workloadtypes.UpdateStrategySurgeThenDrain, 0, 0)
 			if allowed != tc.wantAllowed {
 				t.Errorf("allowed=%v want %v (reason=%q)", allowed, tc.wantAllowed, reason)
@@ -1595,9 +1595,44 @@ func TestEvaluateUpdateGate_RecreatePodSymmetricCleared(t *testing.T) {
 	pinActiveRun(isvc) // re-pin: the budget edit must be part of the pinned plan
 	client := fakeClientForISVC(isvc)
 
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategyRecreatePod, 0, 0); !allowed {
 		t.Errorf("RecreatePod on symmetric 4:4 (MaxUnavailable=3) must be allowed via the tiebreaker; got denied: %s", reason)
+	}
+}
+
+// TestEvaluateUpdateGate_RatioWaiverFollowsTheMechanism pins the ratio
+// waiver to the mechanism the caller reports. On an asymmetric 4:2 pair
+// (tol 25%, band [1.5, 2.5]) a decoder recreate projects 4:1 = 4.0, past
+// even the 2x-band tiebreaker, so a RecreatePod consult — the consult a
+// gang's in-place fallback arrives as — is held on Ratio. The same
+// consult as an in-place mechanism is waived, since a same-pod patch
+// keeps the decoder's capacity, and passes on the unavailability budget.
+// A recreate that stays in band (the engine's, 3:2 = 1.5) is admitted,
+// so the mechanism decides which check runs, not whether the start runs.
+func TestEvaluateUpdateGate_RatioWaiverFollowsTheMechanism(t *testing.T) {
+	isvc := mkRatioProgressFixture(25, 4, 0, 2, 0)
+	mu := intstr.FromInt(1)
+	isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxUnavailable = &mu
+	pinActiveRun(isvc) // re-pin: the budget edit must be part of the pinned plan
+	client := fakeClientForISVC(isvc)
+
+	allowed, gate, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
+		workloadtypes.UpdateStrategyRecreatePod, 0, 0)
+	if allowed || gate != v1beta1.RolloutHoldGateRatio {
+		t.Errorf("decoder RecreatePod on 4:2 tol=25%% must be held on Ratio (4:1 = 4.0 leaves the band); got allowed=%v gate=%q reason=%q", allowed, gate, reason)
+	}
+	for _, mechanism := range []workloadtypes.UpdateStrategyType{
+		workloadtypes.UpdateStrategyInPlaceIfPossible, workloadtypes.UpdateStrategyInPlaceOnly,
+	} {
+		if allowed, gate, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
+			mechanism, 0, 0); !allowed {
+			t.Errorf("decoder %s on 4:2 tol=25%% must be waived past the ratio gate; got held gate=%q reason=%q", mechanism, gate, reason)
+		}
+	}
+	if allowed, gate, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
+		workloadtypes.UpdateStrategyRecreatePod, 0, 0); !allowed {
+		t.Errorf("engine RecreatePod on 4:2 tol=25%% must be admitted (3:2 = 1.5 stays in band); got held gate=%q reason=%q", gate, reason)
 	}
 }
 
@@ -1719,7 +1754,7 @@ func TestDecoderSurgeBudget_RatioBalanced(t *testing.T) {
 	// peak 5.
 	isvc, decInsts := mkPDGroupSurge(v1beta1.CoordinationPacingRatioBalanced, 0)
 	client := fakeClientForISVCWithInstances(isvc, map[v1beta1.ComponentType][]v1beta1.OMENativeInstanceStatus{v1beta1.DecoderComponent: decInsts})
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); !allowed {
 		t.Fatalf("RatioBalanced: decoder's FIRST surge (→ peak N+1=5) must be allowed; got denied: %s", reason)
 	}
@@ -1730,7 +1765,7 @@ func TestDecoderSurgeBudget_RatioBalanced(t *testing.T) {
 	// peak 4, the first-surge assertion above would already have failed.)
 	isvc, decInsts = mkPDGroupSurge(v1beta1.CoordinationPacingRatioBalanced, 1)
 	client = fakeClientForISVCWithInstances(isvc, map[v1beta1.ComponentType][]v1beta1.OMENativeInstanceStatus{v1beta1.DecoderComponent: decInsts})
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); allowed {
 		t.Fatalf("RatioBalanced: decoder's SECOND surge (would be peak 6 > maxSurge=1 budget) must be denied; got allowed (reason=%s)", reason)
 	}
@@ -1743,14 +1778,14 @@ func TestDecoderSurgeBudget_RatioBalanced(t *testing.T) {
 func TestDecoderSurgeBudget_PerComponent(t *testing.T) {
 	isvc, decInsts := mkPDGroupSurge(v1beta1.CoordinationPacingPerComponent, 0)
 	client := fakeClientForISVCWithInstances(isvc, map[v1beta1.ComponentType][]v1beta1.OMENativeInstanceStatus{v1beta1.DecoderComponent: decInsts})
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); !allowed {
 		t.Fatalf("PerComponent: decoder's FIRST surge (→ peak N+1=5) must be allowed; got denied: %s", reason)
 	}
 
 	isvc, decInsts = mkPDGroupSurge(v1beta1.CoordinationPacingPerComponent, 1)
 	client = fakeClientForISVCWithInstances(isvc, map[v1beta1.ComponentType][]v1beta1.OMENativeInstanceStatus{v1beta1.DecoderComponent: decInsts})
-	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, nil, GroupDefaults{},
+	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategySurgeThenDrain, 0, 0); allowed {
 		t.Fatalf("PerComponent: decoder's SECOND surge (would be peak 6 > maxSurge=1 budget) must be denied; got allowed (reason=%s)", reason)
 	}
@@ -1770,7 +1805,7 @@ func TestDecoderSurgeBudget_InWakeUpDeltaGatesSecondSurge(t *testing.T) {
 		isvc, decInsts := mkPDGroupSurge(pt, 0)
 		client := fakeClientForISVCWithInstances(isvc, map[v1beta1.ComponentType][]v1beta1.OMENativeInstanceStatus{v1beta1.DecoderComponent: decInsts})
 		// inFlightSurge=1 → CheckSurge projects 0+1+1 = 2 > budget 1.
-		if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, nil, GroupDefaults{},
+		if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{},
 			workloadtypes.UpdateStrategySurgeThenDrain, 1, 0); allowed {
 			t.Errorf("pacing=%s: a second decoder surge in one wake-up (inFlightSurge=1, budget=1) must be denied; got allowed (reason=%s)", pt, reason)
 		}
@@ -2069,7 +2104,7 @@ func TestEvaluateUpdateGate_PlanGateHoldsWithoutRun(t *testing.T) {
 	isvc.Status.Rollout = nil // no run pinned yet
 	client := fakeClientForISVC(isvc)
 
-	allowed, gate, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, nil, GroupDefaults{},
+	allowed, gate, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategyRecreatePod, 0, 0)
 	if allowed {
 		t.Fatalf("a grouped Component without an active run must be denied, got allowed (reason=%q)", reason)
@@ -2079,7 +2114,7 @@ func TestEvaluateUpdateGate_PlanGateHoldsWithoutRun(t *testing.T) {
 	}
 
 	pinActiveRun(isvc)
-	allowed, gate, reason = EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, nil, GroupDefaults{},
+	allowed, gate, reason = EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategyRecreatePod, 0, 0)
 	if !allowed {
 		t.Fatalf("with the run pinned the normal gate path must allow, got denied: gate=%q reason=%q", gate, reason)

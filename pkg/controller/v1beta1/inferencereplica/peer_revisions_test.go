@@ -131,8 +131,10 @@ func TestResolvePeerRevisions_RollbackPinsPeerTarget(t *testing.T) {
 	engine := projectedIR(v1beta1.EngineComponent, "7", "e1", "e1")
 	decoder := projectedIR(v1beta1.DecoderComponent, "7", "d1", "d2")
 	decoder.Spec.Pacing = &v1beta1.InferenceReplicaPacing{RollbackToRevision: ptr.To("llama-decoder-d1")}
+	rollback := ownTargetCR("llama-decoder-d1")
+	rollback.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(decoder, irGVK)}
 
-	r, _ := newReconciler(t, engine, decoder, pdParent(), ownTargetCR("llama-decoder-d1"))
+	r, _ := newReconciler(t, engine, decoder, pdParent(), rollback)
 	peers, hold, err := r.resolvePeerRevisions(context.Background(), engine, pdParent(), ownTargetCR("llama-engine-e1"))
 	if err != nil || hold != "" {
 		t.Fatalf("resolve: hold=%q err=%v", hold, err)
@@ -148,6 +150,38 @@ func TestResolvePeerRevisions_RollbackPinsPeerTarget(t *testing.T) {
 	}
 	if got := peers.hashFor(v1beta1.DecoderComponent, "e1"); got != "d2" {
 		t.Errorf("swept rollback revision falls through to the spec target d2, got %q", got)
+	}
+}
+
+// TestResolvePeerRevisions_ForeignRollbackRevisionPairsOnTheSpecTarget pins
+// that a peer pinned to a rollback revision it does not control (another
+// replica controls it, or nothing does) pairs on its spec target, since the
+// peer's own reconciler ignores that revision.
+func TestResolvePeerRevisions_ForeignRollbackRevisionPairsOnTheSpecTarget(t *testing.T) {
+	engine := projectedIR(v1beta1.EngineComponent, "7", "e1", "e1")
+	decoder := projectedIR(v1beta1.DecoderComponent, "7", "d1", "d2")
+	decoder.Spec.Pacing = &v1beta1.InferenceReplicaPacing{RollbackToRevision: ptr.To("pool-b-decoder-d1")}
+	foreign := ownTargetCR("pool-b-decoder-d1")
+	foreign.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(baselineIR("pool-b-decoder", "default", 1), irGVK)}
+
+	r, _ := newReconciler(t, engine, decoder, pdParent(), foreign)
+	peers, hold, err := r.resolvePeerRevisions(context.Background(), engine, pdParent(), ownTargetCR("llama-engine-e1"))
+	if err != nil || hold != "" {
+		t.Fatalf("resolve: hold=%q err=%v", hold, err)
+	}
+	if got := peers.hashFor(v1beta1.DecoderComponent, "e1"); got != "d2" {
+		t.Errorf("a rollback revision the peer does not control pairs on the peer's spec target d2, got %q", got)
+	}
+
+	ownerless := decoder.DeepCopy()
+	ownerless.Spec.Pacing.RollbackToRevision = ptr.To("llama-decoder-d1")
+	r, _ = newReconciler(t, engine, ownerless, pdParent(), ownTargetCR("llama-decoder-d1"))
+	peers, hold, err = r.resolvePeerRevisions(context.Background(), engine, pdParent(), ownTargetCR("llama-engine-e1"))
+	if err != nil || hold != "" {
+		t.Fatalf("resolve: hold=%q err=%v", hold, err)
+	}
+	if got := peers.hashFor(v1beta1.DecoderComponent, "e1"); got != "d2" {
+		t.Errorf("a rollback revision with no owner references pairs on the peer's spec target d2, got %q", got)
 	}
 }
 

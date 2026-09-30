@@ -21,8 +21,8 @@ const (
 	// can drive the Component. status.components.<comp>.scaleTargetRef
 	// publishes the canonical target name for the operator to point at.
 	AutoscalerExternal AutoscalerClass = "External"
-	// AutoscalerNone disables autoscaling entirely. Used by proportional-policy
-	// followers, where the ScalingPolicy coordinator writes replicas directly.
+	// AutoscalerNone means no autoscaler; the InferenceService controller owns
+	// the replica count.
 	AutoscalerNone AutoscalerClass = "None"
 )
 
@@ -107,11 +107,13 @@ type ScalingMode string
 const (
 	// ScalingIndependent — each Component autoscales on its own metrics. Default.
 	ScalingIndependent ScalingMode = "Independent"
-	// ScalingProportional — anchor Component drives; followers scale by declared
-	// ratio via the ScalingPolicy coordinator.
+	// ScalingProportional is accepted by the schema, but admission rejects a
+	// create or an update that sets or changes a policy with this mode: no
+	// controller applies it.
 	ScalingProportional ScalingMode = "Proportional"
-	// ScalingPinned — replica counts pinned with no autoscaler. Reserved for a
-	// future release; not implemented.
+	// ScalingPinned is accepted by the schema, but admission rejects a create
+	// or an update that sets or changes a policy with this mode: no
+	// controller applies it.
 	ScalingPinned ScalingMode = "Pinned"
 )
 

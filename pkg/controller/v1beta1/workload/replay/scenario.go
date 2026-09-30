@@ -137,13 +137,17 @@ type SpecState struct {
 // behavior differs from its configured behavior, and a scenario has to be
 // able to pin either.
 type ConfigState struct {
-	RequeueOperation         string       `json:"requeueOperation,omitempty"`
-	RequeueGate              string       `json:"requeueGate,omitempty"`
-	ScaleDownRequeueInterval string       `json:"scaleDownRequeueInterval,omitempty"`
-	StuckPodGrace            string       `json:"stuckPodGrace,omitempty"`
-	UnschedulableGrace       string       `json:"unschedulableGrace,omitempty"`
-	UpdateRetry              *RetrySpec   `json:"updateRetry,omitempty"`
-	ForceDelete              *ForceDelete `json:"forceDelete,omitempty"`
+	RequeueOperation         string `json:"requeueOperation,omitempty"`
+	RequeueGate              string `json:"requeueGate,omitempty"`
+	ScaleDownRequeueInterval string `json:"scaleDownRequeueInterval,omitempty"`
+	StuckPodGrace            string `json:"stuckPodGrace,omitempty"`
+	UnschedulableGrace       string `json:"unschedulableGrace,omitempty"`
+	// AbandonedReplacementGrace is lifecycle.abandonedReplacementGracePeriod,
+	// the termination grace of a replacement abandoned before it served.
+	// Unset leaves such a pod its own grace.
+	AbandonedReplacementGrace string       `json:"abandonedReplacementGrace,omitempty"`
+	UpdateRetry               *RetrySpec   `json:"updateRetry,omitempty"`
+	ForceDelete               *ForceDelete `json:"forceDelete,omitempty"`
 	// MigrationAudit bounds migration admission. Unset leaves the
 	// engine unconfigured, which holds every request rather than
 	// admitting it unbounded.

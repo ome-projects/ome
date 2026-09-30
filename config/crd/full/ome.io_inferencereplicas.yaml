@@ -637,6 +637,42 @@ spec:
                   format: int32
                   minimum: 0
                   type: integer
+                modelRef:
+                  properties:
+                    apiGroup:
+                      default: ome.io
+                      type: string
+                    fineTunedWeights:
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    kind:
+                      default: ClusterBaseModel
+                      type: string
+                    name:
+                      type: string
+                    overlays:
+                      items:
+                        properties:
+                          apiGroup:
+                            default: ome.io
+                            type: string
+                          kind:
+                            default: ClusterBaseModel
+                            type: string
+                          name:
+                            type: string
+                        required:
+                          - name
+                        type: object
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - name
+                      x-kubernetes-list-type: map
+                  required:
+                    - name
+                  type: object
                 pacing:
                   properties:
                     maxUnavailable:
@@ -658,6 +694,7 @@ spec:
                 parentRef:
                   properties:
                     name:
+                      minLength: 1
                       type: string
                   required:
                     - name
@@ -673,10 +710,63 @@ spec:
                   properties:
                     clusterUID:
                       type: string
+                    demand:
+                      properties:
+                        components:
+                          items:
+                            properties:
+                              component:
+                                enum:
+                                  - engine
+                                  - decoder
+                                type: string
+                              renderingHash:
+                                pattern: ^[a-f0-9]{64}$
+                                type: string
+                            required:
+                              - component
+                              - renderingHash
+                            type: object
+                          maxItems: 2
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - component
+                          x-kubernetes-list-type: map
+                        fingerprint:
+                          pattern: ^[a-f0-9]{64}$
+                          type: string
+                      required:
+                        - components
+                        - fingerprint
+                      type: object
                     pauseSurge:
                       type: boolean
                     planID:
                       type: string
+                    replicaFloors:
+                      items:
+                        properties:
+                          component:
+                            enum:
+                              - engine
+                              - decoder
+                              - router
+                            type: string
+                          replicas:
+                            format: int32
+                            minimum: 0
+                            type: integer
+                        required:
+                          - component
+                          - replicas
+                        type: object
+                      maxItems: 3
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - component
+                      x-kubernetes-list-type: map
                     revision:
                       format: int64
                       minimum: 1
@@ -696,6 +786,7 @@ spec:
                   type: integer
                 replicas:
                   format: int32
+                  minimum: 0
                   type: integer
                 revisionHistoryLimit:
                   format: int32
@@ -3780,11 +3871,28 @@ spec:
                       - size
                       - template
                     type: object
-                  minItems: 1
                   type: array
                   x-kubernetes-list-map-keys:
                     - name
                   x-kubernetes-list-type: map
+                runtimeRef:
+                  properties:
+                    apiGroup:
+                      default: ome.io
+                      type: string
+                    autoSync:
+                      default: true
+                      type: boolean
+                    kind:
+                      default: ClusterServingRuntime
+                      type: string
+                    name:
+                      type: string
+                    revision:
+                      type: string
+                  required:
+                    - name
+                  type: object
                 topologyKey:
                   type: string
                 topologySpread:
@@ -3796,8 +3904,6 @@ spec:
                   type: string
               required:
                 - component
-                - parentRef
-                - runners
               type: object
             status:
               properties:

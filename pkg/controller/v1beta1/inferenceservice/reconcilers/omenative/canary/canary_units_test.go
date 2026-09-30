@@ -347,3 +347,49 @@ func TestReconcileRollback_HoldsForIntermediateStragglers(t *testing.T) {
 			isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase)
 	}
 }
+
+// A member's straggler holds the unit the way the primary's does: the
+// rejected revision drained everywhere, but a decoder pod still exists on a
+// revision that is not the decoder's stable one.
+func TestReconcileRollback_HoldsForMemberStragglers(t *testing.T) {
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "llm-a", Namespace: "ns"},
+		Status: v1beta1.InferenceServiceStatus{
+			Components: map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{},
+		},
+	}
+	cs := &v1beta1.CanaryStatus{
+		StableRevisionHash:     "aaaaaaaa",
+		CanaryRevisionHash:     "cccccccc",
+		RolledBackRevisionHash: "cccccccc",
+	}
+	in := ReconcileInputs{
+		ISVC:            isvc,
+		Component:       v1beta1.EngineComponent,
+		PerRevisionPods: map[string]int32{"aaaaaaaa": 3},
+		GroupTotalPerRevisionPods: map[v1beta1.ComponentType]map[string]int32{
+			v1beta1.EngineComponent:  {"aaaaaaaa": 3},
+			v1beta1.DecoderComponent: {"dddddddd": 2, "eeeeeeee": 1},
+		},
+		GroupStableRevisionHashes: map[v1beta1.ComponentType]string{
+			v1beta1.EngineComponent:  "aaaaaaaa",
+			v1beta1.DecoderComponent: "dddddddd",
+		},
+	}
+	res := reconcileRollback(in, cs)
+	if !res.RolledBack || isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase != v1beta1.RolloutPhaseRollingBack {
+		t.Fatalf("a member straggler must hold RollingBack, got phase %q",
+			isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase)
+	}
+	if res.RequeueAfter == 0 && !res.Requeue {
+		t.Fatalf("a held rollback must requeue, got %+v", res)
+	}
+
+	// The straggler is gone: every member has only its stable revision.
+	in.GroupTotalPerRevisionPods[v1beta1.DecoderComponent] = map[string]int32{"dddddddd": 3}
+	res = reconcileRollback(in, cs)
+	if !res.RolledBack || isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase != v1beta1.RolloutPhaseRolledBack {
+		t.Fatalf("stable-only members must complete the rollback, got phase %q",
+			isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase)
+	}
+}

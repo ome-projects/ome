@@ -25,7 +25,7 @@ const (
 )
 
 // Dispatcher turns the matched candidate set for one source ISVC into the subset
-// to clone onto this pass; fanOut applies to whatever Nominate returns. It
+// to nominate on this pass. The placement controller persists nominations. It
 // returns the nominated subset (a prefix of candidates, in sorted order) and an
 // advisory hold: a non-zero requeue delay asking the caller to wait before
 // widening (an incremental round still in progress), zero to use the normal poll.
@@ -47,21 +47,16 @@ func dispatcherFor(mode DispatcherMode, stepSize int, roundTimeout time.Duration
 	return allAtOnceDispatcher{}
 }
 
-// allAtOnceDispatcher nominates every matched candidate in a single round. It
-// holds no state and never asks the caller to wait, so the placement reconcile
-// behaves exactly as it did before the dispatcher split.
+// allAtOnceDispatcher nominates every matched candidate in a single round.
 type allAtOnceDispatcher struct{}
 
 func (allAtOnceDispatcher) Nominate(_ types.UID, candidates []string, _ time.Time) ([]string, time.Duration) {
 	return candidates, 0
 }
 
-// incrementalDispatcher nominates candidates in sorted batches of stepSize, one
-// batch per round, giving each round roundTimeout for a nominated cluster to win
-// before the next batch is added. Round state is in-memory, keyed by source-ISVC
-// UID (the status API has no nominated-clusters field). A control-plane restart
-// restarts the walk from the first batch — conservative, never destructive
-// (fanOut is idempotent, the loser sweep origin-guarded).
+// incrementalDispatcher widens nominations in sorted batches with a configured
+// dwell per batch. Its clock is in-memory; the controller retains accepted
+// nominations across restarts through the persisted placement plan.
 type incrementalDispatcher struct {
 	// stepSize is how many additional candidates are nominated per round. It is
 	// config-supplied (resolved by the caller); this type does not invent a

@@ -59,7 +59,7 @@ func TestOwnerResolvedMalformedOMEPodPreventsFalseNodeDrained(t *testing.T) {
 			}},
 		},
 		Spec: v1beta1.InferenceReplicaSpec{
-			ParentRef: v1beta1.ParentReference{Name: workloadKey.Name},
+			ParentRef: &v1beta1.ParentReference{Name: workloadKey.Name},
 			Component: v1beta1.EngineComponent,
 			Runners:   []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1}},
 		},

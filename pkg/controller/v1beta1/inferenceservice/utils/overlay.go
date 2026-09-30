@@ -43,7 +43,7 @@ func ResolveOverlays(cl client.Client, isvc *v1beta1.InferenceService) ([]Resolv
 
 		spec, modelMeta, status, err := GetBaseModelWithStatus(cl, ref.Name, isvc.Namespace)
 		if err != nil {
-			if isModelNotFoundError(err) {
+			if IsModelNotFoundError(err) {
 				resolved.SkipReason = fmt.Sprintf("overlay %q not found", ref.Name)
 				out = append(out, resolved)
 				continue
@@ -80,8 +80,4 @@ func OverlayMountPath(modelName string) string {
 
 func sanitizeOverlayName(name string) string {
 	return strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-}
-
-func isModelNotFoundError(err error) bool {
-	return err != nil && strings.HasPrefix(err.Error(), "No BaseModel or ClusterBaseModel with the name:")
 }

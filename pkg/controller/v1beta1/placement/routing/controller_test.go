@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -63,9 +64,8 @@ func splitISVC(clusters []string, admitted, ready []int32) *v1beta1.InferenceSer
 	return &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: testName, Namespace: testNS, UID: "uid-1", Generation: 7},
 		Spec: v1beta1.InferenceServiceSpec{
-			Placement: &v1beta1.PlacementSpec{
-				Mode:         v1beta1.PlacementModeSplit,
-				Requirements: "gpu=tpu",
+			Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
+				Mode: v1beta1.PlacementModeSplit,
 			},
 		},
 		Status: v1beta1.InferenceServiceStatus{
@@ -367,24 +367,45 @@ func TestReconcile_NonPlacementISVCDoesNotCreateTrafficMap(t *testing.T) {
 	assert.False(t, exists)
 }
 
-func TestReconcile_LegacyAnnotationPlacementCreatesSingleModeMap(t *testing.T) {
-	isvc := splitISVC([]string{"a"}, []int32{3}, []int32{3})
-	isvc.Spec.Placement = nil
-	isvc.Annotations = map[string]string{"ome.io/accelerator-requirements": "gpu=tpu"}
-	isvc.Status.Placement.Cluster = "legacy-home"
-	isvc.Status.Placement.Endpoint = apis.HTTPS("legacy.example")
-	isvc.Status.Placement.Candidates = nil
-	r, c := newReconciler(t, controllerTestConfig(), isvc)
-
-	reconcile(t, r)
-
-	tm, exists := getTrafficMap(t, c)
-	require.True(t, exists)
-	assert.Equal(t, v1beta1.PlacementModeSingle, tm.Spec.Mode)
-	require.Len(t, tm.Spec.Entries, 1)
-	assert.Equal(t, "legacy-home", tm.Spec.Entries[0].Cluster)
-	assert.Equal(t, "legacy.example", tm.Spec.Entries[0].Endpoint.Host)
-	assert.Equal(t, int32(1), tm.Spec.Entries[0].Weight)
+func TestReconcile_ObsoletePlacementIntentPreservesTrafficMap(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		edit func(*v1beta1.InferenceService)
+	}{
+		{name: "legacy annotation", edit: func(source *v1beta1.InferenceService) {
+			source.Annotations = map[string]string{"ome.io/accelerator-requirements": "accelerator=gpu"}
+		}},
+		{name: "empty legacy annotation", edit: func(source *v1beta1.InferenceService) {
+			source.Annotations = map[string]string{"ome.io/cluster-selector": ""}
+		}},
+		{name: "legacy traffic factors", edit: func(source *v1beta1.InferenceService) {
+			source.Spec.Placement.CapacityFactors = map[string]resource.Quantity{"a": resource.MustParse("2")}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := splitISVC([]string{"a"}, []int32{3}, []int32{3})
+			r, c := newReconciler(t, controllerTestConfig(), source)
+			reconcile(t, r)
+			before, exists := getTrafficMap(t, c)
+			if !exists {
+				t.Fatal("expected standing traffic map")
+			}
+			tt.edit(source)
+			if err := c.Update(t.Context(), source); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(source)}); err == nil {
+				t.Fatal("obsolete intent was accepted")
+			}
+			after, exists := getTrafficMap(t, c)
+			if !exists {
+				t.Fatal("invalid intent removed standing traffic")
+			}
+			if diff := cmp.Diff(before, after); diff != "" {
+				t.Errorf("traffic changed (-want +got):\n%s", diff)
+			}
+		})
+	}
 }
 
 func TestReconcile_DisabledReapsExistingTrafficMap(t *testing.T) {
@@ -1687,7 +1708,7 @@ func TestReconcile_ValidatesCompleteRoutingPolicyBeforeObservation(t *testing.T)
 				//nolint:staticcheck // exercises rejection of the deprecated compatibility field
 				isvc.Spec.Placement.CapacityFactors = map[string]resource.Quantity{"a": resource.MustParse("1")}
 			},
-			wantErr: "must not both be set",
+			wantErr: "capacityFactors are unsupported",
 		},
 		{
 			name: "non-positive routing capacity factor",
@@ -2031,34 +2052,6 @@ func TestReconcile_UpdatesExistingTrafficMapOnReadyReplicaChange(t *testing.T) {
 	assert.Equal(t, int32(1), tm.Spec.Entries[1].Weight)
 }
 
-func TestReconcile_CapacityFactorWeightsHomes(t *testing.T) {
-	// Two homes with equal admitted+ready replicas: without factors they would
-	// weight 1:1. A per-cluster factor of 2 on "a" doubles its share -> 2:1.
-	isvc := splitISVC([]string{"a", "b"}, []int32{5, 5}, []int32{5, 5})
-	//nolint:staticcheck // compatibility coverage for deprecated spec.placement.capacityFactors
-	isvc.Spec.Placement.CapacityFactors = map[string]resource.Quantity{
-		"a": resource.MustParse("2"),
-	}
-	r, c := newReconciler(t, controllerTestConfig(), isvc)
-
-	reconcile(t, r)
-
-	tm, ok := getTrafficMap(t, c)
-	require.True(t, ok)
-	require.Len(t, tm.Spec.Entries, 2)
-
-	assert.Equal(t, "a", tm.Spec.Entries[0].Cluster)
-	assert.Equal(t, int32(2), tm.Spec.Entries[0].Weight, "factor-2 home carries double the share")
-	require.NotNil(t, tm.Spec.Entries[0].Capacity)
-	require.NotNil(t, tm.Spec.Entries[0].Capacity.Factor, "factor recorded as provenance")
-	assert.Equal(t, "2", tm.Spec.Entries[0].Capacity.Factor.String())
-
-	assert.Equal(t, "b", tm.Spec.Entries[1].Cluster)
-	assert.Equal(t, int32(1), tm.Spec.Entries[1].Weight)
-	require.NotNil(t, tm.Spec.Entries[1].Capacity)
-	assert.Nil(t, tm.Spec.Entries[1].Capacity.Factor, "home absent from map uses the identity factor")
-}
-
 func TestReconcile_RoutingCapacityFactorWeightsHomes(t *testing.T) {
 	// The routing-level factor is the canonical field.
 	isvc := splitISVC([]string{"a", "b"}, []int32{5, 5}, []int32{5, 5})
@@ -2085,10 +2078,9 @@ func TestReconcile_FractionalCapacityFactor(t *testing.T) {
 	// "500m" halves a home's per-replica capacity: a(4 replicas)*0.5 vs b(4)*1
 	// -> 2:4 -> reduced 1:2.
 	isvc := splitISVC([]string{"a", "b"}, []int32{4, 4}, []int32{4, 4})
-	//nolint:staticcheck // compatibility coverage for deprecated spec.placement.capacityFactors
-	isvc.Spec.Placement.CapacityFactors = map[string]resource.Quantity{
+	isvc.Spec.Routing = &v1beta1.RoutingSpec{CapacityFactors: map[string]resource.Quantity{
 		"a": resource.MustParse("500m"),
-	}
+	}}
 	r, c := newReconciler(t, controllerTestConfig(), isvc)
 
 	reconcile(t, r)
@@ -2193,11 +2185,11 @@ func TestRoutingTableChangePredicate(t *testing.T) {
 		assert.True(t, routingTableChange.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: nw}))
 	})
 
-	t.Run("capacity factor change is admitted", func(t *testing.T) {
+	t.Run("obsolete factors do not change traffic", func(t *testing.T) {
 		nw := base.DeepCopy()
 		//nolint:staticcheck // compatibility coverage for deprecated spec.placement.capacityFactors
 		nw.Spec.Placement.CapacityFactors = map[string]resource.Quantity{"a": resource.MustParse("2")}
-		assert.True(t, routingTableChange.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: nw}))
+		assert.False(t, routingTableChange.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: nw}))
 	})
 
 	t.Run("routing capacity factor change is admitted", func(t *testing.T) {
@@ -2239,7 +2231,7 @@ func TestRoutingTableChangePredicate(t *testing.T) {
 		old := base.DeepCopy()
 		old.Spec.Placement.Mode = v1beta1.PlacementModeSingle
 		nw := old.DeepCopy()
-		nw.Spec.Placement.Requirements = ""
+		nw.Spec.Placement = nil
 		assert.True(t, routingTableChange.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: nw}))
 	})
 }

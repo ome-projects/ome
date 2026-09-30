@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 func sourceFixture() *v1beta1.InferenceService {
 	return &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "team-a", UID: "source-a", Generation: 1},
-		Spec:       v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeSplit}},
+		Spec:       v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSplit}},
 	}
 }
 
@@ -36,7 +37,12 @@ func proposalFixture() Proposal {
 }
 
 func capacityFixture() *v1beta1.PlacementCapacitySample {
-	return &v1beta1.PlacementCapacitySample{DemandFingerprint: "demand-a", Replicas: 4, Pools: []v1beta1.PlacementCapacityPool{{
+	return &v1beta1.PlacementCapacitySample{DemandFingerprint: strings.Repeat("a", 64), DemandContract: &v1beta1.PlacementDemandContract{
+		Fingerprint: strings.Repeat("a", 64), Components: []v1beta1.PlacementComponentDemand{
+			{Component: v1beta1.EngineComponent, RenderingHash: strings.Repeat("b", 64)},
+			{Component: v1beta1.DecoderComponent, RenderingHash: strings.Repeat("c", 64)},
+		},
+	}, Replicas: 4, Pools: []v1beta1.PlacementCapacityPool{{
 		ResourceName: "nvidia.com/gpu", ResourceFlavor: "gpu-a", Demand: 2, Allocatable: 8,
 		ObservedAt: metav1.NewTime(time.Unix(100, 0).UTC()), ReportUID: "report-a", ReportResourceVersion: "1",
 		Attribution: v1beta1.AcceleratorCapacityAttribution{FlavorUID: "flavor-a", FlavorSetHash: "mapping-a", Complete: true},

@@ -44,7 +44,7 @@ func scaleCurrentFixture() (*ome.InferenceService, *ome.InferenceReplica) {
 			Annotations:     map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "7"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}},
 		},
-		Spec: ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent, Replicas: &count},
+		Spec: ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent, Replicas: &count},
 		Status: ome.InferenceReplicaStatus{ObservedGeneration: 2, Replicas: 2, ReadyReplicas: 1,
 			InstanceStatuses: []ome.OMENativeInstanceStatus{{Index: 0, Phase: ome.OMENativeInstanceReady}, {Index: 1, Phase: ome.OMENativeInstanceCreating}}},
 	}

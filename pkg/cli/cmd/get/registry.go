@@ -700,7 +700,12 @@ var inferenceReplicasEntry = &entry{
 	Columns: []column{
 		{Name: "NAME", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return r.Name })},
 		{Name: "COMPONENT", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return printers.OrDash(string(r.Spec.Component)) })},
-		{Name: "PARENT", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return printers.OrDash(r.Spec.ParentRef.Name) })},
+		{Name: "PARENT", Extract: safeCol(func(r *v1beta1.InferenceReplica) string {
+			if r.Spec.ParentRef == nil {
+				return printers.OrDash("")
+			}
+			return printers.OrDash(r.Spec.ParentRef.Name)
+		})},
 		{Name: "DESIRED", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return int32OrDash(r.Spec.Replicas) })},
 		{Name: "CURRENT", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return fmt.Sprintf("%d", r.Status.Replicas) })},
 		{Name: "READY", Extract: safeCol(func(r *v1beta1.InferenceReplica) string { return fmt.Sprintf("%d", r.Status.ReadyReplicas) })},

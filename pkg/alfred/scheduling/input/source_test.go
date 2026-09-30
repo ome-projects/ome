@@ -56,7 +56,7 @@ func TestSyntheticIdentityAvoidsColumnarStatusOnlyIndex(t *testing.T) {
 	members := []podMember{{pod: *readySourcePod("source", "source-uid", "source-a", v1beta1.RunnerNameDefault, 0, "default-scheduler"), incarnation: 7}}
 	snap := &Snapshot{ID: "fixed-snapshot", InferenceReplicas: []v1beta1.InferenceReplica{{
 		ObjectMeta: metav1.ObjectMeta{Namespace: source.Namespace},
-		Spec:       v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: source.InferenceService}, Component: source.Component},
+		Spec:       v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: source.InferenceService}, Component: source.Component},
 	}}}
 	first, err := newSyntheticIdentity(snap, source, members, "request")
 	if err != nil {
@@ -442,7 +442,7 @@ func TestSyntheticInstanceIdentityAvoidsLiveCohortIndexes(t *testing.T) {
 	members := []podMember{{pod: *readySourcePod("source", "source-uid", "source-a", v1beta1.RunnerNameDefault, 0, "default-scheduler"), incarnation: 7}}
 	snap := &Snapshot{ID: "fixed-snapshot", InferenceReplicas: []v1beta1.InferenceReplica{{
 		ObjectMeta: metav1.ObjectMeta{Namespace: source.Namespace},
-		Spec:       v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: source.InferenceService}, Component: source.Component},
+		Spec:       v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: source.InferenceService}, Component: source.Component},
 		Status:     v1beta1.InferenceReplicaStatus{InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: source.Instance}}},
 	}}}
 	first, err := newSyntheticIdentity(snap, source, members, "request")
@@ -753,7 +753,7 @@ func baseSourceObjects(runners []v1beta1.Runner, count int32) ([]client.Object, 
 			Namespace: "team", Name: "svc-engine", UID: testIRUID, Generation: 3, ResourceVersion: "12",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceService", Name: "svc", UID: testISVCUID, Controller: ptr.To(true)}},
 		},
-		Spec: v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: "svc"}, Component: v1beta1.EngineComponent, Runners: runners},
+		Spec: v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: "svc"}, Component: v1beta1.EngineComponent, Runners: runners},
 		Status: v1beta1.InferenceReplicaStatus{
 			ObservedGeneration: 3, Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1, AvailableReplicas: 1,
 			CurrentRevision: "svc-engine-rev-a", UpdateRevision: "svc-engine-rev-a",

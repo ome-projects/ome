@@ -479,22 +479,11 @@ func podReadyAndServing(pod *corev1.Pod) bool {
 }
 
 // dropCanaryOwned removes Components driven by a canary group from comps. Those
-// Components belong to the canary engine (canary.Dispatch), which owns their
-// per-revision Services and traffic status; coordination must not touch them.
+// Components, the group's primary and its secondaries alike, belong to the
+// canary engine (canary.Dispatch), which owns their per-revision Services and
+// traffic status; coordination must not touch them.
 func dropCanaryOwned(comps []v1beta1.ComponentType, isvc *v1beta1.InferenceService) []v1beta1.ComponentType {
-	owned := map[v1beta1.ComponentType]struct{}{}
-	for _, g := range isvc.Spec.GetRolloutGroups() {
-		// Declared kind, not an inline body: this reads the raw spec, where a
-		// policyRef-canary group carries no inline arm. Missing it leaves the
-		// Component in coordination's pod-proportional traffic writer, which
-		// then overwrites the canary's explicit step weight every reconcile.
-		if g.DeclaredProgression() != v1beta1.RolloutProgressionCanary {
-			continue
-		}
-		for _, c := range g.Components {
-			owned[c] = struct{}{}
-		}
-	}
+	owned := rollout.CanaryOwnedComponents(isvc)
 	if len(owned) == 0 {
 		return comps
 	}

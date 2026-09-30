@@ -3,11 +3,14 @@ package placement
 import (
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -138,7 +141,7 @@ func TestDeriveISVC_StripsRoutingDirectives(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "uid-123"},
 		Spec: v1beta1.InferenceServiceSpec{
 			Engine: &v1beta1.EngineSpec{},
-			Placement: &v1beta1.PlacementSpec{
+			Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
 				Mode: v1beta1.PlacementModeAll,
 				CapacityFactors: map[string]resource.Quantity{ //nolint:staticcheck // Exercise the supported legacy alias.
 					"cluster-a": resource.MustParse("2"),
@@ -161,41 +164,47 @@ func TestDeriveISVC_StripsRoutingDirectives(t *testing.T) {
 	assert.Equal(t, wantSource, src, "derivation must not mutate the source ISVC")
 }
 
-func TestSetDerivedReplicas(t *testing.T) {
-	newISVC := func(engMax int, withDecoder bool) *v1beta1.InferenceService {
-		i := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
-			Engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: engMax}},
-		}}
-		if withDecoder {
-			i.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: engMax}}
-		}
-		return i
+func TestSetPlannedReplicas(t *testing.T) {
+	for _, tt := range []struct {
+		name                 string
+		floor, cap           int32
+		maximum, wantMaximum int
+	}{
+		{name: "explicit cap", floor: 1, cap: 2, maximum: 9, wantMaximum: 2},
+		{name: "component maximum", floor: 2, maximum: 5, wantMaximum: 5},
+		{name: "floor exceeds explicit maximum", floor: 3, maximum: 1, wantMaximum: 3},
+		{name: "omitted maximum permits runtime inheritance", floor: 2},
+		{name: "retained floor exceeds reduced cap", floor: 3, cap: 1, maximum: 5, wantMaximum: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			member := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
+				Engine:  &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: tt.maximum}},
+				Decoder: &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: tt.maximum}},
+				Router:  &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1), MaxReplicas: 7}},
+			}}
+			router := member.Spec.Router.DeepCopy()
+			setPlannedReplicas(member, tt.floor, tt.cap)
+			want := v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(int(tt.floor)), MaxReplicas: tt.wantMaximum}
+			for _, got := range []v1beta1.ComponentExtensionSpec{member.Spec.Engine.ComponentExtensionSpec, member.Spec.Decoder.ComponentExtensionSpec} {
+				if diff := cmp.Diff(want, got); diff != "" {
+					t.Error(diff)
+				}
+			}
+			if diff := cmp.Diff(router, member.Spec.Router); diff != "" {
+				t.Error(diff)
+			}
+			if tt.maximum == 0 {
+				runtime := &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: 9}}
+				merged, err := isvcutils.MergeEngineSpec(member.Spec.Engine, runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diff := cmp.Diff(9, merged.MaxReplicas); diff != "" {
+					t.Error(diff)
+				}
+			}
+		})
 	}
-
-	// maxPer > 0: the cap is the hard per-cluster ceiling on every scaled
-	// component — clamping the declared MaxReplicas DOWN — while Min is this
-	// home's apportioned share. A PD pair is capped 1:1.
-	d := newISVC(9, true)
-	setDerivedReplicas(d, 1, 2)
-	require.NotNil(t, d.Spec.Engine.MinReplicas)
-	assert.Equal(t, 1, *d.Spec.Engine.MinReplicas)
-	assert.Equal(t, 2, d.Spec.Engine.MaxReplicas, "cap clamps the ceiling down from 9")
-	require.NotNil(t, d.Spec.Decoder.MinReplicas)
-	assert.Equal(t, 1, *d.Spec.Decoder.MinReplicas)
-	assert.Equal(t, 2, d.Spec.Decoder.MaxReplicas, "decoder capped 1:1 with engine")
-
-	// maxPer <= 0 (no cap declared): the component's own MaxReplicas stands.
-	d = newISVC(5, false)
-	setDerivedReplicas(d, 2, 0)
-	assert.Equal(t, 2, *d.Spec.Engine.MinReplicas)
-	assert.Equal(t, 5, d.Spec.Engine.MaxReplicas, "uncapped -> declared ceiling preserved")
-
-	// maxPer <= 0 and the share exceeds the declared ceiling: raise Max to keep
-	// Max >= Min (the request must be honorable).
-	d = newISVC(1, false)
-	setDerivedReplicas(d, 3, 0)
-	assert.Equal(t, 3, *d.Spec.Engine.MinReplicas)
-	assert.Equal(t, 3, d.Spec.Engine.MaxReplicas, "uncapped -> Max raised to keep Max >= Min")
 }
 
 // The queue a derived workload joins is operator-configurable: a per-ISVC

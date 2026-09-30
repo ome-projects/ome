@@ -23,7 +23,7 @@ import (
 // one that spells them out.
 func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec, observed types.WorkloadObservedState) (types.ComponentPlan, error) {
 	replicas := desired.Replicas
-	if replicas <= 0 {
+	if replicas < 0 || (replicas == 0 && !desired.AllowZeroReplicas) {
 		replicas = 1
 	}
 

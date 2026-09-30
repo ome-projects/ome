@@ -27,7 +27,7 @@ func scaleEvidence(spec, current, ready int32) waitscale.Evidence {
 		ObjectMeta: metav1.ObjectMeta{Name: "chat-engine", Namespace: "prod", UID: types.UID("engine-uid"), ResourceVersion: "12", Generation: 2,
 			Annotations:     map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: strconv.FormatInt(parent.Generation, 10)},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}}},
-		Spec:   ome.InferenceReplicaSpec{ParentRef: ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent, Replicas: &spec},
+		Spec:   ome.InferenceReplicaSpec{ParentRef: &ome.ParentReference{Name: "chat"}, Component: ome.EngineComponent, Replicas: &spec},
 		Status: ome.InferenceReplicaStatus{ObservedGeneration: 2, Replicas: current, ReadyReplicas: ready, ServingReplicas: ready, AvailableReplicas: ready},
 	}
 	for i := int32(0); i < current; i++ {

@@ -13,13 +13,14 @@ import (
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 )
 
-// DefaultRuntimeFetcher implements RuntimeFetcher using the controller-runtime client.
-// It leverages the client's built-in caching for efficient runtime retrieval.
+// DefaultRuntimeFetcher implements RuntimeFetcher over a controller-runtime
+// reader: the manager's cached client in a controller, the uncached API
+// reader in a webhook.
 type DefaultRuntimeFetcher struct {
-	client client.Client
+	client client.Reader
 }
 
-func NewDefaultRuntimeFetcher(client client.Client) RuntimeFetcher {
+func NewDefaultRuntimeFetcher(client client.Reader) RuntimeFetcher {
 	return &DefaultRuntimeFetcher{
 		client: client,
 	}

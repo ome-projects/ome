@@ -45,9 +45,9 @@ func DetermineEngineDeploymentMode(engine *v1beta1.EngineSpec, specMode *constan
 // DetermineDeploymentModes determines the deployment modes for all components based on their specs.
 // See DetermineEngineDeploymentMode for the precedence chain that also governs Decoder and Router.
 func DetermineDeploymentModes(engine *v1beta1.EngineSpec, decoder *v1beta1.DecoderSpec, router *v1beta1.RouterSpec, runtime *v1beta1.ServingRuntimeSpec, specMode *constants.DeploymentModeType) (engineMode, decoderMode, routerMode constants.DeploymentModeType, err error) {
-	engineMode = determineComponentDeploymentMode(engine, runtime, specMode)
-	decoderMode = determineComponentDeploymentMode(decoder, runtime, specMode)
-	routerMode = determineComponentDeploymentMode(router, runtime, specMode)
+	engineMode = DetermineComponentDeploymentMode(engine, runtime, specMode)
+	decoderMode = DetermineComponentDeploymentMode(decoder, runtime, specMode)
+	routerMode = DetermineComponentDeploymentMode(router, runtime, specMode)
 
 	if engine == nil {
 		return "", "", "", fmt.Errorf("engine component is required")
@@ -56,11 +56,12 @@ func DetermineDeploymentModes(engine *v1beta1.EngineSpec, decoder *v1beta1.Decod
 	return engineMode, decoderMode, routerMode, nil
 }
 
-// determineComponentDeploymentMode determines deployment mode for a generic component.
+// DetermineComponentDeploymentMode determines deployment mode for a generic component
+// (*EngineSpec, *DecoderSpec or *RouterSpec; any other value resolves to RawDeployment).
 // Per-Component annotation > spec.deploymentMode (specMode) > Leader/Worker shape (OMENative) >
 // RawDeployment default. Symmetric for Engine, Decoder, and Router so PD-disaggregated
 // ISVCs can opt each component into OMENative independently.
-func determineComponentDeploymentMode(spec interface{}, runtime *v1beta1.ServingRuntimeSpec, specMode *constants.DeploymentModeType) constants.DeploymentModeType {
+func DetermineComponentDeploymentMode(spec interface{}, runtime *v1beta1.ServingRuntimeSpec, specMode *constants.DeploymentModeType) constants.DeploymentModeType {
 	switch s := spec.(type) {
 	case *v1beta1.EngineSpec:
 		return DetermineEngineDeploymentMode(s, specMode)

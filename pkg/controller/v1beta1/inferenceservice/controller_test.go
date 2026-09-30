@@ -32,7 +32,9 @@ import (
 	"sigs.k8s.io/ome/pkg/acceleratorclassselector"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	omeTesting "sigs.k8s.io/ome/pkg/utils/testing"
 )
@@ -705,7 +707,7 @@ func TestUpdateStatusFlushesCoordinationWrites(t *testing.T) {
 		}},
 	}
 
-	err := reconciler.updateStatus(desired, constants.RawDeployment)
+	err := reconciler.updateStatus(desired, constants.RawDeployment, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
 	// Re-fetch from the fake apiserver and verify both coordination
@@ -824,7 +826,7 @@ func TestUpdateStatusPersistsCanaryStepDespiteStaleCache(t *testing.T) {
 	desired.Status.Canary.CurrentStep = 1
 	desired.Status.Canary.PromotedThrough = canaryHash
 
-	err := reconciler.updateStatus(desired, constants.OMENative)
+	err := reconciler.updateStatus(desired, constants.OMENative, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred(),
 		"status flush must not lose an optimistic-lock race to a concurrent metadata patch")
 
@@ -949,63 +951,6 @@ func determineEngineDeploymentMode(engineSpec *v1beta1.EngineSpec) constants.Dep
 		return constants.MultiNode
 	}
 	return constants.RawDeployment
-}
-
-func TestValidateResolvedRuntimeEnabled(t *testing.T) {
-	disabled := true
-	tests := []struct {
-		name        string
-		runtimeName string
-		runtimeSpec *v1beta1.ServingRuntimeSpec
-		isCluster   bool
-		wantErr     bool
-	}{
-		{
-			name:        "nil runtime spec",
-			runtimeName: "nil-runtime",
-		},
-		{
-			name:        "enabled runtime",
-			runtimeName: "enabled-runtime",
-			runtimeSpec: &v1beta1.ServingRuntimeSpec{},
-		},
-		{
-			name:        "disabled namespaced runtime",
-			runtimeName: "namespaced-runtime",
-			runtimeSpec: &v1beta1.ServingRuntimeSpec{Disabled: &disabled},
-			wantErr:     true,
-		},
-		{
-			name:        "disabled cluster runtime",
-			runtimeName: "cluster-runtime",
-			runtimeSpec: &v1beta1.ServingRuntimeSpec{Disabled: &disabled},
-			isCluster:   true,
-			wantErr:     true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateResolvedRuntimeEnabled(tt.runtimeSpec, tt.runtimeName, tt.isCluster)
-			if !tt.wantErr {
-				if err != nil {
-					t.Fatalf("validateResolvedRuntimeEnabled() error = %v", err)
-				}
-				return
-			}
-
-			var disabledErr *runtimeselector.RuntimeDisabledError
-			if !errors.As(err, &disabledErr) {
-				t.Fatalf("validateResolvedRuntimeEnabled() error = %T, want *runtimeselector.RuntimeDisabledError", err)
-			}
-			if disabledErr.RuntimeName != tt.runtimeName {
-				t.Errorf("RuntimeName = %q, want %q", disabledErr.RuntimeName, tt.runtimeName)
-			}
-			if disabledErr.IsCluster != tt.isCluster {
-				t.Errorf("IsCluster = %t, want %t", disabledErr.IsCluster, tt.isCluster)
-			}
-		})
-	}
 }
 
 func TestEnsureIngressDisableAnnotation(t *testing.T) {
@@ -1366,4 +1311,229 @@ func TestMarkRuntimeUnresolvedEventPreservesPercent(t *testing.T) {
 	default:
 		t.Fatal("expected a RuntimeNotFound event")
 	}
+}
+
+// Every error the named-runtime validation reports, other than the advisory
+// mismatch and a missing runtime, is a validation failure of the service's
+// own configuration; the reason it is reported under must not depend on the
+// error's type.
+func TestReportResolveErrorEvents(t *testing.T) {
+	model := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}}
+	inheritance := fmt.Errorf("fetch parent %q: %w", "parent-a", errors.New("parent runtime not found"))
+	for _, tt := range []struct {
+		name        string
+		runtime     bool
+		model       bool
+		err         error
+		wantReason  string
+		wantMessage string
+	}{
+		{name: "validation error other than not found", runtime: true, model: true, err: inheritance,
+			wantReason: "RuntimeValidationError", wantMessage: "Runtime runtime-a does not support model model-a: fetch parent"},
+		{name: "disabled runtime reported by validation", runtime: true, model: true, err: &runtimeselector.RuntimeDisabledError{RuntimeName: "runtime-a", IsCluster: true},
+			wantReason: "RuntimeValidationError", wantMessage: "Runtime runtime-a does not support model model-a"},
+		{name: "disabled runtime without a model", runtime: true, err: &runtimeselector.RuntimeDisabledError{RuntimeName: "runtime-a", IsCluster: true},
+			wantReason: "RuntimeValidationError", wantMessage: "Runtime runtime-a failed validation"},
+		{name: "runtime read error without a model", runtime: true, err: inheritance,
+			wantReason: "RuntimeFetchError", wantMessage: "fetch parent"},
+		{name: "merge failure", runtime: true, model: true, err: &render.MergeError{Err: errors.New("failed to merge engine specs")},
+			wantReason: "MergeSpecsError", wantMessage: "failed to merge engine specs"},
+		{name: "auto-selection error", model: true, err: errors.New("failed to fetch runtimes"),
+			wantReason: "RuntimeSelectionError", wantMessage: "Failed to find runtime for model model-a: failed to fetch runtimes"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewGomegaWithT(t)
+			isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "team-a"}}
+			in := render.Inputs{Service: isvc}
+			if tt.runtime {
+				isvc.Spec.Runtime = &v1beta1.ServingRuntimeRef{Name: "runtime-a"}
+			}
+			if tt.model {
+				isvc.Spec.Model = &v1beta1.ModelRef{Name: "model-a"}
+				in.Model = model
+			}
+			rec := record.NewFakeRecorder(10)
+			r := &InferenceServiceReconciler{Log: ctrl.Log.WithName("test"), Recorder: rec}
+			_, err := r.reportResolveError(isvc, constants.RawDeployment, in, tt.err)
+			g.Expect(err).To(gomega.HaveOccurred())
+			select {
+			case ev := <-rec.Events:
+				g.Expect(ev).To(gomega.HavePrefix("Warning " + tt.wantReason + " "))
+				g.Expect(ev).To(gomega.ContainSubstring(tt.wantMessage))
+			default:
+				t.Fatalf("expected a %s event", tt.wantReason)
+			}
+		})
+	}
+}
+
+// An applied operator verb is removed only after the status write that
+// carries its effect has landed; when that write fails the annotation stays,
+// and the record in status keeps it inert until a later pass retries.
+func TestFlushStatusThenConsumeOrdersRemovalAfterTheWrite(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(v1beta1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
+	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
+
+	const canaryHash = "bbfb0fd4"
+	nn := types.NamespacedName{Name: "test-isvc", Namespace: "default"}
+	newISVC := func() *v1beta1.InferenceService {
+		return &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nn.Name, Namespace: nn.Namespace,
+				Annotations: map[string]string{constants.RolloutPromoteAnnotation: canaryHash},
+			},
+			Spec: v1beta1.InferenceServiceSpec{
+				Model:  &v1beta1.ModelRef{Name: "base-model", Kind: stringPtr("BaseModel")},
+				Engine: &v1beta1.EngineSpec{},
+			},
+			Status: v1beta1.InferenceServiceStatus{
+				Components: map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{v1beta1.EngineComponent: {}},
+				Canary:     &v1beta1.CanaryStatus{CanaryRevisionHash: canaryHash},
+			},
+		}
+	}
+	// desiredFrom is the in-memory object after a pass applied the promote:
+	// the step advanced, the record stamped, the annotation taken in-memory.
+	desiredFrom := func(live client.Client) *v1beta1.InferenceService {
+		desired := &v1beta1.InferenceService{}
+		g.Expect(live.Get(context.TODO(), nn, desired)).NotTo(gomega.HaveOccurred())
+		delete(desired.Annotations, constants.RolloutPromoteAnnotation)
+		desired.Status.Canary.CurrentStep = 1
+		desired.Status.Canary.PromotedThrough = canaryHash
+		return desired
+	}
+
+	t.Run("the write lands, then the verb is removed", func(t *testing.T) {
+		isvc := newISVC()
+		live := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc).WithStatusSubresource(isvc).Build()
+		reconciler := &InferenceServiceReconciler{Client: live, APIReader: live, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
+		err := reconciler.flushStatusThenConsume(context.TODO(), desiredFrom(live), constants.OMENative, []string{constants.RolloutPromoteAnnotation}, nil)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		persisted := &v1beta1.InferenceService{}
+		g.Expect(live.Get(context.TODO(), nn, persisted)).NotTo(gomega.HaveOccurred())
+		g.Expect(persisted.Status.Canary.CurrentStep).To(gomega.Equal(int32(1)))
+		g.Expect(persisted.Status.Canary.PromotedThrough).To(gomega.Equal(canaryHash))
+		g.Expect(persisted.Annotations).NotTo(gomega.HaveKey(constants.RolloutPromoteAnnotation))
+	})
+
+	t.Run("the write fails, the verb stays", func(t *testing.T) {
+		isvc := newISVC()
+		live := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc).WithStatusSubresource(isvc).Build()
+		failing := interceptor.NewClient(live, interceptor.Funcs{
+			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+				return errors.New("status write refused")
+			},
+		})
+		reconciler := &InferenceServiceReconciler{Client: failing, APIReader: live, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
+		err := reconciler.flushStatusThenConsume(context.TODO(), desiredFrom(live), constants.OMENative, []string{constants.RolloutPromoteAnnotation}, nil)
+		g.Expect(err).To(gomega.HaveOccurred())
+		persisted := &v1beta1.InferenceService{}
+		g.Expect(live.Get(context.TODO(), nn, persisted)).NotTo(gomega.HaveOccurred())
+		g.Expect(persisted.Annotations).To(gomega.HaveKeyWithValue(constants.RolloutPromoteAnnotation, canaryHash),
+			"a verb must outlive a lost status write so the next pass can apply it again")
+		g.Expect(persisted.Status.Canary.CurrentStep).To(gomega.Equal(int32(0)))
+	})
+}
+
+// The canary executor's record is written only by a pass that read its
+// current value. A pass that read a stale copy keeps the live record, phase
+// and traffic, leaves the verbs it took in place and reports the staleness so
+// it requeues; a pass that read the current record writes its decision.
+func TestUpdateStatusKeepsTheLiveCanaryRecordOverAStalePass(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(v1beta1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
+	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
+
+	nn := types.NamespacedName{Name: "stale-isvc", Namespace: "default"}
+	statusWith := func(cs *v1beta1.CanaryStatus, phase v1beta1.RolloutPhase) v1beta1.InferenceServiceStatus {
+		return v1beta1.InferenceServiceStatus{
+			Canary: cs.DeepCopy(),
+			Components: map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+				v1beta1.EngineComponent: {Canary: cs.DeepCopy(), RolloutPhase: phase},
+			},
+		}
+	}
+	newLive := func(status v1beta1.InferenceServiceStatus, annotations map[string]string) (client.Client, *InferenceServiceReconciler) {
+		isvc := &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: nn.Name, Namespace: nn.Namespace, Annotations: annotations},
+			Spec:       v1beta1.InferenceServiceSpec{Model: &v1beta1.ModelRef{Name: "base-model", Kind: stringPtr("BaseModel")}, Engine: &v1beta1.EngineSpec{}},
+			Status:     status,
+		}
+		live := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc).WithStatusSubresource(isvc).Build()
+		return live, &InferenceServiceReconciler{Client: live, APIReader: live, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
+	}
+	persisted := func(live client.Client) *v1beta1.InferenceService {
+		got := &v1beta1.InferenceService{}
+		g.Expect(live.Get(context.TODO(), nn, got)).NotTo(gomega.HaveOccurred())
+		return got
+	}
+	engine := func(isvc *v1beta1.InferenceService) v1beta1.ComponentStatusSpec {
+		return isvc.Status.Components[v1beta1.EngineComponent]
+	}
+
+	t.Run("a rollback record outlives a pass that read the object before it", func(t *testing.T) {
+		g := gomega.NewGomegaWithT(t)
+		live, reconciler := newLive(
+			statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", RolledBackRevisionHash: "new"}, v1beta1.RolloutPhaseRollingBack),
+			map[string]string{constants.RolloutRollbackAnnotation: "true"})
+		// The pass read the object while the canary was still serving, then
+		// re-armed toward a new target and read the request against it.
+		working := persisted(live)
+		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old"}, v1beta1.RolloutPhasePaused)
+		base := canary.NewBase(working)
+		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "v3", StableRevisionHash: "old", RolledBackRevisionHash: "v3"}, v1beta1.RolloutPhaseRollingBack)
+		entry := engine(working)
+		entry.LatestReadyRevision = "rev-new"
+		working.Status.Components[v1beta1.EngineComponent] = entry
+
+		g.Expect(reconciler.updateStatus(working, constants.OMENative, base)).NotTo(gomega.HaveOccurred())
+		g.Expect(base.Stale()).To(gomega.BeTrue(), "a pass that read a stale record must report it")
+		got := persisted(live)
+		g.Expect(engine(got).Canary.CanaryRevisionHash).To(gomega.Equal("new"))
+		g.Expect(engine(got).Canary.RolledBackRevisionHash).To(gomega.Equal("new"))
+		g.Expect(engine(got).RolloutPhase).To(gomega.Equal(v1beta1.RolloutPhaseRollingBack))
+		g.Expect(got.Status.Canary.RolledBackRevisionHash).To(gomega.Equal("new"))
+		g.Expect(engine(got).LatestReadyRevision).To(gomega.Equal("rev-new"), "state the executor does not own is still written")
+		g.Expect(engine(working).Canary.RolledBackRevisionHash).To(gomega.Equal("new"), "the working copy is re-synced to the live record")
+	})
+
+	t.Run("a verb a stale pass took stays for the next pass", func(t *testing.T) {
+		g := gomega.NewGomegaWithT(t)
+		live, reconciler := newLive(
+			statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", ObservedTrafficWeight: 50}, v1beta1.RolloutPhasePaused),
+			map[string]string{constants.RolloutPromoteAnnotation: "new"})
+		working := persisted(live)
+		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old"}, v1beta1.RolloutPhasePending)
+		base := canary.NewBase(working)
+		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", CurrentStep: 1, PromotedThrough: "new"}, v1beta1.RolloutPhasePending)
+		delete(working.Annotations, constants.RolloutPromoteAnnotation)
+
+		g.Expect(reconciler.flushStatusThenConsume(context.TODO(), working, constants.OMENative, []string{constants.RolloutPromoteAnnotation}, base)).NotTo(gomega.HaveOccurred())
+		got := persisted(live)
+		g.Expect(engine(got).Canary.CurrentStep).To(gomega.Equal(int32(0)))
+		g.Expect(engine(got).Canary.PromotedThrough).To(gomega.BeEmpty())
+		g.Expect(got.Annotations).To(gomega.HaveKeyWithValue(constants.RolloutPromoteAnnotation, "new"),
+			"a verb taken by a decision that was not written must stay")
+	})
+
+	t.Run("a pass that read the current record writes its decision and takes its verb", func(t *testing.T) {
+		g := gomega.NewGomegaWithT(t)
+		live, reconciler := newLive(
+			statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", ObservedTrafficWeight: 50}, v1beta1.RolloutPhasePaused),
+			map[string]string{constants.RolloutPromoteAnnotation: "new"})
+		working := persisted(live)
+		base := canary.NewBase(working)
+		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", ObservedTrafficWeight: 50, CurrentStep: 1, PromotedThrough: "new"}, v1beta1.RolloutPhasePending)
+		delete(working.Annotations, constants.RolloutPromoteAnnotation)
+
+		g.Expect(reconciler.flushStatusThenConsume(context.TODO(), working, constants.OMENative, []string{constants.RolloutPromoteAnnotation}, base)).NotTo(gomega.HaveOccurred())
+		g.Expect(base.Stale()).To(gomega.BeFalse())
+		got := persisted(live)
+		g.Expect(engine(got).Canary.CurrentStep).To(gomega.Equal(int32(1)))
+		g.Expect(engine(got).Canary.PromotedThrough).To(gomega.Equal("new"))
+		g.Expect(got.Annotations).NotTo(gomega.HaveKey(constants.RolloutPromoteAnnotation))
+	})
 }

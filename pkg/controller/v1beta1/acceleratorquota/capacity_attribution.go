@@ -2,9 +2,6 @@ package acceleratorquota
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"maps"
 	"slices"
 
@@ -27,12 +24,7 @@ func attributeCapacity(observed capacity.Result, flavors []capacity.Flavor, reso
 			flavors[i].NodeLabels = nil
 		}
 	}
-	encoded, _ := json.Marshal(struct {
-		Resources []string
-		Flavors   []capacity.Flavor
-	}{resources, flavors})
-	sum := sha256.Sum256(encoded)
-	fingerprint := hex.EncodeToString(sum[:])
+	fingerprint := capacity.MappingFingerprint(resources, flavors)
 	incomplete := map[string]bool{}
 	for _, missing := range observed.Unattributed {
 		incomplete[missing.ResourceName] = true

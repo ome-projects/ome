@@ -155,33 +155,136 @@ spec:
                       - type: string
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
+                    nullable: true
                     type: object
+                  clusterAffinity:
+                    items:
+                      properties:
+                        matchExpressions:
+                          items:
+                            properties:
+                              key:
+                                minLength: 1
+                                type: string
+                              operator:
+                                enum:
+                                - In
+                                - NotIn
+                                - Exists
+                                - DoesNotExist
+                                - Gt
+                                - Lt
+                                type: string
+                              values:
+                                items:
+                                  type: string
+                                maxItems: 64
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          maxItems: 64
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchFields:
+                          items:
+                            properties:
+                              key:
+                                minLength: 1
+                                type: string
+                              operator:
+                                enum:
+                                - In
+                                - NotIn
+                                - Exists
+                                - DoesNotExist
+                                - Gt
+                                - Lt
+                                type: string
+                              values:
+                                items:
+                                  type: string
+                                maxItems: 64
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          maxItems: 64
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        weight:
+                          format: int32
+                          maximum: 100
+                          minimum: 1
+                          type: integer
+                      type: object
+                      x-kubernetes-validations:
+                      - message: a cluster affinity term must contain a requirement
+                        rule: (has(self.matchExpressions) && size(self.matchExpressions)
+                          > 0) || (has(self.matchFields) && size(self.matchFields)
+                          > 0)
+                    maxItems: 64
+                    minItems: 1
+                    nullable: true
+                    type: array
+                    x-kubernetes-list-type: atomic
                   clusterSelector:
+                    nullable: true
                     type: string
+                  maxSurge:
+                    format: int32
+                    minimum: 0
+                    type: integer
                   mode:
-                    default: Single
                     enum:
                     - Single
                     - All
                     - Split
+                    - SplitByCapacity
                     type: string
+                  policy:
+                    enum:
+                    - Legacy
+                    - ClusterAffinity
+                    type: string
+                  replacementTimeout:
+                    type: string
+                    x-kubernetes-validations:
+                    - message: replacementTimeout must be a positive duration
+                      rule: duration(self) > duration('0s')
                   requirements:
+                    nullable: true
                     type: string
                   split:
                     properties:
                       maxReplicasPerCluster:
                         format: int32
+                        minimum: 0
                         type: integer
                       minReplicasPerCluster:
                         format: int32
+                        nullable: true
                         type: integer
                       replicas:
                         format: int32
+                        minimum: 1
                         type: integer
                       spread:
+                        nullable: true
                         type: boolean
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: ClusterAffinity requires an explicit mode
+                  rule: '!has(self.policy) || self.policy != ''ClusterAffinity'' ||
+                    has(self.mode)'
+                - message: replacementTimeout requires ClusterAffinity Single placement
+                  rule: '!has(self.replacementTimeout) || (has(self.policy) && self.policy
+                    == ''ClusterAffinity'' && has(self.mode) && self.mode == ''Single'')'
               rollout:
                 properties:
                   groupOrdering:
@@ -934,6 +1037,11 @@ spec:
                 must not both be set
               rule: '!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement)
                 && has(self.placement.capacityFactors))'
+            - message: ClusterAffinity placement policy cannot be removed; drain and
+                recreate the service to use Legacy
+              rule: '!has(oldSelf.placement) || !has(oldSelf.placement.policy) ||
+                oldSelf.placement.policy != ''ClusterAffinity'' || (has(self.placement)
+                && has(self.placement.policy) && self.placement.policy == ''ClusterAffinity'')'
           status:
             properties:
               address:
@@ -972,9 +1080,26 @@ spec:
                     type: integer
                   canaryRevisionHash:
                     type: string
+                  capacityWaitSince:
+                    format: date-time
+                    type: string
                   currentStep:
                     format: int32
                     type: integer
+                  failed:
+                    properties:
+                      reason:
+                        enum:
+                        - CapacityTimeout
+                        - AnalysisStalled
+                        - StableRevisionMissing
+                        type: string
+                      time:
+                        format: date-time
+                        type: string
+                    required:
+                    - reason
+                    type: object
                   lastConclusiveEvaluationTime:
                     format: date-time
                     type: string
@@ -1144,9 +1269,26 @@ spec:
                           type: integer
                         canaryRevisionHash:
                           type: string
+                        capacityWaitSince:
+                          format: date-time
+                          type: string
                         currentStep:
                           format: int32
                           type: integer
+                        failed:
+                          properties:
+                            reason:
+                              enum:
+                              - CapacityTimeout
+                              - AnalysisStalled
+                              - StableRevisionMissing
+                              type: string
+                            time:
+                              format: date-time
+                              type: string
+                          required:
+                          - reason
+                          type: object
                         lastConclusiveEvaluationTime:
                           format: date-time
                           type: string
@@ -1571,6 +1713,36 @@ spec:
                           properties:
                             capacity:
                               properties:
+                                demandContract:
+                                  properties:
+                                    components:
+                                      items:
+                                        properties:
+                                          component:
+                                            enum:
+                                            - engine
+                                            - decoder
+                                            type: string
+                                          renderingHash:
+                                            pattern: ^[a-f0-9]{64}$
+                                            type: string
+                                        required:
+                                        - component
+                                        - renderingHash
+                                        type: object
+                                      maxItems: 2
+                                      minItems: 1
+                                      type: array
+                                      x-kubernetes-list-map-keys:
+                                      - component
+                                      x-kubernetes-list-type: map
+                                    fingerprint:
+                                      pattern: ^[a-f0-9]{64}$
+                                      type: string
+                                  required:
+                                  - components
+                                  - fingerprint
+                                  type: object
                                 demandFingerprint:
                                   type: string
                                 pools:
@@ -1638,15 +1810,83 @@ spec:
                               type: object
                             clusterUID:
                               type: string
+                            currentHome:
+                              properties:
+                                inputDigest:
+                                  type: string
+                                replicaFloors:
+                                  items:
+                                    properties:
+                                      component:
+                                        enum:
+                                        - engine
+                                        - decoder
+                                        - router
+                                        type: string
+                                      replicas:
+                                        format: int32
+                                        minimum: 0
+                                        type: integer
+                                    required:
+                                    - component
+                                    - replicas
+                                    type: object
+                                  maxItems: 3
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-map-keys:
+                                  - component
+                                  x-kubernetes-list-type: map
+                              required:
+                              - inputDigest
+                              - replicaFloors
+                              type: object
                             currentReplicas:
                               format: int32
                               minimum: 0
                               type: integer
+                            desiredHome:
+                              properties:
+                                inputDigest:
+                                  type: string
+                                replicaFloors:
+                                  items:
+                                    properties:
+                                      component:
+                                        enum:
+                                        - engine
+                                        - decoder
+                                        - router
+                                        type: string
+                                      replicas:
+                                        format: int32
+                                        minimum: 0
+                                        type: integer
+                                    required:
+                                    - component
+                                    - replicas
+                                    type: object
+                                  maxItems: 3
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-map-keys:
+                                  - component
+                                  x-kubernetes-list-type: map
+                              required:
+                              - inputDigest
+                              - replicaFloors
+                              type: object
                             desiredReplicas:
                               format: int32
                               minimum: 0
                               type: integer
                             drainRequested:
+                              type: boolean
+                            homeInputsPending:
+                              type: boolean
+                            inventoryPending:
+                              type: boolean
+                            matched:
                               type: boolean
                             matchingTerms:
                               items:
@@ -1658,6 +1898,11 @@ spec:
                               format: int32
                               minimum: 0
                               type: integer
+                            raceCandidate:
+                              type: boolean
+                            replacementStartedAt:
+                              format: date-time
+                              type: string
                             weight:
                               format: int64
                               minimum: 0
@@ -1769,6 +2014,8 @@ spec:
                     type: string
                   plan:
                     properties:
+                      adoptionDigest:
+                        type: string
                       assignedReplicas:
                         format: int64
                         minimum: 0
@@ -1776,6 +2023,19 @@ spec:
                       id:
                         type: string
                       inputDigest:
+                        type: string
+                      mode:
+                        allOf:
+                        - enum:
+                          - Single
+                          - All
+                          - Split
+                          - SplitByCapacity
+                        - enum:
+                          - Single
+                          - All
+                          - Split
+                          - SplitByCapacity
                         type: string
                       observedGeneration:
                         format: int64
@@ -1795,12 +2055,21 @@ spec:
                         format: int64
                         minimum: 1
                         type: integer
+                      singleMove:
+                        properties:
+                          cursor:
+                            type: string
+                          selected:
+                            type: string
+                        type: object
                       sourceUID:
                         type: string
                       unassignedReplicas:
                         format: int32
                         minimum: 0
                         type: integer
+                      winner:
+                        type: string
                     required:
                     - assignedReplicas
                     - id

@@ -784,8 +784,9 @@ func TestDetectRestartTrigger_TerminalPodsAreAbsent(t *testing.T) {
 
 // A Pending row is a demoted Ready row: its recorded pod count is the
 // proof the gang was once complete, so a terminal member leaves it below
-// desired with a survivor and the rebuild fires. A single-pod Pending row
-// has no survivor and stays with Create.
+// desired with a survivor and the member-loss rebuild fires. A single-pod
+// Pending row has no survivor to drain, but it still records the revision
+// it ran, so the pod-count repair rebuilds it at that revision.
 func TestDetectRestartTrigger_PendingRowWithTerminalMember(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, RestartPolicy: workload.RestartPolicyRecreateInstance}
 	pending := func(podCount int32) workload.InstanceStatus {
@@ -795,32 +796,32 @@ func TestDetectRestartTrigger_PendingRowWithTerminalMember(t *testing.T) {
 		}
 	}
 	cases := []struct {
-		name string
-		size int
-		pods []*corev1.Pod
-		want bool
+		name       string
+		size       int
+		pods       []*corev1.Pod
+		wantReason string
 	}{{
 		name: "failed member leaves a survivor", size: 2,
-		pods: gangPodsWithPhases(corev1.PodFailed, corev1.PodRunning),
-		want: true,
+		pods:       gangPodsWithPhases(corev1.PodFailed, corev1.PodRunning),
+		wantReason: "gang member lost",
 	}, {
 		name: "succeeded member leaves a survivor", size: 2,
-		pods: gangPodsWithPhases(corev1.PodSucceeded, corev1.PodRunning),
-		want: true,
+		pods:       gangPodsWithPhases(corev1.PodSucceeded, corev1.PodRunning),
+		wantReason: "gang member lost",
 	}, {
 		name: "single-pod row has no survivor", size: 1,
-		pods: gangPodsWithPhases(corev1.PodFailed),
-		want: false,
+		pods:       gangPodsWithPhases(corev1.PodFailed),
+		wantReason: "pod count 0 below desired 1",
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			input := gangLossInput(pending(int32(tc.size)))
 			needs, reason := ops.DetectRestartTriggerWithPods(input, plan, gangInstancePlan(tc.size), tc.pods)
-			if needs != tc.want {
-				t.Fatalf("needsRestart = %v (reason %q), want %v", needs, reason, tc.want)
+			if !needs {
+				t.Fatalf("needsRestart = false, want the rebuild")
 			}
-			if needs && !strings.Contains(reason, "gang member lost") {
-				t.Fatalf("reason must name the loss; got %q", reason)
+			if !strings.Contains(reason, tc.wantReason) {
+				t.Fatalf("reason = %q, want it to contain %q", reason, tc.wantReason)
 			}
 		})
 	}

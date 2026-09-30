@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -22,6 +23,121 @@ func TestParentReference_JSONShape(t *testing.T) {
 	want := `{"name":"llama"}`
 	if string(data) != want {
 		t.Errorf("ParentReference JSON shape changed:\n want %s\n got %s", want, string(data))
+	}
+}
+
+func TestInferenceReplicaNames(t *testing.T) {
+	standalone := &InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: "pool-a"}}
+	if got := standalone.ParentName(); got != "" {
+		t.Fatalf("standalone ParentName = %q, want empty", got)
+	}
+	if got := standalone.NamePrefix(); got != "pool-a" {
+		t.Fatalf("standalone NamePrefix = %q, want pool-a", got)
+	}
+
+	projected := &InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc-engine"},
+		Spec:       InferenceReplicaSpec{ParentRef: &ParentReference{Name: "svc"}},
+	}
+	if got := projected.ParentName(); got != "svc" {
+		t.Fatalf("projected ParentName = %q, want svc", got)
+	}
+	if got := projected.NamePrefix(); got != "svc" {
+		t.Fatalf("projected NamePrefix = %q, want svc", got)
+	}
+
+	var absent *InferenceReplica
+	if got := absent.ParentName(); got != "" {
+		t.Fatalf("nil ParentName = %q, want empty", got)
+	}
+	if got := absent.NamePrefix(); got != "" {
+		t.Fatalf("nil NamePrefix = %q, want empty", got)
+	}
+}
+
+func TestInferenceReplicaSpecParentRefJSON(t *testing.T) {
+	raw, err := json.Marshal(InferenceReplicaSpec{Component: EngineComponent})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "parentRef") {
+		t.Fatalf("nil parentRef must be omitted, got %s", raw)
+	}
+	var stored InferenceReplicaSpec
+	if err := json.Unmarshal([]byte(`{"parentRef":{"name":"svc"},"component":"engine","runners":[]}`), &stored); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if stored.ParentRef == nil || stored.ParentRef.Name != "svc" {
+		t.Fatalf("stored parentRef = %+v, want &{Name: svc}", stored.ParentRef)
+	}
+}
+
+// A spec carries one template source: rendered runners, or model and runtime
+// refs. Both forms round-trip through JSON, and the refs form carries no
+// runners key at all.
+func TestInferenceReplicaSpec_TemplateSourceJSONRoundTrip(t *testing.T) {
+	runners := InferenceReplicaSpec{
+		Component: EngineComponent,
+		Runners: []Runner{{
+			Name: RunnerNameDefault,
+			Size: 1,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"ome.io/runner": "default"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "ome-container", Image: "example.com/engine:1"}}},
+			},
+		}},
+	}
+	data, err := json.Marshal(&runners)
+	if err != nil {
+		t.Fatalf("marshal runners form: %v", err)
+	}
+	for _, key := range []string{`"modelRef"`, `"runtimeRef"`} {
+		if strings.Contains(string(data), key) {
+			t.Fatalf("runners form must not carry %s: %s", key, data)
+		}
+	}
+	if !strings.Contains(string(data), `"runners":[{"name":"default","size":1,`) {
+		t.Fatalf("runners form lost its runners: %s", data)
+	}
+	var runnersOut InferenceReplicaSpec
+	if err := json.Unmarshal(data, &runnersOut); err != nil {
+		t.Fatalf("unmarshal runners form: %v", err)
+	}
+	if !equality.Semantic.DeepEqual(runners, runnersOut) {
+		t.Fatalf("runners form changed in the round trip:\n in  %+v\n out %+v", runners, runnersOut)
+	}
+
+	refs := InferenceReplicaSpec{
+		Component:  EngineComponent,
+		ModelRef:   &ModelRef{Name: "example-model"},
+		RuntimeRef: &ServingRuntimeRef{Name: "example-runtime"},
+		Runners:    []Runner{},
+	}
+	data, err = json.Marshal(&refs)
+	if err != nil {
+		t.Fatalf("marshal refs form: %v", err)
+	}
+	want := `{"component":"engine","modelRef":{"name":"example-model"},"runtimeRef":{"name":"example-runtime"}}`
+	if string(data) != want {
+		t.Fatalf("refs form JSON shape changed:\n want %s\n got  %s", want, data)
+	}
+	var refsOut InferenceReplicaSpec
+	if err := json.Unmarshal(data, &refsOut); err != nil {
+		t.Fatalf("unmarshal refs form: %v", err)
+	}
+	if refsOut.Runners != nil {
+		t.Fatalf("refs form decoded with runners: %+v", refsOut.Runners)
+	}
+	refs.Runners = nil
+	if !equality.Semantic.DeepEqual(refs, refsOut) {
+		t.Fatalf("refs form changed in the round trip:\n in  %+v\n out %+v", refs, refsOut)
+	}
+
+	copied := refs.DeepCopy()
+	copied.ModelRef.Name = "changed"
+	copied.RuntimeRef.Name = "changed"
+	if refs.ModelRef.Name != "example-model" || refs.RuntimeRef.Name != "example-runtime" {
+		t.Fatal("DeepCopy shares the refs with the original")
 	}
 }
 

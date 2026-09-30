@@ -27,7 +27,7 @@ func heldFixture() (Target, Evidence) {
 			Annotations:     map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "7", constants.InferenceReplicaControllerWriteAnnotationKey: "true"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "ome.io/v1beta1", Kind: "InferenceService", Name: "chat", UID: parent.UID, Controller: &controller}},
 		},
-		Spec: v1beta1.InferenceReplicaSpec{ParentRef: v1beta1.ParentReference{Name: "chat"}, Component: v1beta1.EngineComponent},
+		Spec: v1beta1.InferenceReplicaSpec{ParentRef: &v1beta1.ParentReference{Name: "chat"}, Component: v1beta1.EngineComponent},
 		Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 2, RetryBlocks: []v1beta1.RetryBlock{{
 			TargetRevision: "chat-engine-aaaaaaaa", State: v1beta1.RetryBlockHeld, AttemptsStarted: 1,
 		}}},
@@ -170,7 +170,7 @@ func TestExactUIDCurrentnessAndCompleteMembershipRequired(t *testing.T) {
 		{"changed source", func(_ *Target, e *Evidence) { e.Complete = false }, ReasonSourceIncomplete},
 		{"replica without read", func(_ *Target, e *Evidence) { e.Sources = 0 }, ReasonSourceIncomplete},
 		{"multiple source count", func(_ *Target, e *Evidence) { e.Sources = 2 }, ReasonSourceIncomplete},
-		{"parent ref", func(_ *Target, e *Evidence) { e.Replica.Spec.ParentRef.Name = "other" }, ReasonSourceInvalid},
+		{"parent ref", func(_ *Target, e *Evidence) { e.Replica.Spec.ParentRef = &v1beta1.ParentReference{Name: "other"} }, ReasonSourceInvalid},
 		{"owner UID", func(_ *Target, e *Evidence) { e.Replica.OwnerReferences[0].UID = "other" }, ReasonSourceInvalid},
 		{"spec component", func(_ *Target, e *Evidence) { e.Replica.Spec.Component = v1beta1.DecoderComponent }, ReasonSourceInvalid},
 		{"different exact name", func(_ *Target, e *Evidence) { e.Replica.Name = "other-engine" }, ReasonSourceInvalid},
@@ -195,7 +195,7 @@ func TestActionCompatibleReplicaIdentityWithoutOptionalLabelsMatches(t *testing.
 				target.ParentName = strings.Repeat("a", 64)
 				target.Revision = target.ParentName + "-engine-aaaaaaaa"
 				evidence.Parent.Name = target.ParentName
-				evidence.Replica.Spec.ParentRef.Name = target.ParentName
+				evidence.Replica.Spec.ParentRef = &v1beta1.ParentReference{Name: target.ParentName}
 				evidence.Replica.OwnerReferences[0].Name = target.ParentName
 				delete(evidence.Replica.Labels, constants.InferenceServiceLabel)
 			}
@@ -385,7 +385,7 @@ func TestCredentialShapedValidIdentifiersAreRedactedFromObservation(t *testing.T
 				target.Revision = secret + "-engine-aaaaaaaa"
 				evidence.Parent.Name = secret
 				evidence.Replica.Name = target.IRName
-				evidence.Replica.Spec.ParentRef.Name = secret
+				evidence.Replica.Spec.ParentRef = &v1beta1.ParentReference{Name: secret}
 				evidence.Replica.Labels[constants.InferenceServiceLabel] = secret
 				evidence.Replica.OwnerReferences[0].Name = secret
 			case "ghp UID":

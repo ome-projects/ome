@@ -285,6 +285,18 @@ func RecreateOfDarkFailedRow(s *InstanceStatus, strategy UpdateStrategyType) boo
 		s.Phase == InstancePhaseFailed && s.ServingPodCount == 0
 }
 
+// DemotedReady reports whether the row is a Ready row demoted for losing
+// every pod: a settled Pending row that still records the revision it
+// ran. Only the demotion writes that shape — a first materialization
+// records no running revision until it is promoted — so the revision is
+// both the proof the Instance was serving and the revision a repair
+// rebuilds at. Under RecreateInstanceOnPodRestart the restart trigger
+// reads the row as it reads Ready, so the phase tells the truth without
+// handing the loss to the Create pass at the target.
+func DemotedReady(s *InstanceStatus) bool {
+	return s != nil && s.Operation == nil && s.Phase == InstancePhasePending && s.RunningRevision != ""
+}
+
 // Interruptible reports whether the named event acts on this row
 // while its owner's step is still in flight, rather than waiting for the
 // step to reach a boundary.

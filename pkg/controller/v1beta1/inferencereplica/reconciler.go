@@ -1,17 +1,20 @@
 // Package inferencereplica implements the controller for the
 // InferenceReplica CRD.
 //
-// One InferenceReplica per (InferenceService, Component) tuple. The
-// IR controller owns the per-Instance pipeline (Create / Update /
-// Restart / Migrate / Delete) by handing a workload.ReconcileInput to
-// workload.Reconcile each pass. It does NOT own ISVC-shape
-// supporting resources (headless / per-revision Services, PodMonitor)
-// or coordination — those are owned by the ISVC controller.
+// A projected replica exists per (InferenceService, Component); a
+// standalone replica is created directly. The IR controller owns the
+// per-Instance pipeline (Create / Update / Restart / Migrate / Delete) by
+// handing a workload.ReconcileInput to workload.Reconcile each pass, and
+// creates and reconciles the per-Component headless Service. The
+// InferenceService controller owns the per-revision Services, the PodMonitor
+// and coordination; this controller only creates, when absent, the
+// per-revision Services of peer revisions its own pods name.
 //
-// Status writer: this controller is the sole writer of
-// InferenceReplica.status. The ISVC controller is the sole writer of
-// InferenceReplica.spec (see the validating webhook in
-// pkg/webhook/admission/inferencereplica/).
+// Writers: the InferenceService controller writes a projected replica's
+// spec, and any client that RBAC allows may write a standalone
+// replica's spec (see the validating webhook in
+// pkg/webhook/admission/inferencereplica/). This controller is the only
+// writer of InferenceReplica.status.
 //
 // The controller is enabled by default; the
 // --enable-inferencereplica-controller manager flag lets operators
@@ -33,6 +36,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
@@ -58,6 +62,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workloadservice "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/service"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
@@ -71,6 +76,9 @@ import (
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=accelerator.gke.io,resources=slices,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=ome.io,resources=basemodels;clusterbasemodels;servingruntimes;clusterservingruntimes;finetunedweights,verbs=get;list;watch
 
 // Reconciler drives each IR lifecycle through the workload pipeline.
 type Reconciler struct {
@@ -82,6 +90,11 @@ type Reconciler struct {
 	// lifecycle configuration. When nil, each resolver applies its documented
 	// compatibility or fail-safe behavior.
 	Clientset kubernetes.Interface
+
+	// RuntimeSelector resolves a replica's runtimeRef and selects a runtime
+	// for a modelRef without one. Nil when this controller renders no refs: a
+	// replica with refs then reports RenderFailed.
+	RuntimeSelector runtimeselector.Selector
 
 	// ConfigCache memoizes the inferenceservice-config ConfigMap for a
 	// short, flag-driven TTL so per-reconcile config loads share one
@@ -156,20 +169,28 @@ type Reconciler struct {
 	// ever raised above the default of one.
 	revisionHashMu sync.Mutex
 	// revisionHashCache memoizes the revision (hash, raw) per IR so the
-	// full-PodSpec json.Marshal + FNV in revision.HashWithWorker is skipped
-	// when the rendered pod template is provably unchanged. The template is
-	// a pure projection of the IR spec, so it only changes on a generation
-	// bump or a collision-count bump (both observable without re-marshaling);
-	// the scope UID partitions per-parent identity. Keyed by the IR's
-	// NamespacedName (so the NotFound branch can evict without the UID) with
-	// the IR UID folded into the entry so a delete-and-recreate of the same
-	// name misses the stale entry.
+	// full-PodSpec json.Marshal + FNV in revision.HashWithWorkerTopologyAndPairing
+	// is skipped when the hash inputs are provably unchanged. Generation covers
+	// the spec-derived inputs; the entry also records the remaining ones: the
+	// excluded annotation list (an annotation, so editing it does not bump
+	// generation), the collision count and the scope UID (revisionScopeUID).
+	// Keyed by the IR's NamespacedName (so the NotFound branch can evict
+	// without the UID) with the IR UID folded into the entry so a
+	// delete-and-recreate of the same name misses the stale entry.
 	revisionHashCache map[types.NamespacedName]revisionHashEntry
 
 	// scaleDownSeriesMu guards the identity needed to remove per-IR metric
 	// series after the object has disappeared and its labels are unavailable.
 	scaleDownSeriesMu    sync.Mutex
 	scaleDownSeriesCache map[types.NamespacedName]scaleDownSeriesIdentity
+
+	// TPUSliceProvisioning is loaded once at startup. nil provisions no TPU
+	// slices.
+	TPUSliceProvisioning *controllerconfig.TPUSliceProvisioningConfig
+	// sliceReader is the cached slice reader. SetupWithManager sets it when
+	// TPUSliceProvisioning is set and the Slice CRD is installed; nil
+	// provisions no TPU slices.
+	sliceReader client.Reader
 
 	// Clock supplies wall-clock time to the workload lifecycle layer.
 	// SetupWithManager defaults it to the real clock; tests may inject a fake.
@@ -216,8 +237,7 @@ type scaleDownSeriesIdentity struct {
 //     IR itself as the event target.
 //  4. Build the workload.ReconcileInput + Deps + ComponentPlan.
 //  5. Ensure the target ControllerRevision for the rendered template.
-//     The collision-retry shape matches the ISVC adapter: on a
-//     same-name-different-Data collision, bump CollisionCount and
+//     On a same-name-different-Data collision, bump CollisionCount and
 //     retry the EnsureControllerRevision call with the new salt.
 //  6. Defer the status aggregator so it runs even when the workload
 //     dispatcher returns early.
@@ -262,7 +282,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// re-stamp them per-line.
 	log = log.WithValues(
 		"component", ir.Spec.Component,
-		"parent", ir.Spec.ParentRef.Name,
+		"parent", ir.ParentName(),
 		"generation", ir.Generation)
 	ctx = ctrl.LoggerInto(ctx, log)
 	log.V(1).Info("Reconcile entry",
@@ -383,7 +403,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// the ISVC-side coordination reconciler.
 	coordDefaults := r.resolveCoordinationGroupDefaults(log)
 
-	input := r.buildReconcileInput(ctx, ir, parent, retryPolicy, forceDeletePolicy, settings, autoMigrateBudget, coordDefaults)
+	// The pod templates: the stored runners, or, for a replica that names a
+	// model or a runtime, the runners rendered from them for this pass only.
+	// The stored spec never gains runners. A template source that cannot be
+	// rendered is published on the Ready condition and the pass ends here;
+	// the runtime and model watches re-trigger the replica when it changes.
+	runners := ir.Spec.Runners
+	if rendered, rerr := r.renderFromRefs(ctx, ir); rerr != nil {
+		var blocked *renderBlocked
+		if errors.As(rerr, &blocked) {
+			return r.reportRenderBlocked(ctx, ir, blocked)
+		}
+		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: render from refs (ir=%s/%s): %w", ir.Namespace, ir.Name, rerr)
+	} else if rendered != nil {
+		runners = rendered
+	}
+
+	input := r.buildReconcileInput(ctx, ir, runners, parent, retryPolicy, forceDeletePolicy, settings, autoMigrateBudget, coordDefaults)
 	input.ScaleUpPodBatchSize = r.ScaleUpPodBatchSize
 	input.ScaleDownPodBatchSize = r.ScaleDownPodBatchSize
 	input.ScaleDownRequeueInterval = r.ScaleDownRequeueInterval
@@ -473,37 +509,37 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		specTarget = t
 	}
 
-	// Canary rollback: when the ISVC controller set Pacing.RollbackToRevision,
-	// roll every Instance back to that (stable) ControllerRevision by rendering
+	// Rollback: when spec.pacing.rollbackToRevision is set, roll every
+	// Instance back to that (stable) ControllerRevision by rendering
 	// the desired template from the revision's stored payload and using the
 	// revision as the ROLL target — while UpdateRevision keeps reporting the spec
 	// target (above). The forward-roll machinery then drains the canary pods onto
-	// stable. CR gone (GC'd) → fall through to the normal desired spec.
+	// stable. CR gone (GC'd) → fall through to the normal desired spec. The
+	// revision must be one this replica controls.
 	rollTarget := specTarget
 	var rollbackPayload *revision.DataPayload
 	var rollbackRevision *appsv1.ControllerRevision
-	if ir.Spec.Pacing != nil && ir.Spec.Pacing.RollbackToRevision != nil && *ir.Spec.Pacing.RollbackToRevision != "" {
-		cr := &appsv1.ControllerRevision{}
-		switch err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: ir.Namespace, Name: *ir.Spec.Pacing.RollbackToRevision}, cr); {
-		case err == nil:
-			payload, perr := revision.PayloadFromControllerRevision(cr)
-			if perr != nil {
-				return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: rollback revision payload (ir=%s/%s): %w", ir.Namespace, ir.Name, perr)
+	cr, rerr := r.rollbackRevision(ctx, ir, workloadtypes.EventTarget(input))
+	if rerr != nil {
+		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: %w", rerr)
+	}
+	if cr != nil {
+		payload, perr := revision.PayloadFromControllerRevision(cr)
+		if perr != nil {
+			return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: rollback revision payload (ir=%s/%s): %w", ir.Namespace, ir.Name, perr)
+		}
+		if payload != nil && payload.PodSpec != nil {
+			if perr := r.applyRollbackPayload(ctx, ir, &input.DesiredSpec, payload, cr); perr != nil {
+				return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: apply rollback revision %s: %w", cr.Name, perr)
 			}
-			if payload != nil && payload.PodSpec != nil {
-				if perr := r.applyRollbackPayload(ctx, ir, &input.DesiredSpec, payload, cr); perr != nil {
-					return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: apply rollback revision %s: %w", cr.Name, perr)
-				}
-				rollTarget = cr
-				rollbackPayload = payload
-				rollbackRevision = cr
-			}
-		case apierrors.IsNotFound(err):
-			// stable CR GC'd — nothing to roll back to; proceed normally.
-		default:
-			return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: get rollback revision %s: %w", *ir.Spec.Pacing.RollbackToRevision, err)
+			rollTarget = cr
+			rollbackPayload = payload
+			rollbackRevision = cr
 		}
 	}
+	// The coordination gates orient by the roll target, so they are wired
+	// only now that it is resolved.
+	r.wireCoordinationGates(ctx, &input, ir, parent, coordDefaults, rollTarget)
 
 	plan, perr := workload.BuildPlan(v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component), input.DesiredSpec, input.ObservedState)
 	if perr != nil {
@@ -518,8 +554,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// overlaid here. Zero (neither set) opens operations with no deadline.
 	plan.InstanceReadyTimeout = instanceReadyTimeout
 	if !scaleDownPodObservationRequired(input, plan) {
-		obsmetrics.SetScaleDownActivePods(ir.Namespace, ir.Spec.ParentRef.Name, string(ir.Spec.Component), 0)
-		obsmetrics.SetScaleDownDeferredInstances(ir.Namespace, ir.Spec.ParentRef.Name, string(ir.Spec.Component), 0)
+		obsmetrics.SetScaleDownActivePods(ir.Namespace, ir.NamePrefix(), string(ir.Spec.Component), 0)
+		obsmetrics.SetScaleDownDeferredInstances(ir.Namespace, ir.NamePrefix(), string(ir.Spec.Component), 0)
 	}
 	// Install status aggregation before PodGroup reconciliation. Besides
 	// counters, the aggregator parks InstanceReadyTimeout deadlines while the
@@ -593,10 +629,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}()
 
 	if rollbackPayload != nil {
-		log.Info("Canary rollback: rolling Instances back to stable revision", "revision", rollbackRevision.Name)
+		log.Info("Rollback: rolling Instances back to revision", "revision", rollbackRevision.Name)
 	}
 	if scaleDownPodObservationRequired(input, plan) {
-		pods, lerr := query.LiveListPodsForComponent(ctx, r.APIReader, ir.Namespace, ir.Spec.ParentRef.Name,
+		pods, lerr := query.LiveListPodsForComponent(ctx, r.APIReader, ir.Namespace, ir.NamePrefix(),
 			v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component))
 		if lerr != nil {
 			return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: observe scale-down pods (component=%s): %w", ir.Spec.Component, lerr)
@@ -647,15 +683,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		Recorder:     r.Recorder,
 		Expectations: r.Expectations,
 		Clock:        r.Clock,
-		// Wire peer-env injection on the IR-managed (live) path.
+		// Wire peer-env injection.
 		// ISVCRenderHook overlays OME_<PEER>_ENDPOINT / _REVISION_ENDPOINT
 		// onto each rendered pod so PD components (engine <-> decoder) can
 		// address each other by stable DNS and by the per-revision Service of
 		// the peer revision they pair with. It returns nil when the parent
 		// ISVC has no rollout groups, so single-component / non-rollout
-		// boxes are unaffected. parent may be nil when the
-		// parent ISVC is unresolved (foreground-GC window) — the hook handles
-		// nil by returning nil.
+		// boxes are unaffected. parent is nil for a standalone replica and
+		// while the parent ISVC is unresolved (foreground-GC window) — the
+		// hook handles nil by returning nil.
 		RenderHook: omenativecore.ISVCRenderHook(parent, peerRevisionFor),
 		// Ensure a gang surge's PodGroup inline, just before its pods —
 		// closes the window where the surge index hasn't yet landed in the
@@ -692,10 +728,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 
 	// PodGroups must exist BEFORE the first pod of any multi-pod Instance is
 	// created, or the gang scheduler rejects the pods with "PodGroup not
-	// found" and they stay Pending forever. The direct OMENative path does
-	// this; the IR-managed path (the default) must too. No-op for single-pod
-	// Components and when the PodGroup CRD is absent — EnsurePodGroups gates
-	// on DesiredSpec.GangSchedulingAvailable, stamps GangSchedulingUnavailable,
+	// found" and they stay Pending forever. No-op for single-pod Components
+	// and when the PodGroup CRD is absent — EnsurePodGroups gates on
+	// DesiredSpec.GangSchedulingAvailable, stamps GangSchedulingUnavailable,
 	// and returns. Runs before the revision/dispatch so the gang is announced
 	// ahead of pod creation.
 	// A name this owner cannot write is classified onto the Instance that
@@ -707,7 +742,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 	plan.InstanceTopologyKeys = effectiveTopology
 
+	slices, sliceErr := r.provisionSlices(ctx, ir, &deps, &input)
+	if sliceErr != nil {
+		return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: provision TPU slices (component=%s): %w", ir.Spec.Component, sliceErr)
+	}
 	result, err = workload.Reconcile(ctx, deps, input, plan, rollTarget)
+	if err == nil {
+		if sweepErr := slices.sweep(ctx, input, plan); sweepErr != nil {
+			result = ctrl.Result{}
+			err = fmt.Errorf("InferenceReplica reconciler: sweep TPU slices (component=%s): %w", ir.Spec.Component, sweepErr)
+		}
+	}
 
 	// Reconcile the per-Component headless Service. The Service gives every
 	// pod a stable FQDN for peer discovery during gang init (multi-node) and
@@ -878,7 +923,7 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 		return false, nil
 	}
 	if input.AuthoritativePods == nil {
-		pods, err := query.LiveListPodsForComponent(ctx, r.APIReader, ir.Namespace, ir.Spec.ParentRef.Name, plan.Component)
+		pods, err := query.LiveListPodsForComponent(ctx, r.APIReader, ir.Namespace, ir.NamePrefix(), plan.Component)
 		if err != nil {
 			return false, fmt.Errorf("InferenceReplica reconciler: observe pods for stale PodGroup cleanup: %w", err)
 		}
@@ -985,6 +1030,10 @@ type lifecycleSettings struct {
 	// Unschedulable bounds a pod the scheduler cannot place. Zero leaves
 	// the hold parking the clock until an operator resolves it.
 	Unschedulable time.Duration
+	// AbandonedReplacement bounds the termination grace of a replacement
+	// pod a rollout abandons before it ever served. Zero leaves such a pod
+	// its own grace.
+	AbandonedReplacement time.Duration
 	// GangScheduleTimeout bounds the PodGroup schedule timeout derived
 	// from InstanceReadyTimeout. Nil passes the derived value through to
 	// the scheduler.
@@ -1018,11 +1067,17 @@ func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings
 	if settings.Unschedulable, err = cfg.ToUnschedulableGracePeriod(); err != nil {
 		log.V(1).Info("unschedulable grace invalid; scheduler-hold escalation disabled this pass", "error", err.Error())
 	}
+	if settings.AbandonedReplacement, err = cfg.ToAbandonedReplacementGracePeriod(); err != nil {
+		log.V(1).Info("abandoned-replacement grace invalid; an abandoned replacement keeps its own grace this pass", "error", err.Error())
+	}
 	if settings.StuckPod == 0 {
 		log.V(1).Info("stuck-pod grace unconfigured (no lifecycle.stuckPodGracePeriod); skipping fast escalation this pass")
 	}
 	if settings.Unschedulable == 0 {
 		log.V(1).Info("unschedulable grace unconfigured (no lifecycle.unschedulableGracePeriod); scheduler-hold escalation disabled this pass")
+	}
+	if settings.AbandonedReplacement == 0 {
+		log.V(1).Info("abandoned-replacement grace unconfigured (no lifecycle.abandonedReplacementGracePeriod); an abandoned replacement keeps its own termination grace")
 	}
 	if settings.GangScheduleTimeout, err = cfg.GangScheduleTimeout.ToClamp(); err != nil {
 		log.V(1).Info("gang schedule timeout invalid; the derived timeout is unclamped this pass", "error", err.Error())
@@ -1445,6 +1500,40 @@ func newestUnsucceededAutoMigration(migrations []v1beta1.MigrationStatus, idx in
 	return pos
 }
 
+// EventReasonRollbackRevisionForeign is the Warning raised when
+// spec.pacing.rollbackToRevision names a ControllerRevision this replica
+// does not control.
+const EventReasonRollbackRevisionForeign = "RollbackRevisionForeign"
+
+// rollbackRevision resolves spec.pacing.rollbackToRevision to a
+// ControllerRevision this replica controls. A missing revision yields nil
+// and the replica rolls to its spec. A revision this replica does not
+// control (another controller, or none) is refused the same way, so a
+// pacing block written by a user can never render another workload's pod
+// template, and the refusal is reported as a Warning.
+func (r *Reconciler) rollbackRevision(ctx context.Context, ir *v1beta1.InferenceReplica, eventTarget client.Object) (*appsv1.ControllerRevision, error) {
+	if ir.Spec.Pacing == nil || ir.Spec.Pacing.RollbackToRevision == nil || *ir.Spec.Pacing.RollbackToRevision == "" {
+		return nil, nil
+	}
+	name := *ir.Spec.Pacing.RollbackToRevision
+	cr := &appsv1.ControllerRevision{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: ir.Namespace, Name: name}, cr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get rollback revision %s: %w", name, err)
+	}
+	if !metav1.IsControlledBy(cr, ir) {
+		if r.Recorder != nil {
+			r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, EventReasonRollbackRevisionForeign,
+				"InferenceReplica %s/%s: rollback revision %s is not controlled by this replica; rolling to the spec instead",
+				ir.Namespace, ir.Name, name)
+		}
+		return nil, nil
+	}
+	return cr, nil
+}
+
 // applyRollbackPayload restores revision-owned render inputs. Explicitly
 // recorded topology is authoritative. A legacy multi-pod revision has no
 // topology field even when its live workers were rendered with OME-generated
@@ -1485,7 +1574,7 @@ func (r *Reconciler) applyRollbackPayload(ctx context.Context, ir *v1beta1.Infer
 		return fmt.Errorf("legacy rollback revision %q has no recognizable revision hash", target.Name)
 	}
 	component := v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component)
-	pods, err := query.ListOMENativePodsByName(ctx, r.APIReader, ir.Namespace, ir.Spec.ParentRef.Name, component, false)
+	pods, err := query.ListOMENativePodsByName(ctx, r.APIReader, ir.Namespace, ir.NamePrefix(), component, false)
 	if err != nil {
 		return fmt.Errorf("list live pods for legacy rollback topology recovery: %w", err)
 	}
@@ -1496,7 +1585,7 @@ func (r *Reconciler) applyRollbackPayload(ctx context.Context, ir *v1beta1.Infer
 		}
 	}
 	recovered, ok, recoveryErr := workloadpodgroup.GeneratedTopologyKeyFromPods(
-		ir.Spec.ParentRef.Name, component, targetPods)
+		ir.NamePrefix(), component, targetPods)
 	if recoveryErr != nil {
 		return fmt.Errorf("legacy rollback revision %q has conflicting OME-generated topology: %w", target.Name, recoveryErr)
 	}
@@ -1527,11 +1616,12 @@ func (r *Reconciler) resolveParent(ctx context.Context, ir *v1beta1.InferenceRep
 // empty IR-owned ledger and leave the parent-owned Started entry to
 // resume as a phantom migration.
 func (r *Reconciler) resolveParentFrom(ctx context.Context, reads client.Reader, ir *v1beta1.InferenceReplica) *v1beta1.InferenceService {
-	if ir.Spec.ParentRef.Name == "" {
+	parentName := ir.ParentName()
+	if parentName == "" {
 		return nil
 	}
 	parent := &v1beta1.InferenceService{}
-	key := types.NamespacedName{Namespace: ir.Namespace, Name: ir.Spec.ParentRef.Name}
+	key := types.NamespacedName{Namespace: ir.Namespace, Name: parentName}
 	if err := reads.Get(ctx, key, parent); err != nil {
 		if !apierrors.IsNotFound(err) && !apierrors.IsForbidden(err) {
 			r.Log.V(1).Info("Failed to fetch parent ISVC for IR event stream; falling back to IR target",
@@ -1542,7 +1632,7 @@ func (r *Reconciler) resolveParentFrom(ctx context.Context, reads client.Reader,
 	return parent
 }
 
-// irRevisionKey is the per-(parent ISVC, Component) revision.Key the IR
+// irRevisionKey is the per-(name prefix, Component) revision.Key the IR
 // path keys ControllerRevisions on. Defined in exactly one place so the
 // revision-ensure step (ensureRevisionWithCollisionRetry) and the
 // retention sweep (sweepRevisions, retention.go) can never drift apart —
@@ -1551,19 +1641,44 @@ func (r *Reconciler) resolveParentFrom(ctx context.Context, reads client.Reader,
 // workload's CRs. Lives here (not retention.go) so reconciler.go keeps
 // owning the constants/query imports it already uses.
 //
-// IR-scoped via the parent ISVC name + Component (NOT the IR's own name
-// or UID) so the labels match what the retired direct path stamped and
-// shadow-mode equivalence holds.
+// The key is scoped by ir.NamePrefix() plus the Component, so a projected
+// replica's revisions carry its InferenceService's name and a standalone
+// replica's carry its own; the labels match what the pod renderer stamps.
 func irRevisionKey(ir *v1beta1.InferenceReplica) revision.Key {
 	return revision.Key{
 		Namespace: ir.Namespace,
-		Name:      ir.Spec.ParentRef.Name + "-" + string(ir.Spec.Component),
+		Name:      ir.NamePrefix() + "-" + string(ir.Spec.Component),
 		Labels: map[string]string{
-			constants.InferenceServicePodLabelKey: ir.Spec.ParentRef.Name,
+			constants.InferenceServicePodLabelKey: ir.NamePrefix(),
 			constants.OMEComponentLabel:           string(ir.Spec.Component),
 			query.LabelManagedBy:                  query.ManagedByOMENative,
 		},
 	}
+}
+
+// revisionScopeUID returns the replica's scope UID. The scope UID feeds the
+// hash and therefore the revision name; listing, numbering and retention
+// select by the key's labels (irRevisionKey). A projected replica's revision
+// names and pod revision labels are computed in its InferenceService's UID
+// scope; a standalone replica scopes by its own UID. A replica that names a parent but has no
+// InferenceService controlling it, or whose controlling InferenceService
+// reference has no UID, is refused: it is a projected replica in a broken
+// state, not a standalone one.
+func revisionScopeUID(ir *v1beta1.InferenceReplica) (types.UID, error) {
+	if ref := metav1.GetControllerOf(ir); ref != nil &&
+		schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind).GroupKind() == isvcGVK.GroupKind() {
+		if ref.UID == "" {
+			return "", fmt.Errorf("InferenceReplica %s/%s: controlling InferenceService reference has no UID; cannot scope its revision history", ir.Namespace, ir.Name)
+		}
+		return ref.UID, nil
+	}
+	if parent := ir.ParentName(); parent != "" {
+		return "", fmt.Errorf("InferenceReplica %s/%s names parent %s but no InferenceService controls it; cannot scope its revision history", ir.Namespace, ir.Name, parent)
+	}
+	if ir.UID == "" {
+		return "", fmt.Errorf("InferenceReplica %s/%s has no UID; cannot scope its revision history", ir.Namespace, ir.Name)
+	}
+	return ir.UID, nil
 }
 
 // ensureRevisionWithCollisionRetry computes the target
@@ -1575,26 +1690,11 @@ func irRevisionKey(ir *v1beta1.InferenceReplica) revision.Key {
 func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput) (*appsv1.ControllerRevision, error) {
 	revKey := irRevisionKey(ir)
 
-	// scopeUID = parent ISVC's UID so the IR-managed path partitions the
-	// revision history by the same identity the direct OMENative path uses
-	// (isvc.UID, via core.EnsureControllerRevisionForISVC). Using ir.UID
-	// here would diverge the two paths' CR names — breaking shadow-mode
-	// equivalence and stranding pods across a path cutover.
-	//
-	// Source: the IR's controller OwnerReference. The projector
-	// (pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector)
-	// stamps the parent ISVC as the IR's controller-owner on every
-	// Create/Update, so this is the authoritative parent-UID. Refusing
-	// to proceed on a missing controller-owner is correct: an empty
-	// scopeUID would silently produce a CR hash that doesn't match the
-	// direct OMENative path and break shadow-mode equivalence.
-	var scopeUID types.UID
-	if ctrlRef := metav1.GetControllerOf(ir); ctrlRef != nil {
-		scopeUID = ctrlRef.UID
-	}
-	if scopeUID == "" {
-		return nil, fmt.Errorf("InferenceReplica %s/%s missing controller OwnerReference; cannot derive scopeUID for revision",
-			ir.Namespace, ir.Name)
+	// The hash is scoped by revisionScopeUID so two pod sets never share a
+	// revision name even when their templates match.
+	scopeUID, err := revisionScopeUID(ir)
+	if err != nil {
+		return nil, err
 	}
 
 	hash, raw, err := r.revisionHash(ir, input, ir.Status.CollisionCount, scopeUID)
@@ -1649,7 +1749,10 @@ func (r *Reconciler) revisionHash(ir *v1beta1.InferenceReplica, input workloadty
 
 	r.revisionHashMu.Lock()
 	defer r.revisionHashMu.Unlock()
-	if entry, ok := r.revisionHashCache[cacheKey]; ok &&
+	// A replica rendered from refs derives its templates from the model and
+	// the runtime, which change without a generation bump, so its hash is
+	// computed every pass.
+	if entry, ok := r.revisionHashCache[cacheKey]; ok && !rendersFromRefs(ir) &&
 		entry.uid == ir.UID &&
 		entry.generation == ir.Generation &&
 		entry.excludedAnnotationKeys == excludedAnnotationKeys &&
@@ -1658,8 +1761,8 @@ func (r *Reconciler) revisionHash(ir *v1beta1.InferenceReplica, input workloadty
 		return entry.hash, entry.raw, nil
 	}
 
-	// Hash a copy without inherited ISVC annotations while retaining them on rendered pods.
-	meta := stripExcludedAnnotations(input.DesiredSpec.PodTemplateObjectMeta, parseExcludedAnnotationKeys(ir))
+	// Hash a copy without the inherited object annotations while retaining them on rendered pods.
+	meta := stripExcludedAnnotations(input.DesiredSpec.PodTemplateObjectMeta, hashExcludedAnnotationKeys(ir))
 	hash, raw, err := revision.HashWithWorkerTopologyAndPairing(
 		input.DesiredSpec.PodSpec, input.DesiredSpec.WorkerPodSpec,
 		meta,
@@ -1683,6 +1786,26 @@ func (r *Reconciler) revisionHash(ir *v1beta1.InferenceReplica, input workloadty
 		raw:                    raw,
 	}
 	return hash, raw, nil
+}
+
+// hashExcludedAnnotationKeys returns the pod-template annotation keys omitted
+// from revision hashing: the inherited InferenceService keys the projector
+// stamps on a projected replica and, on a replica rendered from refs, every
+// key of the replica's own object annotations, which the render inherits
+// into the template the way an InferenceService's are. The refs set is
+// derived in memory; nothing is stamped on the replica.
+func hashExcludedAnnotationKeys(ir *v1beta1.InferenceReplica) map[string]struct{} {
+	excluded := parseExcludedAnnotationKeys(ir)
+	if !rendersFromRefs(ir) || len(ir.Annotations) == 0 {
+		return excluded
+	}
+	if excluded == nil {
+		excluded = make(map[string]struct{}, len(ir.Annotations))
+	}
+	for k := range ir.Annotations {
+		excluded[k] = struct{}{}
+	}
+	return excluded
 }
 
 // parseExcludedAnnotationKeys returns inherited ISVC annotation keys omitted from revision hashing.
@@ -1737,7 +1860,7 @@ func (r *Reconciler) rememberScaleDownSeries(ir *v1beta1.InferenceReplica) {
 	identity := scaleDownSeriesIdentity{
 		uid:       ir.UID,
 		namespace: ir.Namespace,
-		isvc:      ir.Spec.ParentRef.Name,
+		isvc:      ir.NamePrefix(),
 		component: string(ir.Spec.Component),
 	}
 	r.scaleDownSeriesMu.Lock()
@@ -1768,7 +1891,7 @@ func (r *Reconciler) deleteScaleDownSeries(ir *v1beta1.InferenceReplica) {
 	if ir == nil {
 		return
 	}
-	obsmetrics.DeleteScaleDownSeries(ir.Namespace, ir.Spec.ParentRef.Name, string(ir.Spec.Component))
+	obsmetrics.DeleteScaleDownSeries(ir.Namespace, ir.NamePrefix(), string(ir.Spec.Component))
 	obsmetrics.DeleteIRStatusSeries(ir.Namespace, ir.Name, string(ir.Spec.Component))
 	key := client.ObjectKeyFromObject(ir)
 	r.scaleDownSeriesMu.Lock()

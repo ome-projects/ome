@@ -2,6 +2,7 @@ package controllerconfig
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -625,6 +626,59 @@ func TestLifecycleConfig_ToUnschedulableGracePeriod(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &LifecycleConfig{UnschedulableGracePeriod: tt.value}
 			grace, err := cfg.ToUnschedulableGracePeriod()
+			assert.Error(t, err)
+			assert.Equal(t, time.Duration(0), grace)
+		})
+	}
+}
+
+// TestLifecycleConfig_ToAbandonedReplacementGracePeriod pins the
+// validation contract for the abandoned-replacement grace: a configured
+// duration parses, an absent key yields zero (unconfigured, not an
+// error), and any non-positive or unparsable value is an error the
+// caller treats as unconfigured.
+func TestLifecycleConfig_ToAbandonedReplacementGracePeriod(t *testing.T) {
+	t.Run("configured value parses", func(t *testing.T) {
+		cfg := &LifecycleConfig{AbandonedReplacementGracePeriod: "30s"}
+		grace, err := cfg.ToAbandonedReplacementGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, grace)
+	})
+
+	t.Run("nil receiver yields zero, no error", func(t *testing.T) {
+		var cfg *LifecycleConfig
+		grace, err := cfg.ToAbandonedReplacementGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), grace)
+	})
+
+	t.Run("absent key yields zero, no error", func(t *testing.T) {
+		cfg := &LifecycleConfig{AbandonedReplacementGracePeriod: ""}
+		grace, err := cfg.ToAbandonedReplacementGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), grace)
+	})
+
+	t.Run("decodes from the lifecycle document", func(t *testing.T) {
+		var cfg LifecycleConfig
+		require.NoError(t, json.Unmarshal([]byte(`{"abandonedReplacementGracePeriod":"30s"}`), &cfg))
+		grace, err := cfg.ToAbandonedReplacementGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, grace)
+	})
+
+	invalid := []struct {
+		name  string
+		value string
+	}{
+		{"invalid duration", "not-a-duration"},
+		{"zero duration", "0s"},
+		{"negative duration", "-5s"},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &LifecycleConfig{AbandonedReplacementGracePeriod: tt.value}
+			grace, err := cfg.ToAbandonedReplacementGracePeriod()
 			assert.Error(t, err)
 			assert.Equal(t, time.Duration(0), grace)
 		})

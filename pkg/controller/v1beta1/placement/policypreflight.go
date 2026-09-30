@@ -69,17 +69,24 @@ func aggregateCondition(status corev1.ConditionStatus, reason, message string) p
 	}
 }
 
-// applyPolicyConditions writes staged conditions through the ISVC condition
-// manager (which preserves LastTransitionTime on unchanged content). A nil
-// slice is the no-ref fast path: nothing touches the status. A clear entry
-// removes the condition type instead.
+// applyPolicyConditions preserves transition times when the final condition
+// content is unchanged. A clear entry removes the condition type instead.
 func applyPolicyConditions(st *v1beta1.InferenceServiceStatus, conds []policyCondition) {
 	for i := range conds {
 		if conds[i].clear {
 			removeCondition(st, conds[i].condType)
 			continue
 		}
+		previous := st.GetCondition(conds[i].condType)
 		st.SetCondition(conds[i].condType, &conds[i].cond)
+		if sameConditionState(previous, st.GetCondition(conds[i].condType)) {
+			for j := range st.Conditions {
+				if st.Conditions[j].Type == conds[i].condType {
+					st.Conditions[j].LastTransitionTime = previous.LastTransitionTime
+					break
+				}
+			}
+		}
 	}
 }
 
@@ -514,7 +521,7 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 	// Split hard gate: with no per-cluster ceiling, every home renders the
 	// GLOBAL MaxReplicas, so a fleet-wide metric outage would drive each home
 	// to the full budget (N x max). Hold loudly; the fix is one spec field.
-	if placementMode(isvc) == v1beta1.PlacementModeSplit && splitCeilingUnset(isvc) {
+	if mode := placementMode(isvc); (mode == v1beta1.PlacementModeSplit || mode == v1beta1.PlacementModeSplitByCapacity) && splitCeilingUnset(isvc) {
 		for _, name := range names {
 			consumes, err := render.ConsumesMaxReplicas(anchorSpecs[name])
 			if err != nil || consumes {

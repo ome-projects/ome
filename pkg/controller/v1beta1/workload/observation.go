@@ -266,6 +266,12 @@ type ComponentCounters struct {
 // TakeInlineV1Publication consumes the owned rows, overlays the publication
 // observation, and computes Component counters from that same observation.
 // Only durable identity and revision fields participate from the stored rows.
+//
+// The one lifecycle field the publication writes is the phase of a settled
+// Ready row the observation finds no pods for: it publishes Pending, the
+// phase the truth pass moves such a row to, so the phase never contradicts
+// the zero pod count published beside it (status.DemotableReady). The
+// running revision stays on the row for the pass that rebuilds it.
 func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]int32, targetRevName string) ([]types.InstanceStatus, ComponentCounters, error) {
 	var counters ComponentCounters
 	target := query.RevisionFromName(targetRevName)
@@ -290,6 +296,11 @@ func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]in
 	})
 	if err != nil {
 		return nil, ComponentCounters{}, err
+	}
+	for i := range statuses {
+		if statuses[i].PodCount == 0 && status.DemotableReady(&statuses[i]) {
+			statuses[i].Phase = types.InstancePhasePending
+		}
 	}
 	counters.Replicas = int32(len(statuses))
 	return statuses, counters, nil

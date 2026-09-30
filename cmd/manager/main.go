@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -61,6 +62,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/leaderelection"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/tpuslice/gke"
 	"sigs.k8s.io/ome/pkg/utils"
 	"sigs.k8s.io/ome/pkg/version"
 	autoscalerpolicywebhook "sigs.k8s.io/ome/pkg/webhook/admission/autoscalerpolicy"
@@ -530,6 +532,17 @@ func main() {
 		rolloutMaxPlanBytes = rolloutStartupConfig.MaxPinnedPlanBytes
 	}
 
+	// TPU slice provisioning config is read once at startup and shared by
+	// the InferenceReplica controller, which provisions slices from it, and
+	// the InferenceReplica webhook, which checks slice demand against it.
+	var tpuSliceConfig *controllerconfig.TPUSliceProvisioningConfig
+	if !isControlPlane && (options.enableInferenceReplicaCtrl || options.enableWebhook) {
+		if tpuSliceConfig, err = controllerconfig.NewTPUSliceProvisioningConfig(clientSet); err != nil {
+			setupLog.Error(err, "Failed to initialize TPU slice provisioning configuration")
+			os.Exit(1)
+		}
+	}
+
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientSet.CoreV1().Events("")})
 	if isControlPlane {
@@ -557,6 +570,29 @@ func main() {
 			QuotaAcceleratorResources: quotaAcceleratorResources,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create InferenceService controller")
+			os.Exit(1)
+		}
+
+		// With a controllerIdentity configured, the InferenceReplica webhook
+		// admits projections only from that identity. The check runs as a
+		// runnable, after the manager starts and on the leader that projects,
+		// and reports a mismatch, or an identity it could not verify, without
+		// blocking startup.
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			mode, err := controllerconfig.CheckControllerIdentity(ctx, clientSet)
+			switch {
+			case err != nil && mode == "":
+				setupLog.Error(err, "InferenceReplica admission: could not load the controller identity")
+			case errors.Is(err, controllerconfig.ErrControllerIdentityUnverified):
+				setupLog.Error(err, "InferenceReplica admission: could not verify this manager's identity", "mode", mode)
+			case err != nil:
+				setupLog.Error(err, "InferenceReplica admission: this manager is not the configured controller identity; its InferenceReplica projections will be denied until inferenceReplica.controllerIdentity names it", "mode", mode)
+			default:
+				setupLog.Info("InferenceReplica admission mode", "mode", mode)
+			}
+			return nil
+		})); err != nil {
+			setupLog.Error(err, "Failed to register the InferenceReplica controller identity check")
 			os.Exit(1)
 		}
 
@@ -637,6 +673,13 @@ func main() {
 		}
 	}
 
+	// The runtime selector the InferenceReplica controller renders replicas
+	// with from their model and runtime references, shared with the
+	// InferenceService validator. It carries the cluster's model cache
+	// provider so a sharded model selects a runtime that supports it.
+	runtimeSelectorConfig := runtimeselector.NewConfig(mgr.GetClient())
+	runtimeSelector := runtimeselector.NewWithConfig(runtimeSelectorConfig)
+
 	if options.enableInferenceReplicaCtrl && !isControlPlane {
 		setupLog.Info("Setting up InferenceReplica controller")
 		if err = (&v1beta1inferencereplicacontroller.Reconciler{
@@ -644,6 +687,7 @@ func main() {
 			Clientset:                clientSet,
 			Log:                      ctrl.Log.WithName("InferenceReplica"),
 			APIReader:                mgr.GetAPIReader(),
+			RuntimeSelector:          runtimeSelector,
 			InstanceStatusDecoder:    instanceStatusDecoder,
 			InstanceStatusTarget:     omenativeStatusConfig.InstanceStatusEncoding,
 			Recorder:                 eventBroadcaster.NewRecorder(mgr.GetScheme(), v1.EventSource{Component: "v1beta1Controllers"}),
@@ -652,6 +696,7 @@ func main() {
 			ScaleUpPodBatchSize:      podBatchSizes.ScaleUp,
 			ScaleDownPodBatchSize:    podBatchSizes.ScaleDown,
 			ScaleDownRequeueInterval: podBatchSizes.ScaleDownRequeueInterval,
+			TPUSliceProvisioning:     tpuSliceConfig,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create InferenceReplica controller")
 			os.Exit(1)
@@ -737,9 +782,25 @@ func main() {
 		})
 
 		setupLog.Info("Registering InferenceReplica validator webhook to the webhook server")
-		hookServer.Register("/validate-ome-io-v1beta1-inferencereplica", &webhook.Admission{
-			Handler: &inferencereplicawebhook.Validator{Decoder: admission.NewDecoder(mgr.GetScheme())},
-		})
+		irValidator := &inferencereplicawebhook.Validator{
+			Decoder:     admission.NewDecoder(mgr.GetScheme()),
+			Reader:      mgr.GetAPIReader(),
+			Clientset:   clientSet,
+			ConfigCache: controllerconfig.NewConfigCache(options.configCacheTTL),
+		}
+		// Slice demand is checked only when slices are provisioned:
+		// configured, with the Slice CRD installed at startup.
+		if tpuSliceConfig != nil {
+			var sliceFound bool
+			if sliceFound, err = utils.IsCrdAvailable(cfg, gke.GroupVersion.String(), gke.Kind); err != nil {
+				setupLog.Error(err, "Failed to probe for the Slice CRD")
+				os.Exit(1)
+			}
+			if sliceFound {
+				irValidator.TPUSliceProvisioning, irValidator.Nodes = tpuSliceConfig, mgr.GetAPIReader()
+			}
+		}
+		hookServer.Register("/validate-ome-io-v1beta1-inferencereplica", &webhook.Admission{Handler: irValidator})
 
 		// The AutoscalerPolicy ValidatingWebhookConfiguration is chart-gated
 		// alongside the CRD; registering the handler unconditionally is
@@ -766,11 +827,10 @@ func main() {
 		if isControlPlane {
 			setupLog.Info("control-plane role: InferenceService validator webhook disabled (runtime selection runs on workload clusters)")
 		} else {
-			runtimeSelector := runtimeselector.New(mgr.GetClient())
-
 			if err = ctrl.NewWebhookManagedBy(mgr, &v1beta1.InferenceService{}).
 				WithValidator(&isvc.InferenceServiceValidator{
 					Client:          mgr.GetClient(),
+					Reader:          mgr.GetAPIReader(),
 					RuntimeSelector: runtimeSelector,
 					// Rejects any spec.<component>.autoscalerPolicyRef when
 					// the AutoscalerPolicy CRD is absent, so a ref can never

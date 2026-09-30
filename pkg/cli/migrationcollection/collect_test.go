@@ -169,9 +169,9 @@ func TestCollectLongNameScansBoundedlyAndKeepsOnlyExactRelationships(t *testing.
 	relatedRouter.Spec.Component = omev1beta1.RouterComponent
 
 	hostileUnrelated := collectionIR("bad\n\x1b\u202esource", "prod", "uid-hostile")
-	hostileUnrelated.Spec.ParentRef.Name = parent.Name
+	hostileUnrelated.Spec.ParentRef = &omev1beta1.ParentReference{Name: parent.Name}
 	wrongParent := collectionRelatedIR(parent, "wrong-parent", "uid-wrong-parent")
-	wrongParent.Spec.ParentRef.Name = "someone-else"
+	wrongParent.Spec.ParentRef = &omev1beta1.ParentReference{Name: "someone-else"}
 	wrongOwner := collectionRelatedIR(parent, "wrong-owner", "uid-wrong-owner")
 	wrongOwner.OwnerReferences[0].UID = "someone-else"
 	wrongNamespace := collectionRelatedIR(parent, "wrong-namespace", "uid-wrong-namespace")
@@ -497,7 +497,7 @@ func collectionRelatedIR(parent *omev1beta1.InferenceService, name, uid string) 
 			}},
 		},
 		Spec: omev1beta1.InferenceReplicaSpec{
-			ParentRef: omev1beta1.ParentReference{Name: parent.Name}, Component: omev1beta1.EngineComponent,
+			ParentRef: &omev1beta1.ParentReference{Name: parent.Name}, Component: omev1beta1.EngineComponent,
 		},
 	}
 }
