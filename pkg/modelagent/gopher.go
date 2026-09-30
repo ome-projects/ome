@@ -352,8 +352,9 @@ func (s *Gopher) safeParseAndUpdateModelConfig(ctx context.Context, modelPath st
 		return err
 	}
 
-	// add artifact info if necessary
-	if artifact != nil {
+	// add artifact info if necessary. ParseModelConfig returns nil metadata
+	// when it skips parsing, and then nothing is written below.
+	if artifact != nil && metadata != nil {
 		metadata = s.modelConfigParser.PopulateArtifactAttribute(artifact, metadata)
 	}
 

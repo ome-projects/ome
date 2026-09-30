@@ -179,3 +179,22 @@ func TestDirectHFConfigParsingFailurePreservesVerifiedDownload(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, HfArtifactStatusReady, parent.Status)
 }
+
+func TestDirectHFSkipConfigParsingCompletesOrdinaryDownload(t *testing.T) {
+	s, task, input, source, downloads := newTestDirectHfSource(t)
+	s.modelConfigParser = modelparser.NewModelConfigParser(nil, s.logger)
+	// Only the ordinary download passes its artifact to config parsing.
+	task.BaseModel.Spec.Storage.DownloadPolicy = nil
+	task.BaseModel.Annotations[ConfigParsingAnnotation] = "true"
+
+	waiting, err := source.process(context.Background(), s, task, task.BaseModel.Spec, true)
+	require.NoError(t, err)
+	require.False(t, waiting)
+	require.Equal(t, 1, *downloads)
+	require.FileExists(t, filepath.Join(input.ChildModelPath, "model.safetensors"))
+	cm, err := s.configMapReconciler.getConfigMap(context.Background())
+	require.NoError(t, err)
+	var entry ModelEntry
+	require.NoError(t, json.Unmarshal([]byte(cm.Data[input.ChildModelKey]), &entry))
+	require.Nil(t, entry.Config, "skipped parsing must not write model config")
+}
