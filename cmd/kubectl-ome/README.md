@@ -121,7 +121,7 @@ kubectl ome status chat \
 | `admin --alfred-config-key` | Configuration key, default `config.yaml`. |
 
 `--ome-namespace` is available on `status`, `version`, `accelerator explain`,
-`autoscale explain`, `runtime explain/effective/history/sync`,
+`autoscale explain`, `runtime explain/effective/history/render/sync`,
 `instance status/release-held`, `migration start`, `scale`, and
 `rollout pause/resume/promote/rollback`. The `admin` family inherits the OME
 and Alfred options. Other commands do not accept it. For example,
