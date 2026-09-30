@@ -70,15 +70,16 @@ A commented sample config ships in the repository at
 
 The run either completes fully or exits non-zero:
 
-- On any replication error the agent writes the message to
+- On a replication error the agent writes the message to
   `/dev/termination-log` (visible in the pod's termination status) and exits
-  with code 1.
+  with code 1. Size-limit and empty-source aborts also exit with code 1, but
+  report the reason only in the container log.
 - If the process is interrupted (for example a `SIGTERM` during a node drain)
   before replication completed, it also exits non-zero. A wrapping `Job`
   therefore never records success for a partial copy.
 
-There is no automatic retry inside the agent; schedule retries through the
-Job's `backoffLimit` or your own orchestration.
+The agent never retries a failed run; schedule retries through the Job's
+`backoffLimit` or your own orchestration.
 
 ## Configuration
 
