@@ -94,6 +94,12 @@ ome:
         funnelBufferSize: 0      # depth of the funnel's buffered event channel
       # placement: the fan-out placement controller, its status convergence + GC.
       placement:
+        # Member namespace for pinned runtimes and model configuration; required
+        # for capacity placement. No namespace is assumed when this is empty.
+        memberOperatorNamespace: ""
+        # Opt in after installing current member CRDs/controllers. Supply rootName,
+        # maxAge, stabilityWindow, and refreshInterval.
+        capacity: null
         requeueInterval: ""         # status-refresh poll cadence
         gcInterval: ""              # orphan-sweep cadence
         maxConcurrentReconciles: 0  # parallel placement reconciles (0 => single worker)
@@ -425,6 +431,13 @@ ome:
       # its own. Empty means no configured default (each consumer keeps its
       # documented fallback).
       defaultReadyTimeout: "15m"
+      # How soon the canary executor re-checks a step in progress (capacity
+      # coming up, a timed pause, a drain window). Empty means unconfigured:
+      # the executor falls back to the controller's rate-limited requeue.
+      canaryRequeue: "10s"
+      # Heartbeat of a parked (Failed) canary, which only an operator or a new
+      # target moves. Empty means the same rate-limited fallback.
+      canaryParkedRequeue: "5m"
     # coordination tunes the OMENative cross-Component coordination layer.
     coordination:
       # Per-revision hysteresis band (percent) for the pod-proportional traffic
@@ -474,6 +487,48 @@ ome:
         maxUnavailable: 1
       omeNative:
         maxUnavailable: 1
+    # tpuSliceProvisioning describes TPU node pools that provision slices on
+    # demand: how a workload's slice shape is read from the node labels its
+    # pods select, how a provisioned slice is recognized, and the metadata and
+    # ready states of the slice objects the controller creates. Read once at
+    # manager startup. Empty ({}) provisions no slices; set, every field is
+    # required, the binary has no default for any of them, and a malformed
+    # block stops the manager from starting. Pools without the provisionOnly
+    # label hold static slices and are never provisioned or released.
+    # slice.annotations may be {} but must be present. Example for GKE dynamic
+    # slicing with single-host Ironwood slices:
+    #   tpuSliceProvisioning:
+    #     chipResource: google.com/tpu
+    #     nodeLabels:
+    #       accelerator: cloud.google.com/gke-tpu-accelerator
+    #       topology: cloud.google.com/gke-tpu-topology
+    #       slice: cloud.google.com/gke-tpu-slice
+    #     provisionOnly:
+    #       key: cloud.google.com/gke-accelerator-topology-mode
+    #       value: PROVISION_ONLY
+    #     accelerators:
+    #       tpu7x:
+    #         sliceType: tpu7x
+    #         chipsPerHost: 4
+    #         topologies: ["2x2x1"]
+    #     slice:
+    #       ownerKindLabel: cloud.google.com/slice-owner-kind
+    #       ownerNameLabel: cloud.google.com/slice-owner-name
+    #       annotations:
+    #         cloud.google.com/managed-by: slice-scheduler
+    #         slice.gke.io/retry-on-failure: "true"
+    #       readyStates: [ACTIVE, ACTIVE_DEGRADED]
+    tpuSliceProvisioning: {}
+    # inferenceReplica configures InferenceReplica admission. controllerIdentity
+    # names the identity the InferenceService controller writes with; the
+    # webhook admits spec writes on the replicas an InferenceService projects
+    # only from that identity. usernames and groups are added to the chart's
+    # controller ServiceAccount in the release namespace, which is always
+    # listed, so an extra identity can never drop the controller's own.
+    inferenceReplica:
+      controllerIdentity:
+        usernames: []
+        groups: []
     # lifecycle tunes the OMENative per-Instance lifecycle state machine.
     lifecycle:
       # Missing-Pod budget for one OMENative scale-up pass. Instance and
@@ -551,6 +606,17 @@ ome:
       # way. Removing this field disables the escalation, so an unplaceable pod
       # waits for an operator instead.
       unschedulableGracePeriod: 15m
+      # abandonedReplacementGracePeriod is the termination grace given to a
+      # replacement pod a rollout abandons before it ever entered the serving
+      # rotation: a surge replacement superseded by a newer revision, or
+      # retired after its attempt failed, while still pulling, scheduling or
+      # failing readiness. Such a pod owes no in-flight work, and its own
+      # terminationGracePeriodSeconds (the pod grace default above) would
+      # otherwise hold its surge slot — with maxSurge 1, the whole rollout —
+      # for that long before a corrective revision can land. A replacement
+      # that has served keeps its own grace. Removing this field leaves every
+      # abandoned replacement its own grace.
+      abandonedReplacementGracePeriod: 30s
       # gangScheduleTimeout bounds the PodGroup scheduleTimeoutSeconds a
       # multi-pod Instance derives from its Component's instanceReadyTimeout,
       # so gang admission releases an infeasible attempt on a cluster-wide

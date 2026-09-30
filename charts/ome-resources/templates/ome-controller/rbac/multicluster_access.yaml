@@ -40,17 +40,52 @@ rules:
   - get
   - list
   - watch
-# ClusterServingRuntimes: read-only. The control plane never writes runtimes
-# on workload clusters (those are managed per-cluster via GitOps); it only
-# reads them for runtime context. Write verbs were over-broad blast radius.
+# Runtime and model inputs are read on the member before workload application.
 - apiGroups:
   - ome.io
   resources:
   - clusterservingruntimes
+  - servingruntimes
+  - clusterbasemodels
+  - basemodels
   verbs:
   - get
   - list
   - watch
+# Pinned runtime revisions and operator configuration remain member-owned.
+- apiGroups:
+  - apps
+  resources:
+  - controllerrevisions
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  resourceNames:
+  - inferenceservice-config
+  verbs:
+  - get
+# Capacity normalization reads hardware reports, flavor labels and pod overhead.
+- apiGroups:
+  - ome.io
+  resources:
+  - acceleratorquotas
+  verbs:
+  - get
+- apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - resourceflavors
+  verbs:
+  - list
+- apiGroups:
+  - node.k8s.io
+  resources:
+  - runtimeclasses
+  verbs:
+  - get
 # Pods: read-only, needed so the placement controller can observe admission
 # on the workload cluster directly (pods released from / held by a scheduling
 # gate) instead of only trusting the mirrored derived-ISVC status.

@@ -36,6 +36,44 @@ app.kubernetes.io/part-of: ome
 {{- end -}}
 
 {{/*
+A list of identity names from values, rendered as a JSON array for
+fromJsonArray. A single name becomes a one-element list, a list passes through,
+and nil or an empty string is an empty list; any other top-level kind fails the
+render. Each name must be a non-blank string without surrounding whitespace,
+since the manager rejects the whole block otherwise. The output must always be
+valid JSON, because fromJsonArray turns a parse error into a one-element list.
+Parameters:
+  - key: the values path, named in the error (required)
+  - value: the configured value
+*/}}
+{{- define "ome.identityList" -}}
+{{- $key := .key -}}
+{{- $value := .value -}}
+{{- if kindIs "invalid" $value -}}
+[]
+{{- else if kindIs "string" $value -}}
+{{- if eq $value "" -}}
+[]
+{{- else if ne (trim $value) $value -}}
+{{- fail (printf "%s must be a non-blank name without surrounding whitespace" $key) -}}
+{{- else -}}
+{{- list $value | mustToJson -}}
+{{- end -}}
+{{- else if kindIs "slice" $value -}}
+{{- range $i, $name := $value -}}
+{{- if not (kindIs "string" $name) -}}
+{{- fail (printf "%s[%d] must be a name, got %s" $key $i (kindOf $name)) -}}
+{{- else if or (eq $name "") (ne (trim $name) $name) -}}
+{{- fail (printf "%s[%d] must be a non-blank name without surrounding whitespace" $key $i) -}}
+{{- end -}}
+{{- end -}}
+{{- $value | mustToJson -}}
+{{- else -}}
+{{- fail (printf "%s must be a list of names or a single name, got %s" $key (kindOf $value)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Selector labels for the bundled Prometheus (Deployment + Service
 selector). Kept minimal so they stay stable across re-renders.
 */}}

@@ -70,6 +70,8 @@ All options below are under `ome.multicluster.config`. Each has a consumer in
 | `placement.winnerLostGrace` | Relevant to sticky single-active placement; not a Split distribution control. |
 | `placement.dispatcherMode`, `.dispatcherStepSize`, `.dispatcherRoundTimeout` | Candidate-dispatch tuning for single-active placement. The step/dwell knobs are unused by AllAtOnce; Split follows its apportionment path. |
 | `placement.localQueue` | Optional fallback only. A source's `ome.io/local-queue` annotation wins. Leave empty for a fleet with per-service quota leaves. |
+| `placement.memberOperatorNamespace` | Namespace of each member's `inferenceservice-config` and pinned runtime revisions. Required for SplitByCapacity, and for any mode that must resolve a pinned runtime or an operator-default floor. Empty holds that resolution. |
+| `placement.capacity` (`rootName`, `maxAge`, `stabilityWindow`, `refreshInterval`) | Opt-in for SplitByCapacity; null keeps that mode pending. Every field is required when present, and setting it grants the control-plane manager read access to quota reports. |
 
 Empty/zero entries mostly delegate to consuming-package defaults; they need not
 be repeated in GitOps overrides. They should remain documented advanced options,

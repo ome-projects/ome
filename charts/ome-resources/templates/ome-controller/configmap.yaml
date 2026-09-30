@@ -47,6 +47,10 @@ data:
   podDisruptionBudget: |-
     {{- toJson . | nindent 4 }}
 {{- end }}
+{{- with .Values.ome.controller.tpuSliceProvisioning }}
+  tpuSliceProvisioning: |-
+    {{- toJson . | nindent 4 }}
+{{- end }}
 
   canaryAnalysis: |-
     {
@@ -60,7 +64,9 @@ data:
   rollout: |-
     {
       "maxPinnedPlanBytes": {{ .Values.ome.controller.rollout.maxPinnedPlanBytes | default 0 }},
-      "defaultReadyTimeout": "{{ .Values.ome.controller.rollout.defaultReadyTimeout | default "" }}"
+      "defaultReadyTimeout": "{{ .Values.ome.controller.rollout.defaultReadyTimeout | default "" }}",
+      "canaryRequeue": "{{ .Values.ome.controller.rollout.canaryRequeue | default "" }}",
+      "canaryParkedRequeue": "{{ .Values.ome.controller.rollout.canaryParkedRequeue | default "" }}"
     }
 {{- with .Values.ome.metricProviders }}
 
@@ -94,6 +100,19 @@ data:
       "maxDecodedInstances": {{ int64 $omenativeStatus.maxDecodedInstances }}{{- end }}
     }
 
+  {{- $inferenceReplica := .Values.ome.controller.inferenceReplica | default dict }}
+  {{- $identity := $inferenceReplica.controllerIdentity | default dict }}
+  {{- $controllerUser := printf "system:serviceaccount:%s:ome-controller-manager" .Release.Namespace }}
+  {{- $usernames := include "ome.identityList" (dict "key" "ome.controller.inferenceReplica.controllerIdentity.usernames" "value" $identity.usernames) | fromJsonArray }}
+  {{- $groups := include "ome.identityList" (dict "key" "ome.controller.inferenceReplica.controllerIdentity.groups" "value" $identity.groups) | fromJsonArray }}
+  inferenceReplica: |-
+    {
+      "controllerIdentity": {
+        "usernames": {{ concat (list $controllerUser) $usernames | uniq | toJson }},
+        "groups": {{ $groups | uniq | toJson }}
+      }
+    }
+
   {{- with .Values.ome.controller.lifecycle }}
   {{- $fields := list }}
   {{- if hasKey . "scaleUpPodBatchSize" }}
@@ -122,6 +141,9 @@ data:
   {{- end }}
   {{- with .unschedulableGracePeriod }}
   {{- $fields = append $fields (dict "unschedulableGracePeriod" .) }}
+  {{- end }}
+  {{- with .abandonedReplacementGracePeriod }}
+  {{- $fields = append $fields (dict "abandonedReplacementGracePeriod" .) }}
   {{- end }}
   {{- with .gangScheduleTimeout }}
   {{- $fields = append $fields (dict "gangScheduleTimeout" (dict "min" .min "max" .max)) }}
@@ -178,7 +200,14 @@ data:
         "dispatcherMode": "{{ .Values.ome.multicluster.config.placement.dispatcherMode | default "" }}",
         "dispatcherStepSize": {{ .Values.ome.multicluster.config.placement.dispatcherStepSize | default 0 }},
         "dispatcherRoundTimeout": "{{ .Values.ome.multicluster.config.placement.dispatcherRoundTimeout | default "" }}",
-        "localQueue": "{{ .Values.ome.multicluster.config.placement.localQueue | default "" }}"
+        "localQueue": "{{ .Values.ome.multicluster.config.placement.localQueue | default "" }}"{{- with .Values.ome.multicluster.config.placement.memberOperatorNamespace }},
+        "memberOperatorNamespace": {{ . | quote }}{{- end }}{{- with .Values.ome.multicluster.config.placement.capacity }},
+        "capacity": {
+          "rootName": {{ .rootName | default "" | quote }},
+          "maxAge": {{ .maxAge | default "" | quote }},
+          "stabilityWindow": {{ .stabilityWindow | default "" | quote }},
+          "refreshInterval": {{ .refreshInterval | default "" | quote }}
+        }{{- end }}
       },
       "endpoint": {
         "globalHostTemplate": "{{ .Values.ome.multicluster.config.endpoint.globalHostTemplate | default "" }}",
