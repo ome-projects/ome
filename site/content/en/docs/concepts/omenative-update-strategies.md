@@ -3,7 +3,7 @@ title: "OMENative Update Strategies"
 linkTitle: "Update Strategies"
 weight: 31
 description: >
-  How OMENative physically replaces an Instance's pods on a template change — SurgeThenDrain, RecreatePod, InPlaceIfPossible, InPlaceOnly — how partition, maxSurge, and maxUnavailable pace the roll, and where the defaults come from.
+  Which changes mint a new revision, how OMENative physically replaces an Instance's pods — SurgeThenDrain, RecreatePod, InPlaceIfPossible, InPlaceOnly — how partition, maxSurge, and maxUnavailable pace the roll, and where the defaults come from.
 ---
 
 When the pod template of an [OMENative](/ome/docs/concepts/omenative) component changes — a new image, a runtime edit, an environment tweak — OMENative rolls each **Instance** from its current revision to the new one. `lifecycle.updateStrategy` on the component controls the **physical replacement mechanism** for one Instance's pods and how many Instances may be moving at once:
@@ -28,6 +28,26 @@ spec:
 ```
 
 The block is read only for components that resolve to the OMENative deployment mode; on any other mode it is ignored (`RawDeployment` components use the standard `deploymentStrategy` field instead). It is also a different layer from `spec.rollout`: a rollout group's progression (blue-green, canary, its own `rollingUpdate` budgets) decides *when* revisions advance and how traffic shifts, while `lifecycle.updateStrategy` decides *how each Instance's pods are physically swapped* once an update is admitted.
+
+## What mints a new revision
+
+A component's revision is a content hash of its rendered pod template: the pod spec (for a multi-pod component, the leader **and** worker specs plus the resolved `topologyKey`), the pod-template **labels and annotations**, and — on components that participate in P/D pairing — the pairing-protocol token. When the hash changes, a new revision is minted and Instances roll to it under the strategy below; when it does not, nothing is replaced. Fields outside the template never mint a revision: `lifecycle.updateStrategy` itself (see [Editing the strategy mid-roll](#editing-the-strategy-mid-roll)), replica counts and autoscaling bounds, `spec.rollout`, and the [`topologySpread` / `topologySpreadKey`](/ome/docs/tasks/run-workloads/spread-instances-across-fault-domains) placement policy.
+
+Pod-spec inputs are unambiguous — an image, argument, env, or resource change anywhere in the leader or worker template mints a revision. Metadata is where predictions go wrong, because **where an annotation is set decides whether it defines revision identity**:
+
+- **InferenceService-level** (`metadata.annotations`) — inherited onto the component's pod metadata but **excluded from the hash**. Adding, editing, or removing one never rolls a healthy fleet; the new value reaches only pods created afterwards (scale-ups, repairs, the next rollout).
+- **Component-level** (`spec.<component>.annotations`, or the same field on the runtime's `engineConfig` / `decoderConfig` / `routerConfig`, since the two merge) — **participates in the hash**. Changing one mints a new revision and rolls the component; an annotation bump here is the canonical way to force a rollout without touching the image. A key declared at both levels counts as component-declared, and the component's value is the one on the template.
+
+The split is visible on the component's InferenceReplica: the InferenceService controller stamps `ome.io/revision-excluded-annotation-keys` with every InferenceService-level annotation key *not* also declared on the component, and the InferenceReplica controller strips exactly those keys from the template metadata before hashing. Predicting whether an annotation edit rolls means checking that list:
+
+```bash
+kubectl get inferencereplica llama-chat-engine -n llama-demo \
+  -o jsonpath="{.metadata.annotations['ome\.io/revision-excluded-annotation-keys']}"
+```
+
+On top of the placement rule, controller-owned annotations **never feed the hash wherever they appear** — they are read or written by the controller mid-reconcile, and hashing one would let an operator verb manufacture a phantom rollout of a spec nobody edited: `ome.io/rollout-paused`, `ome.io/rollout-promote`, `ome.io/rollout-rollback`, `ome.io/release-held-revision`, [`ome.io/reset-instances`](/ome/docs/tasks/reset-failed-instances), any `ome.io/migration-request-v1-*` key, `ome.io/local-queue`, and `ome.io/placement-execution`.
+
+**Labels have no InferenceService-level exemption.** `metadata.labels` merge into every component's pod template and are hashed, so changing an InferenceService-level label mints a new revision for **every** OMENative component of the service and rolls them all. The only labels left out of the hash are controller- or admission-owned: the Kueue queue assignment (`kueue.x-k8s.io/queue-name`, `kueue.x-k8s.io/priority-class`) and the control plane's placement markers. The queue exclusion cuts the other way too — re-pointing a component at another queue replaces nothing on its own; the new queue takes effect as pods are next created.
 
 ## The four strategies
 
