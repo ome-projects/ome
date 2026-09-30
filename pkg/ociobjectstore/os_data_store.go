@@ -132,6 +132,24 @@ func applyDownloadDefaults(opts *DownloadOptions) DownloadOptions {
 
 // BulkDownload uses DownloadWithStrategy for each object with concurrency and retry logic.
 func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, concurrency int, opts ...DownloadOption) error {
+	return cds.BulkDownloadContext(context.Background(), objects, targetDir, concurrency, opts...)
+}
+
+// BulkDownloadContext stops standard downloads between files and can cancel
+// multipart downloads in progress. It waits for active downloads to return.
+// Active SDK calls retain their retry policy and may delay cancellation.
+func (cds *OCIOSDataStore) BulkDownloadContext(ctx context.Context, objects []ObjectURI, targetDir string, concurrency int, opts ...DownloadOption) error {
+	return cds.bulkDownload(ctx, objects, targetDir, concurrency, func(object ObjectURI, target string, opts ...DownloadOption) error {
+		return cds.DownloadWithStrategyContext(ctx, object, target, opts...)
+	}, opts...)
+}
+
+func (cds *OCIOSDataStore) bulkDownload(ctx context.Context, objects []ObjectURI, targetDir string, concurrency int,
+	download func(ObjectURI, string, ...DownloadOption) error, opts ...DownloadOption,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(objects) == 0 {
 		return nil
 	}
@@ -147,13 +165,23 @@ func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, c
 			for object := range jobs {
 				var err error
 				for attempt := 1; attempt <= maxRetries; attempt++ {
-					err = cds.DownloadWithStrategy(object, targetDir, opts...)
+					if ctx.Err() != nil {
+						return
+					}
+					err = download(object, targetDir, opts...)
+					if ctx.Err() != nil {
+						return
+					}
 					if err == nil {
 						cds.logger.Infof("[Worker %d] Successfully downloaded and validated %s", workerID, object.ObjectName)
 						break
 					}
 					cds.logger.Warnf("[Worker %d] Retry %d for %s after error: %v", workerID, attempt, object.ObjectName, err)
-					time.Sleep(retryDelay)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(retryDelay):
+					}
 				}
 				if err != nil {
 					errs <- fmt.Errorf("failed to smart download %s: %w", object.ObjectName, err)
@@ -168,6 +196,9 @@ func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, c
 	close(jobs)
 	wg.Wait()
 	close(errs)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	for err := range errs {
 		return err
@@ -179,6 +210,12 @@ func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, c
 
 // DownloadWithStrategy chooses between standard and multipart download based on object size and options.
 func (cds *OCIOSDataStore) DownloadWithStrategy(source ObjectURI, target string, opts ...DownloadOption) error {
+	return cds.DownloadWithStrategyContext(context.Background(), source, target, opts...)
+}
+
+// DownloadWithStrategyContext cancels multipart downloads through ctx. Standard
+// downloads continue until the current file finishes.
+func (cds *OCIOSDataStore) DownloadWithStrategyContext(ctx context.Context, source ObjectURI, target string, opts ...DownloadOption) error {
 	downloadOpts, err := applyDownloadOptions(opts...)
 	if err != nil {
 		return fmt.Errorf("failed to apply download options: %w", err)
@@ -212,6 +249,9 @@ func (cds *OCIOSDataStore) DownloadWithStrategy(source ObjectURI, target string,
 	if err != nil {
 		return fmt.Errorf("failed to list objects for %s: %w", source.ObjectName, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(objects) == 0 {
 		return fmt.Errorf("object %s not found in bucket %s", source.ObjectName, source.BucketName)
 	}
@@ -225,7 +265,7 @@ func (cds *OCIOSDataStore) DownloadWithStrategy(source ObjectURI, target string,
 
 	if downloadOpts.ForceMultipart || (object.Size != nil && *object.Size >= int64(downloadOpts.SizeThresholdInMB)*1024*1024) {
 		cds.logger.Infof("DownloadWithStrategy using multipart for %s, size: %d", source.ObjectName, *object.Size)
-		return cds.MultipartDownload(source, target, opts...)
+		return cds.MultipartDownloadContext(ctx, source, target, opts...)
 	}
 
 	cds.logger.Infof("DownloadWithStrategy using standard download for %s", source.ObjectName)
