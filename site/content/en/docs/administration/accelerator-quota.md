@@ -126,6 +126,7 @@ for the full commentary):
 | `quotaManager.mode` | *(required)* | `workload` renders the local tree into Kueue on this cluster. |
 | `quotaManager.capacity.resources` | `google.com/tpu`, `nvidia.com/gpu` | Extended resource names that count as accelerator capacity, written in full. A vendor left off contributes no capacity, and a budget against it reports `CapacityExceeded`. Empty disables capacity derivation. |
 | `quotaManager.capacity.hysteresisPercent` | `10` | How far observed capacity must fall below the recorded high-water mark before the mark follows it down. `0` disables damping. |
+| `quotaManager.capacity.reportInterval` | `1m` | How long an unchanged capacity observation may keep its `observedAt` stamp before the manager re-stamps it, so a stale stamp means the reporter stopped — see [The reserved root](#the-reserved-root). Empty or `0s` disables the refresh. |
 | `quotaManager.materialize.enrolledNamespaces` | `[]` | Namespaces served from this cluster. Empty disables materialization, so you can observe the tree before enforcing it. |
 | `quotaManager.materialize.coverResources` | `cpu: 16M`, `memory: 16Pi`, `ephemeral-storage: 16Pi` | Non-accelerator ceilings every rendered ClusterQueue funds. Not a budget — see below. Emptying the map disables materialization. |
 | `quotaManager.materialize.fieldManager` | component name | Owns the applied Kueue objects and is the value of the managed-by label. Two quota managers on one cluster must not share it. |
@@ -170,6 +171,23 @@ Each entry reports, per `(resource, flavor)` pair:
   mark is lowered only once the observed value stays below it by more than the
   configured hysteresis band. Growth is always believed immediately.
 - `observedAt` — when the value was last sampled.
+
+`observedAt` carries a freshness contract, because "the numbers stopped
+changing" is what both stable hardware and a dead reporter look like.
+Unchanged values are deliberately not rewritten on every pass — that would
+spin the watch that triggers the pass — so instead, whenever any entry's
+stamp is older than `quotaManager.capacity.reportInterval` (default `1m`),
+the manager re-samples and re-stamps the whole `status.capacity` list even
+though no number moved. While capacity derivation is on it also requeues at
+the smaller of this interval and `resyncInterval`, so idle hardware really is
+sampled on this cadence rather than only when a node event happens to fire.
+Read the stamp accordingly: one within the interval means the reporter
+sampled the hardware and found it unchanged; one well past it means the
+reporter stopped — the pod is down, or its Node and ResourceFlavor reads are
+failing, which surfaces as reconcile errors but never refreshes the stamp.
+Setting `reportInterval` empty or to `0s` disables the refresh: capacity is
+then written only when it changes, and a stale `observedAt` no longer
+distinguishes stable hardware from a reporter that stopped.
 
 ## Author the tree
 
