@@ -137,8 +137,12 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	@perl -pi -e 's/Any/string/g' config/crd/full/ome.io_inferenceservices.yaml
 	@echo "  • Updating framework properties..."
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.*.required)' -i config/crd/full/ome.io_inferenceservices.yaml
-	@echo "  • Optimizing CRD size..."
-	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.ephemeralContainers)' -i config/crd/full/ome.io_inferenceservices.yaml
+	@echo "  • Removing ephemeralContainers from every pod schema..."
+	@# Pod templates may not carry ephemeral containers (the API server rejects
+	@# them on create), so every embedded copy of the schema only adds size.
+	@for crd in inferenceservices servingruntimes clusterservingruntimes inferencereplicas; do \
+	  $(YQ) 'del(.. | .ephemeralContainers?)' -i config/crd/full/ome.io_$$crd.yaml; \
+	done
 	@echo "  • Updating probe configurations..."
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.*.properties.readinessProbe.properties.httpGet.required)' -i config/crd/full/ome.io_inferenceservices.yaml
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.*.properties.livenessProbe.properties.httpGet.required)' -i config/crd/full/ome.io_inferenceservices.yaml
@@ -146,13 +150,10 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.*.properties.livenessProbe.properties.tcpSocket.required)' -i config/crd/full/ome.io_inferenceservices.yaml
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.containers.items.properties.livenessProbe.properties.httpGet.required)' -i config/crd/full/ome.io_inferenceservices.yaml
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.*.properties.containers.items.properties.readinessProbe.properties.httpGet.required)' -i config/crd/full/ome.io_inferenceservices.yaml
-	@echo "  • Optimizing InferenceReplica CRD size..."
+	@echo "  • Relaxing InferenceReplica probe schemas..."
 	@# InferenceReplica embeds PodTemplateSpec one level deeper than ISVC
-	@# (spec.runners.items.template.spec.<podfield>). The same OpenAPI
-	@# strictness fixes the ISVC CRD needs are applied here at the deeper
-	@# path. Without ephemeralContainers deletion the CRD bloats from
-	@# ~1.3k to ~4k lines for almost no operator value.
-	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.runners.items.properties.template.properties.spec.properties.ephemeralContainers)' -i config/crd/full/ome.io_inferencereplicas.yaml
+	@# (spec.runners.items.template.spec.<podfield>), so the same OpenAPI
+	@# strictness fixes the ISVC CRD needs are applied at the deeper path.
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.runners.items.properties.template.properties.spec.properties.containers.items.properties.readinessProbe.properties.httpGet.required)' -i config/crd/full/ome.io_inferencereplicas.yaml
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.runners.items.properties.template.properties.spec.properties.containers.items.properties.livenessProbe.properties.httpGet.required)' -i config/crd/full/ome.io_inferencereplicas.yaml
 	@$(YQ) 'del(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.runners.items.properties.template.properties.spec.properties.containers.items.properties.readinessProbe.properties.tcpSocket.required)' -i config/crd/full/ome.io_inferencereplicas.yaml
@@ -178,11 +179,16 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	@./hack/minimal-crdgen.sh
 	@echo "✅ Minimal CRDs generated"
 
-	@echo "\n📁 Step 6: Copying manifests to Helm charts..."
-	@cp config/crd/full/ome* charts/ome-crd/templates/ && cp config/rbac/role.yaml charts/ome-resources/templates/ome-controller/rbac/role.yaml
+	@echo "\n📁 Step 6: Rendering manifests into Helm charts..."
+	@# The chart's CRD templates are generated, not copied: schema subtrees
+	@# that repeat across the CRDs become shared partials in _schemas.tpl, so
+	@# the Helm release record stays far below its 1 MiB Secret limit. The
+	@# rendered CRDs equal config/crd/full; the ome-crd render test enforces it.
+	@$(GO_CMD) run ./cmd/crd-gen helmchart --out charts/ome-crd/templates --partials _schemas.tpl --min-bytes 2048 config/crd/full/ome.io_*.yaml
+	@cp config/rbac/role.yaml charts/ome-resources/templates/ome-controller/rbac/role.yaml
 	@# The policy CRD templates are Helm-gated (each feature installs
-	@# CRD + controller + webhook together); the raw copy above drops the
-	@# wrapper, so re-wrap after every copy. The ome-crd render test fails
+	@# CRD + controller + webhook together); the generator writes plain
+	@# templates, so re-wrap after every run. The ome-crd render test fails
 	@# loudly if this ever regresses.
 	@f=charts/ome-crd/templates/ome.io_autoscalerpolicies.yaml; \
 	if ! head -1 $$f | grep -q 'autoscalerPolicy.enabled'; then \
@@ -287,7 +293,7 @@ lint-fix: golangci-lint ## 🔧 Run golangci-lint against code and fix linting i
 	@echo "✅ Auto-fix complete"
 
 .PHONY: helm-lint
-helm-lint: helm ## ⎈ Lint all charts
+helm-lint: helm yq ## ⎈ Lint all charts
 	@echo "⎈ Linting Helm charts..."
 	@for chart in $(CHARTS_DIR)/*/; do \
 	  echo "🔍 Linting $$chart..."; \
@@ -297,7 +303,7 @@ helm-lint: helm ## ⎈ Lint all charts
 	  fi \
 	done
 	@echo "🧪 Testing ome-crd chart contracts..."
-	@HELM_BIN="$(HELM)" bash $(CHARTS_DIR)/ome-crd/tests/render_test.sh
+	@HELM_BIN="$(HELM)" YQ_BIN="$(YQ)" bash $(CHARTS_DIR)/ome-crd/tests/render_test.sh
 	@echo "🧪 Testing ome-scheduler chart contracts..."
 	@HELM_BIN="$(HELM)" bash $(CHARTS_DIR)/ome-scheduler/tests/render_test.sh
 	@echo "🧪 Testing ome-resources chart contracts..."

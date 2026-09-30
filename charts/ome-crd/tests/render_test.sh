@@ -46,3 +46,22 @@ rollout_enabled="$("${helm_bin}" template ome-crd "${chart_dir}" \
   --set ome.rolloutPolicy.enabled=true)"
 grep -Fq 'name: rolloutpolicies.ome.io' <<<"${rollout_enabled}" ||
   fail "RolloutPolicy CRD was not rendered with the feature gate on"
+
+# Every CRD the chart renders must equal its config/crd/full source. The
+# templates are generated with shared schema partials, and the API server
+# must see exactly the generated schema.
+yq_bin="${YQ_BIN:-yq}"
+crd_src="${chart_dir}/../../config/crd/full"
+all_on="$("${helm_bin}" template ome-crd "${chart_dir}" \
+  --namespace ome \
+  --set ome.autoscalerPolicy.enabled=true \
+  --set ome.rolloutPolicy.enabled=true)"
+for src in "${crd_src}"/ome.io_*.yaml; do
+  name="$("${yq_bin}" '.metadata.name' "${src}")"
+  want="$("${yq_bin}" -o=json -I=0 'sort_keys(..)' "${src}")"
+  got="$("${yq_bin}" -o=json -I=0 \
+    "select(.kind == \"CustomResourceDefinition\" and .metadata.name == \"${name}\") | sort_keys(..)" \
+    <<<"${all_on}")"
+  [[ -n "${got}" ]] || fail "CRD ${name} was not rendered"
+  [[ "${want}" == "${got}" ]] || fail "rendered CRD ${name} differs from ${src}"
+done
