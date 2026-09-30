@@ -138,6 +138,43 @@ Separately from the per-component dispatch, OME resolves one mode for the Infere
 
 This is where `PDDisaggregated` comes from: it is a description of the service's shape, not a workload backend. In a prefill-decode disaggregated service, each component still dispatches through its own per-component mode.
 
+## Instance readiness: `lifecycle.readyPolicy`
+
+An Instance reports **Ready** only when every pod in it is Ready — the one pod of a single-pod Instance, or the leader pod and every worker pod of a multi-pod one. Everything that consumes Instance readiness reads that aggregated signal: the `readyReplicas` count below, the `maxUnavailable` rollout budget, and the [readiness deadlines](/ome/docs/administration/instance-readiness-deadlines) that bound how long an Instance may take to get there.
+
+The component's `lifecycle.readyPolicy` field names the aggregation:
+
+| `readyPolicy` | Meaning | Default for |
+|---------------|---------|-------------|
+| `AllPodReady` | The Instance is Ready only when every one of its pods is Ready | Multi-pod (leader/worker) Instances |
+| `None` | Accepted only on single-pod Instances, where it is behaviorally identical to `AllPodReady` | Single-pod Instances |
+
+Per-pod readiness reporting is not yet supported, so no value reports a multi-pod Instance's pods individually: `None` is accepted only where one pod's readiness *is* the aggregate, and every accepted combination of shape and value behaves the same way. In practice you never need to set this field.
+
+Like the rest of the `lifecycle` block, it is read only for components that resolve to OMENative. The first layer that sets it wins:
+
+1. **The InferenceService component** — `spec.engine.lifecycle.readyPolicy` (likewise `decoder`, `router`).
+2. **The ServingRuntime** — the same block on the runtime's `engineConfig` / `decoderConfig` / `routerConfig`, merged with your component spec (your fields take precedence).
+3. **Fixed fallback by shape** — multi-pod Instances run as `AllPodReady`, single-pod Instances as `None`.
+
+Unlike `updateStrategy` and `minReadySeconds`, there is no cluster-ConfigMap defaulting layer for this field.
+
+### Why `readyPolicy: None` is rejected on a multi-pod component
+
+Because a multi-pod OMENative component always runs the `AllPodReady` aggregation, admitting `None` on one would silently behave like `AllPodReady`. The admission webhook rejects the write instead:
+
+```
+engine.lifecycle.readyPolicy "None" is not allowed on a multi-pod OMENative component: per-pod readiness reporting is not yet supported; set readyPolicy to "AllPodReady" or remove the field
+```
+
+The webhook reads only the InferenceService — it does not fetch the ServingRuntime — so the rejection covers an Engine or Decoder that, on your InferenceService itself:
+
+- declares a complete `leader`/`worker` pair with `worker.size` unset or positive (an unset size resolves to one worker at reconcile time), **and**
+- sets `lifecycle.readyPolicy: None`, **and**
+- resolves to OMENative from the InferenceService's own fields — the component's `ome.io/deploymentMode` annotation, else the service-level mode above.
+
+A component that becomes multi-pod OMENative only through the ServingRuntime's merged config is not judged at admission; it still runs the `AllPodReady` aggregation. The Router is always single-pod and is never rejected. On update the check **ratchets**: only a violation newly introduced by that write is rejected, so a stored object that already carries one keeps admitting unrelated updates and continues to reconcile. To clear the violation, set the component's `readyPolicy` to `AllPodReady` or remove the field.
+
 ## Observing OMENative in status
 
 A component that resolves to OMENative reports an aggregated `lifecycle` block under `status.components.<component>` (the block is absent for other modes):
