@@ -28,7 +28,7 @@ spec:
 | `canary` / `blueGreen` / `rollingUpdate` | The progression, a presence-based one-of: at most one may be set. **Omitted defaults to blueGreen** — `components: [engine]` alone is a valid group. |
 | `policyRef` | Names a [RolloutPolicy](/ome/docs/concepts/rollout_policy) that supplies the progression. For every shape rule on this page, a ref-carrying group counts as its **declared** progression kind. |
 | `soak` | Wait after this group completes before the next begins. Only honored in the one-at-a-time shape below. |
-| `maintainRatio` | Cross-component replica-ratio guard. Meaningful only on multi-component blueGreen/rollingUpdate groups; rejected on canary groups. |
+| `maintainRatio` | Bounds cross-component replica-ratio drift while the group rolls — see [maintainRatio](#maintainratio-bounding-replica-ratio-drift) below. Meaningful only on multi-component blueGreen/rollingUpdate groups; rejected on canary groups. |
 | `order` | **Rejected when non-empty.** No progression applies a within-group sequence — the components in a group advance together. |
 
 Three rules govern membership, enforced at admission:
@@ -126,6 +126,61 @@ Canary traffic is driven through a unit's **entrypoint** component, which constr
 - The **router** is its own unit.
 - **Engine and decoder are one unit** whenever the InferenceService declares both: a canary group naming either must name both (`CanaryInvalid`), because splitting a prefill/decode pair across a canary boundary can leave a new-protocol prefill with no pairable decoder.
 - A unit may be driven by **at most one** canary group — two ladders contending for one unit's revision and step counter are rejected (`MultipleCanaryGroups`). Two canary groups on *different* units (router + engine) are fine under `Concurrent`.
+
+## maintainRatio: bounding replica-ratio drift
+
+A multi-component group rolls its members **together**, but not in lockstep: each component's Instances are swapped on their own cadence, so a prefill/decode pair sized 4:2 can sit at 4:1 live capacity while a decoder swap is in flight. `maintainRatio` bounds that drift:
+
+```yaml
+spec:
+  rollout:
+    groups:
+      - components: [engine, decoder]
+        blueGreen: {}
+        maintainRatio:
+          tolerance: 25    # max % drift from the ratio at rollout start
+```
+
+When the run opens, the engine snapshots each member's desired replica count as the **ratio anchor** (visible at `status.rolloutCoordination.groups[].observedRatio.original`). While the group rolls, each step that would change live capacity — surging a new-revision pod in, draining an old one out — is checked pairwise: the projected **serving** capacity ratio (pods actually in the traffic rotation, not merely running) of every pair of members must stay within `anchor × (1 ± tolerance/100)`. With a 4:2 anchor (ratio 2.0) and `tolerance: 25`, the live engine:decoder ratio must stay within [1.5, 2.5].
+
+A step that would leave the band is **paused, not failed**: the component holds, re-evaluates every reconcile, and proceeds once the pools rebalance — typically the lagging peer catching up. The refusal is reported under `status.components.<component>.lifecycle.rolloutHold` with gate `Ratio`:
+
+```yaml
+rolloutHold:
+  gate: Ratio
+  reason: 'surge would skew cross-Component serving ratio past tolerance'
+  target: llama-chat-engine-7c9f21
+  since: "2026-09-25T08:14:02Z"
+```
+
+The guard keys on the **field**, not the progression: it works the same on a blueGreen and a rollingUpdate group. It is ignored on single-component groups (no peer to skew against) and rejected on canary groups (`CanaryInvalid`) — the canary engine does not enforce it.
+
+The band is enforced at whole-pod granularity, with two pragmatic escapes so a roll that can only proceed by a minimal step is not wedged: on a balanced pool, one surge is always admitted (the extra pod is transient and cannot starve a peer — this is also why an explicit `tolerance: 0` still lets a SurgeThenDrain roll advance one pod at a time), and one drain is admitted when its overshoot is rounding-error-sized (within twice the band). A skew beyond that — the 4:2 pair above dropping to 4:1 — holds until you widen the tolerance.
+
+### Where the tolerance comes from
+
+- **An explicit `tolerance`** (0–100) is used verbatim — including an explicit `0`, which pins the ratio exactly.
+- **Omitted**, the operator-configured default fills it in: `coordination.defaultRatioTolerancePercent` in the `inferenceservice-config` ConfigMap.
+- **Neither configured** — the binary has no built-in number — the group rolls with **no drift bound**: `maintainRatio: {}` under an unconfigured default enforces nothing, rather than silently inheriting a baked-in value.
+
+The default fills in only for groups that set `maintainRatio` at all; a group without the field never gets a ratio guard, whatever the ConfigMap says.
+
+The `ome-resources` chart ships the default as `5`:
+
+```yaml
+# charts/ome-resources/values.yaml
+ome:
+  controller:
+    coordination:
+      # Fills maintainRatio.tolerance when a group omits it. An explicit
+      # per-group value (including 0) always wins. Remove the key to leave
+      # the default unconfigured.
+      defaultRatioTolerancePercent: 5
+```
+
+### In-place update strategies bypass the gate
+
+Components whose [update strategy](/ome/docs/concepts/omenative-update-strategies) is `InPlaceIfPossible` or `InPlaceOnly` skip the ratio gate entirely. An in-place update drains a pod and returns the **same pod** (mark not-ready → patch → mark ready), so the net capacity change is effectively zero; running the gate would project that transient dip as a permanent loss and indefinitely over-block the smaller member of a pair — draining one decoder of the 4:2 pair projects 4:1 = 4.0, outside [1.5, 2.5], forever. The bypass is announced with a Normal `RatioGateBypassed` event (and a metric) so it is visible why the gate did not run; the strategy's `maxUnavailable` budget still bounds how many pods an in-place roll may pull from rotation at once.
 
 ## What admission rejects: summary
 
