@@ -1,7 +1,8 @@
 # OME website
 
 The redesigned OME documentation site, served at `lightseek.org/ome` from
-launch. Until launch, documentation changes still go to `../site/`.
+launch. Documentation changes go to `src/lib/content/`; `../site/` is retained
+for migration reference.
 
 ## Develop
 

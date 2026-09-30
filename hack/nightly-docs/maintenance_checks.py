@@ -1,10 +1,8 @@
 """Deterministic checks for authored docs; examples are data, never commands."""
 
-from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
-from urllib.parse import unquote, urlsplit
 
 
 def kubernetes_schema(schema):
@@ -44,8 +42,8 @@ def document_findings(files, root):
     catalog = schema_catalog(root)
     findings = []
     for path, content in files.items():
-        for match in re.finditer(r'(?:\]\(|href=["\'])(/docs/[^\s)"\']*)', content):
-            findings.append(f"{path}: internal link {match[1]} omits the deployed /ome/ prefix")
+        for match in re.finditer(r'(?:\]\(|href=["\'])(/(?:ome/)?docs/[^\s)"\']*)', content):
+            findings.append(f"{path}: internal link {match[1]} uses a legacy docs URL; use the website /ome/<section>/ route")
         # Shell heredocs are deliberately not executed or claimed as validated.
         for match in re.finditer(r"^```ya?ml[^\n]*\n(.*?)^```", content, re.M | re.S):
             try:
@@ -65,53 +63,8 @@ def document_findings(files, root):
     return findings
 
 
-class Page(HTMLParser):
-    """Collect local links and anchors without executing rendered content."""
-
-    def __init__(self, text):
-        super().__init__()
-        self.links, self.ids = [], set()
-        self.feed(text)
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if attrs.get("id"):
-            self.ids.add(attrs["id"])
-        if tag == "a" and attrs.get("name"):
-            self.ids.add(attrs["name"])
-        if tag == "a" and attrs.get("href"):
-            self.links.append(attrs["href"])
-
-
-def rendered_findings(paths, public):
-    """Check rendered docs links/anchors on edited pages, including relative URLs."""
-    from urllib.parse import urljoin
-    findings = []
-    for path in paths:
-        relative = path.removeprefix("site/content/en/").removesuffix(".md")
-        relative = relative.removesuffix("/_index")
-        page = public / relative / "index.html"
-        if not page.is_file():
-            findings.append(f"{path}: expected rendered page {relative}/index.html is missing")
-            continue
-        for link in Page(page.read_text()).links:
-            url = urlsplit(urljoin(f"https://ome-projects.github.io/ome/{relative}/", link))
-            if url.netloc != "ome-projects.github.io" or not url.path.startswith("/ome/docs/"):
-                continue
-            target = public / unquote(url.path.removeprefix("/ome/"))
-            if target.is_dir():
-                target /= "index.html"
-            if not target.is_file():
-                findings.append(f"{path}: broken rendered link {link}")
-            elif url.fragment and unquote(url.fragment) not in Page(target.read_text()).ids:
-                findings.append(f"{path}: missing rendered anchor {link}")
-    return sorted(set(findings))
-
-
-def write_report(files, root, output, public=None):
-    """Persist all findings so a failed validation is usable by the next repair."""
+def write_report(files, root, output):
+    """Persist example findings; the website content tests validate rendered links."""
     findings = document_findings(files, root)
-    if public:
-        findings.extend(rendered_findings(files, public))
     Path(output).write_text(json.dumps(findings, indent=2))
     return findings

@@ -14,7 +14,7 @@ def proposal(**changes):
     item = {"area": "rollouts", "concern": "wait-timeout", "source_sha": "a" * 40,
             "title": "[Docs] Explain rollout wait timeout", "question": "How long does rollout wait?",
             "evidence": "pkg/controller: timeout default differs from the guide.",
-            "doc_paths": [docs.DOC_ROOT + "tasks/rollouts.md"]}
+            "doc_paths": [docs.DOC_ROOT + "guides/rollouts.md"]}
     return {**item, **changes}
 
 
@@ -73,7 +73,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_accepts_one_hundred_independent_concerns(self):
         items = [proposal(concern=f"concern-{i}",
-                          doc_paths=[docs.DOC_ROOT + f"tasks/concern-{i}.md"])
+                          doc_paths=[docs.DOC_ROOT + f"guides/concern-{i}.md"])
                  for i in range(100)]
         self.assertEqual(len(self.plan(items)), 100)
 
@@ -86,7 +86,7 @@ class PlanningTests(unittest.TestCase):
             self.plan([proposal(source_sha="b" * 40)])
 
     def test_same_commit_can_have_separate_nonoverlapping_concerns(self):
-        second = proposal(concern="rollback", doc_paths=[docs.DOC_ROOT + "tasks/rollback.md"])
+        second = proposal(concern="rollback", doc_paths=[docs.DOC_ROOT + "guides/rollback.md"])
         items = self.plan([proposal(), second])
         self.assertEqual(len(items), 2)
         self.assertNotEqual(items[0]["branch"], items[1]["branch"])
@@ -110,7 +110,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_disallowed_paths_and_slugs(self):
         for path in ["README.md", docs.GENERATED, docs.DOC_ROOT + "../outside.md",
-                     docs.DOC_ROOT + "tasks/x.yaml", "/tmp/test.md"]:
+                     docs.DOC_ROOT + "guides/x.yaml", "/tmp/test.md"]:
             with self.subTest(path=path), self.assertRaises(ValueError):
                 docs.validate_item(proposal(doc_paths=[path]))
         for slug in ["../bad", "rollout;cmd", "UPPER", "a" * 65]:

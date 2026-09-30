@@ -1,5 +1,8 @@
 Read AGENTS.md and the context JSON at the path in NIGHTLY_CONTEXT.
-The documentation source is site/content/en/docs/ in this repository.
+The documentation source is website/src/lib/content/ in this repository.
+This destination overrides stale site/ transition instructions in AGENTS.md.
+Old Hugo site/ pages and old nightly-docs PRs do not establish website coverage;
+check the corresponding CURRENT website page for the same concern.
 
 You own ONLY the user-facing concerns described in the context's focus field.
 Other scans own the other scan_responsibilities. Shared source files/commits are
@@ -75,11 +78,17 @@ ONE CONCERN PER ITEM, never one item per broad subsystem or per day's changes:
 - evidence must cite exact current source paths/symbols and explain the missing
   or wrong documentation, including why this is one independent concern.
 - doc_paths is an explicit allowlist of the Markdown files needed in
-  site/content/en/docs/. Choose only files necessary to explain this concern.
+  website/src/lib/content/. Choose only files necessary to explain this concern.
   There is no file-count limit. Keep the proposed edit under 1,000 total added
   plus deleted lines (999 maximum). Do not edit the
-  generated reference/ome.v1beta1.md. Avoid broad rewrites, formatting sweeps,
-  unrelated examples, or navigation/configuration changes.
+  generated reference/api/ subtree. Avoid broad rewrites, formatting sweeps,
+  unrelated examples, or configuration changes. The only auxiliary data paths
+  allowed are website/src/lib/config/nav.ts and website/redirects.json, when
+  necessary for this concern. Include at least one authored Markdown page.
+  Read website/src/lib/content/contributing/writing-docs.md before planning:
+  a new page requires its nav.ts entry and section index.md card; completing
+  a draft may require redirects.json rewrittenFrom updates. Include these in
+  doc_paths. Do not invent replacement pages for existing draft/canonical pages.
 
 Before selecting anything, inspect existing_prs in the context, including human
 PRs and closed nightly PRs. Do not duplicate an actual concern being addressed,

@@ -95,22 +95,17 @@ jobs:
       - uses: ./.github/actions/nightly-docs-setup
         with:
           source-sha: ${{ steps.baseline.outputs.sha }}
-      - uses: actions/setup-go@v6
+      - uses: pnpm/action-setup@v4
         with:
-          go-version: '1.26'
-          cache-dependency-path: hack/internal/tools/go.sum
+          version: 10
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: site/package-lock.json
+          cache: pnpm
+          cache-dependency-path: website/pnpm-lock.yaml
       - name: Verify the base documentation site builds before planning
-        env:
-          HUGO_ENVIRONMENT: production
-          HUGO_BASEURL: https://ome-projects.github.io/ome/
         run: |
-          python3 "$RUNNER_TEMP/nightly-docs-tools/install_hugo.py" "$RUNNER_TEMP/nightly-docs-bin"
-          python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" site "$RUNNER_TEMP/nightly-docs-base-site" "$RUNNER_TEMP/nightly-docs-bin/hugo"
+          python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" website "$RUNNER_TEMP/nightly-docs-base-site"
       - name: Gather code history and existing documentation PRs
         env:
           NIGHTLY_CONTEXT: ${{ runner.temp }}/nightly-docs-context/context.json
@@ -377,25 +372,20 @@ jobs:
           REVIEW_JSON: ${{ steps.review.outputs.structured_output }}
         run: |
           python3 "$RUNNER_TEMP/nightly-docs-tools/nightly_docs.py" review
-      - uses: actions/setup-go@v6
+      - uses: pnpm/action-setup@v4
         if: steps.verdict.outputs.accepted == 'true'
         with:
-          go-version: '1.26'
-          cache-dependency-path: hack/internal/tools/go.sum
+          version: 10
       - uses: actions/setup-node@v6
         if: steps.verdict.outputs.accepted == 'true'
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: site/package-lock.json
+          cache: pnpm
+          cache-dependency-path: website/pnpm-lock.yaml
       - name: Build the documentation site
         if: steps.verdict.outputs.accepted == 'true'
-        env:
-          HUGO_ENVIRONMENT: production
-          HUGO_BASEURL: https://ome-projects.github.io/ome/
         run: |
-          python3 "$RUNNER_TEMP/nightly-docs-tools/install_hugo.py" "$RUNNER_TEMP/nightly-docs-bin"
-          python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" site "$RUNNER_TEMP/nightly-docs-site" "$RUNNER_TEMP/nightly-docs-bin/hugo"
+          python3 "$RUNNER_TEMP/nightly-docs-tools/build_site.py" website "$RUNNER_TEMP/nightly-docs-site"
       - name: Publish one documentation PR or validate a dry run
         if: steps.verdict.outputs.accepted == 'true'
         env:

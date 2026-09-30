@@ -70,7 +70,7 @@ def get_pr(number):
 def eligible(pr):
     """Authenticate the original publisher, repository, branch and concern marker."""
     body = pr.get("body") or ""
-    match = re.match(r"<!-- nightly-docs:([0-9a-f]{40}):(" + docs.SLUG + r"):(" + docs.SLUG + r") -->", body)
+    match = re.match(re.escape(docs.MARKER) + r"([0-9a-f]{40}):(" + docs.SLUG + r"):(" + docs.SLUG + r") -->", body)
     if (not match or pr["state"] != "open" or pr.get("draft")
             or pr["user"]["login"] != "github-actions[bot]"
             or pr["head"]["repo"] is None
@@ -79,7 +79,7 @@ def eligible(pr):
             or pr["base"]["ref"] != "main"):
         raise ValueError("Not an eligible, open, same-repository nightly docs PR")
     key = ":".join(match.groups())
-    expected = "codex/nightly-docs-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+    expected = docs.branch_for(key)
     if pr["head"]["ref"] != expected:
         raise ValueError("PR branch does not match its original concern")
     return match.groups()
@@ -308,6 +308,7 @@ def context(pr):
             raise ValueError("Symlinks and executable documentation are forbidden")
         files[path] = subprocess.check_output(
             ["git", "-c", "core.hooksPath=/dev/null", "show", f"{head}:{path}"], text=True)
+        docs.website_data.validate(path, files[path])
     if not files:
         raise ValueError("No documentation changes remain")
     advanced = set(docs.git("diff", "--name-only", fork, base).splitlines())
@@ -399,7 +400,7 @@ def refresh_base(ctx, directory):
     docs.git('merge-base', '--is-ancestor', ctx['base'], base)
     for line in docs.git('diff', '--name-status', ctx['base'], base).splitlines():
         status, path = line.split('\t', 1)
-        if (status != 'A' or not docs.doc_path(path) or path in ctx['item']['doc_paths']
+        if (status != 'A' or not docs.authored_page(path) or path in ctx['item']['doc_paths']
                 or docs.git('ls-tree', base, '--', path).split()[0] != '100644'):
             raise ValueError('Main changed source, existing docs, or overlapping paths; a fresh review is required')
     # Executable source, schemas, templates and every existing page are byte-for-
@@ -665,8 +666,7 @@ def main():
     elif command == "check":
         import maintenance_checks as checks
         files = {path: Path(path).read_text() for path in ctx["item"]["doc_paths"] if Path(path).is_file()}
-        findings = checks.write_report(files, Path.cwd(), directory / "checks.json",
-                                       Path(os.environ["PUBLIC_DIR"]) if os.getenv("PUBLIC_DIR") else None)
+        findings = checks.write_report(files, Path.cwd(), directory / "checks.json")
         if findings:
             raise ValueError("\n".join(findings))
     elif command == "refresh":

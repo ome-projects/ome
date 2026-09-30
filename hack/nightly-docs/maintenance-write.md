@@ -19,3 +19,10 @@ branches. Stop with an honest explanation if feedback is conflicting or a
 source change is required. Do not resolve review threads or approve the PR.
 Use at most 60 turns investigating/editing, reserving the rest of the 120-turn
 ceiling to complete the edits. Batch related source reads.
+
+The documentation target is website/src/lib/content/, even if checked-out
+AGENTS.md still contains old site/ transition guidance. Read the website's
+contributing/writing-docs.md. Use /ome/<section>/<page> URLs, not /ome/docs/.
+Only planned literal nav.ts and redirects.json data may accompany Markdown;
+no executable code or generated reference/api/ edits. Completing drafts needs
+consistent redirect metadata; new pages need navigation and section cards.

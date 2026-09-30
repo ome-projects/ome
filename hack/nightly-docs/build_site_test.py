@@ -7,34 +7,39 @@ import build_site
 
 
 class BuildSiteTests(unittest.TestCase):
-    def test_dependency_and_generated_changes_cannot_enter_source_tree(self):
+    def test_isolated_website_checks_run_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source, output = root / "site", root / "build"
+            source, output = root / 'website', root / 'build'
             source.mkdir()
-            (source / "go.mod").write_text("module example.invalid/site\n")
-            (source / "page.md").write_text("documentation change\n")
+            (source / 'package.json').write_text('{}')
+            (source / 'page.md').write_text('documentation change\n')
+            (source / 'node_modules').mkdir()
+            (source / 'node_modules' / 'untrusted').write_text('not copied')
+            commands = []
 
             def run(command, *, cwd, check):
                 self.assertEqual(Path(cwd), output)
                 self.assertTrue(check)
-                if command[0] == "go":
-                    self.assertEqual(command[-1], "-require=github.com/google/docsy@v0.14.3")
-                    (output / "go.mod").write_text("resolved theme dependencies")
-                    (output / "go.sum").write_text("checksums")
-                elif command[0] == "npm":
-                    (output / "node_modules").mkdir()
-                else:
-                    self.assertTrue((output / "node_modules").is_dir())
-                    self.assertEqual((output / "page.md").read_text(), "documentation change\n")
-                    (output / "public").mkdir()
+                self.assertFalse((output / 'node_modules' / 'untrusted').exists())
+                commands.append(command)
+                (output / 'package.json').write_text('isolated mutation')
 
-            with patch.object(build_site.subprocess, "run", side_effect=run):
-                build_site.build(source, output, root / "hugo")
-            self.assertEqual((source / "go.mod").read_text(), "module example.invalid/site\n")
-            self.assertEqual(sorted(p.name for p in source.iterdir()), ["go.mod", "page.md"])
-            self.assertTrue((output / "public").is_dir())
+            with patch.object(build_site.subprocess, 'run', side_effect=run):
+                build_site.build(source, output)
+            self.assertEqual(commands, [['pnpm', 'install', '--frozen-lockfile'],
+                ['pnpm', 'lint'], ['pnpm', 'test'], ['pnpm', 'check'], ['pnpm', 'build']])
+            self.assertEqual((source / 'package.json').read_text(), '{}')
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_failed_content_validation_blocks_build(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, 'website')
+            source.mkdir()
+            def run(command, **kwargs):
+                if command == ['pnpm', 'test']:
+                    raise subprocess.CalledProcessError(1, command)
+            with patch.object(build_site.subprocess, 'run', side_effect=run) as mocked:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    build_site.build(source, Path(directory, 'build'))
+                self.assertNotIn(['pnpm', 'build'], [call.args[0] for call in mocked.call_args_list])

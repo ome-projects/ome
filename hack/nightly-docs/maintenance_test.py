@@ -17,7 +17,7 @@ from nightly_docs_test import proposal
 def pull():
     item = m.docs.validate_item(proposal())
     return {"number": 7, "state": "open", "draft": False, "user": {"login": "github-actions[bot]"},
-            "title": item["title"], "body": f"<!-- nightly-docs:{item['key']} -->",
+            "title": item["title"], "body": f"{m.docs.MARKER}{item['key']} -->",
             "head": {"sha": "b" * 40, "ref": item["branch"], "repo": {"full_name": "ome-projects/ome"}},
             "base": {"sha": "a" * 40, "ref": "main", "repo": {"full_name": "ome-projects/ome"}}}
 
@@ -394,11 +394,11 @@ class ExampleTests(unittest.TestCase):
         schema = {("ome.io/v1", "ServingRuntime"): {"type": "object", "required": ["spec"],
                     "properties": {"spec": {"type": "object", "required": ["runner"],
                        "properties": {"runner": {"type": "object", "required": ["name"]}}}}}}
-        text = '[bad](/docs/tasks/)\n```yaml\napiVersion: ome.io/v1\nkind: ServingRuntime\nspec:\n  runner: {}\n```\n'
+        text = '[bad](/docs/guides/)\n```yaml\napiVersion: ome.io/v1\nkind: ServingRuntime\nspec:\n  runner: {}\n```\n'
         with patch.object(checks, "schema_catalog", return_value=schema):
             findings = checks.document_findings({"guide.md": text}, Path.cwd())
             self.assertEqual(len(findings), 2)
-            fixed = text.replace('/docs/', '/ome/docs/').replace('runner: {}', 'runner: {name: model}')
+            fixed = text.replace('/docs/', '/ome/').replace('runner: {}', 'runner: {name: model}')
             self.assertEqual(checks.document_findings({"guide.md": fixed}, Path.cwd()), [])
 
     def test_nullable_int_or_string(self):
@@ -408,18 +408,11 @@ class ExampleTests(unittest.TestCase):
             self.assertTrue(validator.is_valid(value))
         self.assertFalse(validator.is_valid([]))
 
-    def test_rendered_relative_links_and_fragments(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            page = root / 'docs/tasks/guide/index.html'
-            page.parent.mkdir(parents=True)
-            page.write_text('<a href="../other/#exists">good</a><a href="../other/#missing">bad</a>')
-            target = root / 'docs/tasks/other/index.html'
-            target.parent.mkdir(parents=True)
-            target.write_text('<h2 id="exists">Title</h2>')
-            findings = checks.rendered_findings(['site/content/en/docs/tasks/guide.md'], root)
-            self.assertEqual(len(findings), 1)
-            self.assertIn('missing', findings[0])
+    def test_legacy_hugo_prefix_is_rejected(self):
+        with patch.object(checks, "schema_catalog", return_value={}):
+            findings = checks.document_findings({'guide.md': '[old](/ome/docs/guides/x)'}, Path.cwd())
+        self.assertEqual(len(findings), 1)
+        self.assertIn('legacy', findings[0])
 
 
 class PublicationTests(unittest.TestCase):
@@ -491,7 +484,7 @@ class PublicationTests(unittest.TestCase):
             self.git('add', path)
             self.git('commit', '-qm', 'invalid PR edit')
             pr = pull()
-            pr['body'] = f"<!-- nightly-docs:{self.item['key']} -->"
+            pr['body'] = f"{m.docs.MARKER}{self.item['key']} -->"
             pr['head'].update(sha=self.git('rev-parse', 'HEAD'), ref=self.item['branch'])
             pr['base']['sha'] = self.base
             with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'ome-projects/ome'}), \
@@ -500,7 +493,7 @@ class PublicationTests(unittest.TestCase):
 
     def refresh_context(self, base):
         pr = pull()
-        pr['body'] = f"<!-- nightly-docs:{self.item['key']} -->"
+        pr['body'] = f"{m.docs.MARKER}{self.item['key']} -->"
         pr['head'].update(sha=self.head, ref=self.item['branch'])
         pr['base']['sha'] = base
         details = {'threads': [], 'comments': [], 'failed_checks': []}

@@ -50,7 +50,7 @@ class DiscoveryTests(unittest.TestCase):
         for n, scan in enumerate(self.scans):
             scan['inspected_commits'] = ['a' * 40]
             scan['concerns'] = [proposal(concern=f'concern-{n}-{i}', question=f'Question {n} {i}',
-                                        doc_paths=[docs.DOC_ROOT + f'tasks/{n}-{i}.md']) for i in range(20)]
+                                        doc_paths=[docs.DOC_ROOT + f'guides/{n}-{i}.md']) for i in range(20)]
         selected, deferred = self.combine()
         self.assertEqual(len(selected), 100)
         self.assertEqual(len(deferred), 60)
@@ -61,7 +61,7 @@ class DiscoveryTests(unittest.TestCase):
         for scan in self.scans[:3]:
             scan['inspected_commits'] = ['a' * 40, 'b' * 40]
         self.scans[0]['concerns'] = [proposal()]
-        self.scans[1]['concerns'] = [proposal(source_sha='b' * 40, doc_paths=[docs.DOC_ROOT + 'tasks/other.md'])]
+        self.scans[1]['concerns'] = [proposal(source_sha='b' * 40, doc_paths=[docs.DOC_ROOT + 'guides/other.md'])]
         self.scans[2]['concerns'] = [proposal(concern='other', question='Different question')]
         selected, deferred = self.combine()
         self.assertEqual(len(selected), 1)
@@ -103,7 +103,7 @@ class DiscoveryTests(unittest.TestCase):
         first = proposal()
         second = proposal(concern='another-fix', question='Another claim')
         pending = docs.validate_item(proposal(concern='prior-work', question='Prior gap',
-                                             doc_paths=[docs.DOC_ROOT + 'tasks/prior.md']))
+                                             doc_paths=[docs.DOC_ROOT + 'guides/prior.md']))
         self.context['pending_concerns'] = [pending]
         self.scans[0].update(inspected_commits=['a' * 40], concerns=[first, second])
         with patch.object(discovery, 'partition', return_value=self.assignments):
@@ -153,7 +153,7 @@ class DiscoveryTests(unittest.TestCase):
         self.context.update(pending_concerns=prior, max_prs=1)
         first = proposal(concern='selected')
         deferred = proposal(concern='newly-deferred', question='Another gap',
-                            doc_paths=[docs.DOC_ROOT + 'tasks/other.md'])
+                            doc_paths=[docs.DOC_ROOT + 'guides/other.md'])
         self.scans[0].update(inspected_commits=['a' * 40], concerns=[first, deferred])
         with patch.object(discovery, 'partition', return_value=self.assignments):
             report = discovery.build_report(self.scans[:1], self.context)

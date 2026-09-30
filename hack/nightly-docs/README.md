@@ -2,7 +2,7 @@
 
 `.github/workflows/nightly-docs.yml` runs daily at **09:23 UTC** and supports
 manual dispatch. All jobs use **ome-runner-cpu** and **claude-fable-5**.
-It updates the documentation source in this repository's `site/content/en/docs/`;
+It updates the documentation source in this repository's `website/src/lib/content/`;
 the existing release-driven Pages workflow publishes the website separately.
 
 ## Scope and lifecycle
@@ -30,7 +30,8 @@ the existing release-driven Pages workflow publishes the website separately.
 3. Give each concern its own fresh checkout and allowlist of handwritten
    Markdown files. Each PR must have **fewer than 1,000 added plus deleted lines
    (999 maximum)**, with **no file-count limit**. Generated API
-   reference files, code, configuration, file deletion, and symlinks are blocked.
+   reference files, code, executable configuration, file deletion, and symlinks
+   are blocked. Only validated literal navigation/redirect data may accompany pages.
 4. Defer duplicate concern keys, area/concern identities, identical normalized
    questions, and overlapping files across scans. Open nightly documentation
    PRs reserve their files; human PR file lists do not. Review their actual
@@ -51,7 +52,7 @@ the existing release-driven Pages workflow publishes the website separately.
    single concern, appropriate page placement, consistency of related docs, and
    absence of competing human PR work. Capture human PR head SHAs and doc-only
    diffs using each branch's merge base with pinned main; never execute PR code.
-   Build the production Hugo site, recheck live PRs, sign off
+   Build the production SvelteKit website, recheck live PRs, sign off
    one commit, and open one PR. Git commands disable hooks, including pre-push.
    Nothing is merged automatically. Empty or failed edits publish no PR.
    Any new/changed overlapping human PR observed by the final recheck invalidates
@@ -156,19 +157,16 @@ build when evaluating a pilot.
 ## Setup
 
 - Runner pods must expose `ANTHROPIC_API_KEY` with access to `claude-fable-5`,
-  and support the Linux/Go/Node build used by the Pages workflow. The nightly
-  downloads Hugo Extended 0.157.0 for Linux amd64/arm64 and verifies its pinned
-  SHA-256 digest; a C compiler is not required on the runner. Builds use Node 22
-  (required by postcss-cli 12) and pin Docsy 0.14.3, compatible with this Hugo,
-  only in the isolated build copy. Dependency resolution and generated files
-  never enter the documentation PR. The Pages deployment workflow is separate.
+  and support Node 22 and pnpm 10. An isolated website copy runs frozen-lockfile
+  installation, lint, content/link/anchor/navigation tests, type checks and a
+  production build. Dependencies and generated output never enter the PR.
   Use ephemeral, single-job runner pods so jobs do not share mutable host state.
 - Enable **Allow GitHub Actions to create and approve pull requests** in the
   repository's Actions settings (organization policy must allow it).
 - Publication uses the scoped `GITHUB_TOKEN` (`contents: write` and
   `pull-requests: write`); no additional PAT or GitHub App is required.
   Token-generated events do not reliably run follow-up CI without approval.
-  The nightly therefore performs its own scope, review and Hugo checks. The
+  The nightly therefore performs its own scope, review and website checks. The
   maintenance worker below validates its actual PR head independently; it does
   not bypass any other pending or required CI. An installation token can be
   added separately if normal event-driven CI without approval is desired.
@@ -222,7 +220,7 @@ Each activation does one repair round:
    of any association protects a thread from automatic resolution.
    Read main's live Git ref because the PR API's `base.sha` can lag updates.
    Ignore maintenance bookkeeping and CodeRabbit's informational skip notices.
-   Overlay only the PR's Markdown on trusted main; changes to the same pages on
+   Overlay only the PR's Markdown and validated navigation/redirect data on trusted main; changes to the same pages on
    main require human conflict resolution.
 2. A fresh **claude-fable-5**, `xhigh`, 120-turn worker fixes the original concern
    using read/edit tools and a read-only GitHub token. It cannot push or merge.
@@ -237,8 +235,8 @@ Each activation does one repair round:
    running in that job. Known live credentials and recognizable token literals
    are rejected before artifact upload and public reporting. Non-model setup
    does not copy the runner API key into the GitHub environment file.
-   Build the production Hugo site, then check internal docs links and anchors
-   from the rendered pages. Fenced YAML is data: shell heredocs, CEL rules and
+   Run the website content tests (rendered links, anchors, navigation and
+   redirects), lint, type checks and production SvelteKit build. Fenced YAML is data: shell heredocs, CEL rules and
    admission webhooks are not executed. These checks do not prove every example
    can run against a live Kubernetes cluster.
    Before building, a main advance may be carried forward only if it adds
@@ -307,3 +305,18 @@ and `force` require an explicit PR number; they cannot fan out across a sweep.
 A PR with malformed feedback is skipped with a diagnostic during a sweep, while
 an explicit dispatch fails loudly. Scope/conflict rejections during preparation
 are marked `needs-human` rather than repeatedly launching workers.
+
+## Website migration
+
+Only authored pages in `website/src/lib/content/` are editable; generated
+`reference/api/` pages are excluded. `website/src/lib/config/nav.ts` and
+`website/redirects.json` may accompany a concern as narrowly validated data.
+Navigation must retain its literal array export and fixed type-only import;
+expressions, functions, extra imports and statements are rejected before any
+website tooling runs. New pages require navigation entries and section cards.
+The entire diff, including metadata, remains below 1,000 changed lines.
+
+Website PRs use a `nightly-website-docs` marker and a documentation-root-specific
+branch hash. Old Hugo PRs are not maintenance targets or evidence of website
+coverage. Reports carry `doc_root`; old pending queues are skipped and the
+unchanged full-history scans rediscover gaps against the current website.

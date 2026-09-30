@@ -80,7 +80,7 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual(discovery.deferred_queue(scans, deferred, [pr(self.item, state='closed')]), [])
 
     def test_queue_rechecks_current_history_and_deduplicates(self):
-        report = {'queued_concerns': [self.item, self.item, {**self.item, 'source_sha': 'd' * 40}]}
+        report = {'doc_root': docs.DOC_ROOT, 'queued_concerns': [self.item, self.item, {**self.item, 'source_sha': 'd' * 40}]}
         context = {'code_history': ['a' * 40 + ' old change']}
         self.assertEqual(discovery.pending_from_report(report, context), [self.item])
 
@@ -90,7 +90,7 @@ class PlacementTests(unittest.TestCase):
             calls.append(args)
             if args[:3] == ('gh', 'run', 'download'):
                 Path(args[-1], 'nightly-docs-discovery-report.json').write_text(
-                    json.dumps({'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
+                    json.dumps({'doc_root': docs.DOC_ROOT, 'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
                                 'scans': [{'shard': name} for name, _, _ in discovery.SHARDS]}))
                 return ''
             if 'artifacts?' in args[2]:
@@ -105,10 +105,10 @@ class PlacementTests(unittest.TestCase):
 
     def test_main_branch_pilots_do_not_replace_the_full_queue(self):
         """Skip filtered, capped, dry-run, and legacy reports before a full run."""
-        full = {'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
+        full = {'doc_root': docs.DOC_ROOT, 'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
                 'scans': [{'shard': name} for name, _, _ in discovery.SHARDS]}
         reports = [{**full, 'scans': full['scans'][:1]}, {**full, 'max_prs': 2},
-                   {**full, 'dry_run': True}, {'queued_concerns': []}] + [{**full, 'dry_run': True}] * 8 + [full]
+                   {**full, 'dry_run': True}, {'doc_root': docs.DOC_ROOT, 'queued_concerns': []}] + [{**full, 'dry_run': True}] * 8 + [full]
         downloaded = []
         def run(*args):
             if args[:3] == ('gh', 'run', 'download'):
@@ -130,7 +130,7 @@ class PlacementTests(unittest.TestCase):
 
     def test_full_run_can_recover_a_queue_despite_missing_scan_artifacts(self):
         """A partial production report may seed recovery; a pilot still may not."""
-        report = {'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
+        report = {'doc_root': docs.DOC_ROOT, 'queued_concerns': [self.item], 'dry_run': False, 'max_prs': 100,
                   'expected_shards': [name for name, _, _ in discovery.SHARDS],
                   'scans': [{'shard': discovery.SHARDS[0][0]}], 'complete': False,
                   'missing_shards': [name for name, _, _ in discovery.SHARDS[1:]]}
@@ -148,7 +148,7 @@ class PlacementTests(unittest.TestCase):
 
     def test_recovered_queue_drops_recorded_concerns_but_keeps_file_blocked_work(self):
         """Recovery cannot resurrect a merged/declined concern or lose blocked work."""
-        report = {'queued_concerns': [self.item]}
+        report = {'doc_root': docs.DOC_ROOT, 'queued_concerns': [self.item]}
         context = {'code_history': ['a' * 40 + ' old'], 'existing_prs': [pr(self.item, state='closed')]}
         self.assertEqual(discovery.pending_from_report(report, context), [])
         context['existing_prs'] = [pr(self.item, body=docs.MARKER + 'other -->', branch='codex/nightly-docs-other')]

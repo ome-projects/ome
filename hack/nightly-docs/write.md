@@ -18,13 +18,23 @@ complete, accurate fix cannot fit, leave the tree unchanged; do not truncate a
 larger change or broaden the plan. If the gap is already fixed,
 unsupported by current code, or depends on an unfinished OEP, make no changes.
 
-Follow existing Hugo front matter, links, shortcodes, and writing conventions.
+Read website/src/lib/content/contributing/writing-docs.md and follow its
+front matter, links, callout and writing conventions. This task targets website/
+regardless of stale transition guidance in the checked-out AGENTS.md.
+Use /ome/<section>/<page> links, never /ome/docs/ links or Hugo shortcodes.
+When completing a draft, update its redirects.json rewrittenFrom mapping with
+the last legacy site commit incorporated (inspect the supplied history/source
+and existing mappings; do not invent hashes). A new page must be listed in
+nav.ts and linked from the section index.md; those paths must be planned too.
+Navigation edits must remain literal data in the existing fixed type import
+and array export. Do not add expressions, imports, functions or executable code.
 Use concrete source-backed defaults and examples. Distinguish released behavior
 from unreleased behavior on main when relevant. Never invent test results.
 Verify API verbs, RBAC requirements, and success guarantees by following the
 implementation into its helpers; help text and comments alone are not proof.
 Do not describe reported status as convergence or attribution unless verified.
-Do not edit generated API reference docs, code, workflows, site configuration,
+Do not edit generated reference/api/ docs, code, workflows, site configuration
+(other than planned literal nav.ts and redirects.json data),
 lockfiles, or the automation's own instructions. Do not delete existing files.
 Do not commit, push, create PRs, comment, or invoke other agents; the workflow
 will validate, build the site, sign off the commit, and open the PR.

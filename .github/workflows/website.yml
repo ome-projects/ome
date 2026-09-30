@@ -155,7 +155,7 @@ jobs:
     if: needs.changes.outputs.website == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # The nightly docs bot changes site/ every day, so drift is expected
+    # Legacy site/ changes can still produce drift during migration
     # until launch. The report is information, not a gate.
     continue-on-error: true
     steps:

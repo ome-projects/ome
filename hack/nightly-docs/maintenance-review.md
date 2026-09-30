@@ -17,3 +17,10 @@ Only report a thread addressed if every substantive concern in it is fixed.
 The trusted publisher may resolve bot-only threads; human threads are never
 automatically resolved. Do not approve a GitHub review or call GitHub tools.
 Target 60 turns for evidence gathering within the 120-turn ceiling.
+
+The documentation target is website/src/lib/content/, even if checked-out
+AGENTS.md still contains old site/ transition guidance. Read the website's
+contributing/writing-docs.md. Use /ome/<section>/<page> URLs, not /ome/docs/.
+Only planned literal nav.ts and redirects.json data may accompany Markdown;
+no executable code or generated reference/api/ edits. Completing drafts needs
+consistent redirect metadata; new pages need navigation and section cards.

@@ -35,8 +35,8 @@ Key packages:
 - `charts/` — `ome-crd` must be installed before `ome-resources`; `ome-serving` is an optional add-on of pre-configured models/runtimes/services.
 - `config/models/` and `config/runtimes/` — the catalog of pre-configured models and SGLang (`srt`) / vLLM runtime definitions.
 - `oeps/` — OME Enhancement Proposals. Major features and API changes require an OEP (see CONTRIBUTING.md); check `oeps/<n>/oep.yaml` for status before building on in-progress designs.
-- `site/` — Hugo documentation site. Use Node 20 so `package-lock.json` stays in sync with CI.
-- `website/` — the redesigned documentation site (SvelteKit on Cloudflare, Node 22 and pnpm 10) that replaces `site/` at launch. Until then, documentation changes still go to `site/`.
+- `site/` — Legacy Hugo documentation, retained for migration reference.
+- `website/` — The documentation source (SvelteKit on Cloudflare, Node 22 and pnpm 10). Put documentation changes in `website/src/lib/content/`; follow its `contributing/writing-docs.md`.
 
 ## Conventions
 

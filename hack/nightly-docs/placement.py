@@ -11,7 +11,7 @@ def inventory(base):
     """Index authored pages at the pinned source revision, including headings."""
     result = []
     for path in docs.git('ls-tree', '-r', '--name-only', base, '--', docs.DOC_ROOT).splitlines():
-        if not docs.doc_path(path):
+        if not docs.authored_page(path):
             continue
         content = docs.git('show', f'{base}:{path}')
         title = re.search(r'^title:\s*(.+)$', content, re.MULTILINE)
@@ -37,7 +37,7 @@ def validate(item, pages):
     reason = decision.get('new_page_reason')
     if not isinstance(reason, str) or len(reason) > 4000:
         raise ValueError('Invalid new-page justification')
-    if set(item['doc_paths']) - known:
+    if {path for path in item['doc_paths'] if docs.authored_page(path)} - known:
         if not reason.strip():
             raise ValueError('New pages require an explanation of why existing pages cannot host the concern')
     elif not canonical:

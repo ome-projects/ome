@@ -5,20 +5,22 @@ import hashlib
 import html
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import subprocess
 import tempfile
 
+import website_data
 
-DOC_ROOT = "site/content/en/docs/"
-GENERATED = DOC_ROOT + "reference/ome.v1beta1.md"
+
+DOC_ROOT = "website/src/lib/content/"
+GENERATED = DOC_ROOT + "reference/api/index.md"
 MAX_LINES = 1000
 MAX_PRS = 100
 CODE_PATHS = ["cmd", "pkg", "internal", "charts", "config", "scheduler", "hack",
               "dockerfiles", "Makefile", "Makefile-deps.mk", "go.mod"]
 SLUG = r"[a-z0-9]+(?:-[a-z0-9]+)*"
-MARKER = "<!-- nightly-docs:"
+MARKER = "<!-- nightly-website-docs:"
 
 
 def run(*args):
@@ -38,10 +40,19 @@ def pages(endpoint):
     return [item for chunk in chunks for item in chunk]
 
 
+def authored_page(path):
+    return (path.startswith(DOC_ROOT) and website_data.page_path(path)
+            and path.removeprefix(DOC_ROOT).split('/')[0] in website_data.SECTIONS
+            and not path.startswith(DOC_ROOT + "reference/api/"))
+
+
 def doc_path(path):
-    p = PurePosixPath(path)
-    return (path.startswith(DOC_ROOT) and path.endswith(".md")
-            and ".." not in p.parts and str(p) == path and path != GENERATED)
+    return authored_page(path) or path in website_data.AUXILIARY
+
+
+def branch_for(key):
+    digest = hashlib.sha256((DOC_ROOT + key).encode()).hexdigest()[:16]
+    return f'codex/nightly-docs-{digest}'
 
 
 def validate_item(item):
@@ -60,11 +71,10 @@ def validate_item(item):
     paths = item["doc_paths"]
     if not paths or len(set(paths)) != len(paths):
         raise ValueError("Expected one or more distinct documentation files")
-    if not all(doc_path(path) for path in paths):
-        raise ValueError("Only handwritten documentation Markdown is allowed")
+    if not all(doc_path(path) for path in paths) or not any(authored_page(path) for path in paths):
+        raise ValueError("Expected authored website Markdown with optional navigation/redirect data")
     key = f'{item["source_sha"]}:{item["area"]}:{item["concern"]}'
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return {**item, "key": key, "branch": f'codex/nightly-docs-{digest}'}
+    return {**item, "key": key, "branch": branch_for(key)}
 
 
 def open_pr_files(repo, numbers):
@@ -178,15 +188,20 @@ def validate_diff(item, base):
         return False
     if not changed <= set(item["doc_paths"]):
         raise ValueError("Changes exceed the planned documentation file allowlist")
+    if not any(authored_page(path) for path in changed):
+        raise ValueError("A documentation patch must change an authored page")
     canonical = set(item.get('placement', {}).get('canonical_pages', []))
     if not canonical <= changed:
         raise ValueError('The patch leaves a planned canonical-page correction unchanged')
     for path in changed:
+        if not doc_path(path):
+            raise ValueError("Only website documentation data is allowed")
         p = Path(path)
         if not p.is_file() or any(parent.is_symlink() for parent in (p, *p.parents)):
             raise ValueError("Deleted files and symbolic links are not allowed")
         if p.stat().st_mode & 0o111:
             raise ValueError("Documentation must not be executable")
+        website_data.validate(path, p.read_text())
     mutate_git("add", "--", *sorted(changed))
     total = 0
     for line in git("diff", "--cached", "--numstat", base).splitlines():
@@ -226,6 +241,7 @@ def import_bundle(item, base, raw):
         if (not doc_path(path) or not isinstance(content, str) or "\x00" in content
                 or any(parent.is_symlink() for parent in (p, *p.parents))):
             raise ValueError("Invalid documentation bundle entry")
+        website_data.validate(path, content)
     for path, content in files.items():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -323,7 +339,7 @@ Scope: **{item["area"]} / {item["concern"]}**. Other concerns are deferred.
 
 - Passed the documentation path and size guard (under {MAX_LINES} added plus deleted lines; no file-count limit).
 - Passed an independent accuracy and single-concern review.
-- Passed `git diff --check` and the production Hugo build.
+- Passed `git diff --check` and website content/link tests, type checks, lint and production build.
 
 ## Checklist
 

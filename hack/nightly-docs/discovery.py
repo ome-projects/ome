@@ -167,7 +167,7 @@ def build_report(scans, context):
                  if (item['area'], item['concern']) not in selected_ids]
         queued = prior + queued
     queued = pending_candidates(queued, context)
-    return {'base_sha': context['base_sha'], 'scans': scans, 'selected': selected,
+    return {'doc_root': docs.DOC_ROOT, 'base_sha': context['base_sha'], 'scans': scans, 'selected': selected,
             'deferred': deferred, 'queued_concerns': queued[:docs.MAX_PRS],
             'queue_overflow': [item['key'] for item in queued[docs.MAX_PRS:]],
             'expected_shards': expected, 'missing_shards': missing, 'complete': not missing,
@@ -193,6 +193,8 @@ def pending_candidates(proposals, context):
 
 def pending_from_report(report, context):
     """Carry a bounded queue as evidence for fresh discovery."""
+    if report.get('doc_root') != docs.DOC_ROOT:
+        return []
     return pending_candidates(report.get('queued_concerns', []), context)[:docs.MAX_PRS]
 
 
@@ -217,7 +219,7 @@ def previous_pending(repo, branch, context):
             report = json.loads(Path(directory, 'nightly-docs-discovery-report.json').read_text())
         # A full production attempt may carry a partial recovery report.
         # Filtered/dry-run pilots still cannot replace the production queue.
-        if (report.get('dry_run') is not False or report.get('max_prs') != docs.MAX_PRS
+        if (report.get('doc_root') != docs.DOC_ROOT or report.get('dry_run') is not False or report.get('max_prs') != docs.MAX_PRS
                 or set(report.get('expected_shards', [scan['shard'] for scan in report.get('scans', [])]))
                 != {name for name, _, _ in SHARDS}):
             continue
