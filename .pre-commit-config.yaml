@@ -25,11 +25,7 @@ repos:
     hooks:
       - id: codespell
         # Preserve literal truncated CLI column labels in documentation samples.
-<<<<<<< HEAD
-        args: ['-L', 'AfterAll,NotIn,OptIn,UpToDate,WithT,allReady,rouge,trough', '--ignore-regex', '^TrafficMap (?:Admi|Trun)\.\.\.']
-=======
-        args: ['-L', 'AfterAll,NotIn,UpToDate,WithT,allReady,notin,rouge,trough', '--ignore-regex', '^TrafficMap (?:Admi|Trun)\.\.\.']
->>>>>>> origin/main
+        args: ['-L', 'AfterAll,NotIn,OptIn,UpToDate,WithT,allReady,notin,rouge,trough', '--ignore-regex', '^TrafficMap (?:Admi|Trun)\.\.\.']
         exclude: |
           (?x)^(
             charts/.*/templates/.*\.yaml$|
