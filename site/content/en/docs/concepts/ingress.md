@@ -36,7 +36,7 @@ spec:
         nvidia.com/gpu: 2
 ```
 
-This creates a **Kubernetes Ingress** resource accessible at:
+Depending on the cluster's ingress configuration, this generates either Gateway API **HTTPRoutes** or a **Kubernetes Ingress** resource (see [Component-Based Routing](#component-based-routing) below). The externally callable URL is published in the service's `status.url`, for example:
 ```
 https://llama-chat.your-namespace.your-cluster.com
 ```
@@ -64,7 +64,14 @@ spec:
 
 ## Component-Based Routing
 
-OME's inference services can include multiple components that work together. The ingress system automatically creates the right routing rules based on which components you deploy:
+OME's inference services can include multiple components that work together: the engine, plus an optional router and decoder. OME does **not** route components by request path — there are no special `/v1/router/...` or `/v1/decoder/...` URL paths. Instead, it creates one route per deployed component plus a top-level route that serves as the client entry point.
+
+How those routes are addressed depends on the cluster's ingress mode (the `enableGatewayAPI` setting in the `inferenceservice-config` ConfigMap — a cluster-wide choice, not a per-service one). For an InferenceService named `llama-chat` in namespace `your-namespace`:
+
+- **Gateway API mode**: one HTTPRoute per component, named `llama-chat` (top-level), `llama-chat-engine`, `llama-chat-router`, and `llama-chat-decoder`. Under the default **shared-host scheme**, every route carries the cluster's shared hostname (for example `llm.example.com`) and matches the path prefix `/<namespace>/<route-name>/`, which is stripped before the request reaches the backend — so the decoder is reached at `https://llm.example.com/your-namespace/llama-chat-decoder/...`. Under the opt-in **per-ISVC subdomain scheme**, all of the service's routes share one hostname rendered from `domainTemplate` (for example `llama-chat.your-namespace.example.com`) and match at the root path `/`, so individual components are **not** separately addressable. See [Gateway API Host Schemes](/ome/docs/administration/gateway-host-schemes/) for both schemes in detail.
+- **Kubernetes Ingress mode**: a single Ingress whose rules route by per-component **hostname** — each component's service name rendered through `domainTemplate`, for example `llama-chat-decoder.your-namespace.example.com` — with every rule matching at the root path `/`.
+
+Which routes exist, and where the top-level route points, follows from the components you deploy:
 
 ### Engine Only (Basic Inference)
 ```yaml
@@ -72,7 +79,9 @@ spec:
   engine:
     model: llama-3-70b-instruct
 ```
-**Routing**: All requests → Engine service
+**Routing**:
+- Top-level route → Engine service
+- Gateway API mode also creates the `llama-chat-engine` route → Engine service
 
 ### Engine + Router (Advanced Inference)
 ```yaml
@@ -87,8 +96,9 @@ spec:
           image: custom-router:latest
 ```
 **Routing**:
-- Top-level requests → Router service
-- Router processes and forwards → Engine service
+- Top-level route → Router service (the router forwards requests on to the engine)
+- `llama-chat-router` route → Router service
+- `llama-chat-engine` route → Engine service
 
 ### Engine + Decoder (Post-Processing)
 ```yaml
@@ -103,8 +113,9 @@ spec:
           image: custom-decoder:latest
 ```
 **Routing**:
-- Top-level requests → Engine service
-- Decoder-specific requests (`/v1/decoder/...`) → Decoder service
+- Top-level route → Engine service
+- `llama-chat-engine` route → Engine service
+- `llama-chat-decoder` route → Decoder service
 
 ### Full Pipeline (Engine + Router + Decoder)
 ```yaml
@@ -125,13 +136,14 @@ spec:
           image: custom-decoder:latest
 ```
 **Routing**:
-- Top-level requests → Router service
-- Router-specific requests (`/v1/router/...`) → Router service
-- Decoder-specific requests (`/v1/decoder/...`) → Decoder service
+- Top-level route → Router service
+- `llama-chat-router` route → Router service
+- `llama-chat-engine` route → Engine service
+- `llama-chat-decoder` route → Decoder service
 
 ## Making API Calls
 
-Once your inference service is deployed and ingress is configured, you can make API calls using standard HTTP clients:
+Once your inference service is deployed and ingress is configured, you can make API calls using standard HTTP clients. The examples below use a per-service hostname; under the default Gateway API shared-host scheme the same request goes to `https://llm.example.com/your-namespace/llama-chat/...` instead. The URL published in the service's `status.url` always reflects the active scheme:
 
 ### Basic Text Generation
 ```bash
@@ -164,27 +176,43 @@ curl -X POST https://llama-chat.your-namespace.example.com/v1/chat/completions \
 
 ### Component-Specific Endpoints
 
-When using services with multiple components, you can access specific endpoints:
+Each deployed component is reached through its own route — by path prefix under the default Gateway API shared-host scheme, or by hostname in Kubernetes Ingress mode (see [Component-Based Routing](#component-based-routing)). The path you append is the component's own API path, such as `/health` or `/v1/completions`; there are no OME-specific `/v1/router/...` or `/v1/decoder/...` endpoints.
+
+Under the default Gateway API shared-host scheme (shared host `llm.example.com`, service `llama-chat` in namespace `your-namespace`):
 
 ```bash
-# Router-specific endpoint
-curl -X POST https://llama-chat.your-namespace.example.com/v1/router/route \
+# Call the engine directly, bypassing the router
+curl -X POST https://llm.example.com/your-namespace/llama-chat-engine/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"request": "route this to the best model"}'
+  -d '{
+    "model": "llama-3-70b-instruct",
+    "prompt": "Direct engine request",
+    "max_tokens": 100
+  }'
 
-# Decoder-specific endpoint
-curl -X POST https://llama-chat.your-namespace.example.com/v1/decoder/decode \
-  -H "Content-Type: application/json" \
-  -d '{"tokens": [1, 2, 3, 4], "decode_format": "text"}'
-
-# Health checks
+# Per-component health checks
 curl -H "Accept: application/json" \
-  https://llama-chat.your-namespace.example.com/health
+  https://llm.example.com/your-namespace/llama-chat-engine/health
 curl -H "Accept: application/json" \
-  https://llama-chat.your-namespace.example.com/v1/router/health
+  https://llm.example.com/your-namespace/llama-chat-router/health
 curl -H "Accept: application/json" \
-  https://llama-chat.your-namespace.example.com/v1/decoder/health
+  https://llm.example.com/your-namespace/llama-chat-decoder/health
 ```
+
+The `/<namespace>/<service>/` prefix is stripped before the request reaches the component, so the engine above receives `/v1/completions`.
+
+In Kubernetes Ingress mode, address each component by its hostname instead:
+
+```bash
+curl -H "Accept: application/json" \
+  https://llama-chat-engine.your-namespace.example.com/health
+curl -H "Accept: application/json" \
+  https://llama-chat-router.your-namespace.example.com/health
+curl -H "Accept: application/json" \
+  https://llama-chat-decoder.your-namespace.example.com/health
+```
+
+Under the per-ISVC subdomain Gateway API scheme, components are not individually addressable: all of the service's routes share one hostname and match at `/`, so requests to that host reach the top-level backend (router if present, otherwise engine).
 
 ### Model Information
 ```bash
@@ -350,6 +378,7 @@ All external ingress endpoints should use HTTPS in production. Check your ingres
 ## Next Steps
 
 - **[Administration Guide](/docs/administration/ingress/)** - Configure ingress controllers and networking
+- **[Gateway API Host Schemes](/ome/docs/administration/gateway-host-schemes/)** - How generated routes are addressed: shared host with path prefixes, or per-service subdomains
 - **[Serving Runtime](/docs/concepts/serving_runtime/)** - Understand the underlying serving infrastructure
 - **[InferenceService](/docs/concepts/inference_service/)** - Complete InferenceService configuration reference
 
