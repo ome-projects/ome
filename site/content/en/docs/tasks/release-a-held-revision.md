@@ -4,7 +4,7 @@ linkTitle: "Release a Held Revision"
 weight: 21
 date: 2026-09-26
 description: >
-  Ask the controller to release one exact Held retry block with the guarded `kubectl ome instance release-held` action
+  How a failing target revision backs off and Holds under `lifecycle.updateRetry`, and how to release one exact Held retry block with the guarded `kubectl ome instance release-held` action
 ---
 
 When update attempts for a component's target revision keep failing, the
@@ -14,7 +14,9 @@ every instance attempting it. A block in state `Backoff` still has attempts
 left; a block in state **`Held`** means attempts are exhausted (or retry was
 never configured), and the controller will not attempt that revision again on
 its own. Only a new target revision — or an explicit operator release — ends
-the hold.
+the hold. How many attempts a revision gets before that, and how they are
+spaced, is the [`lifecycle.updateRetry`
+backoff](#how-a-revision-becomes-held-the-lifecycleupdateretry-backoff).
 
 `kubectl ome instance release-held` is the guarded way to request that
 release. It writes a **release mailbox annotation**
@@ -27,6 +29,94 @@ with `spec.deploymentMode: OMENative`.
 > **Note:** This command submits a *request*. API acceptance is not the
 > release itself — see [What acceptance means — and what it does
 > not](#what-acceptance-means--and-what-it-does-not).
+
+## How a revision becomes Held: the `lifecycle.updateRetry` backoff
+
+Whether the controller retries a failed target revision at all — and how many
+times, how fast — is set by one operator-level block, `lifecycle.updateRetry`,
+in the `inferenceservice-config` ConfigMap. There is no per-service or
+per-component override. The `ome-resources` chart renders it from
+`ome.controller.lifecycle.updateRetry` with these defaults:
+
+```yaml
+ome:
+  controller:
+    lifecycle:
+      updateRetry:
+        maxAttempts: 3    # attempts at one target revision before Held
+        initialDelay: 1m  # backoff after the first failed attempt
+        maxDelay: 30m     # backoff ceiling
+        multiplier: 2.0   # backoff growth per attempt
+```
+
+When an attempt toward the component's target revision fails **and the
+failure is workload-caused** — evidence that deterministically travels with
+the pod template, such as `ImagePullBackOff` or an invalid pod spec (see
+[what happens when the deadline
+expires](/ome/docs/administration/instance-readiness-deadlines/#what-happens-when-the-deadline-expires))
+— the failure charges one attempt against the revision's retry block:
+
+- **Attempts remain** (`attemptsStarted` < `maxAttempts`): the block enters
+  `Backoff` and persists the resume time in `nextRetryAt`. The wait after
+  attempt *n* is `initialDelay × multiplier^(n−1)`, capped at `maxDelay` —
+  with the chart defaults, a bad revision is attempted three times in total,
+  backing off 1m after the first failure and 2m after the second.
+- **Attempts exhausted** (`attemptsStarted` ≥ `maxAttempts`): the block
+  enters `Held` and `nextRetryAt` is cleared. The controller emits the
+  one-shot [`RetryHeld` warning](#the-retryheld-event), reports the hold in
+  the InferenceReplica's `status.rolloutHold` (mirrored onto the
+  InferenceService's component status), and never attempts the revision
+  again on its own.
+
+While a block is in `Backoff`, no fresh attempt at that revision starts
+before `nextRetryAt`. Once the backoff is due and an attempt is admitted, the
+block shows `RetryInProgress` (`RUNNING` in the `retry-blocks` table) —
+exactly one retry attempt runs at a time. An attempt that converges the
+component on the revision removes the block. `attemptsStarted` counts these
+lifecycle attempts, never kubelet container restarts.
+
+A failure the revision cannot be blamed for — an elapsed readiness deadline,
+an ambiguous kubelet reason — never charges the ladder: the block re-enters
+`Backoff` at its current rung's delay with `attemptsStarted` unchanged, so no
+number of such failures reaches `Held` by itself.
+
+### When `updateRetry` is unset: the first failure Holds
+
+The OME binary has **no built-in retry policy**. When the `updateRetry` block
+is absent — or invalid: `maxAttempts` ≤ 0, `multiplier` < 1, a delay that
+does not parse or is not positive, or `maxDelay` < `initialDelay` — the
+controller treats retry as unconfigured and fails safe: the **first**
+workload-caused failure toward a target revision Holds it immediately, with
+the same `RetryHeld` event. The cause is named in a V(1) controller log;
+there is never a silent fallback to baked-in numbers. The chart ships the
+block by default, so this is the behavior when you remove or misedit it.
+
+The policy is re-read from the ConfigMap on every reconcile (through a
+short-TTL cache), so an edit applies to future failures without a controller
+restart — but never retroactively: raising `maxAttempts` does **not** release
+a block that is already `Held`. Only a new target revision or an explicit
+release (the rest of this page) ends an existing hold; after a release, a
+revision that fails again starts a fresh block at zero attempts.
+
+### The `RetryHeld` event
+
+At the transition into `Held` — once per block, not once per reconcile — the
+controller emits a Warning event against the InferenceService:
+
+```
+Warning  RetryHeld  InferenceReplica prod/chat-engine component=engine update
+to revision chat-engine-1f2a3b4c held after 3 failed attempt(s) (last
+failure: ImagePullBackOff); publish a corrected revision or raise
+lifecycle.updateRetry limits
+```
+
+```bash
+kubectl get events -n prod --field-selector reason=RetryHeld
+```
+
+Publishing a corrected revision is the normal exit. Releasing the block — the
+steps below — is for when the *same* revision is expected to succeed as-is: a
+bad image tag that has since been pushed, a registry outage that has ended.
 
 ## Before you begin
 
@@ -270,6 +360,10 @@ kubectl get events -n prod \
 kubectl get events -n prod \
   --field-selector reason=RetryBlockReleaseSkipped
 ```
+
+A fresh Warning with reason `RetryHeld` after your release means the revision
+was attempted again and failed its way back to `Held` — see [the backoff
+section](#how-a-revision-becomes-held-the-lifecycleupdateretry-backoff).
 
 ## Exit codes
 
