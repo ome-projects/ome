@@ -191,6 +191,11 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(set(action['with']['allowed_bots'].split(',')),
                              {'claude', 'coderabbitai', 'github-actions'})
         publisher = workflow['jobs']['validate-publish']
+        self.assertEqual(publisher['outputs']['round-completed'], "${{ steps.finish.outcome == 'success' }}")
+        self.assertIn("needs.validate-publish.outputs.round-completed != 'true'",
+                      workflow['jobs']['record-failure']['if'])
+        self.assertEqual(next(step for step in publisher['steps'] if step.get('id') == 'finish')['name'],
+                         'Publish guarded repair and record the actual PR-head check')
         self.assertNotIn('GH_TOKEN', publisher.get('env', {}))
         for step in publisher['steps']:
             self.assertFalse(step.get('uses', '').startswith('anthropics/'))
