@@ -231,9 +231,11 @@ What changes when `pdMode: true`:
   runs `--disaggregation-mode decode` with the same resources.
 - Engine and decoder pods get RDMA auto-injection annotations
   (`rdma.ome.io/auto-inject`, `rdma.ome.io/profile`,
-  `rdma.ome.io/container-name`), `hostNetwork: true` with
-  `dnsPolicy: ClusterFirstWithHostNet`, and — for the `oci-roce` and
-  `cks-gb-sglang` profiles — a privileged security context.
+  `rdma.ome.io/container-name`) and `hostNetwork: true` with
+  `dnsPolicy: ClusterFirstWithHostNet`. For the `oci-roce` and
+  `cks-gb-sglang` profiles the chart also sets `privileged: true` on the
+  rendered runtime's container — that comes from the chart's runtime spec,
+  not from the RDMA profile (see below).
 - The router runs with `--pd-disaggregation` and separate
   `--prefill-selector`/`--decode-selector` flags instead of a single selector.
 - The InferenceService gains `decoder` and `router` components (in PD mode the
@@ -242,7 +244,16 @@ What changes when `pdMode: true`:
 
 PD mode requires RDMA-capable GPU nodes (InfiniBand or RoCE); OME's pod
 mutating webhook reads the `rdma.ome.io/*` annotations and injects the RDMA
-configuration for the chosen profile.
+configuration for the chosen profile: environment variables, a `/dev/shm`
+emptyDir, a `/dev/infiniband` hostPath mount, and the `IPC_LOCK` capability.
+No profile injects a privileged security context, and a profile does not by
+itself grant access to the HCA device nodes — the privileged context on the
+chart's PD runtimes is written into the rendered `ClusterServingRuntime`. If
+you author your own PD runtime with these annotations (for example with
+`createRuntime: false`), request your cluster's RDMA device-plugin resource
+in the container's resources or set `privileged: true` on the container
+explicitly; see
+[RDMA Annotations](/ome/docs/reference/labels-and-annotations/#rdma-annotations).
 
 ## Uninstall
 
