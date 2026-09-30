@@ -135,10 +135,12 @@ func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, c
 	return cds.BulkDownloadContext(context.Background(), objects, targetDir, concurrency, opts...)
 }
 
-// BulkDownloadContext stops between object files when ctx is canceled. It waits
-// for all files already in progress to return before reporting cancellation.
+// BulkDownloadContext stops standard downloads between files and can cancel
+// multipart downloads in progress. It waits for active downloads to return.
 func (cds *OCIOSDataStore) BulkDownloadContext(ctx context.Context, objects []ObjectURI, targetDir string, concurrency int, opts ...DownloadOption) error {
-	return cds.bulkDownload(ctx, objects, targetDir, concurrency, cds.DownloadWithStrategy, opts...)
+	return cds.bulkDownload(ctx, objects, targetDir, concurrency, func(object ObjectURI, target string, opts ...DownloadOption) error {
+		return cds.DownloadWithStrategyContext(ctx, object, target, opts...)
+	}, opts...)
 }
 
 func (cds *OCIOSDataStore) bulkDownload(ctx context.Context, objects []ObjectURI, targetDir string, concurrency int,
@@ -207,6 +209,12 @@ func (cds *OCIOSDataStore) bulkDownload(ctx context.Context, objects []ObjectURI
 
 // DownloadWithStrategy chooses between standard and multipart download based on object size and options.
 func (cds *OCIOSDataStore) DownloadWithStrategy(source ObjectURI, target string, opts ...DownloadOption) error {
+	return cds.DownloadWithStrategyContext(context.Background(), source, target, opts...)
+}
+
+// DownloadWithStrategyContext cancels multipart downloads through ctx. Standard
+// downloads continue until the current file finishes.
+func (cds *OCIOSDataStore) DownloadWithStrategyContext(ctx context.Context, source ObjectURI, target string, opts ...DownloadOption) error {
 	downloadOpts, err := applyDownloadOptions(opts...)
 	if err != nil {
 		return fmt.Errorf("failed to apply download options: %w", err)
@@ -240,6 +248,9 @@ func (cds *OCIOSDataStore) DownloadWithStrategy(source ObjectURI, target string,
 	if err != nil {
 		return fmt.Errorf("failed to list objects for %s: %w", source.ObjectName, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(objects) == 0 {
 		return fmt.Errorf("object %s not found in bucket %s", source.ObjectName, source.BucketName)
 	}
@@ -253,7 +264,7 @@ func (cds *OCIOSDataStore) DownloadWithStrategy(source ObjectURI, target string,
 
 	if downloadOpts.ForceMultipart || (object.Size != nil && *object.Size >= int64(downloadOpts.SizeThresholdInMB)*1024*1024) {
 		cds.logger.Infof("DownloadWithStrategy using multipart for %s, size: %d", source.ObjectName, *object.Size)
-		return cds.MultipartDownload(source, target, opts...)
+		return cds.MultipartDownloadContext(ctx, source, target, opts...)
 	}
 
 	cds.logger.Infof("DownloadWithStrategy using standard download for %s", source.ObjectName)

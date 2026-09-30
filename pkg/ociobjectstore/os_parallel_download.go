@@ -56,6 +56,19 @@ type DownloadedFile struct {
 
 // MultipartDownload used to download big file, or the download will timeout
 func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, opts ...DownloadOption) error {
+	return cds.MultipartDownloadContext(context.Background(), source, target, opts...)
+}
+
+// MultipartDownloadContext cancels a multipart download and waits for all part
+// workers to exit before returning.
+func (cds *OCIOSDataStore) MultipartDownloadContext(ctx context.Context, source ObjectURI, target string, opts ...DownloadOption) error {
+	return cds.downloadMultipart(ctx, ctx.Done() != nil, source, target, opts...)
+}
+
+func (cds *OCIOSDataStore) downloadMultipart(ctx context.Context, interruptible bool, source ObjectURI, target string, opts ...DownloadOption) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	downloadOpts, err := applyDownloadOptions(opts...)
 	if err != nil {
 		return fmt.Errorf("failed to apply download options: %w", err)
@@ -110,9 +123,6 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 		totalParts++
 	}
 
-	prepareDownloadParts := splitToParts(totalParts, partSize, objectSize, source)
-	downloadedParts := cds.multipartDownload(context.Background(), threads, prepareDownloadParts)
-
 	targetFilePath := ComputeTargetFilePath(source, target, &downloadOpts)
 	tempTargetFilePath := targetFilePath + ".temp"
 
@@ -120,6 +130,9 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 	targetDir := filepath.Dir(targetFilePath)
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory %s: %v", targetDir, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Clean up any existing temporary file
@@ -131,25 +144,41 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 		return err
 	}
 
-	// Use a file closure flag to avoid double-closing the file
+	downloadCtx, cancel := context.WithCancel(ctx)
+	prepareDownloadParts := splitToParts(downloadCtx, totalParts, partSize, objectSize, source)
+	downloadedParts := cds.multipartDownload(downloadCtx, threads, prepareDownloadParts, interruptible)
+
 	fileClosed := false
-	defer func(tmpFile *os.File) {
-		// Only close if not already closed
+	completed := false
+	defer func() {
+		cancel()
+		for part := range downloadedParts {
+			if part.tempFilePath != "" {
+				os.Remove(part.tempFilePath)
+			}
+		}
+		for range prepareDownloadParts {
+		}
 		if !fileClosed {
 			err := tmpFile.Close()
 			if err != nil {
 				cds.logger.Warnf("[%s] Failed to close temporary file: %v", source.ObjectName, err)
 			}
 		}
-	}(tmpFile)
+		if !completed {
+			os.Remove(tempTargetFilePath)
+		}
+	}()
 
 	startTime := time.Now()
 	for part := range downloadedParts {
-		if part.err != nil {
-			err := os.Remove(tempTargetFilePath)
-			if err != nil {
-				cds.logger.Warnf("[%s] Failed to clean up temporary file after error: %v", source.ObjectName, err)
+		if err := ctx.Err(); err != nil {
+			if part.tempFilePath != "" {
+				os.Remove(part.tempFilePath)
 			}
+			return err
+		}
+		if part.err != nil {
 			return fmt.Errorf("error downloading part %d: %v", part.partNum, part.err)
 		}
 
@@ -183,6 +212,9 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 			cds.logger.Warnf("[%s] Failed to remove temporary file for part %d: %v", source.ObjectName, part.partNum, err)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Ensure all data is flushed to disk
 	if err := tmpFile.Sync(); err != nil {
@@ -195,6 +227,9 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 	}
 	// Mark as closed to prevent deferred function from trying to close again
 	fileClosed = true
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Rename the temporary file to the final target path
 	if err := os.Rename(tempTargetFilePath, targetFilePath); err != nil {
@@ -206,6 +241,7 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 		}
 		return fmt.Errorf("failed to rename temporary file to target: %v", err)
 	}
+	completed = true
 
 	// Double-check the final file size
 	fileInfo, err := os.Stat(targetFilePath)
@@ -224,7 +260,7 @@ func (cds *OCIOSDataStore) MultipartDownload(source ObjectURI, target string, op
 }
 
 // splitToParts splits the file to the partSize and builds a new struct to prepare for multipart download
-func splitToParts(totalParts, partSize, objectSize int, source ObjectURI) chan *PrepareDownloadPart {
+func splitToParts(ctx context.Context, totalParts, partSize, objectSize int, source ObjectURI) chan *PrepareDownloadPart {
 	prepareDownloadParts := make(chan *PrepareDownloadPart)
 	go func() {
 		defer func() {
@@ -232,6 +268,9 @@ func splitToParts(totalParts, partSize, objectSize int, source ObjectURI) chan *
 		}()
 
 		for part := 0; part < totalParts; part++ {
+			if ctx.Err() != nil {
+				return
+			}
 			start := int64(part * partSize)
 			// Calculate end position (inclusive for HTTP Range header)
 			// Note: HTTP Range is inclusive of both start and end bytes
@@ -256,14 +295,18 @@ func splitToParts(totalParts, partSize, objectSize int, source ObjectURI) chan *
 				size: end - start + 1,
 			}
 
-			prepareDownloadParts <- &part
+			select {
+			case <-ctx.Done():
+				return
+			case prepareDownloadParts <- &part:
+			}
 		}
 	}()
 
 	return prepareDownloadParts
 }
 
-func (cds *OCIOSDataStore) multipartDownload(ctx context.Context, downloadThreads int, prepareDownloadParts chan *PrepareDownloadPart) chan *DownloadedPart {
+func (cds *OCIOSDataStore) multipartDownload(ctx context.Context, downloadThreads int, prepareDownloadParts chan *PrepareDownloadPart, interruptible bool) chan *DownloadedPart {
 	result := make(chan *DownloadedPart)
 
 	var wg sync.WaitGroup
@@ -271,7 +314,7 @@ func (cds *OCIOSDataStore) multipartDownload(ctx context.Context, downloadThread
 
 	for i := 0; i < downloadThreads; i++ {
 		go func() {
-			cds.downloadFilePart(ctx, prepareDownloadParts, result)
+			cds.downloadFilePart(ctx, prepareDownloadParts, result, interruptible)
 			wg.Done()
 		}()
 	}
@@ -285,20 +328,42 @@ func (cds *OCIOSDataStore) multipartDownload(ctx context.Context, downloadThread
 }
 
 // downloadFilePart wraps objectStorage GetObject API call
-func (cds *OCIOSDataStore) downloadFilePart(ctx context.Context, prepareDownloadParts chan *PrepareDownloadPart, result chan *DownloadedPart) {
+func (cds *OCIOSDataStore) downloadFilePart(ctx context.Context, prepareDownloadParts chan *PrepareDownloadPart, result chan *DownloadedPart, interruptible bool) {
+	var retryPolicy *common.RetryPolicy
+	if interruptible {
+		policy := common.NoRetryPolicy()
+		retryPolicy = &policy
+	}
 	for part := range prepareDownloadParts {
+		if ctx.Err() != nil {
+			return
+		}
 		var lastErr error
 		var tempFilePath string
 		var size int64
 		start := time.Now()
 
 		for attempt := 1; attempt <= maxPartRetries; attempt++ {
-			resp, err := cds.Client.GetObject(ctx, objectstorage.GetObjectRequest{
-				NamespaceName: common.String(part.namespace),
-				BucketName:    common.String(part.bucket),
-				ObjectName:    common.String(part.object),
-				Range:         common.String(part.byteRange),
+			if ctx.Err() != nil {
+				return
+			}
+			// The OCI SDK can return before its retry goroutine exits when its
+			// context is canceled. Finish an active request before stopping this part.
+			// Interruptible downloads use this loop for retries so SDK backoff
+			// cannot start another request after cancellation.
+			resp, err := cds.Client.GetObject(context.WithoutCancel(ctx), objectstorage.GetObjectRequest{
+				NamespaceName:   common.String(part.namespace),
+				BucketName:      common.String(part.bucket),
+				ObjectName:      common.String(part.object),
+				Range:           common.String(part.byteRange),
+				RequestMetadata: common.RequestMetadata{RetryPolicy: retryPolicy},
 			})
+			if ctx.Err() != nil {
+				if resp.Content != nil {
+					resp.Content.Close()
+				}
+				return
+			}
 			if err != nil {
 				cds.logger.Warnf("Error getting object for part %d (attempt %d/%d): %s", part.partNum, attempt, maxPartRetries, err)
 				lastErr = err
@@ -314,9 +379,21 @@ func (cds *OCIOSDataStore) downloadFilePart(ctx context.Context, prepareDownload
 				tempFilePath = tempFile.Name()
 
 				// Stream data directly to temp file using pooled buffer
+				copyDone := make(chan struct{})
+				watcherDone := make(chan struct{})
+				go func() {
+					defer close(watcherDone)
+					select {
+					case <-ctx.Done():
+						resp.Content.Close()
+					case <-copyDone:
+					}
+				}()
 				bufp := BufferPool.Get().(*[]byte)
 				written, streamErr := io.CopyBuffer(tempFile, resp.Content, *bufp)
 				BufferPool.Put(bufp)
+				close(copyDone)
+				<-watcherDone
 
 				closeErr := resp.Content.Close()
 				syncErr := tempFile.Sync()
@@ -342,8 +419,18 @@ func (cds *OCIOSDataStore) downloadFilePart(ctx context.Context, prepareDownload
 				}
 			}
 			if attempt < maxPartRetries && lastErr != nil {
-				time.Sleep(2 * time.Second)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
 			}
+		}
+		if ctx.Err() != nil {
+			if tempFilePath != "" {
+				os.Remove(tempFilePath)
+			}
+			return
 		}
 
 		duration := time.Since(start)

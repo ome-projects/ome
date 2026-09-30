@@ -1,6 +1,7 @@
 package ociobjectstore
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -20,7 +21,7 @@ func TestSplitToParts(t *testing.T) {
 		partSize := 1024 * 1024  // 1MB
 		objectSize := 512 * 1024 // 512KB
 
-		parts := splitToParts(totalParts, partSize, objectSize, source)
+		parts := splitToParts(context.Background(), totalParts, partSize, objectSize, source)
 
 		var collectedParts []*PrepareDownloadPart
 		for part := range parts {
@@ -41,7 +42,7 @@ func TestSplitToParts(t *testing.T) {
 		partSize := 1024 * 1024         // 1MB
 		objectSize := 2.5 * 1024 * 1024 // 2.5MB
 
-		parts := splitToParts(totalParts, partSize, int(objectSize), source)
+		parts := splitToParts(context.Background(), totalParts, partSize, int(objectSize), source)
 
 		var collectedParts []*PrepareDownloadPart
 		for part := range parts {
@@ -71,7 +72,7 @@ func TestSplitToParts(t *testing.T) {
 		partSize := 1024 * 1024       // 1MB
 		objectSize := 2 * 1024 * 1024 // Exactly 2MB
 
-		parts := splitToParts(totalParts, partSize, objectSize, source)
+		parts := splitToParts(context.Background(), totalParts, partSize, objectSize, source)
 
 		var collectedParts []*PrepareDownloadPart
 		for part := range parts {
@@ -238,7 +239,7 @@ func TestPartCalculationEdgeCases(t *testing.T) {
 		partSize := 1024
 		objectSize := 0
 
-		parts := splitToParts(totalParts, partSize, objectSize, source)
+		parts := splitToParts(context.Background(), totalParts, partSize, objectSize, source)
 
 		var collectedParts []*PrepareDownloadPart
 		for part := range parts {
@@ -253,7 +254,7 @@ func TestPartCalculationEdgeCases(t *testing.T) {
 		partSize := 1024
 		objectSize := 1
 
-		parts := splitToParts(totalParts, partSize, objectSize, source)
+		parts := splitToParts(context.Background(), totalParts, partSize, objectSize, source)
 
 		var collectedParts []*PrepareDownloadPart
 		for part := range parts {
@@ -271,7 +272,7 @@ func TestPartCalculationEdgeCases(t *testing.T) {
 		partSize := 1024          // 1KB parts
 		objectSize := 1000 * 1024 // 1000KB total
 
-		parts := splitToParts(totalParts, partSize, objectSize, source)
+		parts := splitToParts(context.Background(), totalParts, partSize, objectSize, source)
 
 		var collectedParts []*PrepareDownloadPart
 		for part := range parts {
@@ -333,7 +334,7 @@ func TestByteRangeCalculations(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parts := splitToParts(tt.totalParts, tt.partSize, tt.objectSize, source)
+			parts := splitToParts(context.Background(), tt.totalParts, tt.partSize, tt.objectSize, source)
 
 			var collectedParts []*PrepareDownloadPart
 			for part := range parts {
