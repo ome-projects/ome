@@ -43,7 +43,7 @@ curl -X GET "http://e5-mistral-7b-instruct.e5-mistral-7b-instruct:8080/health"
 
 ## Step 2: Create a simple benchmark
 
-Let's start with a basic benchmark for a text embedding service:
+Let's start with a basic benchmark for a text generation service:
 
 ```bash
 kubectl apply -f - <<EOF
@@ -66,8 +66,8 @@ spec:
       namespace: llama-1b-demo
   task: text-to-text
   trafficScenarios:
-    - "constant_load"
-    - "burst_load"
+    - "D(100,100)"            # Fixed 100 input tokens, 100 output tokens
+    - "N(480,240)/(300,150)"  # Normally distributed input and output lengths
   numConcurrency: [1, 5, 10]
   maxTimePerIteration: 15
   maxRequestsPerIteration: 1000
@@ -80,6 +80,8 @@ spec:
     storageUri: "pvc://benchmark-results-pvc/simple-benchmark"
 EOF
 ```
+
+Every `trafficScenarios` entry must match the task-specific format described in [Traffic Scenario Format](#traffic-scenario-format) below — the admission webhook denies the whole create or update with an `invalid scenario format` error otherwise.
 
 ## Step 3: Comprehensive embedding benchmark
 
@@ -101,12 +103,9 @@ spec:
       namespace: e5-mistral-7b-instruct
   task: text-to-embeddings
   trafficScenarios:
-    - "E(128)"     # 128 token embeddings
-    - "E(512)"     # 512 token embeddings
-    - "E(1024)"    # 1024 token embeddings
-    - "E(2048)"    # 2048 token embeddings
-    - "E(4096)"    # 4096 token embeddings
-    - "E(32000)"   # Maximum context length
+    - "E(64,128)"
+    - "E(256,512)"
+    - "E(1024,2048)"
   maxTimePerIteration: 15
   maxRequestsPerIteration: 15000
   serviceMetadata:
@@ -121,6 +120,8 @@ spec:
       region: "eu-frankfurt-1"
 EOF
 ```
+
+> **Note:** For `task: text-to-embeddings` the webhook only accepts the two-number form `E(x,y)`; single-number scenarios such as `E(128)` are denied. Omitting `trafficScenarios` is also denied for this task, because the built-in defaults the webhook checks in that case (`E(64)` through `E(1024)`) do not match its own required format — always set the field explicitly for embedding benchmarks.
 
 ## Step 4: Large model benchmark with multi-node
 
@@ -149,11 +150,11 @@ spec:
       namespace: deepseek-r1
   task: text-to-text
   trafficScenarios:
-    - "reasoning_short"     # Short reasoning tasks
-    - "reasoning_medium"    # Medium complexity reasoning
-    - "reasoning_long"      # Long chain-of-thought
-    - "math_problems"       # Mathematical reasoning
-    - "code_generation"     # Code generation tasks
+    - "N(480,240)/(300,150)"  # Chat-style traffic with varied lengths
+    - "D(100,100)"            # Short prompt, short completion
+    - "D(100,1000)"           # Short prompt, long generation
+    - "D(2000,200)"           # Long prompt, short completion
+    - "D(7800,200)"           # Very long context, short completion
   numConcurrency: [1, 2, 4, 8]
   maxTimePerIteration: 30  # Longer for reasoning tasks
   maxRequestsPerIteration: 5000
@@ -200,19 +201,18 @@ kubectl describe benchmarkjob -n benchmark-demo simple-benchmark
 
 ## Advanced Benchmark Configurations
 
-### Custom Traffic Patterns
+### Traffic Scenario Format
 
-Define custom traffic scenarios:
+The admission webhook validates every `trafficScenarios` entry against a task-specific pattern and denies the BenchmarkJob with an `invalid scenario format` error if any entry does not match. All parameters are non-negative integers. The accepted forms are:
 
-```yaml
-spec:
-  trafficScenarios:
-    - "warmup(100)"           # Warmup with 100 requests
-    - "constant(50,300)"      # 50 RPS for 300 seconds
-    - "ramp(10,100,60)"       # Ramp from 10 to 100 RPS over 60s
-    - "spike(200,30)"         # Spike to 200 RPS for 30 seconds
-    - "burst(100,5,10)"       # 100 RPS burst every 10s for 5s
-```
+| Task | Accepted forms | Examples |
+|------|----------------|----------|
+| `text-to-text` | `N(mean,stddev)/(mean,stddev)`, `U(min,max)` or `U(min,max)/(min,max)`, `D(input,output)` | `N(480,240)/(300,150)`, `U(50,100)/(200,250)`, `D(100,1000)` |
+| `text-to-embeddings` | `E(x,y)` | `E(64,128)` |
+| `image-to-text` | `I(x,y)` or `I(x,y,z)` | `I(512,512)`, `I(2048,2048)` |
+| `image-to-embeddings` | `I(x,y)` or `I(x,y,z)` | `I(512,512)` |
+
+For `text-to-text`, the numbers describe input and output token counts: `N` draws them from normal distributions (mean, standard deviation), `U` from uniform ranges, and `D` uses fixed counts — so `D(2000,200)` sends 2000-token prompts and requests 200-token completions. OME passes each string unchanged to genai-bench's `--traffic-scenario` flag; see the [genai-bench documentation](https://docs.sglang.ai/genai-bench/) for the full semantics of each scenario type.
 
 ### Multi-Model Comparison
 
@@ -239,8 +239,8 @@ spec:
         namespace: mistral-models
   task: text-to-text
   trafficScenarios:
-    - "constant_load"
-    - "variable_load"
+    - "D(100,100)"
+    - "N(480,240)/(300,150)"
   comparisonMetrics:
     - "throughput"
     - "latency_p50"
@@ -290,49 +290,46 @@ spec:
 
 ## Benchmark Traffic Scenarios
 
+All scenarios must follow the task-specific forms listed in [Traffic Scenario Format](#traffic-scenario-format).
+
 ### Text Generation Scenarios
 
-**Basic Text Generation:**
+**Fixed-length (deterministic):**
 ```yaml
 trafficScenarios:
-  - "short_generation(128)"     # 128 output tokens
-  - "medium_generation(512)"    # 512 output tokens
-  - "long_generation(2048)"     # 2048 output tokens
+  - "D(100,100)"     # 100 input tokens, 100 output tokens
+  - "D(100,1000)"    # Short prompt, long generation
+  - "D(2000,200)"    # Long prompt, short completion
+  - "D(7800,200)"    # Very long context, short completion
 ```
 
-**Chat Completion:**
+**Variable-length (distribution-based):**
 ```yaml
 trafficScenarios:
-  - "chat_single_turn"          # Single user message
-  - "chat_multi_turn(5)"        # 5-turn conversation
-  - "chat_context_long"         # Long context conversations
-```
-
-**Code Generation:**
-```yaml
-trafficScenarios:
-  - "code_completion"           # Code completion tasks
-  - "code_explanation"          # Code explanation requests
-  - "code_refactoring"          # Code refactoring tasks
+  - "N(480,240)/(300,150)"   # Input ~ Normal(480,240), output ~ Normal(300,150)
+  - "U(50,100)/(200,250)"    # Input 50-100 tokens, output 200-250 tokens
 ```
 
 ### Embedding Scenarios
 
-**Document Embedding:**
+For `text-to-embeddings` tasks (the two-number `E(x,y)` form is required):
+
 ```yaml
 trafficScenarios:
-  - "E(128)"    # Short text embedding
-  - "E(512)"    # Paragraph embedding
-  - "E(2048)"   # Document embedding
-  - "E(8192)"   # Long document embedding
+  - "E(64,128)"
+  - "E(256,512)"
+  - "E(1024,2048)"
 ```
 
-**Batch Processing:**
+### Image Scenarios
+
+For `image-to-text` and `image-to-embeddings` tasks:
+
 ```yaml
 trafficScenarios:
-  - "batch_small(10)"           # 10 texts per batch
-  - "batch_medium(50)"          # 50 texts per batch
-  - "batch_large(100)"          # 100 texts per batch
+  - "I(512,512)"
+  - "I(1024,512)"
+  - "I(2048,2048)"
 ```
 
 ## Result Analysis
@@ -402,7 +399,7 @@ cat /results/simple-benchmark/summary.json
   },
   "scenarios": [
     {
-      "name": "E(128)",
+      "name": "E(64,128)",
       "duration": 900,
       "total_requests": 15000,
       "successful_requests": 14987,
@@ -434,8 +431,8 @@ cat /results/simple-benchmark/summary.json
 
 ### Traffic Scenario Selection
 
-1. **Start Simple**: Begin with basic constant load testing
-2. **Add Complexity**: Progress to burst and variable loads
+1. **Start Simple**: Begin with a single deterministic scenario such as `D(100,100)`
+2. **Add Complexity**: Progress to distribution-based scenarios (`N`, `U`) that vary request lengths
 3. **Model-Specific**: Choose scenarios appropriate for your model type
 4. **Production Patterns**: Mirror expected production traffic
 
