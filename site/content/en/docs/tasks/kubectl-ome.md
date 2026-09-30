@@ -47,6 +47,47 @@ Every command accepts the standard kubectl connection flags
 before GA — script against `-o json` and the [exit codes](#exit-codes)
 below.
 
+### How `version` reports the operator
+
+`kubectl ome version` prints two facts: the client version compiled into
+the plugin binary, and a best-effort operator version. For the operator it
+makes exactly one read — a GET of the `ome-controller-manager` Deployment
+in the control-plane namespace — and reports the `manager` container's
+image version: the tag, `tag@digest` when the image reference pins both,
+or the digest alone. If no container is named `manager`, a sole container
+is used; several containers with none named `manager` report
+`unknown (manager container unavailable)`.
+
+Besides the standard connection flags, the command's only flag is
+`--ome-namespace` (default `ome`), the namespace of that Deployment; the
+workload namespace (`-n`) plays no part. With the control plane installed
+elsewhere, point the flag at it:
+
+```bash
+kubectl ome version --ome-namespace ome-system
+```
+
+`version` never fails because the operator cannot be found. Every lookup
+failure — an unusable kubeconfig, a missing Deployment, denied `get` on
+`deployments` — degrades to `Operator Version: unknown (<reason>)` and the
+command still exits `0`; only failing to write the output is an error. So
+`unknown` with a clean exit usually means the control plane lives in a
+namespace other than the one `--ome-namespace` points at, or the caller
+lacks the `deployments` `get` granted by the
+[baseline reader role](#required-rbac) below:
+
+```
+Operator Version: unknown (get deployments.apps ome/ome-controller-manager: Forbidden)
+```
+
+Scripts must therefore test the output for `unknown`, not the exit code.
+In a terminal the command renders a COMPONENT/VERSION table; redirected or
+piped, it prints plain `Client Version:` and `Operator Version:` lines.
+The operator version is the image reference declared in the Deployment
+spec — a declared candidate, not proof of what is actually running (the
+same caveat as
+[doctor's image-tag comparison](/ome/docs/tasks/kubectl-ome-doctor/#what-doctor-does-not-tell-you)).
+
 ## Exit codes
 
 Every command exits through one shared mapping, so scripts can branch on
