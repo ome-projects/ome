@@ -131,6 +131,61 @@ endpoint:
     modelName: "my-model"
 ```
 
+### InferenceService Endpoint Requirements
+
+When the endpoint references an InferenceService, the controller does not
+create the benchmark Job until the target is actually serving:
+
+- The InferenceService must report `Ready`. Until then, the BenchmarkJob is
+  requeued (rechecked about once a minute) and no benchmark pod is created.
+- The InferenceService status must contain a URL; it becomes the benchmark's
+  `--api-base` target.
+- At least one engine pod of the InferenceService must exist, because the
+  served model name is read from the engine pods (see below).
+
+### Served Model Name
+
+Every request genai-bench sends names a model (the `model` field of the
+request body, passed to the benchmark pod as `--api-model-name`), and
+inference engines reject requests that name a model they do not serve.
+
+For a **direct URL endpoint**, the `modelName` field is used as-is.
+
+For an **InferenceService reference**, the controller resolves the name from
+the command line of the InferenceService's engine pods — the pods labeled
+`ome.io/inferenceservice: <name>` and `component: engine` — rather than from
+the ServingRuntime or InferenceService specs. `--served-model-name` can be set
+on either of those, and an InferenceService can override its runtime's runner,
+so only the pod reflects the merged result. Resolution works as follows:
+
+1. The first `--served-model-name` value found in an engine container's
+   command or args wins. Both `--flag value` and `--flag=value` forms are
+   recognized. When the flag lists several names (vLLM accepts aliases), the
+   first name is used, matching the name vLLM reports back to clients.
+2. If no container sets `--served-model-name`, the model location given by
+   `--model` (vLLM) or `--model-path` (SGLang) is used instead. This mirrors
+   the engines' own behavior: without an explicit name they serve the model
+   under its location.
+3. Kubernetes `$(VAR)` references in these values are expanded against the
+   container's environment, so a runtime that passes `--model-path
+   $(MODEL_PATH)` resolves to the actual path the engine sees. Only
+   environment variables with literal values are expanded; `valueFrom`
+   references are left as-is.
+
+For example, an InferenceService using the `srt-mistral-7b-instruct` runtime
+starts its engine with `--model-path $(MODEL_PATH) --served-model-name
+mistralai/Mistral-7B-Instruct-v0.2`, so its benchmark requests use the model
+name `mistralai/Mistral-7B-Instruct-v0.2`.
+
+If no engine pod container specifies any of these flags, reconciliation fails
+with `cannot determine the served model name of InferenceService <namespace>/<name>`
+and the benchmark Job is not created. The same error appears when no engine
+pods match the two labels above — for example, when the pods have been evicted
+after the InferenceService became Ready. Verify that engine pods are running
+(`kubectl get pods -l ome.io/inferenceservice=<name>,component=engine`) and
+that their command line carries `--served-model-name`, `--model`, or
+`--model-path`.
+
 ## Storage Configuration
 
 BenchmarkJob supports storing benchmark results in multiple cloud storage providers. The storage configuration is specified in the `outputLocation` field.
