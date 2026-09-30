@@ -1498,10 +1498,7 @@ func (s *Gopher) downloadModel(ctx context.Context, uri *ociobjectstore.ObjectUR
 	default:
 	}
 
-	// TODO: BulkDownload doesn't support context cancellation yet
-	// This means downloads may continue even after deletion request
-	// Future enhancement: modify ociobjectstore to support context
-	errs := ociOSDataStore.BulkDownload(objectUris, destPath, s.concurrency,
+	errs := ociOSDataStore.BulkDownloadContext(ctx, objectUris, destPath, s.concurrency,
 		ociobjectstore.WithThreads(s.multipartConcurrency),
 		ociobjectstore.WithChunkSize(BigFileSizeInMB),
 		ociobjectstore.WithSizeThreshold(BigFileSizeInMB),

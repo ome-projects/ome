@@ -132,6 +132,21 @@ func applyDownloadDefaults(opts *DownloadOptions) DownloadOptions {
 
 // BulkDownload uses DownloadWithStrategy for each object with concurrency and retry logic.
 func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, concurrency int, opts ...DownloadOption) error {
+	return cds.BulkDownloadContext(context.Background(), objects, targetDir, concurrency, opts...)
+}
+
+// BulkDownloadContext stops between object files when ctx is canceled. It waits
+// for all files already in progress to return before reporting cancellation.
+func (cds *OCIOSDataStore) BulkDownloadContext(ctx context.Context, objects []ObjectURI, targetDir string, concurrency int, opts ...DownloadOption) error {
+	return cds.bulkDownload(ctx, objects, targetDir, concurrency, cds.DownloadWithStrategy, opts...)
+}
+
+func (cds *OCIOSDataStore) bulkDownload(ctx context.Context, objects []ObjectURI, targetDir string, concurrency int,
+	download func(ObjectURI, string, ...DownloadOption) error, opts ...DownloadOption,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(objects) == 0 {
 		return nil
 	}
@@ -147,13 +162,23 @@ func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, c
 			for object := range jobs {
 				var err error
 				for attempt := 1; attempt <= maxRetries; attempt++ {
-					err = cds.DownloadWithStrategy(object, targetDir, opts...)
+					if ctx.Err() != nil {
+						return
+					}
+					err = download(object, targetDir, opts...)
+					if ctx.Err() != nil {
+						return
+					}
 					if err == nil {
 						cds.logger.Infof("[Worker %d] Successfully downloaded and validated %s", workerID, object.ObjectName)
 						break
 					}
 					cds.logger.Warnf("[Worker %d] Retry %d for %s after error: %v", workerID, attempt, object.ObjectName, err)
-					time.Sleep(retryDelay)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(retryDelay):
+					}
 				}
 				if err != nil {
 					errs <- fmt.Errorf("failed to smart download %s: %w", object.ObjectName, err)
@@ -168,6 +193,9 @@ func (cds *OCIOSDataStore) BulkDownload(objects []ObjectURI, targetDir string, c
 	close(jobs)
 	wg.Wait()
 	close(errs)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	for err := range errs {
 		return err
