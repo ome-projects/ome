@@ -96,7 +96,7 @@ These annotations drive [runtime revision pinning](/ome/docs/concepts/runtime-re
 
 | Annotation                    | Description                                                                                            |
 |-------------------------------|-------------------------------------------------------------------------------------------------------|
-| `ome.io/deploymentMode`       | Selects the deployment strategy (e.g. `RawDeployment`, `MultiNode`, `PDDisaggregated`). |
+| `ome.io/deploymentMode`       | Selects the [deployment mode](/ome/docs/concepts/omenative) for a component. Accepted values: `RawDeployment`, `MultiNode`, `OMENative`, and the legacy `VirtualDeployment`. Any other value (including `PDDisaggregated`, a derived service shape rather than a mode) is silently ignored and resolution falls through to the next rule. |
 | `ome.io/dedicated-ai-cluster` | Associates the InferenceService with a dedicated AI cluster.                                           |
 | `ome.io/entrypoint-component` | Identifies the entrypoint component of a multi-component InferenceService.                             |
 | `ome.io/accelerator-class`    | Selects the accelerator class used for runtime matching and scheduling.                                |
