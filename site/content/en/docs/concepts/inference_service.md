@@ -275,6 +275,40 @@ Here `minReplicas`/`maxReplicas` scale the number of leader/worker **groups** (e
 
 > **⚠️ WARNING**: Multi-node configurations typically require high-performance networking such as RoCE or InfiniBand. Performance depends on the underlying network topology and hardware provided by different cloud vendors.
 
+## Automatic Parallelism (PARALLELISM_SIZE)
+
+Runtimes need a total parallelism degree (for example SGLang's `--tp-size`/`--dp-size`), but the right value depends on how the InferenceService is sized — GPUs per pod and the number of worker pods. Instead of hard-coding it, OME computes the value at reconcile time and injects it into the Engine and Decoder runner containers as the `PARALLELISM_SIZE` environment variable. Catalog runtimes reference it in their launch arguments and rely on this contract:
+
+```yaml
+# From a catalog runtime (config/runtimes/srt/deepseek-rdma-rt.yaml)
+command:
+  - python3
+  - -m
+  - sglang.launch_server
+  - --tp-size
+  - $(PARALLELISM_SIZE)    # Kubernetes expands this from the injected env var
+```
+
+### How the Value is Computed
+
+```
+PARALLELISM_SIZE = <GPUs per pod> × (1 + worker.size)
+```
+
+- **GPUs per pod** is read from the runner container's resources after the runtime's and AcceleratorClass's resource defaults have been merged. OME walks the operator-configured accelerator resource names (the `acceleratorResources` key of the `inferenceservice-config` ConfigMap, a JSON list such as `["nvidia.com/gpu", "amd.com/gpu"]`) in order and uses the first name present on the container, checking `limits` before `requests`. When `acceleratorResources` is not configured, only `nvidia.com/gpu` is recognized.
+- **1 + worker.size** counts the leader — or the single pod, outside multi-node mode — plus the worker pods. `worker.size` counts as `0` when no `worker` block is set, so a single-pod service gets `PARALLELISM_SIZE = <GPUs per pod>`.
+
+For the multi-node example above (8 GPUs per pod, `worker.size: 1`), every engine container gets `PARALLELISM_SIZE=16`. The variable is injected into the leader/primary runner and the worker runner separately, each computed from that container's own GPU resources — normally identical, since leader and workers are sized alike.
+
+### When It is Skipped or Overwritten
+
+The injection runs for the Engine and Decoder in **every deployment mode**, whenever the merged component spec has a runner container (the Router serves no model and never gets the variable). Two cases change that:
+
+- **No recognized accelerator resource on the container** — the variable is not injected at all. An argument referencing `$(PARALLELISM_SIZE)` then keeps the literal string, so a runtime that uses the variable must actually end up with GPU resources on its runner (see [Accelerator Selection](#accelerator-selection)).
+- **The runtime's matched `supportedModelFormats` entry has an `acceleratorConfig` for the selected AcceleratorClass with a `tensorParallelismOverride`** — the override owns the parallelism flags (OME rewrites the tensor/pipeline-parallel flags such as `--tp-size`/`--tensor-parallel-size` in the args directly) and skips the `PARALLELISM_SIZE` computation for that component. See [Per-Accelerator Model Configuration](/ome/docs/concepts/serving_runtime/#per-accelerator-model-configuration).
+
+When the computation does run, it **overwrites** any `PARALLELISM_SIZE` already present in the runner's environment, including values you set in `runner.env`. To pin a different parallelism degree, put the literal value in the runtime's arguments or use a `tensorParallelismOverride` — don't set the env var.
+
 ## Accelerator Selection
 
 OME can select the accelerator (GPU class) for an InferenceService declaratively instead of requiring hard-coded `nodeSelector` and resource values. Selection is configured through `spec.acceleratorSelector` and can be overridden per component.
