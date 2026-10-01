@@ -132,7 +132,7 @@ Before you gate a step on a query, run it in Prometheus with real label values, 
 
 ## When queries run
 
-An analysis starts once the step's new instances are ready. It waits `initialDelay`, then samples every `interval`. If the step returns to `Pending` because it lost instances, the warm-up and the bake start over.
+An analysis starts once the step's new instances are ready. It waits `initialDelay`, then samples every `interval`. While the step's gate still waits, a drop below its capacity requirement stops sampling until recovery, but the warm-up and bake clocks keep their original anchors. The separate [capacity timeout](canary-progression.md#readytimeout) bounds that wait.
 
 Each query is an instant query at the time of the sample, so `[5m]` covers the 5 minutes before it. Until the new pods have served requests in that range, a query can return no data, and `initialDelay` gives them that time. The bundled Prometheus can drop data older than 30 minutes by default (`prometheus.retention`), so keep ranges within 30 minutes.
 
@@ -164,7 +164,7 @@ With `Rollback`, a Prometheus outage, a missing token Secret or a `no data` resu
 
 The analysis stalls when its samples stay inconclusive for longer than the canary's [ready timeout](canary-progression.md#readytimeout), 15 minutes with the chart's defaults.
 
-A `Failed` canary stays at its step, even after you fix the metrics source, and `promote --override-analysis` refuses there. A new revision doesn't start a fresh canary either, which is a known bug. Roll the canary back with the alpha `kubectl ome rollout rollback`, then apply your fix, as [When a step never becomes ready](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#when-a-step-never-becomes-ready) shows.
+A `Failed` canary stays at its step, even after you fix the metrics source, and `promote --override-analysis` refuses there. A new target revision starts a fresh canary. You can also roll back with the alpha `kubectl ome rollout rollback`, or fix the metrics source and explicitly [retry the same revision](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#retry-the-same-revision). Every gate runs again on a retry.
 
 ## Analysis in status
 
@@ -179,6 +179,8 @@ OME records the analysis in `status.components.<component>.canary`, where `<comp
 | `lastConclusiveEvaluationTime` | When the last pass or fail at this step finished. |
 | `metricResults` | One entry per metric of the last judged sample. |
 | `rolledBackRevisionHash` | The revision that a rollback rejected, by the analysis or by hand. |
+| `capacityWaitSince` | When the current capacity wait began; cleared on recovery without restarting the warm-up or bake. |
+| `failed.reason` / `failed.time` | Why and when the canary parked. An inconclusive analysis with `Hold` records `AnalysisStalled`. See [Failure status](canary-progression.md#readytimeout). |
 
 Each entry of `metricResults` holds the metric's `name`, `threshold` and `operator`, its worst `value`, whether it `passed`, and the `time` of the sample. An inconclusive metric has `passed: false`, no `value`, and a `message` with its cause:
 

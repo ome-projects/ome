@@ -130,10 +130,10 @@ A step starts by moving its capacity to the new revision, and waits in `Pending`
 | --- | --- | --- |
 | Immediate | Only `capacity` and `traffic` | Its new Instances are ready. |
 | Timed | `pause` with a `duration` | The duration has passed since its new Instances were ready. |
-| Manual | `pause: {}` | You promote it with `kubectl ome rollout promote`. |
+| Manual | `pause: {}` | You request promotion with `kubectl ome rollout promote`, subject to the [final-step limitation](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#final-step-promotion). |
 | Analysis | `analysis` | Its metric checks pass, after the optional `initialDelay` and no sooner than the step's `pause.duration`. See [Canary metric analysis](canary-analysis.md). |
 
-GATE in `kubectl ome rollout status` shows these names. If a step's ready Instances drop below its count, the step goes back to `Pending`, and its clock starts again once its new Instances are ready. At the last step, the gate holds the canary in `Promoting` until it passes.
+GATE in `kubectl ome rollout status` shows these names. If a serving step's ready Instances drop below its count, the step keeps its phase and recorded traffic while it waits for capacity to recover. Its warm-up and bake clocks keep running. A separate capacity-wait clock bounds the outage, as [`readyTimeout`](#readytimeout) describes. At the last step, a gate holds the canary in `Paused`; after it passes, `Promoting` waits for any remaining `scaleDownDelaySeconds`.
 
 ## Phases
 
@@ -143,10 +143,10 @@ The canary's phase is in `status.components.<component>.rolloutPhase` of the gro
 | --- | --- |
 | `Pending` | The step waits for its new Instances to be ready. |
 | `Canarying` | The step's new Instances are ready, and OME checks its gate. |
-| `Paused` | The canary waits at a gate before the last step, or holds after a [repin](../kubectl-ome/rollout.md#repin). |
-| `Promoting` | The last step's new Instances are ready, and the canary waits for its gate and for [`scaleDownDelaySeconds`](#fields). |
+| `Paused` | The canary waits at a gate, including the last step, or holds after a [repin](../kubectl-ome/rollout.md#repin). |
+| `Promoting` | The last step's gate has passed, and the canary waits for any remaining [`scaleDownDelaySeconds`](#fields). |
 | `Stable` | The canary completed. |
-| `Failed` | A step ran past its [ready timeout](#readytimeout). |
+| `Failed` | Capacity or analysis ran past its [ready timeout](#readytimeout), or a rollback couldn't find the stable revision. The canary records the cause in `canary.failed.reason`. |
 | `RollingBack` | A rollback is moving Instances back to the stable revision. |
 | `RolledBack` | Every Instance is back on the stable revision. |
 
@@ -154,7 +154,7 @@ The canary's phase is in `status.components.<component>.rolloutPhase` of the gro
 
 | When | The canary |
 | --- | --- |
-| A change gives the group a newer revision | Starts again at step 1 with the newest revision, and keeps the same stable revision. A `Failed` canary stays `Failed`: see [`readyTimeout`](#readytimeout). |
+| A change gives the group a newer revision | Starts again at step 1 with the newest revision, and keeps the same stable revision. This also clears a `Failed` hold. |
 | You pause the rollout | Holds its step, but its clocks keep running, so it can advance or fail as soon as you resume. See [Pause and resume a rollout](../../guides/roll-out-changes/pause-and-resume-a-rollout.md). |
 | You run the alpha `kubectl ome rollout rollback`, or [its analysis](canary-analysis.md#how-a-sample-is-judged) rolls it back | Records 0% for the new revision at once, and moves every Instance back to the stable revision. The component stays on the stable revision until a change produces a revision other than those two. See [Roll back the canary](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#roll-back-the-canary). |
 | A step runs past its [ready timeout](#readytimeout) | Goes to `Failed`. A stalled analysis with `onInconclusive: RollbackOnStall` rolls it back instead. |
@@ -175,7 +175,7 @@ When a step's new Instances are ready, OME records the step's `traffic` as the n
 
 ## `readyTimeout`
 
-The ready timeout bounds how long a step waits in `Pending` for its new Instances, and how long an analysis step goes without a conclusive result. The first of these that's set applies:
+The ready timeout bounds how long a step's capacity gate stays unmet, including a loss of capacity after the step starts serving, and how long an analysis step goes without a conclusive result. The first of these that's set applies:
 
 | Order | Setting | Notes |
 | --- | --- | --- |
@@ -183,9 +183,16 @@ The ready timeout bounds how long a step waits in `Pending` for its new Instance
 | 2 | `readyTimeout` in the group's `canary` | Above zero. |
 | 3 | `defaultReadyTimeout` in the `rollout` block of the `inferenceservice-config` ConfigMap | `15m` with the ome-resources chart (`ome.controller.rollout.defaultReadyTimeout`). The kustomize manifests don't set it. |
 
-With none set, the canary never fails: a step waits in `Pending` until its Instances are ready. The timeout counts from when the step last entered `Pending`. For an analysis, it counts from the last conclusive sample, or from when the step's new Instances were ready if there's none yet.
+With none set, capacity waits and inconclusive analysis have no timeout. The capacity timeout counts from `status.components.<component>.canary.capacityWaitSince`, set when the current capacity wait starts and cleared once capacity is met. A later dip starts a fresh capacity budget without restarting the step's warm-up or bake. For an analysis, the timeout counts from the last conclusive sample, or from when the step's new Instances were ready if there's none yet.
 
-When it expires, the phase is `Failed`. The canary keeps its Instances and its recorded traffic, the stable Instances keep serving, and `promote` refuses. A new change leaves a failed canary at `Failed`, so [roll it back](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#roll-back-the-canary) first, then apply the fix, as [When a step never becomes ready](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#when-a-step-never-becomes-ready) shows. This is a known bug.
+When the capacity timeout expires, the phase is `Failed`. The canary keeps its Instances and recorded traffic, and `promote` refuses. A stalled analysis with `onInconclusive: Hold` also parks in `Failed`; `RollbackOnStall` rolls back instead. Recover by applying a fix that produces a new target revision, [rolling back](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#roll-back-the-canary), or explicitly [retrying the same revision](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#retry-the-same-revision) after fixing the cause. Capacity or metrics recovery alone doesn't clear a failed hold.
+
+The failure is recorded in `status.components.<component>.canary.failed`:
+
+| Field | What it records |
+| --- | --- |
+| `reason` | `CapacityTimeout`, `AnalysisStalled`, or `StableRevisionMissing` when a rollback can't find its retained stable ControllerRevision. |
+| `time` | When the canary entered the failed hold. It stays unchanged while the hold remains. |
 
 ## What admission rejects
 

@@ -28,6 +28,7 @@ export const nav: NavSection[] = [
 					'deploy-models/deploy-an-inferenceservice.md',
 					'deploy-models/reference-a-runtime-explicitly.md',
 					'deploy-models/troubleshoot-runtime-selection.md',
+					'deploy-models/stage-model-weights.md',
 					'deploy-models/serve-models-from-pvc.md',
 					'deploy-models/serve-models-from-local-storage.md',
 					'deploy-models/select-accelerators.md',
@@ -38,6 +39,9 @@ export const nav: NavSection[] = [
 			{
 				label: 'OMENative',
 				pages: [
+					'omenative/learn-omenative.md',
+					'omenative/recover-a-failed-http-workload.md',
+					'omenative/run-a-standalone-replica.md',
 					'omenative/serve-a-model-on-omenative.md',
 					'omenative/serve-a-multi-node-model.md',
 					'omenative/serve-a-prefill-decode-model.md',
@@ -94,6 +98,7 @@ export const nav: NavSection[] = [
 				label: 'Multi-cluster',
 				preview: true,
 				pages: [
+					'multi-cluster/register-a-workload-cluster.md',
 					'multi-cluster/publish-a-global-endpoint.md',
 					'multi-cluster/routing-health-probes.md',
 					'multi-cluster/drain-a-workload-cluster.md',
@@ -105,6 +110,7 @@ export const nav: NavSection[] = [
 				label: 'Operate OME',
 				pages: [
 					'operate-ome/configure-the-controller.md',
+					'operate-ome/configure-pod-batching.md',
 					'operate-ome/set-replica-defaults.md',
 					'operate-ome/model-agent.md',
 					'operate-ome/configure-model-artifact-retention.md',

@@ -1,0 +1,28 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: registration-smoke
+  namespace: ome-registration-lab
+spec:
+  deploymentMode: OMENative
+  runtime:
+    apiGroup: ome.io
+    kind: ServingRuntime
+    name: registration-http
+  engine:
+    minReplicas: 1
+    maxReplicas: 1
+    autoscaler:
+      class: None
+    lifecycle:
+      minReadySeconds: 5
+  placement:
+    policy: ClusterAffinity
+    mode: Single
+    maxSurge: 1
+    clusterAffinity:
+      - matchFields:
+          - key: metadata.name
+            operator: In
+            values:
+              - worker-a

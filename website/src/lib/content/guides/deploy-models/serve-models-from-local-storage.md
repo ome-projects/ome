@@ -28,6 +28,8 @@ Set `storage.path` to the same directory. The agent checks the directory in `pat
 
 Copy the model's files into the same directory on each node that should serve the model. Use your own tools, such as your node image or a copy job. Put `config.json` and the weight files at the top of the directory, because the runtime loads them from there. By default, the agent sees only the host directory in `modelAgent.hostPath`, `/mnt/data/models`, so the steps use `/mnt/data/models/llama-3-2-1b-instruct` on `gpu-node-1` and `gpu-node-2`. For another directory, see [Use another directory](#use-another-directory).
 
+For an OME-managed download onto the nodes, use an `hf://` or `oci://` model with [the model agent](../operate-ome/model-agent.md) instead. To prepare one shared PVC copy, follow [Stage model weights](stage-model-weights.md). Its `ome-agent replica` command supports PVC and OCI destinations, not `local://`; it doesn't populate every node's disk.
+
 Check that the agent on each node sees the files:
 
 ```bash

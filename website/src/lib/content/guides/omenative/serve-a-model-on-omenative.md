@@ -10,12 +10,14 @@ An engine or decoder with a `leader` or `worker` runs on OMENative by default, a
 
 <div class="prerequisites" markdown>
 
-- OME v1.3 or later, installed with the `ome-resources` chart, and `kubectl`, with the rights to create namespaces and InferenceServices. See [Install OME](../../getting-started/install.md).
+- OME built from the v1.3 development source, with matching controller, CRDs and charts, and `kubectl`, with the rights to create namespaces and InferenceServices. Follow [Install from source](../../getting-started/install.md#install-from-source) with the model agent enabled. The pinned v1.2.2 installation does not support OMENative.
 - The ClusterBaseModel `qwen3-0-6b` in the `Ready` state, and the ClusterServingRuntime `srt-qwen3-0-6b`, both from [Serve your first model](../../getting-started/serve-your-first-model.md). Check with `kubectl get clusterbasemodel qwen3-0-6b` and `kubectl get clusterservingruntime srt-qwen3-0-6b`.
 - A node where the model is `Ready`, with a free NVIDIA GPU, 10 CPUs and 30 GiB of memory for the engine pod. If the InferenceService from Serve your first model still holds the GPU, delete it with `kubectl delete inferenceservice qwen3-0-6b -n qwen3-0-6b`, and keep the model and the runtime.
 - The [kubectl ome](../../reference/kubectl-ome/overview.md) plugin, for Step 3.
 
 </div>
+
+The default update strategy needs capacity for a replacement Instance before retiring the old one: for this runtime, another GPU, 10 CPUs and 30 GiB. A first deployment can fit on one GPU, but a later update may wait for capacity. See [update strategies](../../concepts/architecture/omenative-update-strategies.md) before updating a capacity-constrained service. To practice scale and updates without GPUs, use the [HTTP workload lab](learn-omenative.md).
 
 ## Step 1: Create the InferenceService
 

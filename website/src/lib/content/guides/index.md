@@ -13,7 +13,7 @@ Start with the smallest InferenceService, then add what you need: a runtime you 
 
 -   **[Deploy an InferenceService](deploy-models/deploy-an-inferenceservice.md)**
 
-    Write the smallest InferenceService that serves a model, with only a model, a model and a runtime, or only a runtime, then wait for it, send it a request and see what OME created.
+    Create a complete runtime-managed Qwen deployment, wait for readiness, and send a chat request without a BaseModel or model agent. Requires a v1.3 development build.
 
 -   **[Reference a runtime explicitly](deploy-models/reference-a-runtime-explicitly.md)**
 
@@ -26,6 +26,10 @@ Start with the smallest InferenceService, then add what you need: a runtime you 
 -   **[Serve models from a PVC](deploy-models/serve-models-from-pvc.md)**
 
     Serve model weights that already live on a PersistentVolumeClaim by pointing a BaseModel at a pvc:// URI, with no download to nodes.
+
+-   **[Stage model weights](deploy-models/stage-model-weights.md)**
+
+    Start with an empty shared PVC: copy weights with an ome-agent Job, confirm completion, register a BaseModel and serve it.
 
 -   **[Serve models from node-local storage](deploy-models/serve-models-from-local-storage.md)**
 
@@ -50,6 +54,18 @@ Start with the smallest InferenceService, then add what you need: a runtime you 
 [OMENative](../concepts/omenative/overview.md) runs each replica as an Instance, one pod or a leader and its workers, that OME creates, updates, repairs, moves and removes as one unit.
 
 <div class="grid cards" markdown>
+
+-   **[Learn OMENative with an HTTP workload](omenative/learn-omenative.md)**
+
+    Run a CPU-only lab through a request, scale and template update. Learn Instance ownership and readiness without model downloads or GPUs.
+
+-   **[Run a standalone InferenceReplica](omenative/run-a-standalone-replica.md)**
+
+    Own the pod set directly, supply its HTTP Service, scale and update it, then try a live runtime reference in place of inline templates.
+
+-   **[Recover a failed HTTP workload](omenative/recover-a-failed-http-workload.md)**
+
+    Break the CPU lab's readiness probe, freeze for inspection, and publish a corrected revision. Distinguish template correction, reset and held-revision release.
 
 -   **[Serve a model on OMENative](omenative/serve-a-model-on-omenative.md)**
 
@@ -205,9 +221,13 @@ The OME scheduler and Alfred are alpha. Their configuration and behavior can cha
 
 ## Multi-cluster
 
-Multi-cluster placement and routing are alpha, still in development, and off by default. Fields and behavior can change between releases. [Turn on routing](../concepts/rollouts-and-traffic/traffic-map.md#turn-on-routing) before you follow these guides.
+Multi-cluster placement and routing are alpha, still in development, and off by default. Start with registration and a placement check; [turn on routing](../concepts/rollouts-and-traffic/traffic-map.md#turn-on-routing) only when you add a global endpoint. Fields and behavior can change between releases.
 
 <div class="grid cards" markdown>
+
+-   **[Register a workload cluster](multi-cluster/register-a-workload-cluster.md)**
+
+    Install distinct control-plane and member profiles, provision a dedicated credential, register the member, and check one CPU workload's placement and response.
 
 -   **[Publish a global endpoint](multi-cluster/publish-a-global-endpoint.md)**
 
@@ -238,6 +258,10 @@ Multi-cluster placement and routing are alpha, still in development, and off by 
 -   **[Configure the controller](operate-ome/configure-the-controller.md)**
 
     Tune the OME controller manager's command-line flags, including reconcile concurrency, leader election and runtime-revision garbage collection.
+
+-   **[Configure pod batching](operate-ome/configure-pod-batching.md)**
+
+    Pace OMENative scale-up and scale-down work to reduce bursts of API requests while keeping each Instance's pods in the same batch.
 
 -   **[Set replica defaults](operate-ome/set-replica-defaults.md)**
 

@@ -1,0 +1,15 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen3
+  namespace: qwen-demo
+spec:
+  deploymentMode: OMENative
+  runtime:
+    name: sglang-qwen3
+    kind: ServingRuntime
+  engine:
+    minReplicas: 1
+    maxReplicas: 1
+    autoscaler:
+      class: None

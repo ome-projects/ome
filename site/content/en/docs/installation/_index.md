@@ -27,8 +27,12 @@ description: >
 OME supports multiple deployment modes to enable `InferenceService` deployment with Kubernetes resources:
 
 - **`RawDeployment`** (Default): Uses standard Kubernetes Deployment, Service, Ingress and HorizontalPodAutoscaler. Supports mounting multiple volumes but does not support scale to/from zero. Optionally supports custom metrics scaling with KEDA and Prometheus.
-- **`MultiNode`**: Enables multi-node deployment for models that require distributed computing. **Requires: LeaderWorkerSet (LWS)**.
-- **`PDDisaggregated`**: Enables prefill-decode disaggregated deployment for models that require most optimal performance. **Requires: LeaderWorkerSet (LWS) for larger models that require distributed computing**.
+- **`OMENative`** (development, since v1.3): OME manages serving pods through InferenceReplicas. Supports single-node and multi-node workloads without LeaderWorkerSet.
+- **`MultiNode`** (deprecated on `main`): Enables multi-node deployment for models that require distributed computing. **Requires: LeaderWorkerSet (LWS)**.
+
+Prefill-decode disaggregation is a workload topology, not a `deploymentMode`
+value. On development builds, use OMENative for its engine and decoder;
+multi-node workloads on v1.2.2 require LeaderWorkerSet.
 
 ### Required Components
 
@@ -124,19 +128,10 @@ Please refer to [Kueue installation guide](https://kueue.sigs.k8s.io/docs/instal
 
 ### 7. Clone OME repository
 
-The Go tools require that you clone the repository to the
-`src/sigs.k8s.io/ome` directory in your
-[`GOPATH`](https://github.com/golang/go/wiki/SettingGOPATH).
-
-To check out this repository:
-
-1. Create your own
-   [clone this repo](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository)
-1. Clone it to your machine:
+Clone the repository into a directory of your choice; it does not need to be
+under `GOPATH`:
 
 ```shell
-mkdir -p ${GOPATH}/src/github.com/ome-projects
-cd ${GOPATH}/src/github.com/ome-projects
 git clone https://github.com/ome-projects/ome.git
 cd ome
 ```
@@ -147,23 +142,129 @@ described below.
 
 ## Install the latest development version
 
-To install the latest development version of OME in your cluster, run the
-following command:
+Development features marked since v1.3 require a source build from `main`.
+Use images, CRDs and Helm charts from the same checkout: `make install` alone
+does not build a new controller image, and the source charts still default to
+v1.2.2 images. Use a disposable development cluster, because OME installs
+cluster-wide CRDs and admission webhooks. An existing installation needs an
+upgrade review and its existing values, not the small lab profile below.
+
+The stock image targets need Docker, Go 1.26 or newer and a local development
+toolchain. Install Rust with Cargo, a C/C++ compiler, `pkg-config` and your
+platform's OpenSSL development libraries. The targets run local `fmt` and
+`vet`; prepare Xet before building. All three Dockerfiles also build Xet in
+their build stage.
+
+From a clean checkout, choose a registry your nodes can pull from and a platform
+matching those nodes (`linux/arm64` for an ARM64 lab):
 
 ```shell
-make install
+OME_SOURCE_TAG="src-$(git rev-parse HEAD)"
+OME_IMAGE_REGISTRY=registry.example.com/ome
+OME_IMAGE_PLATFORM=linux/amd64
+
+make xet-build
+make push-manager-image \
+  REGISTRY="$OME_IMAGE_REGISTRY" TAG="$OME_SOURCE_TAG" ARCH="$OME_IMAGE_PLATFORM"
 ```
 
-The controller runs in the `ome` namespace.
+Treat the commit-derived tag as immutable. Changed source needs a new commit
+and tag; reusing a tag can leave old images cached on nodes. Inspect `git diff`
+after the build, since the Make targets can format source files.
+
+Install cert-manager first. On current `main`, RawDeployment and MultiNode also
+require the PodMonitor CRD, even if bundled Prometheus is disabled. If you do
+not already have it through Prometheus Operator, install it before OME:
+
+```shell
+kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.79.2/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
+```
+
+An OMENative-only CPU lab can omit that CRD: OME skips OMENative PodMonitors
+when the API is absent. Restart an existing controller after installing a new
+optional CRD so that it discovers the API.
+
+For a runtime that fetches its own weights, or a CPU-only OMENative lab,
+deploy only the manager image. Save this as `source-values.yaml`. The single
+replica and resource settings are for a small lab, not production or high
+availability:
+
+```yaml
+ome:
+  controller:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+modelAgent:
+  enabled: false
+prometheus:
+  enabled: false
+```
+
+Install both charts into `ome`, where the webhook CA annotations expect their
+certificate. Set every OME image tag explicitly, including the optional agents:
+
+```shell
+helm upgrade --install ome-crd ./charts/ome-crd --namespace ome --create-namespace
+helm upgrade --install ome ./charts/ome-resources \
+  --namespace ome -f source-values.yaml \
+  --set-string global.hub="$OME_IMAGE_REGISTRY" \
+  --set-string ome.controller.tag="$OME_SOURCE_TAG" \
+  --set-string ome.omeAgent.tag="$OME_SOURCE_TAG" \
+  --set-string modelAgent.image.tag="$OME_SOURCE_TAG"
+```
+
+On Helm 4, add `--server-side=false` to the `ome-resources` command to avoid
+server-side apply conflicts with cert-manager's webhook CA updates. Keep these
+values and image overrides on each upgrade. For a new source revision, rebuild
+the images you use and upgrade `ome-crd` before `ome-resources`.
+
+If admission of the chart's default runtime races webhook startup, check that
+`certificate/serving-cert` and `deployment/ome-controller-manager` exist in
+`ome`. Wait for the certificate to be Ready and the Deployment to finish its
+rollout, then retry the same Helm command. Persistent failures require checking
+the certificate events, controller logs and CA injection; a first-install
+webhook failure is not guaranteed.
+
+Wait for the manager and check its image:
+
+```shell
+kubectl rollout status deployment/ome-controller-manager -n ome --timeout=5m
+kubectl get deployment ome-controller-manager -n ome \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}{"\n"}'
+```
+
+For node-local managed BaseModel/ClusterBaseModel weights, also build and push
+`model-agent` with `make push-model-agent-image` and the same `REGISTRY`, `TAG`
+and `ARCH`. Enable `modelAgent.enabled` and size its resources and host path
+before repeating the Helm command. Its defaults request 10 CPUs and 100 GiB
+per node; do not enable them unchanged on a small lab.
+
+For a model registered from an already-populated PVC, build and push
+`ome-agent` with `make push-ome-agent-image` and the same image settings. OME
+uses it for the metadata Job; the model-agent DaemonSet can stay disabled.
+That image target also invokes the host Xet build. Encrypted models and other
+agent-backed operations may need this image as well. Runtime-managed downloads
+with no model resource need neither agent.
 
 
 ### Uninstall
 
-To uninstall OME, run the following command:
+Delete your OME workloads and models while their controllers are still running,
+and wait for their finalizers to clear. Uninstall the resources chart before
+the CRD chart:
 
 ```shell
-make uninstall
+helm uninstall ome -n ome
+helm uninstall ome-crd -n ome
 ```
+
+Uninstalling `ome-crd` deletes OME's CRDs and every remaining OME object.
 
 ## Move a manifest install to the Helm charts
 

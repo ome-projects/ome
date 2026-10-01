@@ -5,7 +5,7 @@ description: Install cert-manager, then the ome-crd and ome-resources Helm chart
 
 Install OME with Helm, and check that the OME controller and the optional [model agent](../guides/operate-ome/model-agent.md) are running. First you install cert-manager, which issues the certificate for OME's admission webhooks. Then you install two OME charts: `ome-crd` adds OME's custom resources, and `ome-resources` runs the controller and, when you turn it on, the model agent. [How OME works](../concepts/architecture/how-ome-works.md) explains each component.
 
-The commands install v1.2.2, the latest release. The features marked Since v1.3, such as [OMENative](../concepts/omenative/overview.md), [Alfred](../concepts/scheduling/alfred.md) and the [OME scheduler](../concepts/scheduling/ome-scheduler.md), are in `main` but not yet in a release. To use them now, [install from source](#install-from-source).
+The release commands below are pinned to v1.2.2; check the [releases](https://github.com/ome-projects/ome/releases) when choosing a version. This documentation also covers development features marked Since v1.3, such as [OMENative](../concepts/omenative/overview.md), [Alfred](../concepts/scheduling/alfred.md) and the [OME scheduler](../concepts/scheduling/ome-scheduler.md). Use the separate [source installation](#install-from-source) for those guides, with images, CRDs and charts from the same checkout. Installing the v1.2.2 release does not enable them.
 
 <div class="prerequisites" markdown>
 
@@ -57,6 +57,8 @@ customresourcedefinition.apiextensions.k8s.io/podmonitors.monitoring.coreos.com 
 ```
 
 The controller looks for the CRD only when it starts. If OME is already running, restart it with `kubectl rollout restart deployment/ome-controller-manager -n ome`.
+
+An OMENative-only installation can omit the PodMonitor CRD: OMENative skips creating PodMonitors when that API is absent. The [CPU-only OMENative lab](../guides/omenative/learn-omenative.md) uses this smaller setup. Turning off the chart's bundled Prometheus does not remove RawDeployment's PodMonitor requirement.
 
 ## Step 2: Install the CRDs
 
@@ -126,7 +128,7 @@ Install the chart as the release `ome`, with the values file:
       -f values.yaml
     ```
 
-Helm installs the release and reports its status as `deployed`. Since v1.3, the first install fails with [a webhook error](#the-first-install-fails-with-a-webhook-error): wait, then run the command again.
+Helm installs the release and reports its status as `deployed`. On a source install, admission of the chart's default runtime can race webhook startup. If that happens, follow [the webhook troubleshooting steps](#the-first-install-fails-with-a-webhook-error).
 
 Pass the same values file to every upgrade: `helm upgrade -f` sets every value that isn't in the file back to the chart's default.
 
@@ -193,46 +195,71 @@ The `ome-scheduler`, `ome-alfred` and `ome-quota-manager` charts need images tha
 
 ## Install from source
 
-To run a build of `main`, with the features marked Since v1.3, build and push OME's three images from a checkout, then install the charts from it. The build needs Docker and Go, and the OME agent image also needs a Rust toolchain: see [Set up a development environment](../contributing/development-setup.md#before-you-begin). From the checkout, run:
+This is the development path for `main` and the features marked Since v1.3. It is separate from the pinned v1.2.2 installation above: use the controller image and both Helm charts from the **same source checkout**. Source charts still default to v1.2.2 images, so installing a local chart without image overrides does not install a source build.
+
+Use a disposable development cluster for these steps. The charts install cluster-wide CRDs and admission webhooks. Before upgrading an existing installation, preserve its values and review the API and configuration changes between your old and new commits; the small lab profile below is not an upgrade profile for an existing deployment.
+
+### Build the controller image
+
+Start from a clean checkout of the source commit you want to run. Install Docker, Go 1.26 or newer, a C/C++ toolchain, `pkg-config`, the platform's OpenSSL development libraries and Rust with Cargo, as in [Set up a development environment](../contributing/development-setup.md#before-you-begin). Authenticate to a container registry that your cluster can pull from.
+
+The stock image targets run `make fmt` and `make vet` on the host before building. Prepare the local Xet library first; all three Dockerfiles also build Xet inside their build stage. A manager-only installation needs only the manager image, but these stock build commands are not a Rust-free build path.
 
 ```bash
-make push-manager-image push-model-agent-image push-ome-agent-image REGISTRY=registry.example.com/ome TAG=dev
+OME_SOURCE_TAG="src-$(git rev-parse HEAD)"
+OME_IMAGE_REGISTRY=registry.example.com/ome
+OME_IMAGE_PLATFORM=linux/amd64
+
+make xet-build
+make push-manager-image \
+  REGISTRY="$OME_IMAGE_REGISTRY" TAG="$OME_SOURCE_TAG" ARCH="$OME_IMAGE_PLATFORM"
 ```
 
-The command builds the images for `linux/amd64`, and pushes `ome-manager`, `model-agent` and `ome-agent` to `registry.example.com/ome` with the tag `dev`. Set `ARCH` for another platform.
+Replace the registry and choose the platform of your Kubernetes nodes, for example `linux/arm64` for an ARM64 lab. The command builds and pushes `ome-manager` with the full source commit in its tag. Treat that tag as immutable: changed source needs a new commit and tag, not a replacement image under the old tag. The controller uses `IfNotPresent`, so reusing a mutable tag can leave old images on nodes. Check `git diff` after the build, because the Make targets can format source files; if build inputs changed, commit them and rebuild with the new tag.
 
-Install cert-manager and the PodMonitor CRD as in [Step 1](#step-1-install-cert-manager), then the CRDs from `charts/ome-crd`:
+### Install a manager-only profile
+
+This profile is enough when a serving runtime downloads its own weights, as in [Deploy an InferenceService](../guides/deploy-models/deploy-an-inferenceservice.md), or for the [CPU-only OMENative lab](../guides/omenative/learn-omenative.md). Neither needs the model-agent DaemonSet or an OME-agent image. The controller does not need a GPU; the model-serving workload may still need one.
+
+Install cert-manager as in [Step 1](#step-1-install-cert-manager). Also install the PodMonitor CRD if you will use RawDeployment or MultiNode; an OMENative-only lab can omit it. Then install the CRDs from this checkout:
 
 ```bash
 helm upgrade --install ome-crd ./charts/ome-crd --namespace ome --create-namespace
 ```
 
-Helm installs the release and reports its status as `deployed`.
+Save this manager-only profile. Its single replica and reduced resource requests are for a small lab, not high availability or a production sizing recommendation:
 
-Point the `ome-resources` chart at your images in `values.yaml`:
-
-```yaml title="values.yaml"
-global:
-  hub: registry.example.com/ome
+```yaml title="source-values.yaml"
 ome:
   controller:
-    tag: dev
-  omeAgent:
-    tag: dev
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
 modelAgent:
-  enabled: true
-  image:
-    tag: dev
+  enabled: false
+prometheus:
+  enabled: false
 ```
 
-Then install OME from `charts/ome-resources`:
+This also leaves out bundled Prometheus. Metrics-driven autoscaling and canary analysis need a suitable metrics backend when you add those features.
+
+Install OME from the same checkout, setting all three OME image tags explicitly. The optional agents will use the matching tag if you enable them later:
 
 === "Helm 4"
 
     ```bash
     helm upgrade --install ome ./charts/ome-resources \
       --namespace ome \
-      -f values.yaml \
+      -f source-values.yaml \
+      --set-string global.hub="$OME_IMAGE_REGISTRY" \
+      --set-string ome.controller.tag="$OME_SOURCE_TAG" \
+      --set-string ome.omeAgent.tag="$OME_SOURCE_TAG" \
+      --set-string modelAgent.image.tag="$OME_SOURCE_TAG" \
       --server-side=false
     ```
 
@@ -241,17 +268,52 @@ Then install OME from `charts/ome-resources`:
     ```bash
     helm upgrade --install ome ./charts/ome-resources \
       --namespace ome \
-      -f values.yaml
+      -f source-values.yaml \
+      --set-string global.hub="$OME_IMAGE_REGISTRY" \
+      --set-string ome.controller.tag="$OME_SOURCE_TAG" \
+      --set-string ome.omeAgent.tag="$OME_SOURCE_TAG" \
+      --set-string modelAgent.image.tag="$OME_SOURCE_TAG"
     ```
 
-The first install fails, because the webhook certificate isn't ready yet:
+Keep the values file, source commit, registry and tag together, and pass the same image overrides on every upgrade. For a new source revision, rebuild the images you use under its new tag, upgrade `ome-crd` first, then `ome-resources`. Do not mix a newer controller with older CRDs, or the source charts with a v1.2.2 controller.
 
-```output
-Release "ome" does not exist. Installing it now.
-Error: Internal error occurred: failed calling webhook "clusterservingruntime.ome-webhook-server.validator": could not get REST client: unable to load root certificates: unable to parse bytes as PEM block
+If installation fails while admitting the default runtime, check [webhook startup](#the-first-install-fails-with-a-webhook-error). Otherwise, wait for the controller and check its image:
+
+```bash
+kubectl rollout status deployment/ome-controller-manager -n ome --timeout=5m
+kubectl get deployment ome-controller-manager -n ome \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}{"\n"}'
 ```
 
-Wait, then run the command again, as [The first install fails with a webhook error](#the-first-install-fails-with-a-webhook-error) shows. In `helm list -n ome`, both charts have the version 0.1.0, the placeholder version in a checkout.
+The image must match `$OME_IMAGE_REGISTRY/ome-manager:$OME_SOURCE_TAG`. There is no model-agent DaemonSet to wait for in this profile. In `helm list -n ome`, the local charts have the placeholder version `0.1.0`; use your recorded source commit and the deployed image to identify the build.
+
+### Add managed model weights when needed
+
+Build only the additional images required by your storage path, from the same checkout and with the same tag:
+
+| Storage path | Additional image and chart settings |
+| --- | --- |
+| BaseModel or ClusterBaseModel weights cached on nodes | Build `model-agent`, set `modelAgent.enabled: true`, and choose its node selectors, resource requests and `hostPath`. The model's `storage.path` must be inside that host path. |
+| A model registered from an existing PVC | Build `ome-agent` for the metadata Job. The model-agent DaemonSet can stay disabled. The PVC must already contain the model files. |
+| Runtime-managed downloads, with no model resource | Neither agent is required. Keep the manager-only profile. |
+
+For node-local managed weights:
+
+```bash
+make push-model-agent-image \
+  REGISTRY="$OME_IMAGE_REGISTRY" TAG="$OME_SOURCE_TAG" ARCH="$OME_IMAGE_PLATFORM"
+```
+
+For PVC metadata Jobs or other OME-agent-backed operations:
+
+```bash
+make push-ome-agent-image \
+  REGISTRY="$OME_IMAGE_REGISTRY" TAG="$OME_SOURCE_TAG" ARCH="$OME_IMAGE_PLATFORM"
+```
+
+The OME-agent image target also invokes `make xet-build` on the host. It supplies Jobs and init containers; it is not a DaemonSet that you turn on globally. Encrypted models and other agent-backed operations may need it in addition to the node-local model agent.
+
+For node-local weights, edit `source-values.yaml` to enable and size the model agent, then repeat the Helm command above with all image overrides. Its defaults request 10 CPUs and 100 GiB of memory **per node**, so do not enable it unchanged on a small lab. For PVC-backed weights, the image override already configures the metadata Job without enabling the DaemonSet. Continue with [Stage model weights](../guides/deploy-models/stage-model-weights.md) or [Serve models from a PVC](../guides/deploy-models/serve-models-from-pvc.md).
 
 ## Move a manifest install to the Helm charts
 
@@ -274,13 +336,19 @@ ensure CRDs are installed first]
 
 ### The first install fails with a webhook error {since=v1.3}
 
-The first install of the `ome` release fails, because the webhook certificate isn't ready yet:
+During a first source installation, the chart's default runtime can reach admission before the webhook certificate, its CA bundle or the controller is ready. One possible error is:
 
 ```text
 Error: Internal error occurred: failed calling webhook "clusterservingruntime.ome-webhook-server.validator": could not get REST client: unable to load root certificates: unable to parse bytes as PEM block
 ```
 
-Helm still creates the rest of the release. Wait for the certificate and the controller:
+Check whether Helm created the certificate and controller, and inspect their status:
+
+```bash
+kubectl get certificate/serving-cert deployment/ome-controller-manager -n ome
+```
+
+If they exist, wait for both:
 
 ```bash
 kubectl wait --for=condition=Ready certificate/serving-cert -n ome --timeout=5m
@@ -292,7 +360,7 @@ certificate.cert-manager.io/serving-cert condition met
 deployment "ome-controller-manager" successfully rolled out
 ```
 
-Then run the same `helm upgrade --install` command again. If it fails with the same error, run it once more. If it keeps failing, check that both releases are in the namespace `ome`.
+Then retry the same `helm upgrade --install` command with the same values and image settings. If it still fails, check that both releases are in the namespace `ome`, inspect the certificate's events and the controller's logs, and verify cert-manager's CA injection. If the certificate or Deployment was not created, resolve the earlier Helm error instead of waiting for a missing resource.
 
 ### An upgrade fails with a conflict
 
@@ -364,6 +432,8 @@ cert-manager and the PodMonitor CRD stay installed, since other applications can
 
 ## Next steps
 
+- [Deploy an InferenceService](../guides/deploy-models/deploy-an-inferenceservice.md): use a runtime that downloads its own model weights. Requires the source installation.
+- [Learn OMENative on a CPU-only cluster](../guides/omenative/learn-omenative.md): inspect the serving lifecycle without GPUs or model downloads. Requires the source installation.
 - [Serve your first model](serve-your-first-model.md): serve a small model and send it a request.
 - [Pre-configured models and runtimes](pre-configured-models.md): install ready-made models, runtimes and InferenceServices from OME's catalog.
 - [Serve a model on OMENative](../guides/omenative/serve-a-model-on-omenative.md): run a model on OME's own workload controller. Since v1.3.

@@ -1,0 +1,46 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceReplica
+metadata:
+  name: standalone-http
+  namespace: ome-standalone-lab
+spec:
+  component: engine
+  replicas: 1
+  minReadySeconds: 5
+  lifecycle:
+    instanceReadyTimeout: 2m
+    updateStrategy:
+      type: SurgeThenDrain
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 0
+  runners:
+    - name: default
+      size: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: standalone-http
+        spec:
+          terminationGracePeriodSeconds: 10
+          containers:
+            - name: ome-container
+              image: docker.io/hashicorp/http-echo:1.0.0
+              args:
+                - -listen=:8080
+                - -text=hello from standalone v1
+              ports:
+                - name: http
+                  containerPort: 8080
+              readinessProbe:
+                httpGet:
+                  path: /
+                  port: http
+                periodSeconds: 2
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi

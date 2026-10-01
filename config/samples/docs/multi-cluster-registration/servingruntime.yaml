@@ -1,0 +1,29 @@
+apiVersion: ome.io/v1beta1
+kind: ServingRuntime
+metadata:
+  name: registration-http
+  namespace: ome-registration-lab
+spec:
+  engineConfig:
+    terminationGracePeriodSeconds: 10
+    runner:
+      name: ome-container
+      image: docker.io/hashicorp/http-echo:1.0.0
+      args:
+        - -listen=:8080
+        - -text=hello from worker-a
+      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /
+          port: http
+        periodSeconds: 2
+      resources:
+        requests:
+          cpu: 25m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi

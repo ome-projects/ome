@@ -123,7 +123,9 @@ When OME picks the runtime for you, it skips runtimes whose `engineConfig` or `d
 
 ## OMENative {since=v1.3}
 
-For an OMENative component, OME writes an [InferenceReplica](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-InferenceReplica) named `{isvc}-{component}` from the InferenceService, and the InferenceReplica controller creates, updates and replaces the component's Instances. Make your changes in the InferenceService, and get or describe the InferenceReplica, short name `irep`, to see what's happening.
+For an InferenceService's OMENative component, OME writes an [InferenceReplica](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-InferenceReplica) named `{isvc}-{component}` from the InferenceService, and the InferenceReplica controller creates, updates and replaces the component's Instances. Make your changes in the InferenceService, and get or describe the InferenceReplica, short name `irep`, to see what's happening.
+
+You can also author a [standalone InferenceReplica](../omenative/overview.md#standalone-inferencereplicas). It always runs on OMENative and has no InferenceService to select its deployment mode. The names, generated objects and InferenceService status described below refer to the InferenceService-managed form.
 
 ### Instances
 

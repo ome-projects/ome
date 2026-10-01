@@ -3,6 +3,16 @@ title: Getting Started
 description: "Start here if you are new to OME: install the operator, serve your first model, and add pre-configured models and runtimes."
 ---
 
+Choose a first workflow that matches your installation and available hardware:
+
+| Workflow | OME version | What you need |
+| --- | --- | --- |
+| [Model-agent-managed Qwen](serve-your-first-model.md) | Pinned v1.2.2 release | One NVIDIA GPU, model-agent capacity and node-local storage |
+| [Runtime-managed Qwen](../guides/deploy-models/deploy-an-inferenceservice.md) | v1.3 development source | One NVIDIA GPU; no model agent or pre-staged weights |
+| [CPU-only OMENative lab](../guides/omenative/learn-omenative.md) | v1.3 development source | CPU workers; no GPU or model download; HTTP echo, not inference |
+
+For retained model storage, [stage weights onto a PVC](../guides/deploy-models/stage-model-weights.md) before registering and serving them. Do not mix released controllers with development CRDs or manifests.
+
 <div class="grid cards" markdown>
 
 -   **[Introduction](introduction.md)**

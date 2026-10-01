@@ -180,7 +180,10 @@ Details worth knowing per resource:
   over `Ready` so a serving-but-wedged rollout cannot look healthy, and
   `Unavailable` when neither condition exists. The wide `ENCODING` column
   reports the stored status representation — `DenseV1`, `ColumnarV2`,
-  `Unknown` (unmarked) or `Invalid` — not the validity of individual rows.
+  `Unknown` (an unrecognized marker) or `Invalid` (an inconsistent
+  representation) — not the validity of individual rows. An unmarked
+  status without columnar data is read as `DenseV1`. A standalone replica
+  has no InferenceService parent, so its `PARENT` column is `-`.
 - **`workloadclusters`** — `CONNECTION`, `REFERENCE` and `KEY` describe the
   cluster source: `KubeConfig` with its Secret reference and key, or
   `ClusterProfile` with the profile name; an ambiguous or empty source

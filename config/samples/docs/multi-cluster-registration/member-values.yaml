@@ -1,0 +1,10 @@
+ome:
+  multicluster:
+    enabled: false
+    role: ""
+  multiclusterAccess:
+    enabled: true
+    subjects:
+      - kind: ServiceAccount
+        name: ome-placement-lab
+        namespace: ome

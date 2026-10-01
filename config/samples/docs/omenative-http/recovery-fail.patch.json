@@ -1,0 +1,21 @@
+{
+  "spec": {
+    "engine": {
+      "runner": {
+        "name": "ome-container",
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/",
+            "port": 8081
+          }
+        }
+      },
+      "lifecycle": {
+        "instanceReadyTimeout": "30s",
+        "migrationPolicy": {
+          "mode": "Never"
+        }
+      }
+    }
+  }
+}

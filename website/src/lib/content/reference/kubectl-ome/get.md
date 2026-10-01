@@ -17,7 +17,7 @@ Give one RESOURCE from [Resources](#resources), in any letter case, and at most 
 | Resource | Also accepted | Scope | What it lists |
 | --- | --- | --- | --- |
 | `inferenceservices` | `inferenceservice`, `isvc`, `isvcs` | Namespaced | InferenceServices |
-| `inferencereplicas` | `inferencereplica`, `ir` | Namespaced | The InferenceReplicas that OME creates, one for each OMENative component |
+| `inferencereplicas` | `inferencereplica`, `ir` | Namespaced | Projected and user-authored standalone InferenceReplicas |
 | `models` | `model` | Merged | BaseModels, then ClusterBaseModels |
 | `basemodels` | `basemodel`, `bm` | Namespaced | BaseModels |
 | `clusterbasemodels` | `clusterbasemodel`, `cbm` | Cluster | ClusterBaseModels |
@@ -48,6 +48,8 @@ Give one RESOURCE from [Resources](#resources), in any letter case, and at most 
 
 With a NAME, `get` shows the namespaced object, or the cluster-scoped one when there's none. When a BaseModel and a ClusterBaseModel [share a name](../../concepts/models/base-models.md), an InferenceService in the BaseModel's namespace gets the BaseModel too, even when it asks for the ClusterBaseModel. For an InferenceService's runtime, OME looks for the ClusterServingRuntime first, unless the InferenceService sets `spec.runtime.kind: ServingRuntime`. So `get runtimes NAME` can show a different runtime from the one an InferenceService runs, which [`kubectl ome status`](status.md) `-o wide` names.
 
+The named lookup falls back only after `NotFound`. A different error, such as `Forbidden` on the namespaced object, is returned without trying the cluster-scoped one.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -59,6 +61,8 @@ With a NAME, `get` shows the namespaced object, or the cluster-scoped one when t
 Plus the standard kubeconfig flags, such as `-n` and `--context`.
 
 A NAME can't be combined with `-A` or `-l`. For a cluster-scoped resource, `get` ignores `-n`, and ignores `-A` with a warning on stderr. `-o wide` adds the Wide columns in [Output fields](#output-fields), where a resource has any. `-o json` and `-o yaml` print Kubernetes objects, not a report. With a NAME, that's the object; otherwise it's a `List` with `apiVersion: v1`, whose items carry their own `apiVersion` and `kind`.
+
+Listings fetch pages of at most 500 objects until the collection is exhausted; merged views read both collections. If a continuation expires, the CLI discards the partial result and retries the paged read once. A second expiration fails without printing a partial listing. JSON and YAML always use an array for `items`, including `items: []` when no objects match.
 
 ## Output fields
 
@@ -86,12 +90,12 @@ The RolloutPolicy, AutoscalerPolicy and TrafficMap tables hide stale values: a c
 
 ### `inferencereplicas` {#inferencereplicas-columns}
 
-OME writes an InferenceReplica for each OMENative component of an InferenceService. It holds the component's replicas, each one an [Instance](../../concepts/omenative/instances.md): one pod, or a leader and its workers. [`kubectl ome instance`](instance.md) lists the Instances themselves.
+OME writes an InferenceReplica for each OMENative component of an InferenceService; users can also create [standalone replicas](../../guides/omenative/run-a-standalone-replica.md). Both hold [Instances](../../concepts/omenative/instances.md): one pod, or a leader and its workers. [`kubectl ome instance`](instance.md) inspects Instances through an InferenceService; use the standalone replica's own status when it has no parent.
 
 | Column | What it shows |
 | --- | --- |
 | COMPONENT | `spec.component`. |
-| PARENT | `spec.parentRef.name`, the InferenceService. |
+| PARENT | `spec.parentRef.name`, the InferenceService, or `-` for a standalone replica. |
 | DESIRED | `spec.replicas`, the number of Instances the component should run. |
 | CURRENT | `status.replicas`, the number of Instances, in any phase. |
 | READY | `status.readyReplicas`, as [Readiness and availability](../../concepts/omenative/instances.md#readiness-and-availability) defines it. |
@@ -100,7 +104,7 @@ OME writes an InferenceReplica for each OMENative component of an InferenceServi
 | REASON | Wide. The reason of the LIFECYCLE condition. |
 | SERVING | Wide. `status.servingReplicas`. |
 | UPDATED | Wide. `status.updatedReplicas`, the number of Instances on the update revision. |
-| ENCODING | Wide. How the status stores its Instance rows: `ColumnarV2` or `DenseV1`. See [Change the status encoding](../../guides/omenative/change-the-status-encoding.md). |
+| ENCODING | Wide. The stored representation: `ColumnarV2`, `DenseV1`, `Unknown` for an unrecognized marker, or `Invalid` for an inconsistent representation. It does not validate every Instance row. See [Change the status encoding](../../guides/omenative/change-the-status-encoding.md). |
 | CURRENT-REVISION, UPDATE-REVISION | Wide. `status.currentRevision`, which serves traffic, and `status.updateRevision`, which is rolling out. |
 | MIGRATIONS | Wide. The number of entries in `status.migrations`. See [Migration and transient scale](../../concepts/omenative/migration-and-transient-scale.md). |
 | PAUSED | Wide. `spec.paused`: `true` or `false`. |

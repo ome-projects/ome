@@ -9,6 +9,8 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'site/content/**'
+      - 'config/samples/docs/**'
       - 'hack/docs-examples/**'
       - 'hack/docs-drift/**'
       - 'hack/genref/**'
@@ -50,7 +52,7 @@ jobs:
         # Pushes to main are already filtered by on.push.paths. Keep the
         # pattern in step with those paths.
         run: |
-          pattern='^(website/|hack/(docs-examples|docs-drift|genref)/|config/crd/full/|pkg/apis/|go\.(mod|sum)$|Makefile(-deps\.mk)?$|\.github/workflows/website\.yml$)'
+          pattern='^(website/|site/content/|hack/(docs-examples|docs-drift|genref)/|config/(crd/full|samples/docs)/|pkg/apis/|go\.(mod|sum)$|Makefile(-deps\.mk)?$|\.github/workflows/website\.yml$)'
           if [ "$EVENT_NAME" != pull_request ]; then
             website=true
           else

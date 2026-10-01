@@ -1,0 +1,14 @@
+ome:
+  multicluster:
+    enabled: true
+    role: control-plane
+    placementControlPlaneID: registration-lab-hub
+    config:
+      placement:
+        memberOperatorNamespace: ome
+        localQueue: ""
+        capacity: null
+      routing:
+        enabled: false
+  multiclusterAccess:
+    enabled: false

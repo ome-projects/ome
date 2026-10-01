@@ -18,7 +18,7 @@ Two related names are **not** dispatch modes you set per component: `PDDisaggreg
 
 ## What OMENative is
 
-OMENative is OME's native pod-lifecycle engine. Instead of delegating to a Deployment or a LeaderWorkerSet, the InferenceService controller projects each OMENative-mode component onto an **InferenceReplica** — a per-component workload resource (one per InferenceService/component pair) whose spec is written by the InferenceService controller and whose status is written by the InferenceReplica controller:
+OMENative is OME's native pod-lifecycle engine. For each OMENative component of an InferenceService, OME creates an **InferenceReplica** whose spec it keeps in sync with that component. Edit the InferenceService to change these controller-owned replicas. With the chart's controller identity configured, admission rejects direct spec changes from other users. The InferenceReplica controller manages their Instances and writes their status:
 
 ```bash
 kubectl get inferencereplicas        # short name: irep
@@ -31,6 +31,14 @@ The InferenceReplica controller manages pods directly, grouped into **Instances*
 `Pending` → `Creating` → `Ready`, with `Updating`, `Restarting`, `Migrating`, `Failed`, and `Deleting` covering updates, recovery, and teardown.
 
 Because OMENative owns the pod lifecycle, it can offer capabilities a Deployment cannot, such as revision-tracked in-place updates and per-Instance rollout pacing. Those behaviors are configured through the component's `lifecycle` block and the rollout API, which are beyond the scope of this page.
+
+### Standalone InferenceReplicas
+
+On the v1.3 development line, you can also create an InferenceReplica directly, without an InferenceService. This is useful when you want to manage one pod set and its lifecycle yourself. It always uses OMENative. InferenceService remains the entry point for composing engine, decoder and router components, coordinated rollout groups, and service exposure.
+
+A standalone replica omits `spec.parentRef` and the InferenceService owner reference. You write its spec, subject to RBAC and admission. Set its immutable `spec.component` to `engine`, `decoder` or `router`, and choose exactly one template source: pod templates in `spec.runners`, or `spec.modelRef` and/or `spec.runtimeRef`. A runtime reference must declare the selected component; without a model reference, that runtime handles its own weights. References follow the live runtime, and runtime pins are rejected.
+
+Set the desired Instance count with `spec.replicas` and the availability delay with `spec.minReadySeconds`. An omitted replica count or `0` runs one Instance; standalone replicas do not support scale-to-zero. An external HPA or KEDA ScaledObject may target the scale subresource, but OME does not create it from a standalone replica's autoscaler block. Manual Instance migration is not supported on standalone replicas. Read their status and events on the replica itself; commands that take an InferenceService name do not automatically support them. These capabilities require a controller and CRDs built from the development source, not the v1.2.2 release.
 
 ## Opting in
 

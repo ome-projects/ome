@@ -104,7 +104,7 @@ Install or upgrade OME with the values file:
       -f values.yaml
     ```
 
-Helm reports the release's status as `deployed`, and on an upgrade the controller and model agent pods restart with images from your registry. Since v1.3, the first install fails with [a webhook error](install.md#the-first-install-fails-with-a-webhook-error): wait, then run the command again.
+Helm reports the release's status as `deployed`, and on an upgrade the controller and model agent pods restart with images from your registry. On a first source installation, admission can race webhook startup. If that happens, follow [webhook troubleshooting](install.md#the-first-install-fails-with-a-webhook-error), then retry the same command with the same image settings.
 
 ## Step 3: Check the images
 

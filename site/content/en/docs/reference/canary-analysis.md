@@ -190,23 +190,27 @@ operator-configured `rollout.defaultReadyTimeout` (the `ome-resources` chart set
 If none of the three is configured, the stall timeout does not exist: `Hold` holds
 indefinitely and `RollbackOnStall` never fires — only `Rollback` acts without it.
 
-A rollout parked `Failed` by a stall is resolved by the operator: abort it with
-[`kubectl ome rollout rollback`](/ome/docs/tasks/promote-or-rollback-a-canary/#roll-back-the-canary)
-(accepted in the `Failed` phase), or fix the metrics source — an unbound provider,
-unreachable address, or missing tenant header shows up in the per-metric `message` in
-status.
+A rollout parked `Failed` by a stall stays parked when the metrics source
+recovers. An unbound provider, unreachable address, or missing tenant header
+shows up in the per-metric `message` in status. Fix that cause, then
+[retry the same revision](/ome/docs/tasks/promote-or-rollback-a-canary/#retry-the-same-revision),
+apply a change that produces a new target revision, or abort with
+[`kubectl ome rollout rollback`](/ome/docs/tasks/promote-or-rollback-a-canary/#roll-back-the-canary),
+which is accepted in the `Failed` phase. A retry restarts at step 1 and runs
+every gate again.
 
 ## Observing analysis in status
 
-The executor records analysis state on the component's canary status
-(`status.components.<component>.canary`), all maintained only while a step gates on
-analysis:
+The executor records analysis and capacity-wait state on the component's
+canary status (`status.components.<component>.canary`):
 
 | Field | Meaning |
 |-------|---------|
 | `analysisFailedChecks` | Failing samples in the **current** step; reset to zero on each advance. Rollback fires when it reaches `failureLimit`. |
 | `lastEvaluationTime` | When metrics were last sampled; the interval throttle measures from here. |
 | `lastConclusiveEvaluationTime` | When the last conclusive sample (pass or fail) was recorded; the stall timeout measures from here. |
+| `capacityWaitSince` | When the current capacity wait began; cleared on recovery without restarting the warm-up or bake. |
+| `failed.reason` / `failed.time` | Why and when the canary parked. An inconclusive analysis with `Hold` records `AnalysisStalled`. |
 | `metricResults[]` | The most recent per-metric evaluation: `name`, `value` (empty when the metric could not be read), `threshold`, `operator`, `passed`, `message` (the reason when not passed — "no data", a query or template error), and `time`. |
 
 `metricResults` is why a step held or rolled back, without leaving `kubectl`:

@@ -98,6 +98,35 @@ submitted) when:
   final 100% step), a pre-step exposure hold is in effect, or a previous
   promote is still being consumed.
 
+### Final-step promotion
+
+The controller now reports `Paused` while the final manual or analysis gate
+waits, but the CLI still requires `Promoting` for a final-step promotion.
+It therefore refuses `promote`, including `--override-analysis`, at that
+`Paused` gate. Timed gates and passing analysis can still advance themselves.
+
+To request a final manual promotion directly, check the current step and read
+`status.components.<component>.canary.canaryRevisionHash`, then set
+`ome.io/rollout-promote` to that hash. On an analysis gate, the same annotation
+overrides its checks. The controller acts once capacity is met. This direct
+annotation doesn't perform the CLI's preview or confirmation checks.
+
+### Retry the same revision
+
+After fixing the cause of a `Failed` or `RolledBack` canary, set
+`ome.io/rollout-resume` to its parked
+`status.components.<component>.canary.canaryRevisionHash`, optionally prefixed
+with `<component>=` to select the group. It retries from step 1 with fresh
+gate counters and clocks, preserving the stable revision and rerunning every
+gate. The controller clears the hold and removes the request after recording
+the retry, along with any lingering rollback request. A failed canary needs
+its pinned rollout run to remain available.
+
+This differs from `kubectl ome rollout resume`, which releases a service-wide
+pause. A globally paused service leaves the request pending; an in-progress
+rollback cannot be restarted by this request. For a multi-cluster service,
+apply it to the member InferenceService, where the canary runs.
+
 ## Override an analysis gate
 
 When a step gates on analysis, ordinary promote refuses. To force the step

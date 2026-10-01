@@ -1,0 +1,24 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: http-lab
+  namespace: ome-http-lab
+spec:
+  deploymentMode: OMENative
+  runtime:
+    apiGroup: ome.io
+    kind: ServingRuntime
+    name: http-echo
+  engine:
+    minReplicas: 2
+    maxReplicas: 2
+    autoscaler:
+      class: None
+    lifecycle:
+      minReadySeconds: 5
+      instanceReadyTimeout: 2m
+      updateStrategy:
+        type: SurgeThenDrain
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 0
