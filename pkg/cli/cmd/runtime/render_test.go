@@ -58,6 +58,12 @@ func executeRender(t *testing.T, f *acquisitionFactory, files map[string]string,
 
 func executeRenderStreams(t *testing.T, f *acquisitionFactory, files map[string]string, args ...string) (string, string, error) {
 	t.Helper()
+	return executeRenderArgs(t, f, files, append([]string{"service"}, args...)...)
+}
+
+// executeRenderArgs runs render without a default service name.
+func executeRenderArgs(t *testing.T, f *acquisitionFactory, files map[string]string, args ...string) (string, string, error) {
+	t.Helper()
 	var out, errOut bytes.Buffer
 	o := &renderOptions{
 		IOStreams:        genericiooptions.IOStreams{In: &bytes.Buffer{}, Out: &out, ErrOut: &errOut},
@@ -72,7 +78,7 @@ func executeRenderStreams(t *testing.T, f *acquisitionFactory, files map[string]
 		},
 	}
 	cmd := newRenderCmdWithOptions(f, o)
-	cmd.SetArgs(append([]string{"service", "--ome-namespace", "control-plane"}, args...))
+	cmd.SetArgs(append([]string{"--ome-namespace", "control-plane"}, args...))
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	err := cmd.Execute()

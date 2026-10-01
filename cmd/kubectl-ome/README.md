@@ -180,7 +180,7 @@ An empty list succeeds; human output writes its empty-result notice to stderr.
 | `runtime explain --model MODEL` | Which live runtimes match a model according to the operator's runtime-selection engine, including rejection reasons. |
 | `runtime explain --isvc SERVICE` | The same selection explanation for a service's model. |
 | `runtime effective SERVICE` | Live versus controller-active runtime evidence, inheritance, pins, and drift. |
-| `runtime render SERVICE` | The complete engine, decoder, and router specs the controller acts on, after the runtime merge and deploy defaults. Unredacted. |
+| `runtime render [SERVICE]` | The complete engine, decoder, and router specs the controller acts on, after the runtime merge and deploy defaults. Unredacted. |
 | `runtime history SERVICE` | Retention-bounded runtime ControllerRevision evidence. |
 | `runtime tree RUNTIME` | Parent paths, inheriting descendants, and explicit InferenceService users. |
 | `accelerator explain SERVICE` | Declared accelerator policy, reported selection, verified AcceleratorClass identity, and base/applied requests. |
@@ -219,7 +219,7 @@ diff before.yaml after.yaml
 ```
 
 With `-f` (repeatable), the service, runtimes, and models come from manifest
-files and the command makes no API request, so CI can diff two revisions of a
+files and the command makes no API request, so you can diff two revisions of a
 GitOps repository. `-f` requires `--deploy-config` and supports only
 `--view live`. Other kinds in the files are skipped with a notice on stderr,
 objects without a namespace get the `-n` namespace, and an object defined twice
@@ -227,6 +227,18 @@ fails the command:
 
 ```sh
 kubectl ome runtime render chat -n team-a -f base/chat.yaml -f base/runtimes.yaml \
+  --deploy-config base/inferenceservice-config.yaml > before.yaml
+```
+
+Without a service name, `-f` renders every InferenceService in the files,
+across namespaces, as one `RenderedInferenceServiceList` sorted by namespace
+and name. You do not need to know which services a change affects: render the
+base and head revisions and diff them. If any service fails, every failure is
+reported and nothing is printed, so a failure never looks like an unchanged
+service:
+
+```sh
+kubectl ome runtime render -f base/services.yaml -f base/runtimes.yaml \
   --deploy-config base/inferenceservice-config.yaml > before.yaml
 ```
 

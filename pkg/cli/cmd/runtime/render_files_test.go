@@ -148,12 +148,92 @@ func TestRenderFilesUsesNamespaceFlag(t *testing.T) {
 	assert.Contains(t, out, "name: prod/vllm\n")
 }
 
+// renderFileProdService is a second service and runtime in another
+// namespace, for rendering every service.
+const renderFileProdService = `apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: chat
+  namespace: prod
+spec:
+  model:
+    name: llama
+  runtime:
+    name: vllm
+    kind: ServingRuntime
+  engine:
+    minReplicas: 1
+---
+apiVersion: ome.io/v1beta1
+kind: ServingRuntime
+metadata:
+  name: vllm
+  namespace: prod
+spec:
+  engineConfig:
+    runner:
+      name: runner
+      image: runtime:v2
+`
+
+var renderAllArgs = append([]string{"-f", "prod.yaml"}, renderFileArgs...)
+
+func TestRenderFilesAllServices(t *testing.T) {
+	// Pin the team-a namespaces so -n can select either service below.
+	files := renderFiles(map[string]string{
+		"prod.yaml":     renderFileProdService,
+		"service.yaml":  strings.Replace(renderFileService, "name: service\n", "name: service\n  namespace: team-a\n", 1),
+		"runtimes.yaml": strings.Replace(renderFileRuntimes, "metadata:\n  name: vllm\n", "metadata:\n  name: vllm\n  namespace: team-a\n", 1),
+	})
+	f := renderFactory(t, false)
+
+	out, _, err := executeRenderArgs(t, f, files, renderAllArgs...)
+
+	require.NoError(t, err)
+	assertRenderGolden(t, "render_files_all.golden.yaml", out)
+	assert.Zero(t, f.omeGet+f.kubeGet+f.runtimeGet, "file mode must not construct API clients")
+
+	// Each item equals rendering that service by name.
+	var list struct {
+		Items []map[string]any `json:"items"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(out), &list))
+	require.Len(t, list.Items, 2)
+	for i, service := range []struct{ namespace, name string }{{"prod", "chat"}, {"team-a", "service"}} {
+		f := renderFactory(t, false)
+		f.namespace = service.namespace
+		single, _, err := executeRenderArgs(t, f, files, append([]string{service.name}, renderAllArgs...)...)
+		require.NoError(t, err)
+		var want map[string]any
+		require.NoError(t, yaml.Unmarshal([]byte(single), &want))
+		assert.Equal(t, want, list.Items[i], service.name)
+	}
+}
+
+func TestRenderFilesAllServicesFailsTogether(t *testing.T) {
+	// Both services lose their runtime; every failure is reported and
+	// nothing is printed.
+	files := renderFiles(map[string]string{
+		"prod.yaml":     strings.SplitN(renderFileProdService, "---\n", 2)[0],
+		"runtimes.yaml": strings.SplitN(renderFileRuntimes, "---\n", 2)[1],
+	})
+
+	out, _, err := executeRenderArgs(t, renderFactory(t, false), files, renderAllArgs...)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "2 of 2 InferenceServices failed to render")
+	assert.Contains(t, err.Error(), "InferenceService prod/chat: render live view: ")
+	assert.Contains(t, err.Error(), "InferenceService team-a/service: render live view: ")
+	assert.Empty(t, out)
+}
+
 func TestRenderFilesFailures(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		files    map[string]string
 		args     []string
 		contains string
+		noName   bool
 	}{
 		{
 			name:     "missing deploy-config",
@@ -197,7 +277,11 @@ func TestRenderFilesFailures(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := renderFactory(t, false)
-			out, _, err := executeRenderStreams(t, f, renderFiles(test.files), test.args...)
+			args := test.args
+			if !test.noName {
+				args = append([]string{"service"}, args...)
+			}
+			out, _, err := executeRenderArgs(t, f, renderFiles(test.files), args...)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), test.contains)
 			assert.Empty(t, out)

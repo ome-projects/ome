@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"sort"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -21,6 +23,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/factory"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 )
 
 // fileDecoder knows only the kinds file mode reads, so every other object
@@ -47,7 +50,8 @@ func (o fileObject) key() string {
 
 // runFiles renders from -f manifests and --deploy-config without any API
 // request. Runtimes and models are served to the live resolver from memory,
-// so selection and merging follow the same code as cluster mode.
+// so selection and merging follow the same code as cluster mode. Without a
+// name it renders every InferenceService in the files.
 func (o *renderOptions) runFiles(ctx context.Context, f factory.Factory) error {
 	workloadNamespace, err := fileWorkloadNamespace(f)
 	if err != nil {
@@ -61,33 +65,78 @@ func (o *renderOptions) runFiles(ctx context.Context, f factory.Factory) error {
 	if err != nil {
 		return err
 	}
-	isvc, err := selectFileInferenceService(objects, o.name, workloadNamespace)
-	if err != nil {
-		return err
-	}
 
 	scheme := k8sruntime.NewScheme()
 	utilruntime.Must(v1beta1.AddToScheme(scheme))
 	builder := ctrlfake.NewClientBuilder().WithScheme(scheme)
+	var services []*v1beta1.InferenceService
 	for _, object := range objects {
-		if object.kind != "InferenceService" {
+		if isvc, ok := object.object.(*v1beta1.InferenceService); ok {
+			services = append(services, isvc)
+		} else {
 			builder = builder.WithObjects(object.object)
 		}
 	}
 	resolver := effective.NewRuntimeResolver(builder.Build())
 	resolver.SetDeployConfig(deployConfig)
-	live, err := resolver.ResolveLive(ctx, isvc)
-	if err != nil {
-		return fmt.Errorf("render live view: %w", err)
+
+	if o.name != "" {
+		i := slices.IndexFunc(services, func(isvc *v1beta1.InferenceService) bool {
+			return isvc.Name == o.name && isvc.Namespace == workloadNamespace
+		})
+		if i < 0 {
+			return fmt.Errorf("InferenceService %s/%s not found in -f files", workloadNamespace, o.name)
+		}
+		rendered, err := o.renderFileService(ctx, resolver, deployConfig, services[i])
+		if err != nil {
+			return err
+		}
+		return writeRendered(o.Out, o.output, rendered)
 	}
 
+	if len(services) == 0 {
+		return errors.New("no InferenceService in -f files")
+	}
+	sort.Slice(services, func(i, j int) bool {
+		if services[i].Namespace != services[j].Namespace {
+			return services[i].Namespace < services[j].Namespace
+		}
+		return services[i].Name < services[j].Name
+	})
+	list := &renderedInferenceServiceList{APIVersion: renderAPIVersion, Kind: renderListKind}
+	var failures []error
+	for _, isvc := range services {
+		rendered, err := o.renderFileService(ctx, resolver, deployConfig, isvc)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("InferenceService %s/%s: %w", isvc.Namespace, isvc.Name, err))
+			continue
+		}
+		list.Items = append(list.Items, rendered)
+	}
+	// A partial list would make the failed services look unchanged in a
+	// diff, so any failure writes nothing.
+	if len(failures) > 0 {
+		return fmt.Errorf("%d of %d InferenceServices failed to render:\n%w", len(failures), len(services), errors.Join(failures...))
+	}
+	return writeRendered(o.Out, o.output, list)
+}
+
+func (o *renderOptions) renderFileService(
+	ctx context.Context,
+	resolver *effective.RuntimeResolver,
+	deployConfig *controllerconfig.DeployConfig,
+	isvc *v1beta1.InferenceService,
+) (*renderedInferenceService, error) {
+	live, err := resolver.ResolveLive(ctx, isvc)
+	if err != nil {
+		return nil, fmt.Errorf("render live view: %w", err)
+	}
 	sources := []renderedSource{{
 		Kind: "InferenceService", Name: isvc.Namespace + "/" + isvc.Name, Origin: renderOriginFile,
 	}}
 	sources = append(sources, liveSources(live, renderOriginFile)...)
 	sources = append(sources, renderedSource{Kind: "ConfigMap", Name: o.deployConfigPath, Origin: renderOriginFile})
-	rendered := buildRendered(isvc, deployConfig, renderViewLive, sources, live.Components)
-	return writeRendered(o.Out, o.output, rendered)
+	return buildRendered(isvc, deployConfig, renderViewLive, sources, live.Components), nil
 }
 
 // fileWorkloadNamespace returns the kubectl namespace. Without a kubeconfig
@@ -173,13 +222,4 @@ func (o *renderOptions) decodeFileObjects(path string, data []byte, workloadName
 		}
 		objects = append(objects, fileObject{object: object, kind: gvk.Kind})
 	}
-}
-
-func selectFileInferenceService(objects []fileObject, name, namespace string) (*v1beta1.InferenceService, error) {
-	for _, object := range objects {
-		if isvc, ok := object.object.(*v1beta1.InferenceService); ok && isvc.Name == name && isvc.Namespace == namespace {
-			return isvc, nil
-		}
-	}
-	return nil, fmt.Errorf("InferenceService %s/%s not found in -f files", namespace, name)
 }

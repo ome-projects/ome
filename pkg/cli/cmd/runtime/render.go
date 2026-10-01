@@ -27,6 +27,7 @@ import (
 const (
 	renderAPIVersion = "cli.ome.io/v1alpha1"
 	renderKind       = "RenderedInferenceService"
+	renderListKind   = "RenderedInferenceServiceList"
 
 	renderViewLive   = "Live"
 	renderViewActive = "Active"
@@ -50,6 +51,14 @@ type renderedInferenceService struct {
 	Sources        []renderedSource   `json:"sources"`
 	DeployDefaults string             `json:"deployDefaults"`
 	Components     renderedComponents `json:"components"`
+}
+
+// renderedInferenceServiceList holds every service of a file render
+// without a name, sorted by namespace and name.
+type renderedInferenceServiceList struct {
+	APIVersion string                      `json:"apiVersion"`
+	Kind       string                      `json:"kind"`
+	Items      []*renderedInferenceService `json:"items"`
 }
 
 type renderedMetadata struct {
@@ -103,7 +112,7 @@ func newRenderCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.
 
 func newRenderCmdWithOptions(f factory.Factory, o *renderOptions) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "render INFERENCESERVICE",
+		Use:   "render [INFERENCESERVICE]",
 		Short: "Print the component specs the controller acts on",
 		Long: `Prints the engine, decoder, and router specs the InferenceService
 controller acts on: the service merged with its runtime, each component's
@@ -116,7 +125,9 @@ to the defaults.
 instead of the cluster, for example to diff two revisions of a GitOps
 repository. Other kinds are skipped with a notice. -f requires
 --deploy-config, supports only --view live, and makes no API request.
-Objects without a namespace get the -n namespace.
+Objects without a namespace get the -n namespace. Without INFERENCESERVICE,
+-f renders every InferenceService in the files, across namespaces, as one
+RenderedInferenceServiceList; if any fails, nothing is printed.
 
 --view live merges the runtime as it is now; --view active merges the
 ControllerRevision the controller has pinned.
@@ -134,10 +145,13 @@ cannot be applied.`,
 		Example: `  kubectl ome runtime render chat -n prod
   kubectl ome runtime render chat -n prod --view active -o json
   kubectl ome runtime render chat -n prod --deploy-config ./inferenceservice-config.yaml
-  kubectl ome runtime render chat -n prod -f service.yaml -f runtimes.yaml --deploy-config ./inferenceservice-config.yaml`,
-		Args: cobra.ExactArgs(1),
+  kubectl ome runtime render chat -n prod -f service.yaml -f runtimes.yaml --deploy-config ./inferenceservice-config.yaml
+  kubectl ome runtime render -f services.yaml -f runtimes.yaml --deploy-config ./inferenceservice-config.yaml`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o.name = args[0]
+			if len(args) == 1 {
+				o.name = args[0]
+			}
 			if err := o.validate(); err != nil {
 				return err
 			}
@@ -155,8 +169,13 @@ cannot be applied.`,
 }
 
 func (o *renderOptions) validate() error {
-	if err := (&effectiveOptions{name: o.name}).validateName(); err != nil {
-		return err
+	switch {
+	case o.name == "" && len(o.filenames) == 0:
+		return errors.New("INFERENCESERVICE is required without -f")
+	case o.name != "":
+		if err := (&effectiveOptions{name: o.name}).validateName(); err != nil {
+			return err
+		}
 	}
 	switch o.view {
 	case "live", "active":
@@ -321,7 +340,7 @@ func buildRendered(
 	return rendered
 }
 
-func writeRendered(w io.Writer, format string, rendered *renderedInferenceService) error {
+func writeRendered(w io.Writer, format string, rendered any) error {
 	var data []byte
 	var err error
 	if format == "json" {

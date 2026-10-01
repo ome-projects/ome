@@ -1,0 +1,69 @@
+apiVersion: cli.ome.io/v1alpha1
+items:
+- apiVersion: cli.ome.io/v1alpha1
+  components:
+    engine:
+      deploymentMode: RawDeployment
+      deploymentModeSource: Default
+      spec:
+        maxReplicas: 6
+        minReplicas: 1
+        runner:
+          image: runtime:v2
+          name: runner
+          resources: {}
+        terminationGracePeriodSeconds: 45
+  deployDefaults: Applied
+  kind: RenderedInferenceService
+  metadata:
+    name: chat
+    namespace: prod
+  sources:
+  - kind: InferenceService
+    name: prod/chat
+    origin: File
+  - kind: ClusterBaseModel
+    name: llama
+    origin: File
+  - kind: ServingRuntime
+    name: prod/vllm
+    origin: File
+  - kind: ConfigMap
+    name: deploy.yaml
+    origin: File
+  view: Live
+- apiVersion: cli.ome.io/v1alpha1
+  components:
+    engine:
+      deploymentMode: RawDeployment
+      deploymentModeSource: Default
+      spec:
+        maxReplicas: 6
+        minReplicas: 3
+        runner:
+          args:
+          - --port=8080
+          image: runtime:v1
+          name: runner
+          resources: {}
+        terminationGracePeriodSeconds: 45
+  deployDefaults: Applied
+  kind: RenderedInferenceService
+  metadata:
+    name: service
+    namespace: team-a
+  sources:
+  - kind: InferenceService
+    name: team-a/service
+    origin: File
+  - kind: ClusterBaseModel
+    name: llama
+    origin: File
+  - kind: ServingRuntime
+    name: team-a/vllm
+    origin: File
+  - kind: ConfigMap
+    name: deploy.yaml
+    origin: File
+  view: Live
+kind: RenderedInferenceServiceList
