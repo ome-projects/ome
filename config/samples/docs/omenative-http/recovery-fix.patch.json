@@ -1,0 +1,23 @@
+{
+  "spec": {
+    "engine": {
+      "runner": {
+        "name": "ome-container",
+        "args": [
+          "-listen=:8080",
+          "-text=hello from OMENative v3"
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/",
+            "port": 8080
+          }
+        }
+      },
+      "lifecycle": {
+        "instanceReadyTimeout": "2m",
+        "migrationPolicy": null
+      }
+    }
+  }
+}

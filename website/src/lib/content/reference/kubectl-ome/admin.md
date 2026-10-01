@@ -287,6 +287,8 @@ kubectl ome admin recommendations [flags]
 
 The command reads Alfred's configuration, the key `config.yaml` in the ConfigMap `alfred-config`. When the configuration turns it on, the command also reads the record of the latest pass: the key `last-cycle.json` in the recommendations ConfigMap, `alfred-recommendations` by default. Both ConfigMaps are in Alfred's namespace, which is the OME namespace unless you set `--alfred-namespace`. The command reads the configuration as stored. That can differ from the one Alfred runs, since Alfred keeps its last good configuration when a new one fails to load; see [Hot reload](../scheduling/alfred-configuration.md#hot-reload). [Alfred configuration](../scheduling/alfred-configuration.md) describes its keys.
 
+This inspection performs at most two named ConfigMap GETs, each with a ten-second timeout. It does not list resources, read Secrets or change anything. The record name comes from the selected configuration, not a separate command-line override. A namespace-scoped Role granting `get` on those ConfigMaps is enough; no cluster-wide ConfigMap access is needed.
+
 ### Flags {#recommendations-flags}
 
 | Flag | Default | Description |
@@ -365,9 +367,12 @@ Each recommendation's outcome is one of these; [How Alfred decides](../../concep
 | `advisory` | The move is advice that the arbiter didn't evaluate; `-o wide` shows its reason. In recommend-only mode, new moves are `advisory`, and requests left from execute mode keep their status. |
 | `rejected` | The arbiter rejected the move against its safety bounds. |
 | `withheld` | The arbiter admitted the move, but Alfred didn't request the migration. |
+| `admitted` | Reserved reporter value; classified `Unverifiable`, with no execution inferred. |
 | `submitted`, `acknowledged`, `completed`, `failed` or `stalled` | The status of the migration request Alfred wrote for the move. |
 
 The CLI leaves out recommendations it doesn't recognize, and every copy of a duplicated one, and counts them as invalid. The `Rows` row counts them, and an `Issue` row names the cause.
+
+A reported `completed` dispatch is Alfred's account, not independent proof of convergence. Verify the workload with [migration status and history](migration.md). Neither a recent timestamp nor a recommendation authorizes a migration or proves Alfred's current health.
 
 The CLI also counts some valid recommendations as invalid, so the report shows `Partial`. These are whole-component ones, with `instance` -1, and, once you set `migration.apiVersion`, OMENative ones with a scheduling advisory reason, such as `SimulationUnavailable`. To see them, read `last-cycle.json` in the recommendations ConfigMap, as [Run Alfred in recommend-only mode](../../guides/scheduling/run-alfred.md#step-2-read-its-recommendations) shows. This is a known bug.
 

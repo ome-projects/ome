@@ -135,7 +135,7 @@ hint            Use -o json or -o yaml for full values.
 
 ## Step 3: Check that the canary moved on
 
-OME acts on the request after the command returns, so run the `status` command from Step 1 again. STEP shows the next step, and PHASE shows `Pending` or `Canarying` while the canary moves to it, then `Paused` at its next gate. For `chat`, STEP shows `2/2` while the rest of the Instances move to the new revision. The last step's gate is immediate, so PHASE then shows `Stable` and STEP shows `-`. When the last step pauses or runs analysis, or the group sets `scaleDownDelaySeconds`, the canary waits in `Promoting` first. OME removes the `ome.io/rollout-promote` annotation once it records the advance, and another `promote` refuses until then.
+OME acts on the request after the command returns, so run the `status` command from Step 1 again. STEP shows the next step, and PHASE shows `Pending` or `Canarying` while the canary moves to it, then `Paused` at its next gate. For `chat`, STEP shows `2/2` while the rest of the Instances move to the new revision. The last step's gate is immediate, so PHASE then shows `Stable` and STEP shows `-`. A last-step pause or analysis holds in `Paused`; after the gate passes, any remaining `scaleDownDelaySeconds` holds completion in `Promoting`. See [Final-step promotion](#final-step-promotion) for the current CLI limitation. OME removes the `ome.io/rollout-promote` annotation once it records the advance, and another `promote` refuses until then.
 
 ## Roll back the canary
 
@@ -223,11 +223,29 @@ inferenceservice.ome.io/chat configured
 
 Step 1's new Instance never becomes ready, so `status` shows PHASE `Pending`. After 10 minutes, PHASE shows `Failed`, and the canary stays there while the Instances on the stable revision keep serving. The `ome.io/rollout-ready-timeout` annotation overrides `readyTimeout`, and the ome-resources chart sets a default of `15m` for groups that set neither. [`readyTimeout`](../../reference/rollouts/canary-progression.md#readytimeout) has the details.
 
-`promote` refuses on a failed canary. To recover:
+`promote` refuses on a failed canary. Fix the image in `chat.yaml` and apply it again: a new target revision clears the failed hold and starts a fresh canary at step 1. You can instead [roll back the canary](#roll-back-the-canary) to return to the stable revision. If the cause was outside the pod template, such as an unavailable image registry or metrics source, fix it and explicitly retry the same revision below; recovery alone leaves the canary parked.
 
-1. [Roll back the canary](#roll-back-the-canary), and wait until PHASE shows `RolledBack`.
-2. Remove the `ome.io/rollout-rollback` annotation, as that section shows.
-3. Fix the image in `chat.yaml`, and apply it again. The new revision starts a fresh canary at step 1.
+### Retry the same revision
+
+The `ome.io/rollout-resume` annotation retries a canary parked in `Failed` or `RolledBack` at step 1, with fresh gate counters and clocks. This differs from `kubectl ome rollout resume`, which releases a service-wide pause. Read the parked engine canary's revision:
+
+```bash
+kubectl get inferenceservice chat -n prod -o jsonpath='{.status.components.engine.canary.canaryRevisionHash}{"\n"}'
+```
+
+Copy that hash into `ome.io/rollout-resume` as `engine=<hash>` and apply the annotation to `chat`. The optional component prefix selects its canary group; a bare hash targets the group whose canary carries it. The controller checks the hash, clears the failed or completed-rollback hold, and removes the request after recording the retry. It also removes a lingering rollback request. A failed canary needs its pinned rollout run to remain available.
+
+Replace `REPLACE_WITH_HASH` with the value you just read:
+
+```bash
+kubectl annotate inferenceservice chat -n prod \
+  'ome.io/rollout-resume=engine=REPLACE_WITH_HASH' --overwrite
+kubectl ome rollout status chat -n prod
+```
+
+Check that the failed hold clears and the canary starts its steps again. If it stays parked, inspect `kubectl describe inferenceservice chat -n prod` for a rejected request or another failure.
+
+Every gate runs again, so fix the underlying problem first. This request doesn't restart a rollback still in progress. A globally paused service leaves the request pending until you release the service-wide pause. For a multi-cluster service, apply it to the member InferenceService, where the canary runs.
 
 ## Troubleshooting
 
@@ -238,9 +256,23 @@ When `promote` or `rollback` refuses, it prints `error:` and the reason, changes
 `error: action refused: promote requires an active indefinite manual gate; analysis requires explicit override` means the canary isn't waiting at a gate that this `promote` can pass. Run `status` and check:
 
 - GATE: plain `promote` needs `Manual`, and `--override-analysis --yes` needs `Analysis`.
-- PHASE: the canary must be `Paused`, or `Promoting` at the last step. `Pending` means the step's new Instances are still starting. `Failed` means the ready timeout passed before they were ready, or while the step's analysis got only inconclusive results: see [When a step never becomes ready](#when-a-step-never-becomes-ready).
+- PHASE: the CLI requires `Paused` before the last step, or `Promoting` at the last step; see the [final-step limitation](#final-step-promotion) below. `Pending` means the step's new Instances are still starting. `Failed` records a capacity timeout, stalled analysis or missing stable revision: see [`readyTimeout`](../../reference/rollouts/canary-progression.md#readytimeout).
 - An earlier `promote` that OME is still finishing: wait, and run `status` again.
 - HOLD `CanaryPreStep` in `explain`, after a repin: `promote` can't release this hold. Set the promote annotation by hand, as [Repin a drifted rollout plan](repin-a-drifted-rollout-plan.md#what-the-controller-does-next) shows.
+
+### Final-step promotion
+
+The controller reports `Paused` while a final manual or analysis gate waits, but the current CLI requires `Promoting` at the last step. As a result, `promote`, including `--override-analysis`, refuses a final gate in `Paused`. Timed and passing analysis gates can still advance on their own.
+
+To request a final manual promotion directly, first check the current step and read `status.components.<component>.canary.canaryRevisionHash`, then set `ome.io/rollout-promote` to that hash. Setting the same annotation on an analysis gate overrides its checks. The controller applies it after the capacity gate is met; this direct annotation doesn't perform the CLI's preview or confirmation checks.
+
+For `chat`, replace `REPLACE_WITH_HASH` with that revision and request promotion:
+
+```bash
+kubectl annotate inferenceservice chat -n prod \
+  'ome.io/rollout-promote=REPLACE_WITH_HASH' --overwrite
+kubectl ome rollout status chat -n prod
+```
 
 ### A promote or rollback request is present
 

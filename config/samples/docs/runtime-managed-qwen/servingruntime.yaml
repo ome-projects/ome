@@ -1,0 +1,68 @@
+apiVersion: ome.io/v1beta1
+kind: ServingRuntime
+metadata:
+  name: sglang-qwen3
+  namespace: qwen-demo
+spec:
+  protocolVersions:
+    - openAI
+  engineConfig:
+    nodeSelector:
+      kubernetes.io/arch: amd64
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+    runner:
+      name: ome-container
+      image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+      command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+        - --model-path
+        - Qwen/Qwen3-0.6B
+        - --served-model-name
+        - Qwen/Qwen3-0.6B
+        - --tp-size
+        - "1"
+        - --mem-frac
+        - "0.9"
+      ports:
+        - name: http1
+          containerPort: 8080
+      volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+      resources:
+        requests:
+          cpu: "10"
+          memory: 30Gi
+          nvidia.com/gpu: 1
+        limits:
+          cpu: "10"
+          memory: 30Gi
+          nvidia.com/gpu: 1
+      startupProbe:
+        httpGet:
+          path: /health_generate
+          port: 8080
+        initialDelaySeconds: 60
+        periodSeconds: 6
+        timeoutSeconds: 30
+        failureThreshold: 150
+      readinessProbe:
+        httpGet:
+          path: /health_generate
+          port: 8080
+        periodSeconds: 60
+        timeoutSeconds: 200
+        failureThreshold: 3

@@ -1,5 +1,30 @@
 [
 	{
+		"old": "tasks/kubectl-ome-admin-recommendations.md",
+		"new": "reference/kubectl-ome/admin.md",
+		"rewrittenFrom": "2d4b064d"
+	},
+	{
+		"old": "tasks/kubectl-ome-get.md",
+		"new": "reference/kubectl-ome/get.md",
+		"rewrittenFrom": "2f7ab3bc"
+	},
+	{
+		"old": "tasks/kubectl-ome-rollout-status.md",
+		"new": "reference/kubectl-ome/rollout.md",
+		"rewrittenFrom": "74b4a0b7"
+	},
+	{
+		"old": "administration/model-replication.md",
+		"new": "guides/deploy-models/stage-model-weights.md",
+		"rewrittenFrom": "b095cb8f"
+	},
+	{
+		"old": "administration/omenative-pod-batching.md",
+		"new": "guides/operate-ome/configure-pod-batching.md",
+		"rewrittenFrom": "b5711d11"
+	},
+	{
 		"old": "_index.md",
 		"new": "getting-started/index.md",
 		"rewrittenFrom": "2f5da6dd"

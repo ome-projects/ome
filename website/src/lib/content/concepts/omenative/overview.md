@@ -38,7 +38,7 @@ A single-pod component that opts in, such as the router, gets held revisions, re
 
 ## How OMENative runs a component
 
-For an OMENative component, OME writes an [InferenceReplica](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-InferenceReplica) named `{isvc}-{component}`, owned by the InferenceService. The InferenceReplica holds the component's Instances, and records the versions of their pod template as revisions. OME keeps the InferenceReplica's spec in line with the InferenceService, so make your changes in the InferenceService. Run `kubectl get irep` to list InferenceReplicas with their desired, current, ready and available Instances, and `kubectl describe irep` to see their conditions. The InferenceService shows Instance events, including failures and held revisions.
+For an InferenceService's OMENative component, OME writes an [InferenceReplica](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-InferenceReplica) named `{isvc}-{component}`, owned by the InferenceService. The InferenceReplica holds the component's Instances, and records the versions of their pod template as revisions. OME keeps this replica's spec in line with the InferenceService, so make your changes in the InferenceService. With the chart's controller identity configured, the admission webhook rejects direct spec changes to these controller-owned replicas from other users. Run `kubectl get irep` to list InferenceReplicas with their desired, current, ready and available Instances, and `kubectl describe irep` to see their conditions. The InferenceService shows Instance events, including failures and held revisions.
 
 An Instance isn't an object of its own: it's a row in the InferenceReplica's status, and its pods carry its index in the `ome.io/instance-index` label. For example, take an InferenceService named `chat` with `spec.deploymentMode: OMENative`. Its router has one Instance, and its engine has two, each a leader and one worker. OME runs these objects:
 
@@ -52,6 +52,33 @@ InferenceService chat
 ```
 
 OME also creates the component's Services, and a PodDisruptionBudget, an autoscaler, a PodMonitor or PodGroups when the component and the cluster call for them. [What OME creates](../architecture/deployment-modes.md#what-ome-creates) lists every object.
+
+### Standalone InferenceReplicas {#standalone-inferencereplicas since=v1.3}
+
+For a complete CPU example, follow [Run a standalone InferenceReplica](../../guides/omenative/run-a-standalone-replica.md), including its user-managed Service, scaling and template update.
+
+You can also create an InferenceReplica directly. Use this form when you want to manage one pod set and its Instance lifecycle yourself. Use an InferenceService when OME should compose the engine, decoder and router, coordinate their rollout groups, and expose the service.
+
+A standalone replica has no `spec.parentRef` and no InferenceService owner reference. You choose its name and write its spec, subject to Kubernetes RBAC and admission checks. Set `spec.component` to `engine`, `decoder` or `router` at creation; the role cannot change afterwards. Give it a name distinct from existing InferenceServices and their component workloads in the namespace.
+
+Choose one template source:
+
+| Source | What to set | What OME runs |
+| --- | --- | --- |
+| Pod templates you supply | `spec.runners` | One `default` runner for a single-pod Instance, or `leader` and `worker` runners for a multi-pod Instance |
+| A runtime, optionally with a model | `spec.runtimeRef`, optionally `spec.modelRef` | The runtime's configuration for the selected component; without a model reference, the runtime handles its own weights |
+| A model with automatic runtime selection | `spec.modelRef` | A matching runtime that declares the selected component |
+
+Do not combine `runners` with either reference. Reference-based replicas follow the live runtime; pinned runtime references are rejected. Model and runtime resources must exist and satisfy the same storage and rendering requirements as when an InferenceService uses them.
+
+The standalone form has a smaller orchestration scope:
+
+- Change `spec.replicas` to set the Instance count. An omitted count or `0` runs one Instance; standalone replicas do not support scale-to-zero. An external HPA or KEDA ScaledObject can target the scale subresource, but OME does not create that scaler from the replica's `autoscaler` block; `HPA` and `KEDA` classes in that block are rejected.
+- Put the availability delay in `spec.minReadySeconds`, not `spec.lifecycle.minReadySeconds`. Do not assume InferenceService deployment defaults apply to a standalone replica's lifecycle policies.
+- Manual Instance migration is not supported on standalone replicas. Use an InferenceService for the migration workflows in these docs.
+- Read status and events from the InferenceReplica itself. The `kubectl ome` workflows that take an InferenceService name do not automatically apply to a standalone replica.
+
+These capabilities are on the v1.3 development line and are not part of the v1.2.2 installation. Use the [source-build installation](../../getting-started/install.md#install-from-source) for the matching controller and CRDs.
 
 ## Scheduling and placement
 

@@ -15,6 +15,8 @@ Serve [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), a small language mod
 
 </div>
 
+This is the model-agent path for the pinned v1.2.2 installation. For a development build without the model agent, use [runtime-managed Qwen](../guides/deploy-models/deploy-an-inferenceservice.md); without a GPU, try the [CPU-only OMENative lab](../guides/omenative/learn-omenative.md). OMENative requires a [matching source installation](install.md#install-from-source), not just a new field on a v1.2.2 service.
+
 ## Step 1: Check that OME is running
 
 Check that the OME controller and the model agent are ready:

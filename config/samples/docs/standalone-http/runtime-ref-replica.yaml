@@ -1,0 +1,20 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceReplica
+metadata:
+  name: standalone-http-ref
+  namespace: ome-standalone-lab
+spec:
+  component: engine
+  replicas: 1
+  minReadySeconds: 5
+  runtimeRef:
+    apiGroup: ome.io
+    kind: ServingRuntime
+    name: http-echo
+  lifecycle:
+    instanceReadyTimeout: 2m
+    updateStrategy:
+      type: SurgeThenDrain
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 0

@@ -34,6 +34,8 @@ kubectl ome rollout status INFERENCESERVICE [flags]
 
 `status` shows where each component of the InferenceService is in its rollout: its rollout group, its phase, the current step of a canary, and the revisions it serves. The values come from the controller's status. While a run is active, the steps come from the plan the run pinned.
 
+The command makes one GET of that InferenceService and reads no pods, policies or other child resources. It reports the recorded progress, not an independent check that workloads or traffic converged.
+
 ### Flags {#status-flags}
 
 | Flag | Default | Description |
@@ -102,7 +104,7 @@ GATE is one of:
 
 [Canary progression](../rollouts/canary-progression.md#how-a-step-advances) describes how a step advances, and [Canary metric analysis](../rollouts/canary-analysis.md) the analysis checks.
 
-Before the last step, a canary waiting at any gate, or holding after a [`repin`](#repin), is `Paused`, and so is REPORTED. At the last step, the canary waits as `Promoting`, so REPORTED stays `InProgress`.
+A canary waiting at any gate, including the last step, or holding after a [`repin`](#repin), is `Paused`, and so is REPORTED. Once the final gate passes, any remaining completion delay reports `Promoting`, with REPORTED `InProgress`.
 
 The last row, ISSUES, lists issue codes for the service and for each component, in their own columns. An issue tied to a rollout group shows as `Code(group=N)`. Any issue also adds a `PartialData` warning. The issues are:
 
@@ -119,7 +121,9 @@ The last row, ISSUES, lists issue codes for the service and for each component, 
 | `RevisionNameInvalid` | A revision name in the status is empty or invalid. |
 | `SpecMalformed` | The rollout part of the spec is malformed. |
 | `StatusMalformed` | The rollout status is malformed or contradicts the spec. |
-| `TrafficInvalid` | A traffic weight in the status is outside 0 to 100. |
+| `TrafficInvalid` | The entire per-revision traffic list is withheld: revision names are invalid, hashes are duplicated, weights are outside 0 to 100, or their sum is not 100. |
+
+Malformed evidence also forces REPORTED to `Unknown` before phase precedence is applied. Missing-status notices, `AnalysisInconclusive` and `EpochUnverifiable` do not by themselves mark the evidence malformed; they still qualify what the report can establish.
 
 `-o wide` prints a row per component, with every field but COORDINATION as a column.
 
@@ -663,6 +667,8 @@ Besides the refusals [every action shares](guarded-actions.md#target-checks), `p
 - Before the last step, the canary is `Paused`. At the last step, it's `Promoting`, and the step's traffic weight is 100%.
 - The controller recorded when the canary entered the step, and both sides of TRAFFIC match.
 - The controller finished the previous promote.
+
+The last-step phase check currently differs from the controller: a final gate waits in `Paused`, so the CLI refuses promotion there. See [Final-step promotion](../../guides/roll-out-changes/promote-or-roll-back-a-canary.md#final-step-promotion) for the limitation and the direct annotation request.
 
 It also refuses while the canary holds after a repin, which [`explain`](#explain) shows as HOLD `CanaryPreStep`. [Repin a drifted rollout plan](../../guides/roll-out-changes/repin-a-drifted-rollout-plan.md#what-the-controller-does-next) shows how to release the hold.
 

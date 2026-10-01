@@ -5,10 +5,12 @@ description: "Serve model weights that already live on a PersistentVolumeClaim b
 
 Every serving pod reads the model from the same PersistentVolumeClaim, so you keep one copy of the weights, and the [model agent](../operate-ome/model-agent.md) downloads nothing to the nodes. You point a [BaseModel](../../concepts/models/base-models.md) at the claim with a `pvc://` URI, and a metadata Job reads the model's details from the claim. Then the pods of an [InferenceService](../../concepts/serving/inference-services.md) mount the claim read-only. The steps serve `meta-llama/Llama-3.2-1B-Instruct`.
 
+If you don't have a populated claim yet, start with [Stage model weights](stage-model-weights.md). That guide downloads ungated Qwen3-0.6B to a shared PVC, then registers and serves it; this page covers the PVC URI, metadata Job and storage options in more detail.
+
 <div class="prerequisites" markdown>
 
 - OME installed, and `kubectl` access to the cluster. See [Install OME](../../getting-started/install.md).
-- A Bound PersistentVolumeClaim `model-storage` in the namespace `llama-demo`, with the access mode `ReadOnlyMany` or `ReadWriteMany`. The metadata Job and the serving pods can run on different nodes, and each of them mounts the claim.
+- A Bound PersistentVolumeClaim `model-storage` in the namespace `llama-demo`, with the access mode `ReadOnlyMany` or `ReadWriteMany`. The metadata Job and the serving pods can run on different nodes, and each of them mounts the claim. A Job that first populates the volume needs write access; its consumers can mount a `ReadWriteMany` claim read-only without changing the claim's access mode.
 - On the claim, the files of `meta-llama/Llama-3.2-1B-Instruct` in a Hugging Face layout, `config.json` plus the weight files, in the directory `llama-3-2-1b-instruct` at the root of the volume. The metadata Job runs as user 65532, so that user must be able to read them. World-readable files work.
 - The [ClusterServingRuntime](../../concepts/runtimes/serving-runtimes.md) `srt-llama-3-2-1b-instruct`. Check with `kubectl get clusterservingruntime srt-llama-3-2-1b-instruct`. If it's missing, apply [`config/runtimes/srt/meta/llama-3-2-1b-instruct-rt.yaml`](https://github.com/ome-projects/ome/blob/main/config/runtimes/srt/meta/llama-3-2-1b-instruct-rt.yaml) from a clone of the OME repository.
 - An amd64 node with an NVIDIA GPU, 10 CPUs and 30 GiB of memory free, which is what the runtime requests.

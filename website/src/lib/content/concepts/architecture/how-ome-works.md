@@ -22,7 +22,7 @@ The manager is OME's core, and OMENative runs inside it. Two optional, alpha com
 
 ## Resources
 
-All of OME's kinds have the API version `ome.io/v1beta1`. OME writes InferenceReplicas and TrafficMaps itself, and you write the rest.
+All of OME's kinds have the API version `ome.io/v1beta1`. An InferenceService creates an InferenceReplica for each OMENative component. You can also create a [standalone InferenceReplica](../omenative/overview.md#standalone-inferencereplicas) when you need one workload without an InferenceService. OME generates TrafficMaps for multi-cluster serving.
 
 | Kind | Scope | Purpose |
 | --- | --- | --- |
@@ -34,7 +34,7 @@ All of OME's kinds have the API version `ome.io/v1beta1`. OME writes InferenceRe
 | [BenchmarkJob](../serving/benchmarks.md) | Namespaced | A genai-bench run against an InferenceService or a URL. |
 | [AutoscalerPolicy](../serving/autoscaler-policy.md) | Namespaced | Since v1.3. Alpha, and off by default. An autoscaling template that InferenceService components attach by name. |
 | [RolloutPolicy](../rollouts-and-traffic/rollout-policy.md) | Namespaced | Since v1.3. Alpha, and off by default. A rollout progression that InferenceService rollout groups refer to. |
-| [InferenceReplica](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-InferenceReplica) | Namespaced | Since v1.3. The workload of one OMENative component, which runs the component's pods as Instances. |
+| [InferenceReplica](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-InferenceReplica) | Namespaced | Since v1.3. An OMENative workload that runs pods as Instances. Created by an InferenceService for one component, or authored directly as a standalone workload. |
 | [AcceleratorQuota](../../guides/operate-ome/accelerator-quota.md) | Cluster | Since v1.3. One entry in a tree of quotas that divides accelerators among teams. |
 | [WorkloadCluster](../../reference/api/ome.v1beta1.md#ome-io-v1beta1-WorkloadCluster) | Cluster | Since v1.3. Alpha, and in development. A cluster that OME can place workloads onto, for multi-cluster serving, which is off by default. |
 | [TrafficMap](../rollouts-and-traffic/traffic-map.md) | Namespaced | Since v1.3. Alpha, and in development. How the traffic of a multi-cluster InferenceService splits across clusters. |

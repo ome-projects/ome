@@ -1,0 +1,13 @@
+apiVersion: ome.io/v1beta1
+kind: WorkloadCluster
+metadata:
+  name: worker-a
+  labels:
+    docs.ome.io/lab: registration
+spec:
+  clusterSource:
+    kubeConfig:
+      secretRef:
+        name: worker-a-kubeconfig
+        namespace: ome
+      key: kubeconfig

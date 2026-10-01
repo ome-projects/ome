@@ -152,8 +152,10 @@ intermediate steps, evaluated at full traffic: an analysis gate validates at
 explicit promote, and a timed pause holds for its duration. Once the gate
 passes, completion additionally waits out the
 [drain window](#scaledowndelayseconds-the-drain-window). The Component reports
-phase `Promoting` from the moment 100% traffic shifts until completion, then
-`Stable`.
+`Paused` while the final gate waits, then `Promoting` while any completion
+delay remains, and `Stable` when complete. The current CLI still requires
+`Promoting` for a last-step promote; see
+[Final-step promotion](/ome/docs/tasks/promote-or-rollback-a-canary/#final-step-promotion).
 
 ## scaleDownDelaySeconds: the drain window
 
@@ -162,8 +164,8 @@ per step): the wait, in seconds, between shifting 100% of traffic to the new
 revision and scaling the old revision's pods down, so in-flight requests on the
 old revision can drain.
 
-The window is anchored to the moment 100% traffic actually shifts (entering
-`Promoting`), not to when the final step was entered — on slow capacity the
+The window is anchored to the moment 100% traffic actually shifts, not to
+when the final step was entered — on slow capacity the
 final step is entered well before traffic moves, and measuring from step entry
 could consume the whole window before cutover. It runs alongside the final
 step's gate: the rollout completes only when the gate has passed **and** the
@@ -174,8 +176,8 @@ window has elapsed. Unset, zero, or negative values complete immediately.
 `canary.readyTimeout` bounds how long a step's **capacity gate** may stay
 unsatisfied before the canary is marked `Failed`. The same resolved value also
 serves as the stall timeout for an analysis gate that cannot read health
-(inconclusive samples). In the capacity case, no traffic has shifted when the
-timeout fires — the stable revision keeps serving.
+(inconclusive samples). A capacity timeout leaves the step's recorded traffic
+unchanged, including when capacity drops after the step has started serving.
 
 The effective value is resolved in precedence order:
 
@@ -193,9 +195,11 @@ When none of the three yields a positive duration, the escalation is disabled:
 the capacity gate waits indefinitely and never parks the canary `Failed` on
 capacity wait alone.
 
-The timeout clock is anchored to the start of the **current capacity wait**
-(entering `Pending`), so a long bake on an earlier gate does not eat the
-budget, and a capacity dip mid-step starts a fresh window.
+The timeout clock is anchored to the start of the **current capacity wait**,
+recorded in `status.components.<component>.canary.capacityWaitSince` and
+cleared once capacity is met. A later capacity dip starts a fresh window.
+A serving step keeps its phase, recorded traffic and warm-up/bake anchors
+through the dip, so recovery doesn't restart the soak.
 
 `Failed` is a parked hold, not an automatic revert: the controller re-checks on
 a slow five-minute heartbeat and stable keeps serving until you act. Recover by
@@ -203,6 +207,15 @@ pushing a fixed revision (a genuinely new target re-arms a fresh canary) or by
 aborting with
 [`kubectl ome rollout rollback`](/ome/docs/tasks/promote-or-rollback-a-canary/#roll-back-the-canary),
 which is accepted in the `Failed` phase.
+
+To retry without a new revision after fixing an external cause, use the
+[`ome.io/rollout-resume` annotation](/ome/docs/tasks/promote-or-rollback-a-canary/#retry-the-same-revision).
+Capacity or metrics recovery alone doesn't clear the failed hold.
+
+`status.components.<component>.canary.failed.reason` records `CapacityTimeout`,
+`AnalysisStalled`, or `StableRevisionMissing` when rollback can't find the
+retained stable ControllerRevision. `failed.time` records when the hold began
+and stays unchanged while it remains parked.
 
 ## What admission rejects
 
