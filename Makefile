@@ -110,7 +110,6 @@ docs-drift: ## 📚 Report Hugo pages that changed since website/ rewrote them
 generate-apiref: genref ## 📚 Generate API reference documentation
 	@echo "📚 Generating API reference documentation..."
 	@cd $(PROJECT_DIR)/hack/genref/ && $(GENREF) -o $(PROJECT_DIR)/site/content/en/docs/reference
-	@cd $(PROJECT_DIR)/hack/genref/website && $(GENREF) -c ../config.yaml -o $(PROJECT_DIR)/website/src/lib/content/reference/api
 	@echo "✅ API reference documentation generated"
 
 .PHONY: docs-examples

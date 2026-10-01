@@ -6,7 +6,6 @@ on:
     paths-ignore:
       - '*.md'
       - 'site/**'
-      - 'website/src/lib/content/**'
       - '*.lock'
   issue_comment:
     types: [created]

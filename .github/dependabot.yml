@@ -55,17 +55,6 @@ updates:
       - "documentation"
       - "javascript"
 
-  # NPM dependencies for the redesigned documentation site
-  - package-ecosystem: "npm"
-    directory: "/website"
-    schedule:
-      interval: "weekly"
-      day: "saturday"
-    labels:
-      - "dependencies"
-      - "documentation"
-      - "javascript"
-
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"

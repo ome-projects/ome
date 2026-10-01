@@ -24,6 +24,9 @@ When submitting a pull request:
 5. Fill out the pull request template completely. The template will guide you through providing all necessary information.
 6. Link any related issues using the "Fixes #123" syntax to automatically close them when the PR is merged.
 
+#### Documentation
+The live documentation is the Hugo site in `site/`, so documentation changes go there. The redesigned site that replaces it at launch lives in [ome-projects/ome-docs](https://github.com/ome-projects/ome-docs).
+
 #### Pre-commit check
 **Pre-commit hooks** run these checks automatically on every commit.
 - **General Checks**: Trailing whitespace, end-of-file fixing, YAML/TOML validation, merge conflict detection, large file prevention
