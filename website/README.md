@@ -24,8 +24,5 @@ Pages live in `src/lib/content/`, and `src/lib/config/nav.ts` orders them.
 The Writing docs page, `src/lib/content/contributing/writing-docs.md`,
 covers the syntax and style.
 
-The [documentation refresh plan](DOCUMENTATION_PLAN.md) tracks the current
-source audit, missing reader workflows, and validation required for each batch.
-
 The layout and styles come from
 [smg-docs](https://github.com/smg-project/smg-docs).
