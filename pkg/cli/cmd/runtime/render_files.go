@@ -1,9 +1,9 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/effective"
@@ -132,14 +133,20 @@ func (o *renderOptions) readFileObjects(workloadNamespace string) ([]fileObject,
 }
 
 func (o *renderOptions) decodeFileObjects(path string, data []byte, workloadNamespace string) ([]fileObject, error) {
-	reader := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(data)))
 	var objects []fileObject
 	for {
-		var raw json.RawMessage
-		if err := reader.Decode(&raw); err != nil {
+		document, err := reader.Read()
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return objects, nil
 			}
+			return nil, fmt.Errorf("-f %s: read manifest: %w", path, err)
+		}
+		// Strict conversion rejects duplicate mapping keys, which a plain
+		// conversion would resolve silently to the last value.
+		raw, err := yaml.YAMLToJSONStrict(document)
+		if err != nil {
 			return nil, fmt.Errorf("-f %s: decode manifest: %w", path, err)
 		}
 		if len(raw) == 0 || string(raw) == "null" {

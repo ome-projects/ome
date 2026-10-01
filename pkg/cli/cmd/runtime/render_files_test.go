@@ -183,6 +183,12 @@ func TestRenderFilesFailures(t *testing.T) {
 			contains: "render live view: ",
 		},
 		{
+			name:     "duplicate key",
+			files:    map[string]string{"service.yaml": strings.Replace(renderFileService, "minReplicas: 3", "minReplicas: 3\n    minReplicas: 4", 1)},
+			args:     renderFileArgs,
+			contains: `key "minReplicas" already set in map`,
+		},
+		{
 			name:     "unknown field",
 			files:    map[string]string{"service.yaml": strings.Replace(renderFileService, "minReplicas: 3", "minReplica: 3", 1)},
 			args:     renderFileArgs,
