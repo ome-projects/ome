@@ -16,6 +16,7 @@
 - [Design Details](#design-details)
   - [Render Pipeline](#render-pipeline)
   - [Inputs](#inputs)
+  - [Rendering Every File InferenceService](#rendering-every-file-inferenceservice)
   - [Output Object](#output-object)
   - [Failure Behavior](#failure-behavior)
   - [Implementation Scope](#implementation-scope)
@@ -79,6 +80,9 @@ way to preview the result.
 - Support the live and active (pinned) views of `runtime effective`.
 - Render fully offline from manifest files, so a preview can compare
   two Git revisions without cluster access.
+- In file mode, render every InferenceService in the files in one run,
+  so a preview does not need to know in advance which services a change
+  affects.
 - Reuse exported controller helpers for every step.
 - Keep diagnostic reports allowlisted and unchanged.
 
@@ -95,7 +99,7 @@ way to preview the result.
 
 ### Command Surface
 
-`kubectl ome runtime render ISVC` with these flags:
+`kubectl ome runtime render [ISVC]` with these flags:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -107,15 +111,21 @@ way to preview the result.
 
 With `-f` and `--deploy-config`, the command makes no API request.
 
+`ISVC` is required in cluster mode. With `-f` and no `ISVC`, every
+InferenceService in the files is rendered; see
+[Rendering Every File InferenceService](#rendering-every-file-inferenceservice).
+
 ### User Stories
 
 #### Preview a Runtime Change in a GitOps Pull Request
 
-A pull request edits a ClusterServingRuntime's arguments. CI renders
-each InferenceService that uses it from the base and head revisions,
-with `-f` and `--deploy-config` pointing at the rendered manifests, and
-posts the diff. The reviewer sees every affected component, and sees
-that a service which overrides the argument is unaffected.
+A pull request edits a ClusterServingRuntime's arguments. Its preview
+renders every InferenceService from the base and head revisions, with
+`-f` and `--deploy-config` pointing at the rendered manifests and no
+`ISVC` argument, and posts the diff. The preview never works out which
+services use the runtime: unaffected services render identically and
+drop out of the diff. The reviewer sees every affected component, and
+sees that a service which overrides the argument is unaffected.
 
 #### Check a Deploy Default Change Before Rollout
 
@@ -212,6 +222,28 @@ Runtime resolution uses the same lookup interface as cluster mode.
 
 Both modes parse deploy defaults with `controllerconfig.ParseDeployConfig`.
 
+### Rendering Every File InferenceService
+
+With `-f` and no `ISVC`, the command renders every InferenceService in
+the files, across all namespaces. `-n` only fills in a missing
+namespace, as it does for a single service. Each service goes through
+the same pipeline and the same runtime lookup as a single render, so
+the result for a service equals rendering it by name.
+
+- The output is one `RenderedInferenceServiceList`, sorted by namespace
+  and name, even when the files hold a single service. The shape does
+  not depend on the input count.
+- If any service fails, for example because its runtime is missing
+  from the files, the command reports every failing service on stderr,
+  writes nothing to stdout, and exits `1`. A partial list would make
+  the failed services look unchanged in a diff.
+- Files with no InferenceService are an error, so a wrong path does
+  not produce an empty diff.
+
+Cluster mode still requires `ISVC`. Rendering every service in a
+cluster is out of scope: it needs `list` across namespaces and has no
+preview use yet.
+
 ### Output Object
 
 ```yaml
@@ -241,6 +273,17 @@ components:
 Output is deterministic (no resource versions, UIDs, or status), so two
 renders of the same inputs are byte-identical.
 
+Rendering every file InferenceService wraps the objects in a list:
+
+```yaml
+apiVersion: cli.ome.io/v1alpha1
+kind: RenderedInferenceServiceList
+items:                          # sorted by namespace, then name
+  - kind: RenderedInferenceService
+    metadata: { name: chat, namespace: prod }
+    ...
+```
+
 ### Failure Behavior
 
 | Case | Exit |
@@ -249,6 +292,8 @@ renders of the same inputs are byte-identical.
 | InferenceService, runtime, or pinned revision missing or unreadable | `1` |
 | Deploy defaults missing, Forbidden, or invalid | `1` |
 | `-f` without `--deploy-config`, `--view active` with `-f`, or ambiguous file input | `1` |
+| No `ISVC` without `-f`, or `-f` files with no InferenceService | `1` |
+| Any service fails while rendering every file InferenceService | `1` |
 
 ### Implementation Scope
 
@@ -268,6 +313,7 @@ Planned PRs:
    of the annotation alone.
 3. `runtime render` in cluster mode.
 4. File mode.
+5. Rendering every file InferenceService.
 
 ### Test Plan
 
@@ -283,6 +329,9 @@ existing tests before accepting changes necessary for this enhancement.
   component to `VirtualDeployment` and skip `specdefaults`.
 - `pkg/cli/cmd/runtime`: each failure row, the `--deploy-config`
   override, `--view active`, and golden YAML and JSON outputs.
+- Rendering every file InferenceService: a golden list across two
+  namespaces; each item equals rendering that service by name; one
+  failing service fails the run with nothing on stdout.
 - Integration: TBD, possibly an envtest case comparing a reconciled
   workload's defaulted fields with `render` output.
 
@@ -297,12 +346,14 @@ existing tests before accepting changes necessary for this enhancement.
 - Include accelerator-injected resources? They depend on
   AcceleratorClass and node state, which breaks offline rendering.
   Proposed for alpha: omit them.
-- Is a stderr warning enough for secrets in CI logs, or should
+- Is a stderr warning enough for secrets in shared logs, or should
   non-interactive use require an acknowledgement flag?
 
 ## Implementation History
 
 - 2026-09-28: Provisional OEP-0011.2 created.
+- 2026-10-01: File mode renders every InferenceService when no `ISVC`
+  is given.
 
 ## Drawbacks
 
@@ -324,3 +375,13 @@ existing tests before accepting changes necessary for this enhancement.
    Rejected.
 5. **Controller dry-run endpoint.** New server surface, no offline use.
    Rejected for now.
+6. **The caller lists the services and renders each by name.** The
+   caller would have to parse manifests as `render` does, and to find
+   the services a runtime change affects it would need runtime
+   auto-selection: a second copy of the resolver. Rejected.
+7. **An explicit `--all` flag.** Clearer at the call site, but
+   `kubectl get -f` already reads "no name" as every object in the
+   files. Rejected; revisit if cluster mode gains an all-services form.
+8. **Per-item errors in the list.** Lets a preview show the healthy
+   services, but a reader of the diff can miss a failure. Rejected for
+   alpha.
