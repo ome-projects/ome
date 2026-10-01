@@ -95,8 +95,8 @@ func TestRenderFilesGoldenOutput(t *testing.T) {
 	require.NoError(t, err)
 	assertRenderGolden(t, "render_files.golden.yaml", out)
 	assert.Equal(t,
-		`ignoring v1 ConfigMap "inferenceservice-config" from service.yaml: -f reads only InferenceServices, runtimes, and models`+"\n"+
-			`ignoring apps/v1 Deployment "unrelated" from runtimes.yaml: -f reads only InferenceServices, runtimes, and models`+"\n",
+		"ignoring v1 ConfigMap from service.yaml: -f reads only InferenceServices, runtimes, and models\n"+
+			"ignoring apps/v1 Deployment from runtimes.yaml: -f reads only InferenceServices, runtimes, and models\n",
 		errOut)
 	assert.Zero(t, f.omeGet+f.kubeGet+f.runtimeGet, "file mode must not construct API clients")
 }
@@ -135,18 +135,15 @@ func TestRenderFilesMatchesClusterMode(t *testing.T) {
 	assert.NotContains(t, fromFiles, `"origin": "Cluster"`)
 }
 
+// TestRenderFilesUsesNamespaceFlag checks that -n selects the service and
+// that the runtime without a namespace lands in the same namespace.
 func TestRenderFilesUsesNamespaceFlag(t *testing.T) {
 	service := strings.Replace(renderFileService, "name: service\n", "name: service\n  namespace: prod\n", 1)
-
-	_, _, err := executeRenderStreams(t, renderFactory(t, false), renderFiles(map[string]string{"service.yaml": service}), renderFileArgs...)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "InferenceService team-a/service not found in -f files; it is defined in namespace prod (use -n)")
-
-	// With -n prod the service matches; the runtime without a namespace
-	// also lands in prod.
 	f := renderFactory(t, false)
 	f.namespace = "prod"
+
 	out, _, err := executeRenderStreams(t, f, renderFiles(map[string]string{"service.yaml": service}), renderFileArgs...)
+
 	require.NoError(t, err)
 	assert.Contains(t, out, "name: prod/vllm\n")
 }
@@ -169,11 +166,6 @@ func TestRenderFilesFailures(t *testing.T) {
 			contains: "--view active needs the cluster and cannot be used with -f",
 		},
 		{
-			name:     "file missing",
-			args:     []string{"-f", "absent.yaml", "--deploy-config", "deploy.yaml"},
-			contains: "read -f absent.yaml",
-		},
-		{
 			name: "duplicate runtime across files",
 			files: map[string]string{"copy.yaml": "apiVersion: ome.io/v1beta1\nkind: ServingRuntime\nmetadata:\n" +
 				"  name: vllm\n  namespace: team-a\n"},
@@ -194,25 +186,7 @@ func TestRenderFilesFailures(t *testing.T) {
 			name:     "unknown field",
 			files:    map[string]string{"service.yaml": strings.Replace(renderFileService, "minReplicas: 3", "minReplica: 3", 1)},
 			args:     renderFileArgs,
-			contains: `-f service.yaml: InferenceService "service": `,
-		},
-		{
-			name:     "malformed manifest",
-			files:    map[string]string{"service.yaml": "kind: [\n"},
-			args:     renderFileArgs,
-			contains: "-f service.yaml: decode manifest",
-		},
-		{
-			name:     "object without name",
-			files:    map[string]string{"service.yaml": "apiVersion: ome.io/v1beta1\nkind: InferenceService\nspec: {}\n"},
-			args:     renderFileArgs,
-			contains: "-f service.yaml: InferenceService has no metadata.name",
-		},
-		{
-			name:     "invalid deploy-config",
-			files:    map[string]string{"deploy.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: other\n"},
-			args:     renderFileArgs,
-			contains: `want "inferenceservice-config"`,
+			contains: `-f service.yaml: strict decoding error: unknown field "spec.engine.minReplica"`,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -222,14 +222,7 @@ func (o *renderOptions) run(ctx context.Context, f factory.Factory) error {
 		if live == nil {
 			return fmt.Errorf("render live view: %w", liveRuntimeError(evidence.state))
 		}
-		if live.Model != nil {
-			sources = append(sources, renderedSource{
-				Kind: live.Model.Kind, Name: objectName(live.Model.Namespace, live.Model.Name), Origin: renderOriginCluster,
-			})
-		}
-		sources = append(sources, renderedSource{
-			Kind: live.Runtime.Kind, Name: objectName(live.Runtime.Namespace, live.Runtime.Name), Origin: renderOriginCluster,
-		})
+		sources = append(sources, liveSources(live, renderOriginCluster)...)
 		components = live.Components
 	}
 	sources = append(sources, deployConfigSource)
@@ -263,6 +256,19 @@ func (o *renderOptions) decodeDeployConfigFile(path string) (*controllerconfig.D
 		return nil, fmt.Errorf("--deploy-config %s: %w", path, err)
 	}
 	return deployConfig, nil
+}
+
+// liveSources lists the model, if any, and the runtime the live view merged.
+func liveSources(live *effective.LiveConfiguration, origin string) []renderedSource {
+	var sources []renderedSource
+	if live.Model != nil {
+		sources = append(sources, renderedSource{
+			Kind: live.Model.Kind, Name: objectName(live.Model.Namespace, live.Model.Name), Origin: origin,
+		})
+	}
+	return append(sources, renderedSource{
+		Kind: live.Runtime.Kind, Name: objectName(live.Runtime.Namespace, live.Runtime.Name), Origin: origin,
+	})
 }
 
 func liveRuntimeError(state *effective.RuntimeState) error {

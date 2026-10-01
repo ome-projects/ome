@@ -7,37 +7,37 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
-	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/yaml"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 )
 
-// fileObjectKinds are the ome.io/v1beta1 kinds file mode reads. The value
-// reports whether the kind is namespaced.
-var fileObjectKinds = map[string]bool{
-	"InferenceService":      true,
-	"ServingRuntime":        true,
-	"ClusterServingRuntime": false,
-	"BaseModel":             true,
-	"ClusterBaseModel":      false,
-}
+// fileDecoder knows only the kinds file mode reads, so every other object
+// decodes as not registered and is skipped. Strict decoding rejects unknown
+// fields instead of dropping them.
+var fileDecoder = func() k8sruntime.Decoder {
+	scheme := k8sruntime.NewScheme()
+	scheme.AddKnownTypes(v1beta1.SchemeGroupVersion,
+		&v1beta1.InferenceService{}, &v1beta1.ServingRuntime{}, &v1beta1.ClusterServingRuntime{},
+		&v1beta1.BaseModel{}, &v1beta1.ClusterBaseModel{})
+	return serializer.NewCodecFactory(scheme, serializer.EnableStrict).UniversalDeserializer()
+}()
+
+var fileClusterScopedKinds = map[string]bool{"ClusterServingRuntime": true, "ClusterBaseModel": true}
 
 type fileObject struct {
 	object ctrlclient.Object
 	kind   string
-	path   string
 }
 
 func (o fileObject) key() string {
@@ -83,17 +83,8 @@ func (o *renderOptions) runFiles(ctx context.Context, f factory.Factory) error {
 	sources := []renderedSource{{
 		Kind: "InferenceService", Name: isvc.Namespace + "/" + isvc.Name, Origin: renderOriginFile,
 	}}
-	if live.Model != nil {
-		sources = append(sources, renderedSource{
-			Kind: live.Model.Kind, Name: objectName(live.Model.Namespace, live.Model.Name), Origin: renderOriginFile,
-		})
-	}
-	sources = append(sources,
-		renderedSource{
-			Kind: live.Runtime.Kind, Name: objectName(live.Runtime.Namespace, live.Runtime.Name), Origin: renderOriginFile,
-		},
-		renderedSource{Kind: "ConfigMap", Name: o.deployConfigPath, Origin: renderOriginFile},
-	)
+	sources = append(sources, liveSources(live, renderOriginFile)...)
+	sources = append(sources, renderedSource{Kind: "ConfigMap", Name: o.deployConfigPath, Origin: renderOriginFile})
 	rendered := buildRendered(isvc, deployConfig, renderViewLive, sources, live.Components)
 	return writeRendered(o.Out, o.output, rendered)
 }
@@ -141,11 +132,11 @@ func (o *renderOptions) readFileObjects(workloadNamespace string) ([]fileObject,
 }
 
 func (o *renderOptions) decodeFileObjects(path string, data []byte, workloadNamespace string) ([]fileObject, error) {
-	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+	reader := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
 	var objects []fileObject
 	for {
 		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
+		if err := reader.Decode(&raw); err != nil {
 			if errors.Is(err, io.EOF) {
 				return objects, nil
 			}
@@ -154,69 +145,34 @@ func (o *renderOptions) decodeFileObjects(path string, data []byte, workloadName
 		if len(raw) == 0 || string(raw) == "null" {
 			continue
 		}
-		var header struct {
-			metav1.TypeMeta `json:",inline"`
-			Metadata        struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-		}
-		if err := json.Unmarshal(raw, &header); err != nil {
-			return nil, fmt.Errorf("-f %s: decode manifest: %w", path, err)
-		}
-		namespaced, known := fileObjectKinds[header.Kind]
-		if !known || header.APIVersion != v1beta1.SchemeGroupVersion.String() {
-			fmt.Fprintf(o.ErrOut, "ignoring %s %s %q from %s: -f reads only InferenceServices, runtimes, and models\n",
-				header.APIVersion, header.Kind, header.Metadata.Name, path)
+		decoded, gvk, err := fileDecoder.Decode(raw, nil, nil)
+		if k8sruntime.IsNotRegisteredError(err) {
+			fmt.Fprintf(o.ErrOut, "ignoring %s %s from %s: -f reads only InferenceServices, runtimes, and models\n",
+				gvk.GroupVersion(), gvk.Kind, path)
 			continue
 		}
-		object := newFileObject(header.Kind)
-		if err := yaml.UnmarshalStrict(raw, object); err != nil {
-			return nil, fmt.Errorf("-f %s: %s %q: %w", path, header.Kind, header.Metadata.Name, err)
+		if err != nil {
+			return nil, fmt.Errorf("-f %s: %w", path, err)
 		}
+		object := decoded.(ctrlclient.Object)
 		if object.GetName() == "" {
-			return nil, fmt.Errorf("-f %s: %s has no metadata.name", path, header.Kind)
+			return nil, fmt.Errorf("-f %s: %s has no metadata.name", path, gvk.Kind)
 		}
 		switch {
-		case !namespaced:
+		case fileClusterScopedKinds[gvk.Kind]:
 			object.SetNamespace("")
 		case object.GetNamespace() == "":
 			object.SetNamespace(workloadNamespace)
 		}
-		objects = append(objects, fileObject{object: object, kind: header.Kind, path: path})
+		objects = append(objects, fileObject{object: object, kind: gvk.Kind})
 	}
 }
 
-func newFileObject(kind string) ctrlclient.Object {
-	switch kind {
-	case "InferenceService":
-		return &v1beta1.InferenceService{}
-	case "ServingRuntime":
-		return &v1beta1.ServingRuntime{}
-	case "ClusterServingRuntime":
-		return &v1beta1.ClusterServingRuntime{}
-	case "BaseModel":
-		return &v1beta1.BaseModel{}
-	default:
-		return &v1beta1.ClusterBaseModel{}
-	}
-}
-
-func selectFileInferenceService(objects []fileObject, name, workloadNamespace string) (*v1beta1.InferenceService, error) {
-	var elsewhere []string
+func selectFileInferenceService(objects []fileObject, name, namespace string) (*v1beta1.InferenceService, error) {
 	for _, object := range objects {
-		isvc, ok := object.object.(*v1beta1.InferenceService)
-		if !ok || isvc.Name != name {
-			continue
-		}
-		if isvc.Namespace == workloadNamespace {
+		if isvc, ok := object.object.(*v1beta1.InferenceService); ok && isvc.Name == name && isvc.Namespace == namespace {
 			return isvc, nil
 		}
-		elsewhere = append(elsewhere, isvc.Namespace)
 	}
-	if len(elsewhere) > 0 {
-		sort.Strings(elsewhere)
-		return nil, fmt.Errorf("InferenceService %s/%s not found in -f files; it is defined in namespace %s (use -n)",
-			workloadNamespace, name, strings.Join(elsewhere, ", "))
-	}
-	return nil, fmt.Errorf("InferenceService %s/%s not found in -f files", workloadNamespace, name)
+	return nil, fmt.Errorf("InferenceService %s/%s not found in -f files", namespace, name)
 }
