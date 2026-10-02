@@ -56,11 +56,14 @@ go test ./test/integration/... -v
 
 ## Status
 
-The placement loop is live end to end: `PreFilter` best-fits and
-pins the gang's domain, `Filter` enforces it, `Permit` gates the gang until all
-members are present, and `Unreserve` unwinds a half-formed gang. `Reserve` claims
-the gang's whole-node capacity in its pinned domain so two gangs can't race into
-one and over-commit it. Gang membership + size come from the standard
+The placement loop is live end to end: `PreFilter` proves which domains can hold
+the complete gang and normally best-fit-pins one. When a gang has a hard topology
+spread constraint, it instead exposes every feasible domain so the framework's
+regular filters can narrow the candidates; `Reserve` then pins the selected
+node's domain. `Permit` gates the gang until all members are present, and
+`Unreserve` unwinds a half-formed gang. `Reserve` claims the gang's remaining
+whole-node capacity so two gangs can't race into one and over-commit it. Gang
+membership + size come from the standard
 scheduler-plugins `PodGroup`; the domain label is declared per-workload via a
 configured PodGroup annotation key; and node free-ness is inferred from the gang
 pod's own resource requests. The OME chart maps that generic setting to
@@ -74,8 +77,8 @@ reaching the gate) are turned into explicit activations. `NodeResourcesFit` supp
 node-level `MostAllocated` packing. Placement
 decisions, gate outcomes, unwinds, and the count of pinned groups are exported as
 `ome_scheduler_*` metrics on the
-scheduler's `/metrics` endpoint. Still ahead: replica spreading across domains
-for fault isolation, and topology-aware preemption.
+scheduler's `/metrics` endpoint. Required replica spreading composes with the
+built-in PodTopologySpread filter; topology-aware preemption is still ahead.
 
 ## Version policy
 

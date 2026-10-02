@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -11,11 +12,9 @@ import (
 )
 
 // OME renders topologySpread as a standard DoNotSchedule constraint on each
-// gang's anchor (leader) pod — the scheduler carries NO spread logic of its
-// own. These tests prove the plugin's existing machinery absorbs that
-// constraint: gangpack best-fit-pins a packed domain, PodTopologySpread's
-// Filter (kept enabled for hard constraints) vetoes it, PostFilter remembers
-// the failed domain, and the retry re-plans into a compatible one.
+// gang's anchor (leader) pod. GangPack does not duplicate that logic: it offers
+// every whole-gang-feasible domain to the framework, PodTopologySpread filters
+// the candidates, and Reserve pins the gang to the selected node's domain.
 
 // cubeLabelKey is the coarser fault-domain label the split-key test spreads
 // across while co-locating by domainLabelKey (the TPU shape: gang-sized
@@ -55,11 +54,10 @@ func spreadLeaderPod(name, ns, pgName, spreadKey string, when v1.UnsatisfiableCo
 }
 
 // spreadWorkerPod mirrors the worker's spread-relevant surface: no
-// constraint of its own. Under this scheduler the gang PIN is what
-// co-locates workers with their leader (the rendered worker→leader
-// affinity is defense-in-depth for non-gang schedulers and is exercised
-// by the controller-side suites); the TSC-gated leader decides the fault
-// domain because only leaders match the constraint's selector.
+// constraint of its own. GangPack makes an unconstrained member wait for its
+// hard-spread anchor, then the gang PIN co-locates it with that leader (the
+// rendered worker→leader affinity is defense-in-depth for non-gang schedulers
+// and is exercised by the controller-side suites).
 func spreadWorkerPod(name, ns, pgName string) *v1.Pod {
 	p := makeGangPod(name, ns, pgName)
 	p.Labels["runner"] = "worker"
@@ -89,6 +87,15 @@ func placeTSCGang(t *testing.T, tc *testContext, ns, pgName, spreadKey, domainLa
 	}
 	n0 := waitForPodBound(t, tc, ns, pgName+"-0", 60*time.Second)
 	n1 := waitForPodBound(t, tc, ns, pgName+"-1", 60*time.Second)
+	events, err := tc.ClientSet.CoreV1().Events(ns).List(tc.Ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list events for %s: %v", pgName, err)
+	}
+	for _, event := range events.Items {
+		if event.InvolvedObject.Name == pgName+"-0" && strings.Contains(event.Message, "gang reservation released after all candidate nodes were filtered") {
+			t.Fatalf("leader %s committed before topology-spread filtering: %s", pgName+"-0", event.Message)
+		}
+	}
 	if labelOf(n0) != labelOf(n1) {
 		t.Fatalf("gang %s split across %s values %s/%s", pgName, domainLabel, labelOf(n0), labelOf(n1))
 	}
@@ -118,6 +125,49 @@ func TestTSCSpreadsGangsAcrossCubes(t *testing.T) {
 	c1 := placeTSCGang(t, tc, ns, "v1", cubeLabelKey, cubeLabelKey)
 	if c0 == c1 {
 		t.Fatalf("both gangs in cube %q — the leader constraint did not spread on the gang scheduler", c0)
+	}
+}
+
+// TestTSCNodeGranularityFiltersBeforeGangPin proves that the spread topology
+// need not match GangPack's co-location topology. Each hostname is a spread
+// domain, while each rack remains a two-node gang domain. Existing anchors on
+// both rack-a nodes make every rack-a candidate violate maxSkew; the first gang
+// commitment must therefore be made directly in rack b, without a PostFilter
+// unwind/retry through rack a.
+func TestTSCNodeGranularityFiltersBeforeGangPin(t *testing.T) {
+	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
+	defer tc.teardown(t)
+
+	const ns = "tsc-hostnames"
+	createNamespace(t, tc, ns)
+	for _, n := range []struct{ name, rack string }{
+		{"th-a1", "a"}, {"th-a2", "a"}, {"th-b1", "b"}, {"th-b2", "b"},
+	} {
+		node := makeGPUNode(n.name, n.rack, 1)
+		node.Labels[v1.LabelHostname] = n.name
+		if _, err := tc.ClientSet.CoreV1().Nodes().Create(tc.Ctx, node, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create node %s: %v", n.name, err)
+		}
+	}
+	for _, node := range []string{"th-a1", "th-a2"} {
+		seed := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "seed-" + node,
+				Namespace: ns,
+				Labels:    map[string]string{"app": "tsc-svc", "runner": "leader"},
+			},
+			Spec: v1.PodSpec{
+				NodeName:   node,
+				Containers: []v1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.10"}},
+			},
+		}
+		if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, seed, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create seed on %s: %v", node, err)
+		}
+	}
+
+	if rack := placeTSCGang(t, tc, ns, "node-spread", v1.LabelHostname, domainLabelKey); rack != "b" {
+		t.Fatalf("node-level spread gang landed in rack %q, want b", rack)
 	}
 }
 

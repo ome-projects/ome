@@ -1,6 +1,7 @@
 // Package gangpack is the OME placement plugin: topology-aware gang placement and
-// bin-packing. PreFilter chooses and pins a gang's domain; Filter enforces it.
-// The core (domain accounting, best-fit, pins) lives in the pure
+// bin-packing. PreFilter identifies whole-gang-feasible domains and normally pins
+// one; hard-spread gangs defer the pin until Reserve sees the node that survived
+// the framework filters. The core (domain accounting, best-fit, pins) lives in the pure
 // topology/placement packages; this package wires the live scheduler state onto
 // them.
 package gangpack
@@ -120,12 +121,13 @@ func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework
 // Name returns the plugin's registered name.
 func (g *GangPack) Name() string { return Name }
 
-// PreFilter chooses and pins the gang's domain. For a resolvable gang it best-fits
-// a domain over the live node snapshot, records the pin (which Filter enforces),
-// and narrows downstream candidates to that domain's nodes. Standalone pods
-// continue so Filter can protect forming-gang reservations; labeled gang pods
-// fail closed when their PodGroup cannot be resolved. Unschedulable when a real
-// gang fits in no domain.
+// PreFilter plans the gang's domain. Most gangs best-fit and pin immediately.
+// For an unplaced gang whose current anchor carries a hard topology spread
+// constraint, it exposes the union of every whole-gang-feasible domain instead;
+// the framework's regular filters apply the constraint and Reserve pins the
+// domain of the selected node. Standalone pods continue so Filter can protect
+// forming-gang reservations; labeled gang pods fail closed when their PodGroup
+// cannot be resolved. Unschedulable when a real gang fits in no domain.
 func (g *GangPack) PreFilter(_ context.Context, state framework.CycleState, pod *v1.Pod, nodes []framework.NodeInfo) (*framework.PreFilterResult, *framework.Status) {
 	ns, name, isMember := podGroupNameOf(pod)
 	if !isMember {
@@ -243,6 +245,15 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 	if status != nil {
 		return nil, status
 	}
+	// OME puts hard spreading on one anchor (normally the leader). If an
+	// unconstrained sibling ran first it could commit the gang before that anchor's
+	// PodTopologySpread filter had a say. Let the anchor choose from all feasible
+	// domains; Permit activation will wake this member after the anchor is placed.
+	if sibling, blocked := hardSpreadAnchorBlocked(pod, templates[1:]); blocked {
+		klog.V(4).InfoS("gangpack.pinGang.spread_anchor_wait", "gang", gang.key, "sibling", klog.KObj(sibling))
+		return nil, framework.NewStatus(framework.Unschedulable,
+			"waiting for gang spread anchor "+sibling.Namespace+"/"+sibling.Name+" to be placed")
+	}
 	// A required affinity to a sibling that is neither bound nor assumed fails on
 	// every node, so planning now would only fail Filter and record the chosen
 	// domain as failed. Yield without a pin; the sibling's own Permit activation
@@ -294,6 +305,9 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 				"pinned domain "+domain+" cannot fit all remaining gang members "+gang.key)
 		}
 	}
+	if !pinned && placement.count == 0 && hasHardTopologySpread(pod) {
+		return g.deferDomainPin(state, nodes, gang, templates, free, need)
+	}
 
 	if !pinned {
 		d, id, status := g.planDomain(nodes, gang, placement, free, need)
@@ -312,6 +326,76 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 	}
 	writePin(state, domain, gang, commitment)
 	klog.V(4).InfoS("gangpack.pinGang.result", "gang", gang.key, "domain", domain, "narrowedNodes", candidates.Len())
+	return &framework.PreFilterResult{NodeNames: candidates}, nil
+}
+
+// hasHardTopologySpread identifies constraints that participate in Filter. Soft
+// ScheduleAnyway constraints affect only scoring and do not need domain-choice
+// deferral (OME's packing profile intentionally disables that built-in score).
+func hasHardTopologySpread(pod *v1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, constraint := range pod.Spec.TopologySpreadConstraints {
+		if constraint.WhenUnsatisfiable == v1.DoNotSchedule {
+			return true
+		}
+	}
+	return false
+}
+
+func hardSpreadAnchorBlocked(current *v1.Pod, unplaced []*v1.Pod) (*v1.Pod, bool) {
+	if hasHardTopologySpread(current) {
+		return nil, false
+	}
+	for _, sibling := range unplaced {
+		if sibling != nil && !samePodIdentity(sibling, current) && hasHardTopologySpread(sibling) {
+			return sibling, true
+		}
+	}
+	return nil, false
+}
+
+// deferDomainPin returns candidate nodes from every domain that can fit the
+// entire gang. PodTopologySpread and the other framework filters can therefore
+// veto nodes or whole spread domains before GangPack makes a reservation. The
+// scheduler's selected node determines the final gang domain in Reserve.
+func (g *GangPack) deferDomainPin(state framework.CycleState, nodes []framework.NodeInfo, gang gangInfo, templates []*v1.Pod, free topology.FreeByDomain, need int) (*framework.PreFilterResult, *framework.Status) {
+	nodesByDomain := nodeNamesByDomain(nodes, gang.topologyKey)
+	available := g.pins.WithoutReservedDomains(gang.topologyKey, free, nodesByDomain)
+	choice, hadFailed := g.withoutFailedDomains(gang, available)
+	if _, fits := topology.BestFit(choice, need); !fits && hadFailed {
+		g.clearFailedDomains(gang)
+		choice = available
+	}
+	if _, fits := topology.BestFit(choice, need); !fits {
+		gangPinTotal.WithLabelValues("no_fit").Inc()
+		return nil, framework.NewStatus(framework.Unschedulable, "no domain has room for gang "+gang.key)
+	}
+
+	candidates := sets.New[string]()
+	plannedFree := make(topology.FreeByDomain)
+	plannedNodes := make(map[string][]string)
+	for domain, capacity := range choice {
+		if capacity < need {
+			continue
+		}
+		domainNodes := nodeInfosInDomain(nodes, gang.topologyKey, domain)
+		domainCandidates := matchingCandidateNodesForNeed(domainNodes, gang.topologyKey, domain, templates, need)
+		if domainCandidates.Len() == 0 {
+			continue
+		}
+		candidates.Insert(domainCandidates.UnsortedList()...)
+		plannedFree[domain] = capacity
+		plannedNodes[domain] = append([]string(nil), nodesByDomain[domain]...)
+	}
+	if candidates.Len() == 0 {
+		gangPinTotal.WithLabelValues("no_fit").Inc()
+		return nil, framework.NewStatus(framework.Unschedulable, "no domain has candidate nodes for gang "+gang.key)
+	}
+	writeDeferredPin(state, &deferredPinState{gang: gang, need: need, free: plannedFree, nodesByDomain: plannedNodes})
+	klog.V(4).InfoS("gangpack.pinGang.deferred", "gang", gang.key, "topologyKey", gang.topologyKey,
+		"domains", fmt.Sprintf("%v", plannedFree), "candidateNodes", candidates.Len())
 	return &framework.PreFilterResult{NodeNames: candidates}, nil
 }
 

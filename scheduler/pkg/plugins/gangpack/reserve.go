@@ -10,23 +10,55 @@ import (
 	"k8s.io/kube-scheduler/framework"
 
 	"sigs.k8s.io/ome/scheduler/pkg/placement"
+	"sigs.k8s.io/ome/scheduler/pkg/topology"
 )
 
-// Reserve drains one whole node from the gang's domain reservation: this member
-// has now been assigned a real node (PreFilter pinned the domain and reserved the
-// gang's full capacity there; Filter kept it in-domain), so it becomes live
-// occupancy in the snapshot and its reserved slot is handed off via Place. That
-// hand-off is what stops two gangs racing into one domain — the reservation holds
-// the not-yet-placed capacity, and draining it as members land avoids
-// double-counting against the snapshot. A pod that is not a pinned gang member
-// reserves nothing.
-func (g *GangPack) Reserve(_ context.Context, state framework.CycleState, _ *v1.Pod, _ string) *framework.Status {
-	if pin := readPin(state); pin != nil {
-		_, drained := g.pins.PlaceIf(pin.gang.key, pin.commitment)
-		if drained {
-			g.clearFailedDomains(pin.gang)
-			g.activateReservationBlocked()
+// Reserve commits a deferred hard-spread plan to the selected node's domain, if
+// PreFilter did not pin it already, then drains one whole node from the gang's
+// reservation. The member becomes live occupancy in the snapshot and its
+// reserved slot is handed off via Place. That hand-off is what stops two gangs
+// racing into one domain — the reservation holds the not-yet-placed capacity,
+// and draining it as members land avoids double-counting against the snapshot. A
+// pod that is not a pinned or deferred gang member reserves nothing.
+func (g *GangPack) Reserve(_ context.Context, state framework.CycleState, _ *v1.Pod, nodeName string) *framework.Status {
+	pin := readPin(state)
+	if pin == nil {
+		plan := readDeferredPin(state)
+		if plan == nil {
+			return nil
 		}
+		domain := ""
+		for candidateDomain, names := range plan.nodesByDomain {
+			for _, name := range names {
+				if name == nodeName {
+					domain = candidateDomain
+					break
+				}
+			}
+			if domain != "" {
+				break
+			}
+		}
+		if domain == "" || plan.free[domain] < plan.need {
+			return framework.NewStatus(framework.Error, "selected node is outside the deferred gang plan")
+		}
+		selectedFree := topology.FreeByDomain{domain: plan.free[domain]}
+		selectedNodes := map[string][]string{domain: plan.nodesByDomain[domain]}
+		chosen, commitment, ok := g.pins.ChooseForOwnerInTopologyOnNodes(plan.gang.key, plan.gang.uid,
+			plan.gang.topologyKey, selectedFree, selectedNodes, plan.need)
+		if !ok || chosen != domain {
+			return framework.NewStatus(framework.Error, "selected gang domain became unavailable before Reserve")
+		}
+		writePin(state, domain, plan.gang, commitment)
+		pin = readPin(state)
+		gangPinTotal.WithLabelValues("pinned_after_filter").Inc()
+		pinnedGroups.Set(float64(g.pins.Len()))
+	}
+
+	_, drained := g.pins.PlaceIf(pin.gang.key, pin.commitment)
+	if drained {
+		g.clearFailedDomains(pin.gang)
+		g.activateReservationBlocked()
 	}
 	return nil
 }
