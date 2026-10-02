@@ -328,7 +328,7 @@ func classify(snap *snapshot.ClusterSnapshot, cfg *config.Config, w *snapshot.Wo
 		candidate.AdvisoryReason = reason
 		return candidate, true
 	}
-	if inst.TotalGPUs == 0 {
+	if inst.TotalTPUs > 0 {
 		candidate.AdvisoryReason = policy.AdvisoryAcceleratorPlacementUnmodeled
 		return candidate, true
 	}

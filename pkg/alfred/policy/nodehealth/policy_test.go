@@ -548,3 +548,23 @@ func TestTPUInstanceOnFlaggedNodeIsReportedButNotExecutable(t *testing.T) {
 		})
 	}
 }
+
+func TestMixedGPUAndTPUInstanceIsNotExecutable(t *testing.T) {
+	snap := testutil.NewSnapshot().
+		WithNode("source", "h100", 8, testutil.NodeUnhealthy()).
+		WithNode("target", "h100", 8).
+		WithInstance("prod/mixed", v1beta1.EngineComponent, constants.OMENative, "source", 1).
+		Build()
+	// Surge planning places only the GPU footprint; the TPU chips must keep
+	// the finding advisory even though the GPUs alone would fit.
+	inst := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "mixed"}].
+		Components[v1beta1.EngineComponent].Instances[0]
+	inst.TotalTPUs = 8
+	inst.Pods[0].TPUs = 8
+
+	got := findings(evaluate(t, snap, config.Default()))
+	if len(got) != 1 || got[0].Executable ||
+		got[0].AdvisoryReason != policy.AdvisoryAcceleratorPlacementUnmodeled {
+		t.Fatalf("findings = %+v, want one non-executable %s finding", got, policy.AdvisoryAcceleratorPlacementUnmodeled)
+	}
+}
