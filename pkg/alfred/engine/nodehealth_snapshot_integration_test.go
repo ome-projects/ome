@@ -184,7 +184,7 @@ func TestOwnerResolvedMalformedOMEPodPreventsFalseNodeDrained(t *testing.T) {
 			t.Fatalf("orphan candidates = %+v, want one remediation marker", orphanCandidates)
 		}
 		orphanMarker := orphanCandidates[0].Remediation
-		if len(orphanMarker.Workloads) != 0 || !orphanMarker.OMEGPUOccupantsPresent {
+		if len(orphanMarker.Workloads) != 0 || !orphanMarker.OMEAcceleratorOccupantsPresent {
 			t.Fatalf("orphan remediation marker = %+v", orphanMarker)
 		}
 
@@ -202,8 +202,151 @@ func TestOwnerResolvedMalformedOMEPodPreventsFalseNodeDrained(t *testing.T) {
 		}
 		orphanRecord, ok := nodeRecord(t, orphanReportClient, nodeName)
 		if !ok || orphanRecord.DrainedAt != nil || len(orphanRecord.Workloads) != 0 ||
-			!orphanRecord.OMEGPUOccupantsPresent {
+			!orphanRecord.OMEAcceleratorOccupantsPresent {
 			t.Fatalf("orphan node remediation record = %+v, present=%t", orphanRecord, ok)
 		}
 	})
+}
+
+func TestTPUOccupantPreventsFalseNodeDrainedForMaintenance(t *testing.T) {
+	const nodeName = "tpu-node"
+	workloadKey := types.NamespacedName{Namespace: "prod", Name: "tpu-svc"}
+	mode := constants.OMENative
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName, UID: "tpu-node-uid"},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule,
+			}},
+		},
+		Status: corev1.NodeStatus{
+			Allocatable: corev1.ResourceList{"google.com/tpu": resource.MustParse("8")},
+		},
+	}
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Namespace: workloadKey.Namespace, Name: workloadKey.Name, UID: "tpu-isvc-uid"},
+		Spec: v1beta1.InferenceServiceSpec{
+			DeploymentMode: &mode,
+			Engine:         &v1beta1.EngineSpec{},
+		},
+	}
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  workloadKey.Namespace,
+			Name:       "tpu-svc-engine",
+			UID:        "tpu-ir-uid",
+			Generation: 1,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: v1beta1.SchemeGroupVersion.String(),
+				Kind:       "InferenceService",
+				Name:       workloadKey.Name,
+				UID:        isvc.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: v1beta1.InferenceReplicaSpec{
+			ParentRef: &v1beta1.ParentReference{Name: workloadKey.Name},
+			Component: v1beta1.EngineComponent,
+			Runners:   []v1beta1.Runner{{Name: v1beta1.RunnerNameDefault, Size: 1}},
+		},
+		Status: v1beta1.InferenceReplicaStatus{
+			ObservedGeneration: 1,
+			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{
+				Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+				RunningRevision: "rev-a", PodCount: 1, ServingPodCount: 1,
+				AvailablePodCount: 1, Admitted: true,
+			}},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: workloadKey.Namespace,
+			Name:      "tpu-svc-engine-0",
+			Labels: map[string]string{
+				constants.InferenceServicePodLabelKey: workloadKey.Name,
+				constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+				"ome.io/managed-by":                   "OMENative",
+				"ome.io/instance-index":               "0",
+				"ome.io/instance-incarnation":         "1",
+				"ome.io/runner":                       string(v1beta1.RunnerNameDefault),
+				"ome.io/pod-ordinal":                  "0",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: v1beta1.SchemeGroupVersion.String(),
+				Kind:       "InferenceReplica",
+				Name:       ir.Name,
+				UID:        ir.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+			Containers: []corev1.Container{{
+				Name: "runner",
+				Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+					"google.com/tpu": resource.MustParse("8"),
+				}},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, isvc, ir, pod).Build()
+	cordoned := config.MaintenanceTrigger{Name: "cordoned", Taint: &config.MaintenanceTaint{
+		Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule,
+	}}
+	snap, err := snapshot.Build(context.Background(), reader, snapshot.Options{
+		Now:                 func() time.Time { return testNow },
+		MaintenanceTriggers: []config.MaintenanceTrigger{cordoned},
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if occupants := snap.Nodes[nodeName].OMEPods; len(occupants) != 1 || occupants[0].TPUs != 8 {
+		t.Fatalf("TPU node occupancy = %+v, want the serving TPU pod", occupants)
+	}
+
+	candidates := (&nodehealth.Policy{}).Evaluate(snap, config.Default())
+	if len(candidates) != 2 {
+		t.Fatalf("node-health candidates = %+v, want marker plus one Instance finding", candidates)
+	}
+	marker := candidates[0].Remediation
+	if marker == nil || len(marker.Workloads) != 1 || marker.Workloads[0] != workloadKey.String() ||
+		!marker.OMEAcceleratorOccupantsPresent {
+		t.Fatalf("remediation marker = %+v, want the TPU workload as an occupant", marker)
+	}
+	finding := candidates[1]
+	if finding.Workload != workloadKey || finding.Instance != 0 || finding.FromNode != nodeName ||
+		finding.Reason != policy.ReasonNodeMaintenance || finding.Executable {
+		t.Fatalf("finding = %+v, want a non-executable maintenance finding for Instance 0", finding)
+	}
+
+	reporter, _, _, reportClient := newTestReporter(t, recommendationsCM(nil))
+	recorder := &capturingRecorder{}
+	reporter.Recorder = recorder
+	cfg := config.Default()
+	reporter.ReportCycle(context.Background(), candidates, nil, cfg, testNow)
+	if got := recorder.count(eventNodeMaintenanceRequested); got != 1 {
+		t.Fatalf("opening observation emitted %d maintenance-requested event(s), want 1", got)
+	}
+	reporter.ReportCycle(context.Background(), candidates, nil, cfg, testNow.Add(time.Minute))
+	if got := recorder.count(eventNodeDrainedForMaintenance); got != 0 {
+		t.Fatalf("serving TPU pod emitted %d drained-for-maintenance event(s)", got)
+	}
+	record, ok := nodeRecord(t, reportClient, nodeName)
+	if !ok || record.MaintenanceDrainedAt != nil || !record.OMEAcceleratorOccupantsPresent ||
+		len(record.Workloads) != 1 || record.Workloads[0] != workloadKey.String() {
+		t.Fatalf("node remediation record = %+v, present=%t", record, ok)
+	}
 }

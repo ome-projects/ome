@@ -136,12 +136,14 @@ type Node struct {
 	// spot/preemptible label.
 	Preemptible bool
 
-	// OMEPods retain OME-managed GPU occupancy, including unresolved owner
-	// evidence. An ambiguous owner projects multiple logical blockers here;
-	// AllocatedGPUs still counts the physical Pod exactly once.
+	// OMEPods retain OME-managed accelerator (GPU or TPU) occupancy,
+	// including unresolved owner evidence. An ambiguous owner projects
+	// multiple logical blockers here; AllocatedGPUs still counts the
+	// physical Pod exactly once.
 	OMEPods []PodInfo
-	// OtherOccupants are non-OME GPU pods (notebooks, batch jobs, ...):
-	// they count against capacity but are never migration candidates.
+	// OtherOccupants are non-OME accelerator pods (notebooks, batch jobs,
+	// ...): their GPUs count against capacity, but they are never migration
+	// candidates.
 	OtherOccupants []PodInfo
 }
 
@@ -151,7 +153,7 @@ func (n *Node) UnavailableAsTarget() bool {
 	return n == nil || n.Health.Quarantined() || n.Maintenance.Requested || n.Cordoned || n.ScaleDownMarked
 }
 
-// PodInfo is the slice of pod state the snapshot keeps per GPU-consuming pod.
+// PodInfo is the slice of pod state the snapshot keeps per pod.
 type PodInfo struct {
 	Namespace string
 	Name      string
@@ -160,6 +162,9 @@ type PodInfo struct {
 	Node string
 	// GPUs is the pod's GPU request.
 	GPUs int64
+	// TPUs is the pod's TPU chip request. TPU chips make the pod a node
+	// occupant but never count toward GPU capacity.
+	TPUs int64
 	// Ready reports the pod Ready condition.
 	Ready bool
 	// Terminating reports a non-nil deletion timestamp.
@@ -200,6 +205,12 @@ type PodInfo struct {
 	ControllerOwnerName       string
 	ControllerOwnerPresent    bool
 	ControllerOwnerValid      bool
+}
+
+// HoldsAccelerators reports whether the pod requests GPUs or TPU chips, which
+// is what makes it a node occupant.
+func (p *PodInfo) HoldsAccelerators() bool {
+	return p.GPUs > 0 || p.TPUs > 0
 }
 
 // Workload is one InferenceService with everything policies need to reason
@@ -307,8 +318,16 @@ type Instance struct {
 	// TotalGPUs is the summed GPU request of all member pods — the
 	// instance's surge footprint.
 	TotalGPUs int64
+	// TotalTPUs is the summed TPU chip request of all member pods. Surge
+	// planning does not model TPU placement.
+	TotalTPUs int64
 	// ReadyPods counts members whose Ready condition is true.
 	ReadyPods int32
+}
+
+// HoldsAccelerators reports whether any member pod requests GPUs or TPU chips.
+func (i *Instance) HoldsAccelerators() bool {
+	return i.TotalGPUs > 0 || i.TotalTPUs > 0
 }
 
 // InFlight is one in-flight migration touching a workload, reconstructed
