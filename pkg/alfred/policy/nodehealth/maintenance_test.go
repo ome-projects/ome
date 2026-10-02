@@ -33,7 +33,7 @@ func TestMaintenanceEvacuatesWholeGangAndCopiesMarker(t *testing.T) {
 	marker := got[0].Remediation
 	if marker == nil || marker.NodeUID != "node-incarnation" || !marker.ObservedAt.Equal(snap.Timestamp) ||
 		!marker.Maintenance.Requested || !reflect.DeepEqual(marker.Workloads, []string{"prod/wide"}) ||
-		!marker.OMEGPUOccupantsPresent {
+		!marker.OMEAcceleratorOccupantsPresent {
 		t.Fatalf("complete maintenance marker = %+v", marker)
 	}
 	marker.Maintenance.Triggers[0] = "mutated"

@@ -64,13 +64,13 @@ func remediationMarkers(snap *snapshot.ClusterSnapshot) []policy.Candidate {
 			FromNode:   name,
 			Executable: false,
 			Remediation: &policy.NodeRemediation{
-				Node:                   name,
-				NodeUID:                node.UID,
-				ObservedAt:             snap.Timestamp,
-				Health:                 copyHealth(node.Health),
-				Maintenance:            copyMaintenance(node.Maintenance),
-				Workloads:              workloads,
-				OMEGPUOccupantsPresent: occupantsPresent,
+				Node:                           name,
+				NodeUID:                        node.UID,
+				ObservedAt:                     snap.Timestamp,
+				Health:                         copyHealth(node.Health),
+				Maintenance:                    copyMaintenance(node.Maintenance),
+				Workloads:                      workloads,
+				OMEAcceleratorOccupantsPresent: occupantsPresent,
 			},
 		})
 	}
@@ -98,7 +98,7 @@ func nodeOccupancy(node *snapshot.Node) ([]string, bool) {
 	occupantsPresent := false
 	for i := range node.OMEPods {
 		pod := &node.OMEPods[i]
-		if pod.GPUs <= 0 {
+		if !pod.HoldsAccelerators() {
 			continue
 		}
 		occupantsPresent = true
@@ -139,7 +139,7 @@ func evacuationFindings(snap *snapshot.ClusterSnapshot, cfg *config.Config) []po
 				return instances[i].Index < instances[j].Index
 			})
 			for _, inst := range instances {
-				if inst == nil || inst.TotalGPUs <= 0 {
+				if inst == nil || !inst.HoldsAccelerators() {
 					continue
 				}
 				from, reason := firstEvacuationMember(snap, inst)
@@ -188,7 +188,7 @@ func evacuationComponentPods(snap *snapshot.ClusterSnapshot, w *snapshot.Workloa
 		}
 		for i := range node.OMEPods {
 			pod := &node.OMEPods[i]
-			if pod.GPUs > 0 && pod.ISVC == w.NamespacedName && pod.Component == comp.Type {
+			if pod.HoldsAccelerators() && pod.ISVC == w.NamespacedName && pod.Component == comp.Type {
 				pods[componentPodKey{namespace: pod.Namespace, name: pod.Name, node: nodeName, uid: pod.UID}] = struct{}{}
 			}
 		}
@@ -199,7 +199,7 @@ func evacuationComponentPods(snap *snapshot.ClusterSnapshot, w *snapshot.Workloa
 func coverInstancePods(covered, physical map[componentPodKey]struct{}, inst *snapshot.Instance) {
 	for i := range inst.Pods {
 		pod := &inst.Pods[i]
-		if pod.GPUs <= 0 || pod.Node == "" {
+		if !pod.HoldsAccelerators() || pod.Node == "" {
 			continue
 		}
 		key := componentPodKey{namespace: pod.Namespace, name: pod.Name, node: pod.Node, uid: pod.UID}
@@ -326,6 +326,10 @@ func classify(snap *snapshot.ClusterSnapshot, cfg *config.Config, w *snapshot.Wo
 	}
 	if reason := policy.OMENativeEligibility(snap, w, comp, inst); reason != "" {
 		candidate.AdvisoryReason = reason
+		return candidate, true
+	}
+	if inst.TotalGPUs == 0 {
+		candidate.AdvisoryReason = policy.AdvisoryAcceleratorPlacementUnmodeled
 		return candidate, true
 	}
 
