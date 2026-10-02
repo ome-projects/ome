@@ -64,10 +64,6 @@ const (
 	// (see ModelAvailability.ResolveError); the policy treats the model as
 	// having no feasible target and surfaces the reason.
 	AdvisoryModelUnresolved = "ModelUnresolved"
-	// AdvisoryAcceleratorPlacementUnmodeled: the Instance holds accelerators
-	// that surge planning cannot place (TPU chips), so no replacement can be
-	// planned or simulated.
-	AdvisoryAcceleratorPlacementUnmodeled = "AcceleratorPlacementUnmodeled"
 )
 
 // ComponentWideInstance marks a Candidate that addresses a whole component
@@ -76,17 +72,16 @@ const (
 const ComponentWideInstance int32 = -1
 
 // NodeRemediation is a complete observation of a node's desired remediation
-// state. Physical OME accelerator (GPU or TPU) occupancy is retained even when
-// workload identity cannot be resolved, so an unjoined Pod cannot make a node
-// appear drained.
+// state. Physical OME GPU occupancy is retained even when workload identity
+// cannot be resolved, so an unjoined Pod cannot make a node appear drained.
 type NodeRemediation struct {
-	Node                           string
-	NodeUID                        types.UID
-	ObservedAt                     time.Time
-	Health                         snapshot.NodeHealthObservation
-	Maintenance                    snapshot.NodeMaintenanceObservation
-	Workloads                      []string
-	OMEAcceleratorOccupantsPresent bool
+	Node                   string
+	NodeUID                types.UID
+	ObservedAt             time.Time
+	Health                 snapshot.NodeHealthObservation
+	Maintenance            snapshot.NodeMaintenanceObservation
+	Workloads              []string
+	OMEGPUOccupantsPresent bool
 }
 
 // Candidate is a single proposed action — "migrate Component X's Instance Y

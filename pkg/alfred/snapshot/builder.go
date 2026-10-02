@@ -208,7 +208,6 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 		UID:         pod.UID,
 		Node:        pod.Spec.NodeName,
 		GPUs:        gpus,
-		TPUs:        PodTPURequest(pod),
 		Ready:       podIsReady(pod),
 		Terminating: pod.DeletionTimestamp != nil,
 		Component:   component,
@@ -223,9 +222,8 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 		info.ISVC = types.NamespacedName{Namespace: pod.Namespace, Name: isvcName}
 	}
 
-	// Node occupancy: accelerator-holding pods only. GPU capacity counts only
-	// GPU requests.
-	if info.HoldsAccelerators() && podOccupiesNode(pod) {
+	// Node occupancy: GPU-holding pods only.
+	if gpus > 0 && podHoldsGPUs(pod) {
 		if node, ok := s.Nodes[pod.Spec.NodeName]; ok {
 			node.AllocatedGPUs += gpus
 			if info.Terminating {
@@ -411,7 +409,6 @@ func newInstance(index int32, pods []PodInfo) *Instance {
 	inst := &Instance{Index: index, Pods: pods, ObservationValid: true, NodesSet: map[string]int{}}
 	for _, pod := range pods {
 		inst.TotalGPUs += pod.GPUs
-		inst.TotalTPUs += pod.TPUs
 		if pod.Node != "" {
 			inst.NodesSet[pod.Node]++
 		}

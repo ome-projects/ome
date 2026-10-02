@@ -71,7 +71,7 @@ type nodeRecordView struct {
 	SuspectUntil                                 *time.Time                          `json:"suspectUntil"`
 	Maintenance                                  snapshot.NodeMaintenanceObservation `json:"maintenance"`
 	Workloads                                    []string                            `json:"workloads"`
-	OMEAcceleratorOccupantsPresent               bool                                `json:"omeAcceleratorOccupantsPresent"`
+	OMEGPUOccupantsPresent                       bool                                `json:"omeGpuOccupantsPresent"`
 	ObservedAt                                   time.Time                           `json:"observedAt"`
 	SignaledAt, DrainedAt                        *time.Time
 	MaintenanceRequestedAt, MaintenanceDrainedAt *time.Time
@@ -79,7 +79,7 @@ type nodeRecordView struct {
 
 func remediationCandidate(node string, health snapshot.NodeHealthObservation, workloads ...string) policy.Candidate {
 	return policy.Candidate{Policy: "nodehealth", Reason: policy.ReasonRemediationSignal, FromNode: node, Remediation: &policy.NodeRemediation{
-		Node: node, NodeUID: types.UID(node + "-uid"), ObservedAt: testNow, Health: health, Workloads: workloads, OMEAcceleratorOccupantsPresent: len(workloads) > 0,
+		Node: node, NodeUID: types.UID(node + "-uid"), ObservedAt: testNow, Health: health, Workloads: workloads, OMEGPUOccupantsPresent: len(workloads) > 0,
 	}}
 }
 func nodeRecord(t *testing.T, cl client.Client, node string) (nodeRecordView, bool) {
@@ -144,10 +144,10 @@ func TestReporterNodeInvalidObservationCannotAdvance(t *testing.T) {
 			c := remediationCandidate("node7", unhealthyObservation(), "prod/a")
 			reportMarker(r, c, testNow)
 			c.Remediation.Workloads = nil
-			c.Remediation.OMEAcceleratorOccupantsPresent = false
+			c.Remediation.OMEGPUOccupantsPresent = false
 			reportMarker(r, c, at)
 			v, _ := nodeRecord(t, cl, "node7")
-			if !v.ObservedAt.Equal(testNow) || !v.OMEAcceleratorOccupantsPresent || v.DrainedAt != nil {
+			if !v.ObservedAt.Equal(testNow) || !v.OMEGPUOccupantsPresent || v.DrainedAt != nil {
 				t.Fatalf("invalid observation advanced record: %+v", v)
 			}
 		})
@@ -175,13 +175,13 @@ func TestReporterNodeMaintenanceAndRepairIndependent(t *testing.T) {
 	if v.DrainedAt != nil || v.MaintenanceDrainedAt != nil {
 		t.Fatal("unidentified GPU occupant marked drained")
 	}
-	c.Remediation.OMEAcceleratorOccupantsPresent = false
+	c.Remediation.OMEGPUOccupantsPresent = false
 	reportMarker(r, c, testNow.Add(3*time.Minute))
 	v, _ = nodeRecord(t, cl, "node7")
 	if v.DrainedAt == nil || v.MaintenanceDrainedAt == nil || rec.count("NodeDrainedForRepair") != 1 || rec.count("NodeDrainedForMaintenance") != 1 {
 		t.Fatalf("independent drain transitions missing: %+v events=%+v", v, rec.events)
 	}
-	c.Remediation.OMEAcceleratorOccupantsPresent = true
+	c.Remediation.OMEGPUOccupantsPresent = true
 	reportMarker(r, c, testNow.Add(4*time.Minute))
 	v, _ = nodeRecord(t, cl, "node7")
 	if v.DrainedAt != nil || v.MaintenanceDrainedAt != nil {

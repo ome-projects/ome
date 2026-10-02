@@ -44,18 +44,18 @@ type nodeMaintenanceRecord struct {
 }
 
 type nodeRemediationRecord struct {
-	NodeUID                        types.UID                `json:"nodeUID"`
-	State                          snapshot.NodeHealthState `json:"state"`
-	Conditions                     []nodeConditionRecord    `json:"conditions"`
-	SuspectUntil                   *time.Time               `json:"suspectUntil,omitempty"`
-	Maintenance                    nodeMaintenanceRecord    `json:"maintenance"`
-	Workloads                      []string                 `json:"workloads"`
-	OMEAcceleratorOccupantsPresent bool                     `json:"omeAcceleratorOccupantsPresent"`
-	ObservedAt                     time.Time                `json:"observedAt"`
-	SignaledAt                     *time.Time               `json:"signaledAt,omitempty"`
-	DrainedAt                      *time.Time               `json:"drainedAt,omitempty"`
-	MaintenanceRequestedAt         *time.Time               `json:"maintenanceRequestedAt,omitempty"`
-	MaintenanceDrainedAt           *time.Time               `json:"maintenanceDrainedAt,omitempty"`
+	NodeUID                types.UID                `json:"nodeUID"`
+	State                  snapshot.NodeHealthState `json:"state"`
+	Conditions             []nodeConditionRecord    `json:"conditions"`
+	SuspectUntil           *time.Time               `json:"suspectUntil,omitempty"`
+	Maintenance            nodeMaintenanceRecord    `json:"maintenance"`
+	Workloads              []string                 `json:"workloads"`
+	OMEGPUOccupantsPresent bool                     `json:"omeGpuOccupantsPresent"`
+	ObservedAt             time.Time                `json:"observedAt"`
+	SignaledAt             *time.Time               `json:"signaledAt,omitempty"`
+	DrainedAt              *time.Time               `json:"drainedAt,omitempty"`
+	MaintenanceRequestedAt *time.Time               `json:"maintenanceRequestedAt,omitempty"`
+	MaintenanceDrainedAt   *time.Time               `json:"maintenanceDrainedAt,omitempty"`
 }
 
 func (r *Reporter) reconcileNodeRemediations(ctx context.Context, markers []*policy.NodeRemediation, cfg *config.Config, now time.Time, observed []time.Time) (map[string]nodeRemediationRecord, time.Time, bool) {
@@ -128,13 +128,13 @@ func (r *Reporter) reconcileNodeRemediations(ctx context.Context, markers []*pol
 				Requested: m.Maintenance.Requested,
 				Triggers:  sortedUniqueStrings(m.Maintenance.Triggers),
 			},
-			Workloads: workloads, OMEAcceleratorOccupantsPresent: m.OMEAcceleratorOccupantsPresent || len(workloads) > 0,
+			Workloads: workloads, OMEGPUOccupantsPresent: m.OMEGPUOccupantsPresent || len(workloads) > 0,
 			ObservedAt: at,
 			SignaledAt: cloneTime(previous.SignaledAt), DrainedAt: cloneTime(previous.DrainedAt),
 			MaintenanceRequestedAt: cloneTime(previous.MaintenanceRequestedAt),
 			MaintenanceDrainedAt:   cloneTime(previous.MaintenanceDrainedAt),
 		}
-		if record.OMEAcceleratorOccupantsPresent {
+		if record.OMEGPUOccupantsPresent {
 			record.DrainedAt = nil
 			record.MaintenanceDrainedAt = nil
 		}
@@ -148,7 +148,7 @@ func (r *Reporter) reconcileNodeRemediations(ctx context.Context, markers []*pol
 		if record.SignaledAt == nil && (record.State == snapshot.NodeHealthUnhealthy || record.State == snapshot.NodeHealthUnknown) {
 			record.SignaledAt = cloneTime(&at)
 			r.nodeEvent(node, m.NodeUID, eventNodeRepairNeeded, true)
-		} else if record.SignaledAt != nil && record.State != snapshot.NodeHealthUnknown && record.DrainedAt == nil && !record.OMEAcceleratorOccupantsPresent && at.After(*record.SignaledAt) {
+		} else if record.SignaledAt != nil && record.State != snapshot.NodeHealthUnknown && record.DrainedAt == nil && !record.OMEGPUOccupantsPresent && at.After(*record.SignaledAt) {
 			record.DrainedAt = cloneTime(&at)
 			r.nodeEvent(node, m.NodeUID, eventNodeDrainedForRepair, false)
 		}
@@ -158,7 +158,7 @@ func (r *Reporter) reconcileNodeRemediations(ctx context.Context, markers []*pol
 		} else if record.MaintenanceRequestedAt == nil {
 			record.MaintenanceRequestedAt = cloneTime(&at)
 			r.nodeEvent(node, m.NodeUID, eventNodeMaintenanceRequested, false)
-		} else if record.MaintenanceDrainedAt == nil && !record.OMEAcceleratorOccupantsPresent && at.After(*record.MaintenanceRequestedAt) {
+		} else if record.MaintenanceDrainedAt == nil && !record.OMEGPUOccupantsPresent && at.After(*record.MaintenanceRequestedAt) {
 			record.MaintenanceDrainedAt = cloneTime(&at)
 			r.nodeEvent(node, m.NodeUID, eventNodeDrainedForMaintenance, false)
 		}
@@ -261,7 +261,7 @@ func usableConditionEvidence(c snapshot.NodeConditionObservation, observed time.
 }
 
 func (r *Reporter) nodeEvent(node string, uid types.UID, reason string, warning bool) {
-	message := "node %s has no observed OME accelerator occupants; this does not establish whole-node maintenance safety"
+	message := "node %s has no observed OME GPU occupants; this does not establish whole-node maintenance safety"
 	switch reason {
 	case eventNodeRepairNeeded:
 		message = "node %s has an observed health concern; repair investigation requested"

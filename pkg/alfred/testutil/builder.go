@@ -179,19 +179,6 @@ func (b *SnapshotBuilder) WithInstance(workload string, ctype v1beta1.ComponentT
 // WithMultiPodInstance adds one Instance whose pods (gpusPerPod each) sit on
 // the given nodes — an atomic multi-pod group when len(nodes) > 1.
 func (b *SnapshotBuilder) WithMultiPodInstance(workload string, ctype v1beta1.ComponentType, mode constants.DeploymentModeType, gpusPerPod int64, nodes ...string) *SnapshotBuilder {
-	return b.withMultiPodInstance(workload, ctype, mode, podAccelerators{gpus: gpusPerPod}, nodes...)
-}
-
-// WithMultiPodTPUInstance adds one Instance whose pods request tpusPerPod TPU
-// chips each, and no GPUs, on the given nodes.
-func (b *SnapshotBuilder) WithMultiPodTPUInstance(workload string, ctype v1beta1.ComponentType, mode constants.DeploymentModeType, tpusPerPod int64, nodes ...string) *SnapshotBuilder {
-	return b.withMultiPodInstance(workload, ctype, mode, podAccelerators{tpus: tpusPerPod}, nodes...)
-}
-
-// podAccelerators is the per-pod accelerator request of a synthetic Instance.
-type podAccelerators struct{ gpus, tpus int64 }
-
-func (b *SnapshotBuilder) withMultiPodInstance(workload string, ctype v1beta1.ComponentType, mode constants.DeploymentModeType, perPod podAccelerators, nodes ...string) *SnapshotBuilder {
 	w := b.ensureWorkload(workload)
 	component, ok := w.Components[ctype]
 	if !ok {
@@ -248,8 +235,7 @@ func (b *SnapshotBuilder) withMultiPodInstance(workload string, ctype v1beta1.Co
 			Namespace:            w.NamespacedName.Namespace,
 			Name:                 b.nextPodName(w.NamespacedName.Name + "-" + string(ctype)),
 			Node:                 nodeName,
-			GPUs:                 perPod.gpus,
-			TPUs:                 perPod.tpus,
+			GPUs:                 gpusPerPod,
 			Ready:                true,
 			ISVC:                 w.NamespacedName,
 			Component:            ctype,
@@ -276,11 +262,10 @@ func (b *SnapshotBuilder) withMultiPodInstance(workload string, ctype v1beta1.Co
 		pod.StartTime = &start
 		inst.Pods = append(inst.Pods, pod)
 		inst.NodesSet[nodeName]++
-		inst.TotalGPUs += perPod.gpus
-		inst.TotalTPUs += perPod.tpus
+		inst.TotalGPUs += gpusPerPod
 		inst.ReadyPods++
-		if pod.HoldsAccelerators() {
-			n.AllocatedGPUs += perPod.gpus
+		if gpusPerPod > 0 {
+			n.AllocatedGPUs += gpusPerPod
 			n.OMEPods = append(n.OMEPods, pod)
 		}
 	}

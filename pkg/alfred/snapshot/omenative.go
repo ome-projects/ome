@@ -183,9 +183,9 @@ func routeWorkloadPods(
 	return routed, ownerResolvedTargets
 }
 
-// projectOwnerResolvedNodeOccupancy replaces a physical accelerator Pod's raw
-// node classification with every OMENative workload/component target proven
-// by its controller owner. Workload validation continues to consume the raw
+// projectOwnerResolvedNodeOccupancy replaces a physical GPU Pod's raw node
+// classification with every OMENative workload/component target proven by
+// its controller owner. Workload validation continues to consume the raw
 // routed PodInfo above, so malformed label evidence is not repaired here.
 //
 // A Pod may project to multiple logical blockers when its owner UID is
@@ -567,7 +567,6 @@ func addPodToInstance(instance *Instance, pod PodInfo) {
 	instance.Pods = append(instance.Pods, pod)
 	instance.ObservedPods++
 	instance.TotalGPUs += pod.GPUs
-	instance.TotalTPUs += pod.TPUs
 	if pod.Node != "" {
 		instance.NodesSet[pod.Node]++
 	}

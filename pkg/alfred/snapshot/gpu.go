@@ -44,13 +44,6 @@ func IsGPUResource(name corev1.ResourceName) bool {
 	return false
 }
 
-// IsTPUResource reports whether a resource name counts as TPU chips. TPU pods
-// occupy their node for evacuation but stay outside GPU capacity, pools and
-// scoring.
-func IsTPUResource(name corev1.ResourceName) bool {
-	return name == corev1.ResourceName(constants.GoogleTPUResourceType)
-}
-
 // NodeGPUAllocatable returns the node's GPU resource name and allocatable
 // count. Allocatable is used deliberately (not capacity): it is what the
 // scheduler can actually place against. Nodes exposing several GPU resource
@@ -75,43 +68,33 @@ func NodeGPUAllocatable(node *corev1.Node) (string, int64) {
 // at steady state. Ordinary init containers are ignored: they release
 // resources before serving starts.
 func PodGPURequest(pod *corev1.Pod) int64 {
-	return podResourceRequest(pod, IsGPUResource)
-}
-
-// PodTPURequest returns the pod's TPU chip request, counted like
-// PodGPURequest.
-func PodTPURequest(pod *corev1.Pod) int64 {
-	return podResourceRequest(pod, IsTPUResource)
-}
-
-func podResourceRequest(pod *corev1.Pod, matches func(corev1.ResourceName) bool) int64 {
 	var total int64
 	for i := range pod.Spec.Containers {
-		total += containerResourceRequest(&pod.Spec.Containers[i], matches)
+		total += containerGPURequest(&pod.Spec.Containers[i])
 	}
 	for i := range pod.Spec.InitContainers {
 		c := &pod.Spec.InitContainers[i]
 		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
-			total += containerResourceRequest(c, matches)
+			total += containerGPURequest(c)
 		}
 	}
 	return total
 }
 
-// containerResourceRequest evaluates each matching resource independently:
-// its limit when present, else its request. Extended resources normally carry
-// equal limits and requests, but an unrelated (e.g. CPU-only) limits section
-// must never suppress an accelerator request, and a resource must never be
-// double-counted when it appears in both maps.
-func containerResourceRequest(c *corev1.Container, matches func(corev1.ResourceName) bool) int64 {
+// containerGPURequest evaluates each GPU resource independently: its limit
+// when present, else its request. Extended resources normally carry equal
+// limits and requests, but an unrelated (e.g. CPU-only) limits section must
+// never suppress a GPU request, and a resource must never be double-counted
+// when it appears in both maps.
+func containerGPURequest(c *corev1.Container) int64 {
 	var total int64
 	for name, quantity := range c.Resources.Limits {
-		if matches(name) {
+		if IsGPUResource(name) {
 			total += quantity.Value()
 		}
 	}
 	for name, quantity := range c.Resources.Requests {
-		if !matches(name) {
+		if !IsGPUResource(name) {
 			continue
 		}
 		if _, limited := c.Resources.Limits[name]; limited {
@@ -122,10 +105,10 @@ func containerResourceRequest(c *corev1.Container, matches func(corev1.ResourceN
 	return total
 }
 
-// podOccupiesNode reports whether the pod currently occupies its node: it is
-// bound and not in a terminal phase. Terminating (deletion-timestamped) pods
-// still hold their accelerators until they exit.
-func podOccupiesNode(pod *corev1.Pod) bool {
+// podHoldsGPUs reports whether the pod currently counts against node GPU
+// capacity: it is bound to a node and not in a terminal phase. Terminating
+// (deletion-timestamped) pods still hold their GPUs until they exit.
+func podHoldsGPUs(pod *corev1.Pod) bool {
 	if pod.Spec.NodeName == "" {
 		return false
 	}
