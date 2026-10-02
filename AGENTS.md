@@ -36,7 +36,7 @@ Key packages:
 - `config/models/` and `config/runtimes/` — the catalog of pre-configured models and SGLang (`srt`) / vLLM runtime definitions.
 - `oeps/` — OME Enhancement Proposals. Major features and API changes require an OEP (see CONTRIBUTING.md); check `oeps/<n>/oep.yaml` for status before building on in-progress designs.
 - `site/` — Hugo documentation site. Use Node 20 so `package-lock.json` stays in sync with CI.
-- `hack/docs-examples/`, `hack/docs-drift/` and `hack/genref/website/` — tooling for the redesigned documentation site, which lives in [ome-projects/ome-docs](https://github.com/ome-projects/ome-docs) and replaces `site/` at launch. That repository's CI runs these tools from a checkout of this one, at the commit pinned in its `ome.ref`, so keep them working when the API types or CRDs change. Until launch, documentation changes still go to `site/`.
+- `hack/docs-examples/` and `hack/docs-drift/` — tooling for the redesigned documentation site, which lives in [ome-projects/ome-docs](https://github.com/ome-projects/ome-docs) and replaces `site/` at launch. That repository's CI runs these tools from a checkout of this one, at the commit pinned in its `ome.ref`, so keep them working when the API types or CRDs change. It also generates its API reference from the Go types in `pkg/apis/ome/v1beta1`, with its own templates. Until launch, documentation changes still go to `site/`.
 
 ## Conventions
 
