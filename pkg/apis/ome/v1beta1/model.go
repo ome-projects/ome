@@ -125,6 +125,7 @@ type StorageSpec struct {
 	// Supported formats:
 	//
 	// - OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path}
+	// - CNCF ModelPack:       modelpack://{registry}/{repository}[:{tag}]
 	// - Persistent Volume:    pvc://{pvc-name}/{sub-path}
 	// - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path}
 	// - Hugging Face:         hf://{org}/{repo}[@{revision}]

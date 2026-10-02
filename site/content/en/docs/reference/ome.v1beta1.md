@@ -3807,6 +3807,7 @@ This key will be used to fetch credentials during model download or access.</p>
 Supported formats:</p>
 <ul>
 <li>OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path}</li>
+<li>CNCF ModelPack:       modelpack://{registry}/{repository}[:{tag}]</li>
 <li>Persistent Volume:    pvc://{pvc-name}/{sub-path}</li>
 <li>Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path}
 This field is required.</li>

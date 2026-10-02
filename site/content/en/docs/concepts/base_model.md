@@ -116,6 +116,26 @@ storage:
     auth_type: "InstancePrincipal"
 ```
 
+### CNCF ModelPack (OCI registry)
+
+Pull a [CNCF ModelPack](https://github.com/modelpack/model-spec) artifact from a container registry:
+```
+modelpack://{registry}/{repository}[:{tag}|@{digest}]
+```
+
+Example:
+```yaml
+storage:
+  storageUri: "modelpack://ghcr.io/myorg/llama-3-70b:v1"
+  path: "/raid/models/llama-3-70b-instruct"
+```
+
+The model agent pulls the artifact through a running [`llmman serve`](https://github.com/llmmanorg/llmman)
+daemon. The daemon address comes from `LLMMAN_HOST` (default `127.0.0.1:17434`), and the `llmman` binary
+must be on `PATH` (or set `OME_LLMMAN_BIN`). Neither is needed unless a `modelpack://` URI is used.
+
+> **Note**: `oci://` is unchanged and still addresses Oracle Cloud Object Storage.
+
 ### Hugging Face Hub
 
 Download models directly from Hugging Face Hub:

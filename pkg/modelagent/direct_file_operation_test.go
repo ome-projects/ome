@@ -50,6 +50,7 @@ func TestIsDirectFileTaskUsesArtifactRouting(t *testing.T) {
 	}{
 		{name: "direct HF", uri: "hf://org/model", want: true},
 		{name: "direct OCI", uri: "oci://n/ns/b/bucket/o/model", want: true},
+		{name: "direct ModelPack", uri: "modelpack://registry.example.com/org/model:tag", want: true},
 		{name: "shared HF", uri: "hf://org/model", shared: true},
 		{name: "shared OCI", uri: "oci://n/ns/b/bucket/o/model", shared: true},
 		{name: "local", uri: "local:///model"},
@@ -199,24 +200,28 @@ func receiveDirectRetry(t *testing.T, g *Gopher) *GopherTask {
 }
 
 func TestDirectDeleteRetriesCompatibleFileLock(t *testing.T) {
-	g, task := newDirectOperationTestGopher(t, "oci://n/ns/b/bucket/o/model")
-	task.TaskType = Delete
-	lock, acquired, err := tryHfArtifactChildFileLock(hfArtifactTaskInput{
-		ModelStoreRoot: g.modelRootDir, ChildModelPath: *task.BaseModel.Spec.Storage.Path,
-	})
-	require.NoError(t, err)
-	require.True(t, acquired)
-	defer lock.Close()
-	require.NoError(t, g.processTask(task))
-	require.FileExists(t, filepath.Join(*task.BaseModel.Spec.Storage.Path, "weights"), "ordinary Delete must not remove files owned by another operation")
-	require.Same(t, task, receiveDirectRetry(t, g))
-	require.NoError(t, lock.Close())
-	require.NoError(t, g.processTask(task))
-	require.NoDirExists(t, *task.BaseModel.Spec.Storage.Path)
+	for _, uri := range []string{"oci://n/ns/b/bucket/o/model", "modelpack://ghcr.io/org/model:tag"} {
+		t.Run(uri, func(t *testing.T) {
+			g, task := newDirectOperationTestGopher(t, uri)
+			task.TaskType = Delete
+			lock, acquired, err := tryHfArtifactChildFileLock(hfArtifactTaskInput{
+				ModelStoreRoot: g.modelRootDir, ChildModelPath: *task.BaseModel.Spec.Storage.Path,
+			})
+			require.NoError(t, err)
+			require.True(t, acquired)
+			defer lock.Close()
+			require.NoError(t, g.processTask(task))
+			require.FileExists(t, filepath.Join(*task.BaseModel.Spec.Storage.Path, "weights"), "ordinary Delete must not remove files owned by another operation")
+			require.Same(t, task, receiveDirectRetry(t, g))
+			require.NoError(t, lock.Close())
+			require.NoError(t, g.processTask(task))
+			require.NoDirExists(t, *task.BaseModel.Spec.Storage.Path)
+		})
+	}
 }
 
 func TestSharedRoutedDirectFallbackDeleteKeepsFileLock(t *testing.T) {
-	for _, uri := range []string{"hf://org/model", "oci://n/ns/b/bucket/o/model"} {
+	for _, uri := range []string{"hf://org/model", "oci://n/ns/b/bucket/o/model", "modelpack://ghcr.io/org/model:tag"} {
 		t.Run(uri, func(t *testing.T) {
 			g, task := newDirectOperationTestGopher(t, uri)
 			task.TaskType = Delete

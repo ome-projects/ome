@@ -26,6 +26,9 @@ const (
 	GitHubStoragePrefix = "github://"
 	// LocalStoragePrefix is the prefix for local filesystem storage URIs
 	LocalStoragePrefix = "local://"
+	// ModelPackStoragePrefix is the prefix for CNCF ModelPack artifact URIs,
+	// e.g. modelpack://ghcr.io/org/model:tag
+	ModelPackStoragePrefix = "modelpack://"
 )
 
 // StorageType is a string enum for storage type
@@ -50,6 +53,8 @@ const (
 	StorageTypeGitHub StorageType = "GITHUB"
 	// StorageTypeLocal is the value for local filesystem storage
 	StorageTypeLocal StorageType = "LOCAL"
+	// StorageTypeModelPack is the value for CNCF ModelPack artifacts in an OCI registry
+	StorageTypeModelPack StorageType = "MODELPACK"
 )
 
 // OCIStorageComponents represents the components of an OCI storage URI
@@ -110,6 +115,12 @@ type GitHubStorageComponents struct {
 // LocalStorageComponents represents the components of a local filesystem storage URI
 type LocalStorageComponents struct {
 	Path string // Absolute or relative path to the model files
+}
+
+// ModelPackStorageComponents represents a CNCF ModelPack artifact reference
+type ModelPackStorageComponents struct {
+	// Reference is the registry reference, e.g. "ghcr.io/org/model:tag".
+	Reference string
 }
 
 // ParseOCIStorageURI parses an OCI storage URI and returns its components
@@ -539,6 +550,32 @@ func ValidateLocalStorageURI(uri string) error {
 	return err
 }
 
+// ParseModelPackStorageURI parses a CNCF ModelPack artifact URI.
+// Format: modelpack://{registry}/{repository}[:{tag}|@{digest}]
+//
+// The whole remainder is the reference: a repository name may contain slashes,
+// so there is nothing further to split.
+func ParseModelPackStorageURI(uri string) (*ModelPackStorageComponents, error) {
+	if !strings.HasPrefix(uri, ModelPackStoragePrefix) {
+		return nil, fmt.Errorf("invalid ModelPack storage URI format: missing %s prefix", ModelPackStoragePrefix)
+	}
+
+	reference := strings.TrimSpace(strings.TrimPrefix(uri, ModelPackStoragePrefix))
+	registry, repository, found := strings.Cut(reference, "/")
+	if !found || registry == "" || repository == "" {
+		return nil, fmt.Errorf(
+			"invalid ModelPack storage URI %q: expected modelpack://{registry}/{repository}[:{tag}]", uri)
+	}
+
+	return &ModelPackStorageComponents{Reference: reference}, nil
+}
+
+// ValidateModelPackStorageURI validates if the given URI matches ModelPack storage format
+func ValidateModelPackStorageURI(uri string) error {
+	_, err := ParseModelPackStorageURI(uri)
+	return err
+}
+
 // GetStorageType determines the type of storage URI
 func GetStorageType(uri string) (StorageType, error) {
 	switch {
@@ -560,6 +597,8 @@ func GetStorageType(uri string) (StorageType, error) {
 		return StorageTypeGitHub, nil
 	case strings.HasPrefix(uri, LocalStoragePrefix):
 		return StorageTypeLocal, nil
+	case strings.HasPrefix(uri, ModelPackStoragePrefix):
+		return StorageTypeModelPack, nil
 	default:
 		return "", fmt.Errorf("unknown storage type for URI: %s", uri)
 	}
@@ -591,6 +630,8 @@ func ValidateStorageURI(uri string) error {
 		return ValidateGitHubStorageURI(uri)
 	case StorageTypeLocal:
 		return ValidateLocalStorageURI(uri)
+	case StorageTypeModelPack:
+		return ValidateModelPackStorageURI(uri)
 	default:
 		return fmt.Errorf("unsupported storage type: %s", storageType)
 	}

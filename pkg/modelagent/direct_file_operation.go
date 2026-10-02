@@ -28,7 +28,13 @@ func directFileOperationContext(ctx context.Context) (context.Context, func()) {
 	}
 }
 
-// isDirectFileTask identifies tasks routed directly to HF or OCI file handling.
+// isDirectFileStorageType reports file-writing storage types.
+func isDirectFileStorageType(kind storage.StorageType) bool {
+	return kind == storage.StorageTypeOCI || kind == storage.StorageTypeHuggingFace ||
+		kind == storage.StorageTypeModelPack
+}
+
+// isDirectFileTask identifies tasks routed directly to HF, OCI or ModelPack file handling.
 // A Shared task can still fall back to Direct handling after routing.
 func isDirectFileTask(task *GopherTask) bool {
 	if task.SharedArtifact {
@@ -42,7 +48,7 @@ func isDirectFileTask(task *GopherTask) bool {
 		return false
 	}
 	kind, err := storage.GetStorageType(*spec.Storage.StorageUri)
-	return err == nil && (kind == storage.StorageTypeOCI || kind == storage.StorageTypeHuggingFace)
+	return err == nil && isDirectFileStorageType(kind)
 }
 
 // Shared tasks and Direct file tasks use the same per-model task coordinator.

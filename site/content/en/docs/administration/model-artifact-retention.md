@@ -53,8 +53,8 @@ left on disk.
 
 ## Storage backends the agent never deletes
 
-File deletion applies to models the agent downloaded itself, i.e. `oci://`
-and `hf://` sources. Other backends only get the label and status cleanup:
+File deletion applies to models the agent downloaded itself, i.e. `oci://`,
+`modelpack://` and `hf://` sources. Other backends only get the label and status cleanup:
 
 - `local://` — the files are pre-existing and user-managed; delete is a
   file no-op by design.
@@ -64,7 +64,7 @@ and `hf://` sources. Other backends only get the label and status cleanup:
 
 ## Safety checks that skip file deletion
 
-Before deleting an `oci://` or `hf://` model directory, the agent skips the
+Before deleting an `oci://`, `modelpack://` or `hf://` model directory, the agent skips the
 file removal (but still cleans up the label and status entry) when any of the
 following holds:
 

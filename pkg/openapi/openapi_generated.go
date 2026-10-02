@@ -15049,7 +15049,7 @@ func schema_pkg_apis_ome_v1beta1_StorageSpec(ref common.ReferenceCallback) commo
 					},
 					"storageUri": {
 						SchemaProps: spec.SchemaProps{
-							Description: "StorageUri specifies the source URI of the model in a supported storage backend. Supported formats:\n\n- OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path} - Persistent Volume:    pvc://{pvc-name}/{sub-path} - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path} - Hugging Face:         hf://{org}/{repo}[@{revision}] - Amazon S3:            s3://{bucket}/{object_path} - Azure Blob Storage:   az://{account}/{container}/{object_path} - Google Cloud Storage: gs://{bucket}/{object_path} - GitHub:               github://{org}/{repo}[@{tag}] - Local filesystem:     local://{path}",
+							Description: "StorageUri specifies the source URI of the model in a supported storage backend. Supported formats:\n\n- OCI Object Storage:   oci://n/{namespace}/b/{bucket}/o/{object_path} - CNCF ModelPack:       modelpack://{registry}/{repository}[:{tag}] - Persistent Volume:    pvc://{pvc-name}/{sub-path} - Vendor-specific:      vendor://{vendor-name}/{resource-type}/{resource-path} - Hugging Face:         hf://{org}/{repo}[@{revision}] - Amazon S3:            s3://{bucket}/{object_path} - Azure Blob Storage:   az://{account}/{container}/{object_path} - Google Cloud Storage: gs://{bucket}/{object_path} - GitHub:               github://{org}/{repo}[@{tag}] - Local filesystem:     local://{path}",
 							Type:        []string{"string"},
 							Format:      "",
 						},

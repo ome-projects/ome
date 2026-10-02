@@ -617,6 +617,11 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 			if err := s.processLocalStorageModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
 				return err
 			}
+		case storage.StorageTypeModelPack:
+			s.logger.Infof("Starting CNCF ModelPack download for model %s", modelInfo)
+			if err := s.processModelPackModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unknown storage type %s", storageType)
 		}
@@ -668,7 +673,7 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 		}
 		if !handled {
 			// Shared handling can fall back to the Direct deletion path.
-			if storageType == storage.StorageTypeOCI || storageType == storage.StorageTypeHuggingFace {
+			if isDirectFileStorageType(storageType) {
 				acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&baseModelSpec, s.modelRootDir))
 				if err != nil {
 					return err
@@ -683,7 +688,7 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 				}
 			}
 			switch storageType {
-			case storage.StorageTypeOCI:
+			case storage.StorageTypeOCI, storage.StorageTypeModelPack:
 				s.logger.Infof("Starting deletion for model %s", modelInfo)
 				destPath := getDestPath(&baseModelSpec, s.modelRootDir)
 				// check if it needs to skip artifact deletion
