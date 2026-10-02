@@ -107,6 +107,9 @@ var capabilityRules = []capabilityRule{
 	// the vision short-circuit would otherwise drop the text and
 	// audio outputs.
 	nemotronHNanoRule,
+	// The VL variant explicitly disables sound. Check its config before
+	// inferring audio capabilities from the Omni architecture token.
+	nemotronSuperVLRule,
 	// Omni before vision: omni implies audio-output capabilities
 	// that the vision short-circuit alone would miss.
 	omniRule,
@@ -182,6 +185,24 @@ func nemotronHNanoRule(hf HuggingFaceModel) []Capability {
 		)
 	}
 	return capabilities
+}
+
+// nemotronSuperVLRule recognizes the VL-only configuration of this
+// architecture. Missing sound metadata is not evidence of disabled audio;
+// object-valued sound configs and other architectures retain existing rules.
+func nemotronSuperVLRule(hf HuggingFaceModel) []Capability {
+	if hf.GetArchitecture() != "NemotronH_Omni_Reasoning_V3" || !hf.HasVision() {
+		return nil
+	}
+	config, ok := hf.(*GenericModelConfig)
+	if !ok || strings.TrimSpace(string(config.soundConfig)) != "null" {
+		return nil
+	}
+	return []Capability{
+		CapabilityTextToText,
+		CapabilityImageTextToText,
+		CapabilityVideoTextToText,
+	}
 }
 
 func omniRule(hf HuggingFaceModel) []Capability {
