@@ -36,6 +36,10 @@ type GenericModelConfig struct {
 
 	// Set during loading when a vision shape signal is detected.
 	hasVisionConfig bool
+
+	// Preserve the top-level sound config for architecture-specific rules.
+	// Absent, explicit null, and object-valued configs have different meanings.
+	soundConfig json.RawMessage
 }
 
 // GetParameterCount derives a parameter count: try safetensors first,
@@ -152,6 +156,7 @@ func probeNestedConfig(data []byte, config *GenericModelConfig) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return
 	}
+	config.soundConfig = raw["sound_config"]
 
 	for _, key := range nestedLLMConfigKeys {
 		sub, ok := raw[key]
