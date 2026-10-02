@@ -1,0 +1,22 @@
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen-sea-lion-v4-32b-it
+spec:
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  vendor: aisingapore
+  displayName: aisingapore.qwen-sea-lion-v4-32b-it
+  disabled: false
+  version: "1.0.0"
+  modelArchitecture: Qwen3ForCausalLM
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.51.0"
+  modelParameterSize: 32.762B
+  storage:
+    storageUri: hf://aisingapore/Qwen-SEA-LION-v4-32B-IT
+    path: /raid/models/aisingapore/Qwen-SEA-LION-v4-32B-IT
