@@ -365,6 +365,27 @@ fi
 grep -Fq '"scaleDownPodBatchSize":100' <<<"${scale_down_interval_omitted}" ||
   fail "omitting the requeue interval unexpectedly removed the scale-down Pod batch size"
 
+repair_batch_overridden="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.lifecycle.repairBatchSize=7 \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"repairBatchSize":7' <<<"${repair_batch_overridden}" ||
+  fail "OMENative repair batch size override was not rendered"
+grep -Fq '"scaleDownPodBatchSize":100' <<<"${repair_batch_overridden}" ||
+  fail "repair batch size override unexpectedly changed the scale-down Pod batch size"
+grep -Fq '"repairBatchSize":10' <<<"${scale_down_batch_overridden}" ||
+  fail "default OMENative repair batch size was not rendered"
+
+repair_batch_omitted="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.lifecycle.repairBatchSize=null \
+  --show-only templates/ome-controller/configmap.yaml)"
+if grep -Fq 'repairBatchSize' <<<"${repair_batch_omitted}"; then
+  fail "OMENative repair batch size was rendered when omitted"
+fi
+grep -Fq '"scaleDownPodBatchSize":100' <<<"${repair_batch_omitted}" ||
+  fail "omitting the repair batch size unexpectedly removed the scale-down Pod batch size"
+
 default_controller_checksum="$(grep -m1 'checksum/config:' <<<"${controller}" | awk '{print $2}')"
 scale_down_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
@@ -385,6 +406,57 @@ scale_down_interval_checksum="$(grep -m1 'checksum/config:' <<<"${scale_down_int
   fail "scale-down requeue interval controller checksum was not rendered"
 [[ "${default_controller_checksum}" != "${scale_down_interval_checksum}" ]] ||
   fail "changing scale-down requeue interval did not roll the controller checksum"
+
+grep -Fq '"burstSize":400' <<<"${controller_config}" ||
+  fail "event recorder burst size default was not rendered"
+grep -Fq '"refillInterval":"5s"' <<<"${controller_config}" ||
+  fail "event recorder refill interval default was not rendered"
+
+event_burst_overridden="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.eventRecorder.burstSize=37 \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"burstSize":37' <<<"${event_burst_overridden}" ||
+  fail "event recorder burst size override was not rendered"
+grep -Fq '"refillInterval":"5s"' <<<"${event_burst_overridden}" ||
+  fail "burst size override unexpectedly changed the refill interval"
+
+event_refill_overridden="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-string ome.controller.eventRecorder.refillInterval=37s \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"refillInterval":"37s"' <<<"${event_refill_overridden}" ||
+  fail "event recorder refill interval override was not rendered"
+grep -Fq '"burstSize":400' <<<"${event_refill_overridden}" ||
+  fail "refill interval override unexpectedly changed the burst size"
+
+event_burst_omitted="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.eventRecorder.burstSize=null \
+  --show-only templates/ome-controller/configmap.yaml)"
+if grep -Fq 'burstSize' <<<"${event_burst_omitted}"; then
+  fail "event recorder burst size was rendered when omitted"
+fi
+grep -Fq '"refillInterval":"5s"' <<<"${event_burst_omitted}" ||
+  fail "omitting the burst size unexpectedly removed the refill interval"
+
+event_recorder_omitted="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.eventRecorder=null \
+  --show-only templates/ome-controller/configmap.yaml)"
+if grep -Fq 'eventRecorder' <<<"${event_recorder_omitted}"; then
+  fail "event recorder block was rendered when omitted"
+fi
+
+event_burst_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.eventRecorder.burstSize=37 \
+  --show-only templates/ome-controller/deployment.yaml)"
+event_burst_checksum="$(grep -m1 'checksum/config:' <<<"${event_burst_controller}" | awk '{print $2}')"
+[[ -n "${event_burst_checksum}" ]] ||
+  fail "event recorder controller checksum was not rendered"
+[[ "${default_controller_checksum}" != "${event_burst_checksum}" ]] ||
+  fail "changing the event recorder burst size did not roll the controller checksum"
 
 model_agent="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \

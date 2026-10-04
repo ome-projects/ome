@@ -34,7 +34,13 @@ data:
   # demand. Omit this key to provision no slices. Read once at manager startup;
   # when present every field is required (slice.annotations may be {}), the
   # binary has no default for any of them, and an invalid block prevents
-  # startup. Pools without the provisionOnly label are never provisioned or
+  # startup. Two fields are optional. slice.readyTimeout releases and
+  # provisions again a slice that has partitions but stays out of a ready state
+  # longer than it (e.g. "10m"), while no pod holds it; unset never times a
+  # slice out. slice.podAnnotations lists annotation keys copied from a
+  # workload's pod template onto the slices created for it, such as a
+  # per-workload scheduling priority; a slice keeps the values it was created
+  # with. Pools without the provisionOnly label are never provisioned or
   # released. Example for GKE dynamic slicing with single-host Ironwood slices:
   #
   # tpuSliceProvisioning: |-
@@ -59,7 +65,8 @@ data:
   #         "cloud.google.com/managed-by": "slice-scheduler",
   #         "slice.gke.io/retry-on-failure": "true"
   #       },
-  #       "readyStates": ["ACTIVE", "ACTIVE_DEGRADED"]
+  #       "readyStates": ["ACTIVE", "ACTIVE_DEGRADED"],
+  #       "podAnnotations": ["example.com/slice-priority"]
   #     }
   #   }
 
@@ -69,8 +76,11 @@ data:
   # batch field preserves that direction's unbounded selection. The scale-down
   # requeue interval polls while destructive work remains in flight; omitting
   # it leaves progress to watched resources and exact configured lifecycle
-  # deadlines. These settings are read once at manager startup; invalid values
-  # prevent startup, and a direct ConfigMap edit requires a manager restart.
+  # deadlines. The repair batch size bounds the crash-loop repairs opened per
+  # Component in one pass, in Instances (a gang counts as one); omitting it
+  # leaves the repairs opened per pass unbounded. These settings are read once
+  # at manager startup; invalid values prevent startup, and a direct ConfigMap
+  # edit requires a manager restart.
   #
   # instanceReadyTimeout is how long a newly created Instance may take to become
   # Ready before its in-flight operation is failed; a per-Component
@@ -82,7 +92,22 @@ data:
       "scaleUpPodBatchSize": 100,
       "scaleDownPodBatchSize": 100,
       "scaleDownRequeueInterval": "5s",
+      "repairBatchSize": 10,
       "instanceReadyTimeout": "30m"
+    }
+
+  # How many Kubernetes Events the manager may record about one object before
+  # client-go's spam filter drops them silently: one bucket per object and
+  # event type holding burstSize events, refilled one event every
+  # refillInterval. Every emission counts, including repeats. Omitting a field
+  # keeps client-go's own default for it (25 events refilled one every five
+  # minutes), which a Component of eight gangs spends on creation and
+  # readiness alone. Read once at manager startup; non-positive values prevent
+  # startup, and a direct ConfigMap edit requires a manager restart.
+  eventRecorder: |-
+    {
+      "burstSize": 400,
+      "refillInterval": "5s"
     }
 
   # How the manager stores InferenceReplica per-Instance status. Read once at

@@ -495,8 +495,14 @@ ome:
     # required, the binary has no default for any of them, and a malformed
     # block stops the manager from starting. Pools without the provisionOnly
     # label hold static slices and are never provisioned or released.
-    # slice.annotations may be {} but must be present. Example for GKE dynamic
-    # slicing with single-host Ironwood slices:
+    # slice.annotations may be {} but must be present. Two fields are optional.
+    # slice.readyTimeout (e.g. 10m) releases and provisions again a slice that
+    # has partitions but stays out of a ready state longer than it, while no
+    # pod holds it; unset never times a slice out. slice.podAnnotations lists
+    # annotation keys copied from a workload's pod template onto the slices
+    # created for it, such as a per-workload scheduling priority; a slice keeps
+    # the values it was created with. Example for GKE dynamic slicing with
+    # single-host Ironwood slices:
     #   tpuSliceProvisioning:
     #     chipResource: google.com/tpu
     #     nodeLabels:
@@ -518,6 +524,7 @@ ome:
     #         cloud.google.com/managed-by: slice-scheduler
     #         slice.gke.io/retry-on-failure: "true"
     #       readyStates: [ACTIVE, ACTIVE_DEGRADED]
+    #       podAnnotations: [example.com/slice-priority]
     tpuSliceProvisioning: {}
     # inferenceReplica configures InferenceReplica admission. controllerIdentity
     # names the identity the InferenceService controller writes with; the
@@ -529,6 +536,23 @@ ome:
       controllerIdentity:
         usernames: []
         groups: []
+    # eventRecorder bounds the Kubernetes Events the manager may record about
+    # one object before client-go's spam filter drops them silently. Every
+    # object (InferenceService, InferenceReplica, ...) gets one bucket per
+    # event type holding burstSize events, refilled one event every
+    # refillInterval; every emission counts, including a repeat of an earlier
+    # event. The OME binary has NO built-in values: removing a field keeps
+    # client-go's own default for it (25 events refilled one every five
+    # minutes), which a Component of eight gangs spends on creation and
+    # readiness alone. A plain rollout stamps five events per gang on its
+    # Component (created, ready, update started, update completed, ready
+    # again), so 400 holds ten back-to-back rollouts of eight gangs, and a
+    # refill every 5s sustains any rollout whose gangs each take longer than
+    # that. Read once at manager startup; non-positive values prevent startup.
+    # Helm rolls the manager when the rendered ConfigMap changes.
+    eventRecorder:
+      burstSize: 400
+      refillInterval: 5s
     # lifecycle tunes the OMENative per-Instance lifecycle state machine.
     lifecycle:
       # Missing-Pod budget for one OMENative scale-up pass. Instance and
@@ -556,6 +580,15 @@ ome:
       # due. Malformed or non-positive durations prevent manager startup. Helm
       # rolls the manager when this value changes.
       scaleDownRequeueInterval: 5s
+      # Bound on the crash-loop repairs the controller opens per Component in
+      # one reconcile pass, in Instances: a leader/worker gang counts as one.
+      # Repairs already in flight and the recovery of pods that are already
+      # gone are not bounded by it; Instances past the bound are repaired on
+      # the following passes. Omit to leave the repairs opened per pass
+      # unbounded. The manager reads this once at startup and rejects
+      # non-positive values; Helm rolls the manager when the rendered
+      # ConfigMap changes.
+      repairBatchSize: 10
       # revisionHistoryLimit caps how many non-live ControllerRevisions the
       # InferenceReplica controller retains per (InferenceService, Component)
       # when the ISVC does not set the ome.io/revision-history-limit

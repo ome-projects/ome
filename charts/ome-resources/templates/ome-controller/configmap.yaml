@@ -113,6 +113,20 @@ data:
       }
     }
 
+  {{- with .Values.ome.controller.eventRecorder }}
+  {{- $eventRecorder := dict }}
+  {{- if hasKey . "burstSize" }}
+  {{- $_ := set $eventRecorder "burstSize" .burstSize }}
+  {{- end }}
+  {{- if hasKey . "refillInterval" }}
+  {{- $_ := set $eventRecorder "refillInterval" .refillInterval }}
+  {{- end }}
+  {{- if $eventRecorder }}
+  eventRecorder: |-
+    {{ $eventRecorder | toJson }}
+  {{- end }}
+  {{- end }}
+
   {{- with .Values.ome.controller.lifecycle }}
   {{- $fields := list }}
   {{- if hasKey . "scaleUpPodBatchSize" }}
@@ -123,6 +137,9 @@ data:
   {{- end }}
   {{- if hasKey . "scaleDownRequeueInterval" }}
   {{- $fields = append $fields (dict "scaleDownRequeueInterval" .scaleDownRequeueInterval) }}
+  {{- end }}
+  {{- if hasKey . "repairBatchSize" }}
+  {{- $fields = append $fields (dict "repairBatchSize" .repairBatchSize) }}
   {{- end }}
   {{- if hasKey . "revisionHistoryLimit" }}
   {{- $fields = append $fields (dict "revisionHistoryLimit" .revisionHistoryLimit) }}
